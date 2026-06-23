@@ -9,10 +9,8 @@
 import { createRequire } from "node:module";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { getAoBaseDir } from "./paths.js";
-
-// Use createRequire so we can try/catch on native module load without top-level await.
-const _require = createRequire(import.meta.url);
 
 type BetterSqlite3Database = {
   pragma(source: string, options?: { simple?: boolean }): unknown;
@@ -99,8 +97,27 @@ function pruneOldEvents(db: BetterSqlite3Database, cutoff: number): void {
   ).run(cutoff, PRUNE_BATCH_SIZE);
 }
 
+// Resolve the native better-sqlite3 binding via createRequire.
+//
+// `import.meta.url` is the natural base, but bundlers inline this module into a
+// larger output (the dashboard bundles ao-core) and freeze import.meta.url to a
+// stale build-machine path. On Windows that POSIX-style file URL is rejected by
+// createRequire with ERR_INVALID_ARG_VALUE; when this ran at module top-level it
+// threw at import time and took down every dashboard route that imports ao-core.
+// Doing it here (inside openDb, which getDb wraps in try/catch) plus a cwd-anchored
+// fallback base means a mangled URL degrades to "DB unavailable" (null) instead.
+function requireBetterSqlite3(): new (path: string) => BetterSqlite3Database {
+  let req: ReturnType<typeof createRequire>;
+  try {
+    req = createRequire(import.meta.url);
+  } catch {
+    req = createRequire(pathToFileURL(join(process.cwd(), "noop.js")).href);
+  }
+  return req("better-sqlite3") as new (path: string) => BetterSqlite3Database;
+}
+
 function openDb(): BetterSqlite3Database {
-  const Database = _require("better-sqlite3") as new (path: string) => BetterSqlite3Database;
+  const Database = requireBetterSqlite3();
   mkdirSync(getAoBaseDir(), { recursive: true });
   const db = new Database(getEventsDbPath());
 
