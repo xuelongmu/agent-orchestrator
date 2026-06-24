@@ -1,5 +1,12 @@
 # @aoagents/ao-plugin-workspace-worktree
 
+## 0.9.3
+
+### Patch Changes
+
+- Updated dependencies [cd45a7c]
+  - @aoagents/ao-core@0.9.3
+
 ## 0.9.1
 
 ### Patch Changes
