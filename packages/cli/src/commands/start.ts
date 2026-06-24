@@ -79,6 +79,7 @@ import {
 } from "../lib/running-state.js";
 import { attachToDaemon, killExistingDaemon } from "../lib/daemon.js";
 import { startProjectSupervisor } from "../lib/project-supervisor.js";
+import { startBacklogPoller } from "../lib/backlog-service.js";
 import { isHumanCaller } from "../lib/caller-context.js";
 import { detectEnvironment } from "../lib/detect-env.js";
 import {
@@ -976,6 +977,11 @@ async function runStartup(
       spinner.start("Starting project supervisor");
       await startProjectSupervisor({ configPath: config.configPath });
       spinner.succeed("Lifecycle project supervisor started");
+
+      // Drive labeled backlog issues to execution without needing the dashboard
+      // (headless autonomy). The poller's cross-process lock prevents
+      // double-spawning with the dashboard's poller when both run.
+      startBacklogPoller(config.configPath);
     } catch (err) {
       spinner.fail("Project supervisor failed to start");
       recordActivityEvent({

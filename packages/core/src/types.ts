@@ -1554,6 +1554,12 @@ export interface ProjectConfig {
   /** Override default workspace */
   workspace?: string;
 
+  /**
+   * Maximum number of concurrent worker sessions the backlog poller will spawn
+   * for this project. Defaults to 5 when unset.
+   */
+  maxConcurrentAgents?: number;
+
   /** Environment variables forwarded into worker session runtimes (AO_* internals always win) */
   env?: Record<string, string>;
 

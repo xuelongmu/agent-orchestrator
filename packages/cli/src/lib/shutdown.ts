@@ -23,6 +23,7 @@ import { stopBunTmpJanitor } from "./bun-tmp-janitor.js";
 import { getSessionManager } from "./create-session-manager.js";
 import { stopAllLifecycleWorkers } from "./lifecycle-service.js";
 import { stopProjectSupervisor } from "./project-supervisor.js";
+import { stopBacklogPoller } from "./backlog-service.js";
 import { unregister, writeLastStop } from "./running-state.js";
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -73,6 +74,7 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
     });
 
     try {
+      stopBacklogPoller();
       stopProjectSupervisor();
       stopAllLifecycleWorkers();
     } catch {
