@@ -1,5 +1,12 @@
 # @aoagents/ao-plugin-agent-grok
 
+## 0.1.4
+
+### Patch Changes
+
+- Updated dependencies [cd45a7c]
+  - @aoagents/ao-core@0.9.3
+
 ## 0.1.3
 
 ### Patch Changes

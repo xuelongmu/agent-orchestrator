@@ -1,5 +1,36 @@
 # @aoagents/ao-cli
 
+## 0.9.3
+
+### Patch Changes
+
+- Updated dependencies [cd45a7c]
+  - @aoagents/ao-core@0.9.3
+  - @aoagents/ao-plugin-agent-aider@0.9.3
+  - @aoagents/ao-plugin-agent-claude-code@0.9.3
+  - @aoagents/ao-plugin-agent-codex@0.9.3
+  - @aoagents/ao-plugin-agent-cursor@0.9.3
+  - @aoagents/ao-plugin-agent-grok@0.1.4
+  - @aoagents/ao-plugin-agent-kimicode@0.9.3
+  - @aoagents/ao-plugin-agent-opencode@0.9.3
+  - @aoagents/ao-plugin-notifier-composio@0.9.3
+  - @aoagents/ao-plugin-notifier-dashboard@0.9.3
+  - @aoagents/ao-plugin-notifier-desktop@0.9.3
+  - @aoagents/ao-plugin-notifier-discord@0.9.3
+  - @aoagents/ao-plugin-notifier-openclaw@0.9.3
+  - @aoagents/ao-plugin-notifier-slack@0.9.3
+  - @aoagents/ao-plugin-notifier-webhook@0.9.3
+  - @aoagents/ao-plugin-runtime-process@0.9.3
+  - @aoagents/ao-plugin-runtime-tmux@0.9.3
+  - @aoagents/ao-plugin-scm-github@0.9.3
+  - @aoagents/ao-plugin-terminal-iterm2@0.9.3
+  - @aoagents/ao-plugin-terminal-web@0.9.3
+  - @aoagents/ao-plugin-tracker-github@0.9.3
+  - @aoagents/ao-plugin-tracker-linear@0.9.3
+  - @aoagents/ao-plugin-workspace-clone@0.9.3
+  - @aoagents/ao-plugin-workspace-worktree@0.9.3
+  - @aoagents/ao-web@0.9.3
+
 ## 0.9.2
 
 ### Patch Changes
