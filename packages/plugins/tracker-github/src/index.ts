@@ -125,6 +125,54 @@ function mapState(ghState: string, stateReason?: string | null): Issue["state"] 
 }
 
 // ---------------------------------------------------------------------------
+// Relation emulation
+//
+// GitHub Issues has no first-class blocking/dependency model that the `gh` CLI
+// exposes uniformly, so relations are emulated with a convention written into
+// the issue body. These markers also create native cross-references in GitHub's
+// UI (each `#N` becomes a linked reference).
+// ---------------------------------------------------------------------------
+
+const PARENT_MARKER = /^Part of #(\d+)\s*$/im;
+const BLOCKED_BY_MARKER = /^Blocked by #(\d+)\s*$/gim;
+const RELATED_TO_MARKER = /^Related to #(\d+)\s*$/gim;
+
+function normalizeIssueNumber(identifier: string): string {
+  return identifier.replace(/^#/, "");
+}
+
+/** Build the relations footer appended to an issue body on create. */
+function buildRelationsFooter(input: CreateIssueInput): string {
+  const lines: string[] = [];
+  if (input.parentId) {
+    lines.push(`Part of #${normalizeIssueNumber(input.parentId)}`);
+  }
+  for (const blocker of input.blockedBy ?? []) {
+    lines.push(`Blocked by #${normalizeIssueNumber(blocker)}`);
+  }
+  for (const related of input.relatedTo ?? []) {
+    lines.push(`Related to #${normalizeIssueNumber(related)}`);
+  }
+  return lines.join("\n");
+}
+
+/** Parse relation markers out of an issue body into Issue relation fields. */
+function parseRelations(body: string): Pick<Issue, "parentId" | "blockedBy" | "relatedTo"> {
+  const result: Pick<Issue, "parentId" | "blockedBy" | "relatedTo"> = {};
+
+  const parent = body.match(PARENT_MARKER);
+  if (parent) result.parentId = parent[1];
+
+  const blockedBy = [...body.matchAll(BLOCKED_BY_MARKER)].map((m) => m[1]);
+  if (blockedBy.length > 0) result.blockedBy = blockedBy;
+
+  const relatedTo = [...body.matchAll(RELATED_TO_MARKER)].map((m) => m[1]);
+  if (relatedTo.length > 0) result.relatedTo = relatedTo;
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Tracker implementation
 // ---------------------------------------------------------------------------
 
@@ -216,6 +264,7 @@ function createGitHubTracker(): Tracker {
           state: mapState(data.state, data.stateReason),
           labels: data.labels.map((l) => l.name),
           assignee: data.assignees[0]?.login,
+          ...parseRelations(data.body ?? ""),
         };
 
         writeCachedIssue(repo, identifier, issue);
@@ -405,6 +454,12 @@ function createGitHubTracker(): Tracker {
     },
 
     async createIssue(input: CreateIssueInput, project: ProjectConfig): Promise<Issue> {
+      // Emulate parent/blocking/related relations via a body convention.
+      const footer = buildRelationsFooter(input);
+      const body = footer
+        ? `${input.description ?? ""}\n\n${footer}`.trimStart()
+        : (input.description ?? "");
+
       const args = [
         "issue",
         "create",
@@ -413,7 +468,7 @@ function createGitHubTracker(): Tracker {
         "--title",
         input.title,
         "--body",
-        input.description ?? "",
+        body,
       ];
 
       if (input.labels && input.labels.length > 0) {

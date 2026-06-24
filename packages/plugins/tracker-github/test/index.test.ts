@@ -128,6 +128,25 @@ describe("tracker-github plugin", () => {
       await expect(tracker.getIssue("999", project)).rejects.toThrow("issue not found");
     });
 
+    it("parses parent/blocking/related relations from the body convention", async () => {
+      mockGh({
+        ...sampleIssue,
+        body: "Some description\n\nPart of #10\nBlocked by #20\nBlocked by #21\nRelated to #30",
+      });
+      const issue = await tracker.getIssue("123", project);
+      expect(issue.parentId).toBe("10");
+      expect(issue.blockedBy).toEqual(["20", "21"]);
+      expect(issue.relatedTo).toEqual(["30"]);
+    });
+
+    it("omits relation fields when the body has no markers", async () => {
+      mockGh(sampleIssue);
+      const issue = await tracker.getIssue("123", project);
+      expect(issue.parentId).toBeUndefined();
+      expect(issue.blockedBy).toBeUndefined();
+      expect(issue.relatedTo).toBeUndefined();
+    });
+
     it("falls back when gh does not support stateReason field", async () => {
       mockGhError('gh issue view failed: Unknown JSON field "stateReason"');
       mockGh({ ...sampleIssue, stateReason: undefined });
@@ -560,6 +579,45 @@ describe("tracker-github plugin", () => {
         expect.arrayContaining(["issue", "create", "--label", "bug", "--assignee", "alice"]),
         expect.any(Object),
       );
+    });
+
+    it("writes parent/blocking/related relations into the issue body", async () => {
+      mockGhRaw("https://github.com/acme/repo/issues/1001\n");
+      mockGh({
+        number: 1001,
+        title: "Sub",
+        body: "Desc\n\nPart of #10\nBlocked by #20\nRelated to #30",
+        url: "https://github.com/acme/repo/issues/1001",
+        state: "OPEN",
+        stateReason: null,
+        labels: [],
+        assignees: [],
+      });
+
+      const issue = await tracker.createIssue!(
+        {
+          title: "Sub",
+          description: "Desc",
+          parentId: "10",
+          blockedBy: ["20"],
+          relatedTo: ["30"],
+        },
+        project,
+      );
+
+      // The --body argument carries the relation footer.
+      const createArgs = ghMock.mock.calls[0]?.[1] as string[];
+      const bodyIndex = createArgs.indexOf("--body");
+      const body = createArgs[bodyIndex + 1];
+      expect(body).toContain("Desc");
+      expect(body).toContain("Part of #10");
+      expect(body).toContain("Blocked by #20");
+      expect(body).toContain("Related to #30");
+
+      // getIssue round-trips the relations back out.
+      expect(issue.parentId).toBe("10");
+      expect(issue.blockedBy).toEqual(["20"]);
+      expect(issue.relatedTo).toEqual(["30"]);
     });
 
     it("throws when URL cannot be parsed from gh output", async () => {

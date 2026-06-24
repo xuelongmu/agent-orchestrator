@@ -763,6 +763,16 @@ export interface Issue {
   assignee?: string;
   priority?: number;
   branchName?: string;
+  /** Parent issue identifier (sub-issue hierarchy) */
+  parentId?: string;
+  /** Child sub-issue identifiers */
+  children?: string[];
+  /** Identifiers of issues that block this one */
+  blockedBy?: string[];
+  /** Identifiers of issues this one blocks */
+  blocks?: string[];
+  /** Identifiers of issues related to this one */
+  relatedTo?: string[];
 }
 
 export interface IssueFilters {
@@ -786,6 +796,12 @@ export interface CreateIssueInput {
   labels?: string[];
   assignee?: string;
   priority?: number;
+  /** Parent issue identifier — create this as a sub-issue of the parent */
+  parentId?: string;
+  /** Identifiers of issues that block this one */
+  blockedBy?: string[];
+  /** Identifiers of issues related to this one */
+  relatedTo?: string[];
 }
 
 // =============================================================================

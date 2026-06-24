@@ -338,6 +338,10 @@ interface LinearIssueNode {
   team: {
     key: string;
   };
+  parent?: { identifier: string } | null;
+  children?: { nodes: Array<{ identifier: string }> };
+  relations?: { nodes: Array<{ type: string; relatedIssue: { identifier: string } | null }> };
+  inverseRelations?: { nodes: Array<{ type: string; issue: { identifier: string } | null }> };
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +378,64 @@ const ISSUE_FIELDS = `
   labels { nodes { name } }
   assignee { name displayName }
   team { key }
+  parent { identifier }
+  children { nodes { identifier } }
+  relations { nodes { type relatedIssue { identifier } } }
+  inverseRelations { nodes { type issue { identifier } } }
 `;
+
+/**
+ * Map a raw Linear issue node into the core Issue type, including
+ * hierarchy (parent/children) and dependency relations.
+ *
+ * Linear models blocking as a directional "blocks" relation:
+ * - `relations` are edges where this issue is the source.
+ * - `inverseRelations` are edges where this issue is the target.
+ * So a "blocks" edge in `inverseRelations` means another issue blocks this one.
+ */
+function mapIssueNode(node: LinearIssueNode): Issue {
+  const issue: Issue = {
+    id: node.identifier,
+    title: node.title,
+    description: node.description ?? "",
+    url: node.url,
+    state: mapLinearState(node.state.type),
+    labels: node.labels.nodes.map((l) => l.name),
+    assignee: node.assignee?.displayName ?? node.assignee?.name,
+    priority: node.priority,
+    branchName: node.branchName ?? undefined,
+  };
+
+  if (node.parent?.identifier) {
+    issue.parentId = node.parent.identifier;
+  }
+
+  const children = node.children?.nodes.map((c) => c.identifier) ?? [];
+  if (children.length > 0) {
+    issue.children = children;
+  }
+
+  const blocks: string[] = [];
+  const blockedBy: string[] = [];
+  const relatedTo: string[] = [];
+
+  for (const rel of node.relations?.nodes ?? []) {
+    if (!rel.relatedIssue) continue;
+    if (rel.type === "blocks") blocks.push(rel.relatedIssue.identifier);
+    else if (rel.type === "related") relatedTo.push(rel.relatedIssue.identifier);
+  }
+  for (const rel of node.inverseRelations?.nodes ?? []) {
+    if (!rel.issue) continue;
+    if (rel.type === "blocks") blockedBy.push(rel.issue.identifier);
+    else if (rel.type === "related") relatedTo.push(rel.issue.identifier);
+  }
+
+  if (blocks.length > 0) issue.blocks = blocks;
+  if (blockedBy.length > 0) issue.blockedBy = blockedBy;
+  if (relatedTo.length > 0) issue.relatedTo = relatedTo;
+
+  return issue;
+}
 
 // ---------------------------------------------------------------------------
 // Tracker implementation
@@ -394,18 +455,7 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
         { id: identifier },
       );
 
-      const node = data.issue;
-      return {
-        id: node.identifier,
-        title: node.title,
-        description: node.description ?? "",
-        url: node.url,
-        state: mapLinearState(node.state.type),
-        labels: node.labels.nodes.map((l) => l.name),
-        assignee: node.assignee?.displayName ?? node.assignee?.name,
-        priority: node.priority,
-        branchName: node.branchName ?? undefined,
-      };
+      return mapIssueNode(data.issue);
     },
 
     async isCompleted(identifier: string, _project: ProjectConfig): Promise<boolean> {
@@ -528,17 +578,7 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
         variables,
       );
 
-      return data.issues.nodes.map((node) => ({
-        id: node.identifier,
-        title: node.title,
-        description: node.description ?? "",
-        url: node.url,
-        state: mapLinearState(node.state.type),
-        labels: node.labels.nodes.map((l) => l.name),
-        assignee: node.assignee?.displayName ?? node.assignee?.name,
-        priority: node.priority,
-        branchName: node.branchName ?? undefined,
-      }));
+      return data.issues.nodes.map(mapIssueNode);
     },
 
     async updateIssue(
@@ -688,6 +728,21 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
         throw new Error("Linear tracker requires 'teamId' in project tracker config");
       }
 
+      // Resolve a short identifier (e.g. "INT-5") to its UUID, which the
+      // relation/parent mutations require. Linear's issue() query accepts
+      // both forms, so we can pass identifiers straight through.
+      const resolveUuid = async (identifier: string): Promise<string | null> => {
+        try {
+          const res = await query<{ issue: { id: string } | null }>(
+            `query($id: String!) { issue(id: $id) { id } }`,
+            { id: identifier },
+          );
+          return res.issue?.id ?? null;
+        } catch {
+          return null;
+        }
+      };
+
       const variables: Record<string, unknown> = {
         title: input.title,
         description: input.description ?? "",
@@ -698,18 +753,27 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
         variables["priority"] = input.priority;
       }
 
+      // Set the parent on create so the new issue becomes a sub-issue.
+      if (input.parentId) {
+        const parentUuid = await resolveUuid(input.parentId);
+        if (parentUuid) {
+          variables["parentId"] = parentUuid;
+        }
+      }
+
       const data = await query<{
         issueCreate: {
           success: boolean;
           issue: LinearIssueNode;
         };
       }>(
-        `mutation($title: String!, $description: String!, $teamId: String!, $priority: Int) {
+        `mutation($title: String!, $description: String!, $teamId: String!, $priority: Int, $parentId: String) {
           issueCreate(input: {
             title: $title,
             description: $description,
             teamId: $teamId,
-            priority: $priority
+            priority: $priority,
+            parentId: $parentId
           }) {
             success
             issue {
@@ -721,17 +785,7 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
       );
 
       const node = data.issueCreate.issue;
-      const issue: Issue = {
-        id: node.identifier,
-        title: node.title,
-        description: node.description ?? "",
-        url: node.url,
-        state: mapLinearState(node.state.type),
-        labels: node.labels.nodes.map((l) => l.name),
-        assignee: node.assignee?.displayName ?? node.assignee?.name,
-        priority: node.priority,
-        branchName: node.branchName ?? undefined,
-      };
+      const issue = mapIssueNode(node);
 
       // Assign after creation (Linear's issueCreate uses assigneeId, not display name)
       if (input.assignee) {
@@ -805,6 +859,60 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
         } catch {
           // Labels are best-effort; don't fail the whole creation
         }
+      }
+
+      // Create dependency relations. Linear models blocking as a directional
+      // "blocks" relation, so "this issue is blocked by X" is created as
+      // "X blocks this issue" (issueId = X, relatedIssueId = new issue).
+      const createRelation = async (
+        issueUuid: string,
+        relatedUuid: string,
+        type: "blocks" | "related",
+      ): Promise<void> => {
+        await query(
+          `mutation($issueId: String!, $relatedIssueId: String!, $type: IssueRelationType!) {
+            issueRelationCreate(input: {
+              issueId: $issueId,
+              relatedIssueId: $relatedIssueId,
+              type: $type
+            }) {
+              success
+            }
+          }`,
+          { issueId: issueUuid, relatedIssueId: relatedUuid, type },
+        );
+      };
+
+      if (input.blockedBy && input.blockedBy.length > 0) {
+        const blockedBy: string[] = [];
+        for (const blocker of input.blockedBy) {
+          try {
+            const blockerUuid = await resolveUuid(blocker);
+            if (blockerUuid) {
+              await createRelation(blockerUuid, node.id, "blocks");
+              blockedBy.push(blocker);
+            }
+          } catch {
+            // Relations are best-effort; don't fail the whole creation
+          }
+        }
+        if (blockedBy.length > 0) issue.blockedBy = blockedBy;
+      }
+
+      if (input.relatedTo && input.relatedTo.length > 0) {
+        const relatedTo: string[] = [];
+        for (const related of input.relatedTo) {
+          try {
+            const relatedUuid = await resolveUuid(related);
+            if (relatedUuid) {
+              await createRelation(node.id, relatedUuid, "related");
+              relatedTo.push(related);
+            }
+          } catch {
+            // Relations are best-effort; don't fail the whole creation
+          }
+        }
+        if (relatedTo.length > 0) issue.relatedTo = relatedTo;
       }
 
       return issue;

@@ -30,6 +30,53 @@ interface GitLabIssueData {
   assignees: Array<{ username: string }>;
 }
 
+// ---------------------------------------------------------------------------
+// Relation emulation
+//
+// The `glab` CLI exposes no first-class blocking/dependency model, so relations
+// are emulated (best-effort) with a convention written into the issue
+// description. Each `#N` marker also renders as a native cross-reference link.
+// ---------------------------------------------------------------------------
+
+const PARENT_MARKER = /^Part of #(\d+)\s*$/im;
+const BLOCKED_BY_MARKER = /^Blocked by #(\d+)\s*$/gim;
+const RELATED_TO_MARKER = /^Related to #(\d+)\s*$/gim;
+
+function normalizeIssueNumber(identifier: string): string {
+  return identifier.replace(/^#/, "");
+}
+
+/** Build the relations footer appended to an issue description on create. */
+function buildRelationsFooter(input: CreateIssueInput): string {
+  const lines: string[] = [];
+  if (input.parentId) {
+    lines.push(`Part of #${normalizeIssueNumber(input.parentId)}`);
+  }
+  for (const blocker of input.blockedBy ?? []) {
+    lines.push(`Blocked by #${normalizeIssueNumber(blocker)}`);
+  }
+  for (const related of input.relatedTo ?? []) {
+    lines.push(`Related to #${normalizeIssueNumber(related)}`);
+  }
+  return lines.join("\n");
+}
+
+/** Parse relation markers out of an issue description into Issue fields. */
+function parseRelations(body: string): Pick<Issue, "parentId" | "blockedBy" | "relatedTo"> {
+  const result: Pick<Issue, "parentId" | "blockedBy" | "relatedTo"> = {};
+
+  const parent = body.match(PARENT_MARKER);
+  if (parent) result.parentId = parent[1];
+
+  const blockedBy = [...body.matchAll(BLOCKED_BY_MARKER)].map((m) => m[1]);
+  if (blockedBy.length > 0) result.blockedBy = blockedBy;
+
+  const relatedTo = [...body.matchAll(RELATED_TO_MARKER)].map((m) => m[1]);
+  if (relatedTo.length > 0) result.relatedTo = relatedTo;
+
+  return result;
+}
+
 function toIssue(data: GitLabIssueData): Issue {
   return {
     id: String(data.iid),
@@ -39,6 +86,7 @@ function toIssue(data: GitLabIssueData): Issue {
     state: data.state.toLowerCase() === "closed" ? "closed" : "open",
     labels: data.labels ?? [],
     assignee: data.assignees?.[0]?.username,
+    ...parseRelations(data.description ?? ""),
   };
 }
 
@@ -181,6 +229,12 @@ function createGitLabTracker(config?: Record<string, unknown>): Tracker {
     },
 
     async createIssue(input: CreateIssueInput, project: ProjectConfig): Promise<Issue> {
+      // Emulate parent/blocking/related relations via a description convention.
+      const footer = buildRelationsFooter(input);
+      const description = footer
+        ? `${input.description ?? ""}\n\n${footer}`.trimStart()
+        : (input.description ?? "");
+
       const args = [
         "issue",
         "create",
@@ -189,7 +243,7 @@ function createGitLabTracker(config?: Record<string, unknown>): Tracker {
         "--title",
         input.title,
         "--description",
-        input.description ?? "",
+        description,
       ];
 
       if (input.labels && input.labels.length > 0) {
