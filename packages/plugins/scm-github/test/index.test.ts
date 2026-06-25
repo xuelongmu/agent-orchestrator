@@ -1018,6 +1018,16 @@ describe("scm-github plugin", () => {
             url: "u",
             createdAt: "2025-01-01T00:00:00Z",
           },
+          {
+            isResolved: false,
+            id: "C4",
+            author: "chatgpt-codex-connector[bot]",
+            body: "Codex says",
+            path: "a.ts",
+            line: 4,
+            url: "u",
+            createdAt: "2025-01-01T00:00:00Z",
+          },
         ]),
       );
 
