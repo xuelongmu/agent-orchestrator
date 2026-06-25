@@ -492,14 +492,17 @@ export async function enrichSessionAgentSummary(
   coreSession: Session,
   agent: Agent,
 ): Promise<void> {
-  if (dashboard.summary) return;
+  // Cost rides along on the same getSessionInfo() call; skip only when both
+  // summary and cost are already populated. A session reconstructed from
+  // metadata can have a saved summary but no agentInfo.cost — still fetch so
+  // the dashboard cost is populated.
+  if (dashboard.summary && dashboard.cost) return;
   try {
     const info = await agent.getSessionInfo(coreSession);
-    if (info?.summary) {
+    if (info?.summary && !dashboard.summary) {
       dashboard.summary = info.summary;
       dashboard.summaryIsFallback = info.summaryIsFallback ?? false;
     }
-    // Cost rides along on the same getSessionInfo() call when present.
     if (info?.cost && !dashboard.cost) {
       dashboard.cost = info.cost;
     }
@@ -590,7 +593,7 @@ function prepareSessionMetadataEnrichment(
 
   // Agent summaries + cost (local disk I/O — reads agent JSONL)
   const summaryPromises = coreSessions.map((core, i) => {
-    if (dashboardSessions[i].summary) return Promise.resolve();
+    if (dashboardSessions[i].summary && dashboardSessions[i].cost) return Promise.resolve();
     const agentName = core.metadata["agent"];
     if (!agentName) return Promise.resolve();
     const agent = registry.get<Agent>("agent", agentName);

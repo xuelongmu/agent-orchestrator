@@ -2676,6 +2676,18 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
   }
 
+  /** Sum estimated cost per project across a set of (enriched) sessions. */
+  function sumProjectCost(sessions: Session[]): Map<string, number> {
+    const totals = new Map<string, number>();
+    for (const s of sessions) {
+      const cost = s.agentInfo?.cost?.estimatedCostUsd ?? 0;
+      if (cost > 0) {
+        totals.set(s.projectId, (totals.get(s.projectId) ?? 0) + cost);
+      }
+    }
+    return totals;
+  }
+
   /** Poll a single session and handle state transitions. */
   async function checkSession(session: Session, projectCostUsd?: number): Promise<void> {
     // Use tracked state if available; otherwise use the persisted metadata status
@@ -2731,6 +2743,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             },
           });
         }
+      } else if (session.metadata["budgetPausedAt"]) {
+        // No breach but still working: the cap was raised or removed. Clear the
+        // latch so a future breach notifies and re-records the pause event.
+        updateSessionMetadata(session, { budgetPausedAt: "", budgetPausedReason: "" });
       }
     } else if (session.metadata["budgetPausedAt"]) {
       // Session moved on (PR opened, cleaned up, restored): clear the latch so a
@@ -3178,13 +3194,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
       // Sum each project's estimated cost across all (enriched) sessions so the
       // per-project budget cap can be evaluated per session below.
-      const projectCostUsd = new Map<string, number>();
-      for (const s of sessions) {
-        const cost = s.agentInfo?.cost?.estimatedCostUsd ?? 0;
-        if (cost > 0) {
-          projectCostUsd.set(s.projectId, (projectCostUsd.get(s.projectId) ?? 0) + cost);
-        }
-      }
+      const projectCostUsd = sumProjectCost(sessions);
 
       // Poll all sessions concurrently
       await Promise.allSettled(
@@ -3336,7 +3346,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // Populate batch enrichment cache for this session's PR so
       // checkSession can read from cache (no individual REST fallback).
       await populatePREnrichmentCache([session]);
-      await checkSession(session);
+      // Sum the project's spend across all its sessions so the per-project
+      // budget cap is evaluated correctly for direct (e.g. webhook) checks,
+      // not just the polling loop.
+      const projectCostUsd = sumProjectCost(await sessionManager.list(session.projectId));
+      await checkSession(session, projectCostUsd.get(session.projectId) ?? 0);
     },
   };
 }

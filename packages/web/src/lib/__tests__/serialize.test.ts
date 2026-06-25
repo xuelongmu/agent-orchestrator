@@ -1121,13 +1121,18 @@ describe("enrichSessionsMetadata", () => {
     expect(dashboard.summary).toBe("Working on feature");
   });
 
-  it("should skip summary enrichment when session already has one", async () => {
+  it("should skip enrichment when session already has summary and cost", async () => {
     const tracker = mockTracker();
     const agent = mockAgent();
     const registry = mockRegistry(tracker, agent);
 
     const core = createCoreSession({
-      agentInfo: { summary: "Existing summary", summaryIsFallback: false, agentSessionId: "x" },
+      agentInfo: {
+        summary: "Existing summary",
+        summaryIsFallback: false,
+        agentSessionId: "x",
+        cost: { inputTokens: 10, outputTokens: 5, estimatedCostUsd: 0.5 },
+      },
     });
     const dashboard = sessionToDashboard(core);
 
@@ -1135,6 +1140,33 @@ describe("enrichSessionsMetadata", () => {
 
     expect(agent.getSessionInfo).not.toHaveBeenCalled();
     expect(dashboard.summary).toBe("Existing summary");
+  });
+
+  it("fetches cost via getSessionInfo when summary exists but cost is missing", async () => {
+    const tracker = mockTracker();
+    const agent = {
+      ...mockAgent(),
+      getSessionInfo: vi.fn().mockResolvedValue({
+        summary: "Fresh summary",
+        summaryIsFallback: false,
+        agentSessionId: "abc",
+        cost: { inputTokens: 1200, outputTokens: 800, estimatedCostUsd: 4.21 },
+      }),
+    } as Agent;
+    const registry = mockRegistry(tracker, agent);
+
+    // Summary from metadata, no agentInfo (so cost is null after serialize).
+    const core = createCoreSession({ agentInfo: null, metadata: { summary: "Saved summary" } });
+    const dashboard = sessionToDashboard(core);
+    expect(dashboard.summary).toBe("Saved summary");
+    expect(dashboard.cost).toBeNull();
+
+    await enrichSessionsMetadata([core], [dashboard], testConfig, registry);
+
+    expect(agent.getSessionInfo).toHaveBeenCalled();
+    // Existing summary is preserved; cost is now populated.
+    expect(dashboard.summary).toBe("Saved summary");
+    expect(dashboard.cost).toEqual({ inputTokens: 1200, outputTokens: 800, estimatedCostUsd: 4.21 });
   });
 
   it("should handle missing tracker plugin gracefully", async () => {
@@ -1201,7 +1233,12 @@ describe("enrichSessionsMetadata", () => {
       createCoreSession({
         id: "test-3",
         issueId: `${urlBase}-multi-3`,
-        agentInfo: { summary: "Already has one", summaryIsFallback: false, agentSessionId: "y" },
+        agentInfo: {
+          summary: "Already has one",
+          summaryIsFallback: false,
+          agentSessionId: "y",
+          cost: { inputTokens: 10, outputTokens: 5, estimatedCostUsd: 0.5 },
+        },
       }),
     ];
     const dashboards = cores.map(sessionToDashboard);

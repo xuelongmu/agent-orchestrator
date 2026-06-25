@@ -321,6 +321,44 @@ describe("budget enforcement", () => {
 
     expect(lm.getStates().get("app-1")).toBe("working");
   });
+
+  it("pauses on the per-project cap using the aggregate of all project sessions", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    // The session's own cost ($6) is under any per-session cap, but the project
+    // total across two sessions ($12) exceeds perProjectUsd ($10).
+    const target = withCost(6);
+    const sibling = withCost(6);
+    sibling.id = "app-2";
+    const lm = setupCheck("app-1", {
+      session: target,
+      configOverride: { ...config, budget: { perProjectUsd: 10 } },
+    });
+    vi.mocked(mockSessionManager.list).mockResolvedValue([target, sibling]);
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedReason"]).toContain("project");
+  });
+
+  it("clears the pause latch when the cap is raised above current cost", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const session = withCost(3.0);
+    session.metadata = { ...session.metadata, budgetPausedAt: "2026-01-01T00:00:00.000Z" };
+    // Cost is $3 but the (now raised) cap is $5 — no breach.
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { budgetPausedAt: "2026-01-01T00:00:00.000Z" },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("working");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeFalsy();
+  });
 });
 
 describe("check (single session)", () => {
