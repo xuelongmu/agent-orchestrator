@@ -17,10 +17,14 @@ import {
 import {
   getPipePath,
   ptyHostSendMessage,
+  ptyHostSendRaw,
   ptyHostGetOutput,
   ptyHostIsAlive,
   ptyHostKill,
 } from "./pty-client.js";
+
+/** Escape key — cancels the agent's in-flight generation without exiting it. */
+const INTERRUPT_KEY = "\x1b";
 
 export const manifest = {
   name: "process",
@@ -410,6 +414,22 @@ export function create(): Runtime {
         stdin.on("drain", onDrain);
         stdin.write(message + "\n", (err) => finish(err ?? null));
       });
+    },
+
+    async interrupt(handle: RuntimeHandle): Promise<void> {
+      // Send Escape to cancel the agent's in-flight generation, halting token
+      // spend (e.g. for an over-budget session) while keeping the process alive.
+      const pipePath = (handle.data as Record<string, unknown>)?.pipePath as string | undefined;
+      if (pipePath) {
+        await ptyHostSendRaw(pipePath, INTERRUPT_KEY);
+        return;
+      }
+
+      const entry = processes.get(handle.id);
+      const child = entry?.process;
+      if (child?.stdin?.writable) {
+        child.stdin.write(INTERRUPT_KEY);
+      }
     },
 
     async getOutput(handle: RuntimeHandle, lines = 50): Promise<string> {

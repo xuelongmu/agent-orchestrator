@@ -408,6 +408,17 @@ export interface Runtime {
   /** Send a text message/prompt to the running agent */
   sendMessage(handle: RuntimeHandle, message: string): Promise<void>;
 
+  /**
+   * Interrupt the agent's in-flight work without tearing down the session.
+   * Sends a cancel/stop keystroke (Escape) to the foreground process so it
+   * halts the current generation (e.g. an over-budget run) while staying alive
+   * and interactive — a human can then raise the cap and resume. Destroying the
+   * runtime instead would make the next isAlive probe read it as dead and the
+   * lifecycle reconciler would mark the session terminated (#1735), not paused.
+   * Best-effort: optional, and a no-op if the session is not running.
+   */
+  interrupt?(handle: RuntimeHandle): Promise<void>;
+
   /** Capture recent output from the session */
   getOutput(handle: RuntimeHandle, lines?: number): Promise<string>;
 

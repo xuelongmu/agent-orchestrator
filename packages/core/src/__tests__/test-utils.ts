@@ -151,6 +151,7 @@ export function createMockPlugins(): MockPlugins {
     create: vi.fn().mockResolvedValue({ id: "rt-1", runtimeName: "mock", data: {} }),
     destroy: vi.fn().mockResolvedValue(undefined),
     sendMessage: vi.fn().mockResolvedValue(undefined),
+    interrupt: vi.fn().mockResolvedValue(undefined),
     getOutput: vi.fn().mockResolvedValue("$ some terminal output\n"),
     isAlive: vi.fn().mockResolvedValue(true),
   };

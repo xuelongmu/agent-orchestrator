@@ -2688,6 +2688,34 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return totals;
   }
 
+  /**
+   * Stop an over-budget agent from accruing further cost. We interrupt (cancel
+   * the in-flight generation) rather than destroy the runtime: destroying would
+   * make the next isAlive probe read the runtime as dead and the reconciler
+   * would mark the session terminated (#1735), not paused. Interrupt keeps the
+   * agent alive and interactive so a human can raise the cap and resume.
+   * Best-effort — runtimes without an interrupt() method are a no-op.
+   */
+  async function interruptForBudget(session: Session): Promise<void> {
+    if (!session.runtimeHandle) return;
+    const project = config.projects[session.projectId];
+    const runtime = registry.get<Runtime>("runtime", project?.runtime ?? config.defaults.runtime);
+    if (!runtime?.interrupt) return;
+    try {
+      await runtime.interrupt(session.runtimeHandle);
+    } catch (err) {
+      recordActivityEvent({
+        projectId: session.projectId,
+        sessionId: session.id,
+        source: "lifecycle",
+        kind: "budget.interrupt_failed",
+        level: "warn",
+        summary: `failed to interrupt over-budget agent ${session.id}`,
+        data: { errorMessage: err instanceof Error ? err.message : String(err) },
+      });
+    }
+  }
+
   /** Poll a single session and handle state transitions. */
   async function checkSession(session: Session, projectCostUsd?: number): Promise<void> {
     // Use tracked state if available; otherwise use the persisted metadata status
@@ -2705,20 +2733,32 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
     let newStatus = assessment.status;
 
-    // Budget enforcement: pause an actively-working session whose estimated
-    // cost has crossed a configured cap. We only override the live "working"
-    // state — PR/CI/idle/terminal states are left untouched so we never
-    // interfere with PR or cleanup lifecycle. Reusing the needs_input path
-    // makes the pause sticky (re-derived each poll while over budget) and lets
-    // the existing transition machinery fire the notification exactly once.
-    if (newStatus === SESSION_STATUS.WORKING) {
+    // Budget enforcement: pause a session whose estimated cost has crossed a
+    // configured cap. On the first breach we interrupt the runtime (see
+    // interruptForBudget) so the agent actually stops spending — marking
+    // metadata alone would leave it running. Reusing the needs_input path makes
+    // the pause sticky and lets the existing transition machinery fire the
+    // notification exactly once.
+    const alreadyBudgetPaused = !!session.metadata["budgetPausedAt"];
+    // Evaluate the cap on a live "working" session, and also keep evaluating it
+    // for a session we already paused that has since gone quiet. After the
+    // first-pause interrupt the agent stops generating, so the next poll often
+    // derives idle/needs_input rather than working; re-evaluating in those
+    // states keeps the pause sticky (and lets us release it if the cap is later
+    // raised) instead of clearing the latch. PR/CI/cleanup/terminal states are
+    // left untouched so we never interfere with PR or cleanup lifecycle.
+    const evaluateBudget =
+      newStatus === SESSION_STATUS.WORKING ||
+      (alreadyBudgetPaused &&
+        (newStatus === SESSION_STATUS.NEEDS_INPUT || newStatus === SESSION_STATUS.IDLE));
+    if (evaluateBudget) {
       const breach = evaluateBudgetBreach(
         config,
         session,
         projectCostUsd ?? session.agentInfo?.cost?.estimatedCostUsd ?? 0,
       );
       if (breach) {
-        const firstPause = !session.metadata["budgetPausedAt"];
+        const firstPause = !alreadyBudgetPaused;
         // Stamp the transition once, at first pause, and reuse that timestamp on
         // every subsequent poll while still over budget. Resetting it each poll
         // would make the dashboard/observability show a perpetually-fresh
@@ -2733,6 +2773,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         session.lifecycle.session.lastTransitionAt = pausedAt;
         assessment.evidence = breach.evidence;
         if (firstPause) {
+          // Actually stop the agent so it can't keep spending tokens while the
+          // session is reported paused — marking metadata alone leaves the
+          // runtime running. Interrupt before persisting the latch so a failure
+          // is recorded but never blocks the pause.
+          await interruptForBudget(session);
           updateSessionMetadata(session, {
             budgetPausedAt: pausedAt,
             budgetPausedReason: breach.evidence,
@@ -2751,9 +2796,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             },
           });
         }
-      } else if (session.metadata["budgetPausedAt"]) {
-        // No breach but still working: the cap was raised or removed. Clear the
-        // latch so a future breach notifies and re-records the pause event.
+      } else if (alreadyBudgetPaused) {
+        // No breach but previously paused: the cap was raised or removed. Clear
+        // the latch so a future breach notifies and re-records the pause event.
         updateSessionMetadata(session, { budgetPausedAt: "", budgetPausedReason: "" });
       }
     } else if (session.metadata["budgetPausedAt"]) {

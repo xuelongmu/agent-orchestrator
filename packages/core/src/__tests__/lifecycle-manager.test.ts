@@ -363,6 +363,72 @@ describe("budget enforcement", () => {
     expect(lifecycle.session.lastTransitionAt).toBe(pausedAt);
   });
 
+  it("interrupts the runtime when first pausing an over-budget session", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const lm = setupCheck("app-1", {
+      session: withCost(9.99),
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    // The agent is actually stopped (not just relabeled) so it can't keep
+    // spending tokens while reported paused.
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "rt-1" }),
+    );
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+  });
+
+  it("does not re-interrupt on a subsequent poll while already paused", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const session = withCost(9.99);
+    session.metadata = { ...session.metadata, budgetPausedAt: "2026-01-01T00:00:00.000Z" };
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { budgetPausedAt: "2026-01-01T00:00:00.000Z" },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    // Interrupt only fires on the first pause; re-pausing each poll must not
+    // re-interrupt (idempotent latch).
+    expect(plugins.runtime.interrupt).not.toHaveBeenCalled();
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+  });
+
+  it("keeps an interrupted, at-prompt session paused while still over budget", async () => {
+    // After the first-pause interrupt the agent stops generating and sits at its
+    // prompt (waiting_input). The pause must stay sticky (needs_input) and the
+    // latch must not be cleared while the cost is still over the cap.
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+    const session = withCost(9.99);
+    session.status = "needs_input";
+    session.metadata = {
+      ...session.metadata,
+      budgetPausedAt: "2026-01-01T00:00:00.000Z",
+      budgetPausedReason: "budget_exceeded:session",
+    };
+    session.lifecycle.session.state = "needs_input";
+    session.lifecycle.session.reason = "awaiting_user_input";
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: {
+        budgetPausedAt: "2026-01-01T00:00:00.000Z",
+        budgetPausedReason: "budget_exceeded:session",
+      },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    expect(plugins.runtime.interrupt).not.toHaveBeenCalled();
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeTruthy();
+  });
+
   it("clears the pause latch when the cap is raised above current cost", async () => {
     vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
     const session = withCost(3.0);

@@ -12,6 +12,7 @@ const {
   mockGetShell,
   mockGetPipePath,
   mockPtyHostSendMessage,
+  mockPtyHostSendRaw,
   mockPtyHostGetOutput,
   mockPtyHostIsAlive,
   mockPtyHostKill,
@@ -22,6 +23,7 @@ const {
   mockGetShell: vi.fn(() => ({ cmd: "sh", args: (c: string) => ["-c", c] })),
   mockGetPipePath: vi.fn((id: string) => `\\\\.\\pipe\\ao-pty-${id}`),
   mockPtyHostSendMessage: vi.fn().mockResolvedValue(undefined),
+  mockPtyHostSendRaw: vi.fn().mockResolvedValue(undefined),
   mockPtyHostGetOutput: vi.fn().mockResolvedValue(""),
   mockPtyHostIsAlive: vi.fn().mockResolvedValue(true),
   mockPtyHostKill: vi.fn().mockResolvedValue(undefined),
@@ -50,6 +52,7 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
 vi.mock("../pty-client.js", () => ({
   getPipePath: mockGetPipePath,
   ptyHostSendMessage: mockPtyHostSendMessage,
+  ptyHostSendRaw: mockPtyHostSendRaw,
   ptyHostGetOutput: mockPtyHostGetOutput,
   ptyHostIsAlive: mockPtyHostIsAlive,
   ptyHostKill: mockPtyHostKill,
@@ -480,6 +483,47 @@ describe("sendMessage()", () => {
     const handle = await runtime.create(defaultConfig());
 
     await expect(runtime.sendMessage(handle, "hello")).rejects.toThrow(/write EPIPE/);
+  });
+});
+
+// =========================================================================
+// interrupt()
+// =========================================================================
+describe("interrupt()", () => {
+  it("writes the Escape byte to stdin without a trailing newline (Unix)", async () => {
+    const child = createMockChild();
+    // interrupt() does a fire-and-forget write (no callback), unlike sendMessage.
+    child.stdin.write = vi.fn((_data: string) => true);
+    mockSpawn.mockReturnValue(child);
+
+    const runtime = create();
+    const handle = await runtime.create(defaultConfig());
+
+    await runtime.interrupt!(handle);
+
+    expect(child.stdin.write).toHaveBeenCalledWith("\x1b");
+  });
+
+  it("is a no-op for an unknown session", async () => {
+    const runtime = create();
+    await expect(runtime.interrupt!(makeHandle("nonexistent"))).resolves.toBeUndefined();
+  });
+
+  it("sends the raw Escape byte via the pty-host on Windows", async () => {
+    mockIsWindows.mockReturnValue(true);
+    const child = createWindowsMockChild();
+    mockSpawn.mockReturnValue(child);
+
+    const runtime = create();
+    const handle = await runtime.create(defaultConfig({ sessionId: "win-interrupt-test" }));
+
+    await runtime.interrupt!(handle);
+
+    expect(mockPtyHostSendRaw).toHaveBeenCalledWith(
+      expect.stringContaining("win-interrupt-test"),
+      "\x1b",
+    );
+    mockIsWindows.mockReturnValue(false);
   });
 });
 

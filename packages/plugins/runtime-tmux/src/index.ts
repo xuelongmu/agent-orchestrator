@@ -189,6 +189,13 @@ export function create(): Runtime {
       await tmux("send-keys", "-t", handle.id, "Enter");
     },
 
+    async interrupt(handle: RuntimeHandle): Promise<void> {
+      // Send Escape to cancel the agent's in-flight generation. This halts
+      // token spend (e.g. for an over-budget session) while leaving the tmux
+      // session and agent process alive so a human can resume it.
+      await tmux("send-keys", "-t", handle.id, "Escape");
+    },
+
     async getOutput(handle: RuntimeHandle, lines = 50): Promise<string> {
       try {
         return await tmux("capture-pane", "-t", handle.id, "-p", "-S", `-${lines}`);
