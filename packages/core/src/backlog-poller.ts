@@ -18,6 +18,7 @@ import {
   futimesSync,
   mkdirSync,
   openSync,
+  renameSync,
   rmSync,
   statSync,
   writeSync,
@@ -155,13 +156,43 @@ function tryAcquireLock(lockPath: string): LockHandle | null {
       // Unexpected FS error — treat as "could not acquire" rather than crash the loop.
       return null;
     }
-    // Lock exists. Reclaim it if it is stale (holder likely crashed).
+    // Lock exists. Reclaim it if it is stale (holder likely crashed) — but do
+    // it atomically. A plain `rmSync` + recursive acquire is a TOCTOU race:
+    // two pollers can both pass the stale-mtime check, then one unlinks the
+    // other's freshly-acquired lock and both run `spawnFromBacklog` (double
+    // spawn). Instead, rename the stale file to a per-process name as the
+    // handoff: `renameSync` is atomic, so only one racing process can move a
+    // given file — the loser gets ENOENT and backs off until the next cycle.
     try {
       const info = statSync(lockPath);
-      if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
-        rmSync(lockPath, { force: true });
-        return tryAcquireLock(lockPath);
+      if (Date.now() - info.mtimeMs <= LOCK_STALE_MS) {
+        return null; // Fresh lock — a live holder owns it.
       }
+      const reclaimPath = `${lockPath}.reclaim.${process.pid}`;
+      try {
+        renameSync(lockPath, reclaimPath);
+      } catch {
+        // Lost the rename race (gone or already reclaimed) — retry next cycle.
+        return null;
+      }
+      // The file we grabbed could be one a peer recreated fresh between our
+      // stat and our rename. Re-check its mtime: if it's no longer stale we
+      // stole a live lock, so restore it (best effort) and back off.
+      try {
+        const reclaimed = statSync(reclaimPath);
+        if (Date.now() - reclaimed.mtimeMs <= LOCK_STALE_MS) {
+          try {
+            renameSync(reclaimPath, lockPath);
+          } catch {
+            rmSync(reclaimPath, { force: true });
+          }
+          return null;
+        }
+      } catch {
+        // Renamed file vanished — nothing to restore; fall through to acquire.
+      }
+      rmSync(reclaimPath, { force: true });
+      return tryAcquireLock(lockPath);
     } catch {
       // The lock vanished between open and stat — let the next cycle retry.
     }
@@ -377,16 +408,33 @@ async function spawnFromBacklog(
     for (const issue of backlogIssues) {
       if (availableSlots <= 0) break;
 
+      // Canonicalize via the tracker's own `issueUrl()` rather than trusting
+      // the listed `issue.url`. `takenIssueUrls` is built from `issueUrl()`
+      // (line above), but some trackers' `listIssues()` returns a URL that
+      // isn't byte-identical to it — e.g. Linear records sessions with the
+      // short `issueUrl()` but lists `node.url`, which can carry a title slug.
+      // Comparing raw `issue.url` would miss an already-running worker and
+      // double-spawn. Deriving both keys from the same function avoids that.
+      let canonicalUrl = issue.url;
+      if (tracker.issueUrl) {
+        try {
+          canonicalUrl = tracker.issueUrl(issue.id, project);
+        } catch {
+          // URL construction failed — fall back to the listed URL; the
+          // per-project id check below still guards same-project duplicates.
+        }
+      }
+
       // Skip if already being worked on (per-project id) or already taken by
       // any project / claimed earlier this cycle (tracker-wide by URL).
       if (activeIssueIds.has(issue.id.toLowerCase())) continue;
-      if (takenIssueUrls.has(issue.url)) continue;
+      if (takenIssueUrls.has(canonicalUrl)) continue;
 
       try {
         await sessionManager.spawn({ projectId, issueId: issue.id });
         availableSlots--;
         activeIssueIds.add(issue.id.toLowerCase());
-        takenIssueUrls.add(issue.url);
+        takenIssueUrls.add(canonicalUrl);
 
         // Mark as claimed on the tracker
         if (tracker.updateIssue) {

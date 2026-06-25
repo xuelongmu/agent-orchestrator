@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, openSync, closeSync, rmSync } from "node:fs";
+import { mkdtempSync, openSync, closeSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createBacklogPoller, type BacklogServices } from "../backlog-poller.js";
@@ -501,5 +501,95 @@ describe("backlog poller", () => {
     // buffer the page would have held only issue 1 and nothing would spawn.
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(spawn).toHaveBeenCalledWith({ projectId: "proj", issueId: "2" });
+  });
+
+  it("recognizes a taken issue when the listed URL differs from issueUrl() (slug)", async () => {
+    // Mimics Linear: active sessions are recorded via the short `issueUrl()`,
+    // but `listIssues()` returns `node.url`, which carries a title slug. A
+    // byte-exact compare would miss the duplicate; the poller must canonicalize
+    // both sides through `issueUrl()` before comparing.
+    const shortUrl = (id: string): string => `https://linear.app/acme/issue/${id}`;
+    const issue = {
+      ...makeIssue("INT-42"),
+      url: "https://linear.app/acme/issue/INT-42-add-widget", // slugged list URL
+    } as Issue;
+    const listIssues = vi.fn(async (filters: { labels?: string[] }) =>
+      filters.labels?.includes("agent:backlog") ? [issue] : [],
+    );
+    const updateIssue = vi.fn(async () => undefined);
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const tracker = { name: "linear", listIssues, updateIssue, getIssue, issueUrl: shortUrl };
+
+    const project = (name: string, prefix: string) => ({
+      name,
+      path: `/tmp/${name}`,
+      defaultBranch: "main",
+      sessionPrefix: prefix,
+      tracker: { plugin: "linear" },
+    });
+    const services: BacklogServices = {
+      config: {
+        // projB shares the Linear tracker; projA holds the live worker, so the
+        // issue is invisible in projB's per-project id set and only the
+        // URL-based cross-project guard can catch it.
+        projects: { projA: project("projA", "a"), projB: project("projB", "b") },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => [makeWorkerSession("a-1", "INT-42", "projA")]),
+        spawn,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("reclaims a stale lock and runs the cycle", async () => {
+    const lockPath = join(tmp, "backlog-poll.lock");
+    const fd = openSync(lockPath, "wx"); // a lock left behind by a crashed holder
+    closeSync(fd);
+    // Backdate the lock's mtime well past the 5-min stale threshold.
+    const old = new Date(Date.now() - 10 * 60_000);
+    utimesSync(lockPath, old, old);
+
+    const harness = makeHarness({ backlogIssues: [makeIssue("1")], maxConcurrentAgents: 5 });
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.spawn).toHaveBeenCalledTimes(1);
+    rmSync(lockPath, { force: true });
+  });
+
+  it("does not reclaim a fresh lock held by another process", async () => {
+    const lockPath = join(tmp, "backlog-poll.lock");
+    const fd = openSync(lockPath, "wx"); // fresh lock (current mtime)
+    try {
+      const harness = makeHarness({ backlogIssues: [makeIssue("1")], maxConcurrentAgents: 5 });
+      const poller = createBacklogPoller({
+        resolveServices: async () => harness.services,
+        lockPath,
+      });
+
+      await poller.pollOnce();
+
+      expect(harness.spawn).not.toHaveBeenCalled();
+    } finally {
+      closeSync(fd);
+      rmSync(lockPath, { force: true });
+    }
   });
 });

@@ -30,6 +30,15 @@ import { unregister, writeLastStop } from "./running-state.js";
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
 /**
+ * Upper bound on how long shutdown waits for an in-flight backlog poll to
+ * settle before proceeding to kill sessions. Comfortably under
+ * {@link SHUTDOWN_TIMEOUT_MS} so a poll stuck in a slow tracker call or
+ * `sessionManager.spawn()` can never let the force-exit timer fire before the
+ * kill loop and last-stop write run.
+ */
+const BACKLOG_DRAIN_TIMEOUT_MS = 3_000;
+
+/**
  * Load the config that defines the full shutdown scope. The backlog poller
  * spawns against the global config (all registered projects), so a full
  * graceful shutdown must enumerate all of them — matching `ao stop`, which
@@ -123,8 +132,30 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
       try {
         // Wait for an in-flight backlog poll to settle so a session it spawned
         // right before the signal is enumerated below and killed cleanly. A
-        // rejection here must not abort the kill path, so swallow it.
-        await backlogStopped.catch(() => {});
+        // rejection here must not abort the kill path, so swallow it. Bound the
+        // wait: if the poll is stuck in a slow tracker call or spawn, proceed
+        // anyway rather than let the 10s force-exit fire with sessions un-killed
+        // and last-stop unwritten.
+        const drained = await Promise.race([
+          backlogStopped.then(
+            () => true,
+            () => true,
+          ),
+          new Promise<boolean>((resolve) => {
+            const t = setTimeout(() => resolve(false), BACKLOG_DRAIN_TIMEOUT_MS);
+            t.unref();
+          }),
+        ]);
+        if (!drained) {
+          recordActivityEvent({
+            projectId: ctx.projectId,
+            source: "cli",
+            kind: "cli.shutdown_backlog_drain_timeout",
+            level: "warn",
+            summary: `backlog poll did not settle within ${BACKLOG_DRAIN_TIMEOUT_MS}ms; proceeding with shutdown`,
+            data: { signal, timeoutMs: BACKLOG_DRAIN_TIMEOUT_MS },
+          });
+        }
         const shutdownConfig = loadShutdownConfig(ctx.configPath);
         const sm = await getSessionManager(shutdownConfig);
         const allSessions = await sm.list();

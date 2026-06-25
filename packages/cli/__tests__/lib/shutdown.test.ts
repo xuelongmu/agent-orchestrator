@@ -19,6 +19,7 @@ const {
   mockStopBunTmpJanitor,
   mockStopProjectSupervisor,
   mockStopAllLifecycleWorkers,
+  mockStopBacklogPoller,
   mockLoadConfig,
   mockIsTerminalSession,
 } = vi.hoisted(() => ({
@@ -30,6 +31,7 @@ const {
   mockStopBunTmpJanitor: vi.fn(),
   mockStopProjectSupervisor: vi.fn(),
   mockStopAllLifecycleWorkers: vi.fn(),
+  mockStopBacklogPoller: vi.fn(),
   mockLoadConfig: vi.fn(),
   mockIsTerminalSession: vi.fn(),
 }));
@@ -66,6 +68,10 @@ vi.mock("../../src/lib/bun-tmp-janitor.js", () => ({
   stopBunTmpJanitor: (...args: unknown[]) => mockStopBunTmpJanitor(...args),
 }));
 
+vi.mock("../../src/lib/backlog-service.js", () => ({
+  stopBacklogPoller: (...args: unknown[]) => mockStopBacklogPoller(...args),
+}));
+
 const recordedEvents = (): Array<Record<string, unknown>> =>
   vi.mocked(recordActivityEvent).mock.calls.map((c) => c[0] as Record<string, unknown>);
 
@@ -92,8 +98,12 @@ describe("shutdown handlers — activity events", () => {
     mockStopBunTmpJanitor.mockReset();
     mockStopProjectSupervisor.mockReset();
     mockStopAllLifecycleWorkers.mockReset();
+    mockStopBacklogPoller.mockReset();
     mockLoadConfig.mockReset();
     mockIsTerminalSession.mockReset();
+
+    // Default: no in-flight poll — stop resolves immediately.
+    mockStopBacklogPoller.mockResolvedValue(undefined);
 
     mockLoadConfig.mockReturnValue({ projects: {} });
     mockIsTerminalSession.mockReturnValue(false);
@@ -228,6 +238,39 @@ describe("shutdown handlers — activity events", () => {
       }),
     );
     expect(events.filter((e) => e.kind === "cli.shutdown_failed")).toHaveLength(0);
+  });
+
+  it("proceeds with shutdown (bounded drain) when the backlog poll is stuck", async () => {
+    vi.useFakeTimers();
+    try {
+      const { installShutdownHandlers } = await import("../../src/lib/shutdown.js");
+      // Backlog poll never settles — shutdown must not block on it.
+      mockStopBacklogPoller.mockReturnValue(new Promise(() => {}));
+      mockListSessions.mockResolvedValue([{ id: "s1", projectId: "p1", status: "working" }]);
+
+      installShutdownHandlers({ configPath: "/tmp/cfg.yaml", projectId: "p1" });
+
+      process.emit("SIGTERM", "SIGTERM");
+      // Advance only past the 3s drain bound — well under the 10s force-exit.
+      await vi.advanceTimersByTimeAsync(3_000);
+
+      // The stuck poll did not prevent the kill loop from running.
+      expect(mockKillSession).toHaveBeenCalledWith("s1");
+
+      const events = recordedEvents();
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "cli.shutdown_backlog_drain_timeout",
+          source: "cli",
+          level: "warn",
+          data: expect.objectContaining({ timeoutMs: 3_000 }),
+        }),
+      );
+      // Force-exit (10s) must NOT have fired within the bounded drain window.
+      expect(events.filter((e) => e.kind === "cli.shutdown_force_exit")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("emits cli.shutdown_force_exit when the 10s timer fires", async () => {
