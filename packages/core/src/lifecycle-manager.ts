@@ -52,6 +52,11 @@ import {
   deriveLegacyStatus,
   isBlockedByDependency,
 } from "./lifecycle-state.js";
+import {
+  collectSatisfiedDependencyIds,
+  computeRemainingBlockedBy,
+  countActiveSessions,
+} from "./dependency-scheduler.js";
 import { updateMetadata } from "./metadata.js";
 import { getProjectSessionsDir } from "./paths.js";
 import { applyDecisionToLifecycle as commitLifecycleDecisionInPlace } from "./lifecycle-transition.js";
@@ -1821,6 +1826,28 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           escalated: false,
         };
       }
+
+      case "spawn-session": {
+        // Trigger a dependency scheduler pass: launch any held sessions whose
+        // prerequisites have now merged (#10). This makes "merge unblocks a
+        // dependent" configurable as a reaction in addition to the automatic
+        // per-poll scheduler.
+        const launchedCount = await spawnDependentSessions();
+        recordActivityEvent({
+          projectId,
+          sessionId,
+          source: "reaction",
+          kind: "reaction.action_succeeded",
+          summary: `spawn-session ${reactionKey} (${launchedCount} launched)`,
+          data: { reactionKey, action: "spawn-session", launched: launchedCount },
+        });
+        return {
+          reactionType: reactionKey,
+          success: true,
+          action: "spawn-session",
+          escalated: false,
+        };
+      }
     }
 
     return {
@@ -3116,6 +3143,112 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
   }
 
+  /**
+   * Dependency scheduler pass (#10). Runs once per poll over the full session
+   * list. When the supervisor is unscoped (the dashboard's portfolio-wide
+   * lifecycle worker), `sessions` spans every project, so a backend repo merge
+   * can unblock a frontend repo session. For each held (blocked-by-dependency)
+   * session:
+   *   1. Narrow `blockedBy` by prerequisites whose PR has merged, persisting the
+   *      narrowed set immediately so the progress survives both the
+   *      prerequisite's post-merge cleanup and an AO restart.
+   *   2. Once `blockedBy` is empty, launch the session via `sessionManager.unblock`,
+   *      respecting the project's `maxConcurrent` cap.
+   * Returns the number of sessions launched this pass.
+   */
+  async function runScheduler(sessions: Session[]): Promise<number> {
+    const held = sessions.filter((s) => isBlockedByDependency(s.lifecycle));
+    if (held.length === 0) return 0;
+
+    const satisfied = collectSatisfiedDependencyIds(sessions);
+    // Account for launches issued this pass before the next list() reflects the
+    // newly-running sessions, so a burst of unblocks still respects the cap.
+    const launchedByProject = new Map<string, number>();
+    let launched = 0;
+
+    for (const session of held) {
+      const current = session.blockedBy ?? [];
+      const remaining = computeRemainingBlockedBy(current, satisfied);
+
+      // Persist any narrowing first — durable regardless of whether the launch
+      // below happens now (cap permitting) or on a later poll / after restart.
+      if (remaining.length !== current.length) {
+        session.blockedBy = remaining;
+        updateMetadata(getProjectSessionsDir(session.projectId), session.id, {
+          blockedBy: remaining.join(","),
+        });
+        recordActivityEvent({
+          projectId: session.projectId,
+          sessionId: session.id,
+          source: "lifecycle",
+          kind: "scheduler.dependency_resolved",
+          summary: `prerequisites resolved for ${session.id}`,
+          data: {
+            cleared: current.filter((id) => !remaining.includes(id)).join(","),
+            remaining: remaining.join(","),
+          },
+        });
+      }
+
+      if (remaining.length > 0) continue;
+
+      // Ready to launch — enforce the per-project concurrency cap.
+      const cap = config.projects[session.projectId]?.maxConcurrent;
+      if (typeof cap === "number" && cap > 0) {
+        const active =
+          countActiveSessions(sessions, session.projectId) +
+          (launchedByProject.get(session.projectId) ?? 0);
+        if (active >= cap) {
+          recordActivityEvent({
+            projectId: session.projectId,
+            sessionId: session.id,
+            source: "lifecycle",
+            kind: "scheduler.launch_deferred",
+            summary: `concurrency cap reached for ${session.projectId} (${active}/${cap})`,
+            data: { active, cap },
+          });
+          continue;
+        }
+      }
+
+      try {
+        await sessionManager.unblock(session.id);
+        launched++;
+        launchedByProject.set(
+          session.projectId,
+          (launchedByProject.get(session.projectId) ?? 0) + 1,
+        );
+        recordActivityEvent({
+          projectId: session.projectId,
+          sessionId: session.id,
+          source: "lifecycle",
+          kind: "scheduler.session_launched",
+          summary: `launched unblocked session: ${session.id}`,
+          data: {},
+        });
+      } catch (err) {
+        recordActivityEvent({
+          projectId: session.projectId,
+          sessionId: session.id,
+          source: "lifecycle",
+          kind: "scheduler.launch_failed",
+          level: "warn",
+          summary: `failed to launch unblocked session: ${session.id}`,
+          data: { errorMessage: err instanceof Error ? err.message : String(err) },
+        });
+      }
+    }
+
+    return launched;
+  }
+
+  /** Run a scheduler pass against a freshly-listed session set. Backs the
+   *  `spawn-session` reaction action so it can be triggered on demand. */
+  async function spawnDependentSessions(): Promise<number> {
+    const sessions = await sessionManager.list(scopedProjectId);
+    return runScheduler(sessions);
+  }
+
   /** Run one polling cycle across all sessions. */
   async function pollAll(): Promise<void> {
     const correlationId = createCorrelationId("lifecycle-poll");
@@ -3150,6 +3283,23 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // Persist batch enrichment data to session metadata files so the
       // web dashboard can read it without calling GitHub API.
       persistPREnrichmentToMetadata(sessionsToCheck);
+
+      // Dependency scheduler (#10): unblock and launch held sessions whose
+      // prerequisites just merged. Runs after checkSession so newly-merged
+      // PR state is reflected in the in-memory session objects. Best-effort —
+      // a failure here must never abort the rest of the poll cycle.
+      try {
+        await runScheduler(sessions);
+      } catch (err) {
+        recordActivityEvent({
+          projectId: scopedProjectId,
+          source: "lifecycle",
+          kind: "scheduler.pass_failed",
+          level: "warn",
+          summary: "dependency scheduler pass failed",
+          data: { errorMessage: err instanceof Error ? err.message : String(err) },
+        });
+      }
 
       // Prune stale entries from states, reactionTrackers, and lastReviewBacklogCheckAt
       // for sessions that no longer appear in the session list (e.g., after kill/cleanup)

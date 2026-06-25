@@ -125,6 +125,11 @@ const mockSessionManager: SessionManager = {
     if (!session) throw new SessionNotFoundError(id);
     return { ...session, status: "spawning" as const, activity: "active" as const };
   }),
+  unblock: vi.fn(async (id: string) => {
+    const session = baseSessions.find((s) => s.id === id);
+    if (!session) throw new SessionNotFoundError(id);
+    return { ...session, status: "spawning" as const, activity: "active" as const };
+  }),
 };
 
 const mockSCM: SCM = {

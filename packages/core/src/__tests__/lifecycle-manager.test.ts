@@ -4743,3 +4743,95 @@ describe("multi-PR state machine aggregation", () => {
     }
   });
 });
+
+describe("dependency scheduler (#10)", () => {
+  function makeHeld(id: string, blockedBy: string[], issueId: string) {
+    const held = makeSession({ id, status: "spawning", issueId, branch: `feat/${id}` });
+    held.lifecycle.session.reason = "blocked_by_dependency";
+    held.blockedBy = blockedBy;
+    held.workspacePath = null;
+    held.runtimeHandle = null;
+    return held;
+  }
+
+  it("launches a held session once its prerequisite PR has merged", async () => {
+    vi.useFakeTimers();
+    try {
+      const merged = makeSession({ id: "app-1", status: "merged", issueId: "back" });
+      const held = makeHeld("app-2", ["back"], "front");
+
+      vi.mocked(mockSessionManager.list).mockResolvedValue([merged, held]);
+      const unblockSpy = vi.mocked(mockSessionManager.unblock);
+      unblockSpy.mockResolvedValue(makeSession({ id: "app-2", status: "working" }));
+
+      const lm = createLifecycleManager({
+        config,
+        registry: mockRegistry,
+        sessionManager: mockSessionManager,
+      });
+      lm.start(60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      lm.stop();
+
+      expect(unblockSpy).toHaveBeenCalledWith("app-2");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a multi-prerequisite dependent blocked until all prerequisites merge", async () => {
+    vi.useFakeTimers();
+    try {
+      const merged = makeSession({ id: "app-1", status: "merged", issueId: "back-a" });
+      const stillOpen = makeSession({ id: "app-3", status: "working", issueId: "back-b" });
+      const held = makeHeld("app-2", ["back-a", "back-b"], "front");
+
+      vi.mocked(mockSessionManager.list).mockResolvedValue([merged, stillOpen, held]);
+      const unblockSpy = vi.mocked(mockSessionManager.unblock);
+
+      const lm = createLifecycleManager({
+        config,
+        registry: mockRegistry,
+        sessionManager: mockSessionManager,
+      });
+      lm.start(60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      lm.stop();
+
+      expect(unblockSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("defers launch when the project concurrency cap is reached", async () => {
+    vi.useFakeTimers();
+    try {
+      const baseProject = config.projects["my-app"];
+      if (!baseProject) throw new Error("expected my-app project");
+      const capConfig: OrchestratorConfig = {
+        ...config,
+        projects: { "my-app": { ...baseProject, maxConcurrent: 1 } },
+      };
+      const merged = makeSession({ id: "app-1", status: "merged", issueId: "back" });
+      const active = makeSession({ id: "app-3", status: "working" });
+      const held = makeHeld("app-2", ["back"], "front");
+
+      vi.mocked(mockSessionManager.list).mockResolvedValue([merged, active, held]);
+      const unblockSpy = vi.mocked(mockSessionManager.unblock);
+
+      const lm = createLifecycleManager({
+        config: capConfig,
+        registry: mockRegistry,
+        sessionManager: mockSessionManager,
+      });
+      lm.start(60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      lm.stop();
+
+      expect(unblockSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

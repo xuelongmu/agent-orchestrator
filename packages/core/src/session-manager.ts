@@ -1298,7 +1298,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     }
   }
 
-  async function _spawnInner(spawnConfig: SessionSpawnConfig): Promise<Session> {
+  async function _spawnInner(
+    spawnConfig: SessionSpawnConfig,
+    options?: { reuseIdentity?: { sessionId: string; tmuxName: string | undefined } },
+  ): Promise<Session> {
     const project = config.projects[spawnConfig.projectId];
     if (!project) {
       throw new Error(`Unknown project: ${spawnConfig.projectId}`);
@@ -1365,9 +1368,19 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     try {
       // Determine session ID — atomically reserve to prevent concurrent collisions
       let tmuxName: string | undefined;
-      ({ sessionId, tmuxName } = await reserveNextSessionIdentity(project, sessionsDir));
-      const reservedSessionId = sessionId;
-      cleanupStack.push(() => deleteMetadata(sessionsDir, reservedSessionId));
+      if (options?.reuseIdentity) {
+        // Relaunch of a previously-held session (#10): reuse its already-reserved
+        // id and branch rather than allocating a new one. The held metadata file
+        // already exists; the launch below overwrites it (clearing `blockedBy`).
+        // No deleteMetadata cleanup is registered, so a failed launch leaves the
+        // held record intact for the scheduler to retry on the next poll.
+        sessionId = options.reuseIdentity.sessionId;
+        tmuxName = options.reuseIdentity.tmuxName;
+      } else {
+        ({ sessionId, tmuxName } = await reserveNextSessionIdentity(project, sessionsDir));
+        const reservedSessionId = sessionId;
+        cleanupStack.push(() => deleteMetadata(sessionsDir, reservedSessionId));
+      }
 
       // Determine branch name — explicit branch always takes priority
       let branch: string;
@@ -1763,6 +1776,62 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       });
       throw err;
     }
+  }
+
+  /**
+   * Launch a session previously held in the `blocked_by_dependency` pre-state,
+   * reusing its reserved identity and branch. Called by the dependency
+   * scheduler (#10) once all of a session's prerequisites have merged.
+   *
+   * Idempotent: if the located record is no longer held (already launched, or
+   * never blocked) the current session is returned without relaunching, so
+   * repeated scheduler passes never double-spawn.
+   */
+  async function unblock(sessionId: SessionId): Promise<Session> {
+    const located = findSessionRecord(sessionId);
+    if (!located) throw new SessionNotFoundError(sessionId);
+    const { raw, project, projectId } = located;
+
+    const lifecycle = parseLifecycleFromRaw(raw);
+    const stillHeld =
+      parseIdList(raw["blockedBy"]).length > 0 ||
+      (lifecycle ? isBlockedByDependency(lifecycle) : false);
+    if (!stillHeld) {
+      const existing = await get(sessionId);
+      if (existing) return existing;
+      throw new SessionNotFoundError(sessionId);
+    }
+
+    // Reuse the held session's reserved number for a stable tmux name; the
+    // branch is carried verbatim so it still auto-links to the issue tracker.
+    const num = getSessionNumber(sessionId, project.sessionPrefix);
+    const tmuxName =
+      project.path && num !== undefined
+        ? generateSessionName(project.sessionPrefix, num)
+        : undefined;
+
+    const spawnConfig: SessionSpawnConfig = {
+      projectId,
+      ...(raw["issue"] ? { issueId: raw["issue"] } : {}),
+      ...(raw["branch"] ? { branch: raw["branch"] } : {}),
+      ...(raw["userPrompt"] ? { prompt: raw["userPrompt"] } : {}),
+      ...(raw["agent"] ? { agent: raw["agent"] } : {}),
+      // Explicit empty unblocked set: prevents collectSessionDependencies from
+      // re-deriving a non-empty `blockedBy` from the tracker and re-holding the
+      // session we are deliberately launching.
+      blockedBy: [],
+    };
+
+    recordActivityEvent({
+      projectId,
+      sessionId,
+      source: "session-manager",
+      kind: "session.unblock_started",
+      summary: `launching unblocked session: ${sessionId}`,
+      data: { branch: raw["branch"] ?? undefined },
+    });
+
+    return _spawnInner(spawnConfig, { reuseIdentity: { sessionId, tmuxName } });
   }
 
   function recordOrchestratorSpawnFailed(
@@ -3859,6 +3928,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     ensureOrchestrator,
     relaunchOrchestrator,
     restore,
+    unblock,
     list,
     listCached,
     invalidateCache,

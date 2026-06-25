@@ -122,6 +122,9 @@ function makeSessionManager(
     restore: async () => {
       throw new Error("not implemented");
     },
+    unblock: async () => {
+      throw new Error("not implemented");
+    },
     kill: async () => ({ cleaned: false, alreadyTerminated: false }),
     cleanup: async () => ({ killed: [], skipped: [], errors: [] }),
     send: async () => {},
