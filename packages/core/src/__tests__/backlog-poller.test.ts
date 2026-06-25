@@ -5,12 +5,16 @@ import { join } from "node:path";
 import { createBacklogPoller, type BacklogServices } from "../backlog-poller.js";
 import type { Issue, Session } from "../types.js";
 
+function issueUrlFor(id: string): string {
+  return `https://github.com/test/test/issues/${String(id).replace(/^#/, "")}`;
+}
+
 function makeIssue(id: string): Issue {
   return {
     id,
     title: `Issue ${id}`,
     description: "",
-    url: `https://github.com/test/test/issues/${id}`,
+    url: issueUrlFor(id),
     state: "open",
     labels: ["agent:backlog"],
   } as Issue;
@@ -64,7 +68,7 @@ function makeHarness(opts: {
   }));
   const spawn = vi.fn(async () => ({ id: "spawned" }));
 
-  const tracker = { name: "github", listIssues, updateIssue, getIssue };
+  const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
 
   const services: BacklogServices = {
     config: {
@@ -373,7 +377,7 @@ describe("backlog poller", () => {
     });
     const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
     const spawn = vi.fn(async () => ({ id: "spawned" }));
-    const tracker = { name: "github", listIssues, updateIssue, getIssue };
+    const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
 
     const project = (name: string, prefix: string) => ({
       name,
@@ -403,5 +407,99 @@ describe("backlog poller", () => {
     await poller.pollOnce();
 
     expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats an active worker's issue as taken across projects sharing a tracker", async () => {
+    // projA already has a live worker for issue 42, but its claim label
+    // transition failed so 42 is still listed in the backlog. projB shares the
+    // tracker/repo and must not spawn a second worker for the same issue, even
+    // though 42 is invisible in projB's own per-project worker set.
+    const issue = makeIssue("42");
+    const listIssues = vi.fn(async (filters: { labels?: string[] }) =>
+      filters.labels?.includes("agent:backlog") ? [issue] : [],
+    );
+    const updateIssue = vi.fn(async () => undefined);
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
+
+    const project = (name: string, prefix: string) => ({
+      name,
+      path: `/tmp/${name}`,
+      defaultBranch: "main",
+      sessionPrefix: prefix,
+      tracker: { plugin: "github" },
+    });
+    const services: BacklogServices = {
+      config: {
+        projects: { projA: project("projA", "a"), projB: project("projB", "b") },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => [makeWorkerSession("a-1", "42", "projA")]),
+        spawn,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("over-fetches the backlog so active-but-still-labeled issues don't starve fresh ones", async () => {
+    // Issue 1 is already being worked on (its label transition failed, so it
+    // still appears in the backlog); issue 2 is fresh. With a cap of 2 and one
+    // active worker only one slot is free — the list limit must include a
+    // buffer so issue 2 is returned alongside the skipped issue 1.
+    const issues = [makeIssue("1"), makeIssue("2")];
+    const listIssues = vi.fn(async (filters: { labels?: string[]; limit?: number }) => {
+      if (!filters.labels?.includes("agent:backlog")) return [];
+      return issues.slice(0, filters.limit ?? issues.length);
+    });
+    const updateIssue = vi.fn(async () => undefined);
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
+
+    const services: BacklogServices = {
+      config: {
+        projects: {
+          proj: {
+            name: "proj",
+            path: "/tmp/proj",
+            defaultBranch: "main",
+            sessionPrefix: "ao",
+            tracker: { plugin: "github" },
+            maxConcurrentAgents: 2,
+          },
+        },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => [makeWorkerSession("ao-1", "1")]),
+        spawn,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    // Issue 1 is active → skipped; issue 2 is fresh → spawned. Without the
+    // buffer the page would have held only issue 1 and nothing would spawn.
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledWith({ projectId: "proj", issueId: "2" });
   });
 });

@@ -321,12 +321,27 @@ async function spawnFromBacklog(
     workersByProject.set(session.projectId, list);
   }
 
-  // Issues claimed earlier in this same cycle, keyed by the issue's URL (which
-  // is unique per tracker scope/repo, unlike the bare issue id). Guards the
-  // case where two project entries point at the same repo and a claim update
-  // fails after spawning — without this the next project could list the still
-  // `agent:backlog` issue and spawn a duplicate worker.
-  const claimedThisCycle = new Set<string>();
+  // Tracker-wide set of issue URLs that are already taken — by an active
+  // worker in ANY project, or claimed earlier in this same poll cycle. Keyed
+  // by URL (globally unique) rather than the bare issue id, since ids like
+  // GitHub "#42" collide across repos. Duplicate detection therefore spans
+  // projects that point at the same tracker/repo (concurrency caps stay per
+  // project), and a worker for issue 42 in project A is no longer invisible
+  // while polling project B even if A's claim label transition failed.
+  const takenIssueUrls = new Set<string>();
+  for (const session of workerSessions) {
+    if (!session.issueId) continue;
+    const sessionProject = config.projects[session.projectId];
+    const plugin = sessionProject?.tracker?.plugin;
+    if (!sessionProject || !plugin) continue;
+    const sessionTracker = registry.get<Tracker>("tracker", plugin);
+    if (!sessionTracker?.issueUrl) continue;
+    try {
+      takenIssueUrls.add(sessionTracker.issueUrl(session.issueId, sessionProject));
+    } catch {
+      // URL construction failed — the per-project id check below still applies.
+    }
+  }
 
   for (const [projectId, project] of Object.entries(config.projects)) {
     if (!project.tracker?.plugin) continue;
@@ -347,9 +362,12 @@ async function spawnFromBacklog(
     let backlogIssues: Issue[];
     try {
       backlogIssues = await tracker.listIssues(
-        // Request up to the number of free slots so larger per-project caps
-        // (maxConcurrentAgents > 10) are honored within a single poll cycle.
-        { state: "open", labels: [BACKLOG_LABEL], limit: availableSlots },
+        // Request the free slots plus a buffer for issues we'll skip: claimed
+        // items whose label transition failed can still appear in the backlog,
+        // and without the buffer they could fill the whole page and starve
+        // unclaimed issues further down even though capacity remains. Over-
+        // fetching is harmless — the spawn loop stops at `availableSlots`.
+        { state: "open", labels: [BACKLOG_LABEL], limit: availableSlots + takenIssueUrls.size },
         project,
       );
     } catch {
@@ -359,16 +377,16 @@ async function spawnFromBacklog(
     for (const issue of backlogIssues) {
       if (availableSlots <= 0) break;
 
-      // Skip if already being worked on, or already claimed this cycle by
-      // another project sharing the same tracker scope.
+      // Skip if already being worked on (per-project id) or already taken by
+      // any project / claimed earlier this cycle (tracker-wide by URL).
       if (activeIssueIds.has(issue.id.toLowerCase())) continue;
-      if (claimedThisCycle.has(issue.url)) continue;
+      if (takenIssueUrls.has(issue.url)) continue;
 
       try {
         await sessionManager.spawn({ projectId, issueId: issue.id });
         availableSlots--;
         activeIssueIds.add(issue.id.toLowerCase());
-        claimedThisCycle.add(issue.url);
+        takenIssueUrls.add(issue.url);
 
         // Mark as claimed on the tracker
         if (tracker.updateIssue) {
