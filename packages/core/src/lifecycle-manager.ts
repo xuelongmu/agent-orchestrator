@@ -2718,15 +2718,23 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         projectCostUsd ?? session.agentInfo?.cost?.estimatedCostUsd ?? 0,
       );
       if (breach) {
+        const firstPause = !session.metadata["budgetPausedAt"];
+        // Stamp the transition once, at first pause, and reuse that timestamp on
+        // every subsequent poll while still over budget. Resetting it each poll
+        // would make the dashboard/observability show a perpetually-fresh
+        // transition time and churn the persisted lifecycle.
+        const pausedAt = firstPause
+          ? new Date().toISOString()
+          : session.metadata["budgetPausedAt"];
         newStatus = SESSION_STATUS.NEEDS_INPUT;
         session.status = SESSION_STATUS.NEEDS_INPUT;
         session.lifecycle.session.state = "needs_input";
         session.lifecycle.session.reason = "awaiting_user_input";
-        session.lifecycle.session.lastTransitionAt = new Date().toISOString();
+        session.lifecycle.session.lastTransitionAt = pausedAt;
         assessment.evidence = breach.evidence;
-        if (!session.metadata["budgetPausedAt"]) {
+        if (firstPause) {
           updateSessionMetadata(session, {
-            budgetPausedAt: new Date().toISOString(),
+            budgetPausedAt: pausedAt,
             budgetPausedReason: breach.evidence,
           });
           recordActivityEvent({

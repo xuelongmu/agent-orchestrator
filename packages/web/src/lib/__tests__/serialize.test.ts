@@ -707,6 +707,7 @@ describe("enrichSessionAgentSummary", () => {
 
   it("fetches cost when a summary exists but cost is missing, preserving the summary", async () => {
     const core = createCoreSession({
+      id: "cost-fetch-direct",
       agentInfo: { summary: "Existing summary", summaryIsFallback: false, agentSessionId: "abc" },
     });
     const dashboard = sessionToDashboard(core);
@@ -725,6 +726,26 @@ describe("enrichSessionAgentSummary", () => {
     // Existing summary preserved; cost now populated.
     expect(dashboard.summary).toBe("Existing summary");
     expect(dashboard.cost).toEqual({ inputTokens: 1200, outputTokens: 800, estimatedCostUsd: 4.21 });
+  });
+
+  it("does not re-read an agent that reports no cost on subsequent refreshes", async () => {
+    const core = createCoreSession({
+      id: "cost-miss-cache",
+      agentInfo: { summary: "Existing summary", summaryIsFallback: false, agentSessionId: "abc" },
+    });
+    const dashboard = sessionToDashboard(core);
+    expect(dashboard.cost).toBeNull();
+
+    // Agent returns a summary but never a cost.
+    const agent = createMockAgent({ summary: "X", summaryIsFallback: false });
+
+    await enrichSessionAgentSummary(dashboard, core, agent);
+    expect(agent.getSessionInfo).toHaveBeenCalledTimes(1);
+
+    // A later refresh (fresh dashboard, same session) is skipped via the miss cache.
+    const dashboard2 = sessionToDashboard(core);
+    await enrichSessionAgentSummary(dashboard2, core, agent);
+    expect(agent.getSessionInfo).toHaveBeenCalledTimes(1);
   });
 
   it("should handle agent.getSessionInfo throwing", async () => {
@@ -1181,7 +1202,11 @@ describe("enrichSessionsMetadata", () => {
     const registry = mockRegistry(tracker, agent);
 
     // Summary from metadata, no agentInfo (so cost is null after serialize).
-    const core = createCoreSession({ agentInfo: null, metadata: { summary: "Saved summary" } });
+    const core = createCoreSession({
+      id: "cost-fetch-meta",
+      agentInfo: null,
+      metadata: { summary: "Saved summary" },
+    });
     const dashboard = sessionToDashboard(core);
     expect(dashboard.summary).toBe("Saved summary");
     expect(dashboard.cost).toBeNull();

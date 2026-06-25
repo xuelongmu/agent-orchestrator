@@ -342,6 +342,27 @@ describe("budget enforcement", () => {
     expect(meta!["budgetPausedReason"]).toContain("project");
   });
 
+  it("does not reset the transition timestamp on a poll while already paused", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const pausedAt = "2026-01-01T00:00:00.000Z";
+    const session = withCost(9.99);
+    session.metadata = { ...session.metadata, budgetPausedAt: pausedAt };
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { budgetPausedAt: pausedAt },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    // Transition time reuses the original pause timestamp, not a fresh one.
+    const lifecycle = JSON.parse(meta!["lifecycle"] as string);
+    expect(lifecycle.session.lastTransitionAt).toBe(pausedAt);
+    expect(meta!["budgetPausedAt"]).toBe(pausedAt);
+  });
+
   it("clears the pause latch when the cap is raised above current cost", async () => {
     vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
     const session = withCost(3.0);

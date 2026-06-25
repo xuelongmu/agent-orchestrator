@@ -32,6 +32,13 @@ import { matchesSessionPrefix } from "./session-utils";
 const issueTitleCache = new TTLCache<string>(300_000);
 /** Cache failed issue-title lookups to avoid repeated tracker API calls. */
 const issueTitleMissCache = new TTLCache<boolean>(120_000);
+/**
+ * Cache "this session's agent reports no cost" so agents that never expose
+ * token usage aren't re-read from disk on every 5s dashboard refresh. Keyed by
+ * session id; short TTL so a session that later starts reporting cost is picked
+ * up within ~2 min.
+ */
+const costMissCache = new TTLCache<boolean>(120_000);
 
 function isAbsoluteUrl(value: string): boolean {
   try {
@@ -493,18 +500,22 @@ export async function enrichSessionAgentSummary(
   agent: Agent,
 ): Promise<void> {
   // Cost rides along on the same getSessionInfo() call; skip only when both
-  // summary and cost are already populated. A session reconstructed from
+  // summary and cost are already resolved. A session reconstructed from
   // metadata can have a saved summary but no agentInfo.cost — still fetch so
-  // the dashboard cost is populated.
-  if (dashboard.summary && dashboard.cost) return;
+  // the dashboard cost is populated. costMissCache prevents re-reading agents
+  // that have already been shown to report no cost.
+  if (dashboard.summary && (dashboard.cost || costMissCache.get(coreSession.id))) return;
   try {
     const info = await agent.getSessionInfo(coreSession);
     if (info?.summary && !dashboard.summary) {
       dashboard.summary = info.summary;
       dashboard.summaryIsFallback = info.summaryIsFallback ?? false;
     }
-    if (info?.cost && !dashboard.cost) {
-      dashboard.cost = info.cost;
+    if (info?.cost) {
+      if (!dashboard.cost) dashboard.cost = info.cost;
+    } else {
+      // Agent exposes no cost — remember so we don't re-parse its JSONL every refresh.
+      costMissCache.set(coreSession.id, true);
     }
   } catch {
     // Can't read agent session info — keep summary/cost null
@@ -593,7 +604,12 @@ function prepareSessionMetadataEnrichment(
 
   // Agent summaries + cost (local disk I/O — reads agent JSONL)
   const summaryPromises = coreSessions.map((core, i) => {
-    if (dashboardSessions[i].summary && dashboardSessions[i].cost) return Promise.resolve();
+    if (
+      dashboardSessions[i].summary &&
+      (dashboardSessions[i].cost || costMissCache.get(core.id))
+    ) {
+      return Promise.resolve();
+    }
     const agentName = core.metadata["agent"];
     if (!agentName) return Promise.resolve();
     const agent = registry.get<Agent>("agent", agentName);
