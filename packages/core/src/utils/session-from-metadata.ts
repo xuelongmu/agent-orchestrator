@@ -11,7 +11,7 @@ import { deriveLegacyStatus, parseCanonicalLifecycle } from "../lifecycle-state.
 import { createActivitySignal } from "../activity-signal.js";
 import { AGENT_REPORT_METADATA_KEYS } from "../agent-report.js";
 import { dedupePrInfos, parsePrFromUrl } from "./pr.js";
-import { safeJsonParse, validateStatus } from "./validation.js";
+import { parseIdList, safeJsonParse, validateStatus } from "./validation.js";
 
 interface SessionFromMetadataOptions {
   projectId?: string;
@@ -97,6 +97,9 @@ export function sessionFromMetadata(
       : [];
   const prs = dedupePrInfos(parsedPrs);
 
+  const dependsOn = parseIdList(meta["dependsOn"]);
+  const blockedBy = parseIdList(meta["blockedBy"]);
+
   return {
     id: sessionId,
     projectId: meta["project"] ?? options.projectId ?? "",
@@ -115,6 +118,8 @@ export function sessionFromMetadata(
     lastActivityAt: options.lastActivityAt ?? new Date(),
     restoredAt:
       options.restoredAt ?? (meta["restoredAt"] ? new Date(meta["restoredAt"]) : undefined),
+    ...(dependsOn.length > 0 ? { dependsOn } : {}),
+    ...(blockedBy.length > 0 ? { blockedBy } : {}),
     metadata: meta,
   };
 }

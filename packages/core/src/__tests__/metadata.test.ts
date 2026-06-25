@@ -96,6 +96,44 @@ describe("writeMetadata + readMetadata", () => {
     expect(meta).toBeNull();
   });
 
+  it("round-trips dependsOn / blockedBy as comma-separated ids", () => {
+    writeMetadata(dataDir, "app-dep", {
+      worktree: "/tmp/w",
+      branch: "feat/9",
+      status: "spawning",
+      dependsOn: ["7", "app-2"],
+      blockedBy: ["7"],
+    });
+
+    const content = readFileSync(join(dataDir, "app-dep.json"), "utf-8");
+    const parsed = JSON.parse(content);
+    expect(parsed.dependsOn).toBe("7,app-2");
+    expect(parsed.blockedBy).toBe("7");
+
+    const meta = readMetadata(dataDir, "app-dep");
+    expect(meta!.dependsOn).toEqual(["7", "app-2"]);
+    expect(meta!.blockedBy).toEqual(["7"]);
+  });
+
+  it("omits dependsOn / blockedBy when empty", () => {
+    writeMetadata(dataDir, "app-nodep", {
+      worktree: "/tmp/w",
+      branch: "feat/x",
+      status: "working",
+      dependsOn: [],
+      blockedBy: [],
+    });
+
+    const content = readFileSync(join(dataDir, "app-nodep.json"), "utf-8");
+    const parsed = JSON.parse(content);
+    expect(parsed.dependsOn).toBeUndefined();
+    expect(parsed.blockedBy).toBeUndefined();
+
+    const meta = readMetadata(dataDir, "app-nodep");
+    expect(meta!.dependsOn).toBeUndefined();
+    expect(meta!.blockedBy).toBeUndefined();
+  });
+
   it("produces JSON format", () => {
     writeMetadata(dataDir, "app-3", {
       worktree: "/tmp/w",
