@@ -21,6 +21,25 @@ describe("SessionInspector", () => {
     expect(screen.getByText("PR #55: Add the thing")).toBeInTheDocument();
   });
 
+  it("shows the agent cost in the Overview when present", () => {
+    render(
+      <SessionInspector
+        session={makeSession({
+          id: "insp-cost",
+          cost: { inputTokens: 40_000, outputTokens: 5_200, estimatedCostUsd: 1.23 },
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Cost")).toBeInTheDocument();
+    expect(screen.getByText("$1.23 · 45.2k tok")).toBeInTheDocument();
+  });
+
+  it("omits the cost row when there is no cost", () => {
+    render(<SessionInspector session={makeSession({ id: "insp-no-cost", cost: null })} />);
+    expect(screen.queryByText("Cost")).not.toBeInTheDocument();
+  });
+
   it("shows an empty state when there is no pull request", () => {
     render(<SessionInspector session={makeSession({ id: "insp-2", pr: null })} />);
     expect(screen.getByText("No pull request opened yet.")).toBeInTheDocument();

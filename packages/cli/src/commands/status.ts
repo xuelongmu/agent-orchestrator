@@ -9,6 +9,7 @@ import {
   type CIStatus,
   type ReviewDecision,
   type ActivityState,
+  type CostEstimate,
   type Tracker,
   type ProjectConfig,
   type AgentReportAuditEntry,
@@ -52,6 +53,7 @@ interface SessionInfo {
   reviewDecision: ReviewDecision | null;
   pendingThreads: number | null;
   activity: ActivityState | null;
+  cost: CostEstimate | null;
   reports: AgentReportAuditEntry[];
 }
 
@@ -248,8 +250,15 @@ async function gatherSessionInfo(
     reviewDecision,
     pendingThreads,
     activity,
+    cost: session.agentInfo?.cost ?? null,
     reports,
   };
+}
+
+/** Compact USD cost, e.g. `$1.20` or `$0.05`. Returns null for zero/missing. */
+function formatCost(cost: CostEstimate | null): string | null {
+  if (!cost || cost.estimatedCostUsd <= 0) return null;
+  return `$${cost.estimatedCostUsd.toFixed(2)}`;
 }
 
 function formatReportTime(iso: string): string {
@@ -288,6 +297,7 @@ const COL = {
   threads: 4,
   activity: 9,
   age: 8,
+  cost: 8,
 };
 
 function printTableHeader(): void {
@@ -299,15 +309,25 @@ function printTableHeader(): void {
     padCol("Rev", COL.review) +
     padCol("Thr", COL.threads) +
     padCol("Activity", COL.activity) +
-    "Age";
+    padCol("Age", COL.age) +
+    "Cost";
   console.log(chalk.dim(`  ${hdr}`));
   const totalWidth =
-    COL.session + COL.branch + COL.pr + COL.ci + COL.review + COL.threads + COL.activity + 3;
+    COL.session +
+    COL.branch +
+    COL.pr +
+    COL.ci +
+    COL.review +
+    COL.threads +
+    COL.activity +
+    COL.age +
+    COL.cost;
   console.log(chalk.dim(`  ${"─".repeat(totalWidth)}`));
 }
 
 function printSessionRow(info: SessionInfo): void {
   const prStr = info.prNumber ? `#${info.prNumber}` : "-";
+  const costStr = formatCost(info.cost);
 
   const row =
     padCol(chalk.green(info.name), COL.session) +
@@ -322,7 +342,8 @@ function printSessionRow(info: SessionInfo): void {
       COL.threads,
     ) +
     padCol(activityIcon(info.activity), COL.activity) +
-    chalk.dim(info.lastActivity);
+    padCol(chalk.dim(info.lastActivity), COL.age) +
+    (costStr ? chalk.yellow(costStr) : chalk.dim("-"));
 
   console.log(`  ${row}`);
 

@@ -273,6 +273,56 @@ describe("start / stop", () => {
   });
 });
 
+describe("budget enforcement", () => {
+  const withCost = (estimatedCostUsd: number) =>
+    makeSession({
+      status: "working",
+      agentInfo: {
+        summary: null,
+        agentSessionId: null,
+        cost: { inputTokens: 100, outputTokens: 50, estimatedCostUsd },
+      },
+    });
+
+  it("pauses an over-budget working session into needs_input", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const lm = setupCheck("app-1", {
+      session: withCost(9.99),
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeTruthy();
+    expect(meta!["budgetPausedReason"]).toContain("budget_exceeded");
+  });
+
+  it("leaves an under-budget working session working", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const lm = setupCheck("app-1", {
+      session: withCost(1.0),
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("working");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeFalsy();
+  });
+
+  it("does not enforce when no budget is configured", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const lm = setupCheck("app-1", { session: withCost(1000) });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("working");
+  });
+});
+
 describe("check (single session)", () => {
   it("detects transition from spawning to working", async () => {
     const lm = setupCheck("app-1", {

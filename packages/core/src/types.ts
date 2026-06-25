@@ -651,6 +651,20 @@ export interface CostEstimate {
   estimatedCostUsd: number;
 }
 
+/**
+ * Budget caps (estimated USD). Configurable globally (applies to every
+ * session/project) and per-project. When a cap is exceeded the lifecycle
+ * manager pauses the offending session (needs_input) and notifies.
+ *
+ * A cap of `0` or omitted means "no limit".
+ */
+export interface BudgetConfig {
+  /** Pause a session once its own estimated cost exceeds this many USD. */
+  perSessionUsd?: number;
+  /** Pause sessions once a project's combined estimated cost exceeds this many USD. */
+  perProjectUsd?: number;
+}
+
 // =============================================================================
 // WORKSPACE — Plugin Slot 3
 // =============================================================================
@@ -1402,6 +1416,9 @@ export interface OrchestratorConfig {
   /** Default plugin selections */
   defaults: DefaultPlugins;
 
+  /** Cost budget caps applied to every project unless overridden per-project. */
+  budget?: BudgetConfig;
+
   /** Installer-managed external plugin descriptors */
   plugins?: InstalledPluginConfig[];
 
@@ -1597,6 +1614,9 @@ export interface ProjectConfig {
     | "kill-previous";
 
   opencodeIssueSessionStrategy?: "reuse" | "delete" | "ignore";
+
+  /** Per-project cost budget caps (override the global defaults). */
+  budget?: BudgetConfig;
 }
 
 export interface TrackerConfig {

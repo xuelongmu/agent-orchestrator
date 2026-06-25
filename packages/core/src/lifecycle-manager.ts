@@ -62,6 +62,7 @@ import {
   isWeakActivityEvidence,
 } from "./activity-signal.js";
 import { isAgentReportFresh, mapAgentReportToLifecycle, readAgentReport } from "./agent-report.js";
+import { evaluateBudgetBreach } from "./budget.js";
 import {
   auditAgentReports,
   getReactionKeyForTrigger,
@@ -2676,7 +2677,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   /** Poll a single session and handle state transitions. */
-  async function checkSession(session: Session): Promise<void> {
+  async function checkSession(session: Session, projectCostUsd?: number): Promise<void> {
     // Use tracked state if available; otherwise use the persisted metadata status
     // (not session.status, which list() may have already overwritten for dead runtimes).
     // This ensures transitions are detected after a lifecycle manager restart.
@@ -2690,7 +2691,52 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       states.set(session.id, oldStatus);
       return;
     }
-    const newStatus = assessment.status;
+    let newStatus = assessment.status;
+
+    // Budget enforcement: pause an actively-working session whose estimated
+    // cost has crossed a configured cap. We only override the live "working"
+    // state — PR/CI/idle/terminal states are left untouched so we never
+    // interfere with PR or cleanup lifecycle. Reusing the needs_input path
+    // makes the pause sticky (re-derived each poll while over budget) and lets
+    // the existing transition machinery fire the notification exactly once.
+    if (newStatus === SESSION_STATUS.WORKING) {
+      const breach = evaluateBudgetBreach(
+        config,
+        session,
+        projectCostUsd ?? session.agentInfo?.cost?.estimatedCostUsd ?? 0,
+      );
+      if (breach) {
+        newStatus = SESSION_STATUS.NEEDS_INPUT;
+        session.status = SESSION_STATUS.NEEDS_INPUT;
+        session.lifecycle.session.state = "needs_input";
+        session.lifecycle.session.reason = "awaiting_user_input";
+        session.lifecycle.session.lastTransitionAt = new Date().toISOString();
+        assessment.evidence = breach.evidence;
+        if (!session.metadata["budgetPausedAt"]) {
+          updateSessionMetadata(session, {
+            budgetPausedAt: new Date().toISOString(),
+            budgetPausedReason: breach.evidence,
+          });
+          recordActivityEvent({
+            projectId: session.projectId,
+            sessionId: session.id,
+            source: "lifecycle",
+            kind: "budget.paused",
+            level: "warn",
+            summary: `paused on ${breach.scope} budget`,
+            data: {
+              scope: breach.scope,
+              limitUsd: breach.limitUsd,
+              actualUsd: breach.actualUsd,
+            },
+          });
+        }
+      }
+    } else if (session.metadata["budgetPausedAt"]) {
+      // Session moved on (PR opened, cleaned up, restored): clear the latch so a
+      // future breach notifies again.
+      updateSessionMetadata(session, { budgetPausedAt: "", budgetPausedReason: "" });
+    }
     const lifecycleChanged = session.metadata["lifecycle"] !== JSON.stringify(session.lifecycle);
     let transitionReaction: TransitionReaction | undefined;
 
@@ -3130,8 +3176,20 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // downstream status/reaction logic can reuse batch GraphQL data.
       await populatePREnrichmentCache(sessionsToCheck);
 
+      // Sum each project's estimated cost across all (enriched) sessions so the
+      // per-project budget cap can be evaluated per session below.
+      const projectCostUsd = new Map<string, number>();
+      for (const s of sessions) {
+        const cost = s.agentInfo?.cost?.estimatedCostUsd ?? 0;
+        if (cost > 0) {
+          projectCostUsd.set(s.projectId, (projectCostUsd.get(s.projectId) ?? 0) + cost);
+        }
+      }
+
       // Poll all sessions concurrently
-      await Promise.allSettled(sessionsToCheck.map((s) => checkSession(s)));
+      await Promise.allSettled(
+        sessionsToCheck.map((s) => checkSession(s, projectCostUsd.get(s.projectId) ?? 0)),
+      );
 
       // Persist batch enrichment data to session metadata files so the
       // web dashboard can read it without calling GitHub API.

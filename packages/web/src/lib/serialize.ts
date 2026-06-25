@@ -184,6 +184,7 @@ export function sessionToDashboard(session: Session): DashboardSession {
     displayNameUserSet: session.metadata["displayNameUserSet"] === "true",
     summary,
     summaryIsFallback: agentSummary ? (session.agentInfo?.summaryIsFallback ?? false) : false,
+    cost: session.agentInfo?.cost ?? null,
     createdAt: session.createdAt.toISOString(),
     lastActivityAt: session.lastActivityAt.toISOString(),
     pr: session.pr
@@ -498,8 +499,12 @@ export async function enrichSessionAgentSummary(
       dashboard.summary = info.summary;
       dashboard.summaryIsFallback = info.summaryIsFallback ?? false;
     }
+    // Cost rides along on the same getSessionInfo() call when present.
+    if (info?.cost && !dashboard.cost) {
+      dashboard.cost = info.cost;
+    }
   } catch {
-    // Can't read agent session info — keep summary null
+    // Can't read agent session info — keep summary/cost null
   }
 }
 
@@ -583,7 +588,7 @@ function prepareSessionMetadataEnrichment(
     enrichSessionIssue(dashboardSessions[i], tracker, project);
   });
 
-  // Agent summaries (local disk I/O — reads agent JSONL)
+  // Agent summaries + cost (local disk I/O — reads agent JSONL)
   const summaryPromises = coreSessions.map((core, i) => {
     if (dashboardSessions[i].summary) return Promise.resolve();
     const agentName = core.metadata["agent"];

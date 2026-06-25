@@ -202,6 +202,29 @@ describe("sessionToDashboard", () => {
     expect(dashboard.summaryIsFallback).toBe(false);
   });
 
+  it("should pass agentInfo.cost through to the dashboard", () => {
+    const coreSession = createCoreSession({
+      agentInfo: {
+        summary: "Working on feature X",
+        summaryIsFallback: false,
+        agentSessionId: "abc123",
+        cost: { inputTokens: 1200, outputTokens: 800, estimatedCostUsd: 4.21 },
+      },
+    });
+    const dashboard = sessionToDashboard(coreSession);
+
+    expect(dashboard.cost).toEqual({
+      inputTokens: 1200,
+      outputTokens: 800,
+      estimatedCostUsd: 4.21,
+    });
+  });
+
+  it("should set cost to null when agentInfo has none", () => {
+    const dashboard = sessionToDashboard(createCoreSession({ agentInfo: null }));
+    expect(dashboard.cost).toBeNull();
+  });
+
   it("should propagate summaryIsFallback true from agentInfo", () => {
     const coreSession = createCoreSession({
       agentInfo: {
