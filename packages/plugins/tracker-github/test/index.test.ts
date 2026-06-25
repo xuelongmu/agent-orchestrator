@@ -379,6 +379,18 @@ describe("tracker-github plugin", () => {
       expect(issues[1].id).toBe("456");
     });
 
+    it("parses relations from each issue body", async () => {
+      mockGh([
+        { ...sampleIssue, body: "Desc\n\nPart of #10\nBlocked by #20" },
+        { ...sampleIssue, number: 456, body: "No markers here" },
+      ]);
+      const issues = await tracker.listIssues!({}, project);
+      expect(issues[0].parentId).toBe("10");
+      expect(issues[0].blockedBy).toEqual(["20"]);
+      expect(issues[1].parentId).toBeUndefined();
+      expect(issues[1].blockedBy).toBeUndefined();
+    });
+
     it("passes state filter for closed issues", async () => {
       mockGh([]);
       await tracker.listIssues!({ state: "closed" }, project);

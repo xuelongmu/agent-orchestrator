@@ -882,6 +882,21 @@ describe("tracker-linear plugin", () => {
       expect(relBody.variables.type).toBe("blocks");
     });
 
+    it("throws when the parent issue cannot be resolved", async () => {
+      // Parent lookup returns no issue
+      mockLinearAPI({ issue: null });
+
+      await expect(
+        tracker.createIssue!(
+          { title: "Sub", description: "", parentId: "INT-999" },
+          project,
+        ),
+      ).rejects.toThrow('could not resolve parent issue "INT-999"');
+
+      // Must not proceed to issueCreate after a failed parent resolution
+      expect(requestMock).toHaveBeenCalledTimes(1);
+    });
+
     it("creates a related relation", async () => {
       // 1: issueCreate (no parent)
       mockLinearAPI({ issueCreate: { success: true, issue: sampleIssueNode } });

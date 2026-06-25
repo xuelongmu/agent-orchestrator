@@ -754,11 +754,18 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
       }
 
       // Set the parent on create so the new issue becomes a sub-issue.
+      // Linear's issueCreate requires the parent's UUID, so a short identifier
+      // cannot be passed through. If it can't be resolved, fail loudly rather
+      // than silently creating a top-level issue and losing the hierarchy.
       if (input.parentId) {
         const parentUuid = await resolveUuid(input.parentId);
-        if (parentUuid) {
-          variables["parentId"] = parentUuid;
+        if (!parentUuid) {
+          throw new Error(
+            `Linear tracker could not resolve parent issue "${input.parentId}"; ` +
+              "refusing to create a top-level issue when a sub-issue was requested",
+          );
         }
+        variables["parentId"] = parentUuid;
       }
 
       const data = await query<{

@@ -381,6 +381,7 @@ function createGitHubTracker(): Tracker {
         state: mapState(data.state, data.stateReason),
         labels: data.labels.map((l) => l.name),
         assignee: data.assignees[0]?.login,
+        ...parseRelations(data.body ?? ""),
       }));
     },
 
