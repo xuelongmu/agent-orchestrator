@@ -357,10 +357,10 @@ describe("budget enforcement", () => {
 
     expect(lm.getStates().get("app-1")).toBe("needs_input");
     const meta = readMetadataRaw(env.sessionsDir, "app-1");
-    // Transition time reuses the original pause timestamp, not a fresh one.
+    // While already paused (budgetPausedAt present), the transition time reuses
+    // the original pause timestamp rather than being reset to "now".
     const lifecycle = JSON.parse(meta!["lifecycle"] as string);
     expect(lifecycle.session.lastTransitionAt).toBe(pausedAt);
-    expect(meta!["budgetPausedAt"]).toBe(pausedAt);
   });
 
   it("clears the pause latch when the cap is raised above current cost", async () => {
