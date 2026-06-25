@@ -123,6 +123,17 @@ describe("tracker-gitlab plugin", () => {
       await expect(tracker.getIssue("999", project)).rejects.toThrow("issue not found");
     });
 
+    it("parses parent/blocking/related relations from the description convention", async () => {
+      mockGlab({
+        ...sampleIssue,
+        description: "Some description\n\nPart of #10\nBlocked by #20\nRelated to #30",
+      });
+      const issue = await tracker.getIssue("123", project);
+      expect(issue.parentId).toBe("10");
+      expect(issue.blockedBy).toEqual(["20"]);
+      expect(issue.relatedTo).toEqual(["30"]);
+    });
+
     it("throws on malformed JSON response", async () => {
       glabMock.mockResolvedValueOnce({ stdout: "not json{" });
       await expect(tracker.getIssue("123", project)).rejects.toThrow();
@@ -422,6 +433,42 @@ describe("tracker-gitlab plugin", () => {
         expect.arrayContaining(["issue", "create", "--label", "bug", "--assignee", "alice"]),
         expect.any(Object),
       );
+    });
+
+    it("writes parent/blocking/related relations into the description", async () => {
+      mockGlabRaw("https://gitlab.com/acme/repo/-/issues/1001\n");
+      mockGlab({
+        iid: 1001,
+        title: "Sub",
+        description: "Desc\n\nPart of #10\nBlocked by #20\nRelated to #30",
+        web_url: "https://gitlab.com/acme/repo/-/issues/1001",
+        state: "opened",
+        labels: [],
+        assignees: [],
+      });
+
+      const issue = await tracker.createIssue!(
+        {
+          title: "Sub",
+          description: "Desc",
+          parentId: "10",
+          blockedBy: ["20"],
+          relatedTo: ["30"],
+        },
+        project,
+      );
+
+      const createArgs = glabMock.mock.calls[0]?.[1] as string[];
+      const descIndex = createArgs.indexOf("--description");
+      const description = createArgs[descIndex + 1];
+      expect(description).toContain("Desc");
+      expect(description).toContain("Part of #10");
+      expect(description).toContain("Blocked by #20");
+      expect(description).toContain("Related to #30");
+
+      expect(issue.parentId).toBe("10");
+      expect(issue.blockedBy).toEqual(["20"]);
+      expect(issue.relatedTo).toEqual(["30"]);
     });
 
     it("throws when URL cannot be parsed from glab output", async () => {
