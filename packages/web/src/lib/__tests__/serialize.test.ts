@@ -626,6 +626,7 @@ describe("enrichSessionAgentSummary", () => {
               summary: info.summary ?? null,
               summaryIsFallback: info.summaryIsFallback,
               agentSessionId: info.agentSessionId ?? null,
+              cost: info.cost,
             }
           : null,
       ),
@@ -679,16 +680,18 @@ describe("enrichSessionAgentSummary", () => {
     expect(dashboard.summaryIsFallback).toBe(false);
   });
 
-  it("should skip enrichment when dashboard already has a summary", async () => {
+  it("should skip enrichment when dashboard already has a summary and cost", async () => {
     const core = createCoreSession({
       agentInfo: {
         summary: "Existing summary",
         summaryIsFallback: false,
         agentSessionId: "abc",
+        cost: { inputTokens: 10, outputTokens: 5, estimatedCostUsd: 0.5 },
       },
     });
     const dashboard = sessionToDashboard(core);
     expect(dashboard.summary).toBe("Existing summary");
+    expect(dashboard.cost).not.toBeNull();
 
     const agent = createMockAgent({
       summary: "New summary from agent",
@@ -700,6 +703,28 @@ describe("enrichSessionAgentSummary", () => {
     // Should keep original summary, not overwrite
     expect(dashboard.summary).toBe("Existing summary");
     expect(agent.getSessionInfo).not.toHaveBeenCalled();
+  });
+
+  it("fetches cost when a summary exists but cost is missing, preserving the summary", async () => {
+    const core = createCoreSession({
+      agentInfo: { summary: "Existing summary", summaryIsFallback: false, agentSessionId: "abc" },
+    });
+    const dashboard = sessionToDashboard(core);
+    expect(dashboard.summary).toBe("Existing summary");
+    expect(dashboard.cost).toBeNull();
+
+    const agent = createMockAgent({
+      summary: "New summary from agent",
+      summaryIsFallback: false,
+      cost: { inputTokens: 1200, outputTokens: 800, estimatedCostUsd: 4.21 },
+    });
+
+    await enrichSessionAgentSummary(dashboard, core, agent);
+
+    expect(agent.getSessionInfo).toHaveBeenCalled();
+    // Existing summary preserved; cost now populated.
+    expect(dashboard.summary).toBe("Existing summary");
+    expect(dashboard.cost).toEqual({ inputTokens: 1200, outputTokens: 800, estimatedCostUsd: 4.21 });
   });
 
   it("should handle agent.getSessionInfo throwing", async () => {
