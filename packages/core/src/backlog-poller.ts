@@ -13,7 +13,15 @@
  * acquires the lock runs the cycle; the other skips until the next interval.
  */
 
-import { closeSync, mkdirSync, openSync, rmSync, statSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  futimesSync,
+  mkdirSync,
+  openSync,
+  rmSync,
+  statSync,
+  writeSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { getGlobalConfigPath } from "./global-config.js";
 import {
@@ -30,6 +38,9 @@ import {
 
 /** Tracker label marking an issue as ready for autonomous pickup. */
 export const BACKLOG_LABEL = "agent:backlog";
+
+/** Tracker label marking a merged issue awaiting human verification. */
+export const MERGED_UNVERIFIED_LABEL = "merged-unverified";
 
 /** Default interval between backlog poll cycles (1 minute). */
 export const BACKLOG_POLL_INTERVAL_MS = 60_000;
@@ -68,8 +79,12 @@ export interface BacklogPollerOptions {
 export interface BacklogPoller {
   /** Start the poll loop (immediate run, then on interval). Idempotent. */
   start(): void;
-  /** Stop the poll loop. */
-  stop(): void;
+  /**
+   * Stop the poll loop and resolve once any in-flight poll has settled, so a
+   * spawn started just before shutdown is awaited (and its session enumerated
+   * by the graceful-stop path) rather than racing past it.
+   */
+  stop(): Promise<void>;
   /** Run a single poll cycle. */
   pollOnce(): Promise<void>;
 }
@@ -80,6 +95,14 @@ interface LockHandle {
 
 /** A held lock is considered stale (and reclaimable) after this long. */
 const LOCK_STALE_MS = 5 * 60_000;
+
+/**
+ * How often the lock holder refreshes the lock's mtime while a poll runs.
+ * Kept well under {@link LOCK_STALE_MS} so a legitimately long poll (slow
+ * tracker calls or `sessionManager.spawn()`) is never reclaimed as stale by
+ * the peer process mid-cycle.
+ */
+const LOCK_HEARTBEAT_MS = 60_000;
 
 function defaultLockPath(): string {
   return join(dirname(getGlobalConfigPath()), "backlog-poll.lock");
@@ -98,8 +121,20 @@ function tryAcquireLock(lockPath: string): LockHandle | null {
     } catch {
       // Best-effort — the lock's existence is what matters, not its contents.
     }
+    // Refresh the lock's mtime periodically so a long-running poll isn't
+    // reclaimed as stale by the peer process while we still hold it.
+    const heartbeat = setInterval(() => {
+      try {
+        const now = new Date();
+        futimesSync(fd, now, now);
+      } catch {
+        // Best-effort — a missed refresh just risks an earlier stale reclaim.
+      }
+    }, LOCK_HEARTBEAT_MS);
+    heartbeat.unref?.();
     return {
       release() {
+        clearInterval(heartbeat);
         try {
           closeSync(fd);
         } catch {
@@ -176,11 +211,25 @@ async function labelIssuesForVerification(
       continue;
     }
 
+    // Cross-process dedupe: another poller process (CLI daemon vs dashboard)
+    // may have already labeled this issue — our in-memory `processedIssues`
+    // set is per-process, so check the tracker's authoritative state before
+    // posting the verification comment again.
+    try {
+      const current = await tracker.getIssue(issueId, project);
+      if (current.labels.includes(MERGED_UNVERIFIED_LABEL)) {
+        processedIssues.add(key);
+        continue;
+      }
+    } catch {
+      // getIssue failed — fall through and attempt the update anyway.
+    }
+
     try {
       await tracker.updateIssue(
         issueId,
         {
-          labels: ["merged-unverified"],
+          labels: [MERGED_UNVERIFIED_LABEL],
           removeLabels: ["agent:backlog", "agent:in-progress"],
           comment: `PR merged. Issue awaiting human verification on staging.`,
         },
@@ -288,7 +337,9 @@ async function spawnFromBacklog(
     let backlogIssues: Issue[];
     try {
       backlogIssues = await tracker.listIssues(
-        { state: "open", labels: [BACKLOG_LABEL], limit: 10 },
+        // Request up to the number of free slots so larger per-project caps
+        // (maxConcurrentAgents > 10) are honored within a single poll cycle.
+        { state: "open", labels: [BACKLOG_LABEL], limit: availableSlots },
         project,
       );
     } catch {
@@ -339,6 +390,9 @@ export function createBacklogPoller(options: BacklogPollerOptions): BacklogPolle
 
   let timer: ReturnType<typeof setInterval> | undefined;
   let started = false;
+  // The currently-running poll, if any. Tracked so `stop()` can await an
+  // in-flight spawn before shutdown enumerates sessions to kill.
+  let activePoll: Promise<void> | undefined;
 
   async function pollOnce(): Promise<void> {
     const lock = lockPath ? tryAcquireLock(lockPath) : null;
@@ -361,19 +415,31 @@ export function createBacklogPoller(options: BacklogPollerOptions): BacklogPolle
     }
   }
 
+  // Run a poll while recording it as the active one, so `stop()` can await it.
+  function runTracked(): Promise<void> {
+    const poll = pollOnce().finally(() => {
+      if (activePoll === poll) activePoll = undefined;
+    });
+    activePoll = poll;
+    return poll;
+  }
+
   return {
     start() {
       if (started) return;
       started = true;
-      void pollOnce();
-      timer = setInterval(() => void pollOnce(), intervalMs);
+      void runTracked();
+      timer = setInterval(() => void runTracked(), intervalMs);
       // Don't keep the process alive solely for the poll loop.
       timer.unref?.();
     },
-    stop() {
+    async stop(): Promise<void> {
       if (timer) clearInterval(timer);
       timer = undefined;
       started = false;
+      // Wait for an in-flight poll (e.g. a spawn) to settle so a session
+      // created right before shutdown is still seen by the graceful-stop path.
+      await activePoll;
     },
     pollOnce,
   };

@@ -73,8 +73,9 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
       data: { signal, exitCode },
     });
 
+    let backlogStopped: Promise<void> = Promise.resolve();
     try {
-      stopBacklogPoller();
+      backlogStopped = stopBacklogPoller();
       stopProjectSupervisor();
       stopAllLifecycleWorkers();
     } catch {
@@ -96,6 +97,9 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
 
     void (async () => {
       try {
+        // Wait for an in-flight backlog poll to settle so a session it spawned
+        // right before the signal is enumerated below and killed cleanly.
+        await backlogStopped;
         const shutdownConfig = loadConfig(ctx.configPath);
         const sm = await getSessionManager(shutdownConfig);
         const allSessions = await sm.list();

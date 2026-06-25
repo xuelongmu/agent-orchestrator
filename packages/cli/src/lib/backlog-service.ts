@@ -67,7 +67,13 @@ export function startBacklogPoller(configPath?: string): void {
   activePoller.start();
 }
 
-export function stopBacklogPoller(): void {
-  activePoller?.stop();
+/**
+ * Stop the backlog poller. Returns a promise that resolves once any in-flight
+ * poll (including a spawn started just before shutdown) has settled, so the
+ * graceful-stop path can await it before enumerating sessions to kill.
+ */
+export function stopBacklogPoller(): Promise<void> {
+  const stopped = activePoller?.stop() ?? Promise.resolve();
   activePoller = null;
+  return stopped;
 }

@@ -27,10 +27,22 @@ function makeWorkerSession(id: string, issueId: string, projectId = "proj"): Ses
   } as unknown as Session;
 }
 
+function makeMergedSession(id: string, issueId: string, projectId = "proj"): Session {
+  return {
+    id,
+    projectId,
+    issueId,
+    status: "working",
+    metadata: {},
+    lifecycle: { pr: { state: "merged" } },
+  } as unknown as Session;
+}
+
 interface Harness {
   services: BacklogServices;
   listIssues: ReturnType<typeof vi.fn>;
   updateIssue: ReturnType<typeof vi.fn>;
+  getIssue: ReturnType<typeof vi.fn>;
   spawn: ReturnType<typeof vi.fn>;
 }
 
@@ -38,15 +50,21 @@ function makeHarness(opts: {
   backlogIssues: Issue[];
   sessions?: Session[];
   maxConcurrentAgents?: number;
+  /** Labels the tracker reports for any `getIssue` lookup (cross-process dedupe). */
+  existingLabels?: string[];
 }): Harness {
   const listIssues = vi.fn(async (filters: { labels?: string[] }) => {
     if (filters.labels?.includes("agent:backlog")) return opts.backlogIssues;
     return [];
   });
   const updateIssue = vi.fn(async () => undefined);
+  const getIssue = vi.fn(async (id: string) => ({
+    ...makeIssue(id),
+    labels: opts.existingLabels ?? [],
+  }));
   const spawn = vi.fn(async () => ({ id: "spawned" }));
 
-  const tracker = { name: "github", listIssues, updateIssue };
+  const tracker = { name: "github", listIssues, updateIssue, getIssue };
 
   const services: BacklogServices = {
     config: {
@@ -72,7 +90,7 @@ function makeHarness(opts: {
     } as unknown as BacklogServices["sessionManager"],
   };
 
-  return { services, listIssues, updateIssue, spawn };
+  return { services, listIssues, updateIssue, getIssue, spawn };
 }
 
 describe("backlog poller", () => {
@@ -191,5 +209,107 @@ describe("backlog poller", () => {
     await poller.pollOnce(); // lock released after the first cycle → this runs too
 
     expect(harness.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("requests up to availableSlots backlog issues so caps above ten are honored", async () => {
+    const harness = makeHarness({
+      backlogIssues: [],
+      maxConcurrentAgents: 25,
+    });
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.listIssues).toHaveBeenCalledWith(
+      expect.objectContaining({ labels: ["agent:backlog"], limit: 25 }),
+      expect.anything(),
+    );
+  });
+
+  it("labels merged issues for verification when not yet labeled", async () => {
+    const harness = makeHarness({
+      backlogIssues: [],
+      sessions: [makeMergedSession("ao-1", "42")],
+      existingLabels: [],
+    });
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.updateIssue).toHaveBeenCalledWith(
+      "42",
+      expect.objectContaining({ labels: ["merged-unverified"] }),
+      expect.anything(),
+    );
+  });
+
+  it("skips re-posting verification when the tracker already shows merged-unverified", async () => {
+    // Simulates the peer process having already labeled the issue: our
+    // in-memory dedupe set is empty but the tracker's state is authoritative.
+    const harness = makeHarness({
+      backlogIssues: [],
+      sessions: [makeMergedSession("ao-1", "42")],
+      existingLabels: ["merged-unverified"],
+    });
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.getIssue).toHaveBeenCalledWith("42", expect.anything());
+    expect(harness.updateIssue).not.toHaveBeenCalled();
+  });
+
+  it("stop() resolves only after an in-flight poll settles", async () => {
+    const lockPath = join(tmp, "backlog-poll.lock");
+    let releaseSpawn: () => void = () => {};
+    const harness = makeHarness({
+      backlogIssues: [makeIssue("1")],
+      maxConcurrentAgents: 5,
+    });
+    let spawnSettled = false;
+    (harness.services.sessionManager.spawn as ReturnType<typeof vi.fn>).mockImplementation(
+      async () => {
+        await new Promise<void>((resolve) => {
+          releaseSpawn = () => {
+            spawnSettled = true;
+            resolve();
+          };
+        });
+        return { id: "spawned" };
+      },
+    );
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath,
+    });
+
+    poller.start();
+    // Let the immediate poll reach the blocked spawn.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const stopPromise = poller.stop();
+    let stopResolved = false;
+    void stopPromise.then(() => {
+      stopResolved = true;
+    });
+
+    // stop() must not resolve while the spawn is still in flight.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(stopResolved).toBe(false);
+
+    releaseSpawn();
+    await stopPromise;
+    expect(spawnSettled).toBe(true);
+    expect(stopResolved).toBe(true);
   });
 });
