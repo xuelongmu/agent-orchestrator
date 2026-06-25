@@ -40,7 +40,11 @@ export {
   deleteMetadata,
   listMetadata,
 } from "./metadata.js";
-export { createInitialCanonicalLifecycle, deriveLegacyStatus } from "./lifecycle-state.js";
+export {
+  createInitialCanonicalLifecycle,
+  deriveLegacyStatus,
+  isBlockedByDependency,
+} from "./lifecycle-state.js";
 export {
   resolveAgentSelection,
   resolveAgentSelectionForSession,

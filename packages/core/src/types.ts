@@ -38,6 +38,7 @@ export type CanonicalSessionState =
 
 export type CanonicalSessionReason =
   | "spawn_requested"
+  | "blocked_by_dependency"
   | "agent_acknowledged"
   | "task_in_progress"
   | "pr_created"
@@ -328,6 +329,21 @@ export interface Session {
   /** When this session was last restored (undefined if never restored) */
   restoredAt?: Date;
 
+  /**
+   * Declared prerequisites — session and/or issue ids that must resolve before
+   * this session starts work. Static; populated at spawn time from explicit
+   * config and the tracker's blocking relations. Empty/undefined when none.
+   */
+  dependsOn?: string[];
+
+  /**
+   * Subset of `dependsOn` that is still unresolved. A non-empty value means the
+   * session is held in the `blocked_by_dependency` pre-state and has not started
+   * work. The scheduler clears entries as prerequisites resolve; once empty the
+   * session can be launched.
+   */
+  blockedBy?: string[];
+
   /** Metadata key-value pairs */
   metadata: Record<string, string>;
 }
@@ -378,6 +394,17 @@ export interface SessionSpawnConfig {
   agent?: string;
   /** Override the OpenCode subagent for this session (e.g. "sisyphus", "oracle") */
   subagent?: string;
+  /**
+   * Prerequisite session and/or issue ids. Merged with the tracker's blocking
+   * relations for `issueId`. When the resulting unresolved set is non-empty the
+   * session is recorded as blocked and not launched.
+   */
+  dependsOn?: string[];
+  /**
+   * Explicit unresolved prerequisites at spawn time. Defaults to the full
+   * `dependsOn` set (every declared prerequisite is presumed unresolved).
+   */
+  blockedBy?: string[];
 }
 
 /** Config for creating an orchestrator session */
@@ -1838,6 +1865,10 @@ export interface SessionMetadata {
   restoreFallbackReason?: string;
   pinnedSummary?: string; // First quality summary, pinned for display stability
   userPrompt?: string; // Prompt used when spawning without a tracker issue
+  /** Declared prerequisite session/issue ids (persisted comma-separated). */
+  dependsOn?: string[];
+  /** Unresolved prerequisite session/issue ids (persisted comma-separated). */
+  blockedBy?: string[];
   /**
    * Human-readable display name for the session.
    *

@@ -7,11 +7,15 @@ import type {
   SessionKind,
   SessionStatus,
 } from "../types.js";
-import { deriveLegacyStatus, parseCanonicalLifecycle } from "../lifecycle-state.js";
+import {
+  deriveLegacyStatus,
+  isBlockedByDependency,
+  parseCanonicalLifecycle,
+} from "../lifecycle-state.js";
 import { createActivitySignal } from "../activity-signal.js";
 import { AGENT_REPORT_METADATA_KEYS } from "../agent-report.js";
 import { dedupePrInfos, parsePrFromUrl } from "./pr.js";
-import { safeJsonParse, validateStatus } from "./validation.js";
+import { parseIdList, safeJsonParse, validateStatus } from "./validation.js";
 
 interface SessionFromMetadataOptions {
   projectId?: string;
@@ -97,6 +101,17 @@ export function sessionFromMetadata(
       : [];
   const prs = dedupePrInfos(parsedPrs);
 
+  const dependsOn = parseIdList(meta["dependsOn"]);
+  const blockedBy = parseIdList(meta["blockedBy"]);
+
+  // A held (blocked-by-dependency) session has no workspace yet — never let the
+  // project-path fallback substitute one, or callers would target the project
+  // checkout for a session that was never launched.
+  const blocked = isBlockedByDependency(lifecycle);
+  const workspacePath = blocked
+    ? meta["worktree"] || null
+    : meta["worktree"] || options.workspacePathFallback || null;
+
   return {
     id: sessionId,
     projectId: meta["project"] ?? options.projectId ?? "",
@@ -108,13 +123,15 @@ export function sessionFromMetadata(
     issueId: meta["issue"] || null,
     pr: prs[0] ?? null,
     prs,
-    workspacePath: meta["worktree"] || options.workspacePathFallback || null,
+    workspacePath,
     runtimeHandle: lifecycle.runtime.handle ?? runtimeHandle,
     agentInfo: meta["summary"] ? { summary: meta["summary"], agentSessionId: null } : null,
     createdAt: meta["createdAt"] ? new Date(meta["createdAt"]) : (options.createdAt ?? new Date()),
     lastActivityAt: options.lastActivityAt ?? new Date(),
     restoredAt:
       options.restoredAt ?? (meta["restoredAt"] ? new Date(meta["restoredAt"]) : undefined),
+    ...(dependsOn.length > 0 ? { dependsOn } : {}),
+    ...(blockedBy.length > 0 ? { blockedBy } : {}),
     metadata: meta,
   };
 }

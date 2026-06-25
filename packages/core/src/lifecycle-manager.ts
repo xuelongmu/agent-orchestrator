@@ -50,6 +50,7 @@ import {
   buildLifecycleMetadataPatch,
   cloneLifecycle,
   deriveLegacyStatus,
+  isBlockedByDependency,
 } from "./lifecycle-state.js";
 import { updateMetadata } from "./metadata.js";
 import { getProjectSessionsDir } from "./paths.js";
@@ -1029,6 +1030,19 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         status: session.status,
         evidence: "project_missing",
         detectingAttempts: parseAttemptCount(session.metadata["detectingAttempts"]),
+      };
+    }
+
+    // Sessions held by an unresolved dependency stay in the blocked pre-state
+    // until the scheduler clears their prerequisites. Skip all probing and
+    // status inference so the polling loop never promotes them to "working"
+    // (the SPAWNING → WORKING fallthrough below would otherwise un-block them).
+    if (isBlockedByDependency(session.lifecycle)) {
+      return {
+        status: session.status,
+        evidence: "blocked_by_dependency",
+        detectingAttempts: parseAttemptCount(session.metadata["detectingAttempts"]),
+        skipMetadataWrite: true,
       };
     }
 

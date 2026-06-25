@@ -124,6 +124,62 @@ describe("sessionFromMetadata — multi-PR (issue #1821)", () => {
     expect(session.prs[1].repo).toBe("repo-y");
   });
 
+  it("1.11 — dependsOn / blockedBy parsed from comma-separated metadata", () => {
+    const session = sessionFromMetadata(
+      "app-1",
+      { dependsOn: "7, app-2", blockedBy: "7" },
+      baseOptions,
+    );
+    expect(session.dependsOn).toEqual(["7", "app-2"]);
+    expect(session.blockedBy).toEqual(["7"]);
+  });
+
+  it("1.12 — dependsOn / blockedBy omitted when absent or empty", () => {
+    const session = sessionFromMetadata("app-1", { dependsOn: "", blockedBy: "" }, baseOptions);
+    expect(session.dependsOn).toBeUndefined();
+    expect(session.blockedBy).toBeUndefined();
+  });
+
+  it("1.13 — blocked session keeps workspacePath null despite fallback", () => {
+    const blockedLifecycle = {
+      version: 2,
+      session: {
+        kind: "worker",
+        state: "not_started",
+        reason: "blocked_by_dependency",
+        startedAt: null,
+        completedAt: null,
+        terminatedAt: null,
+        lastTransitionAt: "2025-01-01T00:00:00.000Z",
+      },
+      pr: { state: "none", reason: "not_created", number: null, url: null, lastObservedAt: null },
+      runtime: {
+        state: "unknown",
+        reason: "spawn_incomplete",
+        lastObservedAt: null,
+        handle: null,
+        tmuxName: null,
+      },
+    };
+    const session = sessionFromMetadata(
+      "app-1",
+      { lifecycle: JSON.stringify(blockedLifecycle), dependsOn: "7", blockedBy: "7" },
+      { projectId: "my-app", workspacePathFallback: "/repo/path" },
+    );
+    expect(session.workspacePath).toBeNull();
+    expect(session.runtimeHandle).toBeNull();
+    expect(session.blockedBy).toEqual(["7"]);
+  });
+
+  it("1.14 — non-blocked session still uses workspacePathFallback", () => {
+    const session = sessionFromMetadata(
+      "app-1",
+      { status: "working" },
+      { projectId: "my-app", workspacePathFallback: "/repo/path" },
+    );
+    expect(session.workspacePath).toBe("/repo/path");
+  });
+
   it("1.10 — duplicate prs entries are deduplicated by owner, repo, and number", () => {
     const session = sessionFromMetadata(
       "app-1",

@@ -66,6 +66,7 @@ import {
   cloneLifecycle,
   createInitialCanonicalLifecycle,
   deriveLegacyStatus,
+  isBlockedByDependency,
   parseCanonicalLifecycle,
 } from "./lifecycle-state.js";
 import { buildPrompt } from "./prompt-builder.js";
@@ -93,7 +94,7 @@ import {
 } from "./orchestrator-session-strategy.js";
 import { sessionFromMetadata } from "./utils/session-from-metadata.js";
 import { dedupePrUrls } from "./utils/pr.js";
-import { safeJsonParse, validateStatus } from "./utils/validation.js";
+import { parseIdList, safeJsonParse, validateStatus } from "./utils/validation.js";
 import { isGitBranchNameSafe } from "./utils.js";
 import { resolveAgentSelection, resolveAgentSelectionForSession } from "./agent-selection.js";
 import {
@@ -279,6 +280,34 @@ function deriveDisplayName(input: { issueTitle?: string; prompt?: string }): str
   }
 
   return undefined;
+}
+
+/**
+ * Compute a session's prerequisites at spawn time. `dependsOn` is the union of
+ * the explicit spawn config (`dependsOn` + `blockedBy`) and the tracker's
+ * blocking relations for the issue (#7). `blockedBy` is the still-unresolved
+ * subset — it defaults to the full `dependsOn` set (every declared prerequisite
+ * is presumed unresolved at spawn) unless the caller passes an explicit narrower
+ * set. A non-empty `blockedBy` means the session is held in the
+ * `blocked_by_dependency` pre-state. `blockedBy` is always ⊆ `dependsOn` so the
+ * static dependency graph never loses an edge.
+ */
+function collectSessionDependencies(
+  spawnConfig: SessionSpawnConfig,
+  resolvedIssue: Issue | undefined,
+): { dependsOn: string[]; blockedBy: string[] } {
+  const dependsOn = parseIdList(
+    [
+      ...(spawnConfig.dependsOn ?? []),
+      ...(spawnConfig.blockedBy ?? []),
+      ...(resolvedIssue?.blockedBy ?? []),
+    ].join(","),
+  );
+  const blockedBy =
+    spawnConfig.blockedBy !== undefined
+      ? parseIdList(spawnConfig.blockedBy.join(","))
+      : dependsOn;
+  return { dependsOn, blockedBy };
 }
 
 const SEND_RESTORE_READY_TIMEOUT_MS = 5_000;
@@ -1055,6 +1084,13 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     plugins: ReturnType<typeof resolvePlugins>,
     sessionListPromise?: Promise<OpenCodeSessionListEntry[]>,
   ): Promise<void> {
+    // Held sessions have no workspace or runtime — do not fabricate a handle or
+    // probe activity, or the dashboard/CLI terminal would target a session that
+    // was never launched. The blocked pre-state is preserved verbatim.
+    if (isBlockedByDependency(session.lifecycle)) {
+      return;
+    }
+
     await ensureOpenCodeSessionMapping(
       session,
       sessionName,
@@ -1313,6 +1349,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       }
     }
 
+    // Resolve prerequisites from explicit config + tracker blocking relations.
+    const { dependsOn, blockedBy } = collectSessionDependencies(spawnConfig, resolvedIssue);
+
     // Get the sessions directory for this project
     const sessionsDir = getProjectSessionsDir(spawnConfig.projectId);
 
@@ -1355,6 +1394,79 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         branch = `feat/${slug || sessionId}`;
       } else {
         branch = `session/${sessionId}`;
+      }
+
+      // Held by an unresolved prerequisite: record a blocked session and stop
+      // before any work begins (no workspace, no runtime, no agent launch). The
+      // scheduler (#10) clears `blockedBy` and launches it once prerequisites
+      // resolve. The reserved metadata persists so the block survives restart.
+      if (blockedBy.length > 0) {
+        const createdAt = new Date();
+        const lifecycle = createInitialCanonicalLifecycle("worker", createdAt);
+        lifecycle.session.reason = "blocked_by_dependency";
+
+        const displayName = deriveDisplayName({
+          issueTitle: resolvedIssue?.title,
+          prompt: spawnConfig.prompt,
+        });
+
+        const blockedSession: Session = {
+          id: sessionId,
+          projectId: spawnConfig.projectId,
+          status: deriveLegacyStatus(lifecycle),
+          activity: null,
+          activitySignal: createActivitySignal("unavailable"),
+          lifecycle,
+          branch,
+          issueId: spawnConfig.issueId ?? null,
+          pr: null,
+          prs: [],
+          workspacePath: null,
+          runtimeHandle: null,
+          agentInfo: null,
+          createdAt,
+          lastActivityAt: createdAt,
+          dependsOn,
+          blockedBy,
+          metadata: {
+            ...(spawnConfig.prompt ? { userPrompt: spawnConfig.prompt } : {}),
+            ...(displayName ? { displayName } : {}),
+          },
+        };
+
+        writeMetadata(sessionsDir, sessionId, {
+          worktree: "",
+          branch,
+          status: deriveLegacyStatus(lifecycle),
+          ...buildLifecycleMetadataPatch(lifecycle),
+          // Object override for the typed writeMetadata path — see the launch
+          // site below for the rationale.
+          lifecycle,
+          issue: spawnConfig.issueId,
+          issueTitle: resolvedIssue?.title,
+          project: spawnConfig.projectId,
+          agent: selection.agentName,
+          createdAt: createdAt.toISOString(),
+          dependsOn,
+          blockedBy,
+          userPrompt: spawnConfig.prompt,
+          displayName,
+        });
+
+        // Metadata is now the final persisted form of this held session.
+        cleanupStack.dismiss();
+        invalidateCache();
+
+        recordActivityEvent({
+          projectId: spawnConfig.projectId,
+          sessionId,
+          source: "session-manager",
+          kind: "session.spawn_blocked",
+          summary: `blocked by dependency: ${sessionId}`,
+          data: { blockedBy: blockedBy.join(",") },
+        });
+
+        return blockedSession;
       }
 
       // Create workspace (if workspace plugin is available)
@@ -1543,6 +1655,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         agentInfo: null,
         createdAt,
         lastActivityAt: createdAt,
+        ...(dependsOn.length > 0 ? { dependsOn } : {}),
         metadata: {
           ...(reusedOpenCodeSessionId ? { opencodeSessionId: reusedOpenCodeSessionId } : {}),
           ...(spawnConfig.prompt ? { userPrompt: spawnConfig.prompt } : {}),
@@ -1572,6 +1685,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         createdAt: createdAt.toISOString(),
         runtimeHandle: handle,
         opencodeSessionId: reusedOpenCodeSessionId,
+        dependsOn,
         userPrompt: spawnConfig.prompt,
         displayName,
       });
@@ -3367,6 +3481,40 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     const sessionsDir: string = activeRecord.sessionsDir;
     const project: ProjectConfig = activeRecord.project;
     const projectId: string = activeRecord.projectId;
+
+    // A held (blocked-by-dependency) session must never be launched by restore —
+    // even if `ao stop` flipped its lifecycle to terminated. Its persisted
+    // `blockedBy` is the source of truth: re-establish the held pre-state and
+    // return without starting any work. The scheduler launches it once it clears
+    // the prerequisites. This keeps an unresolved dependent from running across a
+    // stop/restore cycle.
+    if (parseIdList(raw["blockedBy"]).length > 0) {
+      const heldLifecycle = buildUpdatedLifecycle(sessionId, raw, (next) => {
+        next.session.state = "not_started";
+        next.session.reason = "blocked_by_dependency";
+        next.session.startedAt = null;
+        next.session.lastTransitionAt = new Date().toISOString();
+        next.runtime.state = "unknown";
+        next.runtime.reason = "spawn_incomplete";
+        next.runtime.handle = null;
+        next.runtime.tmuxName = null;
+        next.runtime.lastObservedAt = null;
+      });
+      const heldUpdates: Partial<Record<string, string>> = {
+        ...lifecycleMetadataUpdates(raw, heldLifecycle),
+        // Drop any runtime/workspace pointers a prior launch may have written.
+        runtimeHandle: "",
+        tmuxName: "",
+        worktree: "",
+      };
+      updateMetadata(sessionsDir, sessionId, heldUpdates);
+      invalidateCache();
+      raw = applyMetadataUpdatesToRaw(raw, heldUpdates);
+      return metadataToSession(sessionId, raw, {
+        projectId,
+        sessionPrefix: project.sessionPrefix,
+      });
+    }
 
     const selection = resolveSelectionForSession(project, sessionId, raw);
     const selectedAgent = selection.agentName;
