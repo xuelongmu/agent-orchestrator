@@ -53,7 +53,7 @@ import {
   isBlockedByDependency,
 } from "./lifecycle-state.js";
 import {
-  collectSatisfiedDependencyIds,
+  collectSatisfiedDependencies,
   computeRemainingBlockedBy,
   countActiveSessions,
 } from "./dependency-scheduler.js";
@@ -3160,7 +3160,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const held = sessions.filter((s) => isBlockedByDependency(s.lifecycle));
     if (held.length === 0) return 0;
 
-    const satisfied = collectSatisfiedDependencyIds(sessions);
+    const satisfied = collectSatisfiedDependencies(sessions);
     // Account for launches issued this pass before the next list() reflects the
     // newly-running sessions, so a burst of unblocks still respects the cap.
     const launchedByProject = new Map<string, number>();
@@ -3168,7 +3168,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     for (const session of held) {
       const current = session.blockedBy ?? [];
-      const remaining = computeRemainingBlockedBy(current, satisfied);
+      const remaining = computeRemainingBlockedBy(current, session.projectId, satisfied);
 
       // Persist any narrowing first — durable regardless of whether the launch
       // below happens now (cap permitting) or on a later poll / after restart.

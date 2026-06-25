@@ -24,16 +24,6 @@ export function normalizeDependencyId(id: string): string {
 }
 
 /**
- * The identifiers a session satisfies for its dependents once its PR has
- * merged: its session id and its issue id (if any), both normalized. A
- * dependent's `blockedBy` may reference either form.
- */
-export function sessionSatisfiedIds(session: Session): string[] {
-  const ids = [session.id, ...(session.issueId ? [session.issueId] : [])];
-  return ids.map(normalizeDependencyId).filter((id) => id.length > 0);
-}
-
-/**
  * True when a session's work is complete enough to unblock its dependents —
  * its PR has merged. `lifecycle.pr.state` stays "merged" through the post-merge
  * cleanup window (and even after the session is torn down but before it is
@@ -44,17 +34,58 @@ export function isPrerequisiteSatisfied(session: Session): boolean {
 }
 
 /**
- * Collect the normalized set of dependency ids satisfied by the given sessions
- * (those whose PR has merged). Cross-project by construction — the supervisor
- * passes sessions from every project.
+ * The set of dependency identifiers satisfied by merged sessions, split by how
+ * uniquely each identifier resolves:
+ *  - `sessionIds`: session ids are globally unique (`{prefix}-{num}`), so a
+ *    merged session satisfies a matching `blockedBy` entry in **any** project —
+ *    this is the unambiguous cross-project handle.
+ *  - `issueIdsByProject`: issue ids are only unique within a project (GitHub /
+ *    GitLab expose `#20` as "20" in every repo), so a merged session's issue id
+ *    may only satisfy a dependent **in the same project**. Matching globally
+ *    would let repo B's issue 20 wrongly unblock a repo A dependent on its own
+ *    issue 20.
  */
-export function collectSatisfiedDependencyIds(sessions: Session[]): Set<string> {
-  const satisfied = new Set<string>();
+export interface SatisfiedDependencies {
+  sessionIds: Set<string>;
+  issueIdsByProject: Map<string, Set<string>>;
+}
+
+/** Collect the satisfied dependency identifiers from merged sessions. */
+export function collectSatisfiedDependencies(sessions: Session[]): SatisfiedDependencies {
+  const sessionIds = new Set<string>();
+  const issueIdsByProject = new Map<string, Set<string>>();
   for (const session of sessions) {
     if (!isPrerequisiteSatisfied(session)) continue;
-    for (const id of sessionSatisfiedIds(session)) satisfied.add(id);
+    const sessionId = normalizeDependencyId(session.id);
+    if (sessionId) sessionIds.add(sessionId);
+    if (session.issueId) {
+      const issueId = normalizeDependencyId(session.issueId);
+      if (issueId) {
+        let perProject = issueIdsByProject.get(session.projectId);
+        if (!perProject) {
+          perProject = new Set();
+          issueIdsByProject.set(session.projectId, perProject);
+        }
+        perProject.add(issueId);
+      }
+    }
   }
-  return satisfied;
+  return { sessionIds, issueIdsByProject };
+}
+
+/**
+ * True when a single `blockedBy` entry of a dependent in `projectId` is
+ * satisfied — either by a merged session id (any project) or by a merged issue
+ * id within the same project.
+ */
+export function isDependencySatisfied(
+  entry: string,
+  projectId: string,
+  satisfied: SatisfiedDependencies,
+): boolean {
+  const normalized = normalizeDependencyId(entry);
+  if (satisfied.sessionIds.has(normalized)) return true;
+  return satisfied.issueIdsByProject.get(projectId)?.has(normalized) ?? false;
 }
 
 /**
@@ -64,9 +95,10 @@ export function collectSatisfiedDependencyIds(sessions: Session[]): Set<string> 
  */
 export function computeRemainingBlockedBy(
   blockedBy: string[],
-  satisfied: Set<string>,
+  projectId: string,
+  satisfied: SatisfiedDependencies,
 ): string[] {
-  return blockedBy.filter((id) => !satisfied.has(normalizeDependencyId(id)));
+  return blockedBy.filter((id) => !isDependencySatisfied(id, projectId, satisfied));
 }
 
 /**

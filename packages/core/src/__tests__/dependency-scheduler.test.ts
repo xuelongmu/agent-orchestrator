@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
-  collectSatisfiedDependencyIds,
+  collectSatisfiedDependencies,
   computeRemainingBlockedBy,
   countActiveSessions,
+  isDependencySatisfied,
   isPrerequisiteSatisfied,
   normalizeDependencyId,
-  sessionSatisfiedIds,
 } from "../dependency-scheduler.js";
 import { createInitialCanonicalLifecycle } from "../lifecycle-state.js";
 import { createActivitySignal } from "../activity-signal.js";
@@ -62,18 +62,6 @@ describe("normalizeDependencyId", () => {
   });
 });
 
-describe("sessionSatisfiedIds", () => {
-  it("exposes the normalized session id and issue id", () => {
-    const session = makeSession({ id: "back-1", issueId: "#9" });
-    expect(sessionSatisfiedIds(session).sort()).toEqual(["9", "back-1"]);
-  });
-
-  it("omits a missing issue id", () => {
-    const session = makeSession({ id: "back-1", issueId: null });
-    expect(sessionSatisfiedIds(session)).toEqual(["back-1"]);
-  });
-});
-
 describe("isPrerequisiteSatisfied", () => {
   it("is true only when the PR has merged", () => {
     expect(isPrerequisiteSatisfied(makeSession({ prMerged: true }))).toBe(true);
@@ -81,31 +69,60 @@ describe("isPrerequisiteSatisfied", () => {
   });
 });
 
-describe("collectSatisfiedDependencyIds", () => {
-  it("gathers ids only from merged sessions, across projects", () => {
+describe("collectSatisfiedDependencies", () => {
+  it("gathers session ids globally and issue ids per project, from merged sessions only", () => {
     const sessions = [
       makeSession({ id: "back-1", projectId: "backend", issueId: "9", prMerged: true }),
       makeSession({ id: "back-2", projectId: "backend", issueId: "10", prMerged: false }),
     ];
-    const satisfied = collectSatisfiedDependencyIds(sessions);
-    expect(satisfied.has("back-1")).toBe(true);
-    expect(satisfied.has("9")).toBe(true);
-    expect(satisfied.has("10")).toBe(false);
-    expect(satisfied.has("back-2")).toBe(false);
+    const satisfied = collectSatisfiedDependencies(sessions);
+    expect(satisfied.sessionIds.has("back-1")).toBe(true);
+    expect(satisfied.sessionIds.has("back-2")).toBe(false);
+    expect(satisfied.issueIdsByProject.get("backend")?.has("9")).toBe(true);
+    expect(satisfied.issueIdsByProject.get("backend")?.has("10")).toBe(false);
+  });
+});
+
+describe("isDependencySatisfied", () => {
+  const satisfied = collectSatisfiedDependencies([
+    makeSession({ id: "back-1", projectId: "backend", issueId: "20", prMerged: true }),
+  ]);
+
+  it("matches a merged session id from any project (globally unique handle)", () => {
+    expect(isDependencySatisfied("back-1", "frontend", satisfied)).toBe(true);
+    expect(isDependencySatisfied("#back-1", "frontend", satisfied)).toBe(true);
+  });
+
+  it("matches a merged issue id only within the same project", () => {
+    expect(isDependencySatisfied("20", "backend", satisfied)).toBe(true);
+    expect(isDependencySatisfied("#20", "backend", satisfied)).toBe(true);
+  });
+
+  it("does NOT cross-satisfy a same-numbered issue in another project", () => {
+    // backend#20 merged must not unblock a frontend dependent on its own #20.
+    expect(isDependencySatisfied("20", "frontend", satisfied)).toBe(false);
   });
 });
 
 describe("computeRemainingBlockedBy", () => {
   it("keeps a multi-prerequisite dependent blocked until all merge", () => {
-    const onlyOneMerged = new Set(["9"]);
-    expect(computeRemainingBlockedBy(["9", "10"], onlyOneMerged)).toEqual(["10"]);
+    const onlyOne = collectSatisfiedDependencies([
+      makeSession({ id: "a-1", projectId: "app", issueId: "9", prMerged: true }),
+    ]);
+    expect(computeRemainingBlockedBy(["9", "10"], "app", onlyOne)).toEqual(["10"]);
 
-    const bothMerged = new Set(["9", "10"]);
-    expect(computeRemainingBlockedBy(["9", "10"], bothMerged)).toEqual([]);
+    const both = collectSatisfiedDependencies([
+      makeSession({ id: "a-1", projectId: "app", issueId: "9", prMerged: true }),
+      makeSession({ id: "a-2", projectId: "app", issueId: "10", prMerged: true }),
+    ]);
+    expect(computeRemainingBlockedBy(["9", "10"], "app", both)).toEqual([]);
   });
 
-  it("matches regardless of # prefix or case", () => {
-    expect(computeRemainingBlockedBy(["#9", "Back-1"], new Set(["9", "back-1"]))).toEqual([]);
+  it("unblocks a cross-project dependent via the prerequisite's session id", () => {
+    const satisfied = collectSatisfiedDependencies([
+      makeSession({ id: "back-1", projectId: "backend", issueId: "20", prMerged: true }),
+    ]);
+    expect(computeRemainingBlockedBy(["back-1"], "frontend", satisfied)).toEqual([]);
   });
 });
 
