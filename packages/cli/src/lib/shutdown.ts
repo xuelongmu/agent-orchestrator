@@ -13,6 +13,7 @@
  */
 
 import {
+  getGlobalConfigPath,
   isTerminalSession,
   loadConfig,
   markDaemonShutdownHandlerInstalled,
@@ -27,6 +28,29 @@ import { stopBacklogPoller } from "./backlog-service.js";
 import { unregister, writeLastStop } from "./running-state.js";
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
+
+/**
+ * Load the config that defines the full shutdown scope. The backlog poller
+ * spawns against the global config (all registered projects), so a full
+ * graceful shutdown must enumerate all of them — matching `ao stop`, which
+ * also kills sessions across every project. Falls back to the startup config
+ * when no global config exists (first-run `ao start <url>` / `<path>`).
+ */
+function loadShutdownConfig(startupConfigPath: string): ReturnType<typeof loadConfig> {
+  const globalConfigPath = getGlobalConfigPath();
+  try {
+    return loadConfig(globalConfigPath);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT" &&
+      (error as Error & { path?: string }).path === globalConfigPath
+    ) {
+      return loadConfig(startupConfigPath);
+    }
+    throw error;
+  }
+}
 
 export interface ShutdownContext {
   /** Path to the orchestrator config; re-read at shutdown time so any
@@ -98,9 +122,10 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
     void (async () => {
       try {
         // Wait for an in-flight backlog poll to settle so a session it spawned
-        // right before the signal is enumerated below and killed cleanly.
-        await backlogStopped;
-        const shutdownConfig = loadConfig(ctx.configPath);
+        // right before the signal is enumerated below and killed cleanly. A
+        // rejection here must not abort the kill path, so swallow it.
+        await backlogStopped.catch(() => {});
+        const shutdownConfig = loadShutdownConfig(ctx.configPath);
         const sm = await getSessionManager(shutdownConfig);
         const allSessions = await sm.list();
         const activeSessions = allSessions.filter((s) => !isTerminalSession(s));

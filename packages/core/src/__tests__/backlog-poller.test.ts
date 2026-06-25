@@ -312,4 +312,96 @@ describe("backlog poller", () => {
     expect(spawnSettled).toBe(true);
     expect(stopResolved).toBe(true);
   });
+
+  it("keeps awaiting the original poll when interval ticks fire mid-poll", async () => {
+    const lockPath = join(tmp, "backlog-poll.lock");
+    let releaseSpawn: () => void = () => {};
+    let spawnSettled = false;
+    const harness = makeHarness({
+      backlogIssues: [makeIssue("1")],
+      maxConcurrentAgents: 5,
+    });
+    (harness.services.sessionManager.spawn as ReturnType<typeof vi.fn>).mockImplementation(
+      async () => {
+        await new Promise<void>((resolve) => {
+          releaseSpawn = () => {
+            spawnSettled = true;
+            resolve();
+          };
+        });
+        return { id: "spawned" };
+      },
+    );
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath,
+      intervalMs: 5,
+    });
+
+    poller.start();
+    // Let several interval ticks fire while the first poll is blocked on spawn.
+    // The activePoll guard must keep them from replacing the original poll.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const stopPromise = poller.stop();
+    let stopResolved = false;
+    void stopPromise.then(() => {
+      stopResolved = true;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(stopResolved).toBe(false); // still awaiting the original blocked spawn
+
+    releaseSpawn();
+    await stopPromise;
+    expect(spawnSettled).toBe(true);
+    expect(stopResolved).toBe(true);
+    // Only one poll ever acquired the lock and spawned.
+    expect(harness.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not spawn a duplicate worker for the same issue across projects sharing a tracker", async () => {
+    const issue = makeIssue("42"); // identical url across both project entries
+    const listIssues = vi.fn(async (filters: { labels?: string[] }) =>
+      filters.labels?.includes("agent:backlog") ? [issue] : [],
+    );
+    // Claim update fails, so the issue keeps its agent:backlog label and the
+    // second project would re-list it without cross-cycle dedup.
+    const updateIssue = vi.fn(async () => {
+      throw new Error("claim update failed");
+    });
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const tracker = { name: "github", listIssues, updateIssue, getIssue };
+
+    const project = (name: string, prefix: string) => ({
+      name,
+      path: `/tmp/${name}`,
+      defaultBranch: "main",
+      sessionPrefix: prefix,
+      tracker: { plugin: "github" },
+    });
+    const services: BacklogServices = {
+      config: {
+        projects: { projA: project("projA", "a"), projB: project("projB", "b") },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => []),
+        spawn,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
 });

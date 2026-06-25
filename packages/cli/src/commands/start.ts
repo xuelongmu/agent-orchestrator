@@ -977,11 +977,6 @@ async function runStartup(
       spinner.start("Starting project supervisor");
       await startProjectSupervisor({ configPath: config.configPath });
       spinner.succeed("Lifecycle project supervisor started");
-
-      // Drive labeled backlog issues to execution without needing the dashboard
-      // (headless autonomy). The poller's cross-process lock prevents
-      // double-spawning with the dashboard's poller when both run.
-      startBacklogPoller(config.configPath);
     } catch (err) {
       spinner.fail("Project supervisor failed to start");
       recordActivityEvent({
@@ -1181,6 +1176,16 @@ async function runStartup(
       });
       // Non-fatal: don't block startup if last-stop handling fails
     }
+  }
+
+  // Drive labeled backlog issues to execution without needing the dashboard
+  // (headless autonomy). Started after session restore so the first poll
+  // counts restored workers against the per-project cap rather than racing
+  // them — otherwise it could spawn new workers up to the cap while the
+  // restored sessions are still being brought back. The poller's
+  // cross-process lock prevents double-spawning with the dashboard's poller.
+  if (shouldStartLifecycle) {
+    startBacklogPoller(config.configPath);
   }
 
   // Print summary

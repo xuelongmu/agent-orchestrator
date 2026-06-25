@@ -113,8 +113,11 @@ function defaultLockPath(): string {
  * Returns a handle if acquired, or null if another process holds a fresh lock.
  */
 function tryAcquireLock(lockPath: string): LockHandle | null {
-  mkdirSync(dirname(lockPath), { recursive: true });
   try {
+    // Inside the try so a setup failure (e.g. a read-only config mount) is
+    // treated as "could not acquire" rather than thrown out of pollOnce —
+    // an unhandled rejection here would propagate into the shutdown path.
+    mkdirSync(dirname(lockPath), { recursive: true });
     const fd = openSync(lockPath, "wx");
     try {
       writeSync(fd, String(process.pid));
@@ -318,6 +321,13 @@ async function spawnFromBacklog(
     workersByProject.set(session.projectId, list);
   }
 
+  // Issues claimed earlier in this same cycle, keyed by the issue's URL (which
+  // is unique per tracker scope/repo, unlike the bare issue id). Guards the
+  // case where two project entries point at the same repo and a claim update
+  // fails after spawning — without this the next project could list the still
+  // `agent:backlog` issue and spawn a duplicate worker.
+  const claimedThisCycle = new Set<string>();
+
   for (const [projectId, project] of Object.entries(config.projects)) {
     if (!project.tracker?.plugin) continue;
 
@@ -349,13 +359,16 @@ async function spawnFromBacklog(
     for (const issue of backlogIssues) {
       if (availableSlots <= 0) break;
 
-      // Skip if already being worked on
+      // Skip if already being worked on, or already claimed this cycle by
+      // another project sharing the same tracker scope.
       if (activeIssueIds.has(issue.id.toLowerCase())) continue;
+      if (claimedThisCycle.has(issue.url)) continue;
 
       try {
         await sessionManager.spawn({ projectId, issueId: issue.id });
         availableSlots--;
         activeIssueIds.add(issue.id.toLowerCase());
+        claimedThisCycle.add(issue.url);
 
         // Mark as claimed on the tracker
         if (tracker.updateIssue) {
@@ -417,6 +430,11 @@ export function createBacklogPoller(options: BacklogPollerOptions): BacklogPolle
 
   // Run a poll while recording it as the active one, so `stop()` can await it.
   function runTracked(): Promise<void> {
+    // A poll is already in flight — skip this tick instead of overwriting
+    // `activePoll`. Otherwise a poll slower than the interval would be replaced
+    // by the next (lock-skipped, fast-resolving) tick, and stop() could resolve
+    // without awaiting the original spawn the shutdown path depends on.
+    if (activePoll) return activePoll;
     const poll = pollOnce().finally(() => {
       if (activePoll === poll) activePoll = undefined;
     });
