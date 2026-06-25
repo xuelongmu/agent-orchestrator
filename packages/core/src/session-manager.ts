@@ -66,6 +66,7 @@ import {
   cloneLifecycle,
   createInitialCanonicalLifecycle,
   deriveLegacyStatus,
+  isBlockedByDependency,
   parseCanonicalLifecycle,
 } from "./lifecycle-state.js";
 import { buildPrompt } from "./prompt-builder.js";
@@ -283,18 +284,24 @@ function deriveDisplayName(input: { issueTitle?: string; prompt?: string }): str
 
 /**
  * Compute a session's prerequisites at spawn time. `dependsOn` is the union of
- * the explicit spawn config and the tracker's blocking relations for the issue
- * (#7). `blockedBy` is the still-unresolved subset — it defaults to the full
- * `dependsOn` set (every declared prerequisite is presumed unresolved at spawn)
- * unless the caller passes an explicit narrower set. A non-empty `blockedBy`
- * means the session is held in the `blocked_by_dependency` pre-state.
+ * the explicit spawn config (`dependsOn` + `blockedBy`) and the tracker's
+ * blocking relations for the issue (#7). `blockedBy` is the still-unresolved
+ * subset — it defaults to the full `dependsOn` set (every declared prerequisite
+ * is presumed unresolved at spawn) unless the caller passes an explicit narrower
+ * set. A non-empty `blockedBy` means the session is held in the
+ * `blocked_by_dependency` pre-state. `blockedBy` is always ⊆ `dependsOn` so the
+ * static dependency graph never loses an edge.
  */
 function collectSessionDependencies(
   spawnConfig: SessionSpawnConfig,
   resolvedIssue: Issue | undefined,
 ): { dependsOn: string[]; blockedBy: string[] } {
   const dependsOn = parseIdList(
-    [...(spawnConfig.dependsOn ?? []), ...(resolvedIssue?.blockedBy ?? [])].join(","),
+    [
+      ...(spawnConfig.dependsOn ?? []),
+      ...(spawnConfig.blockedBy ?? []),
+      ...(resolvedIssue?.blockedBy ?? []),
+    ].join(","),
   );
   const blockedBy =
     spawnConfig.blockedBy !== undefined
@@ -1077,6 +1084,13 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     plugins: ReturnType<typeof resolvePlugins>,
     sessionListPromise?: Promise<OpenCodeSessionListEntry[]>,
   ): Promise<void> {
+    // Held sessions have no workspace or runtime — do not fabricate a handle or
+    // probe activity, or the dashboard/CLI terminal would target a session that
+    // was never launched. The blocked pre-state is preserved verbatim.
+    if (isBlockedByDependency(session.lifecycle)) {
+      return;
+    }
+
     await ensureOpenCodeSessionMapping(
       session,
       sessionName,
@@ -3467,6 +3481,40 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     const sessionsDir: string = activeRecord.sessionsDir;
     const project: ProjectConfig = activeRecord.project;
     const projectId: string = activeRecord.projectId;
+
+    // A held (blocked-by-dependency) session must never be launched by restore —
+    // even if `ao stop` flipped its lifecycle to terminated. Its persisted
+    // `blockedBy` is the source of truth: re-establish the held pre-state and
+    // return without starting any work. The scheduler launches it once it clears
+    // the prerequisites. This keeps an unresolved dependent from running across a
+    // stop/restore cycle.
+    if (parseIdList(raw["blockedBy"]).length > 0) {
+      const heldLifecycle = buildUpdatedLifecycle(sessionId, raw, (next) => {
+        next.session.state = "not_started";
+        next.session.reason = "blocked_by_dependency";
+        next.session.startedAt = null;
+        next.session.lastTransitionAt = new Date().toISOString();
+        next.runtime.state = "unknown";
+        next.runtime.reason = "spawn_incomplete";
+        next.runtime.handle = null;
+        next.runtime.tmuxName = null;
+        next.runtime.lastObservedAt = null;
+      });
+      const heldUpdates: Partial<Record<string, string>> = {
+        ...lifecycleMetadataUpdates(raw, heldLifecycle),
+        // Drop any runtime/workspace pointers a prior launch may have written.
+        runtimeHandle: "",
+        tmuxName: "",
+        worktree: "",
+      };
+      updateMetadata(sessionsDir, sessionId, heldUpdates);
+      invalidateCache();
+      raw = applyMetadataUpdatesToRaw(raw, heldUpdates);
+      return metadataToSession(sessionId, raw, {
+        projectId,
+        sessionPrefix: project.sessionPrefix,
+      });
+    }
 
     const selection = resolveSelectionForSession(project, sessionId, raw);
     const selectedAgent = selection.agentName;
