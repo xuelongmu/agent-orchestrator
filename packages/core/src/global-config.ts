@@ -1110,6 +1110,8 @@ export function migrateToGlobalConfig(oldConfigPath: string, globalConfigPath?: 
     ] as GlobalConfig["notificationRouting"];
   if (parsed["reactions"] !== null && parsed["reactions"] !== undefined)
     newGlobal.reactions = parsed["reactions"] as GlobalConfig["reactions"];
+  if (parsed["budget"] !== null && parsed["budget"] !== undefined)
+    newGlobal.budget = parsed["budget"] as GlobalConfig["budget"];
 
   // Build project registry entries
   for (const [projectId, project] of Object.entries(oldProjects)) {
