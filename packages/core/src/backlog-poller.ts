@@ -265,27 +265,35 @@ async function labelIssuesForVerification(
     // guards two cases: a peer poller process may have already labeled the
     // issue (our in-memory `processedIssues` set is per-process), and after a
     // daemon restart `processedIssues` is empty while the merged session is
-    // still on disk. Skip if the issue is closed or already carries a
-    // verification label — otherwise a verified / verification-failed issue
-    // (whose `merged-unverified` was removed by `ao verify`) would get dragged
-    // back into the verify queue and receive a duplicate verification comment.
+    // still on disk.
+    let currentIssue: Issue | undefined;
     try {
-      const current = await tracker.getIssue(issueId, project);
-      const alreadyInVerifyFlow =
-        current.state === "closed" ||
-        VERIFICATION_LABELS.some((label) => current.labels.includes(label));
-      if (alreadyInVerifyFlow) {
-        processedIssues.add(key);
-        continue;
-      }
+      currentIssue = await tracker.getIssue(issueId, project);
     } catch {
       // getIssue failed — fall through and attempt the update anyway.
+    }
+
+    // Skip only when the issue already carries an explicit verification label
+    // (e.g. a verified / verification-failed issue whose `merged-unverified` was
+    // removed by `ao verify`) — re-labeling would drag it back into the verify
+    // queue and post a duplicate comment. A *closed* tracker state alone is NOT
+    // AO verification: a tracker may auto-close the issue from a PR closing
+    // keyword on merge. Treating that as verified would silently drop the issue
+    // from the human-verification surfaces, so we still label (and reopen) it.
+    const labels = currentIssue?.labels ?? [];
+    if (currentIssue && VERIFICATION_LABELS.some((label) => labels.includes(label))) {
+      processedIssues.add(key);
+      continue;
     }
 
     try {
       await tracker.updateIssue(
         issueId,
         {
+          // Reopen if the tracker auto-closed the issue on merge, so it lands in
+          // the (state:open-filtered) verification queue for human staging
+          // validation. A no-op when the issue is already open.
+          ...(currentIssue?.state === "closed" ? { state: "open" as const } : {}),
           labels: [MERGED_UNVERIFIED_LABEL],
           removeLabels: ["agent:backlog", "agent:in-progress"],
           comment: `PR merged. Issue awaiting human verification on staging.`,
@@ -329,7 +337,12 @@ async function relabelReopenedIssues(
           issue.id,
           {
             labels: [BACKLOG_LABEL],
-            removeLabels: ["agent:done"],
+            // Clear every verification label, not just `agent:done`. A web-
+            // verified issue is closed with both `verified` and `agent:done`; if
+            // it's later reopened, leaving `verified` behind would make
+            // `spawnFromBacklog` skip it via VERIFICATION_LABELS, stranding it in
+            // the backlog forever. Removing them all returns it cleanly.
+            removeLabels: [...VERIFICATION_LABELS],
             comment: "Issue reopened — returning to agent backlog.",
           },
           project,

@@ -56,6 +56,8 @@ function makeHarness(opts: {
   maxConcurrentAgents?: number;
   /** Labels the tracker reports for any `getIssue` lookup (cross-process dedupe). */
   existingLabels?: string[];
+  /** State the tracker reports for any `getIssue` lookup (default "open"). */
+  existingState?: Issue["state"];
 }): Harness {
   const listIssues = vi.fn(async (filters: { labels?: string[] }) => {
     if (filters.labels?.includes("agent:backlog")) return opts.backlogIssues;
@@ -64,6 +66,7 @@ function makeHarness(opts: {
   const updateIssue = vi.fn(async () => undefined);
   const getIssue = vi.fn(async (id: string) => ({
     ...makeIssue(id),
+    state: opts.existingState ?? "open",
     labels: opts.existingLabels ?? [],
   }));
   const spawn = vi.fn(async () => ({ id: "spawned" }));
@@ -593,6 +596,91 @@ describe("backlog poller", () => {
 
     expect(harness.getIssue).toHaveBeenCalledWith("42", expect.anything());
     expect(harness.updateIssue).not.toHaveBeenCalled();
+  });
+
+  it("reopens and labels an auto-closed merged issue for verification", async () => {
+    // The tracker auto-closed the issue from a PR closing keyword on merge. A
+    // closed state alone is not AO verification — the issue must still be
+    // reopened and labeled merged-unverified so it reaches the (state:open-
+    // filtered) human-verification surfaces.
+    const harness = makeHarness({
+      backlogIssues: [],
+      sessions: [makeMergedSession("ao-1", "42")],
+      existingState: "closed",
+      existingLabels: [],
+    });
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.updateIssue).toHaveBeenCalledWith(
+      "42",
+      expect.objectContaining({ state: "open", labels: ["merged-unverified"] }),
+      expect.anything(),
+    );
+  });
+
+  it("clears verification labels when returning a reopened issue to the backlog", async () => {
+    // A web-verified issue is closed with `verified` + `agent:done`. When a
+    // human reopens it, relabeling to the backlog must drop ALL verification
+    // labels — otherwise the lingering `verified` makes spawnFromBacklog skip it
+    // forever via VERIFICATION_LABELS.
+    const reopenedIssue = {
+      ...makeIssue("42"),
+      labels: ["agent:done", "verified"],
+    } as Issue;
+    const listIssues = vi.fn(async (filters: { labels?: string[] }) =>
+      filters.labels?.includes("agent:done") ? [reopenedIssue] : [],
+    );
+    const updateIssue = vi.fn(async () => undefined);
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
+
+    const services: BacklogServices = {
+      config: {
+        projects: {
+          proj: {
+            name: "proj",
+            path: "/tmp/proj",
+            defaultBranch: "main",
+            sessionPrefix: "ao",
+            tracker: { plugin: "github" },
+          },
+        },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => []),
+        spawn,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(updateIssue).toHaveBeenCalledWith(
+      "42",
+      expect.objectContaining({
+        labels: ["agent:backlog"],
+        removeLabels: expect.arrayContaining([
+          "agent:done",
+          "verified",
+          "verification-failed",
+          "merged-unverified",
+        ]),
+      }),
+      expect.anything(),
+    );
   });
 
   it("does not respawn a backlog issue that is awaiting verification", async () => {

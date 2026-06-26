@@ -15,16 +15,21 @@ import {
   type BacklogServices,
   type OrchestratorConfig,
 } from "@aoagents/ao-core";
+import { loadMergedScopeConfig } from "./config-scope.js";
 import { getPluginRegistry, getSessionManager } from "./create-session-manager.js";
 
 let activePoller: BacklogPoller | null = null;
 
 /**
- * Resolve the freshest services for a poll cycle. Prefers the global registry
- * (so all projects are visible); falls back to the caller-resolved config path
- * when the global config is absent (first-run `ao start <url>` / `<path>`).
+ * Resolve the freshest services for a poll cycle. Unions the global registry
+ * (so all registered projects are visible) with the config that started this
+ * daemon, so a project launched from a non-canonical local/wrapped/URL config —
+ * one that isn't in the global registry yet — still has its `agent:backlog`
+ * issues auto-claimed. Falls back to the global registry, then cwd, when no
+ * startup config path is known.
  */
 function loadBacklogConfig(configPath?: string): OrchestratorConfig {
+  if (configPath) return loadMergedScopeConfig(configPath);
   const globalConfigPath = getGlobalConfigPath();
   try {
     return loadConfig(globalConfigPath);
@@ -36,7 +41,7 @@ function loadBacklogConfig(configPath?: string): OrchestratorConfig {
       "path" in error &&
       (error as Error & { path?: string }).path === globalConfigPath
     ) {
-      return configPath ? loadConfig(configPath) : loadConfig();
+      return loadConfig();
     }
     throw error;
   }

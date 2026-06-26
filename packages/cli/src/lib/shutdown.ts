@@ -13,13 +13,12 @@
  */
 
 import {
-  getGlobalConfigPath,
   isTerminalSession,
-  loadConfig,
   markDaemonShutdownHandlerInstalled,
   recordActivityEvent,
   sweepDaemonChildren,
 } from "@aoagents/ao-core";
+import { loadMergedScopeConfig } from "./config-scope.js";
 import { stopBunTmpJanitor } from "./bun-tmp-janitor.js";
 import { getSessionManager } from "./create-session-manager.js";
 import { stopAllLifecycleWorkers } from "./lifecycle-service.js";
@@ -37,42 +36,6 @@ const SHUTDOWN_TIMEOUT_MS = 10_000;
  * kill loop and last-stop write run.
  */
 const BACKLOG_DRAIN_TIMEOUT_MS = 3_000;
-
-/**
- * Load the config that defines the full shutdown scope. The backlog poller
- * spawns against the global config (all registered projects), so a full
- * graceful shutdown must enumerate all of them — matching `ao stop`, which
- * also kills sessions across every project.
- *
- * But the startup config matters too: when `ao start` runs from a non-canonical
- * local/wrapped config, its sessions are stored under a project scope that the
- * global registry may not include. Loading only the global config would leave
- * those sessions running and absent from last-stop. So union the two configs'
- * projects (startup wins on key collision — it's what actually spawned the
- * current sessions). Falls back to the startup config alone when no global
- * config exists (first-run `ao start <url>` / `<path>`).
- */
-function loadShutdownConfig(startupConfigPath: string): ReturnType<typeof loadConfig> {
-  const startupConfig = loadConfig(startupConfigPath);
-  const globalConfigPath = getGlobalConfigPath();
-  let globalConfig: ReturnType<typeof loadConfig>;
-  try {
-    globalConfig = loadConfig(globalConfigPath);
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      (error as NodeJS.ErrnoException).code === "ENOENT" &&
-      (error as Error & { path?: string }).path === globalConfigPath
-    ) {
-      return startupConfig;
-    }
-    throw error;
-  }
-  return {
-    ...globalConfig,
-    projects: { ...globalConfig.projects, ...startupConfig.projects },
-  };
-}
 
 export interface ShutdownContext {
   /** Path to the orchestrator config; re-read at shutdown time so any
@@ -169,7 +132,7 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
             data: { signal, timeoutMs: BACKLOG_DRAIN_TIMEOUT_MS },
           });
         }
-        const shutdownConfig = loadShutdownConfig(ctx.configPath);
+        const shutdownConfig = loadMergedScopeConfig(ctx.configPath);
         const sm = await getSessionManager(shutdownConfig);
         const allSessions = await sm.list();
         const activeSessions = allSessions.filter((s) => !isTerminalSession(s));
