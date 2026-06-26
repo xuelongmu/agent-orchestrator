@@ -429,7 +429,7 @@ describe("budget enforcement", () => {
     // Poll 1: the runtime interrupt fails transiently (tmux error / pty-host pipe
     // timeout). The session is still paused, but the interrupt latch must NOT be
     // set so a later poll retries instead of giving up.
-    vi.mocked(plugins.runtime.interrupt).mockRejectedValueOnce(new Error("pipe timeout"));
+    vi.mocked(plugins.runtime.interrupt!).mockRejectedValueOnce(new Error("pipe timeout"));
     const lm = setupCheck("app-1", {
       session: withCost(9.99),
       configOverride: { ...config, budget: { perSessionUsd: 5 } },
