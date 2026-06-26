@@ -62,7 +62,7 @@ import {
   isWeakActivityEvidence,
 } from "./activity-signal.js";
 import { isAgentReportFresh, mapAgentReportToLifecycle, readAgentReport } from "./agent-report.js";
-import { evaluateBudgetBreach } from "./budget.js";
+import { evaluateBudgetBreach, resolveBudget } from "./budget.js";
 import {
   auditAgentReports,
   getReactionKeyForTrigger,
@@ -2835,14 +2835,27 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           });
         }
       } else if (alreadyBudgetPaused) {
-        // No breach but previously paused: the cap was raised or removed. Clear
-        // the latch (and the interrupt flag) so a future breach notifies, re-
-        // records the pause event, and interrupts the agent again.
-        updateSessionMetadata(session, {
-          budgetPausedAt: "",
-          budgetPausedReason: "",
-          budgetInterrupted: "",
-        });
+        // No breach but previously paused. Only release the latch when we are
+        // sure the breach is genuinely gone — either the cap was removed, or we
+        // observed a real cost that is now under it. A transient
+        // getSessionInfo/log-read failure leaves agentInfo.cost absent, so
+        // evaluateBudgetBreach() sees $0 and reports no breach; clearing here
+        // would stop enforcing/retrying for a session that is still over budget.
+        // Keep the latch through that failure window.
+        const budget = resolveBudget(config, session.projectId);
+        const anyCapActive =
+          (typeof budget.perSessionUsd === "number" && budget.perSessionUsd > 0) ||
+          (typeof budget.perProjectUsd === "number" && budget.perProjectUsd > 0);
+        const costObserved =
+          projectCostUsd !== undefined ||
+          session.agentInfo?.cost?.estimatedCostUsd !== undefined;
+        if (!anyCapActive || costObserved) {
+          updateSessionMetadata(session, {
+            budgetPausedAt: "",
+            budgetPausedReason: "",
+            budgetInterrupted: "",
+          });
+        }
       }
     } else if (session.metadata["budgetPausedAt"]) {
       // Session moved on (PR opened, cleaned up, restored): clear the latch so a

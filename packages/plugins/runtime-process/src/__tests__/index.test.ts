@@ -492,8 +492,6 @@ describe("sendMessage()", () => {
 describe("interrupt()", () => {
   it("writes the Escape byte to stdin without a trailing newline (Unix)", async () => {
     const child = createMockChild();
-    // interrupt() does a fire-and-forget write (no callback), unlike sendMessage.
-    child.stdin.write = vi.fn((_data: string) => true);
     mockSpawn.mockReturnValue(child);
 
     const runtime = create();
@@ -501,7 +499,26 @@ describe("interrupt()", () => {
 
     await runtime.interrupt!(handle);
 
-    expect(child.stdin.write).toHaveBeenCalledWith("\x1b");
+    // The write is awaited (callback-style) so async EPIPE/ERR_STREAM_DESTROYED
+    // surfaces as a rejection — no trailing newline, unlike sendMessage.
+    expect(child.stdin.write).toHaveBeenCalledWith("\x1b", expect.any(Function));
+  });
+
+  it("rejects when the stdin Escape write fails asynchronously (EPIPE)", async () => {
+    // If the child closes stdin mid-pause, the write must reject so the caller
+    // does not latch a false interrupt success (and AO doesn't crash on an
+    // unhandled stream error).
+    const child = createMockChild();
+    child.stdin.write = vi.fn((_data: string, cb: (err?: Error | null) => void) => {
+      cb(new Error("write EPIPE"));
+      return false;
+    });
+    mockSpawn.mockReturnValue(child);
+
+    const runtime = create();
+    const handle = await runtime.create(defaultConfig());
+
+    await expect(runtime.interrupt!(handle)).rejects.toThrow(/EPIPE/);
   });
 
   it("sends SIGINT to the process group via the persisted PID for a recovered session", async () => {
@@ -541,6 +558,25 @@ describe("interrupt()", () => {
     const runtime = create();
     const handle: RuntimeHandle = { id: "no-pid", runtimeName: "process", data: {} };
     await expect(runtime.interrupt!(handle)).rejects.toThrow(/cannot interrupt process session/);
+  });
+
+  it("does not negative-PID signal a recovered session on Windows (POSIX-only)", async () => {
+    // Negative-PID process-group signalling is POSIX-only (docs/CROSS_PLATFORM).
+    // On Windows a recovered process-runtime handle with no pipe has no
+    // non-destructive interrupt channel — fail loudly instead of issuing a raw
+    // (destructive) signal.
+    mockIsWindows.mockReturnValue(true);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      const runtime = create();
+      await expect(runtime.interrupt!(makeHandle("recovered-win"))).rejects.toThrow(
+        /cannot interrupt process session/,
+      );
+      expect(killSpy).not.toHaveBeenCalled();
+    } finally {
+      killSpy.mockRestore();
+      mockIsWindows.mockReturnValue(false);
+    }
   });
 
   it("sends the raw Escape byte via the pty-host on Windows", async () => {
