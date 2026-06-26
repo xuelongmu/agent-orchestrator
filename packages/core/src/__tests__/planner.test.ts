@@ -198,8 +198,21 @@ describe("createPlanTickets", () => {
 
     await expect(
       createPlanTickets({ plan: p, tracker, project: baseProject }),
-    ).rejects.toThrow(/Cross-repo dependency/);
+    ).rejects.toThrow(/Cross-repo relation/);
     expect(calls).toHaveLength(0); // nothing created
+  });
+
+  it("rejects cross-repo related edges before creating anything", async () => {
+    const { tracker, calls } = makeMockTracker();
+    const p = plan([
+      { ref: "api", title: "API", body: "", repo: "acme/api" },
+      { ref: "web", title: "Web", body: "", relatedRefs: ["api"] }, // web in acme/app
+    ]);
+
+    await expect(
+      createPlanTickets({ plan: p, tracker, project: baseProject }),
+    ).rejects.toThrow(/Cross-repo relation/);
+    expect(calls).toHaveLength(0);
   });
 
   it("throws when the tracker cannot create issues", async () => {
@@ -224,6 +237,21 @@ describe("decomposeGoal", () => {
     });
     expect(runPlanner).toHaveBeenCalledOnce();
     expect(result.tickets[0].ref).toBe("t1");
+  });
+
+  it("passes the model through to the runner context", async () => {
+    const runPlanner = vi.fn(async (ctx) => {
+      expect(ctx.model).toBe("gpt-x");
+      return { rawOutput: '{"tickets":[{"ref":"t1","title":"A"}]}' };
+    });
+    await decomposeGoal({
+      goal: "do a thing",
+      project: baseProject,
+      projectId: "demo",
+      model: "gpt-x",
+      runPlanner,
+    });
+    expect(runPlanner).toHaveBeenCalledOnce();
   });
 
   it("throws when the planner returns no output", async () => {
@@ -277,19 +305,48 @@ describe("decomposer agent resolution", () => {
 });
 
 describe("decomposer command construction", () => {
-  it("builds codex headless args", () => {
-    const args = buildCodexDecomposerArgs("/out.json", "the prompt");
-    expect(args).toEqual(["exec", "--sandbox", "read-only", "--output-last-message", "/out.json", "the prompt"]);
+  it("builds codex headless args with no prompt in argv", () => {
+    // Prompt is delivered over stdin, never on the command line.
+    expect(buildCodexDecomposerArgs("/out.json")).toEqual([
+      "exec",
+      "--sandbox",
+      "read-only",
+      "--output-last-message",
+      "/out.json",
+    ]);
   });
 
-  it("builds claude print args in read-only plan mode", () => {
-    expect(buildClaudeDecomposerArgs("the prompt")).toEqual([
+  it("threads a model into codex args", () => {
+    expect(buildCodexDecomposerArgs("/out.json", "gpt-x")).toEqual([
+      "exec",
+      "--sandbox",
+      "read-only",
+      "--model",
+      "gpt-x",
+      "--output-last-message",
+      "/out.json",
+    ]);
+  });
+
+  it("builds claude print args in read-only plan mode with no prompt in argv", () => {
+    expect(buildClaudeDecomposerArgs()).toEqual([
       "-p",
-      "the prompt",
       "--permission-mode",
       "plan",
       "--output-format",
       "text",
+    ]);
+  });
+
+  it("threads a model into claude args", () => {
+    expect(buildClaudeDecomposerArgs("claude-x")).toEqual([
+      "-p",
+      "--permission-mode",
+      "plan",
+      "--output-format",
+      "text",
+      "--model",
+      "claude-x",
     ]);
   });
 

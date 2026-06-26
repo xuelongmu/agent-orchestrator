@@ -490,7 +490,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function mergeRoleBehavior(
   defaults: Record<string, unknown>,
   project: Record<string, unknown>,
-  key: "orchestrator" | "worker",
+  key: "orchestrator" | "worker" | "decomposer",
 ): Record<string, unknown> | undefined {
   const defaultRole = isRecord(defaults[key]) ? defaults[key] : undefined;
   const projectRole = isRecord(project[key]) ? project[key] : undefined;
@@ -523,6 +523,7 @@ function buildRepairedLocalProjectConfig(
     displayName: _displayName,
     orchestrator: _orchestrator,
     worker: _worker,
+    decomposer: _decomposer,
     ...projectBehavior
   } = project;
   void _name;
@@ -534,6 +535,7 @@ function buildRepairedLocalProjectConfig(
   void _displayName;
   void _orchestrator;
   void _worker;
+  void _decomposer;
 
   const behavior = {
     ...defaultBehavior,
@@ -541,8 +543,10 @@ function buildRepairedLocalProjectConfig(
   };
   const orchestrator = mergeRoleBehavior(defaults, project, "orchestrator");
   const worker = mergeRoleBehavior(defaults, project, "worker");
+  const decomposer = mergeRoleBehavior(defaults, project, "decomposer");
   if (orchestrator) behavior["orchestrator"] = orchestrator;
   if (worker) behavior["worker"] = worker;
+  if (decomposer) behavior["decomposer"] = decomposer;
   return behavior;
 }
 
