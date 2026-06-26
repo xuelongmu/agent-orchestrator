@@ -459,6 +459,7 @@ export function create(): Runtime {
             throw new Error(
               `cannot interrupt process session ${handle.id} via persisted PID ${pid}: ` +
                 `${err2 instanceof Error ? err2.message : String(err2)}`,
+              { cause: err2 },
             );
           }
         }
