@@ -13,6 +13,7 @@
  */
 
 import {
+  isBlockedByDependency,
   isTerminalSession,
   loadConfig,
   markDaemonShutdownHandlerInstalled,
@@ -97,7 +98,13 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
         const shutdownConfig = loadConfig(ctx.configPath);
         const sm = await getSessionManager(shutdownConfig);
         const allSessions = await sm.list();
-        const activeSessions = allSessions.filter((s) => !isTerminalSession(s));
+        // Held (blocked-by-dependency) sessions own no runtime — there is nothing
+        // to stop. Leave their reservation on disk so the scheduler resumes them
+        // on the next `ao start` instead of `kill()` terminating them and losing
+        // the held marker across stop/restore (#10).
+        const activeSessions = allSessions.filter(
+          (s) => !isTerminalSession(s) && !isBlockedByDependency(s.lifecycle),
+        );
 
         const killedSessionIds: string[] = [];
         for (const session of activeSessions) {

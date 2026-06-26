@@ -138,4 +138,14 @@ describe("countActiveSessions", () => {
     ];
     expect(countActiveSessions(sessions, "app")).toBe(2);
   });
+
+  it("counts a merged session still in its post-merge cleanup grace window", () => {
+    // `merged` is terminal for status purposes, but the worker is still alive
+    // until auto-cleanup completes, so it must occupy a concurrency slot.
+    const sessions = [
+      makeSession({ id: "app-1", projectId: "app", status: "merged" }), // grace → counts
+      makeSession({ id: "app-2", projectId: "app", status: "done" }), // cleaned → excluded
+    ];
+    expect(countActiveSessions(sessions, "app")).toBe(1);
+  });
 });

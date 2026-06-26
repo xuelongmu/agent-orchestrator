@@ -23,6 +23,7 @@ import {
   getOrchestratorSessionId,
   isRepoUrl,
   configToYaml,
+  isBlockedByDependency,
   isCanonicalGlobalConfigPath,
   isTerminalSession,
   getDefaultRuntime,
@@ -2019,7 +2020,13 @@ export function registerStop(program: Command): void {
           const allSessions = stopAll
             ? rawSessions
             : rawSessions.filter((s) => s.projectId === _projectId);
-          const activeSessions = allSessions.filter((s) => !isTerminalSession(s));
+          // Held (blocked-by-dependency) sessions own no runtime to stop. Leave
+          // their reservation on disk so the scheduler resumes them on the next
+          // `ao start` rather than terminating them and losing the held marker
+          // across stop/restore (#10).
+          const activeSessions = allSessions.filter(
+            (s) => !isTerminalSession(s) && !isBlockedByDependency(s.lifecycle),
+          );
           const killedSessionIds: string[] = [];
 
           // Separate sessions by project for display and recording

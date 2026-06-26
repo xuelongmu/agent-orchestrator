@@ -103,8 +103,16 @@ export function computeRemainingBlockedBy(
 
 /**
  * Count the sessions occupying a concurrency slot in a project: launched (not
- * held in the blocked pre-state) and not yet terminal. Orchestrator sessions
- * are excluded — the cap governs concurrent worker agents.
+ * held in the blocked pre-state) workers whose agent process is still alive.
+ * Orchestrator sessions are excluded — the cap governs concurrent worker agents.
+ *
+ * A `merged` session is terminal for status purposes, but its worker keeps
+ * running through the post-merge auto-cleanup grace window (cleanup is deferred
+ * while the agent is active / waiting for input). It must still count against
+ * the cap — otherwise `maxConcurrent: 1` would launch a dependent while the
+ * merged agent is still alive, breaking the bound on concurrent workers. Once
+ * cleanup completes the status moves off `merged` (to killed/done/cleanup) and
+ * it stops counting.
  */
 export function countActiveSessions(sessions: Session[], projectId: string): number {
   return sessions.filter(
@@ -112,7 +120,7 @@ export function countActiveSessions(sessions: Session[], projectId: string): num
       s.projectId === projectId &&
       s.metadata["role"] !== "orchestrator" &&
       !s.id.endsWith("-orchestrator") &&
-      !TERMINAL_STATUSES.has(s.status) &&
+      (!TERMINAL_STATUSES.has(s.status) || s.status === "merged") &&
       !isBlockedByDependency(s.lifecycle),
   ).length;
 }

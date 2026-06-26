@@ -372,6 +372,11 @@ function eventToReactionKey(eventType: EventType): string | null {
       return "merge-conflicts";
     case "merge.ready":
       return "approved-and-green";
+    case "merge.completed":
+      // Fires when a PR actually merges (status → merged), unlike
+      // `approved-and-green` which fires on merge.ready before the merge lands.
+      // Lets a `spawn-session` reaction launch dependents on the real merge (#10).
+      return "pr-merged";
     case "session.stuck":
       return "agent-stuck";
     case "session.needs_input":
@@ -3157,7 +3162,18 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * Returns the number of sessions launched this pass.
    */
   async function runScheduler(sessions: Session[]): Promise<number> {
-    const held = sessions.filter((s) => isBlockedByDependency(s.lifecycle));
+    // `sessions` is an UNSCOPED snapshot (every project) so a merge in one
+    // project can satisfy a dependent in another. Held sessions are still
+    // narrowed/launched only for this worker's own scope — when the lifecycle
+    // worker is project-scoped (the CLI default, lifecycle-service.ts), each
+    // worker owns its project's dependents while reading every project's merges.
+    // An unscoped worker (scopedProjectId undefined) owns them all. This keeps
+    // two project workers from racing to launch the same dependent.
+    const held = sessions.filter(
+      (s) =>
+        isBlockedByDependency(s.lifecycle) &&
+        (scopedProjectId === undefined || s.projectId === scopedProjectId),
+    );
     if (held.length === 0) return 0;
 
     const satisfied = collectSatisfiedDependencies(sessions);
@@ -3243,9 +3259,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   /** Run a scheduler pass against a freshly-listed session set. Backs the
-   *  `spawn-session` reaction action so it can be triggered on demand. */
+   *  `spawn-session` reaction action so it can be triggered on demand. The list
+   *  is UNSCOPED so a merge in one project can unblock a dependent in another;
+   *  `runScheduler` still acts only on this worker's scoped dependents. */
   async function spawnDependentSessions(): Promise<number> {
-    const sessions = await sessionManager.list(scopedProjectId);
+    const sessions = await sessionManager.list();
     return runScheduler(sessions);
   }
 
@@ -3286,10 +3304,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
       // Dependency scheduler (#10): unblock and launch held sessions whose
       // prerequisites just merged. Runs after checkSession so newly-merged
-      // PR state is reflected in the in-memory session objects. Best-effort —
-      // a failure here must never abort the rest of the poll cycle.
+      // PR state is reflected on disk (checkSession persists the merged
+      // lifecycle before this point). Uses an UNSCOPED list so a merge in one
+      // project can satisfy a dependent in another even when this worker is
+      // project-scoped; `runScheduler` still only launches this scope's
+      // dependents. Best-effort — a failure here must never abort the poll.
       try {
-        await runScheduler(sessions);
+        const schedulerSessions =
+          scopedProjectId === undefined ? sessions : await sessionManager.list();
+        await runScheduler(schedulerSessions);
       } catch (err) {
         recordActivityEvent({
           projectId: scopedProjectId,
