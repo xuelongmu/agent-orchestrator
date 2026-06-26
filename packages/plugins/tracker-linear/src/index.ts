@@ -626,8 +626,13 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
         }
       }
 
-      // Handle labels (additive — merge with existing labels to match tracker-github behavior)
-      if (update.labels && update.labels.length > 0) {
+      // Handle labels — additive for `labels`, subtractive for `removeLabels`
+      // (mirrors tracker-github, whose add/remove the backlog poller's claim and
+      // verification flows depend on; without removeLabels support a merged
+      // issue keeps `agent:backlog` and gets respawned).
+      const addLabels = update.labels ?? [];
+      const removeLabels = update.removeLabels ?? [];
+      if (addLabels.length > 0 || removeLabels.length > 0) {
         // Fetch existing label IDs on the issue
         const existingData = await query<{
           issue: { labels: { nodes: Array<{ id: string }> } };
@@ -641,7 +646,7 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
         );
         const existingIds = new Set(existingData.issue.labels.nodes.map((l) => l.id));
 
-        // Resolve new label names to IDs
+        // Resolve label names to IDs
         const labelsData = await query<{
           issueLabels: { nodes: Array<{ id: string; name: string }> };
         }>(
@@ -654,9 +659,13 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
         );
 
         const labelMap = new Map(labelsData.issueLabels.nodes.map((l) => [l.name, l.id]));
-        for (const name of update.labels) {
+        for (const name of addLabels) {
           const id = labelMap.get(name);
           if (id) existingIds.add(id);
+        }
+        for (const name of removeLabels) {
+          const id = labelMap.get(name);
+          if (id) existingIds.delete(id);
         }
 
         await query(

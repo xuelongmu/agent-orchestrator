@@ -687,6 +687,34 @@ describe("tracker-linear plugin", () => {
       );
       expect(body.variables.labelIds).toHaveLength(3);
     });
+
+    it("removes labels subtractively (drops from existing)", async () => {
+      // 1: resolve identifier
+      mockLinearAPI({ issue: { id: "uuid-123", team: { id: "team-1" } } });
+      // 2: fetch existing labels on the issue (backlog + keep)
+      mockLinearAPI({
+        issue: { labels: { nodes: [{ id: "label-backlog" }, { id: "label-keep" }] } },
+      });
+      // 3: team label lookup
+      mockLinearAPI({
+        issueLabels: {
+          nodes: [
+            { id: "label-backlog", name: "agent:backlog" },
+            { id: "label-keep", name: "agent:in-progress" },
+          ],
+        },
+      });
+      // 4: issueUpdate (labels)
+      mockLinearAPI({ issueUpdate: { success: true } });
+
+      await tracker.updateIssue!("INT-123", { removeLabels: ["agent:backlog"] }, project);
+      expect(requestMock).toHaveBeenCalledTimes(4);
+
+      const writeCall = requestMock.mock.results[3].value.write.mock.calls[0][0];
+      const body = JSON.parse(writeCall);
+      // agent:backlog dropped; agent:in-progress retained.
+      expect(body.variables.labelIds).toEqual(["label-keep"]);
+    });
   });
 
   // ---- createIssue -------------------------------------------------------

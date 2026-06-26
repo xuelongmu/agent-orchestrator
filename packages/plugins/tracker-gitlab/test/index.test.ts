@@ -358,6 +358,16 @@ describe("tracker-gitlab plugin", () => {
       );
     });
 
+    it("removes labels via --unlabel", async () => {
+      glabMock.mockResolvedValueOnce({ stdout: "" });
+      await tracker.updateIssue!("123", { removeLabels: ["agent:backlog"] }, project);
+      expect(glabMock).toHaveBeenCalledWith(
+        "glab",
+        ["issue", "update", "123", "--repo", "acme/repo", "--unlabel", "agent:backlog"],
+        expect.any(Object),
+      );
+    });
+
     it("adds comment", async () => {
       glabMock.mockResolvedValueOnce({ stdout: "" });
       await tracker.updateIssue!("123", { comment: "Working on this" }, project);

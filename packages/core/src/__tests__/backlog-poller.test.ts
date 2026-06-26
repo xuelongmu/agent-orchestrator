@@ -574,6 +574,88 @@ describe("backlog poller", () => {
     rmSync(lockPath, { force: true });
   });
 
+  it("does not re-label a merged issue that already completed verification", async () => {
+    // After `ao verify` removed `merged-unverified` and added `verified`, the
+    // merged session is still on disk; after a daemon restart `processedIssues`
+    // is empty. The poller must not drag the verified issue back into the verify
+    // queue or post a duplicate verification comment.
+    const harness = makeHarness({
+      backlogIssues: [],
+      sessions: [makeMergedSession("ao-1", "42")],
+      existingLabels: ["verified"],
+    });
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.getIssue).toHaveBeenCalledWith("42", expect.anything());
+    expect(harness.updateIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not respawn a backlog issue that is awaiting verification", async () => {
+    // On trackers whose updateIssue ignores removeLabels (Linear, GitLab), a
+    // merged issue keeps `agent:backlog` alongside `merged-unverified`. Its
+    // session is merged (excluded from workerSessions), so only the verification
+    // -label skip stops a fresh worker from being spawned for it.
+    const issue = {
+      ...makeIssue("42"),
+      labels: ["agent:backlog", "merged-unverified"],
+    } as Issue;
+    const harness = makeHarness({
+      backlogIssues: [issue],
+      maxConcurrentAgents: 5,
+    });
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.spawn).not.toHaveBeenCalled();
+  });
+
+  it("aborts pending spawns when stop() is called mid-poll", async () => {
+    // A poll stuck in a slow `sessionManager.list()` (or tracker call) that
+    // resumes after shutdown began must not spawn a worker the graceful-stop
+    // path already passed. stop() aborts the in-flight poll, so when it resumes
+    // it skips the spawn loop.
+    const lockPath = join(tmp, "backlog-poll.lock");
+    let releaseList: () => void = () => {};
+    const harness = makeHarness({
+      backlogIssues: [makeIssue("1")],
+      maxConcurrentAgents: 5,
+    });
+    (harness.services.sessionManager.list as ReturnType<typeof vi.fn>).mockImplementation(
+      async () => {
+        await new Promise<void>((resolve) => {
+          releaseList = resolve;
+        });
+        return [];
+      },
+    );
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath,
+    });
+
+    poller.start();
+    // Let the immediate poll reach the blocked list() call.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Shutdown: stop() aborts the in-flight poll, then unblock list() so the
+    // poll resumes past it toward the (now-skipped) spawn loop.
+    const stopPromise = poller.stop();
+    releaseList();
+    await stopPromise;
+
+    expect(harness.spawn).not.toHaveBeenCalled();
+  });
+
   it("does not reclaim a fresh lock held by another process", async () => {
     const lockPath = join(tmp, "backlog-poll.lock");
     const fd = openSync(lockPath, "wx"); // fresh lock (current mtime)

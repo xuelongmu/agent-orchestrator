@@ -42,23 +42,36 @@ const BACKLOG_DRAIN_TIMEOUT_MS = 3_000;
  * Load the config that defines the full shutdown scope. The backlog poller
  * spawns against the global config (all registered projects), so a full
  * graceful shutdown must enumerate all of them — matching `ao stop`, which
- * also kills sessions across every project. Falls back to the startup config
- * when no global config exists (first-run `ao start <url>` / `<path>`).
+ * also kills sessions across every project.
+ *
+ * But the startup config matters too: when `ao start` runs from a non-canonical
+ * local/wrapped config, its sessions are stored under a project scope that the
+ * global registry may not include. Loading only the global config would leave
+ * those sessions running and absent from last-stop. So union the two configs'
+ * projects (startup wins on key collision — it's what actually spawned the
+ * current sessions). Falls back to the startup config alone when no global
+ * config exists (first-run `ao start <url>` / `<path>`).
  */
 function loadShutdownConfig(startupConfigPath: string): ReturnType<typeof loadConfig> {
+  const startupConfig = loadConfig(startupConfigPath);
   const globalConfigPath = getGlobalConfigPath();
+  let globalConfig: ReturnType<typeof loadConfig>;
   try {
-    return loadConfig(globalConfigPath);
+    globalConfig = loadConfig(globalConfigPath);
   } catch (error) {
     if (
       error instanceof Error &&
       (error as NodeJS.ErrnoException).code === "ENOENT" &&
       (error as Error & { path?: string }).path === globalConfigPath
     ) {
-      return loadConfig(startupConfigPath);
+      return startupConfig;
     }
     throw error;
   }
+  return {
+    ...globalConfig,
+    projects: { ...globalConfig.projects, ...startupConfig.projects },
+  };
 }
 
 export interface ShutdownContext {

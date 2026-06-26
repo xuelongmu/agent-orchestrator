@@ -43,6 +43,22 @@ export const BACKLOG_LABEL = "agent:backlog";
 /** Tracker label marking a merged issue awaiting human verification. */
 export const MERGED_UNVERIFIED_LABEL = "merged-unverified";
 
+/**
+ * Labels indicating an issue has already entered or completed the human-
+ * verification flow (`ao verify` / the web verify tab). A merged issue carrying
+ * any of these must neither be re-labeled for verification nor respawned as a
+ * backlog worker: `merged-unverified` is awaiting review, `verified` /
+ * `verification-failed` are post-review terminal states, and `agent:done` marks
+ * completed work. Shared by the labeling and spawn paths so both honor the same
+ * source of truth.
+ */
+export const VERIFICATION_LABELS = [
+  MERGED_UNVERIFIED_LABEL,
+  "verified",
+  "verification-failed",
+  "agent:done",
+];
+
 /** Default interval between backlog poll cycles (1 minute). */
 export const BACKLOG_POLL_INTERVAL_MS = 60_000;
 
@@ -245,13 +261,20 @@ async function labelIssuesForVerification(
       continue;
     }
 
-    // Cross-process dedupe: another poller process (CLI daemon vs dashboard)
-    // may have already labeled this issue — our in-memory `processedIssues`
-    // set is per-process, so check the tracker's authoritative state before
-    // posting the verification comment again.
+    // Consult the tracker's authoritative state before (re-)labeling. This
+    // guards two cases: a peer poller process may have already labeled the
+    // issue (our in-memory `processedIssues` set is per-process), and after a
+    // daemon restart `processedIssues` is empty while the merged session is
+    // still on disk. Skip if the issue is closed or already carries a
+    // verification label — otherwise a verified / verification-failed issue
+    // (whose `merged-unverified` was removed by `ao verify`) would get dragged
+    // back into the verify queue and receive a duplicate verification comment.
     try {
       const current = await tracker.getIssue(issueId, project);
-      if (current.labels.includes(MERGED_UNVERIFIED_LABEL)) {
+      const alreadyInVerifyFlow =
+        current.state === "closed" ||
+        VERIFICATION_LABELS.some((label) => current.labels.includes(label));
+      if (alreadyInVerifyFlow) {
         processedIssues.add(key);
         continue;
       }
@@ -330,7 +353,10 @@ async function spawnFromBacklog(
   registry: PluginRegistry,
   sessionManager: OpenCodeSessionManager,
   logger?: BacklogLogger,
+  signal?: AbortSignal,
 ): Promise<void> {
+  if (signal?.aborted) return;
+
   const allSessionPrefixes = Object.entries(config.projects).map(
     ([id, p]) => p.sessionPrefix ?? id,
   );
@@ -408,6 +434,19 @@ async function spawnFromBacklog(
     for (const issue of backlogIssues) {
       if (availableSlots <= 0) break;
 
+      // Shutdown requested mid-cycle (stop() aborted us) — bail before creating
+      // any further worker, so a spawn can't slip in after the graceful-stop
+      // path has already enumerated sessions to kill / written last-stop.
+      if (signal?.aborted) return;
+
+      // A merged issue awaiting human verification can still carry
+      // `agent:backlog`: trackers whose `updateIssue` ignores `removeLabels`
+      // (Linear, GitLab) never drop it, and a failed claim call can leave it on
+      // any tracker. The session is merged (excluded from `workerSessions`), so
+      // nothing else guards it — skip any issue already in the verification
+      // flow rather than respawn a worker for it.
+      if (VERIFICATION_LABELS.some((label) => issue.labels.includes(label))) continue;
+
       // Canonicalize via the tracker's own `issueUrl()` rather than trusting
       // the listed `issue.url`. `takenIssueUrls` is built from `issueUrl()`
       // (line above), but some trackers' `listIssues()` returns a URL that
@@ -472,6 +511,12 @@ export function createBacklogPoller(options: BacklogPollerOptions): BacklogPolle
   // The currently-running poll, if any. Tracked so `stop()` can await an
   // in-flight spawn before shutdown enumerates sessions to kill.
   let activePoll: Promise<void> | undefined;
+  // Aborts the in-flight poll's pending spawns when `stop()` is called. Merely
+  // awaiting the poll isn't enough: a poll stuck in a slow tracker call or
+  // `sessionManager.spawn()` can resume after the bounded shutdown drain and
+  // spawn a worker the graceful-stop path has already passed. Aborting makes
+  // the poll skip any remaining spawns.
+  let activeAbort: AbortController | undefined;
 
   async function pollOnce(): Promise<void> {
     const lock = lockPath ? tryAcquireLock(lockPath) : null;
@@ -480,17 +525,20 @@ export function createBacklogPoller(options: BacklogPollerOptions): BacklogPolle
       return;
     }
 
+    const abort = new AbortController();
+    activeAbort = abort;
     try {
       const { config, registry, sessionManager } = await resolveServices();
 
       const allSessions = await sessionManager.list();
       await labelIssuesForVerification(allSessions, config, registry, processedIssues, logger);
       await relabelReopenedIssues(config, registry, logger);
-      await spawnFromBacklog(allSessions, config, registry, sessionManager, logger);
+      await spawnFromBacklog(allSessions, config, registry, sessionManager, logger, abort.signal);
     } catch (err) {
       logger?.error?.("[backlog] Poll failed:", err);
     } finally {
       lock?.release();
+      if (activeAbort === abort) activeAbort = undefined;
     }
   }
 
@@ -521,8 +569,11 @@ export function createBacklogPoller(options: BacklogPollerOptions): BacklogPolle
       if (timer) clearInterval(timer);
       timer = undefined;
       started = false;
-      // Wait for an in-flight poll (e.g. a spawn) to settle so a session
-      // created right before shutdown is still seen by the graceful-stop path.
+      // Cancel the in-flight poll's pending spawns first, then wait for it to
+      // settle. Aborting (not just awaiting) ensures a poll that resumes from a
+      // slow tracker call / spawn after the bounded shutdown drain can't create
+      // a worker the graceful-stop path has already enumerated and passed.
+      activeAbort?.abort();
       await activePoll;
     },
     pollOnce,
