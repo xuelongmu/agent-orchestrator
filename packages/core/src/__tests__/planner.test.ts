@@ -250,15 +250,22 @@ describe("decomposer agent resolution", () => {
     expect(resolveDecomposerAgent({})).toBe("claude-code");
   });
 
-  it("decomposer default outranks orchestrator/worker roles", () => {
+  it("decomposer config (project or defaults) outranks role-borrowing fallbacks", () => {
+    // A project-level decomposer override wins over everything.
+    expect(
+      resolveDecomposerAgent(
+        { decomposer: { agent: "aider" }, orchestrator: { agent: "claude" } },
+        { decomposer: { agent: "codex" } },
+      ),
+    ).toBe("aider");
+    // With no project decomposer, the defaults.decomposer agent outranks the
+    // project's orchestrator/worker roles — the decomposer dimension is more
+    // specific than borrowing the orchestrator agent.
     expect(
       resolveDecomposerAgent(
         { orchestrator: { agent: "claude" } },
         { decomposer: { agent: "codex" } },
       ),
-    ).toBe("claude"); // project-level decomposer/orchestrator beats defaults
-    expect(
-      resolveDecomposerAgent({}, { decomposer: { agent: "codex" }, orchestrator: { agent: "claude" } }),
     ).toBe("codex");
   });
 
