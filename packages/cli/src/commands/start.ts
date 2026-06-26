@@ -2025,7 +2025,7 @@ export function registerStop(program: Command): void {
           // `ao start` rather than terminating them and losing the held marker
           // across stop/restore (#10).
           const activeSessions = allSessions.filter(
-            (s) => !isTerminalSession(s) && !isBlockedByDependency(s.lifecycle),
+            (s) => !isTerminalSession(s) && !(s.lifecycle && isBlockedByDependency(s.lifecycle)),
           );
           const killedSessionIds: string[] = [];
 

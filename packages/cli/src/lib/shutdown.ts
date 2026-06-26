@@ -103,7 +103,7 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
         // on the next `ao start` instead of `kill()` terminating them and losing
         // the held marker across stop/restore (#10).
         const activeSessions = allSessions.filter(
-          (s) => !isTerminalSession(s) && !isBlockedByDependency(s.lifecycle),
+          (s) => !isTerminalSession(s) && !(s.lifecycle && isBlockedByDependency(s.lifecycle)),
         );
 
         const killedSessionIds: string[] = [];

@@ -1668,7 +1668,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       // for a name the user explicitly set.
       const heldMetadata = options?.reuseIdentity?.heldMetadata;
       const displayName = heldMetadata?.["displayName"] ?? derivedDisplayName;
-      const displayNameUserSet = heldMetadata?.["displayNameUserSet"];
+      const heldDisplayNameUserSet =
+        heldMetadata?.["displayNameUserSet"] === "true" ||
+        heldMetadata?.["displayNameUserSet"] === "on";
 
       // Write metadata and run post-launch setup
       const createdAt = new Date();
@@ -1701,7 +1703,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           ...(reusedOpenCodeSessionId ? { opencodeSessionId: reusedOpenCodeSessionId } : {}),
           ...(spawnConfig.prompt ? { userPrompt: spawnConfig.prompt } : {}),
           ...(displayName ? { displayName } : {}),
-          ...(displayNameUserSet ? { displayNameUserSet } : {}),
+          ...(heldDisplayNameUserSet ? { displayNameUserSet: "true" } : {}),
         },
       };
 
@@ -1730,7 +1732,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         dependsOn,
         userPrompt: spawnConfig.prompt,
         displayName,
-        ...(displayNameUserSet ? { displayNameUserSet } : {}),
+        ...(heldDisplayNameUserSet ? { displayNameUserSet: true } : {}),
       });
 
       if (plugins.agent.postLaunchSetup) {

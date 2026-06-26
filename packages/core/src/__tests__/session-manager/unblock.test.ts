@@ -10,7 +10,6 @@ import type {
   PluginRegistry,
   Runtime,
   Agent,
-  Workspace,
   SessionMetadata,
 } from "../../types.js";
 import {
@@ -23,13 +22,12 @@ let ctx: TestContext;
 let sessionsDir: string;
 let mockRuntime: Runtime;
 let mockAgent: Agent;
-let mockWorkspace: Workspace;
 let mockRegistry: PluginRegistry;
 let config: OrchestratorConfig;
 
 beforeEach(() => {
   ctx = setupTestContext();
-  ({ sessionsDir, mockRuntime, mockAgent, mockWorkspace, mockRegistry, config } = ctx);
+  ({ sessionsDir, mockRuntime, mockAgent, mockRegistry, config } = ctx);
 });
 
 afterEach(() => {
