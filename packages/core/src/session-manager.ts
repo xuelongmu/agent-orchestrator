@@ -1298,7 +1298,16 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     }
   }
 
-  async function _spawnInner(spawnConfig: SessionSpawnConfig): Promise<Session> {
+  async function _spawnInner(
+    spawnConfig: SessionSpawnConfig,
+    options?: {
+      reuseIdentity?: {
+        sessionId: string;
+        tmuxName: string | undefined;
+        heldMetadata: Record<string, string>;
+      };
+    },
+  ): Promise<Session> {
     const project = config.projects[spawnConfig.projectId];
     if (!project) {
       throw new Error(`Unknown project: ${spawnConfig.projectId}`);
@@ -1365,9 +1374,34 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     try {
       // Determine session ID — atomically reserve to prevent concurrent collisions
       let tmuxName: string | undefined;
-      ({ sessionId, tmuxName } = await reserveNextSessionIdentity(project, sessionsDir));
-      const reservedSessionId = sessionId;
-      cleanupStack.push(() => deleteMetadata(sessionsDir, reservedSessionId));
+      if (options?.reuseIdentity) {
+        // Relaunch of a previously-held session (#10): reuse its already-reserved
+        // id and branch rather than allocating a new one. The held metadata file
+        // already exists; the launch below overwrites it (clearing `blockedBy`).
+        sessionId = options.reuseIdentity.sessionId;
+        tmuxName = options.reuseIdentity.tmuxName;
+        // Restore the held record if a LATER launch step fails. The launch's
+        // writeMetadata overwrites the held record with a launched lifecycle and
+        // empty `blockedBy` *before* postLaunchSetup / prompt delivery run; if
+        // one of those throws, rollback tears down the runtime/workspace but
+        // would otherwise leave a torn-down "launched" record the scheduler never
+        // retries. Pushed first → runs last (LIFO), after the runtime/workspace
+        // destroys, so the file ends in its original held form. The snapshot is
+        // written verbatim (worktree:"" and no runtimeHandle), clearing the
+        // launch pointers.
+        const reusedSessionId = sessionId;
+        const heldSnapshot = { ...options.reuseIdentity.heldMetadata };
+        cleanupStack.push(() => {
+          mutateMetadata(sessionsDir, reusedSessionId, () => ({ ...heldSnapshot }), {
+            createIfMissing: true,
+          });
+          invalidateCache();
+        });
+      } else {
+        ({ sessionId, tmuxName } = await reserveNextSessionIdentity(project, sessionsDir));
+        const reservedSessionId = sessionId;
+        cleanupStack.push(() => deleteMetadata(sessionsDir, reservedSessionId));
+      }
 
       // Determine branch name — explicit branch always takes priority
       let branch: string;
@@ -1624,10 +1658,19 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       // enrichment (which is a live tracker API call), this value is captured at
       // spawn time and persisted, so the dashboard has a good name even when the
       // tracker is unavailable or the session has no attached PR yet.
-      const displayName = deriveDisplayName({
+      const derivedDisplayName = deriveDisplayName({
         issueTitle: resolvedIssue?.title,
         prompt: spawnConfig.prompt,
       });
+      // Relaunch of a held session (#10): preserve the title the user gave it in
+      // the dashboard (and the `displayNameUserSet` flag) instead of overwriting
+      // it with a freshly-derived name. The held record is the source of truth
+      // for a name the user explicitly set.
+      const heldMetadata = options?.reuseIdentity?.heldMetadata;
+      const displayName = heldMetadata?.["displayName"] ?? derivedDisplayName;
+      const heldDisplayNameUserSet =
+        heldMetadata?.["displayNameUserSet"] === "true" ||
+        heldMetadata?.["displayNameUserSet"] === "on";
 
       // Write metadata and run post-launch setup
       const createdAt = new Date();
@@ -1660,6 +1703,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           ...(reusedOpenCodeSessionId ? { opencodeSessionId: reusedOpenCodeSessionId } : {}),
           ...(spawnConfig.prompt ? { userPrompt: spawnConfig.prompt } : {}),
           ...(displayName ? { displayName } : {}),
+          ...(heldDisplayNameUserSet ? { displayNameUserSet: "true" } : {}),
         },
       };
 
@@ -1688,6 +1732,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         dependsOn,
         userPrompt: spawnConfig.prompt,
         displayName,
+        ...(heldDisplayNameUserSet ? { displayNameUserSet: true } : {}),
       });
 
       if (plugins.agent.postLaunchSetup) {
@@ -1763,6 +1808,70 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       });
       throw err;
     }
+  }
+
+  /**
+   * Launch a session previously held in the `blocked_by_dependency` pre-state,
+   * reusing its reserved identity and branch. Called by the dependency
+   * scheduler (#10) once all of a session's prerequisites have merged.
+   *
+   * Idempotent: if the located record is no longer held (already launched, or
+   * never blocked) the current session is returned without relaunching, so
+   * repeated scheduler passes never double-spawn.
+   */
+  async function unblock(sessionId: SessionId): Promise<Session> {
+    const located = findSessionRecord(sessionId);
+    if (!located) throw new SessionNotFoundError(sessionId);
+    const { raw, project, projectId } = located;
+
+    const lifecycle = parseLifecycleFromRaw(raw);
+    const stillHeld =
+      parseIdList(raw["blockedBy"]).length > 0 ||
+      (lifecycle ? isBlockedByDependency(lifecycle) : false);
+    if (!stillHeld) {
+      const existing = await get(sessionId);
+      if (existing) return existing;
+      throw new SessionNotFoundError(sessionId);
+    }
+
+    // Reuse the held session's reserved number for a stable tmux name; the
+    // branch is carried verbatim so it still auto-links to the issue tracker.
+    const num = getSessionNumber(sessionId, project.sessionPrefix);
+    const tmuxName =
+      project.path && num !== undefined
+        ? generateSessionName(project.sessionPrefix, num)
+        : undefined;
+
+    const originalDependsOn = parseIdList(raw["dependsOn"]);
+    const spawnConfig: SessionSpawnConfig = {
+      projectId,
+      ...(raw["issue"] ? { issueId: raw["issue"] } : {}),
+      ...(raw["branch"] ? { branch: raw["branch"] } : {}),
+      ...(raw["userPrompt"] ? { prompt: raw["userPrompt"] } : {}),
+      ...(raw["agent"] ? { agent: raw["agent"] } : {}),
+      // Carry the original dependency graph recorded when the session was held.
+      // Without it, collectSessionDependencies would re-derive `dependsOn` from
+      // the tracker alone, dropping any explicit spawn-time prerequisites and
+      // losing the dependency history once the session launches (#10).
+      ...(originalDependsOn.length > 0 ? { dependsOn: originalDependsOn } : {}),
+      // Explicit empty unblocked set: prevents collectSessionDependencies from
+      // re-deriving a non-empty `blockedBy` from the tracker and re-holding the
+      // session we are deliberately launching.
+      blockedBy: [],
+    };
+
+    recordActivityEvent({
+      projectId,
+      sessionId,
+      source: "session-manager",
+      kind: "session.unblock_started",
+      summary: `launching unblocked session: ${sessionId}`,
+      data: { branch: raw["branch"] ?? undefined },
+    });
+
+    return _spawnInner(spawnConfig, {
+      reuseIdentity: { sessionId, tmuxName, heldMetadata: raw },
+    });
   }
 
   function recordOrchestratorSpawnFailed(
@@ -3482,13 +3591,20 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     const project: ProjectConfig = activeRecord.project;
     const projectId: string = activeRecord.projectId;
 
-    // A held (blocked-by-dependency) session must never be launched by restore —
-    // even if `ao stop` flipped its lifecycle to terminated. Its persisted
-    // `blockedBy` is the source of truth: re-establish the held pre-state and
-    // return without starting any work. The scheduler launches it once it clears
-    // the prerequisites. This keeps an unresolved dependent from running across a
-    // stop/restore cycle.
-    if (parseIdList(raw["blockedBy"]).length > 0) {
+    // A held (blocked-by-dependency) session must never be launched by restore.
+    // Detection keys off BOTH the persisted `blockedBy` AND the held lifecycle
+    // pre-state: once every prerequisite has merged the scheduler narrows
+    // `blockedBy` to empty while the session is still only held by its lifecycle
+    // reason (launch deferred by `maxConcurrent`). Keying off `blockedBy` alone
+    // would then restore that resolved-but-deferred session as a normal worker,
+    // bypassing the concurrency cap and the original prompt-delivery path (#10).
+    // Re-establish the held pre-state and return without starting any work; the
+    // scheduler launches it once capacity frees.
+    const restoreLifecycle = parseLifecycleFromRaw(raw);
+    const isHeld =
+      parseIdList(raw["blockedBy"]).length > 0 ||
+      (restoreLifecycle ? isBlockedByDependency(restoreLifecycle) : false);
+    if (isHeld) {
       const heldLifecycle = buildUpdatedLifecycle(sessionId, raw, (next) => {
         next.session.state = "not_started";
         next.session.reason = "blocked_by_dependency";
@@ -3859,6 +3975,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     ensureOrchestrator,
     relaunchOrchestrator,
     restore,
+    unblock,
     list,
     listCached,
     invalidateCache,

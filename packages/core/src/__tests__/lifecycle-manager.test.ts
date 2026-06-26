@@ -2904,6 +2904,50 @@ describe("reactions", () => {
     ).toBe(true);
   });
 
+  it("fires the spawn-session reaction on the real merge transition (merge.completed)", async () => {
+    // Finding 2 (#10): `merge.completed` must map to a reaction key so a
+    // `spawn-session` reaction is reachable when the PR actually merges —
+    // previously there was no mapping, so the reaction never ran.
+    const mockSCM = createMockSCM({
+      getPRState: vi.fn().mockResolvedValue("merged"),
+      enrichSessionsPRBatch: mockBatchEnrichment({ state: "merged" }),
+    });
+    const registry: PluginRegistry = {
+      ...mockRegistry,
+      get: vi.fn().mockImplementation((slot: string, name: string) => {
+        if (slot === "runtime") return plugins.runtime;
+        if (slot === "agent") return plugins.agent;
+        if (slot === "scm") return mockSCM;
+        return name === "desktop" ? createMockNotifier() : null;
+      }),
+    };
+    const configOverride: OrchestratorConfig = {
+      ...config,
+      reactions: {
+        ...config.reactions,
+        "pr-merged": { auto: true, action: "spawn-session" },
+      },
+    };
+    // The reaction triggers an unscoped scheduler pass over the session list.
+    vi.mocked(mockSessionManager.list).mockResolvedValue([]);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "approved", pr: makePR() }),
+      registry,
+      configOverride,
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("merged");
+    expect(recordActivityEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "reaction.action_succeeded",
+        data: expect.objectContaining({ action: "spawn-session" }),
+      }),
+    );
+  });
+
   it("records notifier delivery failures without interrupting lifecycle transitions", async () => {
     const notifier = createMockNotifier();
     vi.mocked(notifier.notify).mockRejectedValue(new Error("webhook failed"));
@@ -4738,6 +4782,180 @@ describe("multi-PR state machine aggregation", () => {
       lm.stop();
 
       expect(lm.getStates().get("app-1")).toBe("merged");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("dependency scheduler (#10)", () => {
+  function makeHeld(id: string, blockedBy: string[], issueId: string) {
+    const held = makeSession({ id, status: "spawning", issueId, branch: `feat/${id}` });
+    held.lifecycle.session.reason = "blocked_by_dependency";
+    held.blockedBy = blockedBy;
+    held.workspacePath = null;
+    held.runtimeHandle = null;
+    return held;
+  }
+
+  it("launches a held session once its prerequisite PR has merged", async () => {
+    vi.useFakeTimers();
+    try {
+      const merged = makeSession({ id: "app-1", status: "merged", issueId: "back" });
+      const held = makeHeld("app-2", ["back"], "front");
+
+      vi.mocked(mockSessionManager.list).mockResolvedValue([merged, held]);
+      const unblockSpy = vi.mocked(mockSessionManager.unblock);
+      unblockSpy.mockResolvedValue(makeSession({ id: "app-2", status: "working" }));
+
+      const lm = createLifecycleManager({
+        config,
+        registry: mockRegistry,
+        sessionManager: mockSessionManager,
+      });
+      lm.start(60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      lm.stop();
+
+      expect(unblockSpy).toHaveBeenCalledWith("app-2");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a multi-prerequisite dependent blocked until all prerequisites merge", async () => {
+    vi.useFakeTimers();
+    try {
+      const merged = makeSession({ id: "app-1", status: "merged", issueId: "back-a" });
+      const stillOpen = makeSession({ id: "app-3", status: "working", issueId: "back-b" });
+      const held = makeHeld("app-2", ["back-a", "back-b"], "front");
+
+      vi.mocked(mockSessionManager.list).mockResolvedValue([merged, stillOpen, held]);
+      const unblockSpy = vi.mocked(mockSessionManager.unblock);
+
+      const lm = createLifecycleManager({
+        config,
+        registry: mockRegistry,
+        sessionManager: mockSessionManager,
+      });
+      lm.start(60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      lm.stop();
+
+      expect(unblockSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("defers launch when the project concurrency cap is reached", async () => {
+    vi.useFakeTimers();
+    try {
+      const baseProject = config.projects["my-app"];
+      if (!baseProject) throw new Error("expected my-app project");
+      const capConfig: OrchestratorConfig = {
+        ...config,
+        projects: { "my-app": { ...baseProject, maxConcurrent: 1 } },
+      };
+      const merged = makeSession({ id: "app-1", status: "merged", issueId: "back" });
+      const active = makeSession({ id: "app-3", status: "working" });
+      const held = makeHeld("app-2", ["back"], "front");
+
+      vi.mocked(mockSessionManager.list).mockResolvedValue([merged, active, held]);
+      const unblockSpy = vi.mocked(mockSessionManager.unblock);
+
+      const lm = createLifecycleManager({
+        config: capConfig,
+        registry: mockRegistry,
+        sessionManager: mockSessionManager,
+      });
+      lm.start(60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      lm.stop();
+
+      expect(unblockSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** A config with the extra `front`/`back` projects the cross-project tests use. */
+  function multiProjectConfig(): OrchestratorConfig {
+    const baseProject = config.projects["my-app"];
+    if (!baseProject) throw new Error("expected my-app project");
+    return {
+      ...config,
+      projects: {
+        "my-app": baseProject,
+        front: { ...baseProject },
+        back: { ...baseProject },
+      },
+    };
+  }
+
+  it("unblocks a dependent using a merged prerequisite in another project (unscoped scheduling)", async () => {
+    vi.useFakeTimers();
+    try {
+      // backend merged in project `back`; frontend held in project `front`,
+      // blocked by the backend *session id* (the cross-project handle).
+      const mergedBack = makeSession({ id: "back-1", status: "merged", issueId: "b" });
+      mergedBack.projectId = "back";
+      const heldFront = makeHeld("front-1", ["back-1"], "f");
+      heldFront.projectId = "front";
+
+      vi.mocked(mockSessionManager.list).mockImplementation(async (projectId?: string) => {
+        // A project-scoped worker's own list only sees its project; the
+        // scheduler must consult the UNSCOPED list to see the merge.
+        if (projectId === "front") return [heldFront];
+        return [mergedBack, heldFront];
+      });
+      const unblockSpy = vi.mocked(mockSessionManager.unblock);
+      unblockSpy.mockResolvedValue(makeSession({ id: "front-1", status: "working" }));
+
+      const lm = createLifecycleManager({
+        config: multiProjectConfig(),
+        registry: mockRegistry,
+        sessionManager: mockSessionManager,
+        projectId: "front",
+      });
+      lm.start(60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      lm.stop();
+
+      expect(unblockSpy).toHaveBeenCalledWith("front-1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not unblock a held dependent owned by another project (scope isolation)", async () => {
+    vi.useFakeTimers();
+    try {
+      // The held dependent belongs to `back`; this worker is scoped to `front`,
+      // so it must leave the `back` dependent to the `back` worker — preventing
+      // two project workers from racing to launch the same session.
+      const mergedBack = makeSession({ id: "back-1", status: "merged", issueId: "b" });
+      mergedBack.projectId = "back";
+      const heldBack = makeHeld("back-2", ["back-1"], "f2");
+      heldBack.projectId = "back";
+
+      vi.mocked(mockSessionManager.list).mockImplementation(async (projectId?: string) => {
+        if (projectId === "front") return [];
+        return [mergedBack, heldBack];
+      });
+      const unblockSpy = vi.mocked(mockSessionManager.unblock);
+
+      const lm = createLifecycleManager({
+        config: multiProjectConfig(),
+        registry: mockRegistry,
+        sessionManager: mockSessionManager,
+        projectId: "front",
+      });
+      lm.start(60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      lm.stop();
+
+      expect(unblockSpy).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }

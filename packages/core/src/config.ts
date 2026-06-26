@@ -152,7 +152,7 @@ function validatePluginConfigFields(
 
 const ReactionConfigSchema = z.object({
   auto: z.boolean().default(true),
-  action: z.enum(["send-to-agent", "notify", "auto-merge"]).default("notify"),
+  action: z.enum(["send-to-agent", "notify", "auto-merge", "spawn-session"]).default("notify"),
   message: z.string().optional(),
   priority: z.enum(["urgent", "action", "warning", "info"]).optional(),
   retries: z.number().optional(),
@@ -255,6 +255,7 @@ const ProjectConfigSchema = z.object({
     .optional(),
   /** Per-project resolution failure captured without aborting global load. */
   resolveError: z.string().optional(),
+  maxConcurrent: z.number().int().positive().optional(),
   runtime: z.string().optional(),
   agent: z.string().optional(),
   workspace: z.string().optional(),

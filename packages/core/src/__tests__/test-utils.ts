@@ -507,6 +507,7 @@ export function createMockSessionManager(): OpenCodeSessionManager {
         makeSession({ id: "app-orchestrator", metadata: { role: "orchestrator" } }),
       ),
     restore: vi.fn().mockResolvedValue(makeSession()),
+    unblock: vi.fn().mockResolvedValue(makeSession()),
     list: vi.fn().mockResolvedValue([]),
     listCached: vi.fn().mockResolvedValue([]),
     invalidateCache: vi.fn(),

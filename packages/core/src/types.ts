@@ -1331,8 +1331,8 @@ export interface ReactionConfig {
   /** Whether this reaction is enabled */
   auto: boolean;
 
-  /** What to do: send message to agent, notify human, auto-merge */
-  action: "send-to-agent" | "notify" | "auto-merge";
+  /** What to do: send message to agent, notify human, auto-merge, spawn a dependent session */
+  action: "send-to-agent" | "notify" | "auto-merge" | "spawn-session";
 
   /** Message to send (for send-to-agent) */
   message?: string;
@@ -1587,6 +1587,15 @@ export interface ProjectConfig {
 
   /** Whether this project is active in portfolio and dashboard surfaces */
   enabled?: boolean;
+
+  /**
+   * Maximum number of concurrently-running worker sessions for this project.
+   * Enforced by the dependency scheduler (#10) when launching unblocked
+   * sessions: a held session whose prerequisites have all merged stays held
+   * until the project is under this cap. Orchestrator sessions are excluded
+   * from the count. Undefined means no limit.
+   */
+  maxConcurrent?: number;
 
   /** Override default runtime */
   runtime?: string;
@@ -1930,6 +1939,13 @@ export interface SessionManager {
    */
   relaunchOrchestrator(config: OrchestratorSpawnConfig): Promise<Session>;
   restore(sessionId: SessionId): Promise<Session>;
+  /**
+   * Launch a session previously held in the `blocked_by_dependency` pre-state,
+   * reusing its reserved identity and branch. Called by the dependency
+   * scheduler (#10) once all of a session's prerequisites have merged.
+   * Idempotent: returns the current session unchanged if it is no longer held.
+   */
+  unblock(sessionId: SessionId): Promise<Session>;
   list(projectId?: string): Promise<Session[]>;
   get(sessionId: SessionId): Promise<Session | null>;
   kill(sessionId: SessionId, options?: KillOptions): Promise<KillResult>;

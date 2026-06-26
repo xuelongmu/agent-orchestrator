@@ -37,6 +37,7 @@ const { mockConfig, mockSessionManager } = vi.hoisted(() => ({
     ensureOrchestrator: vi.fn(),
     relaunchOrchestrator: vi.fn(),
     restore: vi.fn(),
+    unblock: vi.fn(),
     kill: vi.fn(),
     cleanup: vi.fn(),
     send: vi.fn(),

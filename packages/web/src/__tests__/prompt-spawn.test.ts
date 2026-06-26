@@ -81,6 +81,7 @@ const mockSessionManager: SessionManager = {
   spawnOrchestrator: vi.fn(),
   remap: vi.fn(async () => "ses_mock"),
   restore: vi.fn(async (id) => makeSession({ id, status: "spawning" })),
+  unblock: vi.fn(async (id) => makeSession({ id, status: "spawning" })),
   claimPR: vi.fn(async () => ({ session: makeSession({ id: "s1" }), pr: {} as never })),
 };
 
