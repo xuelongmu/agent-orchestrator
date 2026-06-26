@@ -40,11 +40,14 @@ function resolvePlanProject(config: OrchestratorConfig, requested?: string): str
 
   if (projectIds.length === 1) return projectIds[0];
 
-  const envProject = process.env.AO_PROJECT_ID;
-  if (envProject && config.projects[envProject]) return envProject;
-
+  // Prefer the project matching the cwd over AO_PROJECT_ID: an orchestrator or
+  // worker shell often has AO_PROJECT_ID set, and running `ao plan` from inside
+  // a different configured repo should target that repo, not the env project.
   const matched = findProjectForDirectory(config.projects, resolve(process.cwd()));
   if (matched) return matched;
+
+  const envProject = process.env.AO_PROJECT_ID;
+  if (envProject && config.projects[envProject]) return envProject;
 
   throw new Error(
     `Multiple projects configured. Specify one with --project <id>: ${projectIds.join(", ")}`,
@@ -116,6 +119,7 @@ export function registerPlan(program: Command): void {
         const project = config.projects[projectId];
         const registry = await getPluginRegistry(config);
         const agentName = resolveDecomposerAgent(project, config.defaults);
+        const model = project.decomposer?.agentConfig?.model;
 
         recordActivityEvent({
           projectId,
@@ -130,7 +134,7 @@ export function registerPlan(program: Command): void {
         let plan: Plan;
         try {
           const runPlanner = resolvePlanRunner(agentName);
-          plan = await decomposeGoal({ goal, project, projectId, runPlanner });
+          plan = await decomposeGoal({ goal, project, projectId, runPlanner, model });
           spinner.succeed(`Proposed ${plan.tickets.length} ticket(s)`);
         } catch (err) {
           spinner.fail("Failed to produce a plan");

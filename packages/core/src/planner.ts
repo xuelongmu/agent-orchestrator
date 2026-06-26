@@ -12,7 +12,7 @@
  * injectable so the CLI and tests can substitute their own.
  */
 
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -241,12 +241,12 @@ export async function createPlanTickets({
   }
 
   const byRef = new Map(plan.tickets.map((t) => [t.ref, t]));
-  // Dependency relations are emulated as repo-local `#N` markers in the issue
-  // body, so a parent/blocker in a different repo would resolve to the wrong
-  // issue. Reject such edges up front (before creating anything) rather than
-  // silently mislinking. (Cross-repo *session* ordering is handled separately
-  // by the dependency scheduler.)
-  assertDependenciesSameRepo(plan, project, byRef);
+  // All relations (parent, blocker, related) are emulated as repo-local `#N`
+  // markers in the issue body, so an edge to a ticket in a different repo would
+  // resolve to the wrong issue. Reject such edges up front (before creating
+  // anything) rather than silently mislinking. (Cross-repo *session* ordering
+  // is handled separately by the dependency scheduler.)
+  assertRelationsSameRepo(plan, project, byRef);
 
   // Related edges are non-directional. Build a symmetric adjacency so the link
   // is recorded on whichever side of the pair is created last (topological
@@ -305,25 +305,30 @@ function effectiveRepo(ticket: PlannedTicket, project: ProjectConfig): string | 
 }
 
 /**
- * Throw if any dependency edge (parent or blocker) crosses repos. Such edges
- * cannot be faithfully represented by the repo-local `#N` relation emulation.
+ * Throw if any relation edge (parent, blocker, or related) crosses repos. Such
+ * edges cannot be faithfully represented by the repo-local `#N` relation
+ * emulation, so creating them would silently mislink to the wrong issue.
  */
-function assertDependenciesSameRepo(
+function assertRelationsSameRepo(
   plan: Plan,
   project: ProjectConfig,
   byRef: Map<string, PlannedTicket>,
 ): void {
   for (const ticket of plan.tickets) {
     const ticketRepo = effectiveRepo(ticket, project);
-    for (const depRef of dependencyRefs(ticket)) {
-      const dep = byRef.get(depRef);
-      if (!dep) continue; // validated elsewhere
-      const depRepo = effectiveRepo(dep, project);
-      if (depRepo !== ticketRepo) {
+    const edges: Array<{ ref: string; relation: string }> = [
+      ...dependencyRefs(ticket).map((ref) => ({ ref, relation: "depends on" })),
+      ...(ticket.relatedRefs ?? []).map((ref) => ({ ref, relation: "is related to" })),
+    ];
+    for (const { ref, relation } of edges) {
+      const other = byRef.get(ref);
+      if (!other) continue; // validated elsewhere
+      const otherRepo = effectiveRepo(other, project);
+      if (otherRepo !== ticketRepo) {
         throw new PlanValidationError(
-          `Cross-repo dependency is not supported: ticket "${ticket.ref}" (${ticketRepo ?? "default repo"}) ` +
-            `depends on "${dep.ref}" (${depRepo ?? "default repo"}). ` +
-            `Keep blocking/parent relations within a single repo.`,
+          `Cross-repo relation is not supported: ticket "${ticket.ref}" (${ticketRepo ?? "default repo"}) ` +
+            `${relation} "${other.ref}" (${otherRepo ?? "default repo"}). ` +
+            `Keep parent/blocking/related relations within a single repo.`,
         );
       }
     }
@@ -373,6 +378,8 @@ export interface DecomposerContext {
   goal: string;
   project: ProjectConfig;
   projectId: string;
+  /** Optional model override from `decomposer.agentConfig.model`. */
+  model?: string;
 }
 
 export type PlanRunner = (context: DecomposerContext) => Promise<{ rawOutput: string }>;
@@ -408,11 +415,17 @@ export function buildDecomposerPrompt(context: DecomposerContext): string {
 }
 
 /**
- * Run a process with stdin closed, capturing stdout/stderr with a buffer cap
- * and timeout. Tears down the whole process tree on timeout/overflow (Windows
- * needs this). Mirrors the code-review runner's helper.
+ * Spawn a process and capture stdout/stderr with a buffer cap and timeout.
+ * Tears down the whole process tree on timeout/overflow (Windows needs this).
+ * Mirrors the code-review runner's helper.
+ *
+ * When `input` is provided it is written to the child's stdin (then stdin is
+ * closed); otherwise stdin is closed immediately. Delivering the prompt over
+ * stdin keeps untrusted goal text out of the argv, so it cannot be re-parsed
+ * by `cmd.exe` when `shell: true` is required to launch a `.cmd` shim on
+ * Windows (DEP0190).
  */
-async function execFileWithClosedStdin(
+async function spawnCaptured(
   file: string,
   args: string[],
   options: {
@@ -422,6 +435,7 @@ async function execFileWithClosedStdin(
     env?: NodeJS.ProcessEnv;
     shell?: boolean | string;
     windowsHide?: boolean;
+    input?: string;
   } = {},
 ): Promise<{ stdout: string; stderr: string }> {
   const { spawn } = await import("node:child_process");
@@ -433,8 +447,14 @@ async function execFileWithClosedStdin(
       shell: options.shell,
       windowsHide: options.windowsHide ?? true,
       detached: !isWindows(),
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [options.input !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
     });
+
+    if (options.input !== undefined && child.stdin) {
+      // Ignore EPIPE if the child exits before consuming all input.
+      child.stdin.on("error", () => undefined);
+      child.stdin.end(options.input);
+    }
     const maxBuffer = options.maxBuffer ?? DECOMPOSER_MAX_BUFFER;
     let stdout = "";
     let stderr = "";
@@ -503,9 +523,19 @@ async function execFileWithClosedStdin(
   });
 }
 
-/** Build the codex args used to run the decomposer headlessly. */
-export function buildCodexDecomposerArgs(outputFile: string, prompt: string): string[] {
-  return ["exec", "--sandbox", "read-only", "--output-last-message", outputFile, prompt];
+/**
+ * Build the codex args used to run the decomposer headlessly. The prompt is
+ * delivered over stdin (not argv), so it never appears on the command line.
+ */
+export function buildCodexDecomposerArgs(outputFile: string, model?: string): string[] {
+  return [
+    "exec",
+    "--sandbox",
+    "read-only",
+    ...(model ? ["--model", model] : []),
+    "--output-last-message",
+    outputFile,
+  ];
 }
 
 /**
@@ -515,19 +545,22 @@ export function buildCodexDecomposerArgs(outputFile: string, prompt: string): st
  */
 export const runCodexDecomposer: PlanRunner = async (context) => {
   const cwd = context.project.path;
-  // Capture codex's last message under the OS temp dir (not the user's
+  // Capture codex's last message in a per-invocation temp dir (not the user's
   // checkout) so a discarded or --json plan never leaves an untracked file
-  // behind. `ao plan` is read-only until tickets are approved.
-  const outputFile = join(tmpdir(), `ao-plan-${process.pid}.json`);
+  // behind and concurrent runs cannot collide. `ao plan` is read-only until
+  // tickets are approved.
+  const captureDir = mkdtempSync(join(tmpdir(), "ao-plan-"));
+  const outputFile = join(captureDir, "plan.json");
   const prompt = buildDecomposerPrompt(context);
-  const args = buildCodexDecomposerArgs(outputFile, prompt);
+  const args = buildCodexDecomposerArgs(outputFile, context.model);
 
   try {
-    const { stdout, stderr } = await execFileWithClosedStdin("codex", args, {
+    const { stdout, stderr } = await spawnCaptured("codex", args, {
       cwd,
       timeout: DECOMPOSER_TIMEOUT_MS,
       maxBuffer: DECOMPOSER_MAX_BUFFER,
       shell: isWindows(),
+      input: prompt,
     });
     const fileContents = existsSync(outputFile) ? readFileSync(outputFile, "utf-8") : null;
     const rawOutput = fileContents?.trim() || stdout.trim() || stderr.trim();
@@ -541,40 +574,49 @@ export const runCodexDecomposer: PlanRunner = async (context) => {
           : String(error);
     throw new Error(`Decomposer run failed: ${details}`, { cause: error });
   } finally {
-    if (existsSync(outputFile)) {
-      try {
-        rmSync(outputFile, { force: true });
-      } catch {
-        // Best-effort cleanup of the temp capture file.
-      }
+    try {
+      rmSync(captureDir, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup of the temp capture dir.
     }
   }
 };
 
-/** Build the claude args used to run the decomposer headlessly (print mode). */
-export function buildClaudeDecomposerArgs(prompt: string): string[] {
+/**
+ * Build the claude args used to run the decomposer headlessly (print mode).
+ * The prompt is delivered over stdin (`claude -p` reads it), not argv.
+ */
+export function buildClaudeDecomposerArgs(model?: string): string[] {
   // `--permission-mode plan` keeps the non-interactive run read-only regardless
   // of the project's default Claude permission mode (acceptEdits/bypass/etc.),
   // so `ao plan` cannot edit files before tickets are approved.
-  return ["-p", prompt, "--permission-mode", "plan", "--output-format", "text"];
+  return [
+    "-p",
+    "--permission-mode",
+    "plan",
+    "--output-format",
+    "text",
+    ...(model ? ["--model", model] : []),
+  ];
 }
 
 /**
- * Claude Code decomposer runner: `claude -p <prompt>` prints the final
- * assistant turn to stdout and exits (headless one-shot).
+ * Claude Code decomposer runner: `claude -p` reads the prompt from stdin,
+ * prints the final assistant turn to stdout, and exits (headless one-shot).
  */
 export const runClaudeDecomposer: PlanRunner = async (context) => {
   const cwd = context.project.path;
   const prompt = buildDecomposerPrompt(context);
   try {
-    const { stdout, stderr } = await execFileWithClosedStdin(
+    const { stdout, stderr } = await spawnCaptured(
       "claude",
-      buildClaudeDecomposerArgs(prompt),
+      buildClaudeDecomposerArgs(context.model),
       {
         cwd,
         timeout: DECOMPOSER_TIMEOUT_MS,
         maxBuffer: DECOMPOSER_MAX_BUFFER,
         shell: isWindows(),
+        input: prompt,
       },
     );
     return { rawOutput: stdout.trim() || stderr.trim() };
@@ -638,7 +680,7 @@ export function resolvePlanRunner(agentName: string): PlanRunner {
 export function createShellPlanRunner(command: string): PlanRunner {
   return async (context) => {
     const shell = getShell();
-    const { stdout, stderr } = await execFileWithClosedStdin(shell.cmd, shell.args(command), {
+    const { stdout, stderr } = await spawnCaptured(shell.cmd, shell.args(command), {
       cwd: context.project.path,
       timeout: DECOMPOSER_TIMEOUT_MS,
       maxBuffer: DECOMPOSER_MAX_BUFFER,
