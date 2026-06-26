@@ -2749,34 +2749,29 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // the pause sticky and lets the existing transition machinery fire the
     // notification exactly once.
     const alreadyBudgetPaused = !!session.metadata["budgetPausedAt"];
-    // Evaluate the cap whenever the agent could still be spending. Key off the
-    // canonical session state, NOT the legacy status: deriveLegacyStatus()
-    // overlays an open PR onto a still-`working` agent and reports
-    // pr_open/ci_failed/review_pending/etc., so gating on `newStatus === working`
-    // would skip enforcement for an actively-generating agent that happens to
-    // have a PR open (it could keep accruing cost while fixing CI / addressing
-    // review). The underlying lifecycle state still says "working" in that case.
+    // A budget cap is about CUMULATIVE spend, which never decreases, so once a
+    // session crosses the cap it should be flagged regardless of what it is doing
+    // right now. Enforce for any session that could be carrying cost — i.e. any
+    // non-terminal session that isn't in a transient pre-work/probe state.
     //
-    // - canonical "working" → agent is generating → always enforce.
-    // - canonical "idle"/"needs_input" → quiet → only keep evaluating while
-    //   already paused, so the pause stays sticky (and releases if the cap is
-    //   later raised) without newly pausing a genuinely-quiet session.
-    // Terminal/cleanup legacy statuses (merged/cleanup/done/killed/terminated/
-    // errored) are always excluded so we never interfere with PR-merge or
-    // cleanup lifecycle, even though their canonical state may read idle.
+    // This deliberately includes the PR-overlay statuses
+    // (pr_open/ci_failed/review_pending/changes_requested/approved/mergeable):
+    // deriveLegacyStatus() overlays an open PR onto the session and
+    // resolveOpenPRDecision() forces the canonical state to "working" OR "idle"
+    // there, and it massages the activity signal too — so gating on canonical
+    // state or activity would skip a still-over-budget agent that has opened a
+    // PR (e.g. still fixing CI / addressing review). Excluded:
+    //   - terminal/cleanup (merged/cleanup/done/killed/terminated/errored) — must
+    //     never be re-paused; don't interfere with PR-merge or cleanup lifecycle.
+    //   - spawning — no cost accrued yet.
+    //   - detecting/stuck — transient probe / escalation states we must not disturb.
     const liveState = session.lifecycle.session.state;
-    // "Is the agent generating right now?" The canonical state alone is not
-    // enough: resolveOpenPRDecision() forces the canonical state to "idle" for
-    // pr_open/review_pending/approved/mergeable even while the agent keeps
-    // generating after opening a PR, so a still-spending over-budget agent in
-    // that PR-overlay path would read as idle. The activity probe still reports
-    // "active" in that case, so gate on it too.
     const activeActivity = session.activitySignal.activity === "active";
     const evaluateBudget =
       !TERMINAL_STATUSES.has(newStatus) &&
-      (liveState === "working" ||
-        activeActivity ||
-        (alreadyBudgetPaused && (liveState === "idle" || liveState === "needs_input")));
+      newStatus !== SESSION_STATUS.SPAWNING &&
+      newStatus !== SESSION_STATUS.DETECTING &&
+      newStatus !== SESSION_STATUS.STUCK;
     if (evaluateBudget) {
       const breach = evaluateBudgetBreach(
         config,
@@ -2869,13 +2864,20 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         } else {
           // Cost unobservable this poll — keep the session paused (sticky) and
           // the latch intact, reusing the original pause timestamp, until a real
-          // cost reading lets us decide.
+          // cost reading lets us decide. Re-persist the latch so it survives this
+          // poll's metadata write even though we took no breach action.
+          const pausedAt = session.metadata["budgetPausedAt"];
           newStatus = SESSION_STATUS.NEEDS_INPUT;
           session.status = SESSION_STATUS.NEEDS_INPUT;
           session.lifecycle.session.state = "needs_input";
           session.lifecycle.session.reason = "awaiting_user_input";
-          session.lifecycle.session.lastTransitionAt = session.metadata["budgetPausedAt"];
+          session.lifecycle.session.lastTransitionAt = pausedAt;
           assessment.evidence = session.metadata["budgetPausedReason"] || assessment.evidence;
+          updateSessionMetadata(session, {
+            budgetPausedAt: pausedAt,
+            budgetPausedReason: session.metadata["budgetPausedReason"] ?? "",
+            budgetInterrupted: session.metadata["budgetInterrupted"] ?? "",
+          });
         }
       }
     } else if (session.metadata["budgetPausedAt"]) {
