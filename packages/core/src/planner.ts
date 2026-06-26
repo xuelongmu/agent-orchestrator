@@ -12,7 +12,8 @@
  * injectable so the CLI and tests can substitute their own.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { getShell, isWindows, killProcessTree } from "./platform.js";
@@ -239,15 +240,27 @@ export async function createPlanTickets({
     throw new Error(`Tracker "${tracker.name}" does not support creating issues.`);
   }
 
+  const byRef = new Map(plan.tickets.map((t) => [t.ref, t]));
+  // Dependency relations are emulated as repo-local `#N` markers in the issue
+  // body, so a parent/blocker in a different repo would resolve to the wrong
+  // issue. Reject such edges up front (before creating anything) rather than
+  // silently mislinking. (Cross-repo *session* ordering is handled separately
+  // by the dependency scheduler.)
+  assertDependenciesSameRepo(plan, project, byRef);
+
+  // Related edges are non-directional. Build a symmetric adjacency so the link
+  // is recorded on whichever side of the pair is created last (topological
+  // order only constrains dependency edges, not related ones).
+  const relatedAdjacency = buildRelatedAdjacency(plan);
+
   const ordered = topoSortPlan(plan);
   const refToIssue = new Map<string, Issue>();
   const created: CreatedTicket[] = [];
 
-  const resolve = (ref: string): string => {
+  const resolveDep = (ref: string): string => {
     const issue = refToIssue.get(ref);
     if (!issue) {
-      // Topological order guarantees dependencies are created first; relations
-      // (related-to) may point forward, so a missing entry there is skipped.
+      // Topological order guarantees parent/blocker dependencies exist first.
       throw new Error(`Internal error: ref "${ref}" was not created before being referenced.`);
     }
     return issue.id;
@@ -262,15 +275,16 @@ export async function createPlanTickets({
       title: ticket.title,
       description: ticket.body,
       ...(ticket.labels && ticket.labels.length > 0 ? { labels: ticket.labels } : {}),
-      ...(ticket.parentRef ? { parentId: resolve(ticket.parentRef) } : {}),
+      ...(ticket.parentRef ? { parentId: resolveDep(ticket.parentRef) } : {}),
       ...(ticket.blockedByRefs && ticket.blockedByRefs.length > 0
-        ? { blockedBy: ticket.blockedByRefs.map(resolve) }
+        ? { blockedBy: ticket.blockedByRefs.map(resolveDep) }
         : {}),
     };
 
-    // Related refs are non-directional and may point at not-yet-created tickets;
-    // include only the ones already created so the reference is valid.
-    const relatedIds = (ticket.relatedRefs ?? [])
+    // Link to every related ticket already created (in either direction). The
+    // not-yet-created partner of a forward related edge picks the link up when
+    // it is created (it lists this ticket via the symmetric adjacency).
+    const relatedIds = [...(relatedAdjacency.get(ticket.ref) ?? [])]
       .map((ref) => refToIssue.get(ref)?.id)
       .filter((id): id is string => Boolean(id));
     if (relatedIds.length > 0) {
@@ -283,6 +297,57 @@ export async function createPlanTickets({
   }
 
   return created;
+}
+
+/** Effective repo of a ticket: its override, else the project default. */
+function effectiveRepo(ticket: PlannedTicket, project: ProjectConfig): string | undefined {
+  return ticket.repo ?? project.repo;
+}
+
+/**
+ * Throw if any dependency edge (parent or blocker) crosses repos. Such edges
+ * cannot be faithfully represented by the repo-local `#N` relation emulation.
+ */
+function assertDependenciesSameRepo(
+  plan: Plan,
+  project: ProjectConfig,
+  byRef: Map<string, PlannedTicket>,
+): void {
+  for (const ticket of plan.tickets) {
+    const ticketRepo = effectiveRepo(ticket, project);
+    for (const depRef of dependencyRefs(ticket)) {
+      const dep = byRef.get(depRef);
+      if (!dep) continue; // validated elsewhere
+      const depRepo = effectiveRepo(dep, project);
+      if (depRepo !== ticketRepo) {
+        throw new PlanValidationError(
+          `Cross-repo dependency is not supported: ticket "${ticket.ref}" (${ticketRepo ?? "default repo"}) ` +
+            `depends on "${dep.ref}" (${depRepo ?? "default repo"}). ` +
+            `Keep blocking/parent relations within a single repo.`,
+        );
+      }
+    }
+  }
+}
+
+/** Build symmetric related-ref adjacency (each declared edge added both ways). */
+function buildRelatedAdjacency(plan: Plan): Map<string, Set<string>> {
+  const adjacency = new Map<string, Set<string>>();
+  const add = (a: string, b: string): void => {
+    let set = adjacency.get(a);
+    if (!set) {
+      set = new Set();
+      adjacency.set(a, set);
+    }
+    set.add(b);
+  };
+  for (const ticket of plan.tickets) {
+    for (const ref of ticket.relatedRefs ?? []) {
+      add(ticket.ref, ref);
+      add(ref, ticket.ref);
+    }
+  }
+  return adjacency;
 }
 
 // =============================================================================
@@ -450,7 +515,10 @@ export function buildCodexDecomposerArgs(outputFile: string, prompt: string): st
  */
 export const runCodexDecomposer: PlanRunner = async (context) => {
   const cwd = context.project.path;
-  const outputFile = join(cwd, ".ao-plan-output.json");
+  // Capture codex's last message under the OS temp dir (not the user's
+  // checkout) so a discarded or --json plan never leaves an untracked file
+  // behind. `ao plan` is read-only until tickets are approved.
+  const outputFile = join(tmpdir(), `ao-plan-${process.pid}.json`);
   const prompt = buildDecomposerPrompt(context);
   const args = buildCodexDecomposerArgs(outputFile, prompt);
 
@@ -472,12 +540,23 @@ export const runCodexDecomposer: PlanRunner = async (context) => {
           ? error.message
           : String(error);
     throw new Error(`Decomposer run failed: ${details}`, { cause: error });
+  } finally {
+    if (existsSync(outputFile)) {
+      try {
+        rmSync(outputFile, { force: true });
+      } catch {
+        // Best-effort cleanup of the temp capture file.
+      }
+    }
   }
 };
 
 /** Build the claude args used to run the decomposer headlessly (print mode). */
 export function buildClaudeDecomposerArgs(prompt: string): string[] {
-  return ["-p", prompt, "--output-format", "text"];
+  // `--permission-mode plan` keeps the non-interactive run read-only regardless
+  // of the project's default Claude permission mode (acceptEdits/bypass/etc.),
+  // so `ao plan` cannot edit files before tickets are approved.
+  return ["-p", prompt, "--permission-mode", "plan", "--output-format", "text"];
 }
 
 /**
