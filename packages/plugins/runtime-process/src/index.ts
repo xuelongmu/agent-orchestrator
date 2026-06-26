@@ -434,14 +434,44 @@ export function create(): Runtime {
 
       // No in-memory entry: the session was recovered from metadata or launched
       // by a previous AO process, so this process does not own the child's stdin
-      // and cannot send Escape. Unlike isAlive()/destroy() (which can operate via
-      // the persisted PID + signals), there is no durable control channel to
-      // interrupt a foreign child here. Fail loudly rather than resolve — a
-      // silent success would let the lifecycle manager latch the session as
+      // and cannot write Escape. The Unix child was spawned detached (its own
+      // process group, pgid == pid), so we deliver SIGINT to that group via the
+      // persisted PID — the same cancel signal a terminal Ctrl+C sends to its
+      // foreground group. This halts the in-flight generation without the
+      // SIGKILL teardown destroy() uses, which would trip the dead-runtime
+      // reconciler (#1735) and read as killed rather than paused.
+      const pid = (handle.data as Record<string, unknown>)?.pid;
+      if (typeof pid === "number" && pid > 0) {
+        try {
+          // Negative pid signals the whole process group, reaching the agent
+          // binary even though the persisted pid is the shell leader.
+          process.kill(-pid, "SIGINT");
+          return;
+        } catch (err: unknown) {
+          // ESRCH: the group is already gone — nothing to interrupt.
+          if ((err as NodeJS.ErrnoException).code === "ESRCH") return;
+          // Group signalling not available/permitted — fall back to the leader.
+          try {
+            process.kill(pid, "SIGINT");
+            return;
+          } catch (err2: unknown) {
+            if ((err2 as NodeJS.ErrnoException).code === "ESRCH") return;
+            throw new Error(
+              `cannot interrupt process session ${handle.id} via persisted PID ${pid}: ` +
+                `${err2 instanceof Error ? err2.message : String(err2)}`,
+            );
+          }
+        }
+      }
+
+      // No stdin handle and no persisted PID: there is genuinely no channel to
+      // interrupt this session. Fail loudly rather than resolve — a silent
+      // success would let the lifecycle manager latch the session as
       // "interrupted" while the agent keeps spending.
       throw new Error(
-        `cannot interrupt process session ${handle.id}: no in-memory stdin handle ` +
-          `(session not owned by this AO process — recovered from metadata or started by a prior run)`,
+        `cannot interrupt process session ${handle.id}: no in-memory stdin handle and no ` +
+          `persisted PID (session not owned by this AO process — recovered from metadata or ` +
+          `started by a prior run)`,
       );
     },
 

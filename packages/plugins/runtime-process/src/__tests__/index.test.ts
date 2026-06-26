@@ -504,15 +504,43 @@ describe("interrupt()", () => {
     expect(child.stdin.write).toHaveBeenCalledWith("\x1b");
   });
 
-  it("throws for a session with no in-memory stdin handle (recovered/cross-process)", async () => {
-    // Unix path: a session recovered from metadata or launched by a prior AO
-    // process has no entry in the in-memory map and no pty-host pipe, so there is
-    // no channel to send Escape. interrupt() must fail loudly rather than
-    // silently resolve, so the budget-pause caller doesn't latch a false success.
+  it("sends SIGINT to the process group via the persisted PID for a recovered session", async () => {
+    // A session recovered from metadata or launched by a prior AO process has no
+    // in-memory stdin handle, but the detached child is its own process group.
+    // interrupt() delivers SIGINT to that group (negative pid) — the durable
+    // control channel — instead of silently no-oping while the agent keeps
+    // spending.
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      const runtime = create();
+      await runtime.interrupt!(makeHandle("recovered"));
+      expect(killSpy).toHaveBeenCalledWith(-12345, "SIGINT");
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it("resolves without throwing when the recovered process group is already gone", async () => {
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
+      const err = new Error("no such process") as NodeJS.ErrnoException;
+      err.code = "ESRCH";
+      throw err;
+    });
+    try {
+      const runtime = create();
+      await expect(runtime.interrupt!(makeHandle("dead"))).resolves.toBeUndefined();
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it("throws when there is no in-memory handle and no persisted PID", async () => {
+    // No stdin handle, no pty-host pipe, and no PID — genuinely no channel to
+    // interrupt. Fail loudly so the budget-pause caller doesn't latch a false
+    // success.
     const runtime = create();
-    await expect(runtime.interrupt!(makeHandle("nonexistent"))).rejects.toThrow(
-      /cannot interrupt process session/,
-    );
+    const handle: RuntimeHandle = { id: "no-pid", runtimeName: "process", data: {} };
+    await expect(runtime.interrupt!(handle)).rejects.toThrow(/cannot interrupt process session/);
   });
 
   it("sends the raw Escape byte via the pty-host on Windows", async () => {
