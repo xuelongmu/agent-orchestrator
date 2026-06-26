@@ -579,6 +579,75 @@ describe("budget enforcement", () => {
     expect(meta!["budgetPausedAt"]).toBeFalsy();
   });
 
+  it("enforces the cap on an active over-budget session in a PR-overlay idle state (review_pending)", async () => {
+    // resolveOpenPRDecision() forces the canonical session state to "idle" for
+    // review_pending even while the agent is still generating after opening a
+    // PR. The cap must still be enforced — gating on canonical "working" alone
+    // would miss this common post-PR path.
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const mockSCM = createMockSCM({
+      getReviewDecision: vi.fn().mockResolvedValue("pending"),
+      enrichSessionsPRBatch: mockBatchEnrichment({ reviewDecision: "pending" }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const session = makeSession({
+      status: "pr_open",
+      pr: makeMatchingPR(),
+      agentInfo: {
+        summary: null,
+        agentSessionId: null,
+        cost: { inputTokens: 100, outputTokens: 50, estimatedCostUsd: 9.99 },
+      },
+    });
+    const lm = setupPollCheck("app-1", {
+      session,
+      registry,
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    // Canonical state derived idle (review_pending), but active + over budget.
+    expect(session.lifecycle.session.state).toBe("needs_input");
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    expect(plugins.runtime.interrupt).toHaveBeenCalled();
+  });
+
+  it("keeps the budget pause latched (and sticky) when cost is transiently unavailable", async () => {
+    // Already paused, but this poll can't read cost (getSessionInfo/log failure):
+    // agentInfo is null and no project aggregate exists. evaluateBudgetBreach
+    // sees $0 → no breach, but that must NOT be read as "under budget".
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "idle" });
+    const session = makeSession({ status: "needs_input", agentInfo: null });
+    session.metadata = {
+      ...session.metadata,
+      budgetPausedAt: "2026-01-01T00:00:00.000Z",
+      budgetPausedReason: "budget_exceeded session $9.99 > $5.00",
+      budgetInterrupted: "true",
+    };
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: {
+        budgetPausedAt: "2026-01-01T00:00:00.000Z",
+        budgetPausedReason: "budget_exceeded session $9.99 > $5.00",
+        budgetInterrupted: "true",
+      },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    // The latch (and the needs_input pause) survive the cost-read failure window.
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeTruthy();
+    expect(meta!["budgetInterrupted"]).toBe("true");
+  });
+
   it("clears the pause latch when the cap is raised above current cost", async () => {
     vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
     const session = withCost(3.0);

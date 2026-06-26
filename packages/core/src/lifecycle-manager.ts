@@ -2765,9 +2765,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // errored) are always excluded so we never interfere with PR-merge or
     // cleanup lifecycle, even though their canonical state may read idle.
     const liveState = session.lifecycle.session.state;
+    // "Is the agent generating right now?" The canonical state alone is not
+    // enough: resolveOpenPRDecision() forces the canonical state to "idle" for
+    // pr_open/review_pending/approved/mergeable even while the agent keeps
+    // generating after opening a PR, so a still-spending over-budget agent in
+    // that PR-overlay path would read as idle. The activity probe still reports
+    // "active" in that case, so gate on it too.
+    const activeActivity = session.activitySignal.activity === "active";
     const evaluateBudget =
       !TERMINAL_STATUSES.has(newStatus) &&
       (liveState === "working" ||
+        activeActivity ||
         (alreadyBudgetPaused && (liveState === "idle" || liveState === "needs_input")));
     if (evaluateBudget) {
       const breach = evaluateBudgetBreach(
@@ -2777,11 +2785,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       );
       if (breach) {
         const firstPause = !alreadyBudgetPaused;
-        // Whether the agent is still actively generating (vs. quiet at a prompt).
-        // Use the canonical state, not the legacy status, so a working agent
-        // under a PR overlay (ci_failed/pr_open/etc.) still counts as active.
-        // Captured before the canonical state is overwritten to needs_input below.
-        const stillActive = liveState === "working";
+        // Whether the agent is still actively generating (vs. quiet at a prompt),
+        // so we re-interrupt despite the latch. Use the activity probe in
+        // addition to the canonical state so a still-generating agent under a PR
+        // overlay (canonical idle) is caught. Captured before the canonical
+        // state is overwritten to needs_input below.
+        const stillActive = liveState === "working" || activeActivity;
         // Stamp the transition once, at first pause, and reuse that timestamp on
         // every subsequent poll while still over budget. Resetting it each poll
         // would make the dashboard/observability show a perpetually-fresh
@@ -2835,13 +2844,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           });
         }
       } else if (alreadyBudgetPaused) {
-        // No breach but previously paused. Only release the latch when we are
-        // sure the breach is genuinely gone — either the cap was removed, or we
-        // observed a real cost that is now under it. A transient
-        // getSessionInfo/log-read failure leaves agentInfo.cost absent, so
-        // evaluateBudgetBreach() sees $0 and reports no breach; clearing here
-        // would stop enforcing/retrying for a session that is still over budget.
-        // Keep the latch through that failure window.
+        // No breach reported, but this session was previously paused. Only
+        // release the latch when we are sure the breach is genuinely gone —
+        // either the cap was removed, or we observed a real cost that is now
+        // under it. A transient getSessionInfo/log-read failure leaves
+        // agentInfo.cost absent (and sumProjectCost has no entry → projectCostUsd
+        // undefined), so evaluateBudgetBreach() sees $0 and reports no breach;
+        // treating that as "under budget" would drop the pause and stop
+        // retrying interrupts for a session that may still be over the cap.
         const budget = resolveBudget(config, session.projectId);
         const anyCapActive =
           (typeof budget.perSessionUsd === "number" && budget.perSessionUsd > 0) ||
@@ -2850,11 +2860,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           projectCostUsd !== undefined ||
           session.agentInfo?.cost?.estimatedCostUsd !== undefined;
         if (!anyCapActive || costObserved) {
+          // Cap removed, or a real cost was observed below it — release.
           updateSessionMetadata(session, {
             budgetPausedAt: "",
             budgetPausedReason: "",
             budgetInterrupted: "",
           });
+        } else {
+          // Cost unobservable this poll — keep the session paused (sticky) and
+          // the latch intact, reusing the original pause timestamp, until a real
+          // cost reading lets us decide.
+          newStatus = SESSION_STATUS.NEEDS_INPUT;
+          session.status = SESSION_STATUS.NEEDS_INPUT;
+          session.lifecycle.session.state = "needs_input";
+          session.lifecycle.session.reason = "awaiting_user_input";
+          session.lifecycle.session.lastTransitionAt = session.metadata["budgetPausedAt"];
+          assessment.evidence = session.metadata["budgetPausedReason"] || assessment.evidence;
         }
       }
     } else if (session.metadata["budgetPausedAt"]) {
@@ -3309,9 +3330,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // per-project budget cap can be evaluated per session below.
       const projectCostUsd = sumProjectCost(sessions);
 
-      // Poll all sessions concurrently
+      // Poll all sessions concurrently. Pass the raw map lookup (possibly
+      // undefined) — NOT `?? 0` — so checkSession can tell "no cost observed"
+      // (transient enrichment failure) apart from a real $0 aggregate and keep
+      // a budget pause latched through the failure window.
       await Promise.allSettled(
-        sessionsToCheck.map((s) => checkSession(s, projectCostUsd.get(s.projectId) ?? 0)),
+        sessionsToCheck.map((s) => checkSession(s, projectCostUsd.get(s.projectId))),
       );
 
       // Persist batch enrichment data to session metadata files so the
@@ -3463,7 +3487,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // budget cap is evaluated correctly for direct (e.g. webhook) checks,
       // not just the polling loop.
       const projectCostUsd = sumProjectCost(await sessionManager.list(session.projectId));
-      await checkSession(session, projectCostUsd.get(session.projectId) ?? 0);
+      // Pass the raw lookup (possibly undefined) — see the pollAll call site for
+      // why missing cost must not be coalesced to 0.
+      await checkSession(session, projectCostUsd.get(session.projectId));
     },
   };
 }
