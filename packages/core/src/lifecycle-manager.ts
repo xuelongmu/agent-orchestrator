@@ -2768,6 +2768,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       );
       if (breach) {
         const firstPause = !alreadyBudgetPaused;
+        // Whether the agent is still actively generating (vs. quiet at a prompt).
+        // Captured before newStatus is overwritten to needs_input below.
+        const stillActive = newStatus === SESSION_STATUS.WORKING;
         // Stamp the transition once, at first pause, and reuse that timestamp on
         // every subsequent poll while still over budget. Resetting it each poll
         // would make the dashboard/observability show a perpetually-fresh
@@ -2788,7 +2791,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         // pause: retry on every poll until it succeeds. Tying the retry to the
         // pause latch (firstPause) would interrupt exactly once and silently give
         // up on a transient failure, leaving the agent spending indefinitely.
-        if (session.metadata["budgetInterrupted"] !== "true") {
+        //
+        // The `budgetInterrupted` latch only suppresses re-interrupts for a
+        // *quiet* paused session (already stopped at its prompt). If the session
+        // is actively generating again while still over the cap (the Escape
+        // didn't cancel, or a human resumed the terminal without raising the
+        // cap), re-interrupt regardless of the latch — otherwise the agent keeps
+        // accruing cost and the budget cap is defeated.
+        if (stillActive || session.metadata["budgetInterrupted"] !== "true") {
           const interrupted = await interruptForBudget(session);
           if (interrupted) {
             updateSessionMetadata(session, { budgetInterrupted: "true" });

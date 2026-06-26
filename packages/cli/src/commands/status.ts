@@ -166,12 +166,18 @@ async function gatherSessionInfo(
   // normalizes session.metadata.agent on read, so never infer the session agent
   // from current project/default config here.
   let claudeSummary: string | null = null;
+  // Keep the introspection cost so we can fall back to it when the enriched
+  // session record has no agentInfo (enrichment timed out or was skipped for a
+  // recovered/dead-runtime record) — otherwise status reports `-`/null even
+  // though we just parsed the cost here.
+  let introspectionCost: CostEstimate | null = null;
   try {
     const agentName = session.metadata["agent"];
     if (agentName) {
       const agent = getAgentByNameFromRegistry(registry, agentName);
       const introspection = await agent.getSessionInfo(session);
       claudeSummary = introspection?.summary ?? null;
+      introspectionCost = introspection?.cost ?? null;
     }
   } catch {
     // Summary extraction failed — not critical
@@ -250,7 +256,7 @@ async function gatherSessionInfo(
     reviewDecision,
     pendingThreads,
     activity,
-    cost: session.agentInfo?.cost ?? null,
+    cost: session.agentInfo?.cost ?? introspectionCost,
     reports,
   };
 }

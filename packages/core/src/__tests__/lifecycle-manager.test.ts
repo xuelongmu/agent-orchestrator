@@ -380,7 +380,33 @@ describe("budget enforcement", () => {
     expect(lm.getStates().get("app-1")).toBe("needs_input");
   });
 
-  it("does not re-interrupt on a subsequent poll once the interrupt has landed", async () => {
+  it("does not re-interrupt a quiet paused session once the interrupt has landed", async () => {
+    // The interrupt landed and the agent now sits at its prompt (waiting_input),
+    // so it is no longer generating. The latch must suppress redundant interrupts.
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+    const session = withCost(9.99);
+    session.metadata = {
+      ...session.metadata,
+      budgetPausedAt: "2026-01-01T00:00:00.000Z",
+      budgetInterrupted: "true",
+    };
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { budgetPausedAt: "2026-01-01T00:00:00.000Z", budgetInterrupted: "true" },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(plugins.runtime.interrupt).not.toHaveBeenCalled();
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+  });
+
+  it("re-interrupts an over-budget session that is generating again despite the latch", async () => {
+    // The interrupt previously landed (budgetInterrupted latched), but the agent
+    // is actively generating again while still over the cap (Escape didn't
+    // cancel, or a human resumed the terminal). The latch must NOT suppress the
+    // interrupt here, or the agent keeps accruing cost and the cap is defeated.
     vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
     const session = withCost(9.99);
     session.metadata = {
@@ -396,9 +422,9 @@ describe("budget enforcement", () => {
 
     await lm.check("app-1");
 
-    // The interrupt already succeeded (budgetInterrupted latched); re-pausing each
-    // poll must not re-interrupt.
-    expect(plugins.runtime.interrupt).not.toHaveBeenCalled();
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "rt-1" }),
+    );
     expect(lm.getStates().get("app-1")).toBe("needs_input");
   });
 
