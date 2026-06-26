@@ -528,6 +528,57 @@ describe("budget enforcement", () => {
     expect(plugins.runtime.interrupt).toHaveBeenCalledTimes(1);
   });
 
+  it("enforces the cap on an over-budget session whose status is a PR overlay (ci_failed)", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const session = withCost(9.99);
+    // The agent is actively generating (canonical session state "working"), but
+    // it has an open, CI-failing PR, so deriveLegacyStatus() reports "ci_failed"
+    // rather than "working". The cap must still be enforced — otherwise an
+    // over-budget agent can keep spending while fixing CI / addressing review.
+    session.lifecycle.pr.state = "open";
+    session.lifecycle.pr.reason = "ci_failing";
+    session.lifecycle.session.state = "working";
+    session.status = "ci_failed";
+    const lm = setupCheck("app-1", {
+      session,
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "rt-1" }),
+    );
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeTruthy();
+  });
+
+  it("does not enforce the cap on a terminal (merged) session", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "idle" });
+    // A merged session is wrapping up (canonical idle, legacy "merged"). Even
+    // wildly over budget, the budget path must leave terminal/cleanup lifecycle
+    // untouched.
+    const session = withCost(1000);
+    session.lifecycle.pr.state = "merged";
+    session.lifecycle.pr.reason = "merged";
+    session.lifecycle.session.state = "idle";
+    session.status = "merged";
+    const lm = setupCheck("app-1", {
+      session,
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    // The budget path must not pause/interrupt a terminal session, regardless of
+    // exactly which terminal/cleanup status the merge lifecycle derives.
+    expect(lm.getStates().get("app-1")).not.toBe("needs_input");
+    expect(plugins.runtime.interrupt).not.toHaveBeenCalled();
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeFalsy();
+  });
+
   it("clears the pause latch when the cap is raised above current cost", async () => {
     vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
     const session = withCost(3.0);

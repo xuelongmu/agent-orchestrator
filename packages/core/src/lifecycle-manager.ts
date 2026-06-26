@@ -2749,17 +2749,26 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // the pause sticky and lets the existing transition machinery fire the
     // notification exactly once.
     const alreadyBudgetPaused = !!session.metadata["budgetPausedAt"];
-    // Evaluate the cap on a live "working" session, and also keep evaluating it
-    // for a session we already paused that has since gone quiet. After the
-    // first-pause interrupt the agent stops generating, so the next poll often
-    // derives idle/needs_input rather than working; re-evaluating in those
-    // states keeps the pause sticky (and lets us release it if the cap is later
-    // raised) instead of clearing the latch. PR/CI/cleanup/terminal states are
-    // left untouched so we never interfere with PR or cleanup lifecycle.
+    // Evaluate the cap whenever the agent could still be spending. Key off the
+    // canonical session state, NOT the legacy status: deriveLegacyStatus()
+    // overlays an open PR onto a still-`working` agent and reports
+    // pr_open/ci_failed/review_pending/etc., so gating on `newStatus === working`
+    // would skip enforcement for an actively-generating agent that happens to
+    // have a PR open (it could keep accruing cost while fixing CI / addressing
+    // review). The underlying lifecycle state still says "working" in that case.
+    //
+    // - canonical "working" → agent is generating → always enforce.
+    // - canonical "idle"/"needs_input" → quiet → only keep evaluating while
+    //   already paused, so the pause stays sticky (and releases if the cap is
+    //   later raised) without newly pausing a genuinely-quiet session.
+    // Terminal/cleanup legacy statuses (merged/cleanup/done/killed/terminated/
+    // errored) are always excluded so we never interfere with PR-merge or
+    // cleanup lifecycle, even though their canonical state may read idle.
+    const liveState = session.lifecycle.session.state;
     const evaluateBudget =
-      newStatus === SESSION_STATUS.WORKING ||
-      (alreadyBudgetPaused &&
-        (newStatus === SESSION_STATUS.NEEDS_INPUT || newStatus === SESSION_STATUS.IDLE));
+      !TERMINAL_STATUSES.has(newStatus) &&
+      (liveState === "working" ||
+        (alreadyBudgetPaused && (liveState === "idle" || liveState === "needs_input")));
     if (evaluateBudget) {
       const breach = evaluateBudgetBreach(
         config,
@@ -2769,8 +2778,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       if (breach) {
         const firstPause = !alreadyBudgetPaused;
         // Whether the agent is still actively generating (vs. quiet at a prompt).
-        // Captured before newStatus is overwritten to needs_input below.
-        const stillActive = newStatus === SESSION_STATUS.WORKING;
+        // Use the canonical state, not the legacy status, so a working agent
+        // under a PR overlay (ci_failed/pr_open/etc.) still counts as active.
+        // Captured before the canonical state is overwritten to needs_input below.
+        const stillActive = liveState === "working";
         // Stamp the transition once, at first pause, and reuse that timestamp on
         // every subsequent poll while still over budget. Resetting it each poll
         // would make the dashboard/observability show a perpetually-fresh
