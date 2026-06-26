@@ -314,7 +314,10 @@ export const LocalProjectConfigSchema = z
       .enum(["reuse", "delete", "ignore", "delete-new", "ignore-new", "kill-previous"])
       .optional(),
     opencodeIssueSessionStrategy: z.enum(["reuse", "delete", "ignore"]).optional(),
-    decomposer: z.object({}).passthrough().optional(),
+    decomposer: z
+      .object({ agent: z.string().optional(), agentConfig: z.object({}).passthrough().optional() })
+      .passthrough()
+      .optional(),
     budget: z
       .object({
         perSessionUsd: z.number().nonnegative().optional(),
