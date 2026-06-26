@@ -583,7 +583,8 @@ describe("budget enforcement", () => {
     // resolveOpenPRDecision() forces the canonical session state to "idle" for
     // review_pending even while the agent is still generating after opening a
     // PR. The cap must still be enforced — gating on canonical "working" alone
-    // would miss this common post-PR path.
+    // would miss this common post-PR path. (Mirrors the "keeps canonical session
+    // state idle while waiting on external review" setup, with cost + a cap.)
     vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
     const mockSCM = createMockSCM({
       getReviewDecision: vi.fn().mockResolvedValue("pending"),
@@ -596,17 +597,26 @@ describe("budget enforcement", () => {
     });
     const session = makeSession({
       status: "pr_open",
-      pr: makeMatchingPR(),
+      pr: makePR(),
       agentInfo: {
         summary: null,
         agentSessionId: null,
         cost: { inputTokens: 100, outputTokens: 50, estimatedCostUsd: 9.99 },
       },
     });
-    const lm = setupPollCheck("app-1", {
-      session,
+    vi.mocked(mockSessionManager.get).mockResolvedValue(session);
+    writeMetadata(env.sessionsDir, "app-1", {
+      worktree: "/tmp",
+      branch: session.branch ?? "main",
+      status: session.status,
+      project: "my-app",
+      pr: session.pr?.url,
+      runtimeHandle: session.runtimeHandle ?? undefined,
+    });
+    const lm = createLifecycleManager({
+      config: { ...config, budget: { perSessionUsd: 5 } },
       registry,
-      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+      sessionManager: mockSessionManager,
     });
 
     await lm.check("app-1");
@@ -618,11 +628,12 @@ describe("budget enforcement", () => {
   });
 
   it("keeps the budget pause latched (and sticky) when cost is transiently unavailable", async () => {
-    // Already paused, but this poll can't read cost (getSessionInfo/log failure):
-    // agentInfo is null and no project aggregate exists. evaluateBudgetBreach
-    // sees $0 → no breach, but that must NOT be read as "under budget".
-    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "idle" });
-    const session = makeSession({ status: "needs_input", agentInfo: null });
+    // Already paused and still active, but this poll can't read cost
+    // (getSessionInfo/log failure): agentInfo is null and no project aggregate
+    // exists, so evaluateBudgetBreach sees $0 → no breach. That must NOT be read
+    // as "under budget" — the latch and the needs_input pause must survive.
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const session = makeSession({ status: "working", agentInfo: null });
     session.metadata = {
       ...session.metadata,
       budgetPausedAt: "2026-01-01T00:00:00.000Z",
