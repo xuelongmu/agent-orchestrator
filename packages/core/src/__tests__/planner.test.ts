@@ -174,10 +174,10 @@ describe("createPlanTickets", () => {
     expect(calls[1].repo).toBe("acme/app"); // project default
   });
 
-  it("only includes already-created related refs", async () => {
+  it("carries a forward related ref onto the later-created ticket", async () => {
     const { tracker, calls } = makeMockTracker();
-    // t1 relates to t2, but t2 is created after t1 (no blocking edge) — forward
-    // related ref is skipped to keep the reference valid.
+    // t1 relates to t2 with no dependency edge, so t1 is created first (issue 1)
+    // before t2 exists. The link must still be recorded — it lands on t2.
     const p = plan([
       { ref: "t1", title: "A", body: "", relatedRefs: ["t2"] },
       { ref: "t2", title: "B", body: "" },
@@ -185,7 +185,21 @@ describe("createPlanTickets", () => {
 
     await createPlanTickets({ plan: p, tracker, project: baseProject });
 
-    expect(calls[0].input.relatedTo).toBeUndefined();
+    expect(calls[0].input.relatedTo).toBeUndefined(); // t1 created first
+    expect(calls[1].input.relatedTo).toEqual(["1"]); // t2 links back to t1
+  });
+
+  it("rejects cross-repo dependency edges before creating anything", async () => {
+    const { tracker, calls } = makeMockTracker();
+    const p = plan([
+      { ref: "api", title: "API", body: "", repo: "acme/api" },
+      { ref: "web", title: "Web", body: "", blockedByRefs: ["api"] }, // web in acme/app
+    ]);
+
+    await expect(
+      createPlanTickets({ plan: p, tracker, project: baseProject }),
+    ).rejects.toThrow(/Cross-repo dependency/);
+    expect(calls).toHaveLength(0); // nothing created
   });
 
   it("throws when the tracker cannot create issues", async () => {
@@ -261,10 +275,12 @@ describe("decomposer command construction", () => {
     expect(args).toEqual(["exec", "--sandbox", "read-only", "--output-last-message", "/out.json", "the prompt"]);
   });
 
-  it("builds claude print args", () => {
+  it("builds claude print args in read-only plan mode", () => {
     expect(buildClaudeDecomposerArgs("the prompt")).toEqual([
       "-p",
       "the prompt",
+      "--permission-mode",
+      "plan",
       "--output-format",
       "text",
     ]);
