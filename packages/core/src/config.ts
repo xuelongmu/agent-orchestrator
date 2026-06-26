@@ -267,6 +267,7 @@ const ProjectConfigSchema = z.object({
   agentConfig: AgentSpecificConfigSchema.default({}),
   orchestrator: RoleAgentConfigSchema,
   worker: RoleAgentConfigSchema,
+  decomposer: RoleAgentConfigSchema,
   reactions: z.record(ReactionConfigSchema.partial()).optional(),
   agentRules: z.string().optional(),
   agentRulesFile: z.string().optional(),
@@ -284,6 +285,7 @@ const DefaultPluginsSchema = z.object({
   notifiers: z.array(z.string()).default([]),
   orchestrator: RoleAgentDefaultsSchema,
   worker: RoleAgentDefaultsSchema,
+  decomposer: RoleAgentDefaultsSchema,
 });
 
 const InstalledPluginConfigSchema = z
