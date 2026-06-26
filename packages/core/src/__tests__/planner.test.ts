@@ -225,12 +225,27 @@ describe("decomposeGoal", () => {
 });
 
 describe("decomposer agent resolution", () => {
-  it("prefers the decomposer agent, then orchestrator, then project/default agent", () => {
+  it("prefers decomposer, then orchestrator, then worker, then project/default agent", () => {
     expect(resolveDecomposerAgent({ decomposer: { agent: "codex" } })).toBe("codex");
+    expect(resolveDecomposerAgent({}, { decomposer: { agent: "codex" } })).toBe("codex");
     expect(resolveDecomposerAgent({ orchestrator: { agent: "claude" } })).toBe("claude");
+    expect(resolveDecomposerAgent({ worker: { agent: "grok" } })).toBe("grok");
+    expect(resolveDecomposerAgent({}, { worker: { agent: "grok" } })).toBe("grok");
     expect(resolveDecomposerAgent({ agent: "aider" })).toBe("aider");
     expect(resolveDecomposerAgent({}, { agent: "opencode" })).toBe("opencode");
     expect(resolveDecomposerAgent({})).toBe("claude-code");
+  });
+
+  it("decomposer default outranks orchestrator/worker roles", () => {
+    expect(
+      resolveDecomposerAgent(
+        { orchestrator: { agent: "claude" } },
+        { decomposer: { agent: "codex" } },
+      ),
+    ).toBe("claude"); // project-level decomposer/orchestrator beats defaults
+    expect(
+      resolveDecomposerAgent({}, { decomposer: { agent: "codex" }, orchestrator: { agent: "claude" } }),
+    ).toBe("codex");
   });
 
   it("resolves runners for supported agents and rejects others", () => {
