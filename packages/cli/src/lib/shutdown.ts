@@ -112,16 +112,22 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
         // wait: if the poll is stuck in a slow tracker call or spawn, proceed
         // anyway rather than let the 10s force-exit fire with sessions un-killed
         // and last-stop unwritten.
+        let drainTimer: ReturnType<typeof setTimeout> | undefined;
         const drained = await Promise.race([
           backlogStopped.then(
             () => true,
             () => true,
           ),
           new Promise<boolean>((resolve) => {
-            const t = setTimeout(() => resolve(false), BACKLOG_DRAIN_TIMEOUT_MS);
-            t.unref();
+            // NOT unref'd: this timeout gates the kill / last-stop cleanup below.
+            // On a headless daemon with `backlogStopped` still pending, an
+            // unref'd timer plus a pending promise leaves nothing keeping the
+            // event loop alive, so Node could exit before cleanup runs. Cleared
+            // once the race settles so a fast drain leaves no dangling handle.
+            drainTimer = setTimeout(() => resolve(false), BACKLOG_DRAIN_TIMEOUT_MS);
           }),
         ]);
+        if (drainTimer) clearTimeout(drainTimer);
         if (!drained) {
           recordActivityEvent({
             projectId: ctx.projectId,

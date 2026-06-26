@@ -506,6 +506,58 @@ describe("backlog poller", () => {
     expect(spawn).toHaveBeenCalledWith({ projectId: "proj", issueId: "2" });
   });
 
+  it("over-fetches past verification-labeled issues to reach fresh backlog work", async () => {
+    // A stale merged-unverified issue kept agent:backlog and sits ahead of fresh
+    // work. With availableSlots=1 the first page (limit 1) is all skip; the
+    // fetch must grow to surface and spawn the fresh issue rather than starve it.
+    const stale = {
+      ...makeIssue("stale"),
+      labels: ["agent:backlog", "merged-unverified"],
+    } as Issue;
+    const fresh = makeIssue("fresh");
+    const ordered = [stale, fresh];
+    const listIssues = vi.fn(async (filters: { labels?: string[]; limit?: number }) => {
+      if (!filters.labels?.includes("agent:backlog")) return [];
+      return ordered.slice(0, filters.limit ?? ordered.length);
+    });
+    const updateIssue = vi.fn(async () => undefined);
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
+
+    const services: BacklogServices = {
+      config: {
+        projects: {
+          proj: {
+            name: "proj",
+            path: "/tmp/proj",
+            defaultBranch: "main",
+            sessionPrefix: "ao",
+            tracker: { plugin: "github" },
+            maxConcurrentAgents: 1,
+          },
+        },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => []),
+        spawn,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledWith({ projectId: "proj", issueId: "fresh" });
+  });
+
   it("recognizes a taken issue when the listed URL differs from issueUrl() (slug)", async () => {
     // Mimics Linear: active sessions are recorded via the short `issueUrl()`,
     // but `listIssues()` returns `node.url`, which carries a title slug. A

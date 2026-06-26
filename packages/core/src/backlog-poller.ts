@@ -65,6 +65,15 @@ export const BACKLOG_POLL_INTERVAL_MS = 60_000;
 /** Default per-project concurrency cap when `maxConcurrentAgents` is unset. */
 export const DEFAULT_MAX_CONCURRENT_AGENTS = 5;
 
+/**
+ * Upper bound on how many backlog issues a single project poll will request.
+ * The fetch grows its page when stale skip-only issues (claimed-but-unrelabeled
+ * or verification-labeled) saturate it, so fresh work further down isn't
+ * starved; this caps that growth so a large backlog can't trigger an unbounded
+ * listing call.
+ */
+const MAX_BACKLOG_FETCH = 200;
+
 /** Services the poller needs. Compatible with both the CLI and web wiring. */
 export interface BacklogServices {
   config: OrchestratorConfig;
@@ -429,19 +438,66 @@ async function spawnFromBacklog(
         .filter((issueId): issueId is string => Boolean(issueId)),
     );
 
+    // Canonicalize via the tracker's own `issueUrl()` rather than trusting the
+    // listed `issue.url`. `takenIssueUrls` is built from `issueUrl()`, but some
+    // trackers' `listIssues()` returns a URL that isn't byte-identical to it —
+    // e.g. Linear records sessions with the short `issueUrl()` but lists
+    // `node.url`, which can carry a title slug. Deriving both keys from the same
+    // function avoids missing an already-running worker and double-spawning.
+    const canonicalUrlFor = (issue: Issue): string => {
+      if (tracker.issueUrl) {
+        try {
+          return tracker.issueUrl(issue.id, project);
+        } catch {
+          // URL construction failed — fall back to the listed URL; the
+          // per-project id check still guards same-project duplicates.
+        }
+      }
+      return issue.url;
+    };
+    // An issue is skipped when it's already being worked on (per-project id),
+    // already taken by any project / claimed earlier this cycle (tracker-wide by
+    // URL), or still carries a verification label. The last is a merged issue
+    // awaiting human verification that kept `agent:backlog` — on trackers whose
+    // updateIssue ignores removeLabels (Linear, GitLab) or after a failed claim.
+    // Its session is merged (excluded from workerSessions), so nothing else
+    // guards it. Shared by the fetch sizing and the spawn loop so both agree.
+    const wouldSkipForSpawn = (issue: Issue): boolean =>
+      VERIFICATION_LABELS.some((label) => issue.labels.includes(label)) ||
+      activeIssueIds.has(issue.id.toLowerCase()) ||
+      takenIssueUrls.has(canonicalUrlFor(issue));
+
+    // Fetch the backlog, growing the page while it stays saturated with issues
+    // we'll skip and capacity remains. Without this, stale issues still carrying
+    // `agent:backlog` (claimed-but-unrelabeled, or verification-labeled with no
+    // live session to clean them) can fill the whole page every poll and
+    // indefinitely starve fresh work despite open slots. Over-fetching is
+    // harmless — the spawn loop stops at `availableSlots`. Bounded so a large
+    // backlog can't trigger an unbounded fetch.
+    let limit = availableSlots + takenIssueUrls.size;
     let backlogIssues: Issue[];
     try {
       backlogIssues = await tracker.listIssues(
-        // Request the free slots plus a buffer for issues we'll skip: claimed
-        // items whose label transition failed can still appear in the backlog,
-        // and without the buffer they could fill the whole page and starve
-        // unclaimed issues further down even though capacity remains. Over-
-        // fetching is harmless — the spawn loop stops at `availableSlots`.
-        { state: "open", labels: [BACKLOG_LABEL], limit: availableSlots + takenIssueUrls.size },
+        { state: "open", labels: [BACKLOG_LABEL], limit },
         project,
       );
     } catch {
       continue; // Tracker unavailable — skip this project
+    }
+    while (
+      backlogIssues.length >= limit &&
+      limit < MAX_BACKLOG_FETCH &&
+      backlogIssues.filter((issue) => !wouldSkipForSpawn(issue)).length < availableSlots
+    ) {
+      limit = Math.min(limit * 2, MAX_BACKLOG_FETCH);
+      try {
+        backlogIssues = await tracker.listIssues(
+          { state: "open", labels: [BACKLOG_LABEL], limit },
+          project,
+        );
+      } catch {
+        break; // Keep the last good page rather than dropping the project.
+      }
     }
 
     for (const issue of backlogIssues) {
@@ -452,35 +508,8 @@ async function spawnFromBacklog(
       // path has already enumerated sessions to kill / written last-stop.
       if (signal?.aborted) return;
 
-      // A merged issue awaiting human verification can still carry
-      // `agent:backlog`: trackers whose `updateIssue` ignores `removeLabels`
-      // (Linear, GitLab) never drop it, and a failed claim call can leave it on
-      // any tracker. The session is merged (excluded from `workerSessions`), so
-      // nothing else guards it — skip any issue already in the verification
-      // flow rather than respawn a worker for it.
-      if (VERIFICATION_LABELS.some((label) => issue.labels.includes(label))) continue;
-
-      // Canonicalize via the tracker's own `issueUrl()` rather than trusting
-      // the listed `issue.url`. `takenIssueUrls` is built from `issueUrl()`
-      // (line above), but some trackers' `listIssues()` returns a URL that
-      // isn't byte-identical to it — e.g. Linear records sessions with the
-      // short `issueUrl()` but lists `node.url`, which can carry a title slug.
-      // Comparing raw `issue.url` would miss an already-running worker and
-      // double-spawn. Deriving both keys from the same function avoids that.
-      let canonicalUrl = issue.url;
-      if (tracker.issueUrl) {
-        try {
-          canonicalUrl = tracker.issueUrl(issue.id, project);
-        } catch {
-          // URL construction failed — fall back to the listed URL; the
-          // per-project id check below still guards same-project duplicates.
-        }
-      }
-
-      // Skip if already being worked on (per-project id) or already taken by
-      // any project / claimed earlier this cycle (tracker-wide by URL).
-      if (activeIssueIds.has(issue.id.toLowerCase())) continue;
-      if (takenIssueUrls.has(canonicalUrl)) continue;
+      if (wouldSkipForSpawn(issue)) continue;
+      const canonicalUrl = canonicalUrlFor(issue);
 
       try {
         await sessionManager.spawn({ projectId, issueId: issue.id });
