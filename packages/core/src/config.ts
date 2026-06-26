@@ -259,6 +259,8 @@ const ProjectConfigSchema = z.object({
   runtime: z.string().optional(),
   agent: z.string().optional(),
   workspace: z.string().optional(),
+  /** Max concurrent worker sessions the backlog poller spawns for this project. */
+  maxConcurrentAgents: z.number().int().positive().optional(),
   env: z.record(z.string(), z.string()).optional(),
   tracker: TrackerConfigSchema.optional(),
   scm: SCMConfigSchema.optional(),

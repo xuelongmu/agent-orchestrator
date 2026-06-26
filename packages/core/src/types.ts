@@ -1606,6 +1606,23 @@ export interface ProjectConfig {
   /** Override default workspace */
   workspace?: string;
 
+  /**
+   * Absolute path to the config file that actually defines this project. Set
+   * only when projects from more than one config are merged into a single scope
+   * (e.g. the `ao start` daemon unions the global registry with a startup
+   * config). When present it overrides the top-level `config.configPath` for the
+   * worker's `AO_CONFIG_PATH`, so an agent spawned for a startup-only project
+   * can still resolve its own project via `ao`. Unset for normal single-config
+   * projects, which fall back to `config.configPath`.
+   */
+  sourceConfigPath?: string;
+
+  /**
+   * Maximum number of concurrent worker sessions the backlog poller will spawn
+   * for this project. Defaults to 5 when unset.
+   */
+  maxConcurrentAgents?: number;
+
   /** Environment variables forwarded into worker session runtimes (AO_* internals always win) */
   env?: Record<string, string>;
 

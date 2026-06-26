@@ -85,7 +85,13 @@ describe("AddProjectModal", () => {
       ),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /^add project$/i }));
+    // Wait for the browse response (isGitRepo: true) to propagate into
+    // `canSubmit` before clicking — otherwise the click can land while the
+    // button is still disabled (a no-op) and the submit never fires. This was a
+    // race that surfaced intermittently on Windows CI.
+    const addButton = screen.getByRole("button", { name: /^add project$/i });
+    await waitFor(() => expect(addButton).toBeEnabled());
+    fireEvent.click(addButton);
 
     await waitFor(() => expect(mockPush).toHaveBeenCalledWith("/projects/my-repo"));
     expect(fetchMock).toHaveBeenLastCalledWith(

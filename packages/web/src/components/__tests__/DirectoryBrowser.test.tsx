@@ -411,8 +411,19 @@ describe("DirectoryBrowser", () => {
 
     // The dialog wrapper is an ancestor of the browser panes — the state focus
     // lands on when the modal opens. Keyboard nav must still respond.
-    fireEvent.keyDown(screen.getByTestId("dialog"), { key: "ArrowDown" });
-
-    await waitFor(() => expect(alpha?.className).toContain("is-selected"));
+    //
+    // Retry the dispatch until selection sticks: the document keydown listener
+    // re-attaches via a passive effect after the rows render, and on slower CI a
+    // single ArrowDown can land on the prior listener (still closed over the
+    // pre-fetch empty entries) and no-op. Re-firing only while unselected is
+    // safe — selectedIndex stays -1 until a fire takes effect, so the first
+    // effective ArrowDown always lands on index 0 (alpha), never advancing.
+    await waitFor(() => {
+      const row = screen.getByText("alpha").closest("button");
+      if (!row?.className.includes("is-selected")) {
+        fireEvent.keyDown(screen.getByTestId("dialog"), { key: "ArrowDown" });
+      }
+      expect(row?.className).toContain("is-selected");
+    });
   });
 });

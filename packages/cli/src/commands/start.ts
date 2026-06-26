@@ -80,6 +80,7 @@ import {
 } from "../lib/running-state.js";
 import { attachToDaemon, killExistingDaemon } from "../lib/daemon.js";
 import { startProjectSupervisor } from "../lib/project-supervisor.js";
+import { startBacklogPoller } from "../lib/backlog-service.js";
 import { isHumanCaller } from "../lib/caller-context.js";
 import { detectEnvironment } from "../lib/detect-env.js";
 import {
@@ -1176,6 +1177,16 @@ async function runStartup(
       });
       // Non-fatal: don't block startup if last-stop handling fails
     }
+  }
+
+  // Drive labeled backlog issues to execution without needing the dashboard
+  // (headless autonomy). Started after session restore so the first poll
+  // counts restored workers against the per-project cap rather than racing
+  // them — otherwise it could spawn new workers up to the cap while the
+  // restored sessions are still being brought back. The poller's
+  // cross-process lock prevents double-spawning with the dashboard's poller.
+  if (shouldStartLifecycle) {
+    startBacklogPoller(config.configPath);
   }
 
   // Print summary

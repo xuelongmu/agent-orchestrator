@@ -67,7 +67,14 @@ function isMissingConfigError(error: unknown): boolean {
 /** Load the supervisor config: prefer the global registry, fall back to the
  *  caller-resolved local config path (or cwd discovery when none provided).
  *  Returns the source so callers can gate authoritative actions (like the
- *  detach pass) on whether we're looking at the real registry. */
+ *  detach pass) on whether we're looking at the real registry.
+ *
+ *  Note: unlike the poller/shutdown scope, the supervisor deliberately does NOT
+ *  union the startup config when the global registry is healthy — the global
+ *  registry is authoritative for the detach pass, and `ao start` registers the
+ *  started project there, so it's already supervised. Consulting `configPath`
+ *  here would override that contract (see the "ignores caller configPath when
+ *  global is healthy" and global→fallback detach-safety tests). */
 function loadSupervisorConfig(configPath?: string): LoadedSupervisorConfig {
   const globalConfigPath = getGlobalConfigPath();
   try {
