@@ -222,6 +222,7 @@ export const GlobalConfigSchema = z
         notifiers: z.array(z.string()).default(["composio", "desktop"]),
         orchestrator: z.object({ agent: z.string().optional() }).optional(),
         worker: z.object({ agent: z.string().optional() }).optional(),
+        decomposer: z.object({ agent: z.string().optional() }).optional(),
       })
       .default({}),
     /** Project registry — map key is the canonical project ID. */

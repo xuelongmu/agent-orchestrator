@@ -1538,6 +1538,9 @@ export interface DefaultPlugins {
   worker?: {
     agent?: string;
   };
+  decomposer?: {
+    agent?: string;
+  };
 }
 
 export type InstalledPluginSource = "registry" | "npm" | "local";

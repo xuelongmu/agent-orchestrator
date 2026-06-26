@@ -285,6 +285,7 @@ const DefaultPluginsSchema = z.object({
   notifiers: z.array(z.string()).default([]),
   orchestrator: RoleAgentDefaultsSchema,
   worker: RoleAgentDefaultsSchema,
+  decomposer: RoleAgentDefaultsSchema,
 });
 
 const InstalledPluginConfigSchema = z

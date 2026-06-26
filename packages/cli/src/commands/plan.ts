@@ -115,15 +115,6 @@ export function registerPlan(program: Command): void {
 
         const project = config.projects[projectId];
         const registry = await getPluginRegistry(config);
-
-        let tracker: Tracker;
-        try {
-          tracker = getTracker(registry, project);
-        } catch (err) {
-          console.error(chalk.red(`✗ ${err instanceof Error ? err.message : String(err)}`));
-          process.exit(1);
-        }
-
         const agentName = resolveDecomposerAgent(project, config.defaults);
 
         recordActivityEvent({
@@ -155,9 +146,21 @@ export function registerPlan(program: Command): void {
           process.exit(1);
         }
 
+        // --json only previews the plan — it never creates tickets, so it must
+        // not require a tracker that supports issue creation.
         if (opts.json) {
           console.log(JSON.stringify(plan, null, 2));
           return;
+        }
+
+        // Resolve the tracker now (creation requires it); deferred past --json
+        // so previewing a plan works in projects without a configured tracker.
+        let tracker: Tracker;
+        try {
+          tracker = getTracker(registry, project);
+        } catch (err) {
+          console.error(chalk.red(`✗ ${err instanceof Error ? err.message : String(err)}`));
+          process.exit(1);
         }
 
         console.log();

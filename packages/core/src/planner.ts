@@ -515,13 +515,21 @@ export const runClaudeDecomposer: PlanRunner = async (context) => {
  * `decomposer` config field with a sensible fallback chain.
  */
 export function resolveDecomposerAgent(
-  project: Pick<ProjectConfig, "decomposer" | "orchestrator" | "agent">,
-  defaults?: { orchestrator?: { agent?: string }; agent?: string },
+  project: Pick<ProjectConfig, "decomposer" | "orchestrator" | "worker" | "agent">,
+  defaults?: {
+    decomposer?: { agent?: string };
+    orchestrator?: { agent?: string };
+    worker?: { agent?: string };
+    agent?: string;
+  },
 ): string {
   return (
     project.decomposer?.agent ??
+    defaults?.decomposer?.agent ??
     project.orchestrator?.agent ??
     defaults?.orchestrator?.agent ??
+    project.worker?.agent ??
+    defaults?.worker?.agent ??
     project.agent ??
     defaults?.agent ??
     "claude-code"
