@@ -163,6 +163,34 @@ export async function ptyHostSendMessage(pipePath: string, message: string): Pro
 }
 
 // ---------------------------------------------------------------------------
+// ptyHostSendRaw
+// ---------------------------------------------------------------------------
+
+/**
+ * Send raw bytes to the PTY without the trailing Enter that ptyHostSendMessage
+ * appends. Used for control keystrokes like Escape (interrupt) that must reach
+ * the agent verbatim rather than being submitted as a line of input.
+ */
+export async function ptyHostSendRaw(pipePath: string, data: string): Promise<void> {
+  const sock = await connectPtyHost(pipePath);
+  await new Promise<void>((resolve, reject) => {
+    sock.once("error", (err) => {
+      sock.destroy();
+      reject(err);
+    });
+    sock.write(encodeMessage(MSG_TERMINAL_INPUT, data), (err) => {
+      if (err) {
+        sock.destroy();
+        reject(err);
+      } else {
+        sock.end();
+        resolve();
+      }
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // ptyHostGetOutput
 // ---------------------------------------------------------------------------
 

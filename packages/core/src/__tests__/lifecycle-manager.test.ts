@@ -273,6 +273,411 @@ describe("start / stop", () => {
   });
 });
 
+describe("budget enforcement", () => {
+  const withCost = (estimatedCostUsd: number) =>
+    makeSession({
+      status: "working",
+      agentInfo: {
+        summary: null,
+        agentSessionId: null,
+        cost: { inputTokens: 100, outputTokens: 50, estimatedCostUsd },
+      },
+    });
+
+  it("pauses an over-budget working session into needs_input", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const lm = setupCheck("app-1", {
+      session: withCost(9.99),
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeTruthy();
+    expect(meta!["budgetPausedReason"]).toContain("budget_exceeded");
+  });
+
+  it("leaves an under-budget working session working", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const lm = setupCheck("app-1", {
+      session: withCost(1.0),
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("working");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeFalsy();
+  });
+
+  it("does not enforce when no budget is configured", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const lm = setupCheck("app-1", { session: withCost(1000) });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("working");
+  });
+
+  it("pauses on the per-project cap using the aggregate of all project sessions", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    // The session's own cost ($6) is under any per-session cap, but the project
+    // total across two sessions ($12) exceeds perProjectUsd ($10).
+    const target = withCost(6);
+    const sibling = withCost(6);
+    sibling.id = "app-2";
+    const lm = setupCheck("app-1", {
+      session: target,
+      configOverride: { ...config, budget: { perProjectUsd: 10 } },
+    });
+    vi.mocked(mockSessionManager.list).mockResolvedValue([target, sibling]);
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedReason"]).toContain("project");
+  });
+
+  it("does not reset the transition timestamp on a poll while already paused", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const pausedAt = "2026-01-01T00:00:00.000Z";
+    const session = withCost(9.99);
+    session.metadata = { ...session.metadata, budgetPausedAt: pausedAt };
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { budgetPausedAt: pausedAt },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    // While already paused (budgetPausedAt present), the transition time reuses
+    // the original pause timestamp rather than being reset to "now".
+    const lifecycle = JSON.parse(meta!["lifecycle"] as string);
+    expect(lifecycle.session.lastTransitionAt).toBe(pausedAt);
+  });
+
+  it("interrupts the runtime when first pausing an over-budget session", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const lm = setupCheck("app-1", {
+      session: withCost(9.99),
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    // The agent is actually stopped (not just relabeled) so it can't keep
+    // spending tokens while reported paused.
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "rt-1" }),
+    );
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+  });
+
+  it("does not re-interrupt a quiet paused session once the interrupt has landed", async () => {
+    // The interrupt landed and the agent now sits at its prompt (waiting_input),
+    // so it is no longer generating. The latch must suppress redundant interrupts.
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+    const session = withCost(9.99);
+    session.metadata = {
+      ...session.metadata,
+      budgetPausedAt: "2026-01-01T00:00:00.000Z",
+      budgetInterrupted: "true",
+    };
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { budgetPausedAt: "2026-01-01T00:00:00.000Z", budgetInterrupted: "true" },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(plugins.runtime.interrupt).not.toHaveBeenCalled();
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+  });
+
+  it("re-interrupts an over-budget session that is generating again despite the latch", async () => {
+    // The interrupt previously landed (budgetInterrupted latched), but the agent
+    // is actively generating again while still over the cap (Escape didn't
+    // cancel, or a human resumed the terminal). The latch must NOT suppress the
+    // interrupt here, or the agent keeps accruing cost and the cap is defeated.
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const session = withCost(9.99);
+    session.metadata = {
+      ...session.metadata,
+      budgetPausedAt: "2026-01-01T00:00:00.000Z",
+      budgetInterrupted: "true",
+    };
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { budgetPausedAt: "2026-01-01T00:00:00.000Z", budgetInterrupted: "true" },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "rt-1" }),
+    );
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+  });
+
+  it("uses the session handle's runtime (not the project default) to interrupt", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    // The session was launched on the "mock" runtime (its persisted handle), but
+    // the project config has since been switched to a different runtime. The
+    // interrupt must target the handle's runtime, not the current config value.
+    const lm = setupCheck("app-1", {
+      session: withCost(9.99),
+      configOverride: {
+        ...config,
+        defaults: { ...config.defaults, runtime: "some-other-runtime" },
+        budget: { perSessionUsd: 5 },
+      },
+    });
+
+    await lm.check("app-1");
+
+    expect(mockRegistry.get).toHaveBeenCalledWith("runtime", "mock");
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "rt-1" }),
+    );
+  });
+
+  it("retries the interrupt on the next poll after a transient failure", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    // Poll 1: the runtime interrupt fails transiently (tmux error / pty-host pipe
+    // timeout). The session is still paused, but the interrupt latch must NOT be
+    // set so a later poll retries instead of giving up.
+    vi.mocked(plugins.runtime.interrupt!).mockRejectedValueOnce(new Error("pipe timeout"));
+    const lm = setupCheck("app-1", {
+      session: withCost(9.99),
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const afterFail = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(afterFail!["budgetPausedAt"]).toBeTruthy();
+    expect(afterFail!["budgetInterrupted"]).toBeFalsy();
+    expect(plugins.runtime.interrupt).toHaveBeenCalledTimes(1);
+
+    // Poll 2: still over budget, latch persisted but interrupt not yet landed —
+    // the interrupt is retried and this time succeeds.
+    const repaused = withCost(9.99);
+    repaused.metadata = {
+      ...repaused.metadata,
+      budgetPausedAt: afterFail!["budgetPausedAt"] as string,
+      budgetPausedReason: afterFail!["budgetPausedReason"] as string,
+    };
+    vi.mocked(mockSessionManager.get).mockResolvedValue(repaused);
+
+    await lm.check("app-1");
+
+    expect(plugins.runtime.interrupt).toHaveBeenCalledTimes(2);
+    const afterRetry = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(afterRetry!["budgetInterrupted"]).toBe("true");
+  });
+
+  it("keeps an interrupted, at-prompt session paused while still over budget", async () => {
+    // Poll 1: an active, over-budget session is paused — this writes the latch
+    // to disk and interrupts the agent.
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const lm = setupCheck("app-1", {
+      session: withCost(9.99),
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+    await lm.check("app-1");
+    const paused = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(paused!["budgetPausedAt"]).toBeTruthy();
+    expect(paused!["budgetInterrupted"]).toBe("true");
+    expect(plugins.runtime.interrupt).toHaveBeenCalledTimes(1);
+
+    // Poll 2: the interrupt landed and the agent now sits at its prompt
+    // (waiting_input). The reload sees the persisted latch; the pause must stay
+    // sticky — the latch must NOT be cleared and the agent must not be
+    // re-interrupted while the cost is still over the cap.
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+    const repaused = withCost(9.99);
+    repaused.status = "needs_input";
+    repaused.lifecycle.session.state = "needs_input";
+    repaused.lifecycle.session.reason = "awaiting_user_input";
+    repaused.metadata = {
+      agent: "mock-agent",
+      project: "my-app",
+      branch: "feat/test",
+      status: "needs_input",
+      budgetPausedAt: paused!["budgetPausedAt"] as string,
+      budgetPausedReason: paused!["budgetPausedReason"] as string,
+      budgetInterrupted: paused!["budgetInterrupted"] as string,
+    };
+    vi.mocked(mockSessionManager.get).mockResolvedValue(repaused);
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const stillPaused = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(stillPaused!["budgetPausedAt"]).toBeTruthy();
+    expect(plugins.runtime.interrupt).toHaveBeenCalledTimes(1);
+  });
+
+  it("enforces the cap on an over-budget session whose status is a PR overlay (ci_failed)", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const session = withCost(9.99);
+    // The agent is actively generating (canonical session state "working"), but
+    // it has an open, CI-failing PR, so deriveLegacyStatus() reports "ci_failed"
+    // rather than "working". The cap must still be enforced — otherwise an
+    // over-budget agent can keep spending while fixing CI / addressing review.
+    session.lifecycle.pr.state = "open";
+    session.lifecycle.pr.reason = "ci_failing";
+    session.lifecycle.session.state = "working";
+    session.status = "ci_failed";
+    const lm = setupCheck("app-1", {
+      session,
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "rt-1" }),
+    );
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeTruthy();
+  });
+
+  it("does not enforce the cap on a terminal (merged) session", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "idle" });
+    // A merged session is wrapping up (canonical idle, legacy "merged"). Even
+    // wildly over budget, the budget path must leave terminal/cleanup lifecycle
+    // untouched.
+    const session = withCost(1000);
+    session.lifecycle.pr.state = "merged";
+    session.lifecycle.pr.reason = "merged";
+    session.lifecycle.session.state = "idle";
+    session.status = "merged";
+    const lm = setupCheck("app-1", {
+      session,
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    // The budget path must not pause/interrupt a terminal session, regardless of
+    // exactly which terminal/cleanup status the merge lifecycle derives.
+    expect(lm.getStates().get("app-1")).not.toBe("needs_input");
+    expect(plugins.runtime.interrupt).not.toHaveBeenCalled();
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeFalsy();
+  });
+
+  it("enforces the cap on an active over-budget session in a PR-overlay idle state (review_pending)", async () => {
+    // resolveOpenPRDecision() forces the canonical session state to "idle" for
+    // review_pending even while the agent is still generating after opening a
+    // PR. The cap must still be enforced — gating on canonical "working" alone
+    // would miss this common post-PR path. (Mirrors the "keeps canonical session
+    // state idle while waiting on external review" setup, with cost + a cap.)
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const mockSCM = createMockSCM({
+      getReviewDecision: vi.fn().mockResolvedValue("pending"),
+      enrichSessionsPRBatch: mockBatchEnrichment({ reviewDecision: "pending" }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const session = makeSession({
+      status: "pr_open",
+      pr: makePR(),
+      agentInfo: {
+        summary: null,
+        agentSessionId: null,
+        cost: { inputTokens: 100, outputTokens: 50, estimatedCostUsd: 9.99 },
+      },
+    });
+    vi.mocked(mockSessionManager.get).mockResolvedValue(session);
+    writeMetadata(env.sessionsDir, "app-1", {
+      worktree: "/tmp",
+      branch: session.branch ?? "main",
+      status: session.status,
+      project: "my-app",
+      pr: session.pr?.url,
+      runtimeHandle: session.runtimeHandle ?? undefined,
+    });
+    const lm = createLifecycleManager({
+      config: { ...config, budget: { perSessionUsd: 5 } },
+      registry,
+      sessionManager: mockSessionManager,
+    });
+
+    await lm.check("app-1");
+
+    // Canonical state derived idle (review_pending), but active + over budget.
+    expect(session.lifecycle.session.state).toBe("needs_input");
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    expect(plugins.runtime.interrupt).toHaveBeenCalled();
+  });
+
+  it("keeps the budget pause latched (and sticky) when cost is transiently unavailable", async () => {
+    // Already paused and still active, but this poll can't read cost
+    // (getSessionInfo/log failure): agentInfo is null and no project aggregate
+    // exists, so evaluateBudgetBreach sees $0 → no breach. That must NOT be read
+    // as "under budget" — the latch and the needs_input pause must survive.
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const session = makeSession({ status: "working", agentInfo: null });
+    session.metadata = {
+      ...session.metadata,
+      budgetPausedAt: "2026-01-01T00:00:00.000Z",
+      budgetPausedReason: "budget_exceeded session $9.99 > $5.00",
+      budgetInterrupted: "true",
+    };
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: {
+        budgetPausedAt: "2026-01-01T00:00:00.000Z",
+        budgetPausedReason: "budget_exceeded session $9.99 > $5.00",
+        budgetInterrupted: "true",
+      },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    // The latch (and the needs_input pause) survive the cost-read failure window.
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeTruthy();
+    expect(meta!["budgetInterrupted"]).toBe("true");
+  });
+
+  it("clears the pause latch when the cap is raised above current cost", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const session = withCost(3.0);
+    session.metadata = { ...session.metadata, budgetPausedAt: "2026-01-01T00:00:00.000Z" };
+    // Cost is $3 but the (now raised) cap is $5 — no breach.
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { budgetPausedAt: "2026-01-01T00:00:00.000Z" },
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("working");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta!["budgetPausedAt"]).toBeFalsy();
+  });
+});
+
 describe("check (single session)", () => {
   it("detects transition from spawning to working", async () => {
     const lm = setupCheck("app-1", {

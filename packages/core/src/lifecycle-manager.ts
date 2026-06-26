@@ -68,6 +68,7 @@ import {
   isWeakActivityEvidence,
 } from "./activity-signal.js";
 import { isAgentReportFresh, mapAgentReportToLifecycle, readAgentReport } from "./agent-report.js";
+import { evaluateBudgetBreach, resolveBudget } from "./budget.js";
 import {
   auditAgentReports,
   getReactionKeyForTrigger,
@@ -2721,8 +2722,57 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
   }
 
+  /** Sum estimated cost per project across a set of (enriched) sessions. */
+  function sumProjectCost(sessions: Session[]): Map<string, number> {
+    const totals = new Map<string, number>();
+    for (const s of sessions) {
+      const cost = s.agentInfo?.cost?.estimatedCostUsd ?? 0;
+      if (cost > 0) {
+        totals.set(s.projectId, (totals.get(s.projectId) ?? 0) + cost);
+      }
+    }
+    return totals;
+  }
+
+  /**
+   * Stop an over-budget agent from accruing further cost. We interrupt (cancel
+   * the in-flight generation) rather than destroy the runtime: destroying would
+   * make the next isAlive probe read the runtime as dead and the reconciler
+   * would mark the session terminated (#1735), not paused. Interrupt keeps the
+   * agent alive and interactive so a human can raise the cap and resume.
+   * Best-effort — runtimes without an interrupt() method are a no-op.
+   */
+  async function interruptForBudget(session: Session): Promise<boolean> {
+    if (!session.runtimeHandle) return false;
+    // Resolve the runtime that actually launched this session, not the project's
+    // current/default. A session started before a `runtime` config change still
+    // lives on its original runtime, so the persisted handle's runtimeName is
+    // authoritative; the config value is only a fallback for older handles that
+    // never recorded it.
+    const project = config.projects[session.projectId];
+    const runtimeName =
+      session.runtimeHandle.runtimeName || project?.runtime || config.defaults.runtime;
+    const runtime = registry.get<Runtime>("runtime", runtimeName);
+    if (!runtime?.interrupt) return false;
+    try {
+      await runtime.interrupt(session.runtimeHandle);
+      return true;
+    } catch (err) {
+      recordActivityEvent({
+        projectId: session.projectId,
+        sessionId: session.id,
+        source: "lifecycle",
+        kind: "budget.interrupt_failed",
+        level: "warn",
+        summary: `failed to interrupt over-budget agent ${session.id}`,
+        data: { errorMessage: err instanceof Error ? err.message : String(err) },
+      });
+      return false;
+    }
+  }
+
   /** Poll a single session and handle state transitions. */
-  async function checkSession(session: Session): Promise<void> {
+  async function checkSession(session: Session, projectCostUsd?: number): Promise<void> {
     // Use tracked state if available; otherwise use the persisted metadata status
     // (not session.status, which list() may have already overwritten for dead runtimes).
     // This ensures transitions are detected after a lifecycle manager restart.
@@ -2736,7 +2786,155 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       states.set(session.id, oldStatus);
       return;
     }
-    const newStatus = assessment.status;
+    let newStatus = assessment.status;
+
+    // Budget enforcement: pause a session whose estimated cost has crossed a
+    // configured cap. On the first breach we interrupt the runtime (see
+    // interruptForBudget) so the agent actually stops spending — marking
+    // metadata alone would leave it running. Reusing the needs_input path makes
+    // the pause sticky and lets the existing transition machinery fire the
+    // notification exactly once.
+    const alreadyBudgetPaused = !!session.metadata["budgetPausedAt"];
+    // A budget cap is about CUMULATIVE spend, which never decreases, so once a
+    // session crosses the cap it should be flagged regardless of what it is doing
+    // right now. Enforce for any session that could be carrying cost — i.e. any
+    // non-terminal session that isn't in a transient pre-work/probe state.
+    //
+    // This deliberately includes the PR-overlay statuses
+    // (pr_open/ci_failed/review_pending/changes_requested/approved/mergeable):
+    // deriveLegacyStatus() overlays an open PR onto the session and
+    // resolveOpenPRDecision() forces the canonical state to "working" OR "idle"
+    // there, and it massages the activity signal too — so gating on canonical
+    // state or activity would skip a still-over-budget agent that has opened a
+    // PR (e.g. still fixing CI / addressing review). Excluded:
+    //   - terminal/cleanup (merged/cleanup/done/killed/terminated/errored) — must
+    //     never be re-paused; don't interfere with PR-merge or cleanup lifecycle.
+    //   - spawning — no cost accrued yet.
+    //   - detecting/stuck — transient probe / escalation states we must not disturb.
+    const liveState = session.lifecycle.session.state;
+    const activeActivity = session.activitySignal.activity === "active";
+    const evaluateBudget =
+      !TERMINAL_STATUSES.has(newStatus) &&
+      newStatus !== SESSION_STATUS.SPAWNING &&
+      newStatus !== SESSION_STATUS.DETECTING &&
+      newStatus !== SESSION_STATUS.STUCK;
+    if (evaluateBudget) {
+      const breach = evaluateBudgetBreach(
+        config,
+        session,
+        projectCostUsd ?? session.agentInfo?.cost?.estimatedCostUsd ?? 0,
+      );
+      if (breach) {
+        const firstPause = !alreadyBudgetPaused;
+        // Whether the agent is still actively generating (vs. quiet at a prompt),
+        // so we re-interrupt despite the latch. Use the activity probe in
+        // addition to the canonical state so a still-generating agent under a PR
+        // overlay (canonical idle) is caught. Captured before the canonical
+        // state is overwritten to needs_input below.
+        const stillActive = liveState === "working" || activeActivity;
+        // Stamp the transition once, at first pause, and reuse that timestamp on
+        // every subsequent poll while still over budget. Resetting it each poll
+        // would make the dashboard/observability show a perpetually-fresh
+        // transition time and churn the persisted lifecycle.
+        const pausedAt = firstPause
+          ? new Date().toISOString()
+          : session.metadata["budgetPausedAt"];
+        newStatus = SESSION_STATUS.NEEDS_INPUT;
+        session.status = SESSION_STATUS.NEEDS_INPUT;
+        session.lifecycle.session.state = "needs_input";
+        session.lifecycle.session.reason = "awaiting_user_input";
+        session.lifecycle.session.lastTransitionAt = pausedAt;
+        assessment.evidence = breach.evidence;
+        // Actually stop the agent so it can't keep spending tokens while the
+        // session is reported paused — marking metadata alone leaves the runtime
+        // running. The interrupt can fail transiently (tmux command error,
+        // Windows pty-host pipe timeout), so it is latched separately from the
+        // pause: retry on every poll until it succeeds. Tying the retry to the
+        // pause latch (firstPause) would interrupt exactly once and silently give
+        // up on a transient failure, leaving the agent spending indefinitely.
+        //
+        // The `budgetInterrupted` latch only suppresses re-interrupts for a
+        // *quiet* paused session (already stopped at its prompt). If the session
+        // is actively generating again while still over the cap (the Escape
+        // didn't cancel, or a human resumed the terminal without raising the
+        // cap), re-interrupt regardless of the latch — otherwise the agent keeps
+        // accruing cost and the budget cap is defeated.
+        if (stillActive || session.metadata["budgetInterrupted"] !== "true") {
+          const interrupted = await interruptForBudget(session);
+          if (interrupted) {
+            updateSessionMetadata(session, { budgetInterrupted: "true" });
+          }
+        }
+        if (firstPause) {
+          updateSessionMetadata(session, {
+            budgetPausedAt: pausedAt,
+            budgetPausedReason: breach.evidence,
+          });
+          recordActivityEvent({
+            projectId: session.projectId,
+            sessionId: session.id,
+            source: "lifecycle",
+            kind: "budget.paused",
+            level: "warn",
+            summary: `paused on ${breach.scope} budget`,
+            data: {
+              scope: breach.scope,
+              limitUsd: breach.limitUsd,
+              actualUsd: breach.actualUsd,
+            },
+          });
+        }
+      } else if (alreadyBudgetPaused) {
+        // No breach reported, but this session was previously paused. Only
+        // release the latch when we are sure the breach is genuinely gone —
+        // either the cap was removed, or we observed a real cost that is now
+        // under it. A transient getSessionInfo/log-read failure leaves
+        // agentInfo.cost absent (and sumProjectCost has no entry → projectCostUsd
+        // undefined), so evaluateBudgetBreach() sees $0 and reports no breach;
+        // treating that as "under budget" would drop the pause and stop
+        // retrying interrupts for a session that may still be over the cap.
+        const budget = resolveBudget(config, session.projectId);
+        const anyCapActive =
+          (typeof budget.perSessionUsd === "number" && budget.perSessionUsd > 0) ||
+          (typeof budget.perProjectUsd === "number" && budget.perProjectUsd > 0);
+        const costObserved =
+          projectCostUsd !== undefined ||
+          session.agentInfo?.cost?.estimatedCostUsd !== undefined;
+        if (!anyCapActive || costObserved) {
+          // Cap removed, or a real cost was observed below it — release.
+          updateSessionMetadata(session, {
+            budgetPausedAt: "",
+            budgetPausedReason: "",
+            budgetInterrupted: "",
+          });
+        } else {
+          // Cost unobservable this poll — keep the session paused (sticky) and
+          // the latch intact, reusing the original pause timestamp, until a real
+          // cost reading lets us decide. Re-persist the latch so it survives this
+          // poll's metadata write even though we took no breach action.
+          const pausedAt = session.metadata["budgetPausedAt"];
+          newStatus = SESSION_STATUS.NEEDS_INPUT;
+          session.status = SESSION_STATUS.NEEDS_INPUT;
+          session.lifecycle.session.state = "needs_input";
+          session.lifecycle.session.reason = "awaiting_user_input";
+          session.lifecycle.session.lastTransitionAt = pausedAt;
+          assessment.evidence = session.metadata["budgetPausedReason"] || assessment.evidence;
+          updateSessionMetadata(session, {
+            budgetPausedAt: pausedAt,
+            budgetPausedReason: session.metadata["budgetPausedReason"] ?? "",
+            budgetInterrupted: session.metadata["budgetInterrupted"] ?? "",
+          });
+        }
+      }
+    } else if (session.metadata["budgetPausedAt"]) {
+      // Session moved on (PR opened, cleaned up, restored): clear the latch so a
+      // future breach notifies again.
+      updateSessionMetadata(session, {
+        budgetPausedAt: "",
+        budgetPausedReason: "",
+        budgetInterrupted: "",
+      });
+    }
     const lifecycleChanged = session.metadata["lifecycle"] !== JSON.stringify(session.lifecycle);
     let transitionReaction: TransitionReaction | undefined;
 
@@ -3295,8 +3493,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // downstream status/reaction logic can reuse batch GraphQL data.
       await populatePREnrichmentCache(sessionsToCheck);
 
-      // Poll all sessions concurrently
-      await Promise.allSettled(sessionsToCheck.map((s) => checkSession(s)));
+      // Sum each project's estimated cost across all (enriched) sessions so the
+      // per-project budget cap can be evaluated per session below.
+      const projectCostUsd = sumProjectCost(sessions);
+
+      // Poll all sessions concurrently. Pass the raw map lookup (possibly
+      // undefined) — NOT `?? 0` — so checkSession can tell "no cost observed"
+      // (transient enrichment failure) apart from a real $0 aggregate and keep
+      // a budget pause latched through the failure window.
+      await Promise.allSettled(
+        sessionsToCheck.map((s) => checkSession(s, projectCostUsd.get(s.projectId))),
+      );
 
       // Persist batch enrichment data to session metadata files so the
       // web dashboard can read it without calling GitHub API.
@@ -3465,7 +3672,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // Populate batch enrichment cache for this session's PR so
       // checkSession can read from cache (no individual REST fallback).
       await populatePREnrichmentCache([session]);
-      await checkSession(session);
+      // Sum the project's spend across all its sessions so the per-project
+      // budget cap is evaluated correctly for direct (e.g. webhook) checks,
+      // not just the polling loop.
+      const projectCostUsd = sumProjectCost(await sessionManager.list(session.projectId));
+      // Pass the raw lookup (possibly undefined) — see the pollAll call site for
+      // why missing cost must not be coalesced to 0.
+      await checkSession(session, projectCostUsd.get(session.projectId));
     },
   };
 }

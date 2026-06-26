@@ -543,6 +543,31 @@ describe("global-config storage identity", () => {
     });
   });
 
+  it("preserves a top-level budget cap during migration", () => {
+    const repo = createRepo("app", "https://github.com/OpenAI/app.git");
+    const oldConfigPath = join(tempRoot, "legacy-budget.yaml");
+
+    writeFileSync(
+      oldConfigPath,
+      [
+        "port: 3000",
+        "budget:",
+        "  perSessionUsd: 5",
+        "  perProjectUsd: 50",
+        "projects:",
+        "  app:",
+        "    name: App",
+        `    path: ${repo}`,
+        "",
+      ].join("\n"),
+    );
+
+    migrateToGlobalConfig(oldConfigPath, configPath);
+
+    const migrated = loadGlobalConfig(configPath);
+    expect(migrated?.budget).toEqual({ perSessionUsd: 5, perProjectUsd: 50 });
+  });
+
   it("defaults the global runtime to the platform-appropriate value", () => {
     // The Zod default and makeEmptyGlobalConfig() must defer to
     // getDefaultRuntime() so Windows-loaded projects don't inherit

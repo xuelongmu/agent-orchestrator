@@ -12,6 +12,7 @@ const {
   mockGetShell,
   mockGetPipePath,
   mockPtyHostSendMessage,
+  mockPtyHostSendRaw,
   mockPtyHostGetOutput,
   mockPtyHostIsAlive,
   mockPtyHostKill,
@@ -22,6 +23,7 @@ const {
   mockGetShell: vi.fn(() => ({ cmd: "sh", args: (c: string) => ["-c", c] })),
   mockGetPipePath: vi.fn((id: string) => `\\\\.\\pipe\\ao-pty-${id}`),
   mockPtyHostSendMessage: vi.fn().mockResolvedValue(undefined),
+  mockPtyHostSendRaw: vi.fn().mockResolvedValue(undefined),
   mockPtyHostGetOutput: vi.fn().mockResolvedValue(""),
   mockPtyHostIsAlive: vi.fn().mockResolvedValue(true),
   mockPtyHostKill: vi.fn().mockResolvedValue(undefined),
@@ -50,6 +52,7 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
 vi.mock("../pty-client.js", () => ({
   getPipePath: mockGetPipePath,
   ptyHostSendMessage: mockPtyHostSendMessage,
+  ptyHostSendRaw: mockPtyHostSendRaw,
   ptyHostGetOutput: mockPtyHostGetOutput,
   ptyHostIsAlive: mockPtyHostIsAlive,
   ptyHostKill: mockPtyHostKill,
@@ -480,6 +483,117 @@ describe("sendMessage()", () => {
     const handle = await runtime.create(defaultConfig());
 
     await expect(runtime.sendMessage(handle, "hello")).rejects.toThrow(/write EPIPE/);
+  });
+});
+
+// =========================================================================
+// interrupt()
+// =========================================================================
+describe("interrupt()", () => {
+  it("writes the Escape byte to stdin without a trailing newline (Unix)", async () => {
+    const child = createMockChild();
+    mockSpawn.mockReturnValue(child);
+
+    const runtime = create();
+    const handle = await runtime.create(defaultConfig());
+
+    await runtime.interrupt!(handle);
+
+    // The write is awaited (callback-style) so async EPIPE/ERR_STREAM_DESTROYED
+    // surfaces as a rejection — no trailing newline, unlike sendMessage.
+    expect(child.stdin.write).toHaveBeenCalledWith("\x1b", expect.any(Function));
+  });
+
+  it("rejects when the stdin Escape write fails asynchronously (EPIPE)", async () => {
+    // If the child closes stdin mid-pause, the write must reject so the caller
+    // does not latch a false interrupt success (and AO doesn't crash on an
+    // unhandled stream error).
+    const child = createMockChild();
+    child.stdin.write = vi.fn((_data: string, cb: (err?: Error | null) => void) => {
+      cb(new Error("write EPIPE"));
+      return false;
+    });
+    mockSpawn.mockReturnValue(child);
+
+    const runtime = create();
+    const handle = await runtime.create(defaultConfig());
+
+    await expect(runtime.interrupt!(handle)).rejects.toThrow(/EPIPE/);
+  });
+
+  it("sends SIGINT to the process group via the persisted PID for a recovered session", async () => {
+    // A session recovered from metadata or launched by a prior AO process has no
+    // in-memory stdin handle, but the detached child is its own process group.
+    // interrupt() delivers SIGINT to that group (negative pid) — the durable
+    // control channel — instead of silently no-oping while the agent keeps
+    // spending.
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      const runtime = create();
+      await runtime.interrupt!(makeHandle("recovered"));
+      expect(killSpy).toHaveBeenCalledWith(-12345, "SIGINT");
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it("resolves without throwing when the recovered process group is already gone", async () => {
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
+      const err = new Error("no such process") as NodeJS.ErrnoException;
+      err.code = "ESRCH";
+      throw err;
+    });
+    try {
+      const runtime = create();
+      await expect(runtime.interrupt!(makeHandle("dead"))).resolves.toBeUndefined();
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it("throws when there is no in-memory handle and no persisted PID", async () => {
+    // No stdin handle, no pty-host pipe, and no PID — genuinely no channel to
+    // interrupt. Fail loudly so the budget-pause caller doesn't latch a false
+    // success.
+    const runtime = create();
+    const handle: RuntimeHandle = { id: "no-pid", runtimeName: "process", data: {} };
+    await expect(runtime.interrupt!(handle)).rejects.toThrow(/cannot interrupt process session/);
+  });
+
+  it("does not negative-PID signal a recovered session on Windows (POSIX-only)", async () => {
+    // Negative-PID process-group signalling is POSIX-only (docs/CROSS_PLATFORM).
+    // On Windows a recovered process-runtime handle with no pipe has no
+    // non-destructive interrupt channel — fail loudly instead of issuing a raw
+    // (destructive) signal.
+    mockIsWindows.mockReturnValue(true);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      const runtime = create();
+      await expect(runtime.interrupt!(makeHandle("recovered-win"))).rejects.toThrow(
+        /cannot interrupt process session/,
+      );
+      expect(killSpy).not.toHaveBeenCalled();
+    } finally {
+      killSpy.mockRestore();
+      mockIsWindows.mockReturnValue(false);
+    }
+  });
+
+  it("sends the raw Escape byte via the pty-host on Windows", async () => {
+    mockIsWindows.mockReturnValue(true);
+    const child = createWindowsMockChild();
+    mockSpawn.mockReturnValue(child);
+
+    const runtime = create();
+    const handle = await runtime.create(defaultConfig({ sessionId: "win-interrupt-test" }));
+
+    await runtime.interrupt!(handle);
+
+    expect(mockPtyHostSendRaw).toHaveBeenCalledWith(
+      expect.stringContaining("win-interrupt-test"),
+      "\x1b",
+    );
+    mockIsWindows.mockReturnValue(false);
   });
 });
 

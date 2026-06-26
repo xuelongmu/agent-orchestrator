@@ -14,6 +14,7 @@ export type {
   ActivitySignalState,
   ActivitySignalSource,
   CIStatus,
+  CostEstimate,
   ReviewDecision,
   MergeReadiness,
   PRState,
@@ -36,6 +37,7 @@ import {
   type CICheck as CoreCICheck,
   type MergeReadiness,
   type CIStatus,
+  type CostEstimate,
   type SessionStatus,
   type ActivityState,
   type ActivitySignalState,
@@ -115,6 +117,8 @@ export interface DashboardSession {
   summary: string | null;
   /** True when the summary is a low-quality fallback (e.g. truncated spawn prompt) */
   summaryIsFallback: boolean;
+  /** Estimated agent cost so far (tokens + USD). Null/undefined when the agent reports none. */
+  cost?: CostEstimate | null;
   createdAt: string;
   lastActivityAt: string;
   pr: DashboardPR | null;

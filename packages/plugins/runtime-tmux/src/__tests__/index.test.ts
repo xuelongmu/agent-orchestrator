@@ -549,6 +549,24 @@ describe("runtime.sendMessage()", () => {
   });
 });
 
+describe("runtime.interrupt()", () => {
+  it("sends Escape to cancel the agent's in-flight generation", async () => {
+    const runtime = create();
+    const handle = makeHandle("interrupt-test");
+
+    mockTmuxSuccess();
+
+    await runtime.interrupt!(handle);
+
+    expect(mockExecFileCustom).toHaveBeenCalledTimes(1);
+    expect(mockExecFileCustom).toHaveBeenCalledWith(
+      "tmux",
+      ["send-keys", "-t", "interrupt-test", "Escape"],
+      expectedTmuxOptions,
+    );
+  });
+});
+
 describe("runtime.getOutput()", () => {
   it("calls capture-pane with correct args and default lines", async () => {
     const runtime = create();
