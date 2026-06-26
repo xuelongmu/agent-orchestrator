@@ -267,6 +267,7 @@ const ProjectConfigSchema = z.object({
   agentConfig: AgentSpecificConfigSchema.default({}),
   orchestrator: RoleAgentConfigSchema,
   worker: RoleAgentConfigSchema,
+  decomposer: RoleAgentConfigSchema,
   reactions: z.record(ReactionConfigSchema.partial()).optional(),
   agentRules: z.string().optional(),
   agentRulesFile: z.string().optional(),

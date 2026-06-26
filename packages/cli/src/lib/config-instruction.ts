@@ -37,6 +37,8 @@ defaults:
     agent: claude-code        # Optional override for orchestrator sessions
   worker:
     agent: claude-code        # Optional override for worker sessions
+  decomposer:
+    agent: codex              # Optional override for `ao plan` (codex | claude-code)
 
 # ── Installer-managed marketplace plugins (optional) ───────────────
 # External plugins are declared here. Built-ins do not need entries.
