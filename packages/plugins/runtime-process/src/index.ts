@@ -429,7 +429,20 @@ export function create(): Runtime {
       const child = entry?.process;
       if (child?.stdin?.writable) {
         child.stdin.write(INTERRUPT_KEY);
+        return;
       }
+
+      // No in-memory entry: the session was recovered from metadata or launched
+      // by a previous AO process, so this process does not own the child's stdin
+      // and cannot send Escape. Unlike isAlive()/destroy() (which can operate via
+      // the persisted PID + signals), there is no durable control channel to
+      // interrupt a foreign child here. Fail loudly rather than resolve — a
+      // silent success would let the lifecycle manager latch the session as
+      // "interrupted" while the agent keeps spending.
+      throw new Error(
+        `cannot interrupt process session ${handle.id}: no in-memory stdin handle ` +
+          `(session not owned by this AO process — recovered from metadata or started by a prior run)`,
+      );
     },
 
     async getOutput(handle: RuntimeHandle, lines = 50): Promise<string> {

@@ -504,9 +504,15 @@ describe("interrupt()", () => {
     expect(child.stdin.write).toHaveBeenCalledWith("\x1b");
   });
 
-  it("is a no-op for an unknown session", async () => {
+  it("throws for a session with no in-memory stdin handle (recovered/cross-process)", async () => {
+    // Unix path: a session recovered from metadata or launched by a prior AO
+    // process has no entry in the in-memory map and no pty-host pipe, so there is
+    // no channel to send Escape. interrupt() must fail loudly rather than
+    // silently resolve, so the budget-pause caller doesn't latch a false success.
     const runtime = create();
-    await expect(runtime.interrupt!(makeHandle("nonexistent"))).resolves.toBeUndefined();
+    await expect(runtime.interrupt!(makeHandle("nonexistent"))).rejects.toThrow(
+      /cannot interrupt process session/,
+    );
   });
 
   it("sends the raw Escape byte via the pty-host on Windows", async () => {

@@ -2696,13 +2696,21 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * agent alive and interactive so a human can raise the cap and resume.
    * Best-effort — runtimes without an interrupt() method are a no-op.
    */
-  async function interruptForBudget(session: Session): Promise<void> {
-    if (!session.runtimeHandle) return;
+  async function interruptForBudget(session: Session): Promise<boolean> {
+    if (!session.runtimeHandle) return false;
+    // Resolve the runtime that actually launched this session, not the project's
+    // current/default. A session started before a `runtime` config change still
+    // lives on its original runtime, so the persisted handle's runtimeName is
+    // authoritative; the config value is only a fallback for older handles that
+    // never recorded it.
     const project = config.projects[session.projectId];
-    const runtime = registry.get<Runtime>("runtime", project?.runtime ?? config.defaults.runtime);
-    if (!runtime?.interrupt) return;
+    const runtimeName =
+      session.runtimeHandle.runtimeName || project?.runtime || config.defaults.runtime;
+    const runtime = registry.get<Runtime>("runtime", runtimeName);
+    if (!runtime?.interrupt) return false;
     try {
       await runtime.interrupt(session.runtimeHandle);
+      return true;
     } catch (err) {
       recordActivityEvent({
         projectId: session.projectId,
@@ -2713,6 +2721,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         summary: `failed to interrupt over-budget agent ${session.id}`,
         data: { errorMessage: err instanceof Error ? err.message : String(err) },
       });
+      return false;
     }
   }
 
@@ -2772,12 +2781,20 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         session.lifecycle.session.reason = "awaiting_user_input";
         session.lifecycle.session.lastTransitionAt = pausedAt;
         assessment.evidence = breach.evidence;
+        // Actually stop the agent so it can't keep spending tokens while the
+        // session is reported paused — marking metadata alone leaves the runtime
+        // running. The interrupt can fail transiently (tmux command error,
+        // Windows pty-host pipe timeout), so it is latched separately from the
+        // pause: retry on every poll until it succeeds. Tying the retry to the
+        // pause latch (firstPause) would interrupt exactly once and silently give
+        // up on a transient failure, leaving the agent spending indefinitely.
+        if (session.metadata["budgetInterrupted"] !== "true") {
+          const interrupted = await interruptForBudget(session);
+          if (interrupted) {
+            updateSessionMetadata(session, { budgetInterrupted: "true" });
+          }
+        }
         if (firstPause) {
-          // Actually stop the agent so it can't keep spending tokens while the
-          // session is reported paused — marking metadata alone leaves the
-          // runtime running. Interrupt before persisting the latch so a failure
-          // is recorded but never blocks the pause.
-          await interruptForBudget(session);
           updateSessionMetadata(session, {
             budgetPausedAt: pausedAt,
             budgetPausedReason: breach.evidence,
@@ -2798,13 +2815,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         }
       } else if (alreadyBudgetPaused) {
         // No breach but previously paused: the cap was raised or removed. Clear
-        // the latch so a future breach notifies and re-records the pause event.
-        updateSessionMetadata(session, { budgetPausedAt: "", budgetPausedReason: "" });
+        // the latch (and the interrupt flag) so a future breach notifies, re-
+        // records the pause event, and interrupts the agent again.
+        updateSessionMetadata(session, {
+          budgetPausedAt: "",
+          budgetPausedReason: "",
+          budgetInterrupted: "",
+        });
       }
     } else if (session.metadata["budgetPausedAt"]) {
       // Session moved on (PR opened, cleaned up, restored): clear the latch so a
       // future breach notifies again.
-      updateSessionMetadata(session, { budgetPausedAt: "", budgetPausedReason: "" });
+      updateSessionMetadata(session, {
+        budgetPausedAt: "",
+        budgetPausedReason: "",
+        budgetInterrupted: "",
+      });
     }
     const lifecycleChanged = session.metadata["lifecycle"] !== JSON.stringify(session.lifecycle);
     let transitionReaction: TransitionReaction | undefined;

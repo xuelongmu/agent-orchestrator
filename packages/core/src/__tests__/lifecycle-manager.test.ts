@@ -380,22 +380,84 @@ describe("budget enforcement", () => {
     expect(lm.getStates().get("app-1")).toBe("needs_input");
   });
 
-  it("does not re-interrupt on a subsequent poll while already paused", async () => {
+  it("does not re-interrupt on a subsequent poll once the interrupt has landed", async () => {
     vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
     const session = withCost(9.99);
-    session.metadata = { ...session.metadata, budgetPausedAt: "2026-01-01T00:00:00.000Z" };
+    session.metadata = {
+      ...session.metadata,
+      budgetPausedAt: "2026-01-01T00:00:00.000Z",
+      budgetInterrupted: "true",
+    };
     const lm = setupCheck("app-1", {
       session,
-      metaOverrides: { budgetPausedAt: "2026-01-01T00:00:00.000Z" },
+      metaOverrides: { budgetPausedAt: "2026-01-01T00:00:00.000Z", budgetInterrupted: "true" },
       configOverride: { ...config, budget: { perSessionUsd: 5 } },
     });
 
     await lm.check("app-1");
 
-    // Interrupt only fires on the first pause; re-pausing each poll must not
-    // re-interrupt (idempotent latch).
+    // The interrupt already succeeded (budgetInterrupted latched); re-pausing each
+    // poll must not re-interrupt.
     expect(plugins.runtime.interrupt).not.toHaveBeenCalled();
     expect(lm.getStates().get("app-1")).toBe("needs_input");
+  });
+
+  it("uses the session handle's runtime (not the project default) to interrupt", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    // The session was launched on the "mock" runtime (its persisted handle), but
+    // the project config has since been switched to a different runtime. The
+    // interrupt must target the handle's runtime, not the current config value.
+    const lm = setupCheck("app-1", {
+      session: withCost(9.99),
+      configOverride: {
+        ...config,
+        defaults: { ...config.defaults, runtime: "some-other-runtime" },
+        budget: { perSessionUsd: 5 },
+      },
+    });
+
+    await lm.check("app-1");
+
+    expect(mockRegistry.get).toHaveBeenCalledWith("runtime", "mock");
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "rt-1" }),
+    );
+  });
+
+  it("retries the interrupt on the next poll after a transient failure", async () => {
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    // Poll 1: the runtime interrupt fails transiently (tmux error / pty-host pipe
+    // timeout). The session is still paused, but the interrupt latch must NOT be
+    // set so a later poll retries instead of giving up.
+    vi.mocked(plugins.runtime.interrupt).mockRejectedValueOnce(new Error("pipe timeout"));
+    const lm = setupCheck("app-1", {
+      session: withCost(9.99),
+      configOverride: { ...config, budget: { perSessionUsd: 5 } },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    const afterFail = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(afterFail!["budgetPausedAt"]).toBeTruthy();
+    expect(afterFail!["budgetInterrupted"]).toBeFalsy();
+    expect(plugins.runtime.interrupt).toHaveBeenCalledTimes(1);
+
+    // Poll 2: still over budget, latch persisted but interrupt not yet landed —
+    // the interrupt is retried and this time succeeds.
+    const repaused = withCost(9.99);
+    repaused.metadata = {
+      ...repaused.metadata,
+      budgetPausedAt: afterFail!["budgetPausedAt"] as string,
+      budgetPausedReason: afterFail!["budgetPausedReason"] as string,
+    };
+    vi.mocked(mockSessionManager.get).mockResolvedValue(repaused);
+
+    await lm.check("app-1");
+
+    expect(plugins.runtime.interrupt).toHaveBeenCalledTimes(2);
+    const afterRetry = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(afterRetry!["budgetInterrupted"]).toBe("true");
   });
 
   it("keeps an interrupted, at-prompt session paused while still over budget", async () => {
@@ -409,6 +471,7 @@ describe("budget enforcement", () => {
     await lm.check("app-1");
     const paused = readMetadataRaw(env.sessionsDir, "app-1");
     expect(paused!["budgetPausedAt"]).toBeTruthy();
+    expect(paused!["budgetInterrupted"]).toBe("true");
     expect(plugins.runtime.interrupt).toHaveBeenCalledTimes(1);
 
     // Poll 2: the interrupt landed and the agent now sits at its prompt
@@ -427,6 +490,7 @@ describe("budget enforcement", () => {
       status: "needs_input",
       budgetPausedAt: paused!["budgetPausedAt"] as string,
       budgetPausedReason: paused!["budgetPausedReason"] as string,
+      budgetInterrupted: paused!["budgetInterrupted"] as string,
     };
     vi.mocked(mockSessionManager.get).mockResolvedValue(repaused);
 
