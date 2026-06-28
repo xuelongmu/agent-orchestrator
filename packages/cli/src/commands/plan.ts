@@ -1,10 +1,12 @@
 import chalk from "chalk";
 import ora from "ora";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Command } from "commander";
 import {
   createPlanTickets,
   decomposeGoal,
+  getGlobalConfigPath,
   loadConfig,
   recordActivityEvent,
   resolveDecomposerAgent,
@@ -52,6 +54,21 @@ function resolvePlanProject(config: OrchestratorConfig, requested?: string): str
   throw new Error(
     `Multiple projects configured. Specify one with --project <id>: ${projectIds.join(", ")}`,
   );
+}
+
+/**
+ * Load the global registry config (every registered project) so that an explicit
+ * `--project` can be honored outside the local config scope. `loadConfig()` stops
+ * at the nearest flat `agent-orchestrator.yaml`, which lists only that one
+ * project; the global config knows them all. Returns null when unavailable.
+ */
+function loadGlobalProjects(): OrchestratorConfig | null {
+  try {
+    const globalPath = getGlobalConfigPath();
+    return existsSync(globalPath) ? loadConfig(globalPath) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Render a plan as an indented tree grouped by dependency order. */
@@ -106,7 +123,18 @@ export function registerPlan(program: Command): void {
         goal: string,
         opts: { project?: string; yes?: boolean; json?: boolean },
       ) => {
-        const config = loadConfig();
+        let config: OrchestratorConfig = loadConfig();
+
+        // An explicit `--project` may name a project the local config doesn't
+        // know about (loadConfig stops at the nearest flat config, which lists
+        // only one project). Fall back to the global registry so a requested
+        // project registered elsewhere is still resolved instead of rejected.
+        if (opts.project && !config.projects[opts.project]) {
+          const globalConfig = loadGlobalProjects();
+          if (globalConfig?.projects[opts.project]) {
+            config = globalConfig;
+          }
+        }
 
         let projectId: string;
         try {

@@ -240,13 +240,20 @@ export async function createPlanTickets({
     throw new Error(`Tracker "${tracker.name}" does not support creating issues.`);
   }
 
+  // Validate the plan graph before any tracker side effects. createPlanTickets is
+  // exported and accepts a Plan directly, so a caller that skipped parsePlan could
+  // pass dangling, duplicate, or cyclic refs; without this guard the earliest
+  // tickets would be created before resolveDep throws, leaving a partial set.
+  validatePlanGraph(plan);
+
   const byRef = new Map(plan.tickets.map((t) => [t.ref, t]));
-  // All relations (parent, blocker, related) are emulated as repo-local `#N`
-  // markers in the issue body, so an edge to a ticket in a different repo would
-  // resolve to the wrong issue. Reject such edges up front (before creating
-  // anything) rather than silently mislinking. (Cross-repo *session* ordering
-  // is handled separately by the dependency scheduler.)
-  assertRelationsSameRepo(plan, project, byRef);
+  // Related links are non-directional and emulated as repo-local `#N` markers in
+  // whichever ticket is created last, so a cross-repo related edge would silently
+  // mislink. Reject those up front. Cross-repo *dependency* edges (parent/blocker)
+  // are allowed — they are emitted as repo-qualified `owner/repo#N` references
+  // below, which the trackers render as real cross-repo references. (Cross-repo
+  // *session* ordering is handled separately by the dependency scheduler.)
+  assertRelatedSameRepo(plan, project, byRef);
 
   // Related edges are non-directional. Build a symmetric adjacency so the link
   // is recorded on whichever side of the pair is created last (topological
@@ -257,11 +264,21 @@ export async function createPlanTickets({
   const refToIssue = new Map<string, Issue>();
   const created: CreatedTicket[] = [];
 
-  const resolveDep = (ref: string): string => {
+  // Resolve a dependency ref to the identifier embedded in `from`'s issue body.
+  // A cross-repo dependency is qualified as "owner/repo#N" so the tracker renders
+  // a real cross-repo reference instead of a repo-local "#N" that would mislink to
+  // the wrong issue; same-repo dependencies stay bare numbers.
+  const resolveDep = (ref: string, from: PlannedTicket): string => {
     const issue = refToIssue.get(ref);
     if (!issue) {
       // Topological order guarantees parent/blocker dependencies exist first.
       throw new Error(`Internal error: ref "${ref}" was not created before being referenced.`);
+    }
+    const fromRepo = effectiveRepo(from, project);
+    const depTicket = byRef.get(ref);
+    const depRepo = depTicket ? effectiveRepo(depTicket, project) : undefined;
+    if (depRepo && fromRepo && depRepo !== fromRepo) {
+      return `${depRepo}#${issue.id}`;
     }
     return issue.id;
   };
@@ -275,9 +292,9 @@ export async function createPlanTickets({
       title: ticket.title,
       description: ticket.body,
       ...(ticket.labels && ticket.labels.length > 0 ? { labels: ticket.labels } : {}),
-      ...(ticket.parentRef ? { parentId: resolveDep(ticket.parentRef) } : {}),
+      ...(ticket.parentRef ? { parentId: resolveDep(ticket.parentRef, ticket) } : {}),
       ...(ticket.blockedByRefs && ticket.blockedByRefs.length > 0
-        ? { blockedBy: ticket.blockedByRefs.map(resolveDep) }
+        ? { blockedBy: ticket.blockedByRefs.map((ref) => resolveDep(ref, ticket)) }
         : {}),
     };
 
@@ -305,30 +322,32 @@ function effectiveRepo(ticket: PlannedTicket, project: ProjectConfig): string | 
 }
 
 /**
- * Throw if any relation edge (parent, blocker, or related) crosses repos. Such
- * edges cannot be faithfully represented by the repo-local `#N` relation
- * emulation, so creating them would silently mislink to the wrong issue.
+ * Throw if any *related* edge crosses repos. Related links are non-directional
+ * and emulated as a repo-local `#N` marker on whichever ticket is created last,
+ * so a cross-repo related edge would silently mislink to the wrong issue.
+ *
+ * Cross-repo *dependency* edges (parent/blocker) are intentionally NOT rejected:
+ * they are emitted as repo-qualified `owner/repo#N` references at creation time
+ * (see resolveDep), which the trackers render as real cross-repo references. This
+ * supports ordered multi-repo plans (e.g. a web ticket blocked by an API ticket
+ * in another repo).
  */
-function assertRelationsSameRepo(
+function assertRelatedSameRepo(
   plan: Plan,
   project: ProjectConfig,
   byRef: Map<string, PlannedTicket>,
 ): void {
   for (const ticket of plan.tickets) {
     const ticketRepo = effectiveRepo(ticket, project);
-    const edges: Array<{ ref: string; relation: string }> = [
-      ...dependencyRefs(ticket).map((ref) => ({ ref, relation: "depends on" })),
-      ...(ticket.relatedRefs ?? []).map((ref) => ({ ref, relation: "is related to" })),
-    ];
-    for (const { ref, relation } of edges) {
+    for (const ref of ticket.relatedRefs ?? []) {
       const other = byRef.get(ref);
       if (!other) continue; // validated elsewhere
       const otherRepo = effectiveRepo(other, project);
       if (otherRepo !== ticketRepo) {
         throw new PlanValidationError(
-          `Cross-repo relation is not supported: ticket "${ticket.ref}" (${ticketRepo ?? "default repo"}) ` +
-            `${relation} "${other.ref}" (${otherRepo ?? "default repo"}). ` +
-            `Keep parent/blocking/related relations within a single repo.`,
+          `Cross-repo related link is not supported: ticket "${ticket.ref}" (${ticketRepo ?? "default repo"}) ` +
+            `is related to "${other.ref}" (${otherRepo ?? "default repo"}). ` +
+            `Keep related links within a single repo; use blockedByRefs for cross-repo ordering.`,
         );
       }
     }

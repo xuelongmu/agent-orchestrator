@@ -358,6 +358,9 @@
         "worker": {
           "$ref": "#/$defs/roleAgentConfig"
         },
+        "decomposer": {
+          "$ref": "#/$defs/roleAgentConfig"
+        },
         "reactions": {
           "type": "object",
           "additionalProperties": {
@@ -433,6 +436,9 @@
           "$ref": "#/$defs/roleAgentDefaults"
         },
         "worker": {
+          "$ref": "#/$defs/roleAgentDefaults"
+        },
+        "decomposer": {
           "$ref": "#/$defs/roleAgentDefaults"
         }
       }

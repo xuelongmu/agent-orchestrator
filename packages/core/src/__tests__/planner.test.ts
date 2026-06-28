@@ -189,17 +189,33 @@ describe("createPlanTickets", () => {
     expect(calls[1].input.relatedTo).toEqual(["1"]); // t2 links back to t1
   });
 
-  it("rejects cross-repo dependency edges before creating anything", async () => {
+  it("allows cross-repo dependency edges, qualifying the cross-repo ref", async () => {
     const { tracker, calls } = makeMockTracker();
     const p = plan([
       { ref: "api", title: "API", body: "", repo: "acme/api" },
       { ref: "web", title: "Web", body: "", blockedByRefs: ["api"] }, // web in acme/app
     ]);
 
-    await expect(
-      createPlanTickets({ plan: p, tracker, project: baseProject }),
-    ).rejects.toThrow(/Cross-repo relation/);
-    expect(calls).toHaveLength(0); // nothing created
+    const created = await createPlanTickets({ plan: p, tracker, project: baseProject });
+
+    // api created first in acme/api (issue 1); web in acme/app links to it with a
+    // repo-qualified ref so the marker resolves cross-repo instead of mislinking.
+    expect(created.map((c) => c.ref)).toEqual(["api", "web"]);
+    expect(calls[0].repo).toBe("acme/api");
+    expect(calls[1].repo).toBe("acme/app");
+    expect(calls[1].input.blockedBy).toEqual(["acme/api#1"]);
+  });
+
+  it("keeps same-repo dependency refs bare", async () => {
+    const { tracker, calls } = makeMockTracker();
+    const p = plan([
+      { ref: "api", title: "API", body: "", repo: "acme/api" },
+      { ref: "web", title: "Web", body: "", repo: "acme/api", blockedByRefs: ["api"] },
+    ]);
+
+    await createPlanTickets({ plan: p, tracker, project: baseProject });
+
+    expect(calls[1].input.blockedBy).toEqual(["1"]); // same repo → no qualifier
   });
 
   it("rejects cross-repo related edges before creating anything", async () => {
@@ -211,8 +227,24 @@ describe("createPlanTickets", () => {
 
     await expect(
       createPlanTickets({ plan: p, tracker, project: baseProject }),
-    ).rejects.toThrow(/Cross-repo relation/);
+    ).rejects.toThrow(/Cross-repo related/);
     expect(calls).toHaveLength(0);
+  });
+
+  it("validates the plan graph before creating any tickets", async () => {
+    const { tracker, calls } = makeMockTracker();
+    // A dependency-free first ticket followed by one blocked by an unknown ref.
+    // Without up-front validation, the first issue would be created before the
+    // dangling ref is detected, leaving a partial ticket set.
+    const p = plan([
+      { ref: "t1", title: "A", body: "" },
+      { ref: "t2", title: "B", body: "", blockedByRefs: ["nope"] },
+    ]);
+
+    await expect(
+      createPlanTickets({ plan: p, tracker, project: baseProject }),
+    ).rejects.toThrow(/unknown blocker/);
+    expect(calls).toHaveLength(0); // nothing created
   });
 
   it("throws when the tracker cannot create issues", async () => {
