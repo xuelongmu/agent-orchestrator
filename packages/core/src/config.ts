@@ -244,6 +244,13 @@ const RoleAgentConfigSchema = z
   })
   .optional();
 
+const BudgetConfigSchema = z
+  .object({
+    perSessionUsd: z.number().nonnegative().optional(),
+    perProjectUsd: z.number().nonnegative().optional(),
+  })
+  .strict();
+
 const ProjectConfigSchema = z.object({
   name: z.string().optional(),
   repo: z.string().optional(),
@@ -275,6 +282,7 @@ const ProjectConfigSchema = z.object({
     .enum(["reuse", "delete", "ignore", "delete-new", "ignore-new", "kill-previous"])
     .optional(),
   opencodeIssueSessionStrategy: z.enum(["reuse", "delete", "ignore"]).optional(),
+  budget: BudgetConfigSchema.optional(),
 });
 
 const DefaultPluginsSchema = z.object({
@@ -365,6 +373,7 @@ const OrchestratorConfigSchema = z.object({
   lifecycle: LifecycleConfigSchema,
   observability: ObservabilityConfigSchema,
   defaults: DefaultPluginsSchema.default({}),
+  budget: BudgetConfigSchema.optional(),
   plugins: z.array(InstalledPluginConfigSchema).default([]),
   dashboard: DashboardConfigSchema.optional(),
   projects: z.record(
@@ -856,6 +865,7 @@ function buildEffectiveConfigFromFlatLocalPath(
     readyThresholdMs: globalConfig.readyThresholdMs,
     observability: globalConfig.observability,
     defaults: globalConfig.defaults,
+    budget: globalConfig.budget,
     notifiers: globalConfig.notifiers,
     notificationRouting: globalConfig.notificationRouting,
     reactions: globalConfig.reactions,
@@ -908,6 +918,7 @@ function buildEffectiveConfigFromGlobalConfigPath(configPath: string): LoadedCon
     readyThresholdMs: globalConfig.readyThresholdMs,
     observability: globalConfig.observability,
     defaults: globalConfig.defaults,
+    budget: globalConfig.budget,
     notifiers: globalConfig.notifiers,
     notificationRouting: globalConfig.notificationRouting,
     reactions: globalConfig.reactions,

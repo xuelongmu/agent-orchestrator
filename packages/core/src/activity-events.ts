@@ -85,6 +85,9 @@ export type ActivityEventKind =
   | "reaction.escalated"
   | "reaction.send_to_agent_failed"
   | "reaction.action_succeeded"
+  // Budget enforcement
+  | "budget.paused"
+  | "budget.interrupt_failed"
   // Auto-cleanup + poll cycle
   | "session.auto_cleanup_deferred"
   | "session.auto_cleanup_completed"

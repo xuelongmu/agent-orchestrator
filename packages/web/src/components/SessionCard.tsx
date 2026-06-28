@@ -201,9 +201,22 @@ function SessionCardView({ session, onKill, onMerge, onRestore }: SessionCardPro
 
         <div className="card__meta">
           {session.branch && <span className="card__branch">{session.branch}</span>}
-          {prs.length === 1 && (
+          {session.cost && session.cost.estimatedCostUsd > 0 && (
             <>
               {session.branch && (
+                <span className="card__meta-sep" aria-hidden="true">·</span>
+              )}
+              <span
+                className="text-[var(--color-text-tertiary)]"
+                title="Estimated agent cost so far"
+              >
+                ${session.cost.estimatedCostUsd.toFixed(2)}
+              </span>
+            </>
+          )}
+          {prs.length === 1 && (
+            <>
+              {(session.branch || (session.cost && session.cost.estimatedCostUsd > 0)) && (
                 <span className="card__meta-sep" aria-hidden="true">·</span>
               )}
               <a
@@ -386,7 +399,7 @@ type FooterTone = "fail" | "amber" | "green" | undefined;
 
 /**
  * Terse PR/CI detail for the card's thin info footer (mockup: `PR #N · CI …`).
- * No cost is shown (the dashboard session carries none).
+ * Cost (when present) is shown separately in the card meta line, not here.
  */
 function getFooterDetail(
   session: DashboardSession,

@@ -435,6 +435,17 @@ export interface Runtime {
   /** Send a text message/prompt to the running agent */
   sendMessage(handle: RuntimeHandle, message: string): Promise<void>;
 
+  /**
+   * Interrupt the agent's in-flight work without tearing down the session.
+   * Sends a cancel/stop keystroke (Escape) to the foreground process so it
+   * halts the current generation (e.g. an over-budget run) while staying alive
+   * and interactive — a human can then raise the cap and resume. Destroying the
+   * runtime instead would make the next isAlive probe read it as dead and the
+   * lifecycle reconciler would mark the session terminated (#1735), not paused.
+   * Best-effort: optional, and a no-op if the session is not running.
+   */
+  interrupt?(handle: RuntimeHandle): Promise<void>;
+
   /** Capture recent output from the session */
   getOutput(handle: RuntimeHandle, lines?: number): Promise<string>;
 
@@ -676,6 +687,20 @@ export interface CostEstimate {
   inputTokens: number;
   outputTokens: number;
   estimatedCostUsd: number;
+}
+
+/**
+ * Budget caps (estimated USD). Configurable globally (applies to every
+ * session/project) and per-project. When a cap is exceeded the lifecycle
+ * manager pauses the offending session (needs_input) and notifies.
+ *
+ * A cap of `0` or omitted means "no limit".
+ */
+export interface BudgetConfig {
+  /** Pause a session once its own estimated cost exceeds this many USD. */
+  perSessionUsd?: number;
+  /** Pause sessions once a project's combined estimated cost exceeds this many USD. */
+  perProjectUsd?: number;
 }
 
 // =============================================================================
@@ -1445,6 +1470,9 @@ export interface OrchestratorConfig {
   /** Default plugin selections */
   defaults: DefaultPlugins;
 
+  /** Cost budget caps applied to every project unless overridden per-project. */
+  budget?: BudgetConfig;
+
   /** Installer-managed external plugin descriptors */
   plugins?: InstalledPluginConfig[];
 
@@ -1649,6 +1677,9 @@ export interface ProjectConfig {
     | "kill-previous";
 
   opencodeIssueSessionStrategy?: "reuse" | "delete" | "ignore";
+
+  /** Per-project cost budget caps (override the global defaults). */
+  budget?: BudgetConfig;
 }
 
 export interface TrackerConfig {

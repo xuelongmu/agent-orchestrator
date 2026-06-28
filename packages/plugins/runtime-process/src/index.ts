@@ -17,10 +17,14 @@ import {
 import {
   getPipePath,
   ptyHostSendMessage,
+  ptyHostSendRaw,
   ptyHostGetOutput,
   ptyHostIsAlive,
   ptyHostKill,
 } from "./pty-client.js";
+
+/** Escape key — cancels the agent's in-flight generation without exiting it. */
+const INTERRUPT_KEY = "\x1b";
 
 export const manifest = {
   name: "process",
@@ -410,6 +414,91 @@ export function create(): Runtime {
         stdin.on("drain", onDrain);
         stdin.write(message + "\n", (err) => finish(err ?? null));
       });
+    },
+
+    async interrupt(handle: RuntimeHandle): Promise<void> {
+      // Send Escape to cancel the agent's in-flight generation, halting token
+      // spend (e.g. for an over-budget session) while keeping the process alive.
+      const pipePath = (handle.data as Record<string, unknown>)?.pipePath as string | undefined;
+      if (pipePath) {
+        await ptyHostSendRaw(pipePath, INTERRUPT_KEY);
+        return;
+      }
+
+      const entry = processes.get(handle.id);
+      const stdin = entry?.process?.stdin;
+      if (stdin?.writable) {
+        // Await the write (mirroring sendMessage) so an async failure —
+        // EPIPE/ERR_STREAM_DESTROYED when the child exits or closes stdin while
+        // we're writing — surfaces as a rejection instead of a fire-and-forget.
+        // A fire-and-forget would (a) let the lifecycle manager latch
+        // budgetInterrupted=true even though Escape never landed, suppressing
+        // retries, and (b) emit an unhandled 'error' event that can crash AO.
+        await new Promise<void>((resolve, reject) => {
+          let done = false;
+          const finish = (err?: Error | null) => {
+            if (done) return;
+            done = true;
+            stdin.removeListener("error", onError);
+            if (err) reject(err);
+            else resolve();
+          };
+          const onError = (err: Error) => finish(err);
+          stdin.on("error", onError);
+          stdin.write(INTERRUPT_KEY, (err) => finish(err ?? null));
+        });
+        return;
+      }
+
+      // No in-memory entry: the session was recovered from metadata or launched
+      // by a previous AO process, so this process does not own the child's stdin
+      // and cannot write Escape. The Unix child was spawned detached (its own
+      // process group, pgid == pid), so we deliver SIGINT to that group via the
+      // persisted PID — the same cancel signal a terminal Ctrl+C sends to its
+      // foreground group. This halts the in-flight generation without the
+      // SIGKILL teardown destroy() uses, which would trip the dead-runtime
+      // reconciler (#1735) and read as killed rather than paused.
+      //
+      // Negative-PID process-group signalling is POSIX-only (see
+      // docs/CROSS_PLATFORM.md). On Windows there is no equivalent
+      // non-destructive interrupt for a foreign child — a raw process.kill(pid)
+      // would forcibly terminate it — so we signal only on POSIX and otherwise
+      // fail loudly rather than do something destructive.
+      const pid = (handle.data as Record<string, unknown>)?.pid;
+      if (!isWindows() && typeof pid === "number" && pid > 0) {
+        try {
+          // Negative pid signals the whole process group, reaching the agent
+          // binary even though the persisted pid is the shell leader.
+          process.kill(-pid, "SIGINT");
+          return;
+        } catch (err: unknown) {
+          // ESRCH: the group is already gone — nothing to interrupt.
+          if ((err as NodeJS.ErrnoException).code === "ESRCH") return;
+          // Group signalling not available/permitted — fall back to the leader.
+          try {
+            process.kill(pid, "SIGINT");
+            return;
+          } catch (err2: unknown) {
+            if ((err2 as NodeJS.ErrnoException).code === "ESRCH") return;
+            throw new Error(
+              `cannot interrupt process session ${handle.id} via persisted PID ${pid}: ` +
+                `${err2 instanceof Error ? err2.message : String(err2)}`,
+              { cause: err2 },
+            );
+          }
+        }
+      }
+
+      // No stdin handle and no POSIX process-group channel (no persisted PID, or
+      // running on Windows): there is genuinely no non-destructive way to
+      // interrupt this session. Fail loudly rather than resolve — a silent
+      // success would let the lifecycle manager latch the session as
+      // "interrupted" while the agent keeps spending.
+      throw new Error(
+        `cannot interrupt process session ${handle.id}: no in-memory stdin handle and no ` +
+          `POSIX process-group channel (session not owned by this AO process — recovered from ` +
+          `metadata or started by a prior run${isWindows() ? "; negative-PID signalling is POSIX-only" : ""})`,
+      );
     },
 
     async getOutput(handle: RuntimeHandle, lines = 50): Promise<string> {
