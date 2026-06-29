@@ -39,21 +39,57 @@ export function isPrerequisiteSatisfied(session: Session): boolean {
  *  - `sessionIds`: session ids are globally unique (`{prefix}-{num}`), so a
  *    merged session satisfies a matching `blockedBy` entry in **any** project —
  *    this is the unambiguous cross-project handle.
- *  - `issueIdsByProject`: issue ids are only unique within a project (GitHub /
- *    GitLab expose `#20` as "20" in every repo), so a merged session's issue id
+ *  - `issueIdsByProject`: bare issue ids are only unique within a project (GitHub
+ *    / GitLab expose `#20` as "20" in every repo), so a merged session's issue id
  *    may only satisfy a dependent **in the same project**. Matching globally
  *    would let repo B's issue 20 wrongly unblock a repo A dependent on its own
  *    issue 20.
+ *  - `repoQualifiedIssueIds`: a repo-qualified issue ref ("owner/repo#N") IS
+ *    globally unique, so — like a session id — it may satisfy a dependent in
+ *    **any** project. `ao plan` emits cross-repo blockers in this form, so this
+ *    is what lets an ordered multi-repo plan actually unblock across repos.
+ *  - `globalIssueIds`: keys from workspace-scoped trackers (e.g. Linear's
+ *    "ENG-1") are globally unique across the workspace, so they may satisfy a
+ *    dependent in **any** project. Membership is decided by the owning project's
+ *    tracker type (`projectInfo.workspaceScopedTracker`), NOT by the shape of the
+ *    id — a repo-scoped project's ad-hoc/non-numeric `issueId` must stay
+ *    project-local so it can't satisfy an unrelated blocker elsewhere. `ao plan`
+ *    emits cross-project Linear blockers as bare keys, so this lets a
+ *    multi-project Linear plan unblock across projects.
  */
 export interface SatisfiedDependencies {
   sessionIds: Set<string>;
   issueIdsByProject: Map<string, Set<string>>;
+  repoQualifiedIssueIds: Set<string>;
+  globalIssueIds: Set<string>;
 }
 
-/** Collect the satisfied dependency identifiers from merged sessions. */
-export function collectSatisfiedDependencies(sessions: Session[]): SatisfiedDependencies {
+/** Per-project facts the scheduler needs to qualify a merged issue id. */
+export interface ProjectDependencyInfo {
+  /** The project's "owner/repo" path (repo-scoped trackers only). */
+  repo?: string;
+  /** True when the project's tracker uses globally-unique keys (e.g. Linear). */
+  workspaceScopedTracker?: boolean;
+}
+
+/**
+ * Collect the satisfied dependency identifiers from merged sessions.
+ *
+ * `projectInfo` maps a session's project id to its repo + tracker scope. The repo
+ * is used to build the globally-unique `owner/repo#N` form — keyed on the issue's
+ * *project repo*, not on every repo the session opened a PR in, since an issue
+ * number is repo-local and an auxiliary cross-repo PR must not register that
+ * repo's `repo#N`. The tracker scope decides whether the bare issue id is
+ * globally unique (Linear) or must stay project-local (GitHub/GitLab).
+ */
+export function collectSatisfiedDependencies(
+  sessions: Session[],
+  projectInfo?: (projectId: string) => ProjectDependencyInfo | undefined,
+): SatisfiedDependencies {
   const sessionIds = new Set<string>();
   const issueIdsByProject = new Map<string, Set<string>>();
+  const repoQualifiedIssueIds = new Set<string>();
+  const globalIssueIds = new Set<string>();
   for (const session of sessions) {
     if (!isPrerequisiteSatisfied(session)) continue;
     const sessionId = normalizeDependencyId(session.id);
@@ -67,16 +103,24 @@ export function collectSatisfiedDependencies(sessions: Session[]): SatisfiedDepe
           issueIdsByProject.set(session.projectId, perProject);
         }
         perProject.add(issueId);
+        const info = projectInfo?.(session.projectId);
+        if (info?.workspaceScopedTracker) {
+          globalIssueIds.add(issueId);
+        } else if (info?.repo) {
+          repoQualifiedIssueIds.add(normalizeDependencyId(`${info.repo}#${issueId}`));
+        }
       }
     }
   }
-  return { sessionIds, issueIdsByProject };
+  return { sessionIds, issueIdsByProject, repoQualifiedIssueIds, globalIssueIds };
 }
 
 /**
  * True when a single `blockedBy` entry of a dependent in `projectId` is
- * satisfied — either by a merged session id (any project) or by a merged issue
- * id within the same project.
+ * satisfied — by a merged session id (any project), a merged repo-qualified
+ * issue ref "owner/repo#N" (any project, globally unique), a merged
+ * workspace-scoped key like "ENG-1" (any project, globally unique), or a merged
+ * bare repo-scoped issue id within the same project.
  */
 export function isDependencySatisfied(
   entry: string,
@@ -85,6 +129,13 @@ export function isDependencySatisfied(
 ): boolean {
   const normalized = normalizeDependencyId(entry);
   if (satisfied.sessionIds.has(normalized)) return true;
+  if (normalized.includes("/")) {
+    return satisfied.repoQualifiedIssueIds.has(normalized);
+  }
+  // A workspace-scoped key (Linear) is satisfiable from any project; otherwise a
+  // bare id falls back to same-project matching only. globalIssueIds and
+  // issueIdsByProject are disjoint by construction, so checking both is safe.
+  if (satisfied.globalIssueIds.has(normalized)) return true;
   return satisfied.issueIdsByProject.get(projectId)?.has(normalized) ?? false;
 }
 

@@ -222,6 +222,7 @@ export const GlobalConfigSchema = z
         notifiers: z.array(z.string()).default(["composio", "desktop"]),
         orchestrator: z.object({ agent: z.string().optional() }).optional(),
         worker: z.object({ agent: z.string().optional() }).optional(),
+        decomposer: z.object({ agent: z.string().optional() }).optional(),
       })
       .default({}),
     /** Cost budget caps applied to every project unless overridden per-project. */
@@ -314,7 +315,10 @@ export const LocalProjectConfigSchema = z
       .enum(["reuse", "delete", "ignore", "delete-new", "ignore-new", "kill-previous"])
       .optional(),
     opencodeIssueSessionStrategy: z.enum(["reuse", "delete", "ignore"]).optional(),
-    decomposer: z.object({}).passthrough().optional(),
+    decomposer: z
+      .object({ agent: z.string().optional(), agentConfig: z.object({}).passthrough().optional() })
+      .passthrough()
+      .optional(),
     budget: z
       .object({
         perSessionUsd: z.number().nonnegative().optional(),
@@ -499,7 +503,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function mergeRoleBehavior(
   defaults: Record<string, unknown>,
   project: Record<string, unknown>,
-  key: "orchestrator" | "worker",
+  key: "orchestrator" | "worker" | "decomposer",
 ): Record<string, unknown> | undefined {
   const defaultRole = isRecord(defaults[key]) ? defaults[key] : undefined;
   const projectRole = isRecord(project[key]) ? project[key] : undefined;
@@ -532,6 +536,7 @@ function buildRepairedLocalProjectConfig(
     displayName: _displayName,
     orchestrator: _orchestrator,
     worker: _worker,
+    decomposer: _decomposer,
     ...projectBehavior
   } = project;
   void _name;
@@ -543,6 +548,7 @@ function buildRepairedLocalProjectConfig(
   void _displayName;
   void _orchestrator;
   void _worker;
+  void _decomposer;
 
   const behavior = {
     ...defaultBehavior,
@@ -550,8 +556,10 @@ function buildRepairedLocalProjectConfig(
   };
   const orchestrator = mergeRoleBehavior(defaults, project, "orchestrator");
   const worker = mergeRoleBehavior(defaults, project, "worker");
+  const decomposer = mergeRoleBehavior(defaults, project, "decomposer");
   if (orchestrator) behavior["orchestrator"] = orchestrator;
   if (worker) behavior["worker"] = worker;
+  if (decomposer) behavior["decomposer"] = decomposer;
   return behavior;
 }
 

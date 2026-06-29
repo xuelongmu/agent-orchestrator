@@ -3374,7 +3374,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     );
     if (held.length === 0) return 0;
 
-    const satisfied = collectSatisfiedDependencies(sessions);
+    const satisfied = collectSatisfiedDependencies(sessions, (projectId) => {
+      const proj = config.projects[projectId];
+      if (!proj) return undefined;
+      return {
+        repo: proj.repo,
+        // Workspace-scoped trackers (Linear) use globally-unique keys; repo-scoped
+        // ones (GitHub/GitLab) keep their bare numeric ids project-local.
+        workspaceScopedTracker: proj.tracker?.plugin === "linear",
+      };
+    });
     // Account for launches issued this pass before the next list() reflects the
     // newly-running sessions, so a burst of unblocks still respects the cap.
     const launchedByProject = new Map<string, number>();
