@@ -25,6 +25,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { getGlobalConfigPath } from "./global-config.js";
+import { isBlockedByDependency } from "./lifecycle-state.js";
 import {
   isOrchestratorSession,
   TERMINAL_STATUSES,
@@ -226,7 +227,11 @@ function tryAcquireLock(lockPath: string): LockHandle | null {
 }
 
 function getMaxConcurrentAgents(project: ProjectConfig): number {
-  const configured = project.maxConcurrentAgents;
+  // Honor the existing `maxConcurrent` cap (enforced by the dependency scheduler
+  // for launched workers) as the fallback before the default, so a project with
+  // `maxConcurrent: 1` doesn't silently let the backlog poller spawn the default
+  // five. `maxConcurrentAgents` (backlog-specific) still wins when both are set.
+  const configured = project.maxConcurrentAgents ?? project.maxConcurrent;
   return typeof configured === "number" && configured > 0
     ? configured
     : DEFAULT_MAX_CONCURRENT_AGENTS;
@@ -234,7 +239,19 @@ function getMaxConcurrentAgents(project: ProjectConfig): number {
 
 /**
  * Label GitHub issues for verification when their PRs have been merged.
- * Mutates `processedIssues` to avoid repeated API calls.
+ *
+ * Dedupe is keyed per *session* (`${projectId}:${session.id}`), not per issue:
+ * a verified issue can be reopened and reworked by a NEW session for the same
+ * issue id, and that new session must be re-labeled when it merges while the old
+ * merged session stays deduped (keying by issue id would either re-label via the
+ * stale session or block the rework). `processedIssues` is mutated to avoid
+ * repeated API calls within a process.
+ *
+ * Returns the set of `${projectId}:${issueId.toLowerCase()}` keys whose merged
+ * session could NOT be transitioned this cycle (label update failed while the
+ * issue may still carry `agent:backlog`). The caller passes these to
+ * `spawnFromBacklog` so it won't spawn a fresh worker for already-merged work
+ * before the next poll retries the label.
  */
 async function labelIssuesForVerification(
   sessions: Session[],
@@ -242,16 +259,23 @@ async function labelIssuesForVerification(
   registry: PluginRegistry,
   processedIssues: Set<string>,
   logger?: BacklogLogger,
-): Promise<void> {
+): Promise<Set<string>> {
+  const unlabeledMergedIssues = new Set<string>();
   const mergedSessions = sessions.filter(
     (s) =>
       s.lifecycle.pr.state === "merged" &&
       s.issueId &&
-      !processedIssues.has(`${s.projectId}:${s.issueId}`),
+      !processedIssues.has(`${s.projectId}:${s.id}`),
   );
 
   for (const session of mergedSessions) {
-    const key = `${session.projectId}:${session.issueId}`;
+    const key = `${session.projectId}:${session.id}`;
+    const issueId = session.issueId;
+    if (!issueId) {
+      processedIssues.add(key);
+      continue;
+    }
+    const issueKey = `${session.projectId}:${issueId.toLowerCase()}`;
     const project = config.projects[session.projectId];
     if (!project?.tracker?.plugin) {
       processedIssues.add(key);
@@ -264,22 +288,22 @@ async function labelIssuesForVerification(
       continue;
     }
 
-    const issueId = session.issueId;
-    if (!issueId) {
-      processedIssues.add(key);
-      continue;
-    }
-
     // Consult the tracker's authoritative state before (re-)labeling. This
     // guards two cases: a peer poller process may have already labeled the
     // issue (our in-memory `processedIssues` set is per-process), and after a
     // daemon restart `processedIssues` is empty while the merged session is
     // still on disk.
-    let currentIssue: Issue | undefined;
+    let currentIssue: Issue;
     try {
       currentIssue = await tracker.getIssue(issueId, project);
-    } catch {
-      // getIssue failed — fall through and attempt the update anyway.
+    } catch (err) {
+      // Can't determine authoritative state — the update's correctness depends
+      // on it (whether to re-open an auto-closed issue, whether it's already
+      // verified). Skip and retry next poll rather than updating blindly. Don't
+      // mark processed, and keep the issue out of this cycle's spawn pass.
+      logger?.error?.(`[backlog] getIssue failed for ${session.issueId}; will retry:`, err);
+      unlabeledMergedIssues.add(issueKey);
+      continue;
     }
 
     // Skip only when the issue already carries an explicit verification label
@@ -289,8 +313,8 @@ async function labelIssuesForVerification(
     // AO verification: a tracker may auto-close the issue from a PR closing
     // keyword on merge. Treating that as verified would silently drop the issue
     // from the human-verification surfaces, so we still label (and reopen) it.
-    const labels = currentIssue?.labels ?? [];
-    if (currentIssue && VERIFICATION_LABELS.some((label) => labels.includes(label))) {
+    const labels = currentIssue.labels ?? [];
+    if (VERIFICATION_LABELS.some((label) => labels.includes(label))) {
       processedIssues.add(key);
       continue;
     }
@@ -302,7 +326,7 @@ async function labelIssuesForVerification(
           // Reopen if the tracker auto-closed the issue on merge, so it lands in
           // the (state:open-filtered) verification queue for human staging
           // validation. A no-op when the issue is already open.
-          ...(currentIssue?.state === "closed" ? { state: "open" as const } : {}),
+          ...(currentIssue.state === "closed" ? { state: "open" as const } : {}),
           labels: [MERGED_UNVERIFIED_LABEL],
           removeLabels: ["agent:backlog", "agent:in-progress"],
           comment: `PR merged. Issue awaiting human verification on staging.`,
@@ -317,8 +341,15 @@ async function labelIssuesForVerification(
       processedIssues.add(key);
     } catch (err) {
       logger?.error?.(`[backlog] Failed to label issue ${session.issueId} for verification:`, err);
+      // The label transition failed while the merged issue may still carry
+      // `agent:backlog`. Keep it out of this cycle's spawn pass so we don't
+      // launch a fresh worker for work whose PR already merged; the next poll
+      // retries the label (the dedupe slot was intentionally left unconsumed).
+      unlabeledMergedIssues.add(issueKey);
     }
   }
+
+  return unlabeledMergedIssues;
 }
 
 /**
@@ -328,10 +359,9 @@ async function labelIssuesForVerification(
 async function relabelReopenedIssues(
   config: OrchestratorConfig,
   registry: PluginRegistry,
-  processedIssues: Set<string>,
   logger?: BacklogLogger,
 ): Promise<void> {
-  for (const [projectId, project] of Object.entries(config.projects)) {
+  for (const [, project] of Object.entries(config.projects)) {
     if (!project.tracker?.plugin) continue;
     const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
     if (!tracker?.listIssues || !tracker.updateIssue) continue;
@@ -362,13 +392,10 @@ async function relabelReopenedIssues(
           },
           project,
         );
-        // Returning the issue to the backlog starts a fresh work cycle. Drop any
-        // stale verification-dedupe entry from the previous cycle: the
-        // `${projectId}:${issueId}` key was added when the earlier merged session
-        // was labeled (or skipped as already-verified). Without clearing it, when
-        // the rework worker later merges, labelIssuesForVerification would filter
-        // the issue out and never re-label it `merged-unverified` until restart.
-        processedIssues.delete(`${projectId}:${issue.id}`);
+        // No dedupe bookkeeping needed here: `processedIssues` is keyed per
+        // session, so the reopened issue's rework spawns a NEW session whose key
+        // is unseen and gets labeled on merge, while the old merged session stays
+        // deduped and can't re-label the freshly-reopened backlog work.
         logger?.info?.(`[backlog] Relabeled reopened issue ${issue.id} → ${BACKLOG_LABEL}`);
       } catch (err) {
         logger?.error?.(`[backlog] Failed to relabel reopened issue ${issue.id}:`, err);
@@ -387,6 +414,7 @@ async function spawnFromBacklog(
   config: OrchestratorConfig,
   registry: PluginRegistry,
   sessionManager: OpenCodeSessionManager,
+  unlabeledMergedIssues: Set<string>,
   logger?: BacklogLogger,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -395,17 +423,36 @@ async function spawnFromBacklog(
   const allSessionPrefixes = Object.entries(config.projects).map(
     ([id, p]) => p.sessionPrefix ?? id,
   );
+  const isWorkerSession = (session: Session): boolean =>
+    !isOrchestratorSession(
+      session,
+      config.projects[session.projectId]?.sessionPrefix ?? session.projectId,
+      allSessionPrefixes,
+    );
+  // Non-terminal workers actively claiming an issue — used for duplicate
+  // detection (a reopened issue whose old session merged must still be
+  // respawnable, so `merged` is intentionally excluded here).
   const workerSessions = allSessions.filter(
-    (session) =>
-      !isOrchestratorSession(
-        session,
-        config.projects[session.projectId]?.sessionPrefix ?? session.projectId,
-        allSessionPrefixes,
-      ) && !TERMINAL_STATUSES.has(session.status),
+    (session) => isWorkerSession(session) && !TERMINAL_STATUSES.has(session.status),
   );
 
-  // Group active workers per project so the cap and duplicate detection are
-  // both scoped per project (per-project concurrency).
+  // Sessions occupying a concurrency slot for the per-project cap. Mirrors the
+  // dependency scheduler's countActiveSessions: non-terminal OR `merged` (a
+  // merged worker keeps a live runtime through the post-merge cleanup grace
+  // window, so it must still count — otherwise maxConcurrent:1 is exceeded the
+  // moment a PR merges but before the old agent exits), excluding held
+  // (blocked-by-dependency) sessions that own no runtime.
+  const slotCountByProject = new Map<string, number>();
+  for (const session of allSessions) {
+    if (!isWorkerSession(session)) continue;
+    const occupiesSlot =
+      !TERMINAL_STATUSES.has(session.status) || session.status === "merged";
+    if (!occupiesSlot || isBlockedByDependency(session.lifecycle)) continue;
+    slotCountByProject.set(session.projectId, (slotCountByProject.get(session.projectId) ?? 0) + 1);
+  }
+
+  // Group active workers per project so duplicate detection is scoped per
+  // project (per-project concurrency).
   const workersByProject = new Map<string, Session[]>();
   for (const session of workerSessions) {
     const list = workersByProject.get(session.projectId) ?? [];
@@ -439,7 +486,8 @@ async function spawnFromBacklog(
     if (!project.tracker?.plugin) continue;
 
     const projectWorkers = workersByProject.get(projectId) ?? [];
-    let availableSlots = getMaxConcurrentAgents(project) - projectWorkers.length;
+    let availableSlots =
+      getMaxConcurrentAgents(project) - (slotCountByProject.get(projectId) ?? 0);
     if (availableSlots <= 0) continue; // At capacity for this project
 
     const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
@@ -475,10 +523,15 @@ async function spawnFromBacklog(
     // updateIssue ignores removeLabels (Linear, GitLab) or after a failed claim.
     // Its session is merged (excluded from workerSessions), so nothing else
     // guards it. Shared by the fetch sizing and the spawn loop so both agree.
+    // Also skip an issue whose merged session's verification-label transition
+    // failed (or whose tracker state couldn't be read) this cycle: its PR has
+    // already merged, so spawning a fresh worker would redo merged work. The
+    // label is retried next poll; until then it must stay out of the spawn pass.
     const wouldSkipForSpawn = (issue: Issue): boolean =>
       VERIFICATION_LABELS.some((label) => issue.labels.includes(label)) ||
       activeIssueIds.has(issue.id.toLowerCase()) ||
-      takenIssueUrls.has(canonicalUrlFor(issue));
+      takenIssueUrls.has(canonicalUrlFor(issue)) ||
+      unlabeledMergedIssues.has(`${projectId}:${issue.id.toLowerCase()}`);
 
     // Fetch the backlog, growing the page while it stays saturated with issues
     // we'll skip and capacity remains. Without this, stale issues still carrying
@@ -611,9 +664,23 @@ export function createBacklogPoller(options: BacklogPollerOptions): BacklogPolle
       const { config, registry, sessionManager } = await resolveServices();
 
       const allSessions = await sessionManager.list();
-      await labelIssuesForVerification(allSessions, config, registry, processedIssues, logger);
-      await relabelReopenedIssues(config, registry, processedIssues, logger);
-      await spawnFromBacklog(allSessions, config, registry, sessionManager, logger, abort.signal);
+      const unlabeledMergedIssues = await labelIssuesForVerification(
+        allSessions,
+        config,
+        registry,
+        processedIssues,
+        logger,
+      );
+      await relabelReopenedIssues(config, registry, logger);
+      await spawnFromBacklog(
+        allSessions,
+        config,
+        registry,
+        sessionManager,
+        unlabeledMergedIssues,
+        logger,
+        abort.signal,
+      );
     } catch (err) {
       logger?.error?.("[backlog] Poll failed:", err);
     } finally {

@@ -227,11 +227,11 @@ describe("loadMergedScopeConfig", () => {
     expect(merged._registryScopeKey).toBeUndefined();
   });
 
-  it("drops a startup-only project whose session prefix collides with a registered one", () => {
+  it("rejects a startup-only project whose session prefix collides with a registered one", () => {
     // loadConfig validates each config in isolation; merging can still introduce
-    // a cross-config prefix collision. The registered project is authoritative —
-    // the colliding startup-only project is dropped so it can't clobber the
-    // registered project's session ids / branches.
+    // a cross-config prefix collision. Rather than silently drop the startup
+    // project (whose dashboard/orchestrator may already be running), abort loudly
+    // so the collision is fixed before sessions go unsupervised.
     const startup = {
       configPath: STARTUP,
       defaults: startupDefaults,
@@ -244,12 +244,37 @@ describe("loadMergedScopeConfig", () => {
     };
     mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
 
+    expect(() => loadMergedScopeConfig(STARTUP)).toThrow(/prefix collision/i);
+  });
+
+  it("bakes startup-wide reactions / notificationRouting / lifecycle onto a carried project", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      reactions: { "pr-closed": { auto: false } },
+      notificationRouting: { action: ["slack"] },
+      lifecycle: { autoCleanupOnMerge: false },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      reactions: { "pr-closed": { auto: true } },
+      notificationRouting: { action: ["desktop"] },
+      lifecycle: { autoCleanupOnMerge: true },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
     const merged = loadMergedScopeConfig(STARTUP);
 
-    expect(merged.projects.localdup).toBeUndefined();
-    expect(merged.projects.reg).toBeDefined();
-    // Nothing startup-only was carried, so no distinct cache key either.
-    expect(merged._registryScopeKey).toBeUndefined();
+    // The carried startup-only project keeps its own startup-wide policy as
+    // per-project overrides, not the global top-level policy.
+    expect(merged.projects.local.reactions?.["pr-closed"]).toEqual({ auto: false });
+    expect(merged.projects.local.notificationRouting).toEqual({ action: ["slack"] });
+    expect(merged.projects.local.lifecycle).toEqual({ autoCleanupOnMerge: false });
+    // The merged config's top-level policy stays global (it governs global projects).
+    expect(merged.notificationRouting).toEqual({ action: ["desktop"] });
   });
 
   it("falls back to the startup config when no global config exists", () => {

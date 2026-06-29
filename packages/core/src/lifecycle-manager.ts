@@ -2548,7 +2548,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   /** Send a notification to all configured notifiers. */
   async function notifyHuman(event: OrchestratorEvent, priority: EventPriority): Promise<void> {
     const eventWithPriority = { ...event, priority };
-    const notifierNames = config.notificationRouting[priority] ?? config.defaults.notifiers;
+    // Prefer a per-project routing override (preserves a startup-only project's
+    // own routing when merged into a global scope), then top-level, then default.
+    const project = config.projects[event.projectId];
+    const notifierNames =
+      project?.notificationRouting?.[priority] ??
+      config.notificationRouting[priority] ??
+      config.defaults.notifiers;
 
     for (const name of notifierNames) {
       const target = resolveNotifierTarget(config, name);
@@ -2606,9 +2612,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // config.lifecycle is typed optional to support hand-constructed
     // configs in tests. When loaded from YAML via Zod, the schema's
     // .default({}) always populates it. The destructure below handles
-    // both paths uniformly.
+    // both paths uniformly. A per-project `lifecycle` override wins (preserves a
+    // startup-only project's merge-cleanup policy when merged into a global scope).
+    const project = config.projects[session.projectId];
     const { autoCleanupOnMerge = true, mergeCleanupIdleGraceMs: graceMs = 300_000 } =
-      config.lifecycle ?? {};
+      project?.lifecycle ?? config.lifecycle ?? {};
     if (!autoCleanupOnMerge) return;
 
     // Check for idleness: if the agent is still working, defer cleanup.

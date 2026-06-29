@@ -1694,6 +1694,22 @@ export interface ProjectConfig {
   /** Per-project reaction overrides */
   reactions?: Record<string, Partial<ReactionConfig>>;
 
+  /**
+   * Per-project notification routing override (by event priority). When set, it
+   * takes precedence over the top-level `notificationRouting` for this project.
+   * Used to preserve a startup-only project's own routing when its config is
+   * merged into a global scope (see the `ao start` merged-scope wiring).
+   */
+  notificationRouting?: Record<EventPriority, string[]>;
+
+  /**
+   * Per-project lifecycle override (auto-cleanup-on-merge policy, grace window).
+   * When set, it takes precedence over the top-level `lifecycle` for this
+   * project. Used to preserve a startup-only project's own merge-cleanup policy
+   * when its config is merged into a global scope.
+   */
+  lifecycle?: LifecycleConfig;
+
   /** Inline rules/instructions passed to every agent prompt */
   agentRules?: string;
 

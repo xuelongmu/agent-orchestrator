@@ -32,7 +32,6 @@ import {
   generateSessionPrefix,
   getGlobalConfigPath,
   loadConfig,
-  type DefaultPlugins,
   type ExternalPluginEntryRef,
   type InstalledPluginConfig,
   type OrchestratorConfig,
@@ -58,16 +57,30 @@ function isMissingGlobalConfig(error: unknown, globalConfigPath: string): boolea
  * Pinning the *fully resolved* value (rather than just the role default) is
  * required: an explicit `project.agent` outranks a role default, so copying the
  * role default alone could shadow it.
+ *
+ * Startup-WIDE policy (`reactions`, `notificationRouting`, `lifecycle`) is also
+ * baked onto the project as per-project overrides. The merged config otherwise
+ * spreads the GLOBAL top-level policy, so without this a startup-only project's
+ * lifecycle worker would silently run the unrelated global reaction/routing/
+ * merge-cleanup policy instead of the one declared in the config that launched
+ * `ao start`. The lifecycle manager honors these per-project fields.
  */
 function bakeStartupOnlyProject(
   project: ProjectConfig,
-  defaults: DefaultPlugins,
-  startupConfigPath: string,
+  startupConfig: OrchestratorConfig,
 ): ProjectConfig {
+  const defaults = startupConfig.defaults;
   const workerAgent =
     project.worker?.agent ?? project.agent ?? defaults.worker?.agent ?? defaults.agent;
   const orchestratorAgent =
     project.orchestrator?.agent ?? project.agent ?? defaults.orchestrator?.agent ?? defaults.agent;
+  // Startup top-level reactions become per-project overrides (an explicit
+  // `project.reactions` still wins). The lifecycle manager merges per-project
+  // reactions over global, so this scopes the startup policy to this project.
+  const reactions: ProjectConfig["reactions"] =
+    startupConfig.reactions || project.reactions
+      ? { ...(startupConfig.reactions ?? {}), ...(project.reactions ?? {}) }
+      : undefined;
   return {
     ...project,
     runtime: project.runtime ?? defaults.runtime,
@@ -75,7 +88,10 @@ function bakeStartupOnlyProject(
     workspace: project.workspace ?? defaults.workspace,
     worker: { ...project.worker, agent: workerAgent },
     orchestrator: { ...project.orchestrator, agent: orchestratorAgent },
-    sourceConfigPath: project.sourceConfigPath ?? startupConfigPath,
+    ...(reactions ? { reactions } : {}),
+    notificationRouting: project.notificationRouting ?? startupConfig.notificationRouting,
+    lifecycle: project.lifecycle ?? startupConfig.lifecycle,
+    sourceConfigPath: project.sourceConfigPath ?? startupConfig.configPath,
   };
 }
 
@@ -149,11 +165,8 @@ function mergeScopeProjects(
   // session manager derives session ids, tmux names, and `session/<prefix>-N`
   // branches from this prefix, so a startup-only project that collides with a
   // registered one would clobber the registered project's sessions/branches.
-  // Re-run the uniqueness check (loadConfig only validates each config in
-  // isolation) and drop any colliding startup-only project — the registered
-  // project is authoritative; dropping (rather than throwing) keeps the rest of
-  // the scope intact so the poller still claims, and shutdown still kills, every
-  // other project's work.
+  // loadConfig only validates each config in isolation, so re-run the uniqueness
+  // check across the merged set.
   const usedPrefixes = new Set<string>();
   for (const [id, project] of Object.entries(globalConfig.projects)) {
     usedPrefixes.add(project.sessionPrefix || generateSessionPrefix(id));
@@ -163,13 +176,22 @@ function mergeScopeProjects(
   for (const [id, project] of Object.entries(startupConfig.projects)) {
     if (id in projects) continue; // Registered project — keep the global entry + defaults.
     const prefix = project.sessionPrefix || generateSessionPrefix(id);
-    if (usedPrefixes.has(prefix)) continue; // Prefix collision — skip to protect the registered project.
+    if (usedPrefixes.has(prefix)) {
+      // Abort rather than silently drop: `runStartup` may already have spawned
+      // the dashboard/orchestrator (and soon workers) for this startup config
+      // before the supervisor/poller/shutdown call this. Omitting the project
+      // would leave those just-created sessions unenumerated — unsupervised, and
+      // not killed/restored on Ctrl+C. Fail loudly so the collision is fixed.
+      throw new Error(
+        `Session prefix collision in merged scope: startup-only project "${id}" uses ` +
+          `sessionPrefix "${prefix}", which is already used by a registered project. ` +
+          `Session ids, tmux names, and "session/${prefix}-N" branches derive from this prefix, ` +
+          `so carrying "${id}" would clobber the registered project's work. ` +
+          `Set a unique sessionPrefix for "${id}" before launching ao start.`,
+      );
+    }
     usedPrefixes.add(prefix);
-    projects[id] = bakeStartupOnlyProject(
-      project,
-      startupConfig.defaults,
-      startupConfig.configPath,
-    );
+    projects[id] = bakeStartupOnlyProject(project, startupConfig);
     carriedStartupOnly = true;
   }
 

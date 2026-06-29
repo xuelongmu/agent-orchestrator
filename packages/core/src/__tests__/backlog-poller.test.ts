@@ -27,7 +27,7 @@ function makeWorkerSession(id: string, issueId: string, projectId = "proj"): Ses
     issueId,
     status: "working",
     metadata: {},
-    lifecycle: { pr: { state: "none" } },
+    lifecycle: { session: { state: "working", reason: null }, pr: { state: "none" } },
   } as unknown as Session;
 }
 
@@ -38,7 +38,7 @@ function makeMergedSession(id: string, issueId: string, projectId = "proj"): Ses
     issueId,
     status: "working",
     metadata: {},
-    lifecycle: { pr: { state: "merged" } },
+    lifecycle: { session: { state: "working", reason: null }, pr: { state: "merged" } },
   } as unknown as Session;
 }
 
@@ -850,28 +850,74 @@ describe("backlog poller", () => {
     );
   });
 
-  it("re-labels a merged issue for verification after it was reopened and reworked", async () => {
-    // A verified issue (labeled agent:done) is reopened: relabelReopenedIssues
-    // returns it to the backlog and must clear the verification dedupe so when
-    // the rework merges, labelIssuesForVerification re-labels it rather than
-    // skipping it as already processed.
-    let reopenedListed = true;
-    const listIssues = vi.fn(async (filters: { labels?: string[] }) => {
-      if (filters.labels?.includes("agent:done")) {
-        return reopenedListed ? [{ ...makeIssue("42"), labels: ["agent:done"] }] : [];
-      }
-      return []; // no fresh agent:backlog work
+  it("dedupes verification labeling per session so an old merged session can't relabel reopened work", async () => {
+    // Per-session dedupe: once the OLD merged session ao-1 labels issue 42 it is
+    // deduped by session id and never re-labels — even after the issue is reopened
+    // (back in the backlog with no verification label). A NEW session ao-2 for the
+    // same issue (its rework merged) is still considered, because its session id is
+    // unseen. The tracker-state guard is isolated here (getIssue always reports no
+    // verification label) so the test exercises the per-session key, not getIssue.
+    let sessions: Session[] = [makeMergedSession("ao-1", "42")];
+    const listIssues = vi.fn(async () => []); // no agent:backlog / agent:done work
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
+    const updateIssue = vi.fn(async () => undefined);
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const kill = vi.fn(async () => ({ cleaned: true, alreadyTerminated: false }));
+    const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
+
+    const services: BacklogServices = {
+      config: {
+        projects: {
+          proj: {
+            name: "proj",
+            path: "/tmp/proj",
+            defaultBranch: "main",
+            sessionPrefix: "ao",
+            tracker: { plugin: "github" },
+          },
+        },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => sessions),
+        spawn,
+        kill,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
     });
-    // The merged session keeps issue 42 across polls; the tracker shows a
-    // verification label until the reopen relabel clears it.
-    const getIssue = vi.fn(async (id: string) => ({
-      ...makeIssue(id),
-      labels: reopenedListed ? ["agent:done"] : [],
-    }));
-    const updateIssue = vi.fn(async (_id: string, update: { labels?: string[] }) => {
-      // The reopen relabel flips tracker state: labels cleared, no longer listed.
-      if (update.labels?.includes("agent:backlog")) reopenedListed = false;
+
+    // Poll 1: ao-1 is labeled merged-unverified.
+    await poller.pollOnce();
+    expect(updateIssue).toHaveBeenCalledTimes(1);
+
+    // Reopened + reworked: a NEW merged session ao-2 appears for the same issue.
+    sessions = [makeMergedSession("ao-1", "42"), makeMergedSession("ao-2", "42")];
+    await poller.pollOnce();
+
+    // ao-1 stays deduped (no re-label); only ao-2 is labeled → exactly one more.
+    expect(updateIssue).toHaveBeenCalledTimes(2);
+    for (const call of updateIssue.mock.calls) {
+      expect(call[1]).toEqual(expect.objectContaining({ labels: ["merged-unverified"] }));
+    }
+  });
+
+  it("skips and retries verification labeling when getIssue fails transiently", async () => {
+    // getIssue failure means we can't determine authoritative state, so the
+    // update is NOT attempted (no blind labeling) and the issue is not marked
+    // processed — the next poll retries once getIssue recovers.
+    let getIssueFails = true;
+    const listIssues = vi.fn(async () => []);
+    const getIssue = vi.fn(async (id: string) => {
+      if (getIssueFails) throw new Error("tracker timeout");
+      return { ...makeIssue(id), labels: [] };
     });
+    const updateIssue = vi.fn(async () => undefined);
     const spawn = vi.fn(async () => ({ id: "spawned" }));
     const kill = vi.fn(async () => ({ cleaned: true, alreadyTerminated: false }));
     const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
@@ -903,17 +949,117 @@ describe("backlog poller", () => {
       lockPath: null,
     });
 
-    // Poll 1: issue carries agent:done → labeling skips it (processed); reopen
-    // relabel returns it to the backlog and clears the dedupe.
+    // Poll 1: getIssue throws → no update attempted.
     await poller.pollOnce();
-    // Poll 2: the (still-merged) session must be re-labeled for verification.
-    await poller.pollOnce();
+    expect(updateIssue).not.toHaveBeenCalled();
 
+    // Poll 2: getIssue recovers → the issue is labeled (not stuck as processed).
+    getIssueFails = false;
+    await poller.pollOnce();
     expect(updateIssue).toHaveBeenCalledWith(
       "42",
       expect.objectContaining({ labels: ["merged-unverified"] }),
       expect.anything(),
     );
+  });
+
+  it("falls back to maxConcurrent for the backlog cap when maxConcurrentAgents is unset", async () => {
+    // A project with maxConcurrent:1 (and no maxConcurrentAgents) must cap backlog
+    // spawns at 1, not the default 5.
+    const harness = makeHarness({
+      backlogIssues: [makeIssue("1"), makeIssue("2"), makeIssue("3")],
+    });
+    (
+      harness.services.config as unknown as { projects: Record<string, { maxConcurrent?: number }> }
+    ).projects.proj.maxConcurrent = 1;
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts merged-status workers against the backlog cap", async () => {
+    // A worker in `merged` status still has a live runtime during post-merge
+    // cleanup, so it occupies a slot. With cap 1 and one merged worker present,
+    // no new backlog worker may spawn until cleanup completes.
+    const mergedWorker = {
+      ...makeMergedSession("ao-1", "9"),
+      status: "merged",
+    } as unknown as Session;
+    const harness = makeHarness({
+      backlogIssues: [makeIssue("10")],
+      sessions: [mergedWorker],
+      maxConcurrentAgents: 1,
+    });
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.spawn).not.toHaveBeenCalled();
+  });
+
+  it("does not respawn a merged issue whose verification label update failed this cycle", async () => {
+    // The merged issue 42 kept agent:backlog (its claim-label update failed
+    // earlier). The verification-label update fails this poll too, so the issue
+    // must NOT be spawned as fresh backlog work — its PR already merged.
+    const issue = makeIssue("42"); // labels: ["agent:backlog"], no verification label
+    const listIssues = vi.fn(async (filters: { labels?: string[] }) =>
+      filters.labels?.includes("agent:backlog") ? [issue] : [],
+    );
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: ["agent:backlog"] }));
+    const updateIssue = vi.fn(async () => {
+      throw new Error("tracker write failed");
+    });
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const kill = vi.fn(async () => ({ cleaned: true, alreadyTerminated: false }));
+    const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
+
+    const services: BacklogServices = {
+      config: {
+        projects: {
+          proj: {
+            name: "proj",
+            path: "/tmp/proj",
+            defaultBranch: "main",
+            sessionPrefix: "ao",
+            tracker: { plugin: "github" },
+            maxConcurrentAgents: 5,
+          },
+        },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        // Terminal `merged` status → excluded from active workers, so only the
+        // failed-label skip set can keep issue 42 out of the spawn pass.
+        list: vi.fn(async () => [
+          { ...makeMergedSession("ao-1", "42"), status: "merged" } as unknown as Session,
+        ]),
+        spawn,
+        kill,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    // Labeling was attempted (and failed); the spawn pass must skip issue 42.
+    expect(updateIssue).toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   it("tears down a worker spawned after stop() aborted the poll", async () => {
