@@ -258,8 +258,9 @@ export async function createPlanTickets({
     // Reject malformed per-ticket repo overrides and tickets with no resolvable
     // repo up front — they are passed straight to `gh issue create --repo
     // OWNER/REPO`, so an invalid/missing value would only fail mid-run, after
-    // earlier tickets were created.
-    assertTicketReposResolvable(plan, project);
+    // earlier tickets were created. Validation is tracker-specific (GitHub limits
+    // the path to [HOST/]OWNER/REPO; GitLab allows subgroups).
+    assertTicketReposResolvable(plan, project, tracker);
     // Related links are non-directional and emulated as repo-local `#N` markers
     // on whichever ticket is created last, so a cross-repo related edge would
     // silently mislink. Reject those up front. Cross-repo *dependency* edges
@@ -268,6 +269,12 @@ export async function createPlanTickets({
     // cross-repo references. (Cross-repo *session* ordering is handled
     // separately by the dependency scheduler.)
     assertRelatedSameRepo(plan, project, byRef);
+  } else {
+    // A per-ticket `repo` override is meaningless for a workspace-scoped tracker
+    // (e.g. Linear picks the destination from tracker.teamId, not project.repo):
+    // it would mislead the approval preview while the issue is still created in
+    // the original team. Reject it rather than silently ignore it.
+    assertNoRepoOverrides(plan, tracker);
   }
 
   // Related edges are non-directional. Build a symmetric adjacency so the link
@@ -353,23 +360,40 @@ function isRepoScopedTracker(tracker: Tracker): boolean {
 }
 
 /**
+ * Validate a per-ticket repo override for the active repo-scoped tracker.
+ *
+ * GitHub's `gh issue create --repo` accepts `[HOST/]OWNER/REPO` (2 or 3 path
+ * segments). GitLab projects can live under nested subgroups
+ * (`group/subgroup/.../project`), so 2+ segments are allowed there. Anything with
+ * whitespace or an empty segment is rejected for both.
+ */
+function isValidRepoOverride(repo: string, trackerName: string): boolean {
+  if (/\s/.test(repo)) return false;
+  const segments = repo.split("/");
+  if (segments.some((s) => s.length === 0)) return false;
+  if (trackerName === "github") return segments.length === 2 || segments.length === 3;
+  return segments.length >= 2;
+}
+
+/**
  * For a repo-scoped tracker, every ticket must resolve to a valid repo before any
  * issue is created — otherwise an invalid override or a missing default repo would
  * only surface mid-run (after earlier tickets were created), leaving a partial set.
  *
- * A per-ticket `repo` override must be an `OWNER/REPO` path (optionally with a host
- * or GitLab subgroups) — it is passed straight to `gh issue create --repo`. A
+ * A per-ticket `repo` override must be a valid path for the tracker (see
+ * `isValidRepoOverride`); it is passed straight to `gh issue create --repo`. A
  * ticket without an override falls back to `project.repo`, which must exist.
  */
-function assertTicketReposResolvable(plan: Plan, project: ProjectConfig): void {
+function assertTicketReposResolvable(plan: Plan, project: ProjectConfig, tracker: Tracker): void {
   for (const ticket of plan.tickets) {
     const override = ticket.repo;
     if (override !== undefined) {
-      const segments = override.split("/");
-      if (/\s/.test(override) || segments.length < 2 || segments.some((s) => s.length === 0)) {
+      if (!isValidRepoOverride(override, tracker.name)) {
+        const shape =
+          tracker.name === "github" ? "[HOST/]OWNER/REPO" : "OWNER/REPO (subgroups allowed)";
         throw new PlanValidationError(
-          `Ticket "${ticket.ref}" has an invalid repo override "${override}". ` +
-            `Use an OWNER/REPO path (e.g. "acme/api").`,
+          `Ticket "${ticket.ref}" has an invalid repo override "${override}" for the ${tracker.name} tracker. ` +
+            `Use a ${shape} path (e.g. "acme/api").`,
         );
       }
       continue;
@@ -378,6 +402,24 @@ function assertTicketReposResolvable(plan: Plan, project: ProjectConfig): void {
       throw new PlanValidationError(
         `Ticket "${ticket.ref}" has no repo and the project has no default repo. ` +
           `Add a 'repo' to the project config or set a per-ticket repo override.`,
+      );
+    }
+  }
+}
+
+/**
+ * Reject per-ticket `repo` overrides for a non-repo-scoped tracker (e.g. Linear),
+ * where the override changes nothing about where the issue is created — Linear
+ * resolves the destination from `tracker.teamId`. Silently honoring it would let
+ * the approval preview show a different target than what is actually created.
+ */
+function assertNoRepoOverrides(plan: Plan, tracker: Tracker): void {
+  for (const ticket of plan.tickets) {
+    if (ticket.repo !== undefined) {
+      throw new PlanValidationError(
+        `Ticket "${ticket.ref}" sets a repo override "${ticket.repo}", but the ${tracker.name} tracker ` +
+          `is not repo-scoped — issues are created in the project's configured team/workspace, so the ` +
+          `override has no effect. Remove it (or plan against the AO project that targets that repo).`,
       );
     }
   }
@@ -585,8 +627,13 @@ async function spawnCaptured(
       else stderr += next;
 
       if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) <= maxBuffer) return;
-      void terminateChild();
-      finish(() => fail(`Command output exceeded maxBuffer ${maxBuffer}`));
+      // Mirror the timeout path: settle only after the child-tree teardown
+      // resolves, so a caller that exits immediately (e.g. CLI process.exit(1))
+      // doesn't leave the async Windows `taskkill /T` mid-flight with the tree
+      // still running.
+      void terminateChild().finally(() => {
+        finish(() => fail(`Command output exceeded maxBuffer ${maxBuffer}`));
+      });
     };
 
     child.stdout?.on("data", (chunk: Buffer) => append("stdout", chunk));
@@ -799,6 +846,9 @@ export function createShellPlanRunner(command: string): PlanRunner {
       cwd: context.project.path,
       timeout: DECOMPOSER_TIMEOUT_MS,
       maxBuffer: DECOMPOSER_MAX_BUFFER,
+      // Deliver the decomposer prompt on stdin so a custom command can actually
+      // read the goal/context, rather than seeing EOF and producing a generic plan.
+      input: buildDecomposerPrompt(context),
     });
     return { rawOutput: stdout.trim() || stderr.trim() };
   };

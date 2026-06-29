@@ -222,16 +222,57 @@ describe("createPlanTickets", () => {
 
   it("does not repo-qualify dependency ids for non-repo-scoped trackers (Linear)", async () => {
     const { tracker, calls } = makeMockTracker("linear");
-    // Even with differing repo overrides, a Linear blocker stays a bare,
-    // globally-resolvable identifier — qualifying it would break Linear's lookup.
+    // A Linear blocker stays a bare, globally-resolvable identifier — qualifying
+    // it would break Linear's lookup.
     const p = plan([
-      { ref: "api", title: "API", body: "", repo: "acme/api" },
+      { ref: "api", title: "API", body: "" },
       { ref: "web", title: "Web", body: "", blockedByRefs: ["api"] },
     ]);
 
     await createPlanTickets({ plan: p, tracker, project: baseProject });
 
-    expect(calls[1].input.blockedBy).toEqual(["1"]); // bare, not "acme/api#1"
+    expect(calls[1].input.blockedBy).toEqual(["1"]); // bare, not "acme/app#1"
+  });
+
+  it("rejects per-ticket repo overrides for non-repo-scoped trackers (Linear)", async () => {
+    const { tracker, calls } = makeMockTracker("linear");
+    // A repo override is meaningless for Linear (destination comes from teamId),
+    // so it must be rejected rather than silently ignored.
+    const p = plan([
+      { ref: "api", title: "API", body: "", repo: "acme/api" },
+      { ref: "web", title: "Web", body: "" },
+    ]);
+
+    await expect(
+      createPlanTickets({ plan: p, tracker, project: baseProject }),
+    ).rejects.toThrow(/not repo-scoped/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects a GitHub repo override with too many path segments", async () => {
+    const { tracker, calls } = makeMockTracker("github");
+    // gh --repo accepts [HOST/]OWNER/REPO; a GitLab-style subgroup path is invalid.
+    const p = plan([
+      { ref: "t1", title: "A", body: "" },
+      { ref: "t2", title: "B", body: "", repo: "org/team/api/worker" },
+    ]);
+
+    await expect(
+      createPlanTickets({ plan: p, tracker, project: baseProject }),
+    ).rejects.toThrow(/invalid repo override/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("accepts a GitLab subgroup repo override path", async () => {
+    const { tracker, calls } = makeMockTracker("gitlab");
+    const p = plan([
+      { ref: "t1", title: "A", body: "", repo: "group/subgroup/project" },
+      { ref: "t2", title: "B", body: "" },
+    ]);
+
+    await createPlanTickets({ plan: p, tracker, project: baseProject });
+
+    expect(calls[0].repo).toBe("group/subgroup/project");
   });
 
   it("rejects an invalid per-ticket repo override before creating anything", async () => {

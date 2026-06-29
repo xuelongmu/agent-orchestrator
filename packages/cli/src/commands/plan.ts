@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Command } from "commander";
 import {
+  ConfigNotFoundError,
   createPlanTickets,
   decomposeGoal,
   getGlobalConfigPath,
@@ -137,11 +138,26 @@ export function registerPlan(program: Command): void {
         goal: string,
         opts: { project?: string; yes?: boolean; json?: boolean },
       ) => {
-        let config: OrchestratorConfig = loadConfig();
+        let config: OrchestratorConfig;
+        try {
+          config = loadConfig();
+        } catch (err) {
+          // No local `agent-orchestrator.yaml` in this dir. An explicit
+          // `--project` can still be honored from the global registry — that's the
+          // point of running `ao plan --project foo` from an arbitrary shell.
+          const globalConfig =
+            opts.project && err instanceof ConfigNotFoundError ? loadGlobalProjects() : null;
+          if (globalConfig?.projects[opts.project as string]) {
+            config = globalConfig;
+          } else {
+            console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+            process.exit(1);
+          }
+        }
 
-        // An explicit `--project` may name a project the local config doesn't
-        // know about (loadConfig stops at the nearest flat config, which lists
-        // only one project). Fall back to the global registry so a requested
+        // An explicit `--project` may also name a project the *local* config
+        // doesn't know about (loadConfig stops at the nearest flat config, which
+        // lists only one project). Fall back to the global registry so a requested
         // project registered elsewhere is still resolved instead of rejected.
         if (opts.project && !config.projects[opts.project]) {
           const globalConfig = loadGlobalProjects();

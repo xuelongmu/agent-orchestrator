@@ -109,7 +109,7 @@ describe("isDependencySatisfied", () => {
     // qualified repo comes from the issue's project repo, not from PR repos.
     const crossRepo = collectSatisfiedDependencies(
       [makeSession({ id: "api-1", projectId: "api", issueId: "5", prMerged: true })],
-      (projectId) => (projectId === "api" ? "acme/api" : undefined),
+      (projectId) => (projectId === "api" ? { repo: "acme/api" } : undefined),
     );
     expect(isDependencySatisfied("acme/api#5", "web", crossRepo)).toBe(true);
     expect(isDependencySatisfied("acme/api#5", "anything", crossRepo)).toBe(true);
@@ -117,7 +117,7 @@ describe("isDependencySatisfied", () => {
     expect(isDependencySatisfied("acme/other#5", "web", crossRepo)).toBe(false);
   });
 
-  it("does not register repo-qualified ids without a project-repo resolver", () => {
+  it("does not register repo-qualified ids without a project-info resolver", () => {
     // Without the resolver (the issue's repo is unknown), a cross-repo ref can't
     // be claimed satisfied — better unresolved than wrongly unblocking.
     const noRepo = collectSatisfiedDependencies([
@@ -126,19 +126,23 @@ describe("isDependencySatisfied", () => {
     expect(isDependencySatisfied("acme/api#5", "web", noRepo)).toBe(false);
   });
 
-  it("matches a workspace-scoped key (Linear) from any project (globally unique)", () => {
-    // Linear keys carry a team prefix and are globally unique, so a bare "ENG-1"
-    // blocker must resolve a dependent in another AO project once A merges.
-    const linear = collectSatisfiedDependencies([
-      makeSession({ id: "api-1", projectId: "api", issueId: "ENG-1", prMerged: true }),
-    ]);
+  it("globally satisfies issue ids only for workspace-scoped trackers", () => {
+    // A Linear (workspace-scoped) key resolves a dependent in any project.
+    const linear = collectSatisfiedDependencies(
+      [makeSession({ id: "api-1", projectId: "api", issueId: "ENG-1", prMerged: true })],
+      () => ({ workspaceScopedTracker: true }),
+    );
     expect(isDependencySatisfied("ENG-1", "web", linear)).toBe(true);
     expect(isDependencySatisfied("#ENG-1", "web", linear)).toBe(true); // # sugar
-    // A bare numeric id stays repo/project-local and must not match globally.
-    const numeric = collectSatisfiedDependencies([
-      makeSession({ id: "b-1", projectId: "backend", issueId: "7", prMerged: true }),
-    ]);
-    expect(isDependencySatisfied("7", "frontend", numeric)).toBe(false);
+
+    // The SAME non-numeric id from a repo-scoped project (e.g. an ad-hoc/unknown
+    // issue string) must NOT go global — it stays project-local.
+    const repoScoped = collectSatisfiedDependencies(
+      [makeSession({ id: "b-1", projectId: "backend", issueId: "ENG-1", prMerged: true })],
+      () => ({ repo: "acme/backend", workspaceScopedTracker: false }),
+    );
+    expect(isDependencySatisfied("ENG-1", "frontend", repoScoped)).toBe(false);
+    expect(isDependencySatisfied("ENG-1", "backend", repoScoped)).toBe(true); // same project
   });
 });
 

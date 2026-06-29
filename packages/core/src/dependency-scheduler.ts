@@ -48,12 +48,14 @@ export function isPrerequisiteSatisfied(session: Session): boolean {
  *    globally unique, so — like a session id — it may satisfy a dependent in
  *    **any** project. `ao plan` emits cross-repo blockers in this form, so this
  *    is what lets an ordered multi-repo plan actually unblock across repos.
- *  - `globalIssueIds`: workspace-scoped tracker keys (e.g. Linear's "ENG-1") are
- *    globally unique across the workspace — unlike repo-scoped issue numbers,
- *    they carry a team prefix — so they may satisfy a dependent in **any**
- *    project. They are recognized by being non-numeric (GitHub/GitLab ids are
- *    bare numbers); `ao plan` emits cross-project Linear blockers as bare keys,
- *    so this is what lets a multi-project Linear plan unblock across projects.
+ *  - `globalIssueIds`: keys from workspace-scoped trackers (e.g. Linear's
+ *    "ENG-1") are globally unique across the workspace, so they may satisfy a
+ *    dependent in **any** project. Membership is decided by the owning project's
+ *    tracker type (`projectInfo.workspaceScopedTracker`), NOT by the shape of the
+ *    id — a repo-scoped project's ad-hoc/non-numeric `issueId` must stay
+ *    project-local so it can't satisfy an unrelated blocker elsewhere. `ao plan`
+ *    emits cross-project Linear blockers as bare keys, so this lets a
+ *    multi-project Linear plan unblock across projects.
  */
 export interface SatisfiedDependencies {
   sessionIds: Set<string>;
@@ -62,30 +64,27 @@ export interface SatisfiedDependencies {
   globalIssueIds: Set<string>;
 }
 
-/**
- * True for a workspace-scoped tracker key (e.g. Linear's "ENG-1"): globally
- * unique because it carries a non-numeric team prefix. Repo-scoped GitHub/GitLab
- * issue ids are bare numbers and are NOT globally unique. `id` is expected to be
- * already normalized (lowercased, leading "#"/repo prefix removed).
- */
-function isWorkspaceScopedIssueId(id: string): boolean {
-  return id.length > 0 && !/^\d+$/.test(id);
+/** Per-project facts the scheduler needs to qualify a merged issue id. */
+export interface ProjectDependencyInfo {
+  /** The project's "owner/repo" path (repo-scoped trackers only). */
+  repo?: string;
+  /** True when the project's tracker uses globally-unique keys (e.g. Linear). */
+  workspaceScopedTracker?: boolean;
 }
 
 /**
  * Collect the satisfied dependency identifiers from merged sessions.
  *
- * `projectRepo` maps a session's project id to that project's `owner/repo` (the
- * repo the tracker issue lives in). It is used only to build the globally-unique
- * `owner/repo#N` form. We deliberately key on the issue's *project repo*, not on
- * every repo the session opened a PR in: an issue number is repo-local, so an
- * auxiliary PR a session opened in another repo must not register that repo's
- * `repo#N` as satisfied (it would wrongly unblock a dependent on a different
- * issue N in that other repo).
+ * `projectInfo` maps a session's project id to its repo + tracker scope. The repo
+ * is used to build the globally-unique `owner/repo#N` form — keyed on the issue's
+ * *project repo*, not on every repo the session opened a PR in, since an issue
+ * number is repo-local and an auxiliary cross-repo PR must not register that
+ * repo's `repo#N`. The tracker scope decides whether the bare issue id is
+ * globally unique (Linear) or must stay project-local (GitHub/GitLab).
  */
 export function collectSatisfiedDependencies(
   sessions: Session[],
-  projectRepo?: (projectId: string) => string | undefined,
+  projectInfo?: (projectId: string) => ProjectDependencyInfo | undefined,
 ): SatisfiedDependencies {
   const sessionIds = new Set<string>();
   const issueIdsByProject = new Map<string, Set<string>>();
@@ -104,13 +103,11 @@ export function collectSatisfiedDependencies(
           issueIdsByProject.set(session.projectId, perProject);
         }
         perProject.add(issueId);
-        if (isWorkspaceScopedIssueId(issueId)) {
+        const info = projectInfo?.(session.projectId);
+        if (info?.workspaceScopedTracker) {
           globalIssueIds.add(issueId);
-        } else {
-          const repo = projectRepo?.(session.projectId);
-          if (repo) {
-            repoQualifiedIssueIds.add(normalizeDependencyId(`${repo}#${issueId}`));
-          }
+        } else if (info?.repo) {
+          repoQualifiedIssueIds.add(normalizeDependencyId(`${info.repo}#${issueId}`));
         }
       }
     }
@@ -135,9 +132,10 @@ export function isDependencySatisfied(
   if (normalized.includes("/")) {
     return satisfied.repoQualifiedIssueIds.has(normalized);
   }
-  if (isWorkspaceScopedIssueId(normalized)) {
-    return satisfied.globalIssueIds.has(normalized);
-  }
+  // A workspace-scoped key (Linear) is satisfiable from any project; otherwise a
+  // bare id falls back to same-project matching only. globalIssueIds and
+  // issueIdsByProject are disjoint by construction, so checking both is safe.
+  if (satisfied.globalIssueIds.has(normalized)) return true;
   return satisfied.issueIdsByProject.get(projectId)?.has(normalized) ?? false;
 }
 
