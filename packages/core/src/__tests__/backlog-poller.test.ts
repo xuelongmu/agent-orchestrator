@@ -1062,6 +1062,61 @@ describe("backlog poller", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  it("skips a merged-but-unlabeled issue across sibling projects sharing a tracker", async () => {
+    // projA's merged session for issue 42 fails its verification-label update, so
+    // 42 keeps agent:backlog. projB shares the tracker/repo and lists 42 too — it
+    // must NOT spawn a fresh worker for already-merged work. The skip is keyed by
+    // canonical issue URL, so it spans projects (a bare projectId:issueId key
+    // would let projB through).
+    const issue = makeIssue("42");
+    const listIssues = vi.fn(async (filters: { labels?: string[] }) =>
+      filters.labels?.includes("agent:backlog") ? [issue] : [],
+    );
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: ["agent:backlog"] }));
+    const updateIssue = vi.fn(async () => {
+      throw new Error("tracker write failed");
+    });
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const kill = vi.fn(async () => ({ cleaned: true, alreadyTerminated: false }));
+    const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
+
+    const project = (name: string, prefix: string) => ({
+      name,
+      path: `/tmp/${name}`,
+      defaultBranch: "main",
+      sessionPrefix: prefix,
+      tracker: { plugin: "github" },
+    });
+    const services: BacklogServices = {
+      config: {
+        projects: { projA: project("projA", "a"), projB: project("projB", "b") },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        // Terminal `merged` status → excluded from active workers (not in
+        // takenIssueUrls), so only the URL-keyed failed-label skip guards projB.
+        list: vi.fn(async () => [
+          { ...makeMergedSession("a-1", "42", "projA"), status: "merged" } as unknown as Session,
+        ]),
+        spawn,
+        kill,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(updateIssue).toHaveBeenCalled();
+    // Neither projA (id key) nor projB (URL key) spawns for the merged issue.
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("tears down a worker spawned after stop() aborted the poll", async () => {
     // SIGTERM aborts the poll while a spawn is already in flight. Aborting can't
     // cancel that spawn, so when it settles the poll must tear down the worker it

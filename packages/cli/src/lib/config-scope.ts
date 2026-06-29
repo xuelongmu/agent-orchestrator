@@ -29,9 +29,11 @@
 
 import { dirname, isAbsolute, resolve } from "node:path";
 import {
+  EVENT_PRIORITIES,
   generateSessionPrefix,
   getGlobalConfigPath,
   loadConfig,
+  type EventPriority,
   type ExternalPluginEntryRef,
   type InstalledPluginConfig,
   type OrchestratorConfig,
@@ -45,6 +47,30 @@ function isMissingGlobalConfig(error: unknown, globalConfigPath: string): boolea
     (error as NodeJS.ErrnoException).code === "ENOENT" &&
     (error as Error & { path?: string }).path === globalConfigPath
   );
+}
+
+/**
+ * Build the COMPLETE per-priority notification routing for a carried startup-only
+ * project. Precedence per priority: explicit per-project route → startup
+ * top-level route → startup `defaults.notifiers`. Filling every priority means
+ * the lifecycle manager's per-project lookup always resolves to the startup
+ * project's own notifiers instead of falling through to the merged/global
+ * `defaults.notifiers` — the case where a startup project relies on default
+ * notifiers rather than an explicit `notificationRouting`.
+ */
+function bakeStartupNotificationRouting(
+  project: ProjectConfig,
+  startupConfig: OrchestratorConfig,
+): Record<EventPriority, string[]> {
+  const projectRouting: Partial<Record<EventPriority, string[]>> = project.notificationRouting ?? {};
+  const topRouting: Partial<Record<EventPriority, string[]>> =
+    startupConfig.notificationRouting ?? {};
+  const defaultNotifiers = startupConfig.defaults?.notifiers ?? [];
+  const routing = {} as Record<EventPriority, string[]>;
+  for (const priority of EVENT_PRIORITIES) {
+    routing[priority] = projectRouting[priority] ?? topRouting[priority] ?? defaultNotifiers;
+  }
+  return routing;
 }
 
 /**
@@ -90,7 +116,7 @@ function bakeStartupOnlyProject(
     worker: { ...project.worker, agent: workerAgent },
     orchestrator: { ...project.orchestrator, agent: orchestratorAgent },
     ...(reactions ? { reactions } : {}),
-    notificationRouting: project.notificationRouting ?? startupConfig.notificationRouting,
+    notificationRouting: bakeStartupNotificationRouting(project, startupConfig),
     lifecycle: project.lifecycle ?? startupConfig.lifecycle,
     budget: project.budget ?? startupConfig.budget,
     sourceConfigPath: project.sourceConfigPath ?? startupConfig.configPath,
@@ -122,24 +148,24 @@ function pluginIdentityKey(plugin: InstalledPluginConfig): string {
   return `${plugin.source}:${plugin.package ?? plugin.name}`;
 }
 
-/** Append startup plugin declarations, deduped by implementation identity
- *  (source + path/package) against the ENABLED global plugins, and absolutizing
- *  any relative local `path` against the startup config dir. Deduping by name
- *  alone would drop a startup plugin whose global namesake is disabled or points
- *  at a different package/path, leaving a carried startup-only project unable to
- *  resolve its tracker/agent/workspace. */
+/** Append startup plugin declarations, absolutizing any relative local `path`
+ *  against the startup config dir, with two guards against the registry's
+ *  `slot:name` instance keying:
+ *   - dedupe by implementation identity (source + path/package) against ENABLED
+ *     global plugins, so a redundant re-declaration is skipped (but a startup
+ *     plugin whose global namesake is DISABLED is still carried so it loads);
+ *   - reject a same-NAME / different-identity collision against an enabled global
+ *     plugin — keeping both would have the startup plugin silently overwrite the
+ *     global implementation for registered projects, so fail loudly instead. */
 function mergeInstalledPlugins(
   globalPlugins: InstalledPluginConfig[] | undefined,
   startupPlugins: InstalledPluginConfig[] | undefined,
   startupConfigPath: string,
 ): InstalledPluginConfig[] | undefined {
   if (!startupPlugins?.length) return globalPlugins;
-  // Only an ENABLED global entry with the same identity makes a startup
-  // declaration redundant — a disabled global entry would be skipped by the
-  // registry, so the startup one must still be carried to actually load.
-  const seen = new Set(
-    (globalPlugins ?? []).filter((p) => p.enabled !== false).map(pluginIdentityKey),
-  );
+  const enabledGlobal = (globalPlugins ?? []).filter((p) => p.enabled !== false);
+  const seenIdentity = new Set(enabledGlobal.map(pluginIdentityKey));
+  const enabledGlobalByName = new Map(enabledGlobal.map((p) => [p.name, p] as const));
   const merged = [...(globalPlugins ?? [])];
   for (const plugin of startupPlugins) {
     const baked =
@@ -147,8 +173,17 @@ function mergeInstalledPlugins(
         ? { ...plugin, path: absolutizeLocalPluginPath(plugin.path, startupConfigPath) }
         : plugin;
     const key = pluginIdentityKey(baked);
-    if (seen.has(key)) continue;
-    seen.add(key);
+    if (seenIdentity.has(key)) continue; // Same implementation already present (enabled).
+    const collidingGlobal = enabledGlobalByName.get(baked.name);
+    if (collidingGlobal) {
+      throw new Error(
+        `Plugin name collision in merged scope: plugin "${baked.name}" is declared by both ` +
+          `the global config (${pluginIdentityKey(collidingGlobal)}) and the startup config ` +
+          `(${key}). They map to the same registry slot and would overwrite each other. ` +
+          `Rename one of the plugins before launching ao start.`,
+      );
+    }
+    seenIdentity.add(key);
     merged.push(baked);
   }
   return merged;
@@ -300,17 +335,36 @@ function mergeScopeProjects(
 /**
  * Load the config spanning both the global registry and the config that started
  * this `ao start` process. Falls back to the startup config alone when no global
- * config exists (first-run `ao start <url>` / `<path>`).
+ * config exists (first-run `ao start <url>` / `<path>`), and to the global config
+ * alone when the startup config has disappeared/become unreadable at runtime.
+ *
+ * The global config is loaded FIRST: if the startup config was removed while the
+ * daemon runs, the backlog poller must keep polling every registered project and
+ * the SIGINT shutdown path must still enumerate/kill sessions and write
+ * last-stop — eagerly loading the (now-missing) startup config first would throw
+ * and break both.
  */
 export function loadMergedScopeConfig(startupConfigPath: string): OrchestratorConfig {
-  const startupConfig = loadConfig(startupConfigPath);
   const globalConfigPath = getGlobalConfigPath();
-  let globalConfig: OrchestratorConfig;
+  let globalConfig: OrchestratorConfig | undefined;
   try {
     globalConfig = loadConfig(globalConfigPath);
   } catch (error) {
-    if (isMissingGlobalConfig(error, globalConfigPath)) return startupConfig;
-    throw error;
+    // A missing global config is fine (first-run startup-only). Any other error
+    // (corrupt global) is fatal — the global registry is the merge base.
+    if (!isMissingGlobalConfig(error, globalConfigPath)) throw error;
   }
+
+  let startupConfig: OrchestratorConfig;
+  try {
+    startupConfig = loadConfig(startupConfigPath);
+  } catch (error) {
+    // Startup config removed/unreadable at runtime: keep the daemon working over
+    // the registered projects rather than failing the whole poller/shutdown path.
+    if (globalConfig) return globalConfig;
+    throw error; // Neither config available — genuine failure.
+  }
+
+  if (!globalConfig) return startupConfig;
   return mergeScopeProjects(globalConfig, startupConfig);
 }

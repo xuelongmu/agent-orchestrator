@@ -309,4 +309,32 @@ projects:
     });
 
   });
+
+  describe("project-scoped lifecycle overrides", () => {
+    it("preserves per-project notificationRouting and lifecycle from YAML", () => {
+      const configPath = join(testDir, "agent-orchestrator.yaml");
+      writeFileSync(
+        configPath,
+        [
+          "projects:",
+          "  app:",
+          "    path: /a/app",
+          "    defaultBranch: main",
+          "    sessionPrefix: app",
+          "    notificationRouting:",
+          "      action:",
+          "        - slack",
+          "    lifecycle:",
+          "      autoCleanupOnMerge: false",
+          "",
+        ].join("\n"),
+      );
+
+      const config = loadConfig(configPath);
+
+      // These project-level overrides must survive Zod parsing (not be stripped).
+      expect(config.projects.app.notificationRouting).toEqual({ action: ["slack"] });
+      expect(config.projects.app.lifecycle?.autoCleanupOnMerge).toBe(false);
+    });
+  });
 });

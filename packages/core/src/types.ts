@@ -1294,6 +1294,9 @@ export interface Terminal {
 /** Priority levels for events — determines notification routing */
 export type EventPriority = "urgent" | "action" | "warning" | "info";
 
+/** All event priorities, for iterating routing maps. Keep in sync with {@link EventPriority}. */
+export const EVENT_PRIORITIES: readonly EventPriority[] = ["urgent", "action", "warning", "info"];
+
 /** All orchestrator event types */
 export type EventType =
   // Session lifecycle

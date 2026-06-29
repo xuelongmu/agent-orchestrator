@@ -247,11 +247,13 @@ function getMaxConcurrentAgents(project: ProjectConfig): number {
  * stale session or block the rework). `processedIssues` is mutated to avoid
  * repeated API calls within a process.
  *
- * Returns the set of `${projectId}:${issueId.toLowerCase()}` keys whose merged
- * session could NOT be transitioned this cycle (label update failed while the
- * issue may still carry `agent:backlog`). The caller passes these to
- * `spawnFromBacklog` so it won't spawn a fresh worker for already-merged work
- * before the next poll retries the label.
+ * Returns the set of keys whose merged session could NOT be transitioned this
+ * cycle (label update failed while the issue may still carry `agent:backlog`).
+ * Each such issue is recorded under BOTH its per-project `${projectId}:${issueId}`
+ * key AND its tracker-wide canonical issue URL (when available), so a sibling
+ * project pointing at the same tracker/repo also skips it. The caller passes
+ * these to `spawnFromBacklog` so it won't spawn a fresh worker for already-merged
+ * work before the next poll retries the label.
  */
 async function labelIssuesForVerification(
   sessions: Session[],
@@ -288,6 +290,22 @@ async function labelIssuesForVerification(
       continue;
     }
 
+    // Tracker-wide canonical URL for this issue (matches the key `spawnFromBacklog`
+    // builds for active workers), so a merged-but-unlabeled issue is skipped by
+    // EVERY project sharing this tracker/repo, not just the one that owns it.
+    let canonicalIssueUrl: string | undefined;
+    if (tracker.issueUrl) {
+      try {
+        canonicalIssueUrl = tracker.issueUrl(issueId, project);
+      } catch {
+        // URL construction failed — the per-project id key still guards this project.
+      }
+    }
+    const markUnlabeled = (): void => {
+      unlabeledMergedIssues.add(issueKey);
+      if (canonicalIssueUrl) unlabeledMergedIssues.add(canonicalIssueUrl);
+    };
+
     // Consult the tracker's authoritative state before (re-)labeling. This
     // guards two cases: a peer poller process may have already labeled the
     // issue (our in-memory `processedIssues` set is per-process), and after a
@@ -302,7 +320,7 @@ async function labelIssuesForVerification(
       // verified). Skip and retry next poll rather than updating blindly. Don't
       // mark processed, and keep the issue out of this cycle's spawn pass.
       logger?.error?.(`[backlog] getIssue failed for ${session.issueId}; will retry:`, err);
-      unlabeledMergedIssues.add(issueKey);
+      markUnlabeled();
       continue;
     }
 
@@ -345,7 +363,7 @@ async function labelIssuesForVerification(
       // `agent:backlog`. Keep it out of this cycle's spawn pass so we don't
       // launch a fresh worker for work whose PR already merged; the next poll
       // retries the label (the dedupe slot was intentionally left unconsumed).
-      unlabeledMergedIssues.add(issueKey);
+      markUnlabeled();
     }
   }
 
@@ -531,6 +549,7 @@ async function spawnFromBacklog(
       VERIFICATION_LABELS.some((label) => issue.labels.includes(label)) ||
       activeIssueIds.has(issue.id.toLowerCase()) ||
       takenIssueUrls.has(canonicalUrlFor(issue)) ||
+      unlabeledMergedIssues.has(canonicalUrlFor(issue)) ||
       unlabeledMergedIssues.has(`${projectId}:${issue.id.toLowerCase()}`);
 
     // Fetch the backlog, growing the page while it stays saturated with issues
