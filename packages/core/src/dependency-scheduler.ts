@@ -55,8 +55,21 @@ export interface SatisfiedDependencies {
   repoQualifiedIssueIds: Set<string>;
 }
 
-/** Collect the satisfied dependency identifiers from merged sessions. */
-export function collectSatisfiedDependencies(sessions: Session[]): SatisfiedDependencies {
+/**
+ * Collect the satisfied dependency identifiers from merged sessions.
+ *
+ * `projectRepo` maps a session's project id to that project's `owner/repo` (the
+ * repo the tracker issue lives in). It is used only to build the globally-unique
+ * `owner/repo#N` form. We deliberately key on the issue's *project repo*, not on
+ * every repo the session opened a PR in: an issue number is repo-local, so an
+ * auxiliary PR a session opened in another repo must not register that repo's
+ * `repo#N` as satisfied (it would wrongly unblock a dependent on a different
+ * issue N in that other repo).
+ */
+export function collectSatisfiedDependencies(
+  sessions: Session[],
+  projectRepo?: (projectId: string) => string | undefined,
+): SatisfiedDependencies {
   const sessionIds = new Set<string>();
   const issueIdsByProject = new Map<string, Set<string>>();
   const repoQualifiedIssueIds = new Set<string>();
@@ -73,13 +86,9 @@ export function collectSatisfiedDependencies(sessions: Session[]): SatisfiedDepe
           issueIdsByProject.set(session.projectId, perProject);
         }
         perProject.add(issueId);
-        // Index the issue under each repo the session opened a PR in, as the
-        // globally-unique "owner/repo#N" form, so a cross-repo dependent stored
-        // in that form can resolve it.
-        for (const pr of session.prs) {
-          if (pr.owner && pr.repo) {
-            repoQualifiedIssueIds.add(normalizeDependencyId(`${pr.owner}/${pr.repo}#${issueId}`));
-          }
+        const repo = projectRepo?.(session.projectId);
+        if (repo) {
+          repoQualifiedIssueIds.add(normalizeDependencyId(`${repo}#${issueId}`));
         }
       }
     }

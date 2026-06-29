@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { getShell, isWindows, killProcessTree } from "./platform.js";
+import { shellEscape } from "./utils.js";
 import type { CreateIssueInput, Issue, ProjectConfig, Tracker } from "./types.js";
 
 const DECOMPOSER_TIMEOUT_MS = 10 * 60_000;
@@ -246,14 +247,27 @@ export async function createPlanTickets({
   // tickets would be created before resolveDep throws, leaving a partial set.
   validatePlanGraph(plan);
 
+  // Repo-scoped trackers (GitHub/GitLab) key issues and relations by an
+  // `owner/repo` path; workspace-scoped trackers (Linear) use globally-unique
+  // identifiers like `ENG-1`. The per-ticket `repo` override, OWNER/REPO
+  // validation, and cross-repo qualification only make sense for the former.
+  const repoScoped = isRepoScopedTracker(tracker);
+
   const byRef = new Map(plan.tickets.map((t) => [t.ref, t]));
-  // Related links are non-directional and emulated as repo-local `#N` markers in
-  // whichever ticket is created last, so a cross-repo related edge would silently
-  // mislink. Reject those up front. Cross-repo *dependency* edges (parent/blocker)
-  // are allowed — they are emitted as repo-qualified `owner/repo#N` references
-  // below, which the trackers render as real cross-repo references. (Cross-repo
-  // *session* ordering is handled separately by the dependency scheduler.)
-  assertRelatedSameRepo(plan, project, byRef);
+  if (repoScoped) {
+    // Reject malformed per-ticket repo overrides up front — they are passed
+    // straight to `gh issue create --repo OWNER/REPO`, so an invalid value
+    // (e.g. "api") would only fail mid-run, after earlier tickets were created.
+    assertValidRepoOverrides(plan);
+    // Related links are non-directional and emulated as repo-local `#N` markers
+    // on whichever ticket is created last, so a cross-repo related edge would
+    // silently mislink. Reject those up front. Cross-repo *dependency* edges
+    // (parent/blocker) are allowed — they are emitted as repo-qualified
+    // `owner/repo#N` references below, which the trackers render as real
+    // cross-repo references. (Cross-repo *session* ordering is handled
+    // separately by the dependency scheduler.)
+    assertRelatedSameRepo(plan, project, byRef);
+  }
 
   // Related edges are non-directional. Build a symmetric adjacency so the link
   // is recorded on whichever side of the pair is created last (topological
@@ -265,17 +279,21 @@ export async function createPlanTickets({
   const created: CreatedTicket[] = [];
 
   // Resolve a dependency ref to the identifier embedded in `from`'s issue body.
-  // A cross-repo dependency is qualified as "owner/repo#N" so the tracker renders
-  // a real cross-repo reference instead of a repo-local "#N" that would mislink to
-  // the wrong issue; same-repo dependencies stay bare numbers. The qualified form
-  // is globally unique, so the dependency scheduler resolves it across projects
-  // (see isDependencySatisfied) — a bare cross-repo "#N" never would.
+  // On a repo-scoped tracker a cross-repo dependency is qualified as
+  // "owner/repo#N" so the tracker renders a real cross-repo reference instead of
+  // a repo-local "#N" that would mislink; same-repo deps stay bare numbers. The
+  // qualified form is globally unique, so the dependency scheduler resolves it
+  // across projects (see isDependencySatisfied) — a bare cross-repo "#N" never
+  // would. Workspace-scoped trackers (Linear) resolve identifiers like "ENG-1"
+  // globally already, so qualifying them would break the blocker lookup — those
+  // always stay bare.
   const resolveDep = (ref: string, from: PlannedTicket): string => {
     const issue = refToIssue.get(ref);
     if (!issue) {
       // Topological order guarantees parent/blocker dependencies exist first.
       throw new Error(`Internal error: ref "${ref}" was not created before being referenced.`);
     }
+    if (!repoScoped) return issue.id;
     const fromRepo = effectiveRepo(from, project);
     const depTicket = byRef.get(ref);
     const depRepo = depTicket ? effectiveRepo(depTicket, project) : undefined;
@@ -321,6 +339,36 @@ export async function createPlanTickets({
 /** Effective repo of a ticket: its override, else the project default. */
 function effectiveRepo(ticket: PlannedTicket, project: ProjectConfig): string | undefined {
   return ticket.repo ?? project.repo;
+}
+
+/**
+ * True for trackers whose issues live in an `owner/repo` (GitHub) or
+ * `group/.../project` (GitLab) path — where the per-ticket `repo` override and
+ * `owner/repo#N` cross-repo qualification apply. Linear and other
+ * workspace-scoped trackers use globally-unique identifiers and are excluded.
+ */
+function isRepoScopedTracker(tracker: Tracker): boolean {
+  return tracker.name === "github" || tracker.name === "gitlab";
+}
+
+/**
+ * A per-ticket `repo` override must be an `OWNER/REPO` path (optionally with a
+ * host or GitLab subgroups) — it is passed straight to `gh issue create --repo`.
+ * Reject malformed values (e.g. "api", or anything with whitespace) before any
+ * issue is created, so an invalid override can't leave a partial ticket set.
+ */
+function assertValidRepoOverrides(plan: Plan): void {
+  for (const ticket of plan.tickets) {
+    const repo = ticket.repo;
+    if (repo === undefined) continue;
+    const segments = repo.split("/");
+    if (/\s/.test(repo) || segments.length < 2 || segments.some((s) => s.length === 0)) {
+      throw new PlanValidationError(
+        `Ticket "${ticket.ref}" has an invalid repo override "${repo}". ` +
+          `Use an OWNER/REPO path (e.g. "acme/api").`,
+      );
+    }
+  }
 }
 
 /**
@@ -545,6 +593,43 @@ async function spawnCaptured(
 }
 
 /**
+ * Run a decomposer agent binary, capturing stdout/stderr. The prompt is always
+ * delivered over stdin.
+ *
+ * On Windows the binary (typically an npm `.cmd` shim) and its args are wrapped
+ * into a single PowerShell command string via `shellEscape` and run through
+ * `getShell()`, instead of relying on spawn's `shell: true`. Under `shell: true`
+ * Node leaves args "not escaped, only space-separated" (DEP0190), so a temp path
+ * containing spaces (`C:\Users\Jane Doe\...\plan.json`) or a model value with a
+ * metacharacter like `&` would be split/reinterpreted by the shell. `shellEscape`
+ * single-quotes each arg for PowerShell, and the `& ` call operator invokes the
+ * leading quoted path as a command. On Unix the binary is spawned directly with
+ * no shell, so Node passes the argv through verbatim.
+ */
+async function runDecomposerBinary(
+  binary: string,
+  args: string[],
+  context: { cwd: string; input: string },
+): Promise<{ stdout: string; stderr: string }> {
+  if (isWindows()) {
+    const shell = getShell();
+    const command = `& ${[binary, ...args].map(shellEscape).join(" ")}`;
+    return spawnCaptured(shell.cmd, shell.args(command), {
+      cwd: context.cwd,
+      timeout: DECOMPOSER_TIMEOUT_MS,
+      maxBuffer: DECOMPOSER_MAX_BUFFER,
+      input: context.input,
+    });
+  }
+  return spawnCaptured(binary, args, {
+    cwd: context.cwd,
+    timeout: DECOMPOSER_TIMEOUT_MS,
+    maxBuffer: DECOMPOSER_MAX_BUFFER,
+    input: context.input,
+  });
+}
+
+/**
  * Build the codex args used to run the decomposer headlessly. The prompt is
  * delivered over stdin (not argv), so it never appears on the command line.
  */
@@ -576,13 +661,7 @@ export const runCodexDecomposer: PlanRunner = async (context) => {
   const args = buildCodexDecomposerArgs(outputFile, context.model);
 
   try {
-    const { stdout, stderr } = await spawnCaptured("codex", args, {
-      cwd,
-      timeout: DECOMPOSER_TIMEOUT_MS,
-      maxBuffer: DECOMPOSER_MAX_BUFFER,
-      shell: isWindows(),
-      input: prompt,
-    });
+    const { stdout, stderr } = await runDecomposerBinary("codex", args, { cwd, input: prompt });
     const fileContents = existsSync(outputFile) ? readFileSync(outputFile, "utf-8") : null;
     const rawOutput = fileContents?.trim() || stdout.trim() || stderr.trim();
     return { rawOutput };
@@ -629,16 +708,10 @@ export const runClaudeDecomposer: PlanRunner = async (context) => {
   const cwd = context.project.path;
   const prompt = buildDecomposerPrompt(context);
   try {
-    const { stdout, stderr } = await spawnCaptured(
+    const { stdout, stderr } = await runDecomposerBinary(
       "claude",
       buildClaudeDecomposerArgs(context.model),
-      {
-        cwd,
-        timeout: DECOMPOSER_TIMEOUT_MS,
-        maxBuffer: DECOMPOSER_MAX_BUFFER,
-        shell: isWindows(),
-        input: prompt,
-      },
+      { cwd, input: prompt },
     );
     return { rawOutput: stdout.trim() || stderr.trim() };
   } catch (error) {

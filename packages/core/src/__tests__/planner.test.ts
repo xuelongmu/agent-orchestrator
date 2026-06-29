@@ -29,11 +29,13 @@ function plan(tickets: Plan["tickets"]): Plan {
 }
 
 /** Mock tracker that records createIssue calls and returns sequential issues. */
-function makeMockTracker(): { tracker: Tracker; calls: Array<{ input: CreateIssueInput; repo?: string }> } {
+function makeMockTracker(
+  name = "github",
+): { tracker: Tracker; calls: Array<{ input: CreateIssueInput; repo?: string }> } {
   const calls: Array<{ input: CreateIssueInput; repo?: string }> = [];
   let counter = 0;
   const tracker: Tracker = {
-    name: "mock",
+    name,
     getIssue: async () => {
       throw new Error("not implemented");
     },
@@ -216,6 +218,33 @@ describe("createPlanTickets", () => {
     await createPlanTickets({ plan: p, tracker, project: baseProject });
 
     expect(calls[1].input.blockedBy).toEqual(["1"]); // same repo → no qualifier
+  });
+
+  it("does not repo-qualify dependency ids for non-repo-scoped trackers (Linear)", async () => {
+    const { tracker, calls } = makeMockTracker("linear");
+    // Even with differing repo overrides, a Linear blocker stays a bare,
+    // globally-resolvable identifier — qualifying it would break Linear's lookup.
+    const p = plan([
+      { ref: "api", title: "API", body: "", repo: "acme/api" },
+      { ref: "web", title: "Web", body: "", blockedByRefs: ["api"] },
+    ]);
+
+    await createPlanTickets({ plan: p, tracker, project: baseProject });
+
+    expect(calls[1].input.blockedBy).toEqual(["1"]); // bare, not "acme/api#1"
+  });
+
+  it("rejects an invalid per-ticket repo override before creating anything", async () => {
+    const { tracker, calls } = makeMockTracker("github");
+    const p = plan([
+      { ref: "t1", title: "A", body: "" },
+      { ref: "t2", title: "B", body: "", repo: "api" }, // missing OWNER/
+    ]);
+
+    await expect(
+      createPlanTickets({ plan: p, tracker, project: baseProject }),
+    ).rejects.toThrow(/invalid repo override/);
+    expect(calls).toHaveLength(0); // nothing created
   });
 
   it("rejects cross-repo related edges before creating anything", async () => {

@@ -3374,7 +3374,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     );
     if (held.length === 0) return 0;
 
-    const satisfied = collectSatisfiedDependencies(sessions);
+    const satisfied = collectSatisfiedDependencies(
+      sessions,
+      (projectId) => config.projects[projectId]?.repo,
+    );
     // Account for launches issued this pass before the next list() reflects the
     // newly-running sessions, so a burst of unblocks still respects the cap.
     const launchedByProject = new Map<string, number>();

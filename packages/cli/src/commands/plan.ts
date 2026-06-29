@@ -89,6 +89,20 @@ function renderPlan(plan: Plan, project: ProjectConfig): string {
     if (relations.length > 0) {
       lines.push(`        ${chalk.dim(relations.join(" · "))}`);
     }
+    // Show the body — the actual issue description that will be created — so the
+    // approval is informed, not just based on the title. Truncated to keep the
+    // preview readable; the full body is still what gets written on approval.
+    const body = ticket.body?.trim();
+    if (body) {
+      const MAX_BODY_LINES = 8;
+      const bodyLines = body.split("\n");
+      for (const line of bodyLines.slice(0, MAX_BODY_LINES)) {
+        lines.push(`        ${chalk.dim(`│ ${line}`)}`);
+      }
+      if (bodyLines.length > MAX_BODY_LINES) {
+        lines.push(`        ${chalk.dim(`│ … (${bodyLines.length - MAX_BODY_LINES} more line(s))`)}`);
+      }
+    }
   }
   return lines.join("\n");
 }
