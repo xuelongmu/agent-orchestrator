@@ -85,14 +85,15 @@ function findOnPath(name: string): string | null {
   return null;
 }
 
-function resolveWindowsShell(): ShellInfo {
-  // Explicit override — set AO_SHELL to an absolute path or shell name
-  // (e.g. "powershell.exe", "pwsh", "cmd.exe", "bash"). Args are inferred
-  // from the basename so cmd / bash / sh are usable, not just PowerShell.
-  const override = process.env["AO_SHELL"];
-  if (override) {
-    return { cmd: override, args: inferShellArgsFlag(override) };
-  }
+/**
+ * Resolve a PowerShell shell (pwsh preferred, then Windows PowerShell), or null
+ * if none is found. Use this — not getShell() — when emitting PowerShell-specific
+ * command text (single-quote escaping + the `& ` call operator): getShell() can
+ * return cmd.exe (via AO_SHELL=cmd or when no PowerShell resolves), which would
+ * mis-parse that text. Windows-only; returns null elsewhere.
+ */
+export function resolvePowerShell(): ShellInfo | null {
+  if (!isWindows()) return null;
 
   // Prefer pwsh (PowerShell Core, cross-platform). PATH-walk via existsSync
   // rather than execFileSync — a missing pwsh would otherwise block the event
@@ -118,6 +119,23 @@ function resolveWindowsShell(): ShellInfo {
   const psPathLookup = findOnPath("powershell");
   if (psPathLookup) {
     return { cmd: psPathLookup, args: (c) => ["-Command", c] };
+  }
+
+  return null;
+}
+
+function resolveWindowsShell(): ShellInfo {
+  // Explicit override — set AO_SHELL to an absolute path or shell name
+  // (e.g. "powershell.exe", "pwsh", "cmd.exe", "bash"). Args are inferred
+  // from the basename so cmd / bash / sh are usable, not just PowerShell.
+  const override = process.env["AO_SHELL"];
+  if (override) {
+    return { cmd: override, args: inferShellArgsFlag(override) };
+  }
+
+  const powershell = resolvePowerShell();
+  if (powershell) {
+    return powershell;
   }
 
   // Last resort: cmd.exe. Note that agent launch commands often use PowerShell

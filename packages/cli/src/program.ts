@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { registerStatus } from "./commands/status.js";
 import { registerSpawn, registerBatchSpawn } from "./commands/spawn.js";
+import { registerPlan } from "./commands/plan.js";
 import { registerSession } from "./commands/session.js";
 import { registerSend } from "./commands/send.js";
 import { registerAcknowledge, registerReport } from "./commands/report.js";
@@ -36,6 +37,7 @@ export function createProgram(): Command {
   registerStatus(program);
   registerSpawn(program);
   registerBatchSpawn(program);
+  registerPlan(program);
   registerSession(program);
   registerSend(program);
   registerAcknowledge(program);

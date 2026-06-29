@@ -133,25 +133,37 @@ function mapState(ghState: string, stateReason?: string | null): Issue["state"] 
 // UI (each `#N` becomes a linked reference).
 // ---------------------------------------------------------------------------
 
-const PARENT_MARKER = /^Part of #(\d+)\s*$/im;
-const BLOCKED_BY_MARKER = /^Blocked by #(\d+)\s*$/gim;
-const RELATED_TO_MARKER = /^Related to #(\d+)\s*$/gim;
+// A relation marker is either a repo-local `#N` or a cross-repo `owner/repo#N`
+// reference (GitHub cross-links the latter natively).
+const PARENT_MARKER = /^Part of (#\d+|[^\s#]+\/[^\s#]+#\d+)\s*$/im;
+const BLOCKED_BY_MARKER = /^Blocked by (#\d+|[^\s#]+\/[^\s#]+#\d+)\s*$/gim;
+const RELATED_TO_MARKER = /^Related to (#\d+|[^\s#]+\/[^\s#]+#\d+)\s*$/gim;
 
 function normalizeIssueNumber(identifier: string): string {
   return identifier.replace(/^#/, "");
+}
+
+/**
+ * Format a relation identifier for a body marker. Cross-repo references
+ * ("owner/repo#N") are rendered verbatim — GitHub cross-links them natively —
+ * while a bare issue number gets the repo-local "#N" form.
+ */
+function formatRelationRef(identifier: string): string {
+  const ref = normalizeIssueNumber(identifier);
+  return ref.includes("/") ? ref : `#${ref}`;
 }
 
 /** Build the relations footer appended to an issue body on create. */
 function buildRelationsFooter(input: CreateIssueInput): string {
   const lines: string[] = [];
   if (input.parentId) {
-    lines.push(`Part of #${normalizeIssueNumber(input.parentId)}`);
+    lines.push(`Part of ${formatRelationRef(input.parentId)}`);
   }
   for (const blocker of input.blockedBy ?? []) {
-    lines.push(`Blocked by #${normalizeIssueNumber(blocker)}`);
+    lines.push(`Blocked by ${formatRelationRef(blocker)}`);
   }
   for (const related of input.relatedTo ?? []) {
-    lines.push(`Related to #${normalizeIssueNumber(related)}`);
+    lines.push(`Related to ${formatRelationRef(related)}`);
   }
   return lines.join("\n");
 }
@@ -161,12 +173,12 @@ function parseRelations(body: string): Pick<Issue, "parentId" | "blockedBy" | "r
   const result: Pick<Issue, "parentId" | "blockedBy" | "relatedTo"> = {};
 
   const parent = body.match(PARENT_MARKER);
-  if (parent) result.parentId = parent[1];
+  if (parent) result.parentId = normalizeIssueNumber(parent[1]);
 
-  const blockedBy = [...body.matchAll(BLOCKED_BY_MARKER)].map((m) => m[1]);
+  const blockedBy = [...body.matchAll(BLOCKED_BY_MARKER)].map((m) => normalizeIssueNumber(m[1]));
   if (blockedBy.length > 0) result.blockedBy = blockedBy;
 
-  const relatedTo = [...body.matchAll(RELATED_TO_MARKER)].map((m) => m[1]);
+  const relatedTo = [...body.matchAll(RELATED_TO_MARKER)].map((m) => normalizeIssueNumber(m[1]));
   if (relatedTo.length > 0) result.relatedTo = relatedTo;
 
   return result;

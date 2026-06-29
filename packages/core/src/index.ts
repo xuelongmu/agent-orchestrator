@@ -211,6 +211,35 @@ export type { PromptBuildConfig } from "./prompt-builder.js";
 export { generateOrchestratorPrompt } from "./orchestrator-prompt.js";
 export type { OrchestratorPromptConfig } from "./orchestrator-prompt.js";
 
+// Planner — `ao plan` goal decomposition into a linked ticket DAG
+export {
+  PlanSchema,
+  PlannedTicketSchema,
+  PlanValidationError,
+  parsePlan,
+  validatePlanGraph,
+  topoSortPlan,
+  createPlanTickets,
+  buildDecomposerPrompt,
+  buildCodexDecomposerArgs,
+  buildClaudeDecomposerArgs,
+  createShellPlanRunner,
+  runCodexDecomposer,
+  runClaudeDecomposer,
+  resolveDecomposerAgent,
+  resolvePlanRunner,
+  decomposeGoal,
+} from "./planner.js";
+export type {
+  Plan,
+  PlannedTicket,
+  CreatedTicket,
+  CreatePlanTicketsOptions,
+  DecomposerContext,
+  DecomposeGoalOptions,
+  PlanRunner,
+} from "./planner.js";
+
 // Shared utilities
 export {
   shellEscape,

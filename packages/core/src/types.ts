@@ -1578,6 +1578,9 @@ export interface DefaultPlugins {
   worker?: {
     agent?: string;
   };
+  decomposer?: {
+    agent?: string;
+  };
 }
 
 export type InstalledPluginSource = "registry" | "npm" | "local";
@@ -1684,6 +1687,9 @@ export interface ProjectConfig {
   orchestrator?: RoleAgentConfig;
 
   worker?: RoleAgentConfig;
+
+  /** Agent used by `ao plan` to decompose a goal into linked tickets */
+  decomposer?: RoleAgentConfig;
 
   /** Per-project reaction overrides */
   reactions?: Record<string, Partial<ReactionConfig>>;
