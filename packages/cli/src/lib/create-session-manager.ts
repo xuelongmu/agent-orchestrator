@@ -21,7 +21,11 @@ import { importPluginModuleFromSource } from "./plugin-store.js";
 const registryPromises = new Map<string, Promise<PluginRegistry>>();
 
 function getRegistryCacheKey(config: OrchestratorConfig): string {
-  return config.configPath || "__default__";
+  // A merged scope (global ∪ startup-only config) sets `_registryScopeKey` so its
+  // registry — built with the startup config's extra plugin declarations — is
+  // cached apart from the plain global config's registry (which shares the same
+  // `configPath`). See OrchestratorConfig._registryScopeKey.
+  return config._registryScopeKey || config.configPath || "__default__";
 }
 
 /**

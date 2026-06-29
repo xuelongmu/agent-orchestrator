@@ -273,6 +273,33 @@ describe("shutdown handlers — activity events", () => {
     }
   });
 
+  it("re-enumerates and kills a worker that appears after the first kill pass", async () => {
+    vi.useFakeTimers();
+    try {
+      const { installShutdownHandlers } = await import("../../src/lib/shutdown.js");
+      // Backlog poll never settles → both the first and second drains time out.
+      mockStopBacklogPoller.mockReturnValue(new Promise(() => {}));
+      // First enumeration sees nothing; an in-flight spawn produces a worker that
+      // only surfaces on the second pass.
+      mockListSessions
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ id: "escaped", projectId: "p1", status: "working" }]);
+
+      installShutdownHandlers({ configPath: "/tmp/cfg.yaml", projectId: "p1" });
+
+      process.emit("SIGTERM", "SIGTERM");
+      // Advance past both bounded drains (3s + 3s), still under the 10s force-exit.
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      // The escapee, absent from the first pass, is killed by the second.
+      expect(mockKillSession).toHaveBeenCalledWith("escaped");
+      const events = recordedEvents();
+      expect(events.filter((e) => e.kind === "cli.shutdown_force_exit")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("emits cli.shutdown_force_exit when the 10s timer fires", async () => {
     vi.useFakeTimers();
     try {

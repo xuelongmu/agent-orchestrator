@@ -309,10 +309,15 @@ async function labelIssuesForVerification(
         },
         project,
       );
+      // Only mark processed after a confirmed update. A transient tracker /
+      // network failure must NOT consume the dedupe slot — otherwise every
+      // later poll in this daemon skips the merged session and the issue never
+      // reaches the verify queue until the process restarts. Leaving it unset
+      // lets the next cycle retry the label.
+      processedIssues.add(key);
     } catch (err) {
-      logger?.error?.(`[backlog] Failed to close issue ${session.issueId}:`, err);
+      logger?.error?.(`[backlog] Failed to label issue ${session.issueId} for verification:`, err);
     }
-    processedIssues.add(key);
   }
 }
 
@@ -323,9 +328,10 @@ async function labelIssuesForVerification(
 async function relabelReopenedIssues(
   config: OrchestratorConfig,
   registry: PluginRegistry,
+  processedIssues: Set<string>,
   logger?: BacklogLogger,
 ): Promise<void> {
-  for (const [, project] of Object.entries(config.projects)) {
+  for (const [projectId, project] of Object.entries(config.projects)) {
     if (!project.tracker?.plugin) continue;
     const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
     if (!tracker?.listIssues || !tracker.updateIssue) continue;
@@ -356,6 +362,13 @@ async function relabelReopenedIssues(
           },
           project,
         );
+        // Returning the issue to the backlog starts a fresh work cycle. Drop any
+        // stale verification-dedupe entry from the previous cycle: the
+        // `${projectId}:${issueId}` key was added when the earlier merged session
+        // was labeled (or skipped as already-verified). Without clearing it, when
+        // the rework worker later merges, labelIssuesForVerification would filter
+        // the issue out and never re-label it `merged-unverified` until restart.
+        processedIssues.delete(`${projectId}:${issue.id}`);
         logger?.info?.(`[backlog] Relabeled reopened issue ${issue.id} → ${BACKLOG_LABEL}`);
       } catch (err) {
         logger?.error?.(`[backlog] Failed to relabel reopened issue ${issue.id}:`, err);
@@ -474,7 +487,14 @@ async function spawnFromBacklog(
     // indefinitely starve fresh work despite open slots. Over-fetching is
     // harmless — the spawn loop stops at `availableSlots`. Bounded so a large
     // backlog can't trigger an unbounded fetch.
-    let limit = availableSlots + takenIssueUrls.size;
+    //
+    // Clamp the INITIAL page to MAX_BACKLOG_FETCH too: `takenIssueUrls.size` is
+    // tracker-wide, so on a multi-project install with many active workers it can
+    // already be in the hundreds before the growth loop's cap applies. A project
+    // with one free slot would otherwise ask the tracker for an oversized page
+    // every poll, which large portfolios can reject/time out (the catch would
+    // then skip the project despite open capacity).
+    let limit = Math.min(availableSlots + takenIssueUrls.size, MAX_BACKLOG_FETCH);
     let backlogIssues: Issue[];
     try {
       backlogIssues = await tracker.listIssues(
@@ -512,7 +532,25 @@ async function spawnFromBacklog(
       const canonicalUrl = canonicalUrlFor(issue);
 
       try {
-        await sessionManager.spawn({ projectId, issueId: issue.id });
+        const spawned = await sessionManager.spawn({ projectId, issueId: issue.id });
+
+        // Shutdown may have aborted us *while* this spawn was in flight. Aborting
+        // can't cancel a spawn already running, so the graceful-stop path could
+        // have finished enumerating/killing sessions and moved on before this
+        // worker existed — leaving it running after `ao start` exits. Tear it down
+        // here (the poll that created it owns cleanup) and stop spawning.
+        if (signal?.aborted) {
+          try {
+            await sessionManager.kill(spawned.id);
+          } catch (err) {
+            logger?.error?.(
+              `[backlog] Failed to tear down spawn after shutdown abort for issue ${issue.id}:`,
+              err,
+            );
+          }
+          return;
+        }
+
         availableSlots--;
         activeIssueIds.add(issue.id.toLowerCase());
         takenIssueUrls.add(canonicalUrl);
@@ -574,7 +612,7 @@ export function createBacklogPoller(options: BacklogPollerOptions): BacklogPolle
 
       const allSessions = await sessionManager.list();
       await labelIssuesForVerification(allSessions, config, registry, processedIssues, logger);
-      await relabelReopenedIssues(config, registry, logger);
+      await relabelReopenedIssues(config, registry, processedIssues, logger);
       await spawnFromBacklog(allSessions, config, registry, sessionManager, logger, abort.signal);
     } catch (err) {
       logger?.error?.("[backlog] Poll failed:", err);

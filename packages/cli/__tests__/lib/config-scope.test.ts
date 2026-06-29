@@ -4,6 +4,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { dirname, isAbsolute, resolve } from "node:path";
 
 const { mockLoadConfig, mockGetGlobalConfigPath } = vi.hoisted(() => ({
   mockLoadConfig: vi.fn(),
@@ -148,6 +149,107 @@ describe("loadMergedScopeConfig", () => {
     const merged = loadMergedScopeConfig(STARTUP);
 
     expect(merged.projects.shared.name).toBe("global-shared");
+  });
+
+  it("absolutizes a startup-only project's relative local plugin path against the startup dir", () => {
+    // The merged scope keeps the global configPath, so a relative local plugin
+    // path would otherwise resolve under the global dir. It must be absolutized
+    // against the startup config's directory before merging.
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      plugins: [{ name: "custom-tracker", source: "local", path: "./plugins/tracker" }],
+      _externalPluginEntries: [
+        {
+          source: "project local tracker",
+          location: { kind: "project", projectId: "local", configType: "tracker" },
+          slot: "tracker",
+          path: "./plugins/tracker",
+        },
+      ],
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    const expectedPath = resolve(dirname(STARTUP), "./plugins/tracker");
+    const custom = merged.plugins?.find((p) => p.name === "custom-tracker");
+    expect(custom?.path).toBe(expectedPath);
+    expect(isAbsolute(custom?.path ?? "")).toBe(true);
+    // The matching external entry is absolutized identically so registry lookup
+    // (keyed by path) still resolves it.
+    expect(merged._externalPluginEntries?.[0]?.path).toBe(expectedPath);
+  });
+
+  it("gives the merged scope a distinct registry cache key when carrying startup plugins", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      plugins: [{ name: "jira", source: "npm", package: "@acme/ao-plugin-tracker-jira" }],
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    expect(merged._registryScopeKey).toBe(`${GLOBAL}::+startup:${STARTUP}`);
+    // configPath stays the global path so registered projects' AO_CONFIG_PATH is
+    // still correct; only the registry cache key changes.
+    expect(merged.configPath).toBe(GLOBAL);
+  });
+
+  it("does not set a distinct cache key when nothing is startup-only", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { shared: project("startup-shared", "s") },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { shared: project("global-shared", "s") },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    expect(merged._registryScopeKey).toBeUndefined();
+  });
+
+  it("drops a startup-only project whose session prefix collides with a registered one", () => {
+    // loadConfig validates each config in isolation; merging can still introduce
+    // a cross-config prefix collision. The registered project is authoritative —
+    // the colliding startup-only project is dropped so it can't clobber the
+    // registered project's session ids / branches.
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { localdup: project("localdup", "dup") },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "dup") },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    expect(merged.projects.localdup).toBeUndefined();
+    expect(merged.projects.reg).toBeDefined();
+    // Nothing startup-only was carried, so no distinct cache key either.
+    expect(merged._registryScopeKey).toBeUndefined();
   });
 
   it("falls back to the startup config when no global config exists", () => {

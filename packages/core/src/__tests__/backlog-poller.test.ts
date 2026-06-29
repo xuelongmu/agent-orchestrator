@@ -48,6 +48,7 @@ interface Harness {
   updateIssue: ReturnType<typeof vi.fn>;
   getIssue: ReturnType<typeof vi.fn>;
   spawn: ReturnType<typeof vi.fn>;
+  kill: ReturnType<typeof vi.fn>;
 }
 
 function makeHarness(opts: {
@@ -70,6 +71,7 @@ function makeHarness(opts: {
     labels: opts.existingLabels ?? [],
   }));
   const spawn = vi.fn(async () => ({ id: "spawned" }));
+  const kill = vi.fn(async () => ({ cleaned: true, alreadyTerminated: false }));
 
   const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
 
@@ -94,10 +96,11 @@ function makeHarness(opts: {
     sessionManager: {
       list: vi.fn(async () => opts.sessions ?? []),
       spawn,
+      kill,
     } as unknown as BacklogServices["sessionManager"],
   };
 
-  return { services, listIssues, updateIssue, getIssue, spawn };
+  return { services, listIssues, updateIssue, getIssue, spawn, kill };
 }
 
 describe("backlog poller", () => {
@@ -794,6 +797,161 @@ describe("backlog poller", () => {
     await stopPromise;
 
     expect(harness.spawn).not.toHaveBeenCalled();
+  });
+
+  it("clamps the initial backlog fetch to MAX_BACKLOG_FETCH", async () => {
+    // With a very large cap (or many tracker-wide taken issues), the initial
+    // `availableSlots + takenIssueUrls.size` would exceed the intended cap. The
+    // first listIssues call must be clamped to MAX_BACKLOG_FETCH (200) so a
+    // single poll can't ask the tracker for thousands of issues.
+    const harness = makeHarness({ backlogIssues: [], maxConcurrentAgents: 250 });
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.listIssues).toHaveBeenCalledWith(
+      expect.objectContaining({ labels: ["agent:backlog"], limit: 200 }),
+      expect.anything(),
+    );
+    // The clamp also means the initial limit is never asked above 200.
+    for (const call of harness.listIssues.mock.calls) {
+      const filters = call[0] as { limit?: number };
+      if (filters.limit !== undefined) expect(filters.limit).toBeLessThanOrEqual(200);
+    }
+  });
+
+  it("retries verification labeling after a failed tracker update", async () => {
+    // A transient tracker/network failure on updateIssue must NOT consume the
+    // dedupe slot — otherwise the merged PR is permanently dropped from the
+    // verify queue until restart. The next poll must retry the label.
+    const harness = makeHarness({
+      backlogIssues: [],
+      sessions: [makeMergedSession("ao-1", "42")],
+      existingLabels: [],
+    });
+    harness.updateIssue.mockRejectedValue(new Error("transient tracker failure"));
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+    await poller.pollOnce();
+
+    // Both polls attempt the label — the failure did not mark the issue processed.
+    expect(harness.updateIssue).toHaveBeenCalledTimes(2);
+    expect(harness.updateIssue).toHaveBeenCalledWith(
+      "42",
+      expect.objectContaining({ labels: ["merged-unverified"] }),
+      expect.anything(),
+    );
+  });
+
+  it("re-labels a merged issue for verification after it was reopened and reworked", async () => {
+    // A verified issue (labeled agent:done) is reopened: relabelReopenedIssues
+    // returns it to the backlog and must clear the verification dedupe so when
+    // the rework merges, labelIssuesForVerification re-labels it rather than
+    // skipping it as already processed.
+    let reopenedListed = true;
+    const listIssues = vi.fn(async (filters: { labels?: string[] }) => {
+      if (filters.labels?.includes("agent:done")) {
+        return reopenedListed ? [{ ...makeIssue("42"), labels: ["agent:done"] }] : [];
+      }
+      return []; // no fresh agent:backlog work
+    });
+    // The merged session keeps issue 42 across polls; the tracker shows a
+    // verification label until the reopen relabel clears it.
+    const getIssue = vi.fn(async (id: string) => ({
+      ...makeIssue(id),
+      labels: reopenedListed ? ["agent:done"] : [],
+    }));
+    const updateIssue = vi.fn(async (_id: string, update: { labels?: string[] }) => {
+      // The reopen relabel flips tracker state: labels cleared, no longer listed.
+      if (update.labels?.includes("agent:backlog")) reopenedListed = false;
+    });
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const kill = vi.fn(async () => ({ cleaned: true, alreadyTerminated: false }));
+    const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
+
+    const services: BacklogServices = {
+      config: {
+        projects: {
+          proj: {
+            name: "proj",
+            path: "/tmp/proj",
+            defaultBranch: "main",
+            sessionPrefix: "ao",
+            tracker: { plugin: "github" },
+          },
+        },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => [makeMergedSession("ao-1", "42")]),
+        spawn,
+        kill,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    // Poll 1: issue carries agent:done → labeling skips it (processed); reopen
+    // relabel returns it to the backlog and clears the dedupe.
+    await poller.pollOnce();
+    // Poll 2: the (still-merged) session must be re-labeled for verification.
+    await poller.pollOnce();
+
+    expect(updateIssue).toHaveBeenCalledWith(
+      "42",
+      expect.objectContaining({ labels: ["merged-unverified"] }),
+      expect.anything(),
+    );
+  });
+
+  it("tears down a worker spawned after stop() aborted the poll", async () => {
+    // SIGTERM aborts the poll while a spawn is already in flight. Aborting can't
+    // cancel that spawn, so when it settles the poll must tear down the worker it
+    // created — otherwise it escapes the graceful-stop kill loop as an orphan.
+    const lockPath = join(tmp, "backlog-poll.lock");
+    let releaseSpawn: () => void = () => {};
+    const harness = makeHarness({
+      backlogIssues: [makeIssue("1")],
+      maxConcurrentAgents: 5,
+    });
+    (harness.services.sessionManager.spawn as ReturnType<typeof vi.fn>).mockImplementation(
+      async () => {
+        await new Promise<void>((resolve) => {
+          releaseSpawn = resolve;
+        });
+        return { id: "spawned-1" };
+      },
+    );
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath,
+    });
+
+    poller.start();
+    // Let the immediate poll reach the blocked spawn.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Shutdown aborts mid-spawn; then the spawn resolves.
+    const stopPromise = poller.stop();
+    releaseSpawn();
+    await stopPromise;
+
+    // The just-created worker is killed, and no claim label is applied for it.
+    expect(harness.kill).toHaveBeenCalledWith("spawned-1");
+    expect(harness.updateIssue).not.toHaveBeenCalled();
   });
 
   it("does not reclaim a fresh lock held by another process", async () => {

@@ -9,6 +9,7 @@ import {
   type ProjectObserver,
 } from "@aoagents/ao-core";
 import { getSessionManager } from "./create-session-manager.js";
+import { loadMergedScopeConfig } from "./config-scope.js";
 import {
   ensureLifecycleWorker,
   listLifecycleWorkers,
@@ -69,16 +70,23 @@ function isMissingConfigError(error: unknown): boolean {
  *  Returns the source so callers can gate authoritative actions (like the
  *  detach pass) on whether we're looking at the real registry.
  *
- *  Note: unlike the poller/shutdown scope, the supervisor deliberately does NOT
- *  union the startup config when the global registry is healthy — the global
- *  registry is authoritative for the detach pass, and `ao start` registers the
- *  started project there, so it's already supervised. Consulting `configPath`
- *  here would override that contract (see the "ignores caller configPath when
- *  global is healthy" and global→fallback detach-safety tests). */
+ *  When the global registry is healthy AND a startup `configPath` was provided,
+ *  the supervisor unions the startup config — the SAME merged scope the backlog
+ *  poller and shutdown handler use. Without this, a startup-only project (one
+ *  launched from a non-registered local/URL/wrapped config) would have its
+ *  backlog auto-spawned by the poller but no lifecycle worker polling PR/CI or
+ *  performing cleanup. The merged set is a SUPERSET of the global registry, so
+ *  the detach pass stays safe: it can only protect more workers from removal,
+ *  never wrongly detach a still-registered project. `source` remains "global"
+ *  because the global registry is still present and authoritative. */
 function loadSupervisorConfig(configPath?: string): LoadedSupervisorConfig {
   const globalConfigPath = getGlobalConfigPath();
+  let globalConfig: OrchestratorConfig;
   try {
-    return { config: loadConfig(globalConfigPath), source: "global" };
+    // Load the global registry first so a missing global config still routes to
+    // the local fallback below (loadMergedScopeConfig would otherwise resolve to
+    // the startup config alone, which we model as "local-fallback").
+    globalConfig = loadConfig(globalConfigPath);
   } catch (error) {
     if (
       error instanceof Error &&
@@ -92,6 +100,10 @@ function loadSupervisorConfig(configPath?: string): LoadedSupervisorConfig {
     }
     throw error;
   }
+  // Global is healthy and authoritative. Union the startup scope when a startup
+  // configPath is known so startup-only projects are supervised too.
+  const config = configPath ? loadMergedScopeConfig(configPath) : globalConfig;
+  return { config, source: "global" };
 }
 
 function reportProjectSupervisorError(

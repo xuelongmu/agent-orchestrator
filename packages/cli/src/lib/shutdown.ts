@@ -17,6 +17,7 @@ import {
   markDaemonShutdownHandlerInstalled,
   recordActivityEvent,
   sweepDaemonChildren,
+  type Session,
 } from "@aoagents/ao-core";
 import { loadMergedScopeConfig } from "./config-scope.js";
 import { stopBunTmpJanitor } from "./bun-tmp-janitor.js";
@@ -140,38 +141,68 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
         }
         const shutdownConfig = loadMergedScopeConfig(ctx.configPath);
         const sm = await getSessionManager(shutdownConfig);
-        const allSessions = await sm.list();
-        const activeSessions = allSessions.filter((s) => !isTerminalSession(s));
 
-        const killedSessionIds: string[] = [];
-        for (const session of activeSessions) {
-          try {
-            const result = await sm.kill(session.id);
-            if (result.cleaned || result.alreadyTerminated) {
-              killedSessionIds.push(session.id);
+        // Every session killed across one or two enumeration passes, keyed by id
+        // so the second pass never double-kills or double-records a session.
+        const killedSessions = new Map<string, Session>();
+        const killActivePass = async (): Promise<void> => {
+          const active = (await sm.list()).filter((s) => !isTerminalSession(s));
+          for (const session of active) {
+            if (killedSessions.has(session.id)) continue;
+            try {
+              const result = await sm.kill(session.id);
+              if (result.cleaned || result.alreadyTerminated) {
+                killedSessions.set(session.id, session);
+              }
+            } catch (err) {
+              recordActivityEvent({
+                projectId: session.projectId ?? ctx.projectId,
+                sessionId: session.id,
+                source: "cli",
+                kind: "cli.shutdown_session_kill_failed",
+                level: "warn",
+                summary: `failed to kill session during shutdown`,
+                data: { errorMessage: err instanceof Error ? err.message : String(err) },
+              });
             }
-          } catch (err) {
-            recordActivityEvent({
-              projectId: session.projectId ?? ctx.projectId,
-              sessionId: session.id,
-              source: "cli",
-              kind: "cli.shutdown_session_kill_failed",
-              level: "warn",
-              summary: `failed to kill session during shutdown`,
-              data: { errorMessage: err instanceof Error ? err.message : String(err) },
-            });
           }
+        };
+
+        // First pass: kill everything enumerable right now.
+        await killActivePass();
+
+        // If the bounded drain above gave up, the backlog poll may still be inside
+        // an in-flight `sessionManager.spawn()` — aborting can't cancel it, so a
+        // worker could be created after this first enumeration and escape the kill
+        // loop. Wait (bounded again) for the poll to settle: the poller tears down
+        // a worker it spawned once it observes the abort (see backlog-poller
+        // spawnFromBacklog), so by the time `backlogStopped` resolves the escapee
+        // is gone. Re-enumerate as a safety net in case that teardown failed.
+        if (!drained) {
+          let secondDrainTimer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([
+            backlogStopped.then(
+              () => undefined,
+              () => undefined,
+            ),
+            new Promise<void>((resolve) => {
+              secondDrainTimer = setTimeout(resolve, BACKLOG_DRAIN_TIMEOUT_MS);
+            }),
+          ]);
+          if (secondDrainTimer) clearTimeout(secondDrainTimer);
+          await killActivePass();
         }
 
+        const killedSessionIds = [...killedSessions.keys()];
         if (killedSessionIds.length > 0) {
-          const targetIds = killedSessionIds.filter((id) =>
-            activeSessions.some((s) => s.id === id && s.projectId === ctx.projectId),
+          const killedList = [...killedSessions.values()];
+          const targetIds = killedSessionIds.filter(
+            (id) => killedSessions.get(id)?.projectId === ctx.projectId,
           );
           const otherProjects: Array<{ projectId: string; sessionIds: string[] }> = [];
           const otherByProject = new Map<string, string[]>();
-          for (const s of activeSessions) {
+          for (const s of killedList) {
             if (s.projectId === ctx.projectId) continue;
-            if (!killedSessionIds.includes(s.id)) continue;
             const list = otherByProject.get(s.projectId ?? "unknown") ?? [];
             list.push(s.id);
             otherByProject.set(s.projectId ?? "unknown", list);

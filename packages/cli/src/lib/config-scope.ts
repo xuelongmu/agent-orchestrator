@@ -27,10 +27,13 @@
  * merge the startup config's external plugin declarations into the result.
  */
 
+import { dirname, isAbsolute, resolve } from "node:path";
 import {
+  generateSessionPrefix,
   getGlobalConfigPath,
   loadConfig,
   type DefaultPlugins,
+  type ExternalPluginEntryRef,
   type InstalledPluginConfig,
   type OrchestratorConfig,
   type ProjectConfig,
@@ -76,10 +79,26 @@ function bakeStartupOnlyProject(
   };
 }
 
-/** Append startup plugin declarations not already present (dedup by name). */
+/**
+ * Bake a startup config's relative local plugin `path` to an absolute path
+ * anchored at the startup config's directory.
+ *
+ * The merged scope keeps the *global* `configPath`, and the plugin registry
+ * resolves local plugin paths relative to `config.configPath`. A startup-only
+ * `path: ./plugins/tracker` would therefore be looked up under the global config
+ * directory and fail to load. Absolutizing here makes resolution independent of
+ * which config path the merged object carries.
+ */
+function absolutizeLocalPluginPath(path: string, startupConfigPath: string): string {
+  return isAbsolute(path) ? path : resolve(dirname(startupConfigPath), path);
+}
+
+/** Append startup plugin declarations not already present (dedup by name),
+ *  absolutizing any relative local `path` against the startup config dir. */
 function mergeInstalledPlugins(
   globalPlugins: InstalledPluginConfig[] | undefined,
   startupPlugins: InstalledPluginConfig[] | undefined,
+  startupConfigPath: string,
 ): InstalledPluginConfig[] | undefined {
   if (!startupPlugins?.length) return globalPlugins;
   const seen = new Set((globalPlugins ?? []).map((p) => p.name));
@@ -87,9 +106,28 @@ function mergeInstalledPlugins(
   for (const plugin of startupPlugins) {
     if (seen.has(plugin.name)) continue;
     seen.add(plugin.name);
-    merged.push(plugin);
+    merged.push(
+      plugin.source === "local" && plugin.path
+        ? { ...plugin, path: absolutizeLocalPluginPath(plugin.path, startupConfigPath) }
+        : plugin,
+    );
   }
   return merged;
+}
+
+/** Absolutize relative local `path` on startup external plugin entries so they
+ *  match their (absolutized) `plugins` entry and resolve against the startup
+ *  config dir rather than the merged scope's global configPath. */
+function absolutizeExternalEntries(
+  entries: ExternalPluginEntryRef[] | undefined,
+  startupConfigPath: string,
+): ExternalPluginEntryRef[] {
+  if (!entries?.length) return [];
+  return entries.map((entry) =>
+    entry.path && !entry.package
+      ? { ...entry, path: absolutizeLocalPluginPath(entry.path, startupConfigPath) }
+      : entry,
+  );
 }
 
 /**
@@ -106,9 +144,27 @@ function mergeScopeProjects(
   startupConfig: OrchestratorConfig,
 ): OrchestratorConfig {
   const projects: Record<string, ProjectConfig> = { ...globalConfig.projects };
+
+  // Session prefixes already in use by the global (registered) projects. The
+  // session manager derives session ids, tmux names, and `session/<prefix>-N`
+  // branches from this prefix, so a startup-only project that collides with a
+  // registered one would clobber the registered project's sessions/branches.
+  // Re-run the uniqueness check (loadConfig only validates each config in
+  // isolation) and drop any colliding startup-only project — the registered
+  // project is authoritative; dropping (rather than throwing) keeps the rest of
+  // the scope intact so the poller still claims, and shutdown still kills, every
+  // other project's work.
+  const usedPrefixes = new Set<string>();
+  for (const [id, project] of Object.entries(globalConfig.projects)) {
+    usedPrefixes.add(project.sessionPrefix || generateSessionPrefix(id));
+  }
+
   let carriedStartupOnly = false;
   for (const [id, project] of Object.entries(startupConfig.projects)) {
     if (id in projects) continue; // Registered project — keep the global entry + defaults.
+    const prefix = project.sessionPrefix || generateSessionPrefix(id);
+    if (usedPrefixes.has(prefix)) continue; // Prefix collision — skip to protect the registered project.
+    usedPrefixes.add(prefix);
     projects[id] = bakeStartupOnlyProject(
       project,
       startupConfig.defaults,
@@ -125,11 +181,21 @@ function mergeScopeProjects(
   return {
     ...globalConfig,
     projects,
-    plugins: mergeInstalledPlugins(globalConfig.plugins, startupConfig.plugins),
+    plugins: mergeInstalledPlugins(
+      globalConfig.plugins,
+      startupConfig.plugins,
+      startupConfig.configPath,
+    ),
     _externalPluginEntries: [
       ...(globalConfig._externalPluginEntries ?? []),
-      ...(startupConfig._externalPluginEntries ?? []),
+      ...absolutizeExternalEntries(startupConfig._externalPluginEntries, startupConfig.configPath),
     ],
+    // Distinct registry cache identity: this scope carries startup-only plugin
+    // declarations the plain global config lacks, but keeps the global
+    // `configPath`. Without a separate key the CLI registry cache (keyed by
+    // configPath) would serve a global-only registry the project supervisor
+    // built earlier, and startup-only external plugins would never resolve.
+    _registryScopeKey: `${globalConfig.configPath}::+startup:${startupConfig.configPath}`,
   };
 }
 

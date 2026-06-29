@@ -1425,6 +1425,18 @@ export interface OrchestratorConfig {
    * Used by plugin-registry for manifest validation. Set automatically during config validation.
    */
   _externalPluginEntries?: ExternalPluginEntryRef[];
+
+  /**
+   * Internal: Overrides the plugin-registry cache key for this config object.
+   * Set only for a *merged scope* (the `ao start` daemon's union of the global
+   * registry with a startup-only config) so its registry — which carries the
+   * startup config's extra plugin declarations — is cached separately from the
+   * plain global config's. Without it, the CLI registry cache (keyed by
+   * `configPath`, which the merged scope keeps as the global path) would serve a
+   * global-only registry built earlier by the project supervisor, and a
+   * startup-only project's external tracker/agent plugin would fail to resolve.
+   */
+  _registryScopeKey?: string;
 }
 
 export interface DegradedProjectEntry {
