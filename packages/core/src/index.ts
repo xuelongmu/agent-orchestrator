@@ -19,6 +19,9 @@ export {
 } from "./config.js";
 export { isPortfolioEnabled } from "./feature-flags.js";
 
+// Budget — cost cap evaluation for auto-pause
+export { resolveBudget, evaluateBudgetBreach, type BudgetBreach } from "./budget.js";
+
 // Plugin registry
 export {
   createPluginRegistry,
@@ -40,7 +43,11 @@ export {
   deleteMetadata,
   listMetadata,
 } from "./metadata.js";
-export { createInitialCanonicalLifecycle, deriveLegacyStatus } from "./lifecycle-state.js";
+export {
+  createInitialCanonicalLifecycle,
+  deriveLegacyStatus,
+  isBlockedByDependency,
+} from "./lifecycle-state.js";
 export {
   resolveAgentSelection,
   resolveAgentSelectionForSession,

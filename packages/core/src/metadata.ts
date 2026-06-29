@@ -39,7 +39,7 @@ import {
 } from "./lifecycle-state.js";
 import { assertValidSessionIdComponent, SESSION_ID_COMPONENT_PATTERN } from "./utils/session-id.js";
 import { flattenToStringRecord } from "./utils/metadata-flatten.js";
-import { validateStatus } from "./utils/validation.js";
+import { parseIdList, serializeIdList, validateStatus } from "./utils/validation.js";
 import { withFileLockSync } from "./file-lock.js";
 
 const JSON_EXTENSION = ".json";
@@ -130,6 +130,23 @@ function parseDashboardField(raw: Record<string, unknown>): SessionMetadata["das
   return undefined;
 }
 
+/**
+ * Parse a dependsOn/blockedBy field from raw metadata. Accepts either a
+ * comma-separated string (current storage format) or a JSON array (defensive).
+ * Returns undefined when the list is empty so the field stays optional.
+ */
+function readIdListField(value: unknown): string[] | undefined {
+  let ids: string[];
+  if (Array.isArray(value)) {
+    ids = parseIdList(value.map((entry) => String(entry)).join(","));
+  } else if (typeof value === "string") {
+    ids = parseIdList(value);
+  } else {
+    return undefined;
+  }
+  return ids.length > 0 ? ids : undefined;
+}
+
 function validateSessionId(sessionId: SessionId): void {
   assertValidSessionIdComponent(sessionId);
 }
@@ -191,6 +208,8 @@ export function readMetadata(dataDir: string, sessionId: SessionId): SessionMeta
     opencodeSessionId: raw["opencodeSessionId"] as string | undefined,
     pinnedSummary: raw["pinnedSummary"] as string | undefined,
     userPrompt: raw["userPrompt"] as string | undefined,
+    dependsOn: readIdListField(raw["dependsOn"]),
+    blockedBy: readIdListField(raw["blockedBy"]),
     displayName: raw["displayName"] as string | undefined,
     displayNameUserSet:
       raw["displayNameUserSet"] === "off" ||
@@ -317,6 +336,10 @@ export function writeMetadata(
   if (metadata.opencodeSessionId) data["opencodeSessionId"] = metadata.opencodeSessionId;
   if (metadata.pinnedSummary) data["pinnedSummary"] = metadata.pinnedSummary;
   if (metadata.userPrompt) data["userPrompt"] = metadata.userPrompt;
+  const dependsOnSerialized = serializeIdList(metadata.dependsOn);
+  if (dependsOnSerialized) data["dependsOn"] = dependsOnSerialized;
+  const blockedBySerialized = serializeIdList(metadata.blockedBy);
+  if (blockedBySerialized) data["blockedBy"] = blockedBySerialized;
   if (metadata.displayName) data["displayName"] = metadata.displayName;
   if (metadata.displayNameUserSet !== undefined)
     data["displayNameUserSet"] = metadata.displayNameUserSet;

@@ -38,6 +38,7 @@ export type CanonicalSessionState =
 
 export type CanonicalSessionReason =
   | "spawn_requested"
+  | "blocked_by_dependency"
   | "agent_acknowledged"
   | "task_in_progress"
   | "pr_created"
@@ -328,6 +329,21 @@ export interface Session {
   /** When this session was last restored (undefined if never restored) */
   restoredAt?: Date;
 
+  /**
+   * Declared prerequisites — session and/or issue ids that must resolve before
+   * this session starts work. Static; populated at spawn time from explicit
+   * config and the tracker's blocking relations. Empty/undefined when none.
+   */
+  dependsOn?: string[];
+
+  /**
+   * Subset of `dependsOn` that is still unresolved. A non-empty value means the
+   * session is held in the `blocked_by_dependency` pre-state and has not started
+   * work. The scheduler clears entries as prerequisites resolve; once empty the
+   * session can be launched.
+   */
+  blockedBy?: string[];
+
   /** Metadata key-value pairs */
   metadata: Record<string, string>;
 }
@@ -378,6 +394,17 @@ export interface SessionSpawnConfig {
   agent?: string;
   /** Override the OpenCode subagent for this session (e.g. "sisyphus", "oracle") */
   subagent?: string;
+  /**
+   * Prerequisite session and/or issue ids. Merged with the tracker's blocking
+   * relations for `issueId`. When the resulting unresolved set is non-empty the
+   * session is recorded as blocked and not launched.
+   */
+  dependsOn?: string[];
+  /**
+   * Explicit unresolved prerequisites at spawn time. Defaults to the full
+   * `dependsOn` set (every declared prerequisite is presumed unresolved).
+   */
+  blockedBy?: string[];
 }
 
 /** Config for creating an orchestrator session */
@@ -407,6 +434,17 @@ export interface Runtime {
 
   /** Send a text message/prompt to the running agent */
   sendMessage(handle: RuntimeHandle, message: string): Promise<void>;
+
+  /**
+   * Interrupt the agent's in-flight work without tearing down the session.
+   * Sends a cancel/stop keystroke (Escape) to the foreground process so it
+   * halts the current generation (e.g. an over-budget run) while staying alive
+   * and interactive — a human can then raise the cap and resume. Destroying the
+   * runtime instead would make the next isAlive probe read it as dead and the
+   * lifecycle reconciler would mark the session terminated (#1735), not paused.
+   * Best-effort: optional, and a no-op if the session is not running.
+   */
+  interrupt?(handle: RuntimeHandle): Promise<void>;
 
   /** Capture recent output from the session */
   getOutput(handle: RuntimeHandle, lines?: number): Promise<string>;
@@ -651,6 +689,20 @@ export interface CostEstimate {
   estimatedCostUsd: number;
 }
 
+/**
+ * Budget caps (estimated USD). Configurable globally (applies to every
+ * session/project) and per-project. When a cap is exceeded the lifecycle
+ * manager pauses the offending session (needs_input) and notifies.
+ *
+ * A cap of `0` or omitted means "no limit".
+ */
+export interface BudgetConfig {
+  /** Pause a session once its own estimated cost exceeds this many USD. */
+  perSessionUsd?: number;
+  /** Pause sessions once a project's combined estimated cost exceeds this many USD. */
+  perProjectUsd?: number;
+}
+
 // =============================================================================
 // WORKSPACE — Plugin Slot 3
 // =============================================================================
@@ -763,6 +815,16 @@ export interface Issue {
   assignee?: string;
   priority?: number;
   branchName?: string;
+  /** Parent issue identifier (sub-issue hierarchy) */
+  parentId?: string;
+  /** Child sub-issue identifiers */
+  children?: string[];
+  /** Identifiers of issues that block this one */
+  blockedBy?: string[];
+  /** Identifiers of issues this one blocks */
+  blocks?: string[];
+  /** Identifiers of issues related to this one */
+  relatedTo?: string[];
 }
 
 export interface IssueFilters {
@@ -786,6 +848,12 @@ export interface CreateIssueInput {
   labels?: string[];
   assignee?: string;
   priority?: number;
+  /** Parent issue identifier — create this as a sub-issue of the parent */
+  parentId?: string;
+  /** Identifiers of issues that block this one */
+  blockedBy?: string[];
+  /** Identifiers of issues related to this one */
+  relatedTo?: string[];
 }
 
 // =============================================================================
@@ -1288,8 +1356,8 @@ export interface ReactionConfig {
   /** Whether this reaction is enabled */
   auto: boolean;
 
-  /** What to do: send message to agent, notify human, auto-merge */
-  action: "send-to-agent" | "notify" | "auto-merge";
+  /** What to do: send message to agent, notify human, auto-merge, spawn a dependent session */
+  action: "send-to-agent" | "notify" | "auto-merge" | "spawn-session";
 
   /** Message to send (for send-to-agent) */
   message?: string;
@@ -1401,6 +1469,9 @@ export interface OrchestratorConfig {
 
   /** Default plugin selections */
   defaults: DefaultPlugins;
+
+  /** Cost budget caps applied to every project unless overridden per-project. */
+  budget?: BudgetConfig;
 
   /** Installer-managed external plugin descriptors */
   plugins?: InstalledPluginConfig[];
@@ -1557,6 +1628,15 @@ export interface ProjectConfig {
   /** Whether this project is active in portfolio and dashboard surfaces */
   enabled?: boolean;
 
+  /**
+   * Maximum number of concurrently-running worker sessions for this project.
+   * Enforced by the dependency scheduler (#10) when launching unblocked
+   * sessions: a held session whose prerequisites have all merged stays held
+   * until the project is under this cap. Orchestrator sessions are excluded
+   * from the count. Undefined means no limit.
+   */
+  maxConcurrent?: number;
+
   /** Override default runtime */
   runtime?: string;
 
@@ -1626,6 +1706,9 @@ export interface ProjectConfig {
     | "kill-previous";
 
   opencodeIssueSessionStrategy?: "reuse" | "delete" | "ignore";
+
+  /** Per-project cost budget caps (override the global defaults). */
+  budget?: BudgetConfig;
 }
 
 export interface TrackerConfig {
@@ -1851,6 +1934,10 @@ export interface SessionMetadata {
   restoreFallbackReason?: string;
   pinnedSummary?: string; // First quality summary, pinned for display stability
   userPrompt?: string; // Prompt used when spawning without a tracker issue
+  /** Declared prerequisite session/issue ids (persisted comma-separated). */
+  dependsOn?: string[];
+  /** Unresolved prerequisite session/issue ids (persisted comma-separated). */
+  blockedBy?: string[];
   /**
    * Human-readable display name for the session.
    *
@@ -1912,6 +1999,13 @@ export interface SessionManager {
    */
   relaunchOrchestrator(config: OrchestratorSpawnConfig): Promise<Session>;
   restore(sessionId: SessionId): Promise<Session>;
+  /**
+   * Launch a session previously held in the `blocked_by_dependency` pre-state,
+   * reusing its reserved identity and branch. Called by the dependency
+   * scheduler (#10) once all of a session's prerequisites have merged.
+   * Idempotent: returns the current session unchanged if it is no longer held.
+   */
+  unblock(sessionId: SessionId): Promise<Session>;
   list(projectId?: string): Promise<Session[]>;
   get(sessionId: SessionId): Promise<Session | null>;
   kill(sessionId: SessionId, options?: KillOptions): Promise<KillResult>;

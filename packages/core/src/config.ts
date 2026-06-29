@@ -152,7 +152,7 @@ function validatePluginConfigFields(
 
 const ReactionConfigSchema = z.object({
   auto: z.boolean().default(true),
-  action: z.enum(["send-to-agent", "notify", "auto-merge"]).default("notify"),
+  action: z.enum(["send-to-agent", "notify", "auto-merge", "spawn-session"]).default("notify"),
   message: z.string().optional(),
   priority: z.enum(["urgent", "action", "warning", "info"]).optional(),
   retries: z.number().optional(),
@@ -244,6 +244,13 @@ const RoleAgentConfigSchema = z
   })
   .optional();
 
+const BudgetConfigSchema = z
+  .object({
+    perSessionUsd: z.number().nonnegative().optional(),
+    perProjectUsd: z.number().nonnegative().optional(),
+  })
+  .strict();
+
 const ProjectConfigSchema = z.object({
   name: z.string().optional(),
   repo: z.string().optional(),
@@ -255,6 +262,7 @@ const ProjectConfigSchema = z.object({
     .optional(),
   /** Per-project resolution failure captured without aborting global load. */
   resolveError: z.string().optional(),
+  maxConcurrent: z.number().int().positive().optional(),
   runtime: z.string().optional(),
   agent: z.string().optional(),
   workspace: z.string().optional(),
@@ -276,6 +284,7 @@ const ProjectConfigSchema = z.object({
     .enum(["reuse", "delete", "ignore", "delete-new", "ignore-new", "kill-previous"])
     .optional(),
   opencodeIssueSessionStrategy: z.enum(["reuse", "delete", "ignore"]).optional(),
+  budget: BudgetConfigSchema.optional(),
 });
 
 const DefaultPluginsSchema = z.object({
@@ -366,6 +375,7 @@ const OrchestratorConfigSchema = z.object({
   lifecycle: LifecycleConfigSchema,
   observability: ObservabilityConfigSchema,
   defaults: DefaultPluginsSchema.default({}),
+  budget: BudgetConfigSchema.optional(),
   plugins: z.array(InstalledPluginConfigSchema).default([]),
   dashboard: DashboardConfigSchema.optional(),
   projects: z.record(
@@ -857,6 +867,7 @@ function buildEffectiveConfigFromFlatLocalPath(
     readyThresholdMs: globalConfig.readyThresholdMs,
     observability: globalConfig.observability,
     defaults: globalConfig.defaults,
+    budget: globalConfig.budget,
     notifiers: globalConfig.notifiers,
     notificationRouting: globalConfig.notificationRouting,
     reactions: globalConfig.reactions,
@@ -909,6 +920,7 @@ function buildEffectiveConfigFromGlobalConfigPath(configPath: string): LoadedCon
     readyThresholdMs: globalConfig.readyThresholdMs,
     observability: globalConfig.observability,
     defaults: globalConfig.defaults,
+    budget: globalConfig.budget,
     notifiers: globalConfig.notifiers,
     notificationRouting: globalConfig.notificationRouting,
     reactions: globalConfig.reactions,

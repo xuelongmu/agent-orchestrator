@@ -290,6 +290,41 @@ describe("tracker-linear plugin", () => {
       expect(issue.labels).toEqual([]);
     });
 
+    it("returns parent, children, and blocking relations", async () => {
+      mockLinearAPI({
+        issue: {
+          ...sampleIssueNode,
+          parent: { identifier: "INT-100" },
+          children: { nodes: [{ identifier: "INT-200" }, { identifier: "INT-201" }] },
+          relations: {
+            nodes: [
+              { type: "blocks", relatedIssue: { identifier: "INT-300" } },
+              { type: "related", relatedIssue: { identifier: "INT-400" } },
+            ],
+          },
+          inverseRelations: {
+            nodes: [{ type: "blocks", issue: { identifier: "INT-50" } }],
+          },
+        },
+      });
+      const issue = await tracker.getIssue("INT-123", project);
+      expect(issue.parentId).toBe("INT-100");
+      expect(issue.children).toEqual(["INT-200", "INT-201"]);
+      expect(issue.blocks).toEqual(["INT-300"]);
+      expect(issue.blockedBy).toEqual(["INT-50"]);
+      expect(issue.relatedTo).toEqual(["INT-400"]);
+    });
+
+    it("omits relation fields when none are present", async () => {
+      mockLinearAPI({ issue: sampleIssueNode });
+      const issue = await tracker.getIssue("INT-123", project);
+      expect(issue.parentId).toBeUndefined();
+      expect(issue.children).toBeUndefined();
+      expect(issue.blocks).toBeUndefined();
+      expect(issue.blockedBy).toBeUndefined();
+      expect(issue.relatedTo).toBeUndefined();
+    });
+
     it("propagates API errors", async () => {
       mockLinearError("Issue not found");
       await expect(tracker.getIssue("INT-999", project)).rejects.toThrow(
@@ -844,6 +879,70 @@ describe("tracker-linear plugin", () => {
       );
       // Should only include the label that was actually found and applied
       expect(issue.labels).toEqual(["bug"]);
+    });
+
+    it("creates a sub-issue with a parent and a blockedBy relation", async () => {
+      // 1: resolve parent identifier to UUID
+      mockLinearAPI({ issue: { id: "parent-uuid" } });
+      // 2: issueCreate
+      mockLinearAPI({ issueCreate: { success: true, issue: sampleIssueNode } });
+      // 3: resolve blocker identifier to UUID
+      mockLinearAPI({ issue: { id: "blocker-uuid" } });
+      // 4: issueRelationCreate
+      mockLinearAPI({ issueRelationCreate: { success: true } });
+
+      const issue = await tracker.createIssue!(
+        { title: "Sub", description: "", parentId: "INT-100", blockedBy: ["INT-50"] },
+        project,
+      );
+
+      expect(requestMock).toHaveBeenCalledTimes(4);
+      expect(issue.blockedBy).toEqual(["INT-50"]);
+
+      // parentId resolved to UUID and passed to issueCreate
+      const createBody = JSON.parse(requestMock.mock.results[1].value.write.mock.calls[0][0]);
+      expect(createBody.variables.parentId).toBe("parent-uuid");
+
+      // relation created as "blocker blocks new issue"
+      const relBody = JSON.parse(requestMock.mock.results[3].value.write.mock.calls[0][0]);
+      expect(relBody.variables.issueId).toBe("blocker-uuid");
+      expect(relBody.variables.relatedIssueId).toBe("uuid-123");
+      expect(relBody.variables.type).toBe("blocks");
+    });
+
+    it("throws when the parent issue cannot be resolved", async () => {
+      // Parent lookup returns no issue
+      mockLinearAPI({ issue: null });
+
+      await expect(
+        tracker.createIssue!(
+          { title: "Sub", description: "", parentId: "INT-999" },
+          project,
+        ),
+      ).rejects.toThrow('could not resolve parent issue "INT-999"');
+
+      // Must not proceed to issueCreate after a failed parent resolution
+      expect(requestMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("creates a related relation", async () => {
+      // 1: issueCreate (no parent)
+      mockLinearAPI({ issueCreate: { success: true, issue: sampleIssueNode } });
+      // 2: resolve related identifier to UUID
+      mockLinearAPI({ issue: { id: "related-uuid" } });
+      // 3: issueRelationCreate
+      mockLinearAPI({ issueRelationCreate: { success: true } });
+
+      const issue = await tracker.createIssue!(
+        { title: "Sub", description: "", relatedTo: ["INT-77"] },
+        project,
+      );
+
+      expect(issue.relatedTo).toEqual(["INT-77"]);
+      const relBody = JSON.parse(requestMock.mock.results[2].value.write.mock.calls[0][0]);
+      expect(relBody.variables.issueId).toBe("uuid-123");
+      expect(relBody.variables.relatedIssueId).toBe("related-uuid");
+      expect(relBody.variables.type).toBe("related");
     });
 
     it("throws when teamId is missing from config", async () => {

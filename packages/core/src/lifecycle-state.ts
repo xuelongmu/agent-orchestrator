@@ -59,6 +59,7 @@ const CanonicalSessionLifecycleSchema = z.object({
       ]),
       reason: z.enum([
         "spawn_requested",
+        "blocked_by_dependency",
         "agent_acknowledged",
         "task_in_progress",
         "pr_created",
@@ -132,6 +133,19 @@ const TERMINAL_CANONICAL_SESSION_STATES: ReadonlySet<CanonicalSessionState> = ne
   "done",
   "terminated",
 ]);
+
+/**
+ * A session is blocked by an unresolved dependency when it is still in the
+ * `not_started` pre-state with the `blocked_by_dependency` reason. Such sessions
+ * are held by the scheduler and must not be probed or promoted to `working`
+ * until their prerequisites resolve.
+ */
+export function isBlockedByDependency(lifecycle: CanonicalSessionLifecycle): boolean {
+  return (
+    lifecycle.session.state === "not_started" &&
+    lifecycle.session.reason === "blocked_by_dependency"
+  );
+}
 
 export function clearTerminalMarkersForNonTerminalState(
   lifecycle: CanonicalSessionLifecycle,

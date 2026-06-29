@@ -13,6 +13,7 @@
  */
 
 import {
+  isBlockedByDependency,
   isTerminalSession,
   markDaemonShutdownHandlerInstalled,
   recordActivityEvent,
@@ -146,7 +147,13 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
         // so the second pass never double-kills or double-records a session.
         const killedSessions = new Map<string, Session>();
         const killActivePass = async (): Promise<void> => {
-          const active = (await sm.list()).filter((s) => !isTerminalSession(s));
+          // Held (blocked-by-dependency) sessions own no runtime — there is
+          // nothing to stop. Leave their reservation on disk so the scheduler
+          // resumes them on the next `ao start` instead of `kill()` terminating
+          // them and losing the held marker across stop/restore (#10).
+          const active = (await sm.list()).filter(
+            (s) => !isTerminalSession(s) && !(s.lifecycle && isBlockedByDependency(s.lifecycle)),
+          );
           for (const session of active) {
             if (killedSessions.has(session.id)) continue;
             try {

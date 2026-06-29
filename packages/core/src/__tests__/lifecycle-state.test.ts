@@ -3,6 +3,7 @@ import {
   cloneLifecycle,
   createInitialCanonicalLifecycle,
   deriveLegacyStatus,
+  isBlockedByDependency,
   parseCanonicalLifecycle,
 } from "../lifecycle-state.js";
 
@@ -18,6 +19,35 @@ function createOpenPRLifecycle() {
   lifecycle.runtime.reason = "process_running";
   return lifecycle;
 }
+
+describe("isBlockedByDependency", () => {
+  it("is true only for not_started + blocked_by_dependency", () => {
+    const blocked = createInitialCanonicalLifecycle("worker", new Date("2025-01-01T00:00:00Z"));
+    blocked.session.reason = "blocked_by_dependency";
+    expect(isBlockedByDependency(blocked)).toBe(true);
+    // Blocked sessions derive to the spawning legacy status (held pre-state).
+    expect(deriveLegacyStatus(blocked)).toBe("spawning");
+  });
+
+  it("is false for a normal not_started session and other states", () => {
+    const fresh = createInitialCanonicalLifecycle("worker", new Date("2025-01-01T00:00:00Z"));
+    expect(isBlockedByDependency(fresh)).toBe(false);
+
+    const working = createOpenPRLifecycle();
+    working.session.state = "working";
+    working.session.reason = "task_in_progress";
+    expect(isBlockedByDependency(working)).toBe(false);
+  });
+
+  it("survives a metadata round-trip through parseCanonicalLifecycle", () => {
+    const blocked = createInitialCanonicalLifecycle("worker", new Date("2025-01-01T00:00:00Z"));
+    blocked.session.reason = "blocked_by_dependency";
+    const parsed = parseCanonicalLifecycle({ lifecycle: JSON.stringify(blocked) });
+    expect(parsed.session.state).toBe("not_started");
+    expect(parsed.session.reason).toBe("blocked_by_dependency");
+    expect(isBlockedByDependency(parsed)).toBe(true);
+  });
+});
 
 describe("deriveLegacyStatus", () => {
   it("preserves urgent session states ahead of open PR aliases", () => {

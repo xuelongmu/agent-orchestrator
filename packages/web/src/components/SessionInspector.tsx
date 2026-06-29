@@ -2,7 +2,7 @@
 
 import { useState, type ReactNode } from "react";
 import { cn } from "@/lib/cn";
-import type { DashboardSession } from "@/lib/types";
+import type { CostEstimate, DashboardSession } from "@/lib/types";
 import { useResizable } from "@/hooks/useResizable";
 import { StatusBadge } from "./StatusBadge";
 import { SessionDetailPRCard } from "./SessionDetailPRCard";
@@ -172,6 +172,9 @@ function SummaryView({ session }: { session: DashboardSession }) {
           {session.metadata["agent"] ? <Row k="Agent" v={session.metadata["agent"]} mono /> : null}
           {session.branch ? <Row k="Branch" v={session.branch} mono /> : null}
           {session.issueLabel ? <Row k="Issue" v={session.issueLabel} mono /> : null}
+          {session.cost && session.cost.estimatedCostUsd > 0 ? (
+            <Row k="Cost" v={formatCostLine(session.cost)} mono />
+          ) : null}
           <Row k="Started" v={formatTimeCompact(session.createdAt)} mono />
           <Row k="Session" v={session.id} mono />
         </dl>
@@ -299,6 +302,20 @@ function BrowserView() {
       </div>
     </div>
   );
+}
+
+/** Compact token count, e.g. `45.2k` or `1.3M`. */
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+/** One-line cost: `$1.23 · 45.2k tok`. */
+function formatCostLine(cost: CostEstimate): string {
+  const usd = `$${cost.estimatedCostUsd.toFixed(2)}`;
+  const tokens = cost.inputTokens + cost.outputTokens;
+  return tokens > 0 ? `${usd} · ${formatTokens(tokens)} tok` : usd;
 }
 
 function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {

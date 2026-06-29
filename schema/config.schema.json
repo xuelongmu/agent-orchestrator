@@ -47,6 +47,9 @@
     "defaults": {
       "$ref": "#/$defs/defaultPlugins"
     },
+    "budget": {
+      "$ref": "#/$defs/budgetConfig"
+    },
     "plugins": {
       "type": "array",
       "default": [],
@@ -377,6 +380,26 @@
         "opencodeIssueSessionStrategy": {
           "type": "string",
           "enum": ["reuse", "delete", "ignore"]
+        },
+        "budget": {
+          "$ref": "#/$defs/budgetConfig"
+        }
+      }
+    },
+    "budgetConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Cost budget caps (estimated USD). A cap of 0 or omitted means no limit.",
+      "properties": {
+        "perSessionUsd": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Pause a session once its own estimated cost exceeds this many USD."
+        },
+        "perProjectUsd": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Pause sessions once a project's combined estimated cost exceeds this many USD."
         }
       }
     },

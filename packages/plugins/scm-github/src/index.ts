@@ -60,6 +60,7 @@ const BOT_AUTHORS = new Set([
   "deepsource-autofix[bot]",
   "snyk-bot",
   "lgtm-com[bot]",
+  "chatgpt-codex-connector[bot]",
 ]);
 
 const CI_FAILURE_LOG_TAIL_LINES = 120;

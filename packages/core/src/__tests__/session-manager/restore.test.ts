@@ -7,7 +7,10 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { createSessionManager } from "../../session-manager.js";
-import { createInitialCanonicalLifecycle } from "../../lifecycle-state.js";
+import {
+  createInitialCanonicalLifecycle,
+  deriveLegacyStatus,
+} from "../../lifecycle-state.js";
 import { getWorkspaceAgentsMdPath } from "../../opencode-agents-md.js";
 import { getProjectDir } from "../../paths.js";
 import {
@@ -23,6 +26,7 @@ import {
   type Runtime,
   type Agent,
   type Workspace,
+  type SessionMetadata,
 } from "../../types.js";
 import { setupTestContext, teardownTestContext, makeHandle, type TestContext } from "../test-utils.js";
 import { installMockOpencode, PATH_SEP } from "./opencode-helpers.js";
@@ -47,6 +51,34 @@ afterEach(() => {
 });
 
 describe("restore", () => {
+  it("re-establishes the held pre-state without launching when only the lifecycle marks it held", async () => {
+    // Resolved-but-deferred (#10): all prerequisites cleared so `blockedBy` is
+    // empty, but the launch was deferred by the concurrency cap, leaving the
+    // session held purely by its lifecycle reason. restore() must NOT relaunch
+    // it as a normal worker (which would bypass the cap); it must re-establish
+    // the held pre-state.
+    const createdAt = new Date("2024-01-01T00:00:00.000Z");
+    const lifecycle = createInitialCanonicalLifecycle("worker", createdAt);
+    lifecycle.session.reason = "blocked_by_dependency";
+    writeMetadata(sessionsDir, "app-held", {
+      worktree: "",
+      branch: "feat/app-held",
+      status: deriveLegacyStatus(lifecycle),
+      lifecycle,
+      project: "my-app",
+      agent: "mock-agent",
+      createdAt: createdAt.toISOString(),
+    } as unknown as SessionMetadata);
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await sm.restore("app-held");
+
+    expect(mockRuntime.create).not.toHaveBeenCalled();
+    const raw = readMetadataRaw(sessionsDir, "app-held");
+    const restored = JSON.parse(raw?.["lifecycle"] ?? "{}");
+    expect(restored.session?.reason).toBe("blocked_by_dependency");
+  });
+
   it("restores a killed session with existing workspace", async () => {
     // Create a workspace directory that exists
     const wsPath = join(tmpDir, "ws-app-1");

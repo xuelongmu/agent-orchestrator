@@ -224,6 +224,13 @@ export const GlobalConfigSchema = z
         worker: z.object({ agent: z.string().optional() }).optional(),
       })
       .default({}),
+    /** Cost budget caps applied to every project unless overridden per-project. */
+    budget: z
+      .object({
+        perSessionUsd: z.number().nonnegative().optional(),
+        perProjectUsd: z.number().nonnegative().optional(),
+      })
+      .optional(),
     /** Project registry — map key is the canonical project ID. */
     projects: z.record(GlobalProjectEntrySchema).default({}),
     /** Optional explicit project ordering for sidebar / portfolio display. */
@@ -309,6 +316,12 @@ export const LocalProjectConfigSchema = z
       .optional(),
     opencodeIssueSessionStrategy: z.enum(["reuse", "delete", "ignore"]).optional(),
     decomposer: z.object({}).passthrough().optional(),
+    budget: z
+      .object({
+        perSessionUsd: z.number().nonnegative().optional(),
+        perProjectUsd: z.number().nonnegative().optional(),
+      })
+      .optional(),
   })
   .passthrough();
 
@@ -1098,6 +1111,8 @@ export function migrateToGlobalConfig(oldConfigPath: string, globalConfigPath?: 
     ] as GlobalConfig["notificationRouting"];
   if (parsed["reactions"] !== null && parsed["reactions"] !== undefined)
     newGlobal.reactions = parsed["reactions"] as GlobalConfig["reactions"];
+  if (parsed["budget"] !== null && parsed["budget"] !== undefined)
+    newGlobal.budget = parsed["budget"] as GlobalConfig["budget"];
 
   // Build project registry entries
   for (const [projectId, project] of Object.entries(oldProjects)) {
