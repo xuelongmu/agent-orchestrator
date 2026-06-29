@@ -267,7 +267,9 @@ export async function createPlanTickets({
   // Resolve a dependency ref to the identifier embedded in `from`'s issue body.
   // A cross-repo dependency is qualified as "owner/repo#N" so the tracker renders
   // a real cross-repo reference instead of a repo-local "#N" that would mislink to
-  // the wrong issue; same-repo dependencies stay bare numbers.
+  // the wrong issue; same-repo dependencies stay bare numbers. The qualified form
+  // is globally unique, so the dependency scheduler resolves it across projects
+  // (see isDependencySatisfied) — a bare cross-repo "#N" never would.
   const resolveDep = (ref: string, from: PlannedTicket): string => {
     const issue = refToIssue.get(ref);
     if (!issue) {

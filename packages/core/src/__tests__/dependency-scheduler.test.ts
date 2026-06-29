@@ -22,6 +22,8 @@ interface SessionOverrides {
   blockedBy?: string[];
   status?: Session["status"];
   role?: string;
+  /** "owner/repo" the session opened its PR in — drives repoQualifiedIssueIds. */
+  prRepo?: string;
 }
 
 function makeSession(overrides: SessionOverrides = {}): Session {
@@ -33,6 +35,20 @@ function makeSession(overrides: SessionOverrides = {}): Session {
     lifecycle.pr.state = "merged";
     lifecycle.pr.reason = "merged";
   }
+  const prs: Session["prs"] = [];
+  if (overrides.prRepo) {
+    const [owner, repo] = overrides.prRepo.split("/");
+    prs.push({
+      number: 1,
+      url: `https://example.com/${overrides.prRepo}/pull/1`,
+      title: "PR",
+      owner,
+      repo,
+      branch: "feat/1",
+      baseBranch: "main",
+      isDraft: false,
+    });
+  }
   return {
     id: (overrides.id ?? "app-1") as SessionId,
     projectId: overrides.projectId ?? "app",
@@ -42,8 +58,8 @@ function makeSession(overrides: SessionOverrides = {}): Session {
     lifecycle,
     branch: "feat/1",
     issueId: overrides.issueId === undefined ? null : overrides.issueId,
-    pr: null,
-    prs: [],
+    pr: prs[0] ?? null,
+    prs,
     workspacePath: null,
     runtimeHandle: null,
     agentInfo: null,
@@ -101,6 +117,24 @@ describe("isDependencySatisfied", () => {
   it("does NOT cross-satisfy a same-numbered issue in another project", () => {
     // backend#20 merged must not unblock a frontend dependent on its own #20.
     expect(isDependencySatisfied("20", "frontend", satisfied)).toBe(false);
+  });
+
+  it("matches a repo-qualified issue ref from any project (globally unique)", () => {
+    // A cross-repo blocker emitted by `ao plan` as "acme/api#5" must resolve once
+    // the merged session that owns acme/api#5 lands, even in another project.
+    const crossRepo = collectSatisfiedDependencies([
+      makeSession({
+        id: "api-1",
+        projectId: "api",
+        issueId: "5",
+        prRepo: "acme/api",
+        prMerged: true,
+      }),
+    ]);
+    expect(isDependencySatisfied("acme/api#5", "web", crossRepo)).toBe(true);
+    expect(isDependencySatisfied("acme/api#5", "anything", crossRepo)).toBe(true);
+    // A different repo's #5 must not satisfy it.
+    expect(isDependencySatisfied("acme/other#5", "web", crossRepo)).toBe(false);
   });
 });
 
