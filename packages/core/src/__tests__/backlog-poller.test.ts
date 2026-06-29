@@ -860,7 +860,7 @@ describe("backlog poller", () => {
     let sessions: Session[] = [makeMergedSession("ao-1", "42")];
     const listIssues = vi.fn(async () => []); // no agent:backlog / agent:done work
     const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
-    const updateIssue = vi.fn(async () => undefined);
+    const updateIssue = vi.fn(async (_id: string, _update: { labels?: string[] }) => undefined);
     const spawn = vi.fn(async () => ({ id: "spawned" }));
     const kill = vi.fn(async () => ({ cleaned: true, alreadyTerminated: false }));
     const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
