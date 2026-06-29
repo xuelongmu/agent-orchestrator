@@ -16,7 +16,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { getShell, isWindows, killProcessTree } from "./platform.js";
+import { getShell, isWindows, killProcessTree, resolvePowerShell } from "./platform.js";
 import { shellEscape } from "./utils.js";
 import type { CreateIssueInput, Issue, ProjectConfig, Tracker } from "./types.js";
 
@@ -255,10 +255,11 @@ export async function createPlanTickets({
 
   const byRef = new Map(plan.tickets.map((t) => [t.ref, t]));
   if (repoScoped) {
-    // Reject malformed per-ticket repo overrides up front — they are passed
-    // straight to `gh issue create --repo OWNER/REPO`, so an invalid value
-    // (e.g. "api") would only fail mid-run, after earlier tickets were created.
-    assertValidRepoOverrides(plan);
+    // Reject malformed per-ticket repo overrides and tickets with no resolvable
+    // repo up front — they are passed straight to `gh issue create --repo
+    // OWNER/REPO`, so an invalid/missing value would only fail mid-run, after
+    // earlier tickets were created.
+    assertTicketReposResolvable(plan, project);
     // Related links are non-directional and emulated as repo-local `#N` markers
     // on whichever ticket is created last, so a cross-repo related edge would
     // silently mislink. Reject those up front. Cross-repo *dependency* edges
@@ -352,20 +353,31 @@ function isRepoScopedTracker(tracker: Tracker): boolean {
 }
 
 /**
- * A per-ticket `repo` override must be an `OWNER/REPO` path (optionally with a
- * host or GitLab subgroups) — it is passed straight to `gh issue create --repo`.
- * Reject malformed values (e.g. "api", or anything with whitespace) before any
- * issue is created, so an invalid override can't leave a partial ticket set.
+ * For a repo-scoped tracker, every ticket must resolve to a valid repo before any
+ * issue is created — otherwise an invalid override or a missing default repo would
+ * only surface mid-run (after earlier tickets were created), leaving a partial set.
+ *
+ * A per-ticket `repo` override must be an `OWNER/REPO` path (optionally with a host
+ * or GitLab subgroups) — it is passed straight to `gh issue create --repo`. A
+ * ticket without an override falls back to `project.repo`, which must exist.
  */
-function assertValidRepoOverrides(plan: Plan): void {
+function assertTicketReposResolvable(plan: Plan, project: ProjectConfig): void {
   for (const ticket of plan.tickets) {
-    const repo = ticket.repo;
-    if (repo === undefined) continue;
-    const segments = repo.split("/");
-    if (/\s/.test(repo) || segments.length < 2 || segments.some((s) => s.length === 0)) {
+    const override = ticket.repo;
+    if (override !== undefined) {
+      const segments = override.split("/");
+      if (/\s/.test(override) || segments.length < 2 || segments.some((s) => s.length === 0)) {
+        throw new PlanValidationError(
+          `Ticket "${ticket.ref}" has an invalid repo override "${override}". ` +
+            `Use an OWNER/REPO path (e.g. "acme/api").`,
+        );
+      }
+      continue;
+    }
+    if (!project.repo) {
       throw new PlanValidationError(
-        `Ticket "${ticket.ref}" has an invalid repo override "${repo}". ` +
-          `Use an OWNER/REPO path (e.g. "acme/api").`,
+        `Ticket "${ticket.ref}" has no repo and the project has no default repo. ` +
+          `Add a 'repo' to the project config or set a per-ticket repo override.`,
       );
     }
   }
@@ -597,14 +609,17 @@ async function spawnCaptured(
  * delivered over stdin.
  *
  * On Windows the binary (typically an npm `.cmd` shim) and its args are wrapped
- * into a single PowerShell command string via `shellEscape` and run through
- * `getShell()`, instead of relying on spawn's `shell: true`. Under `shell: true`
- * Node leaves args "not escaped, only space-separated" (DEP0190), so a temp path
- * containing spaces (`C:\Users\Jane Doe\...\plan.json`) or a model value with a
- * metacharacter like `&` would be split/reinterpreted by the shell. `shellEscape`
- * single-quotes each arg for PowerShell, and the `& ` call operator invokes the
- * leading quoted path as a command. On Unix the binary is spawned directly with
- * no shell, so Node passes the argv through verbatim.
+ * into a single PowerShell command string via `shellEscape` and run through an
+ * explicitly-resolved PowerShell (`resolvePowerShell()`), instead of relying on
+ * spawn's `shell: true`. Under `shell: true` Node leaves args "not escaped, only
+ * space-separated" (DEP0190), so a temp path containing spaces
+ * (`C:\Users\Jane Doe\...\plan.json`) or a model value with a metacharacter like
+ * `&` would be split/reinterpreted by the shell. `shellEscape` single-quotes each
+ * arg for PowerShell, and the `& ` call operator invokes the leading quoted path
+ * as a command. We resolve PowerShell directly rather than via `getShell()`,
+ * which can return cmd.exe (AO_SHELL=cmd, or no PowerShell) and would mis-parse
+ * this PowerShell-specific text. On Unix the binary is spawned directly with no
+ * shell, so Node passes the argv through verbatim.
  */
 async function runDecomposerBinary(
   binary: string,
@@ -612,7 +627,13 @@ async function runDecomposerBinary(
   context: { cwd: string; input: string },
 ): Promise<{ stdout: string; stderr: string }> {
   if (isWindows()) {
-    const shell = getShell();
+    const shell = resolvePowerShell();
+    if (!shell) {
+      throw new Error(
+        "PowerShell is required to run the decomposer on Windows but could not be found. " +
+          "Install PowerShell (pwsh) or ensure powershell.exe is available.",
+      );
+    }
     const command = `& ${[binary, ...args].map(shellEscape).join(" ")}`;
     return spawnCaptured(shell.cmd, shell.args(command), {
       cwd: context.cwd,

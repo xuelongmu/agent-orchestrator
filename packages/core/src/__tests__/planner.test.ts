@@ -247,6 +247,22 @@ describe("createPlanTickets", () => {
     expect(calls).toHaveLength(0); // nothing created
   });
 
+  it("rejects a ticket with no repo when the project has no default repo", async () => {
+    const { tracker, calls } = makeMockTracker("github");
+    const noRepoProject: ProjectConfig = { ...baseProject, repo: undefined };
+    // First ticket carries an override; a later one omits repo and would fall
+    // back to the (missing) project default — must fail before any creation.
+    const p = plan([
+      { ref: "api", title: "API", body: "", repo: "acme/api" },
+      { ref: "web", title: "Web", body: "" },
+    ]);
+
+    await expect(
+      createPlanTickets({ plan: p, tracker, project: noRepoProject }),
+    ).rejects.toThrow(/no repo/);
+    expect(calls).toHaveLength(0); // nothing created
+  });
+
   it("rejects cross-repo related edges before creating anything", async () => {
     const { tracker, calls } = makeMockTracker();
     const p = plan([

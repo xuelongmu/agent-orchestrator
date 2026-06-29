@@ -48,11 +48,28 @@ export function isPrerequisiteSatisfied(session: Session): boolean {
  *    globally unique, so — like a session id — it may satisfy a dependent in
  *    **any** project. `ao plan` emits cross-repo blockers in this form, so this
  *    is what lets an ordered multi-repo plan actually unblock across repos.
+ *  - `globalIssueIds`: workspace-scoped tracker keys (e.g. Linear's "ENG-1") are
+ *    globally unique across the workspace — unlike repo-scoped issue numbers,
+ *    they carry a team prefix — so they may satisfy a dependent in **any**
+ *    project. They are recognized by being non-numeric (GitHub/GitLab ids are
+ *    bare numbers); `ao plan` emits cross-project Linear blockers as bare keys,
+ *    so this is what lets a multi-project Linear plan unblock across projects.
  */
 export interface SatisfiedDependencies {
   sessionIds: Set<string>;
   issueIdsByProject: Map<string, Set<string>>;
   repoQualifiedIssueIds: Set<string>;
+  globalIssueIds: Set<string>;
+}
+
+/**
+ * True for a workspace-scoped tracker key (e.g. Linear's "ENG-1"): globally
+ * unique because it carries a non-numeric team prefix. Repo-scoped GitHub/GitLab
+ * issue ids are bare numbers and are NOT globally unique. `id` is expected to be
+ * already normalized (lowercased, leading "#"/repo prefix removed).
+ */
+function isWorkspaceScopedIssueId(id: string): boolean {
+  return id.length > 0 && !/^\d+$/.test(id);
 }
 
 /**
@@ -73,6 +90,7 @@ export function collectSatisfiedDependencies(
   const sessionIds = new Set<string>();
   const issueIdsByProject = new Map<string, Set<string>>();
   const repoQualifiedIssueIds = new Set<string>();
+  const globalIssueIds = new Set<string>();
   for (const session of sessions) {
     if (!isPrerequisiteSatisfied(session)) continue;
     const sessionId = normalizeDependencyId(session.id);
@@ -86,21 +104,26 @@ export function collectSatisfiedDependencies(
           issueIdsByProject.set(session.projectId, perProject);
         }
         perProject.add(issueId);
-        const repo = projectRepo?.(session.projectId);
-        if (repo) {
-          repoQualifiedIssueIds.add(normalizeDependencyId(`${repo}#${issueId}`));
+        if (isWorkspaceScopedIssueId(issueId)) {
+          globalIssueIds.add(issueId);
+        } else {
+          const repo = projectRepo?.(session.projectId);
+          if (repo) {
+            repoQualifiedIssueIds.add(normalizeDependencyId(`${repo}#${issueId}`));
+          }
         }
       }
     }
   }
-  return { sessionIds, issueIdsByProject, repoQualifiedIssueIds };
+  return { sessionIds, issueIdsByProject, repoQualifiedIssueIds, globalIssueIds };
 }
 
 /**
  * True when a single `blockedBy` entry of a dependent in `projectId` is
  * satisfied — by a merged session id (any project), a merged repo-qualified
- * issue ref "owner/repo#N" (any project, globally unique), or a merged bare
- * issue id within the same project.
+ * issue ref "owner/repo#N" (any project, globally unique), a merged
+ * workspace-scoped key like "ENG-1" (any project, globally unique), or a merged
+ * bare repo-scoped issue id within the same project.
  */
 export function isDependencySatisfied(
   entry: string,
@@ -111,6 +134,9 @@ export function isDependencySatisfied(
   if (satisfied.sessionIds.has(normalized)) return true;
   if (normalized.includes("/")) {
     return satisfied.repoQualifiedIssueIds.has(normalized);
+  }
+  if (isWorkspaceScopedIssueId(normalized)) {
+    return satisfied.globalIssueIds.has(normalized);
   }
   return satisfied.issueIdsByProject.get(projectId)?.has(normalized) ?? false;
 }

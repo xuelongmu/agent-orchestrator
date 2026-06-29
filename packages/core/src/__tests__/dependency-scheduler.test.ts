@@ -125,6 +125,21 @@ describe("isDependencySatisfied", () => {
     ]);
     expect(isDependencySatisfied("acme/api#5", "web", noRepo)).toBe(false);
   });
+
+  it("matches a workspace-scoped key (Linear) from any project (globally unique)", () => {
+    // Linear keys carry a team prefix and are globally unique, so a bare "ENG-1"
+    // blocker must resolve a dependent in another AO project once A merges.
+    const linear = collectSatisfiedDependencies([
+      makeSession({ id: "api-1", projectId: "api", issueId: "ENG-1", prMerged: true }),
+    ]);
+    expect(isDependencySatisfied("ENG-1", "web", linear)).toBe(true);
+    expect(isDependencySatisfied("#ENG-1", "web", linear)).toBe(true); // # sugar
+    // A bare numeric id stays repo/project-local and must not match globally.
+    const numeric = collectSatisfiedDependencies([
+      makeSession({ id: "b-1", projectId: "backend", issueId: "7", prMerged: true }),
+    ]);
+    expect(isDependencySatisfied("7", "frontend", numeric)).toBe(false);
+  });
 });
 
 describe("computeRemainingBlockedBy", () => {
