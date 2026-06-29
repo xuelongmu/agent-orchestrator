@@ -37,6 +37,7 @@ import {
   type OrchestratorConfig,
   type ProjectConfig,
 } from "@aoagents/ao-core";
+import { pathsEqual } from "./path-equality.js";
 
 function isMissingGlobalConfig(error: unknown, globalConfigPath: string): boolean {
   return (
@@ -58,12 +59,12 @@ function isMissingGlobalConfig(error: unknown, globalConfigPath: string): boolea
  * required: an explicit `project.agent` outranks a role default, so copying the
  * role default alone could shadow it.
  *
- * Startup-WIDE policy (`reactions`, `notificationRouting`, `lifecycle`) is also
- * baked onto the project as per-project overrides. The merged config otherwise
- * spreads the GLOBAL top-level policy, so without this a startup-only project's
- * lifecycle worker would silently run the unrelated global reaction/routing/
- * merge-cleanup policy instead of the one declared in the config that launched
- * `ao start`. The lifecycle manager honors these per-project fields.
+ * Startup-WIDE policy (`reactions`, `notificationRouting`, `lifecycle`, `budget`)
+ * is also baked onto the project as per-project overrides. The merged config
+ * otherwise spreads the GLOBAL top-level policy, so without this a startup-only
+ * project's lifecycle worker would silently run the unrelated global reaction/
+ * routing/merge-cleanup/budget policy instead of the one declared in the config
+ * that launched `ao start`. The lifecycle manager honors these per-project fields.
  */
 function bakeStartupOnlyProject(
   project: ProjectConfig,
@@ -91,6 +92,7 @@ function bakeStartupOnlyProject(
     ...(reactions ? { reactions } : {}),
     notificationRouting: project.notificationRouting ?? startupConfig.notificationRouting,
     lifecycle: project.lifecycle ?? startupConfig.lifecycle,
+    budget: project.budget ?? startupConfig.budget,
     sourceConfigPath: project.sourceConfigPath ?? startupConfig.configPath,
   };
 }
@@ -109,41 +111,80 @@ function absolutizeLocalPluginPath(path: string, startupConfigPath: string): str
   return isAbsolute(path) ? path : resolve(dirname(startupConfigPath), path);
 }
 
-/** Append startup plugin declarations not already present (dedup by name),
- *  absolutizing any relative local `path` against the startup config dir. */
+/**
+ * Identity of a plugin *implementation* — what determines which module loads,
+ * NOT the logical config name. Keyed by source + path/package so a startup local
+ * plugin is never conflated with a same-named global npm/registry plugin (or a
+ * global local plugin in a different directory).
+ */
+function pluginIdentityKey(plugin: InstalledPluginConfig): string {
+  if (plugin.source === "local") return `local:${plugin.path ?? plugin.name}`;
+  return `${plugin.source}:${plugin.package ?? plugin.name}`;
+}
+
+/** Append startup plugin declarations, deduped by implementation identity
+ *  (source + path/package) against the ENABLED global plugins, and absolutizing
+ *  any relative local `path` against the startup config dir. Deduping by name
+ *  alone would drop a startup plugin whose global namesake is disabled or points
+ *  at a different package/path, leaving a carried startup-only project unable to
+ *  resolve its tracker/agent/workspace. */
 function mergeInstalledPlugins(
   globalPlugins: InstalledPluginConfig[] | undefined,
   startupPlugins: InstalledPluginConfig[] | undefined,
   startupConfigPath: string,
 ): InstalledPluginConfig[] | undefined {
   if (!startupPlugins?.length) return globalPlugins;
-  const seen = new Set((globalPlugins ?? []).map((p) => p.name));
+  // Only an ENABLED global entry with the same identity makes a startup
+  // declaration redundant — a disabled global entry would be skipped by the
+  // registry, so the startup one must still be carried to actually load.
+  const seen = new Set(
+    (globalPlugins ?? []).filter((p) => p.enabled !== false).map(pluginIdentityKey),
+  );
   const merged = [...(globalPlugins ?? [])];
   for (const plugin of startupPlugins) {
-    if (seen.has(plugin.name)) continue;
-    seen.add(plugin.name);
-    merged.push(
+    const baked =
       plugin.source === "local" && plugin.path
         ? { ...plugin, path: absolutizeLocalPluginPath(plugin.path, startupConfigPath) }
-        : plugin,
-    );
+        : plugin;
+    const key = pluginIdentityKey(baked);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(baked);
   }
   return merged;
 }
 
-/** Absolutize relative local `path` on startup external plugin entries so they
- *  match their (absolutized) `plugins` entry and resolve against the startup
- *  config dir rather than the merged scope's global configPath. */
-function absolutizeExternalEntries(
+/**
+ * Select the startup external plugin entries that actually belong in the merged
+ * scope, and absolutize their relative local `path` (so they match their
+ * absolutized `plugins` entry and resolve against the startup config dir).
+ *
+ * The registry uses these entries to rewrite `config.projects[id].tracker/scm.plugin`
+ * and `config.notifiers[id].plugin` during manifest resolution. An entry whose
+ * target stayed the GLOBAL entry — a project skipped because its id is already
+ * registered, or a notifier alias that collides with a global one — must be
+ * dropped, otherwise the startup config's plugin would clobber the registered
+ * project's tracker/scm or the global notifier.
+ */
+function scopeStartupExternalEntries(
   entries: ExternalPluginEntryRef[] | undefined,
   startupConfigPath: string,
+  carriedProjectIds: Set<string>,
+  startupOnlyNotifierIds: Set<string>,
 ): ExternalPluginEntryRef[] {
   if (!entries?.length) return [];
-  return entries.map((entry) =>
-    entry.path && !entry.package
-      ? { ...entry, path: absolutizeLocalPluginPath(entry.path, startupConfigPath) }
-      : entry,
-  );
+  const scoped: ExternalPluginEntryRef[] = [];
+  for (const entry of entries) {
+    const loc = entry.location;
+    if (loc.kind === "project" && !carriedProjectIds.has(loc.projectId)) continue;
+    if (loc.kind === "notifier" && !startupOnlyNotifierIds.has(loc.notifierId)) continue;
+    scoped.push(
+      entry.path && !entry.package
+        ? { ...entry, path: absolutizeLocalPluginPath(entry.path, startupConfigPath) }
+        : entry,
+    );
+  }
+  return scoped;
 }
 
 /**
@@ -172,9 +213,26 @@ function mergeScopeProjects(
     usedPrefixes.add(project.sessionPrefix || generateSessionPrefix(id));
   }
 
-  let carriedStartupOnly = false;
+  const carriedProjectIds = new Set<string>();
   for (const [id, project] of Object.entries(startupConfig.projects)) {
-    if (id in projects) continue; // Registered project — keep the global entry + defaults.
+    if (id in projects) {
+      // Same id in both configs. Only treat it as the SAME (registered) project
+      // when they point at the same path. Otherwise the startup config defines a
+      // DIFFERENT project under a colliding id — silently keeping the global
+      // entry would make the supervisor/poller/shutdown manage the startup
+      // project's already-spawned sessions with the wrong path/tracker/defaults.
+      // Fail loudly rather than disambiguate silently.
+      const globalProject = projects[id];
+      if (!pathsEqual(globalProject.path, project.path)) {
+        throw new Error(
+          `Project id collision in merged scope: "${id}" is defined in both the global ` +
+            `registry (path "${globalProject.path}") and the startup config ` +
+            `(path "${project.path}"). Rename the startup project's id (or register it) ` +
+            `before launching ao start.`,
+        );
+      }
+      continue; // Genuinely the same registered project — keep the global entry + defaults.
+    }
     const prefix = project.sessionPrefix || generateSessionPrefix(id);
     if (usedPrefixes.has(prefix)) {
       // Abort rather than silently drop: `runStartup` may already have spawned
@@ -192,17 +250,30 @@ function mergeScopeProjects(
     }
     usedPrefixes.add(prefix);
     projects[id] = bakeStartupOnlyProject(project, startupConfig);
-    carriedStartupOnly = true;
+    carriedProjectIds.add(id);
   }
 
-  if (!carriedStartupOnly) {
+  if (carriedProjectIds.size === 0) {
     // Nothing startup-only — the global config already covers the full scope.
     return { ...globalConfig, projects };
   }
 
+  // Startup notifier aliases not already defined globally. Their definitions are
+  // merged below so a carried project's baked `notificationRouting` can resolve
+  // them; on a name collision the global definition wins (it governs the global
+  // projects), so colliding startup notifier external entries are NOT applied.
+  const startupOnlyNotifierIds = new Set(
+    Object.keys(startupConfig.notifiers ?? {}).filter(
+      (id) => !(id in (globalConfig.notifiers ?? {})),
+    ),
+  );
+
   return {
     ...globalConfig,
     projects,
+    // Add startup-only notifier definitions (global wins on alias collision) so a
+    // carried project routing to a startup alias doesn't hit `target_missing`.
+    notifiers: { ...(startupConfig.notifiers ?? {}), ...(globalConfig.notifiers ?? {}) },
     plugins: mergeInstalledPlugins(
       globalConfig.plugins,
       startupConfig.plugins,
@@ -210,7 +281,12 @@ function mergeScopeProjects(
     ),
     _externalPluginEntries: [
       ...(globalConfig._externalPluginEntries ?? []),
-      ...absolutizeExternalEntries(startupConfig._externalPluginEntries, startupConfig.configPath),
+      ...scopeStartupExternalEntries(
+        startupConfig._externalPluginEntries,
+        startupConfig.configPath,
+        carriedProjectIds,
+        startupOnlyNotifierIds,
+      ),
     ],
     // Distinct registry cache identity: this scope carries startup-only plugin
     // declarations the plain global config lacks, but keeps the global

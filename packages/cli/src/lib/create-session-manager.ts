@@ -19,6 +19,13 @@ import {
 import { importPluginModuleFromSource } from "./plugin-store.js";
 
 const registryPromises = new Map<string, Promise<PluginRegistry>>();
+// The config each cached registry was built from. `loadFromConfig` mutates it,
+// rewriting inline-external plugin references (`project.tracker/scm.plugin`,
+// `notifier.plugin`) from any inferred temporary name to the real manifest.name.
+// A freshly loaded config (e.g. every backlog poll) carries the temp names again,
+// so on a cache hit we reconcile it from this built config — otherwise
+// `registry.get(tempName)` returns null and the project is skipped/fails.
+const builtConfigs = new Map<string, OrchestratorConfig>();
 
 function getRegistryCacheKey(config: OrchestratorConfig): string {
   // A merged scope (global ∪ startup-only config) sets `_registryScopeKey` so its
@@ -26,6 +33,27 @@ function getRegistryCacheKey(config: OrchestratorConfig): string {
   // cached apart from the plain global config's registry (which shares the same
   // `configPath`). See OrchestratorConfig._registryScopeKey.
   return config._registryScopeKey || config.configPath || "__default__";
+}
+
+/**
+ * Copy resolved inline-external plugin names from a previously-built config onto
+ * a fresh one, so the fresh config's plugin references match what the cached
+ * registry actually registered under (the real manifest.name, not an inferred
+ * temporary name). Keyed by the structured external-entry location.
+ */
+function reconcileExternalPluginNames(target: OrchestratorConfig, source: OrchestratorConfig): void {
+  for (const entry of source._externalPluginEntries ?? []) {
+    const loc = entry.location;
+    if (loc.kind === "project") {
+      const resolved = source.projects[loc.projectId]?.[loc.configType]?.plugin;
+      const targetSlot = target.projects[loc.projectId]?.[loc.configType];
+      if (resolved && targetSlot) targetSlot.plugin = resolved;
+    } else if (loc.kind === "notifier") {
+      const resolved = source.notifiers?.[loc.notifierId]?.plugin;
+      const targetNotifier = target.notifiers?.[loc.notifierId];
+      if (resolved && targetNotifier) targetNotifier.plugin = resolved;
+    }
+  }
 }
 
 /**
@@ -43,15 +71,26 @@ export async function getPluginRegistry(config: OrchestratorConfig): Promise<Plu
       // Prefer the AO-managed plugin store when a package is installed there,
       // but still fall back to the CLI/workspace dependency tree for built-ins.
       await registry.loadFromConfig(config, importPluginModuleFromSource);
+      // `config` is now mutated with resolved manifest names — keep it so later
+      // (cache-hit) callers with a fresh config can be reconciled against it.
+      builtConfigs.set(cacheKey, config);
       return registry;
     })().catch((err) => {
       registryPromises.delete(cacheKey);
+      builtConfigs.delete(cacheKey);
       throw err;
     });
     registryPromises.set(cacheKey, registryPromise);
   }
 
-  return registryPromise;
+  const registry = await registryPromise;
+  // Cache hit with a different (freshly loaded) config object: reconcile its
+  // inline-external plugin references so they match the registered manifest names.
+  const builtConfig = builtConfigs.get(cacheKey);
+  if (builtConfig && builtConfig !== config) {
+    reconcileExternalPluginNames(config, builtConfig);
+  }
+  return registry;
 }
 
 /**

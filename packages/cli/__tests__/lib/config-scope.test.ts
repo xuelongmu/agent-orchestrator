@@ -133,22 +133,40 @@ describe("loadMergedScopeConfig", () => {
     expect(merged.projects.local.runtime).toBe("process"); // filled from startup defaults
   });
 
-  it("keeps the canonical global entry for a project present in both configs", () => {
+  it("keeps the canonical global entry for a project present in both configs (same path)", () => {
+    // Same id AND same path → genuinely the same registered project: keep the
+    // global entry. (A same-id/different-path collision is rejected — see below.)
     const startup = {
       configPath: STARTUP,
       defaults: startupDefaults,
-      projects: { shared: project("startup-shared", "s") },
+      projects: { shared: project("startup-shared", "s", { path: "/repos/shared" }) },
     };
     const global = {
       configPath: GLOBAL,
       defaults: globalDefaults,
-      projects: { shared: project("global-shared", "g") },
+      projects: { shared: project("global-shared", "g", { path: "/repos/shared" }) },
     };
     mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
 
     const merged = loadMergedScopeConfig(STARTUP);
 
     expect(merged.projects.shared.name).toBe("global-shared");
+  });
+
+  it("rejects a project-id collision when the startup project points at a different path", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { shared: project("shared", "s", { path: "/repos/startup-shared" }) },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { shared: project("shared", "g", { path: "/repos/global-shared" }) },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    expect(() => loadMergedScopeConfig(STARTUP)).toThrow(/project id collision/i);
   });
 
   it("absolutizes a startup-only project's relative local plugin path against the startup dir", () => {
@@ -213,12 +231,12 @@ describe("loadMergedScopeConfig", () => {
     const startup = {
       configPath: STARTUP,
       defaults: startupDefaults,
-      projects: { shared: project("startup-shared", "s") },
+      projects: { shared: project("startup-shared", "s", { path: "/repos/shared" }) },
     };
     const global = {
       configPath: GLOBAL,
       defaults: globalDefaults,
-      projects: { shared: project("global-shared", "s") },
+      projects: { shared: project("global-shared", "s", { path: "/repos/shared" }) },
     };
     mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
 
@@ -275,6 +293,138 @@ describe("loadMergedScopeConfig", () => {
     expect(merged.projects.local.lifecycle).toEqual({ autoCleanupOnMerge: false });
     // The merged config's top-level policy stays global (it governs global projects).
     expect(merged.notificationRouting).toEqual({ action: ["desktop"] });
+  });
+
+  it("bakes the startup top-level budget onto a carried project", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      budget: { perSessionUsd: 5 },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      budget: { perSessionUsd: 99 },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    expect(merged.projects.local.budget).toEqual({ perSessionUsd: 5 });
+  });
+
+  it("merges startup-only notifier definitions (global wins on alias collision)", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      notifiers: {
+        slack: { plugin: "slack", webhookUrl: "startup-hook" },
+        shared: { plugin: "slack", webhookUrl: "startup-shared" },
+      },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      notifiers: { shared: { plugin: "slack", webhookUrl: "global-shared" } },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    // Startup-only alias is added; the colliding alias keeps the global value.
+    expect(merged.notifiers.slack).toEqual({ plugin: "slack", webhookUrl: "startup-hook" });
+    expect(merged.notifiers.shared).toEqual({ plugin: "slack", webhookUrl: "global-shared" });
+  });
+
+  it("keeps a startup plugin whose name matches a global plugin of a different identity", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      // Same logical name as a global plugin, but a local path (different identity).
+      plugins: [{ name: "tracker", source: "local", path: "./plugins/tracker" }],
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      plugins: [{ name: "tracker", source: "npm", package: "@acme/tracker" }],
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    const local = merged.plugins?.find((p) => p.source === "local" && p.name === "tracker");
+    expect(local).toBeDefined();
+    expect(local?.path).toBe(resolve(dirname(STARTUP), "./plugins/tracker"));
+    // Both implementations survive (npm global + local startup).
+    expect(merged.plugins?.filter((p) => p.name === "tracker")).toHaveLength(2);
+  });
+
+  it("carries a startup plugin whose name matches a DISABLED global plugin", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      plugins: [{ name: "tracker", source: "npm", package: "@acme/tracker" }],
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      plugins: [{ name: "tracker", source: "npm", package: "@acme/tracker", enabled: false }],
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    // The disabled global entry must not suppress the (enabled) startup one.
+    expect(merged.plugins?.some((p) => p.name === "tracker" && p.enabled !== false)).toBe(true);
+  });
+
+  it("does not apply a startup external entry to a skipped (registered) project", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      // `reg` collides with a registered project (same path → skipped); `local`
+      // is carried. Only the carried project's external entry should survive.
+      projects: {
+        reg: project("reg", "r", { path: "/repos/reg" }),
+        local: project("local", "l"),
+      },
+      _externalPluginEntries: [
+        {
+          source: "project reg tracker",
+          location: { kind: "project", projectId: "reg", configType: "tracker" },
+          slot: "tracker",
+          package: "@startup/reg-tracker",
+        },
+        {
+          source: "project local tracker",
+          location: { kind: "project", projectId: "local", configType: "tracker" },
+          slot: "tracker",
+          package: "@startup/local-tracker",
+        },
+      ],
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r", { path: "/repos/reg" }) },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    const entryProjects = (merged._externalPluginEntries ?? []).map(
+      (e) => (e.location as { projectId?: string }).projectId,
+    );
+    expect(entryProjects).toContain("local");
+    expect(entryProjects).not.toContain("reg");
   });
 
   it("falls back to the startup config when no global config exists", () => {
