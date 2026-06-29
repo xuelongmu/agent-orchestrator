@@ -1,6 +1,8 @@
 ---
 "@aoagents/ao-core": minor
 "@aoagents/ao-cli": minor
+"@aoagents/ao-plugin-tracker-github": minor
+"@aoagents/ao-plugin-tracker-gitlab": minor
 ---
 
 feat(cli,core): `ao plan` — decompose a goal into linked tickets with an approval gate
@@ -22,3 +24,7 @@ tickets and only creates them after human approval:
   falling back to the orchestrator/worker/default agent) and documents it in
   `ao config-help`.
 - Teaches the orchestrator prompt when and how to decompose goals with `ao plan`.
+- GitHub and GitLab trackers now render and parse repo-qualified cross-repo
+  relation markers (`owner/repo#N`) in issue bodies, which `ao plan` relies on for
+  cross-repo blocker ordering. Both tracker packages are bumped so a released CLI
+  ships the matching tracker behavior.

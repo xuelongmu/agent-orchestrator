@@ -232,19 +232,26 @@ export interface CreatePlanTicketsOptions {
  * relations (`parentRef`, `blockedByRefs`, `relatedRefs`) are translated into
  * the tracker's `CreateIssueInput` relation fields.
  */
-export async function createPlanTickets({
-  plan,
-  tracker,
-  project,
-}: CreatePlanTicketsOptions): Promise<CreatedTicket[]> {
+export async function createPlanTickets(
+  options: CreatePlanTicketsOptions,
+): Promise<CreatedTicket[]> {
+  const { tracker, project } = options;
   if (!tracker.createIssue) {
     throw new Error(`Tracker "${tracker.name}" does not support creating issues.`);
   }
 
-  // Validate the plan graph before any tracker side effects. createPlanTickets is
-  // exported and accepts a Plan directly, so a caller that skipped parsePlan could
-  // pass dangling, duplicate, or cyclic refs; without this guard the earliest
-  // tickets would be created before resolveDep throws, leaving a partial set.
+  // Full schema validation before any tracker side effects. createPlanTickets is
+  // exported and the `Plan` TS type does not enforce the Zod constraints (e.g.
+  // non-empty titles), so a caller that skipped parsePlan could pass a
+  // schema-invalid plan; without this the earliest tickets would be created
+  // before a later createIssue fails. safeParse also applies defaults (body "").
+  const parsed = PlanSchema.safeParse(options.plan);
+  if (!parsed.success) {
+    throw new PlanValidationError(`Plan failed schema validation: ${parsed.error.message}`);
+  }
+  const plan = parsed.data;
+
+  // Then validate the graph (refs/cycles), which the schema does not cover.
   validatePlanGraph(plan);
 
   // Repo-scoped trackers (GitHub/GitLab) key issues and relations by an
@@ -259,8 +266,13 @@ export async function createPlanTickets({
     // repo up front — they are passed straight to `gh issue create --repo
     // OWNER/REPO`, so an invalid/missing value would only fail mid-run, after
     // earlier tickets were created. Validation is tracker-specific (GitHub limits
-    // the path to [HOST/]OWNER/REPO; GitLab allows subgroups).
+    // the path to [HOST/]OWNER/REPO; GitLab allows subgroups), and covers both
+    // overrides and the project default each ticket falls back to.
     assertTicketReposResolvable(plan, project, tracker);
+    // A standalone relation marker line ("Blocked by #123") inside a ticket body
+    // would be re-parsed by the tracker's parseRelations and double-applied as a
+    // real blocker on later `ao spawn`. Reject those up front.
+    assertNoRelationMarkersInBodies(plan);
     // Related links are non-directional and emulated as repo-local `#N` markers
     // on whichever ticket is created last, so a cross-repo related edge would
     // silently mislink. Reject those up front. Cross-repo *dependency* edges
@@ -376,32 +388,58 @@ function isValidRepoOverride(repo: string, trackerName: string): boolean {
 }
 
 /**
- * For a repo-scoped tracker, every ticket must resolve to a valid repo before any
- * issue is created — otherwise an invalid override or a missing default repo would
- * only surface mid-run (after earlier tickets were created), leaving a partial set.
+ * For a repo-scoped tracker, every ticket must resolve to a VALID repo before any
+ * issue is created — otherwise an invalid override OR an invalid/missing default
+ * repo would only surface mid-run (after earlier tickets were created), leaving a
+ * partial set.
  *
- * A per-ticket `repo` override must be a valid path for the tracker (see
- * `isValidRepoOverride`); it is passed straight to `gh issue create --repo`. A
- * ticket without an override falls back to `project.repo`, which must exist.
+ * The effective repo (per-ticket `repo` override, else `project.repo`) is passed
+ * straight to `gh issue create --repo`, so it must match the tracker's accepted
+ * shape (see `isValidRepoOverride`) — the project default is validated too, not
+ * just explicit overrides.
  */
 function assertTicketReposResolvable(plan: Plan, project: ProjectConfig, tracker: Tracker): void {
   for (const ticket of plan.tickets) {
     const override = ticket.repo;
-    if (override !== undefined) {
-      if (!isValidRepoOverride(override, tracker.name)) {
-        const shape =
-          tracker.name === "github" ? "[HOST/]OWNER/REPO" : "OWNER/REPO (subgroups allowed)";
-        throw new PlanValidationError(
-          `Ticket "${ticket.ref}" has an invalid repo override "${override}" for the ${tracker.name} tracker. ` +
-            `Use a ${shape} path (e.g. "acme/api").`,
-        );
-      }
-      continue;
-    }
-    if (!project.repo) {
+    const effective = override ?? project.repo;
+    if (effective === undefined) {
       throw new PlanValidationError(
         `Ticket "${ticket.ref}" has no repo and the project has no default repo. ` +
           `Add a 'repo' to the project config or set a per-ticket repo override.`,
+      );
+    }
+    if (!isValidRepoOverride(effective, tracker.name)) {
+      const shape =
+        tracker.name === "github" ? "[HOST/]OWNER/REPO" : "OWNER/REPO (subgroups allowed)";
+      const source = override !== undefined ? `repo override "${override}"` : `default repo "${effective}"`;
+      throw new PlanValidationError(
+        `Ticket "${ticket.ref}" has an invalid ${source} for the ${tracker.name} tracker. ` +
+          `Use a ${shape} path (e.g. "acme/api").`,
+      );
+    }
+  }
+}
+
+// A standalone relation footer line ("Part of #N", "Blocked by #N",
+// "Related to #N", including cross-repo "owner/repo#N"). Mirrors the markers the
+// GitHub/GitLab trackers parse out of issue bodies.
+const RELATION_MARKER_LINE = /^(?:Part of|Blocked by|Related to) (?:#\d+|[^\s#]+\/[^\s#]+#\d+)\s*$/im;
+
+/**
+ * Reject a ticket whose body contains a standalone relation-marker line. The
+ * GitHub/GitLab trackers append relations as such lines and parse them back out
+ * of the whole body, so a marker the decomposer wrote into the body would be
+ * silently re-applied as a real blocker on a later `ao spawn` — invisible in the
+ * plan preview. Relations must be expressed via parent/blockedBy/relatedRefs.
+ */
+function assertNoRelationMarkersInBodies(plan: Plan): void {
+  for (const ticket of plan.tickets) {
+    const match = ticket.body.match(RELATION_MARKER_LINE);
+    if (match) {
+      throw new PlanValidationError(
+        `Ticket "${ticket.ref}" body contains a relation marker line ("${match[0].trim()}") that collides ` +
+          `with the tracker's relation footer syntax. Express relations via parentRef/blockedByRefs/relatedRefs, ` +
+          `not in the body.`,
       );
     }
   }
@@ -583,11 +621,19 @@ async function spawnCaptured(
     let stderr = "";
     let settled = false;
 
-    const finish = (callback: () => void) => {
-      if (settled) return;
+    // Claim the single settle synchronously (clearing the timeout). Returns false
+    // if another path already settled. Claiming up front means a racing `close`
+    // (e.g. a fast zero-exit with oversized output) cannot win after we've decided
+    // to fail.
+    const claimSettle = (): boolean => {
+      if (settled) return false;
       settled = true;
       if (timer) clearTimeout(timer);
-      callback();
+      return true;
+    };
+
+    const finish = (callback: () => void) => {
+      if (claimSettle()) callback();
     };
 
     const terminateChild = () => {
@@ -612,13 +658,26 @@ async function spawnCaptured(
       reject(error);
     };
 
+    // Record a failure: claim the settle SYNCHRONOUSLY (so a racing close can't
+    // resolve a zero-exit child with oversized output), then reject only AFTER the
+    // child-tree teardown resolves — so a caller that exits immediately (e.g. CLI
+    // process.exit(1)) doesn't leave the async Windows `taskkill /T` mid-flight
+    // with the tree still running.
+    const failAfterTeardown = (
+      message: string,
+      code?: number | null,
+      signal?: NodeJS.Signals | null,
+    ) => {
+      if (!claimSettle()) return;
+      void terminateChild().finally(() => fail(message, code, signal));
+    };
+
     const timer =
       options.timeout && options.timeout > 0
-        ? setTimeout(() => {
-            void terminateChild().finally(() => {
-              finish(() => fail(`Command timed out after ${options.timeout}ms`, null, "SIGTERM"));
-            });
-          }, options.timeout)
+        ? setTimeout(
+            () => failAfterTeardown(`Command timed out after ${options.timeout}ms`, null, "SIGTERM"),
+            options.timeout,
+          )
         : null;
 
     const append = (kind: "stdout" | "stderr", chunk: Buffer) => {
@@ -627,13 +686,7 @@ async function spawnCaptured(
       else stderr += next;
 
       if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) <= maxBuffer) return;
-      // Mirror the timeout path: settle only after the child-tree teardown
-      // resolves, so a caller that exits immediately (e.g. CLI process.exit(1))
-      // doesn't leave the async Windows `taskkill /T` mid-flight with the tree
-      // still running.
-      void terminateChild().finally(() => {
-        finish(() => fail(`Command output exceeded maxBuffer ${maxBuffer}`));
-      });
+      failAfterTeardown(`Command output exceeded maxBuffer ${maxBuffer}`);
     };
 
     child.stdout?.on("data", (chunk: Buffer) => append("stdout", chunk));

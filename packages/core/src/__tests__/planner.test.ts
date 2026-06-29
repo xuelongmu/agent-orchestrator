@@ -304,6 +304,49 @@ describe("createPlanTickets", () => {
     expect(calls).toHaveLength(0); // nothing created
   });
 
+  it("rejects an invalid project default repo, even with an earlier valid override", async () => {
+    const { tracker, calls } = makeMockTracker("github");
+    // GitHub --repo is [HOST/]OWNER/REPO; a 4-segment default is malformed and
+    // must be caught before the override ticket is created.
+    const badDefault: ProjectConfig = { ...baseProject, repo: "org/team/api/worker" };
+    const p = plan([
+      { ref: "api", title: "API", body: "", repo: "acme/api" }, // valid override
+      { ref: "web", title: "Web", body: "" }, // falls back to malformed default
+    ]);
+
+    await expect(
+      createPlanTickets({ plan: p, tracker, project: badDefault }),
+    ).rejects.toThrow(/invalid default repo/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects a relation marker line inside a ticket body", async () => {
+    const { tracker, calls } = makeMockTracker("github");
+    // A standalone "Blocked by #123" in the body would be re-parsed by the
+    // tracker as a real blocker — reject it up front.
+    const p = plan([
+      { ref: "t1", title: "A", body: "Do the thing.\n\nBlocked by #123" },
+    ]);
+
+    await expect(
+      createPlanTickets({ plan: p, tracker, project: baseProject }),
+    ).rejects.toThrow(/relation marker line/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects a schema-invalid plan (empty title) before creating anything", async () => {
+    const { tracker, calls } = makeMockTracker("github");
+    const p = plan([
+      { ref: "t1", title: "A", body: "" },
+      { ref: "t2", title: "", body: "" }, // violates title min(1)
+    ]);
+
+    await expect(
+      createPlanTickets({ plan: p, tracker, project: baseProject }),
+    ).rejects.toThrow(/schema validation/);
+    expect(calls).toHaveLength(0);
+  });
+
   it("rejects cross-repo related edges before creating anything", async () => {
     const { tracker, calls } = makeMockTracker();
     const p = plan([
