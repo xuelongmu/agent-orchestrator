@@ -21,7 +21,7 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
   };
 });
 
-import { loadMergedScopeConfig } from "../../src/lib/config-scope.js";
+import { loadMergedScopeConfig, __resetMergedScopeCache } from "../../src/lib/config-scope.js";
 
 const GLOBAL = "/home/.agent-orchestrator/config.yaml";
 const STARTUP = "/repo/agent-orchestrator.yaml";
@@ -49,6 +49,7 @@ const project = (name: string, prefix: string, extra: Record<string, unknown> = 
 
 describe("loadMergedScopeConfig", () => {
   beforeEach(() => {
+    __resetMergedScopeCache();
     mockLoadConfig.mockReset();
     mockGetGlobalConfigPath.mockReset();
     mockGetGlobalConfigPath.mockReturnValue(GLOBAL);
@@ -368,6 +369,49 @@ describe("loadMergedScopeConfig", () => {
     expect(merged.notifiers.shared).toEqual({ plugin: "slack", webhookUrl: "global-shared" });
   });
 
+  it("rejects a notifier alias collision a carried project routes to", () => {
+    // "shared" is defined in both configs; the merge keeps the global definition,
+    // so the carried project would notify the wrong target — abort instead.
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      notificationRouting: { action: ["shared"] },
+      notifiers: { shared: { plugin: "slack", webhookUrl: "startup-shared" } },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      notifiers: { shared: { plugin: "slack", webhookUrl: "global-shared" } },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    expect(() => loadMergedScopeConfig(STARTUP)).toThrow(/notifier alias collision/i);
+  });
+
+  it("allows a carried project to route to a startup-only notifier alias", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      notificationRouting: { action: ["startup-slack"] },
+      notifiers: { "startup-slack": { plugin: "slack", webhookUrl: "hook" } },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      notifiers: {},
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    expect(merged.projects.local.notificationRouting?.action).toEqual(["startup-slack"]);
+    expect(merged.notifiers["startup-slack"]).toEqual({ plugin: "slack", webhookUrl: "hook" });
+  });
+
   it("rejects a startup plugin whose name matches an ENABLED global plugin of a different identity", () => {
     // Same logical name, different implementation, global enabled: the registry
     // keys instances by slot:name, so loading both would silently overwrite the
@@ -408,6 +452,47 @@ describe("loadMergedScopeConfig", () => {
 
     // Same identity → not duplicated, not a collision.
     expect(merged.plugins?.filter((p) => p.name === "tracker")).toHaveLength(1);
+  });
+
+  it("does not reject an inferred-name (temp basename) plugin clash", () => {
+    // Both configs declare inline external plugins WITHOUT an explicit `plugin`,
+    // so their config.plugins names are temp basenames the registry replaces with
+    // distinct manifest names at load time. A basename clash must NOT abort.
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      plugins: [{ name: "tracker", source: "local", path: "./plugins/tracker" }],
+      _externalPluginEntries: [
+        {
+          source: "project local tracker",
+          location: { kind: "project", projectId: "local", configType: "tracker" },
+          slot: "tracker",
+          path: "./plugins/tracker",
+          // expectedPluginName omitted → inferred temp name
+        },
+      ],
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      plugins: [{ name: "tracker", source: "npm", package: "@acme/tracker" }],
+      _externalPluginEntries: [
+        {
+          source: "project reg tracker",
+          location: { kind: "project", projectId: "reg", configType: "tracker" },
+          slot: "tracker",
+          package: "@acme/tracker",
+        },
+      ],
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    // Both survive — they load under distinct slot:manifest.name keys.
+    expect(merged.plugins?.filter((p) => p.name === "tracker")).toHaveLength(2);
   });
 
   it("carries a startup plugin whose name matches a DISABLED global plugin", () => {
@@ -514,5 +599,44 @@ describe("loadMergedScopeConfig", () => {
     const merged = loadMergedScopeConfig(STARTUP);
 
     expect(merged).toBe(global);
+  });
+
+  it("preserves carried startup projects when the startup config disappears after a good load", () => {
+    // First load succeeds and caches the startup config (carrying `local`). When
+    // the startup file later vanishes, the merged scope must still include `local`
+    // (so shutdown kills its sessions and the supervisor doesn't detach it).
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      notifiers: {},
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      notifiers: {},
+    };
+    let startupGone = false;
+    mockLoadConfig.mockImplementation((p: string) => {
+      if (p === GLOBAL) return global;
+      if (startupGone) {
+        const err = new Error("ENOENT") as NodeJS.ErrnoException & { path?: string };
+        err.code = "ENOENT";
+        err.path = STARTUP;
+        throw err;
+      }
+      return startup;
+    });
+
+    const first = loadMergedScopeConfig(STARTUP);
+    expect(first.projects.local).toBeDefined();
+
+    startupGone = true;
+    const second = loadMergedScopeConfig(STARTUP);
+
+    // Carried startup project survives the disappearance; global project stays too.
+    expect(second.projects.local).toBeDefined();
+    expect(second.projects.reg).toBeDefined();
   });
 });

@@ -148,6 +148,20 @@ function pluginIdentityKey(plugin: InstalledPluginConfig): string {
   return `${plugin.source}:${plugin.package ?? plugin.name}`;
 }
 
+/** True when a plugin's `name` is an inferred temporary basename (an inline
+ *  external plugin declared without an explicit `plugin`), rather than its final
+ *  registry name. `loadConfig` fills such names from the package/path basename
+ *  and the registry replaces them with the real manifest.name at load time, so
+ *  they must NOT be treated as the final `slot:name` for collision detection. */
+function hasInferredName(
+  plugin: InstalledPluginConfig,
+  inferredIdentities: Set<string>,
+): boolean {
+  if (plugin.package && inferredIdentities.has(`package:${plugin.package}`)) return true;
+  if (plugin.path && inferredIdentities.has(`path:${plugin.path}`)) return true;
+  return false;
+}
+
 /** Append startup plugin declarations, absolutizing any relative local `path`
  *  against the startup config dir, with two guards against the registry's
  *  `slot:name` instance keying:
@@ -156,11 +170,15 @@ function pluginIdentityKey(plugin: InstalledPluginConfig): string {
  *     plugin whose global namesake is DISABLED is still carried so it loads);
  *   - reject a same-NAME / different-identity collision against an enabled global
  *     plugin — keeping both would have the startup plugin silently overwrite the
- *     global implementation for registered projects, so fail loudly instead. */
+ *     global implementation for registered projects, so fail loudly instead. The
+ *     name check is skipped when EITHER side's name is an inferred temporary
+ *     basename: those are replaced with distinct `slot:manifest.name` keys at
+ *     load time, so a basename clash is not a real registry collision. */
 function mergeInstalledPlugins(
   globalPlugins: InstalledPluginConfig[] | undefined,
   startupPlugins: InstalledPluginConfig[] | undefined,
   startupConfigPath: string,
+  inferredIdentities: Set<string>,
 ): InstalledPluginConfig[] | undefined {
   if (!startupPlugins?.length) return globalPlugins;
   const enabledGlobal = (globalPlugins ?? []).filter((p) => p.enabled !== false);
@@ -175,7 +193,14 @@ function mergeInstalledPlugins(
     const key = pluginIdentityKey(baked);
     if (seenIdentity.has(key)) continue; // Same implementation already present (enabled).
     const collidingGlobal = enabledGlobalByName.get(baked.name);
-    if (collidingGlobal) {
+    // Only a clash of FINAL (non-inferred) names is a real registry collision —
+    // use the raw `plugin` (pre-absolutization) so its package/path matches the
+    // external-entry identities collected from the startup config.
+    if (
+      collidingGlobal &&
+      !hasInferredName(plugin, inferredIdentities) &&
+      !hasInferredName(collidingGlobal, inferredIdentities)
+    ) {
       throw new Error(
         `Plugin name collision in merged scope: plugin "${baked.name}" is declared by both ` +
           `the global config (${pluginIdentityKey(collidingGlobal)}) and the startup config ` +
@@ -297,22 +322,63 @@ function mergeScopeProjects(
   // merged below so a carried project's baked `notificationRouting` can resolve
   // them; on a name collision the global definition wins (it governs the global
   // projects), so colliding startup notifier external entries are NOT applied.
+  const globalNotifiers = globalConfig.notifiers ?? {};
+  const startupNotifiers = startupConfig.notifiers ?? {};
   const startupOnlyNotifierIds = new Set(
-    Object.keys(startupConfig.notifiers ?? {}).filter(
-      (id) => !(id in (globalConfig.notifiers ?? {})),
-    ),
+    Object.keys(startupNotifiers).filter((id) => !(id in globalNotifiers)),
   );
+
+  // A notifier alias defined in BOTH configs is a collision: the merged top-level
+  // notifiers keep the GLOBAL definition, so a carried project routing to that
+  // alias would silently notify the global target instead of its startup one.
+  // Reject when a carried project actually routes to such an alias.
+  const collidingNotifierAliases = new Set(
+    Object.keys(startupNotifiers).filter((id) => id in globalNotifiers),
+  );
+  if (collidingNotifierAliases.size > 0) {
+    for (const id of carriedProjectIds) {
+      const routing = projects[id].notificationRouting;
+      if (!routing) continue;
+      for (const aliases of Object.values(routing)) {
+        for (const alias of aliases) {
+          if (collidingNotifierAliases.has(alias)) {
+            throw new Error(
+              `Notifier alias collision in merged scope: carried project "${id}" routes ` +
+                `notifications to "${alias}", which is defined in BOTH the startup and global ` +
+                `configs. The merged scope keeps the global definition, so "${id}" would notify ` +
+                `the wrong target. Rename the startup notifier alias before launching ao start.`,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // External plugin entries that omit an explicit `plugin` carry an inferred
+  // temporary name (basename), which the registry rewrites to the real manifest
+  // name at load time. Track their identities so the plugin-name collision check
+  // ignores basename clashes that aren't real `slot:manifest.name` collisions.
+  const inferredPluginIdentities = new Set<string>();
+  for (const entry of [
+    ...(globalConfig._externalPluginEntries ?? []),
+    ...(startupConfig._externalPluginEntries ?? []),
+  ]) {
+    if (entry.expectedPluginName !== undefined) continue; // explicit `plugin` → final name
+    if (entry.package) inferredPluginIdentities.add(`package:${entry.package}`);
+    else if (entry.path) inferredPluginIdentities.add(`path:${entry.path}`);
+  }
 
   return {
     ...globalConfig,
     projects,
     // Add startup-only notifier definitions (global wins on alias collision) so a
     // carried project routing to a startup alias doesn't hit `target_missing`.
-    notifiers: { ...(startupConfig.notifiers ?? {}), ...(globalConfig.notifiers ?? {}) },
+    notifiers: { ...startupNotifiers, ...globalNotifiers },
     plugins: mergeInstalledPlugins(
       globalConfig.plugins,
       startupConfig.plugins,
       startupConfig.configPath,
+      inferredPluginIdentities,
     ),
     _externalPluginEntries: [
       ...(globalConfig._externalPluginEntries ?? []),
@@ -333,16 +399,29 @@ function mergeScopeProjects(
 }
 
 /**
+ * Last successfully-loaded startup config, keyed by its path. Lets a transient
+ * disappearance of the startup file preserve its carried startup-only projects in
+ * the merged scope (see {@link loadMergedScopeConfig}).
+ */
+const lastStartupConfig = new Map<string, OrchestratorConfig>();
+
+/** Test-only: clear the cached last-known startup configs. */
+export function __resetMergedScopeCache(): void {
+  lastStartupConfig.clear();
+}
+
+/**
  * Load the config spanning both the global registry and the config that started
  * this `ao start` process. Falls back to the startup config alone when no global
- * config exists (first-run `ao start <url>` / `<path>`), and to the global config
- * alone when the startup config has disappeared/become unreadable at runtime.
+ * config exists (first-run `ao start <url>` / `<path>`).
  *
- * The global config is loaded FIRST: if the startup config was removed while the
- * daemon runs, the backlog poller must keep polling every registered project and
- * the SIGINT shutdown path must still enumerate/kill sessions and write
- * last-stop — eagerly loading the (now-missing) startup config first would throw
- * and break both.
+ * The global config is loaded FIRST so a startup config removed/unreadable at
+ * runtime can't break the poller or the SIGINT shutdown path. When the startup
+ * config can't be read, the LAST-KNOWN startup config (if any) is reused so its
+ * carried startup-only projects stay in scope — otherwise shutdown wouldn't
+ * enumerate/kill their sessions and the supervisor would detach their lifecycle
+ * workers as "removed". Only when no startup config has ever loaded does the
+ * scope shrink to the plain global registry.
  */
 export function loadMergedScopeConfig(startupConfigPath: string): OrchestratorConfig {
   const globalConfigPath = getGlobalConfigPath();
@@ -355,14 +434,22 @@ export function loadMergedScopeConfig(startupConfigPath: string): OrchestratorCo
     if (!isMissingGlobalConfig(error, globalConfigPath)) throw error;
   }
 
-  let startupConfig: OrchestratorConfig;
+  let startupConfig = lastStartupConfig.get(startupConfigPath);
+  let startupError: unknown;
   try {
     startupConfig = loadConfig(startupConfigPath);
+    lastStartupConfig.set(startupConfigPath, startupConfig); // remember the last good load
   } catch (error) {
-    // Startup config removed/unreadable at runtime: keep the daemon working over
-    // the registered projects rather than failing the whole poller/shutdown path.
+    // Startup config removed/unreadable at runtime: fall through with the cached
+    // last-known startup config (if any) so its carried projects survive.
+    startupError = error;
+  }
+
+  if (!startupConfig) {
+    // Never loaded the startup config successfully. Keep the daemon working over
+    // the registered projects if the global registry exists; otherwise fail.
     if (globalConfig) return globalConfig;
-    throw error; // Neither config available — genuine failure.
+    throw startupError ?? new Error(`Unable to load startup config at ${startupConfigPath}`);
   }
 
   if (!globalConfig) return startupConfig;

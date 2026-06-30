@@ -3581,13 +3581,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         // Execute all-complete reaction if configured
         const reactionKey = eventToReactionKey("summary.all_complete");
         if (reactionKey) {
-          const reactionConfig = config.reactions[reactionKey];
+          // Per-project worker: honor this project's reaction override (merged over
+          // the top-level), so a carried startup-only project's baked all-complete
+          // policy applies instead of the unrelated global one. The synthetic
+          // system session below doesn't flow through getReactionConfigForSession,
+          // so resolve the override explicitly here.
+          const allCompleteProject = scopedProjectId ? config.projects[scopedProjectId] : undefined;
+          const projectReaction = allCompleteProject?.reactions?.[reactionKey];
+          const reactionConfig = projectReaction
+            ? { ...config.reactions[reactionKey], ...projectReaction }
+            : config.reactions[reactionKey];
           if (reactionConfig && reactionConfig.action) {
             if (reactionConfig.auto !== false || reactionConfig.action === "notify") {
               // Create a minimal session context for system events (no PR/issue context)
               const systemSession: ReactionSessionContext = {
                 id: "system" as SessionId,
-                projectId: "all",
+                projectId: scopedProjectId ?? "all",
                 pr: null,
                 issueId: null,
                 branch: null,
