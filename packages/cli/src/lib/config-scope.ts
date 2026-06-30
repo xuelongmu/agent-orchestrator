@@ -129,7 +129,14 @@ function bakeStartupOnlyProject(
     orchestrator: { ...project.orchestrator, agent: orchestratorAgent },
     ...(reactions ? { reactions } : {}),
     notificationRouting: bakeStartupNotificationRouting(project, startupConfig),
-    lifecycle: project.lifecycle ?? startupConfig.lifecycle,
+    // Field-merge the project lifecycle over the startup top-level (so a partial
+    // project override keeps the startup config's other fields, not the global).
+    lifecycle: {
+      autoCleanupOnMerge:
+        project.lifecycle?.autoCleanupOnMerge ?? startupConfig.lifecycle?.autoCleanupOnMerge,
+      mergeCleanupIdleGraceMs:
+        project.lifecycle?.mergeCleanupIdleGraceMs ?? startupConfig.lifecycle?.mergeCleanupIdleGraceMs,
+    },
     // Carry the startup config's idle/ready threshold so the scoped lifecycle
     // worker supervises this project with its own threshold, not the global one.
     readyThresholdMs: project.readyThresholdMs ?? startupConfig.readyThresholdMs,

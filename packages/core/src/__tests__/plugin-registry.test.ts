@@ -387,6 +387,42 @@ describe("loadBuiltins", () => {
     });
   });
 
+  it("registers a notifier referenced only by per-project routing", async () => {
+    const registry = createPluginRegistry();
+    const fakeDashboard = makePlugin("notifier", "dashboard");
+    const cfg = makeOrchestratorConfig({
+      configPath: "/test/config.yaml",
+      defaults: {
+        runtime: "tmux",
+        agent: "codex",
+        workspace: "worktree",
+        notifiers: [],
+      },
+      // Not referenced by top-level defaults/routing — only a per-project route.
+      notificationRouting: { urgent: [], action: [], warning: [], info: [] },
+      notifiers: {},
+      projects: {
+        app: {
+          name: "app",
+          path: "/p/app",
+          defaultBranch: "main",
+          sessionPrefix: "app",
+          notificationRouting: { urgent: ["dashboard"] },
+        },
+      },
+    } as unknown as Partial<OrchestratorConfig>);
+
+    await registry.loadBuiltins(cfg, async (pkg: string) => {
+      if (pkg === "@aoagents/ao-plugin-notifier-dashboard") return fakeDashboard;
+      throw new Error(`Not found: ${pkg}`);
+    });
+
+    // Registered with its configPath (not create(undefined)), so project-scoped
+    // notifications aren't silently dropped.
+    expect(fakeDashboard.create).toHaveBeenCalledWith({ configPath: "/test/config.yaml" });
+    expect(registry.get("notifier", "dashboard")).not.toBeNull();
+  });
+
   it("does not create an implicit notifier registration over a conflicting explicit entry", async () => {
     const registry = createPluginRegistry();
     const fakeDashboard = makePlugin("notifier", "dashboard");

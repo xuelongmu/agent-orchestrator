@@ -2613,14 +2613,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   async function maybeAutoCleanupOnMerge(session: Session): Promise<void> {
     if (session.status !== SESSION_STATUS.MERGED) return;
 
-    // config.lifecycle is typed optional to support hand-constructed
-    // configs in tests. When loaded from YAML via Zod, the schema's
-    // .default({}) always populates it. The destructure below handles
-    // both paths uniformly. A per-project `lifecycle` override wins (preserves a
-    // startup-only project's merge-cleanup policy when merged into a global scope).
+    // Merge the per-project lifecycle override FIELD-BY-FIELD over the top-level
+    // config (a partial project override only changes the fields it sets, so it
+    // can't accidentally re-enable cleanup the user disabled globally). Defaults
+    // apply only when neither level sets a field.
     const project = config.projects[session.projectId];
-    const { autoCleanupOnMerge = true, mergeCleanupIdleGraceMs: graceMs = 300_000 } =
-      project?.lifecycle ?? config.lifecycle ?? {};
+    const projectLifecycle = project?.lifecycle;
+    const topLifecycle = config.lifecycle;
+    const autoCleanupOnMerge =
+      projectLifecycle?.autoCleanupOnMerge ?? topLifecycle?.autoCleanupOnMerge ?? true;
+    const graceMs =
+      projectLifecycle?.mergeCleanupIdleGraceMs ?? topLifecycle?.mergeCleanupIdleGraceMs ?? 300_000;
     if (!autoCleanupOnMerge) return;
 
     // Check for idleness: if the agent is still working, defer cleanup.

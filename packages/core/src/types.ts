@@ -1707,11 +1707,12 @@ export interface ProjectConfig {
 
   /**
    * Per-project lifecycle override (auto-cleanup-on-merge policy, grace window).
-   * When set, it takes precedence over the top-level `lifecycle` for this
-   * project. Used to preserve a startup-only project's own merge-cleanup policy
+   * Merged FIELD-BY-FIELD over the top-level `lifecycle` (a partial override only
+   * changes the fields it sets), so it must not carry schema defaults — hence
+   * `Partial`. Used to preserve a startup-only project's own merge-cleanup policy
    * when its config is merged into a global scope.
    */
-  lifecycle?: LifecycleConfig;
+  lifecycle?: Partial<LifecycleConfig>;
 
   /**
    * Per-project idle/ready threshold (ms) override. When set, it takes precedence

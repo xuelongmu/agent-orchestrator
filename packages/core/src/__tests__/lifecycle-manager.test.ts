@@ -4833,6 +4833,35 @@ describe("auto-cleanup on merge (#1309)", () => {
     expect(lm.getStates().get("app-1")).toBe("merged");
   });
 
+  it("merges a partial per-project lifecycle override over the top-level (keeps cleanup disabled)", async () => {
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mergedScm(),
+    });
+    // Top-level disables cleanup; the project overrides ONLY the grace window.
+    // The field-merge must keep autoCleanupOnMerge:false rather than letting the
+    // partial override re-enable cleanup.
+    const base = configWithLifecycle({ autoCleanupOnMerge: false });
+    const configOverride: OrchestratorConfig = {
+      ...base,
+      projects: {
+        ...base.projects,
+        "my-app": { ...base.projects["my-app"], lifecycle: { mergeCleanupIdleGraceMs: 600_000 } },
+      },
+    };
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "approved", pr: makePR(), activity: "idle" }),
+      registry,
+      configOverride,
+    });
+
+    await lm.check("app-1");
+
+    expect(mockSessionManager.kill).not.toHaveBeenCalled();
+    expect(lm.getStates().get("app-1")).toBe("merged");
+  });
+
   it("does not trigger cleanup for terminated/killed sessions (no self-recursion)", async () => {
     const registry = createMockRegistry({
       runtime: plugins.runtime,

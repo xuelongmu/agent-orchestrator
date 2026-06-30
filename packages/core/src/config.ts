@@ -278,6 +278,24 @@ const LifecycleConfigSchema = z
   })
   .default({});
 
+// Per-project lifecycle override: optional fields with NO defaults, so a partial
+// override stays partial and merges field-by-field over the top-level lifecycle
+// (the defaulted LifecycleConfigSchema would mask the top-level values).
+const ProjectLifecycleConfigSchema = z
+  .object({
+    autoCleanupOnMerge: z.boolean().optional(),
+    mergeCleanupIdleGraceMs: z
+      .number()
+      .int()
+      .nonnegative()
+      .refine((v) => v === 0 || v >= 10_000, {
+        message:
+          "mergeCleanupIdleGraceMs is in milliseconds; values between 1 and 9999 are likely a units mistake (use 0 to disable the gate, or e.g. 10000 for 10s, 300000 for 5min)",
+      })
+      .optional(),
+  })
+  .optional();
+
 const ProjectConfigSchema = z.object({
   name: z.string().optional(),
   repo: z.string().optional(),
@@ -309,7 +327,7 @@ const ProjectConfigSchema = z.object({
   // carried startup-only projects by the `ao start` merged-scope wiring). Omitted
   // → the project falls back to the top-level routing / lifecycle policy.
   notificationRouting: z.record(z.array(z.string())).optional(),
-  lifecycle: LifecycleConfigSchema.optional(),
+  lifecycle: ProjectLifecycleConfigSchema,
   readyThresholdMs: z.number().int().nonnegative().optional(),
   agentRules: z.string().optional(),
   agentRulesFile: z.string().optional(),

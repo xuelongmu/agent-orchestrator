@@ -87,4 +87,24 @@ describe("getPluginRegistry — cache reconciliation", () => {
     expect(loadFromConfig).toHaveBeenCalledTimes(1);
     expect(fresh.projects.app.tracker?.plugin).toBe("real-tracker");
   });
+
+  it("does not clobber a location reverted to a built-in plugin on a cache hit", async () => {
+    // Build the registry from an inline-external config.
+    const built = makeConfig("/scope-revert");
+    await getPluginRegistry(built);
+
+    // The config is later edited: the tracker is now a built-in (no inline
+    // external entry for that location). A cache hit must NOT overwrite it with
+    // the stale external manifest name.
+    const reverted = {
+      configPath: "/scope-revert",
+      projects: { app: { name: "app", path: "/p/app", tracker: { plugin: "github" } } },
+      notifiers: {},
+      _externalPluginEntries: [],
+    } as unknown as OrchestratorConfig;
+    await getPluginRegistry(reverted);
+
+    expect(loadFromConfig).toHaveBeenCalledTimes(1);
+    expect(reverted.projects.app.tracker?.plugin).toBe("github");
+  });
 });

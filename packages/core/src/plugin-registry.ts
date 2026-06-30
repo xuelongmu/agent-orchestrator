@@ -107,8 +107,19 @@ function collectNotifierRegistrations(
   const routingNotifiers = Object.values(config.notificationRouting ?? {}).flatMap((value) =>
     Array.isArray(value) ? value : [],
   );
+  // Per-project routing can reference a notifier name not present in the
+  // top-level routing/defaults; include those so it's registered with its config
+  // (and configPath) instead of falling back to create(undefined) and dropping
+  // the project-scoped notification.
+  const projectRoutingNotifiers = Object.values(config.projects ?? {}).flatMap((project) =>
+    Object.values(project?.notificationRouting ?? {}).flatMap((value) =>
+      Array.isArray(value) ? value : [],
+    ),
+  );
   const isReferencedByName =
-    defaultNotifiers.includes(pluginName) || routingNotifiers.includes(pluginName);
+    defaultNotifiers.includes(pluginName) ||
+    routingNotifiers.includes(pluginName) ||
+    projectRoutingNotifiers.includes(pluginName);
 
   const exactMatch = config.notifiers?.[pluginName];
   if (

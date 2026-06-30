@@ -40,9 +40,14 @@ function getRegistryCacheKey(config: OrchestratorConfig): string {
  * a fresh one, so the fresh config's plugin references match what the cached
  * registry actually registered under (the real manifest.name, not an inferred
  * temporary name). Keyed by the structured external-entry location.
+ *
+ * Iterates the FRESH config's external entries (not the built config's): if a
+ * location was edited back to a built-in plugin since the registry was built, the
+ * fresh config no longer has an inline-external entry there, so we leave its
+ * built-in name intact instead of clobbering it with the stale external name.
  */
 function reconcileExternalPluginNames(target: OrchestratorConfig, source: OrchestratorConfig): void {
-  for (const entry of source._externalPluginEntries ?? []) {
+  for (const entry of target._externalPluginEntries ?? []) {
     const loc = entry.location;
     if (loc.kind === "project") {
       const resolved = source.projects[loc.projectId]?.[loc.configType]?.plugin;
