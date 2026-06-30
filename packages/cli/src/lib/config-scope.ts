@@ -108,6 +108,18 @@ function bakeStartupOnlyProject(
     startupConfig.reactions || project.reactions
       ? { ...(startupConfig.reactions ?? {}), ...(project.reactions ?? {}) }
       : undefined;
+  // Merge budget caps FIELD-BY-FIELD (per-project cap wins, else startup
+  // top-level). A whole-object fallback would drop a startup top-level cap when
+  // the project sets only the other field — and since `resolveBudget` does not
+  // inherit the global budget for carried (sourceConfigPath) projects, that
+  // missing cap would silently disable enforcement.
+  const budget: ProjectConfig["budget"] =
+    project.budget || startupConfig.budget
+      ? {
+          perSessionUsd: project.budget?.perSessionUsd ?? startupConfig.budget?.perSessionUsd,
+          perProjectUsd: project.budget?.perProjectUsd ?? startupConfig.budget?.perProjectUsd,
+        }
+      : undefined;
   return {
     ...project,
     runtime: project.runtime ?? defaults.runtime,
@@ -118,7 +130,10 @@ function bakeStartupOnlyProject(
     ...(reactions ? { reactions } : {}),
     notificationRouting: bakeStartupNotificationRouting(project, startupConfig),
     lifecycle: project.lifecycle ?? startupConfig.lifecycle,
-    budget: project.budget ?? startupConfig.budget,
+    // Carry the startup config's idle/ready threshold so the scoped lifecycle
+    // worker supervises this project with its own threshold, not the global one.
+    readyThresholdMs: project.readyThresholdMs ?? startupConfig.readyThresholdMs,
+    ...(budget ? { budget } : {}),
     sourceConfigPath: project.sourceConfigPath ?? startupConfig.configPath,
   };
 }

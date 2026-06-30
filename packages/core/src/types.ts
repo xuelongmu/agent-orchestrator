@@ -1713,6 +1713,14 @@ export interface ProjectConfig {
    */
   lifecycle?: LifecycleConfig;
 
+  /**
+   * Per-project idle/ready threshold (ms) override. When set, it takes precedence
+   * over the top-level `readyThresholdMs` in the scoped lifecycle worker's
+   * `getActivityState` call. Used to preserve a startup-only project's own
+   * threshold when its config is merged into a global scope.
+   */
+  readyThresholdMs?: number;
+
   /** Inline rules/instructions passed to every agent prompt */
   agentRules?: string;
 

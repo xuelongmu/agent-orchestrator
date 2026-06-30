@@ -1163,7 +1163,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           }
         }
 
-        const detectedActivity = await agent.getActivityState(session, config.readyThresholdMs);
+        // Prefer this project's idle/ready threshold (preserves a carried
+        // startup-only project's own threshold) over the top-level default.
+        const readyThresholdMs =
+          config.projects[session.projectId]?.readyThresholdMs ?? config.readyThresholdMs;
+        const detectedActivity = await agent.getActivityState(session, readyThresholdMs);
         if (detectedActivity) {
           activitySignal = classifyActivitySignal(detectedActivity, "native");
           activityEvidence = formatActivitySignalEvidence(activitySignal);

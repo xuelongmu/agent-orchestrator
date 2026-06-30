@@ -26,6 +26,8 @@ import {
 import { dirname, join } from "node:path";
 import { getGlobalConfigPath } from "./global-config.js";
 import { isBlockedByDependency } from "./lifecycle-state.js";
+import { updateMetadata } from "./metadata.js";
+import { getProjectSessionsDir } from "./paths.js";
 import {
   isOrchestratorSession,
   TERMINAL_STATUSES,
@@ -59,6 +61,16 @@ export const VERIFICATION_LABELS = [
   "verification-failed",
   "agent:done",
 ];
+
+/**
+ * Session-metadata marker recording that a merged session has already been run
+ * through verification labeling. Persisted so the dedupe survives a daemon
+ * restart (which empties the in-memory `processedIssues` set): without it, after
+ * a verified issue is reopened to `agent:backlog`, the stale on-disk merged
+ * session would be re-labeled `merged-unverified` on the next poll, stripping
+ * `agent:backlog` and stranding the reopened issue.
+ */
+export const VERIFICATION_PROCESSED_MARKER = "verificationProcessed";
 
 /** Default interval between backlog poll cycles (1 minute). */
 export const BACKLOG_POLL_INTERVAL_MS = 60_000;
@@ -245,7 +257,10 @@ function getMaxConcurrentAgents(project: ProjectConfig): number {
  * issue id, and that new session must be re-labeled when it merges while the old
  * merged session stays deduped (keying by issue id would either re-label via the
  * stale session or block the rework). `processedIssues` is mutated to avoid
- * repeated API calls within a process.
+ * repeated API calls within a process; a per-session
+ * {@link VERIFICATION_PROCESSED_MARKER} is also persisted to the session's
+ * metadata so the dedupe survives a daemon restart (the in-memory set is empty
+ * after restart while the merged session is still on disk).
  *
  * Returns the set of keys whose merged session could NOT be transitioned this
  * cycle (label update failed while the issue may still carry `agent:backlog`).
@@ -267,26 +282,46 @@ async function labelIssuesForVerification(
     (s) =>
       s.lifecycle.pr.state === "merged" &&
       s.issueId &&
-      !processedIssues.has(`${s.projectId}:${s.id}`),
+      !processedIssues.has(`${s.projectId}:${s.id}`) &&
+      // Persisted cross-restart guard: a session already run through verification
+      // labeling carries this marker, so a reopened issue isn't re-labeled by its
+      // stale merged session after the in-memory set is cleared by a restart.
+      s.metadata?.[VERIFICATION_PROCESSED_MARKER] !== "1",
   );
 
   for (const session of mergedSessions) {
     const key = `${session.projectId}:${session.id}`;
+    // Mark this session done with verification, in-memory AND persisted to disk
+    // so the dedupe survives a daemon restart.
+    const markProcessed = (): void => {
+      processedIssues.add(key);
+      try {
+        updateMetadata(getProjectSessionsDir(session.projectId), session.id, {
+          [VERIFICATION_PROCESSED_MARKER]: "1",
+        });
+      } catch (err) {
+        // Best-effort persistence — the in-memory set still dedupes this process.
+        logger?.error?.(
+          `[backlog] Failed to persist verification marker for session ${session.id}:`,
+          err,
+        );
+      }
+    };
     const issueId = session.issueId;
     if (!issueId) {
-      processedIssues.add(key);
+      markProcessed();
       continue;
     }
     const issueKey = `${session.projectId}:${issueId.toLowerCase()}`;
     const project = config.projects[session.projectId];
     if (!project?.tracker?.plugin) {
-      processedIssues.add(key);
+      markProcessed();
       continue;
     }
 
     const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
     if (!tracker?.updateIssue) {
-      processedIssues.add(key);
+      markProcessed();
       continue;
     }
 
@@ -333,7 +368,7 @@ async function labelIssuesForVerification(
     // from the human-verification surfaces, so we still label (and reopen) it.
     const labels = currentIssue.labels ?? [];
     if (VERIFICATION_LABELS.some((label) => labels.includes(label))) {
-      processedIssues.add(key);
+      markProcessed();
       continue;
     }
 
@@ -356,7 +391,7 @@ async function labelIssuesForVerification(
       // later poll in this daemon skips the merged session and the issue never
       // reaches the verify queue until the process restarts. Leaving it unset
       // lets the next cycle retry the label.
-      processedIssues.add(key);
+      markProcessed();
     } catch (err) {
       logger?.error?.(`[backlog] Failed to label issue ${session.issueId} for verification:`, err);
       // The label transition failed while the merged issue may still carry

@@ -310,6 +310,7 @@ const ProjectConfigSchema = z.object({
   // → the project falls back to the top-level routing / lifecycle policy.
   notificationRouting: z.record(z.array(z.string())).optional(),
   lifecycle: LifecycleConfigSchema.optional(),
+  readyThresholdMs: z.number().int().nonnegative().optional(),
   agentRules: z.string().optional(),
   agentRulesFile: z.string().optional(),
   orchestratorRules: z.string().optional(),

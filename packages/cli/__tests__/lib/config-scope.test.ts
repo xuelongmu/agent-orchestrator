@@ -344,6 +344,50 @@ describe("loadMergedScopeConfig", () => {
     expect(merged.projects.local.budget).toEqual({ perSessionUsd: 5 });
   });
 
+  it("merges budget fields when a carried project has a partial project budget", () => {
+    // project sets only perSessionUsd; the startup top-level supplies perProjectUsd.
+    // A whole-object fallback would drop perProjectUsd (and resolveBudget won't
+    // inherit it from global for a carried project) — field-merge preserves both.
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l", { budget: { perSessionUsd: 2 } }) },
+      budget: { perProjectUsd: 50 },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      budget: { perSessionUsd: 99, perProjectUsd: 99 },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    expect(merged.projects.local.budget).toEqual({ perSessionUsd: 2, perProjectUsd: 50 });
+  });
+
+  it("carries the startup readyThresholdMs onto a carried project", () => {
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      readyThresholdMs: 120_000,
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      readyThresholdMs: 600_000,
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    // The carried project keeps the startup threshold, not the global one.
+    expect(merged.projects.local.readyThresholdMs).toBe(120_000);
+  });
+
   it("merges startup-only notifier definitions (global wins on alias collision)", () => {
     const startup = {
       configPath: STARTUP,

@@ -2,6 +2,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, openSync, closeSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// Mock the persisted verification-marker write so tests don't touch the real
+// ~/.agent-orchestrator data dir; we assert on the spy where relevant.
+const { mockUpdateMetadata } = vi.hoisted(() => ({ mockUpdateMetadata: vi.fn() }));
+vi.mock("../metadata.js", async (importOriginal) => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+  const actual = await importOriginal<typeof import("../metadata.js")>();
+  return { ...actual, updateMetadata: (...args: unknown[]) => mockUpdateMetadata(...args) };
+});
+
 import { createBacklogPoller, type BacklogServices } from "../backlog-poller.js";
 import type { Issue, Session } from "../types.js";
 
@@ -108,6 +118,7 @@ describe("backlog poller", () => {
 
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), "ao-backlog-"));
+    mockUpdateMetadata.mockClear();
   });
 
   afterEach(() => {
@@ -257,6 +268,37 @@ describe("backlog poller", () => {
       expect.objectContaining({ labels: ["merged-unverified"] }),
       expect.anything(),
     );
+    // The session is marked processed on disk so the dedupe survives a restart.
+    expect(mockUpdateMetadata).toHaveBeenCalledWith(
+      expect.any(String),
+      "ao-1",
+      expect.objectContaining({ verificationProcessed: "1" }),
+    );
+  });
+
+  it("skips a merged session already marked verification-processed on disk (restart-safe)", async () => {
+    // After a restart the in-memory dedupe is empty, but the persisted marker on
+    // the (stale) merged session must keep it from re-labeling a reopened issue
+    // that is now back in agent:backlog.
+    const marked = {
+      ...makeMergedSession("ao-1", "42"),
+      metadata: { verificationProcessed: "1" },
+    } as unknown as Session;
+    const harness = makeHarness({
+      backlogIssues: [],
+      sessions: [marked],
+      existingLabels: [], // issue no longer carries a verification label (reopened)
+    });
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    // The stale merged session is skipped entirely — no getIssue, no relabel.
+    expect(harness.getIssue).not.toHaveBeenCalled();
+    expect(harness.updateIssue).not.toHaveBeenCalled();
   });
 
   it("skips re-posting verification when the tracker already shows merged-unverified", async () => {
