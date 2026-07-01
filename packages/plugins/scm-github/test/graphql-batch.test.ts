@@ -1382,6 +1382,30 @@ describe("shouldRefreshPREnrichment - ETag Guard Strategy", () => {
         expect.stringContaining("[ETag Guard 3b]"),
       );
     });
+
+    it("forces a fresh fetch (no cached ETag) when reviews span multiple pages", async () => {
+      // A paginated 200 response (Link: rel="next") means >100 reviews — the
+      // page-1 ETag can't validate newer reviews, so return true and cache nothing.
+      mockExecFileImpl.mockResolvedValueOnce({
+        stdout:
+          'HTTP/2 200\netag: "page1-etag"\nlink: <https://api.github.com/…?page=2>; rel="next"',
+        stderr: "",
+      });
+      const first = await checkPullReviewsETag("owner", "repo", 42);
+      expect(first).toBe(true);
+
+      // No ETag was cached → the next check sends no If-None-Match and gets 200.
+      mockExecFileImpl.mockResolvedValueOnce({
+        stdout:
+          'HTTP/2 200\netag: "page1-etag"\nlink: <https://api.github.com/…?page=2>; rel="next"',
+        stderr: "",
+      });
+      const second = await checkPullReviewsETag("owner", "repo", 42);
+      expect(second).toBe(true);
+      // The second call must NOT have sent an If-None-Match (nothing cached).
+      const secondArgs = mockExecFileImpl.mock.calls[1]?.[1] as string[];
+      expect(secondArgs.join(" ")).not.toContain("If-None-Match");
+    });
   });
 
   describe("Guard 3c: Pull Request Metadata ETag", () => {
@@ -1419,6 +1443,32 @@ describe("shouldRefreshPREnrichment - ETag Guard Strategy", () => {
       expect(mockObserver.log).toHaveBeenCalledWith(
         "warn",
         expect.stringContaining("[ETag Guard 3c]"),
+      );
+    });
+  });
+
+  describe("clearETagCache clears the new validators", () => {
+    it("drops cached pull-reviews and PR-metadata ETags", async () => {
+      // Cache a pull-reviews and a PR-metadata ETag.
+      mockExecFileImpl.mockResolvedValueOnce({ stdout: 'HTTP/2 200\netag: "rev1"', stderr: "" });
+      await checkPullReviewsETag("owner", "repo", 42);
+      mockExecFileImpl.mockResolvedValueOnce({ stdout: 'HTTP/2 200\netag: "meta1"', stderr: "" });
+      await checkPullRequestETag("owner", "repo", 42);
+
+      clearETagCache();
+
+      // After clearing, neither check may send an If-None-Match validator.
+      mockExecFileImpl.mockClear();
+      mockExecFileImpl.mockResolvedValueOnce({ stdout: 'HTTP/2 200\netag: "rev2"', stderr: "" });
+      await checkPullReviewsETag("owner", "repo", 42);
+      expect((mockExecFileImpl.mock.calls[0]?.[1] as string[]).join(" ")).not.toContain(
+        "If-None-Match",
+      );
+
+      mockExecFileImpl.mockResolvedValueOnce({ stdout: 'HTTP/2 200\netag: "meta2"', stderr: "" });
+      await checkPullRequestETag("owner", "repo", 42);
+      expect((mockExecFileImpl.mock.calls[1]?.[1] as string[]).join(" ")).not.toContain(
+        "If-None-Match",
       );
     });
   });

@@ -1334,6 +1334,12 @@ function createGitHubSCM(): SCM {
         reviewThreadsCache.set(cacheKey, result);
         return result;
       } catch (err) {
+        // The ETag guards already advanced their validators before this GraphQL
+        // refresh ran, so on the next poll all three can return 304. Drop any
+        // cached ReviewThreadsResult so that poll re-fetches instead of serving
+        // stale threads/reviews (a newly submitted clean review or new head SHA
+        // would otherwise stay hidden until an unrelated PR change occurs).
+        reviewThreadsCache.delete(cacheKey);
         const errorMsg = err instanceof Error ? err.message : String(err);
         instanceObserver?.log("warn", `[getReviewThreads] Failed for ${cacheKey}: ${errorMsg}`);
         throw new Error("Failed to fetch review threads", { cause: err });

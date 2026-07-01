@@ -2044,8 +2044,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
     // Force a cache-bypassing fetch when we must observe GraphQL-only thread
     // resolution the REST ETag guards can't see: after the agent reports ready,
-    // or while the escalation latch waits on a human resolving threads.
-    const forceFreshFetch = readyForReviewRecheck || roundEscalated;
+    // while the escalation latch waits on a human resolving threads, or when
+    // revalidating a satisfied session (an existing thread flipping back to
+    // unresolved is a GraphQL-only isResolved change that REST 304s would hide,
+    // leaving the merge-ready latch stale).
+    const forceFreshFetch = readyForReviewRecheck || roundEscalated || revalidateSatisfied;
     // Single GraphQL call for all review threads (human + bot) + review summaries.
     // Split locally by isBot for separate reaction pipelines.
     let allThreads: ReviewComment[];

@@ -119,6 +119,8 @@ export function clearETagCache(): void {
   etagCache.prList.clear();
   etagCache.commitStatus.clear();
   etagCache.reviewComments.clear();
+  etagCache.pullReviews.clear();
+  etagCache.pullMeta.clear();
 }
 
 /**
@@ -427,6 +429,16 @@ function extractETag(output: string): string | undefined {
 }
 
 /**
+ * Whether the HTTP response advertises a `rel="next"` pagination link — i.e. the
+ * resource spans more than the requested page. Used to detect PRs whose review
+ * list exceeds one page, where a single-page ETag can't validate newer entries.
+ */
+function hasNextPageLink(output: string): boolean {
+  const match = output.match(/^link:\s*(.+)$/im);
+  return match ? /rel="next"/i.test(match[1]) : false;
+}
+
+/**
  * Guard 1: PR List ETag Check (per repo)
  *
  * Detects if PR metadata has changed in a repository using REST ETag.
@@ -670,6 +682,16 @@ export async function checkPullReviewsETag(
       const rotatedETag = extractETag(output);
       if (rotatedETag) etagCache.pullReviews.set(cacheKey, rotatedETag);
       return false;
+    }
+
+    // >100 review submissions span multiple pages. A page-1 ETag can't observe a
+    // newer review on a later page, so don't cache a validator — drop any prior
+    // one and force a fresh fetch every poll. (A new submission also bumps the PR
+    // updated_at, so Guard 3c backstops the exact 100→101 boundary while page 1's
+    // ETag is still cached.)
+    if (hasNextPageLink(output)) {
+      etagCache.pullReviews.delete(cacheKey);
+      return true;
     }
 
     const newETag = extractETag(output);

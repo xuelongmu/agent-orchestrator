@@ -5543,8 +5543,9 @@ describe("review loop round-cap + completion detection (#4)", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await lm.check("app-1");
 
-    // A satisfied session bypasses the throttle, so it re-fetches and clears.
-    expect(getReviewThreads).toHaveBeenCalled();
+    // A satisfied session bypasses the throttle AND forces a fresh fetch (a thread
+    // flipping back to unresolved is a GraphQL-only change the REST ETag misses).
+    expect(getReviewThreads.mock.calls[0]?.[1]).toMatchObject({ forceFresh: true });
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeFalsy();
   });
 });
