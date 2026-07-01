@@ -1025,6 +1025,25 @@ describe("backlog poller", () => {
     expect(harness.spawn).toHaveBeenCalledTimes(1);
   });
 
+  it("does not spawn for a project marked _spawnPaused (cached/unreadable source config)", async () => {
+    const harness = makeHarness({
+      backlogIssues: [makeIssue("1")],
+      maxConcurrentAgents: 5,
+    });
+    (
+      harness.services.config as unknown as { projects: Record<string, { _spawnPaused?: boolean }> }
+    ).projects.proj._spawnPaused = true;
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.spawn).not.toHaveBeenCalled();
+  });
+
   it("counts merged-status workers against the backlog cap", async () => {
     // A worker in `merged` status still has a live runtime during post-merge
     // cleanup, so it occupies a slot. With cap 1 and one merged worker present,

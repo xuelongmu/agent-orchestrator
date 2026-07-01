@@ -148,6 +148,44 @@ function defaultLockPath(): string {
 }
 
 /**
+ * Wrap an open lock-file descriptor (holding `lockPath`) in a heartbeat + release
+ * handle. Shared by the initial acquire and the stale-lock reclaim paths.
+ */
+function makeLockHandle(fd: number, lockPath: string): LockHandle {
+  try {
+    writeSync(fd, String(process.pid));
+  } catch {
+    // Best-effort — the lock's existence is what matters, not its contents.
+  }
+  // Refresh the lock's mtime periodically so a long-running poll isn't
+  // reclaimed as stale by the peer process while we still hold it.
+  const heartbeat = setInterval(() => {
+    try {
+      const now = new Date();
+      futimesSync(fd, now, now);
+    } catch {
+      // Best-effort — a missed refresh just risks an earlier stale reclaim.
+    }
+  }, LOCK_HEARTBEAT_MS);
+  heartbeat.unref?.();
+  return {
+    release() {
+      clearInterval(heartbeat);
+      try {
+        closeSync(fd);
+      } catch {
+        // Ignore cleanup races.
+      }
+      try {
+        rmSync(lockPath, { force: true });
+      } catch {
+        // Best-effort cleanup.
+      }
+    },
+  };
+}
+
+/**
  * Try to acquire the cross-process backlog lock without blocking.
  * Returns a handle if acquired, or null if another process holds a fresh lock.
  */
@@ -157,38 +195,7 @@ function tryAcquireLock(lockPath: string): LockHandle | null {
     // treated as "could not acquire" rather than thrown out of pollOnce —
     // an unhandled rejection here would propagate into the shutdown path.
     mkdirSync(dirname(lockPath), { recursive: true });
-    const fd = openSync(lockPath, "wx");
-    try {
-      writeSync(fd, String(process.pid));
-    } catch {
-      // Best-effort — the lock's existence is what matters, not its contents.
-    }
-    // Refresh the lock's mtime periodically so a long-running poll isn't
-    // reclaimed as stale by the peer process while we still hold it.
-    const heartbeat = setInterval(() => {
-      try {
-        const now = new Date();
-        futimesSync(fd, now, now);
-      } catch {
-        // Best-effort — a missed refresh just risks an earlier stale reclaim.
-      }
-    }, LOCK_HEARTBEAT_MS);
-    heartbeat.unref?.();
-    return {
-      release() {
-        clearInterval(heartbeat);
-        try {
-          closeSync(fd);
-        } catch {
-          // Ignore cleanup races.
-        }
-        try {
-          rmSync(lockPath, { force: true });
-        } catch {
-          // Best-effort cleanup.
-        }
-      },
-    };
+    return makeLockHandle(openSync(lockPath, "wx"), lockPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
       // Unexpected FS error — treat as "could not acquire" rather than crash the loop.
@@ -213,24 +220,41 @@ function tryAcquireLock(lockPath: string): LockHandle | null {
         // Lost the rename race (gone or already reclaimed) — retry next cycle.
         return null;
       }
-      // The file we grabbed could be one a peer recreated fresh between our
-      // stat and our rename. Re-check its mtime: if it's no longer stale we
-      // stole a live lock, so restore it (best effort) and back off.
+      // Immediately re-create a lock at `lockPath` so it stays VISIBLE while we
+      // verify the reclaim. Otherwise `lockPath` would be absent during the
+      // mtime recheck/restore below and a third poller could acquire it and run
+      // concurrently — defeating the dedupe the lock provides.
+      let fd: number;
+      try {
+        fd = openSync(lockPath, "wx");
+      } catch {
+        // Another poller already recreated the lock in the tiny gap after our
+        // rename — it owns the cycle now; drop the file we moved and back off.
+        rmSync(reclaimPath, { force: true });
+        return null;
+      }
+      // The file we grabbed could be one a peer recreated fresh between our stat
+      // and our rename. Re-check its mtime: if it's no longer stale we stole a
+      // live lock. The peer keeps running via its still-open fd, so back off —
+      // but LEAVE our placeholder in place so no third poller acquires while the
+      // peer runs (the peer's release removes `lockPath`).
       try {
         const reclaimed = statSync(reclaimPath);
         if (Date.now() - reclaimed.mtimeMs <= LOCK_STALE_MS) {
           try {
-            renameSync(reclaimPath, lockPath);
+            closeSync(fd);
           } catch {
-            rmSync(reclaimPath, { force: true });
+            // Ignore — the placeholder file stays as the visible blocker.
           }
+          rmSync(reclaimPath, { force: true });
           return null;
         }
       } catch {
-        // Renamed file vanished — nothing to restore; fall through to acquire.
+        // Renamed file vanished — nothing to restore; hold our placeholder.
       }
+      // Legit reclaim of a stale lock: hold `lockPath` via our placeholder fd.
       rmSync(reclaimPath, { force: true });
-      return tryAcquireLock(lockPath);
+      return makeLockHandle(fd, lockPath);
     } catch {
       // The lock vanished between open and stat — let the next cycle retry.
     }
@@ -537,6 +561,10 @@ async function spawnFromBacklog(
 
   for (const [projectId, project] of Object.entries(config.projects)) {
     if (!project.tracker?.plugin) continue;
+    // Its source (startup) config is unreadable — only a cached copy is in
+    // scope. Don't spawn new workers (they'd get a stale AO_CONFIG_PATH); the
+    // project's existing sessions are still supervised/killed elsewhere.
+    if (project._spawnPaused) continue;
 
     const projectWorkers = workersByProject.get(projectId) ?? [];
     let availableSlots =

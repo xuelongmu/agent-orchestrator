@@ -281,6 +281,11 @@ function scopeStartupExternalEntries(
 function mergeScopeProjects(
   globalConfig: OrchestratorConfig,
   startupConfig: OrchestratorConfig,
+  // Set when `startupConfig` is a cached (last-known) copy because the source
+  // file is currently unreadable. Carried projects are then supervision/shutdown
+  // -only: they must not be SPAWNED into, since a new worker would get an
+  // `AO_CONFIG_PATH` pointing at the missing file and fail to resolve its config.
+  startupFromCache = false,
 ): OrchestratorConfig {
   const projects: Record<string, ProjectConfig> = { ...globalConfig.projects };
 
@@ -331,13 +336,16 @@ function mergeScopeProjects(
       );
     }
     usedPrefixes.add(prefix);
-    projects[id] = bakeStartupOnlyProject(project, startupConfig);
+    const baked = bakeStartupOnlyProject(project, startupConfig);
+    projects[id] = startupFromCache ? { ...baked, _spawnPaused: true } : baked;
     carriedProjectIds.add(id);
   }
 
   if (carriedProjectIds.size === 0) {
     // Nothing startup-only — the global config already covers the full scope.
-    return { ...globalConfig, projects };
+    // The daemon still runs on the STARTUP config's port, so workers it spawns
+    // must talk to it (not the global registry's port).
+    return { ...globalConfig, projects, port: startupConfig.port };
   }
 
   // Startup notifier aliases not already defined globally. Their definitions are
@@ -393,6 +401,11 @@ function mergeScopeProjects(
   return {
     ...globalConfig,
     projects,
+    // The daemon was started from `startupConfig` and binds its port, so the
+    // merged scope must carry that port — workers (global or startup-only) spawn
+    // with `AO_PORT` from `config.port` and must reach THIS daemon, not the port
+    // recorded in the global registry.
+    port: startupConfig.port,
     // Add startup-only notifier definitions (global wins on alias collision) so a
     // carried project routing to a startup alias doesn't hit `target_missing`.
     notifiers: { ...startupNotifiers, ...globalNotifiers },
@@ -457,14 +470,18 @@ export function loadMergedScopeConfig(startupConfigPath: string): OrchestratorCo
   }
 
   let startupConfig = lastStartupConfig.get(startupConfigPath);
+  let startupFromCache = false;
   let startupError: unknown;
   try {
     startupConfig = loadConfig(startupConfigPath);
     lastStartupConfig.set(startupConfigPath, startupConfig); // remember the last good load
   } catch (error) {
     // Startup config removed/unreadable at runtime: fall through with the cached
-    // last-known startup config (if any) so its carried projects survive.
+    // last-known startup config (if any) so its carried projects survive. Mark it
+    // cache-sourced so carried projects are supervision/shutdown-only (not spawned
+    // into with a stale AO_CONFIG_PATH).
     startupError = error;
+    startupFromCache = startupConfig !== undefined;
   }
 
   if (!startupConfig) {
@@ -475,5 +492,5 @@ export function loadMergedScopeConfig(startupConfigPath: string): OrchestratorCo
   }
 
   if (!globalConfig) return startupConfig;
-  return mergeScopeProjects(globalConfig, startupConfig);
+  return mergeScopeProjects(globalConfig, startupConfig, startupFromCache);
 }

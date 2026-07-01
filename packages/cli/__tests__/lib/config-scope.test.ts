@@ -675,6 +675,8 @@ describe("loadMergedScopeConfig", () => {
 
     const first = loadMergedScopeConfig(STARTUP);
     expect(first.projects.local).toBeDefined();
+    // A fresh (non-cached) load leaves the carried project spawnable.
+    expect(first.projects.local._spawnPaused).toBeUndefined();
 
     startupGone = true;
     const second = loadMergedScopeConfig(STARTUP);
@@ -682,5 +684,48 @@ describe("loadMergedScopeConfig", () => {
     // Carried startup project survives the disappearance; global project stays too.
     expect(second.projects.local).toBeDefined();
     expect(second.projects.reg).toBeDefined();
+    // But it's supervision/shutdown-only now — the poller must not spawn into it.
+    expect(second.projects.local._spawnPaused).toBe(true);
+  });
+
+  it("uses the startup config's daemon port in the merged scope", () => {
+    // The daemon binds the STARTUP config's port; workers spawn with AO_PORT from
+    // config.port and must reach THIS daemon, not the global registry's port.
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      notifiers: {},
+      port: 4100,
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      notifiers: {},
+      port: 3000,
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    // With a carried startup-only project.
+    expect(loadMergedScopeConfig(STARTUP).port).toBe(4100);
+
+    // And when nothing is startup-only (registered project in both, same path).
+    const startup2 = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { shared: project("shared", "s", { path: "/repos/shared" }) },
+      notifiers: {},
+      port: 4100,
+    };
+    const global2 = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { shared: project("shared", "s", { path: "/repos/shared" }) },
+      notifiers: {},
+      port: 3000,
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global2 : startup2));
+    expect(loadMergedScopeConfig(STARTUP).port).toBe(4100);
   });
 });

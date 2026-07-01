@@ -1664,6 +1664,15 @@ export interface ProjectConfig {
   sourceConfigPath?: string;
 
   /**
+   * Internal: set when this carried project's source (startup) config is
+   * currently unreadable and only a cached copy is in scope. The backlog poller
+   * must NOT spawn new workers for it (a worker would get an `AO_CONFIG_PATH`
+   * pointing at the missing file and fail to resolve its config); supervision and
+   * shutdown of its existing sessions still proceed. Unset for normal projects.
+   */
+  _spawnPaused?: boolean;
+
+  /**
    * Maximum number of concurrent worker sessions the backlog poller will spawn
    * for this project. Defaults to 5 when unset.
    */
