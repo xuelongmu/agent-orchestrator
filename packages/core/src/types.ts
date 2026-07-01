@@ -1148,6 +1148,8 @@ export interface ReviewSummary {
   state: string;
   body: string;
   submittedAt: Date;
+  /** Whether the review was submitted by a known bot reviewer (e.g. Codex). */
+  isBot?: boolean;
 }
 
 export interface ReviewThreadsResult {

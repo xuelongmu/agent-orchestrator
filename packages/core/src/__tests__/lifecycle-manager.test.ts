@@ -4957,7 +4957,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBeFalsy();
   });
 
-  it("does not mark multi-PR sessions review-satisfied", async () => {
+  it("marks multi-PR sessions satisfied only once every PR is clean", async () => {
     config.reactions = {
       "bugbot-comments": {
         auto: true,
@@ -4967,11 +4967,14 @@ describe("review loop round-cap + completion detection (#4)", () => {
     };
     const pr1 = makePR({ number: 42 });
     const pr2 = makePR({ number: 43, url: "https://github.com/org/my-app/pull/43" });
-    let hasBotThreads = true;
-    const getReviewThreads = vi.fn().mockImplementation(async () => ({
-      threads: hasBotThreads ? [botThread("b1")] : [],
-      reviews: [],
-    }));
+    let primaryHasBot = true;
+    let secondaryHasThread = true;
+    const getReviewThreads = vi.fn().mockImplementation(async (pr: PRInfo) => {
+      if (pr.number === 42) {
+        return { threads: primaryHasBot ? [botThread("b1")] : [], reviews: [] };
+      }
+      return { threads: secondaryHasThread ? [botThread("b2")] : [], reviews: [] };
+    });
     const mockSCM = createMockSCM({ getReviewThreads });
     const registry = createMockRegistry({
       runtime: plugins.runtime,
@@ -4986,10 +4989,194 @@ describe("review loop round-cap + completion detection (#4)", () => {
     });
 
     await lm.check("app-1"); // primary bot round → botReviewObserved
+
+    // Primary clears but the secondary PR still has an unresolved thread.
+    primaryHasBot = false;
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeFalsy();
+
+    // Secondary clears too → all PRs clean + CI green → satisfied.
+    secondaryHasThread = false;
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeTruthy();
+  });
+
+  it("recognizes a clean bot review with no inline comments", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    // Codex submits a review with zero inline comment threads (the no-issue case).
+    const mockSCM = createMockSCM({
+      getReviewThreads: vi.fn().mockResolvedValue({
+        threads: [],
+        reviews: [
+          {
+            author: "chatgpt-codex-connector[bot]",
+            state: "commented",
+            body: "",
+            submittedAt: new Date(),
+            isBot: true,
+          },
+        ],
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["botReviewObserved"]).toBe("true");
+    expect(meta?.["reviewSatisfiedAt"]).toBeTruthy();
+  });
+
+  it("does not count subset resolution of one batch as a new round", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+        maxRounds: 1,
+      },
+    };
+    // One review batch of two comments; the agent then resolves one at a time.
+    let threads = [botThread("a1"), botThread("a2")];
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({ threads, reviews: [] }));
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1"); // round 1: dispatch {a1,a2}
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+
+    // Agent resolves a1 — the unresolved set shrinks to a subset of the batch.
+    threads = [botThread("a2")];
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+
+    // No NEW bot review happened, so no re-dispatch, no new round, no escalation
+    // (with maxRounds=1 a false round here would immediately escalate).
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["reviewRoundCount"]).toBe("1");
+    expect(meta?.["reviewRoundsEscalated"]).toBeFalsy();
+  });
+
+  it("clears the satisfied mark when CI regresses", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    let hasBotThreads = true;
+    let ci = "passing";
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({
+      threads: hasBotThreads ? [botThread("b1")] : [],
+      reviews: [],
+    }));
+    const mockSCM = createMockSCM({
+      getReviewThreads,
+      getCISummary: vi.fn().mockImplementation(async () => ci),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1"); // bot round → botReviewObserved
     hasBotThreads = false;
     await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
-    await lm.check("app-1"); // primary clears, but multi-PR is deferred
+    await lm.check("app-1"); // threads clear + CI green → satisfied
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeTruthy();
+
+    // A later push flips CI back to pending while threads stay clear.
+    ci = "pending";
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeFalsy();
+  });
+
+  it("releases the escalation latch on a live merge when enrichment is missing", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+        maxRounds: 1,
+      },
+    };
+    let currentBotId = "r1";
+    let prState: "open" | "merged" | "closed" = "open";
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({
+      threads: [botThread(currentBotId)],
+      reviews: [],
+    }));
+    const mockSCM = createMockSCM({
+      getReviewThreads,
+      getPRState: vi.fn().mockImplementation(async () => prState),
+      // Force a batch enrichment cache miss so the guard must consult getPRState.
+      enrichSessionsPRBatch: vi.fn().mockResolvedValue(new Map()),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1"); // round 1 dispatched
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    currentBotId = "r2";
+    await lm.check("app-1"); // exceeds maxRounds → escalate
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBe("true");
+
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+
+    // Human merges; enrichment is still absent, so only the live getPRState
+    // fallback in the guard can release the latch.
+    prState = "merged";
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("merged");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBeFalsy();
   });
 });
 

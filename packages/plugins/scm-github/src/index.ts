@@ -1277,13 +1277,23 @@ function createGitHubSCM(): SCM {
           });
 
         const reviews: ReviewSummary[] = reviewNodes
-          .filter((r) => r.body && r.body.trim().length > 0)
-          .map((r) => ({
-            author: r.author?.login ?? "unknown",
-            state: r.state,
-            body: r.body,
-            submittedAt: parseDate(r.submittedAt),
-          }));
+          // Keep non-empty human reviews for display, and ALL bot reviews (even
+          // with an empty body) so completion detection can recognize a clean,
+          // no-inline-comment bot review as a real review-submission signal.
+          .filter((r) => {
+            const author = r.author?.login ?? "unknown";
+            return (r.body && r.body.trim().length > 0) || BOT_AUTHORS.has(author);
+          })
+          .map((r) => {
+            const author = r.author?.login ?? "unknown";
+            return {
+              author,
+              state: r.state,
+              body: r.body,
+              submittedAt: parseDate(r.submittedAt),
+              isBot: BOT_AUTHORS.has(author),
+            };
+          });
 
         const result: ReviewThreadsResult = { threads, reviews };
         reviewThreadsCache.set(cacheKey, result);

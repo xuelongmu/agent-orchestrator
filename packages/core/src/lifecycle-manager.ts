@@ -1394,8 +1394,19 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       if (session.metadata["reviewRoundsEscalated"] === "true") {
         const escalatedPRKey = `${session.pr.owner}/${session.pr.repo}#${session.pr.number}`;
         const escalatedEnrichment = prEnrichmentCache.get(escalatedPRKey);
-        const prIsTerminal =
+        let prIsTerminal =
           escalatedEnrichment?.state === "merged" || escalatedEnrichment?.state === "closed";
+        // Cache miss (batch enrichment unimplemented or the fetch failed): consult
+        // live PR state so a human merge/close still releases the latch — otherwise
+        // needs_input would stick and merge cleanup / close notifications never run.
+        if (!escalatedEnrichment && scm.getPRState) {
+          try {
+            const liveState = await scm.getPRState(session.pr);
+            prIsTerminal = liveState === "merged" || liveState === "closed";
+          } catch {
+            // Couldn't confirm — keep holding the latch until the next poll.
+          }
+        }
         if (!prIsTerminal) {
           if (lifecycle.pr.state === "none") lifecycle.pr.state = "open";
           if (lifecycle.pr.reason === "not_created") lifecycle.pr.reason = "in_progress";
@@ -2055,6 +2066,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // we returned above so the next poll can retry without waiting 2 minutes.
     lastReviewBacklogCheckAt.set(session.id, Date.now());
 
+    // Tracks whether every secondary PR in the session is free of unresolved
+    // review threads (bot or human). Completion detection requires this so a
+    // multi-PR session is not marked satisfied while a secondary PR still has
+    // open threads. Fetch failures leave it false (can't confirm clean).
+    let secondaryPRsThreadClear = true;
+
     // Persist review comments + summaries to metadata for dashboard consumption
     {
       const unresolved = allThreads.filter((c) => !c.isBot);
@@ -2099,7 +2116,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             secondaryReviews = [];
           }
         } catch {
+          secondaryPRsThreadClear = false; // couldn't confirm this PR is clean
           continue;
+        }
+        if (secondaryThreads.length > 0) {
+          secondaryPRsThreadClear = false;
         }
         const secondaryUnresolved = secondaryThreads.filter((c) => !c.isBot);
         const secondaryBlob = JSON.stringify({
@@ -2130,7 +2151,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // Record that the bot reviewer has actually engaged with this PR. Completion
     // detection requires this so a brand-new PR the bot has never touched is not
     // marked review-satisfied just because it starts out thread-free + CI green.
-    if (automatedComments.length > 0 && session.metadata["botReviewObserved"] !== "true") {
+    // A completed bot review counts even when it left NO inline comments (the
+    // clean/no-issue success case) — recognized via the review submission.
+    const botReviewSubmitted = reviewSummaries.some((r) => r.isBot);
+    if (
+      (automatedComments.length > 0 || botReviewSubmitted) &&
+      session.metadata["botReviewObserved"] !== "true"
+    ) {
       updateSessionMetadata(session, { botReviewObserved: "true" });
     }
 
@@ -2141,6 +2168,18 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     if (
       session.metadata["reviewSatisfiedAt"] &&
       (pendingComments.length > 0 || automatedComments.length > 0)
+    ) {
+      updateSessionMetadata(session, { reviewSatisfiedAt: "" });
+    }
+
+    // Re-validate CI on every fetch: if CI regressed (passing → pending/failing)
+    // after a push/rerun while the threads stayed clear, the stale "satisfied"
+    // mark must be cleared so the merge gate doesn't act on an outdated signal.
+    const primaryEnrichment = getPREnrichmentForSession(session);
+    if (
+      session.metadata["reviewSatisfiedAt"] &&
+      primaryEnrichment &&
+      primaryEnrichment.ciStatus !== "passing"
     ) {
       updateSessionMetadata(session, { reviewSatisfiedAt: "" });
     }
@@ -2226,6 +2265,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         getReactionConfigForSession(session, automatedReactionKey)?.maxRounds ??
         DEFAULT_MAX_REVIEW_ROUNDS;
 
+      // A genuinely new review round requires new bot content — at least one
+      // unresolved comment we have not dispatched before. When the agent merely
+      // resolves a subset of an already-dispatched batch, the unresolved set
+      // shrinks but no new bot review happened, so this stays false: we neither
+      // re-dispatch nor count a new round (which would otherwise let one-at-a-time
+      // resolution of a single batch falsely escalate at maxRounds).
+      const lastDispatchedBotIds = new Set(
+        lastAutomatedDispatchHash ? lastAutomatedDispatchHash.split(",") : [],
+      );
+      const hasNewBotContent = automatedComments.some((c) => !lastDispatchedBotIds.has(c.id));
+
       if (automatedFingerprint !== lastAutomatedFingerprint) {
         clearReactionTracker(session.id, automatedReactionKey);
         updateSessionMetadata(session, {
@@ -2245,14 +2295,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           reviewRoundCount: "",
           reviewRoundsEscalated: "",
         });
-        maybeMarkReviewSatisfied(session, pendingComments.length === 0);
+        maybeMarkReviewSatisfied(session, {
+          primaryHumanThreadsClear: pendingComments.length === 0,
+          secondaryThreadsClear: secondaryPRsThreadClear,
+        });
       } else if (roundEscalated) {
         // Already escalated after exceeding the round cap. Stay latched — no
         // further auto-dispatch — until the bot threads clear (handled by the
         // branch above) or a human intervenes. determineStatus keeps the
         // session parked in needs_input while this flag is set.
-      } else if (automatedFingerprint !== lastAutomatedDispatchHash) {
-        // A new, distinct batch of bot review comments = a new review round.
+      } else if (hasNewBotContent) {
+        // A genuinely new batch of bot review comments = a new review round.
         if (reviewRounds >= maxReviewRounds) {
           await escalateReviewRoundCap(session, reviewRounds, maxReviewRounds);
         } else {
@@ -2295,24 +2348,30 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
   /**
    * Completion detection for the bot review→fix loop: when no unresolved review
-   * threads remain (bot AND human) and CI is green, record that the review is
-   * satisfied so the merge gate (#15) can advance the PR toward merge. Latches
-   * on `reviewSatisfiedAt` so the signal is emitted once per satisfied
-   * transition; the latch is cleared when any unresolved thread reappears.
+   * threads remain (bot AND human, across every PR in the session) and CI is
+   * green on every PR, record that the review is satisfied so the merge gate
+   * (#15) can advance the PR toward merge. Latches on `reviewSatisfiedAt` so the
+   * signal is emitted once per satisfied transition; the latch is cleared when
+   * any unresolved thread reappears or CI regresses.
    */
-  function maybeMarkReviewSatisfied(session: Session, humanThreadsClear: boolean): void {
+  function maybeMarkReviewSatisfied(
+    session: Session,
+    threads: { primaryHumanThreadsClear: boolean; secondaryThreadsClear: boolean },
+  ): void {
     if (session.metadata["reviewSatisfiedAt"]) return; // already marked
-    if (!humanThreadsClear) return; // unresolved human comments still block merge-readiness
+    if (!threads.primaryHumanThreadsClear) return; // primary human comments unresolved
+    if (!threads.secondaryThreadsClear) return; // a secondary PR still has unresolved threads
     // Require the bot reviewer to have actually engaged — never satisfy a PR the
-    // Codex reviewer has not touched (a fresh thread-free PR is not "reviewed").
+    // Codex reviewer has not touched. A completed bot review counts even with no
+    // inline comments (recorded as botReviewObserved from the review submission).
     if (session.metadata["botReviewObserved"] !== "true") return;
-    // Multi-PR sessions: the caller only inspects the primary PR's threads and
-    // this helper only reads the primary PR's enrichment, so a secondary PR could
-    // still be failing CI or hold unresolved threads. Don't emit a false clean
-    // signal — defer multi-PR completion to the merge gate (#15).
-    if (session.prs.length > 1) return;
-    const enrichment = getPREnrichmentForSession(session);
-    if (enrichment?.ciStatus !== "passing") return; // CI not green (or status unknown)
+    // Every PR in the session must be CI-green — a secondary PR failing CI must
+    // not be masked by a clean primary.
+    const sessionPRs = normalizeSessionPRs(session);
+    const allGreen = sessionPRs.every(
+      (p) => prEnrichmentCache.get(`${p.owner}/${p.repo}#${p.number}`)?.ciStatus === "passing",
+    );
+    if (!allGreen) return; // CI not green on some PR (or enrichment unknown)
 
     const satisfiedAt = new Date().toISOString();
     updateSessionMetadata(session, { reviewSatisfiedAt: satisfiedAt });
@@ -2325,6 +2384,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       data: {
         prNumber: session.pr?.number,
         prUrl: session.pr?.url,
+        prCount: sessionPRs.length,
       },
     });
   }
