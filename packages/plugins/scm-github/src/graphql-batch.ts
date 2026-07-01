@@ -76,6 +76,7 @@ interface ETagCache {
   commitStatus: LRUCache<string, string>; // Key: "owner/repo#sha", Value: ETag
   reviewComments: LRUCache<string, string>; // Key: "owner/repo#number", Value: ETag
   pullReviews: LRUCache<string, string>; // Key: "owner/repo#number", Value: ETag
+  pullMeta: LRUCache<string, string>; // Key: "owner/repo#number", Value: ETag
 }
 
 /**
@@ -90,6 +91,7 @@ const etagCache: ETagCache = {
   commitStatus: new LRUCache(MAX_COMMIT_STATUS_ETAGS),
   reviewComments: new LRUCache(MAX_REVIEW_COMMENTS_ETAGS),
   pullReviews: new LRUCache(MAX_PULL_REVIEWS_ETAGS),
+  pullMeta: new LRUCache(MAX_PULL_REVIEWS_ETAGS),
 };
 
 /**
@@ -689,6 +691,66 @@ export async function checkPullReviewsETag(
       return false;
     }
     observer?.log("warn", `[ETag Guard 3b] Pull reviews check failed for ${cacheKey}: ${errorMsg}`);
+    return true; // Assume changed to be safe
+  }
+}
+
+/**
+ * Guard 3c: Pull Request Metadata ETag Check (per PR)
+ *
+ * Detects any change to the PR resource — in particular a new HEAD commit
+ * (push/force-push), which neither the review-comments nor the review-submission
+ * ETag reflects. Without this, a push with no new comments/reviews leaves both
+ * of those validators at 304 and getReviewThreads serves a cached result with a
+ * stale headSha, defeating head-scoped completion detection.
+ *
+ * - Endpoint: GET /repos/{owner}/{repo}/pulls/{number}
+ * - Cost: 0 REST points on 304, 1 REST point on 200
+ */
+export async function checkPullRequestETag(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  observer?: BatchObserver,
+): Promise<boolean> {
+  const cacheKey = `${owner}/${repo}#${prNumber}`;
+  const cachedETag = etagCache.pullMeta.get(cacheKey);
+
+  const url = `repos/${owner}/${repo}/pulls/${prNumber}`;
+  const args = ["api", "--method", "GET", url, "-i"];
+
+  if (cachedETag) {
+    args.push("-H", `If-None-Match: ${cachedETag}`);
+  }
+
+  try {
+    const output = await execGhAsync(args, 10_000, "gh.api.guard-pull-meta");
+
+    if (is304(output)) {
+      const rotatedETag = extractETag(output);
+      if (rotatedETag) etagCache.pullMeta.set(cacheKey, rotatedETag);
+      return false;
+    }
+
+    const newETag = extractETag(output);
+    if (newETag) {
+      etagCache.pullMeta.set(cacheKey, newETag);
+    }
+
+    return true;
+  } catch (err) {
+    const output = extractErrorOutput(err);
+    if (output && is304(output)) {
+      const rotatedETag = extractETag(output);
+      if (rotatedETag) etagCache.pullMeta.set(cacheKey, rotatedETag);
+      return false;
+    }
+
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    if (is304(errorMsg)) {
+      return false;
+    }
+    observer?.log("warn", `[ETag Guard 3c] Pull metadata check failed for ${cacheKey}: ${errorMsg}`);
     return true; // Assume changed to be safe
   }
 }

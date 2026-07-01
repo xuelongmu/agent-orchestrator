@@ -2027,11 +2027,25 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // is the merge-gate clean signal, so a human thread or CI regression must be
     // observed promptly (and the latch cleared) rather than up to 2 minutes late.
     const revalidateSatisfied = !!session.metadata["reviewSatisfiedAt"];
-    if (!hasRelevantTransition && !readyForReviewRecheck && !revalidateSatisfied) {
+    // While the round-cap latch is set the loop is parked in needs_input. A human
+    // may resolve the threads in the UI — a GraphQL-only isResolved change that no
+    // REST ETag reflects — so re-check promptly AND force a fresh fetch (below) so
+    // the resolution is observed and the loop can unblock.
+    const roundEscalated = session.metadata["reviewRoundsEscalated"] === "true";
+    if (
+      !hasRelevantTransition &&
+      !readyForReviewRecheck &&
+      !revalidateSatisfied &&
+      !roundEscalated
+    ) {
       if (Date.now() - lastCheckAt < REVIEW_BACKLOG_THROTTLE_MS) {
         return;
       }
     }
+    // Force a cache-bypassing fetch when we must observe GraphQL-only thread
+    // resolution the REST ETag guards can't see: after the agent reports ready,
+    // or while the escalation latch waits on a human resolving threads.
+    const forceFreshFetch = readyForReviewRecheck || roundEscalated;
     // Single GraphQL call for all review threads (human + bot) + review summaries.
     // Split locally by isBot for separate reaction pipelines.
     let allThreads: ReviewComment[];
@@ -2040,11 +2054,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     let primaryThreadsTruncated = false;
     try {
       if (scm.getReviewThreads) {
-        // On a ready-for-review recheck, force a fresh fetch: the agent has just
-        // resolved threads (GraphQL-only state) that the review-comments ETag
-        // cannot detect, so the cached result would still show them unresolved.
+        // Force a fresh fetch when GraphQL-only thread resolution must be seen
+        // (agent reported ready, or the escalation latch is waiting on a human).
         const result = await scm.getReviewThreads(session.pr, {
-          forceFresh: readyForReviewRecheck,
+          forceFresh: forceFreshFetch,
         });
         allThreads = result.threads;
         reviewSummaries = result.reviews;
@@ -2117,7 +2130,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         try {
           if (scm.getReviewThreads) {
             const result = await scm.getReviewThreads(secondaryPR, {
-              forceFresh: readyForReviewRecheck,
+              forceFresh: forceFreshFetch,
             });
             secondaryThreads = result.threads;
             secondaryReviews = result.reviews;
@@ -2284,7 +2297,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       const automatedFingerprint = makeFingerprint(automatedComments.map((comment) => comment.id));
       const lastAutomatedFingerprint = session.metadata["lastAutomatedReviewFingerprint"] ?? "";
       const lastAutomatedDispatchHash = session.metadata["lastAutomatedReviewDispatchHash"] ?? "";
-      const roundEscalated = session.metadata["reviewRoundsEscalated"] === "true";
+      // roundEscalated is read once at the top of maybeDispatchReviewBacklog.
       const reviewRounds = parseAttemptCount(session.metadata["reviewRoundCount"]);
       const maxReviewRounds =
         getReactionConfigForSession(session, automatedReactionKey)?.maxRounds ??
@@ -2435,15 +2448,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // Fail closed when the thread set may be incomplete — an unresolved thread
     // outside the fetched page must not read as "clean".
     if (ctx.threadsTruncated) return;
-    // Require a code-reviewer review of the CURRENT head. When the SCM reports a
-    // head SHA, the recorded review head must match it (a stale review of an old
-    // push does not count). When it cannot (degraded plugin), fall back to the
-    // head-agnostic engagement boolean.
-    if (ctx.headSha) {
-      if (session.metadata["botReviewObservedSha"] !== ctx.headSha) return;
-    } else if (session.metadata["botReviewObserved"] !== "true") {
-      return;
-    }
+    // Require a code-reviewer review of the CURRENT head. The SCM must report a
+    // head SHA and the recorded review head must match it — a stale review of an
+    // older push does not count. Fail CLOSED when no head SHA is available (e.g.
+    // GitLab, or the getPendingComments fallback): a head-agnostic "ever engaged"
+    // signal would let a later push be satisfied without a fresh review, so we
+    // defer those to the merge gate rather than emit a possibly-stale signal.
+    if (!ctx.headSha) return;
+    if (session.metadata["botReviewObservedSha"] !== ctx.headSha) return;
     // A top-level changes_requested review (even with no inline threads) blocks
     // merge-readiness.
     if (!(await primaryPRNotChangesRequested(session, scm))) return;

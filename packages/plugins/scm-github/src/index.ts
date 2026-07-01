@@ -39,6 +39,7 @@ import {
   enrichSessionsPRBatch as enrichSessionsPRBatchImpl,
   checkReviewCommentsETag,
   checkPullReviewsETag,
+  checkPullRequestETag,
 } from "./graphql-batch.js";
 import {
   getWebhookHeader,
@@ -1172,13 +1173,16 @@ function createGitHubSCM(): SCM {
       // no REST ETag reflects — e.g. after the agent resolves comments.
       if (!options?.forceFresh) {
         // Guard 3: inline review comments changed? Guard 3b: review submissions
-        // changed? A clean bot review with no inline comments only moves the
-        // reviews resource, so both must be consulted before serving the cache.
-        const [commentsChanged, pullReviewsChanged] = await Promise.all([
+        // changed? Guard 3c: PR metadata (esp. a new HEAD commit) changed? A clean
+        // review moves only the reviews resource, and a bare push moves only the
+        // PR head — so all three must be 304 before serving the cache, otherwise
+        // a stale headSha/thread set would defeat head-scoped completion.
+        const [commentsChanged, pullReviewsChanged, pullMetaChanged] = await Promise.all([
           checkReviewCommentsETag(pr.owner, pr.repo, pr.number, instanceObserver),
           checkPullReviewsETag(pr.owner, pr.repo, pr.number, instanceObserver),
+          checkPullRequestETag(pr.owner, pr.repo, pr.number, instanceObserver),
         ]);
-        if (!commentsChanged && !pullReviewsChanged) {
+        if (!commentsChanged && !pullReviewsChanged && !pullMetaChanged) {
           const cached = reviewThreadsCache.get(cacheKey);
           if (cached) return cached;
         }

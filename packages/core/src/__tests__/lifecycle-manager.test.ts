@@ -4664,6 +4664,24 @@ describe("review loop round-cap + completion detection (#4)", () => {
     };
   }
 
+  /**
+   * A getReviewThreads result that carries a head SHA and a Codex review scoped
+   * to that head — the shape scm-github always returns. Completion detection now
+   * requires a head-scoped review, so satisfied-path tests use this.
+   */
+  const HEAD = "sha-head";
+  function reviewedResult(
+    opts: { threads?: unknown[]; head?: string; reviewedHead?: string; truncated?: boolean } = {},
+  ) {
+    const head = opts.head ?? HEAD;
+    return {
+      threads: opts.threads ?? [],
+      reviews: [codexReview({ commitSha: opts.reviewedHead ?? head })],
+      headSha: head,
+      threadsTruncated: opts.truncated ?? false,
+    };
+  }
+
   it("stops the bot review loop and escalates to needs_input after maxRounds", async () => {
     config.reactions = {
       "bugbot-comments": {
@@ -4731,10 +4749,9 @@ describe("review loop round-cap + completion detection (#4)", () => {
     };
 
     let hasBotThreads = true;
-    const getReviewThreads = vi.fn().mockImplementation(async () => ({
-      threads: hasBotThreads ? [botThread("b1")] : [],
-      reviews: [],
-    }));
+    const getReviewThreads = vi.fn().mockImplementation(async () =>
+      reviewedResult({ threads: hasBotThreads ? [botThread("b1")] : [] }),
+    );
     // Default createMockSCM enrichment reports ciStatus "passing".
     const mockSCM = createMockSCM({ getReviewThreads });
     const registry = createMockRegistry({
@@ -4876,25 +4893,21 @@ describe("review loop round-cap + completion detection (#4)", () => {
       },
     };
     let phase: "bot" | "clear" | "human" = "bot";
+    const humanThread = {
+      id: "h1",
+      author: "reviewer",
+      body: "Actually, please revert this",
+      path: "src/worker.ts",
+      line: 3,
+      isResolved: false,
+      createdAt: new Date(),
+      url: "https://example.com/comment/h1",
+      isBot: false,
+    };
     const getReviewThreads = vi.fn().mockImplementation(async () => {
-      if (phase === "bot") return { threads: [botThread("b1")], reviews: [] };
-      if (phase === "clear") return { threads: [], reviews: [] };
-      return {
-        threads: [
-          {
-            id: "h1",
-            author: "reviewer",
-            body: "Actually, please revert this",
-            path: "src/worker.ts",
-            line: 3,
-            isResolved: false,
-            createdAt: new Date(),
-            url: "https://example.com/comment/h1",
-            isBot: false,
-          },
-        ],
-        reviews: [],
-      };
+      if (phase === "bot") return reviewedResult({ threads: [botThread("b1")] });
+      if (phase === "clear") return reviewedResult();
+      return reviewedResult({ threads: [humanThread] });
     });
     const mockSCM = createMockSCM({ getReviewThreads });
     const registry = createMockRegistry({
@@ -5017,10 +5030,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
     };
     // Codex submits a review with zero inline comment threads (the no-issue case).
     const mockSCM = createMockSCM({
-      getReviewThreads: vi.fn().mockResolvedValue({
-        threads: [],
-        reviews: [codexReview()],
-      }),
+      getReviewThreads: vi.fn().mockResolvedValue(reviewedResult()),
     });
     const registry = createMockRegistry({
       runtime: plugins.runtime,
@@ -5090,10 +5100,9 @@ describe("review loop round-cap + completion detection (#4)", () => {
     };
     let hasBotThreads = true;
     let ci = "passing";
-    const getReviewThreads = vi.fn().mockImplementation(async () => ({
-      threads: hasBotThreads ? [botThread("b1")] : [],
-      reviews: [],
-    }));
+    const getReviewThreads = vi.fn().mockImplementation(async () =>
+      reviewedResult({ threads: hasBotThreads ? [botThread("b1")] : [] }),
+    );
     const mockSCM = createMockSCM({
       getReviewThreads,
       getCISummary: vi.fn().mockImplementation(async () => ci),
@@ -5172,6 +5181,51 @@ describe("review loop round-cap + completion detection (#4)", () => {
     await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
     await lm.check("app-1");
     expect(lm.getStates().get("app-1")).toBe("merged");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBeFalsy();
+  });
+
+  it("force-fetches while escalated so a human UI resolution unblocks the loop", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+        maxRounds: 1,
+      },
+    };
+    let botId = "r1";
+    let resolved = false;
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({
+      threads: resolved ? [] : [botThread(botId)],
+      reviews: [codexReview({ commitSha: "h1" })],
+      headSha: "h1",
+    }));
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1"); // round 1
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    botId = "r2";
+    await lm.check("app-1"); // exceeds maxRounds → escalate
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBe("true");
+
+    // While escalated, the fetch is forced fresh so GraphQL-only resolution is seen.
+    getReviewThreads.mockClear();
+    resolved = true; // human resolves the threads in the GitHub UI
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(getReviewThreads.mock.calls[0]?.[1]).toMatchObject({ forceFresh: true });
+    // Threads now clear → the escalation latch is released.
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBeFalsy();
   });
 
@@ -5255,7 +5309,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
     // Codex reviewed (clean, no inline threads) but a human requested changes
     // at the top level — no inline threads, CI green.
     const mockSCM = createMockSCM({
-      getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [codexReview()] }),
+      getReviewThreads: vi.fn().mockResolvedValue(reviewedResult()),
       getReviewDecision: vi.fn().mockResolvedValue("changes_requested"),
     });
     const registry = createMockRegistry({
@@ -5282,7 +5336,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
       },
     };
     const mockSCM = createMockSCM({
-      getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [codexReview()] }),
+      getReviewThreads: vi.fn().mockResolvedValue(reviewedResult()),
       getCISummary: vi.fn().mockResolvedValue("passing"),
       getReviewDecision: vi.fn().mockResolvedValue("none"),
       // No batch enrichment → completion must fall back to live getCISummary.
@@ -5372,11 +5426,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
     // No threads returned, but the result is flagged truncated — an unresolved
     // thread could exist outside the fetched window.
     const mockSCM = createMockSCM({
-      getReviewThreads: vi.fn().mockResolvedValue({
-        threads: [],
-        reviews: [codexReview()],
-        threadsTruncated: true,
-      }),
+      getReviewThreads: vi.fn().mockResolvedValue(reviewedResult({ truncated: true })),
     });
     const registry = createMockRegistry({
       runtime: plugins.runtime,
@@ -5402,7 +5452,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
       },
     };
     const mockSCM = createMockSCM({
-      getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [codexReview()] }),
+      getReviewThreads: vi.fn().mockResolvedValue(reviewedResult()),
       getCISummary: vi.fn().mockResolvedValue("none"), // no configured checks
     });
     const registry = createMockRegistry({
@@ -5429,7 +5479,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
       },
     };
     const mockSCM = createMockSCM({
-      getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [codexReview()] }),
+      getReviewThreads: vi.fn().mockResolvedValue(reviewedResult()),
       getReviewDecision: vi.fn().mockRejectedValue(new Error("permission denied")),
       // Cache miss forces the live getReviewDecision path (which throws).
       enrichSessionsPRBatch: vi.fn().mockResolvedValue(new Map()),
@@ -5458,24 +5508,20 @@ describe("review loop round-cap + completion detection (#4)", () => {
       },
     };
     let hasHumanThread = false;
-    const getReviewThreads = vi.fn().mockImplementation(async () => ({
-      threads: hasHumanThread
-        ? [
-            {
-              id: "h1",
-              author: "reviewer",
-              body: "wait",
-              path: "src/x.ts",
-              line: 1,
-              isResolved: false,
-              createdAt: new Date(),
-              url: "https://example.com/h1",
-              isBot: false,
-            },
-          ]
-        : [],
-      reviews: [codexReview()],
-    }));
+    const humanThread = {
+      id: "h1",
+      author: "reviewer",
+      body: "wait",
+      path: "src/x.ts",
+      line: 1,
+      isResolved: false,
+      createdAt: new Date(),
+      url: "https://example.com/h1",
+      isBot: false,
+    };
+    const getReviewThreads = vi.fn().mockImplementation(async () =>
+      reviewedResult({ threads: hasHumanThread ? [humanThread] : [] }),
+    );
     const mockSCM = createMockSCM({ getReviewThreads });
     const registry = createMockRegistry({
       runtime: plugins.runtime,
