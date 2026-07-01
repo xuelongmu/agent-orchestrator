@@ -5392,7 +5392,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
     hasReview = false; // reviewer has not re-reviewed the new head yet
     await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
     await lm.check("app-1");
-    let meta = readMetadataRaw(env.sessionsDir, "app-1");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
     expect(meta?.["reviewSatisfiedAt"]).toBeFalsy();
     expect(meta?.["botReviewObserved"]).toBeFalsy();
 
