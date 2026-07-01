@@ -4648,6 +4648,19 @@ describe("review loop round-cap + completion detection (#4)", () => {
       createdAt: new Date(),
       url: `https://example.com/comment/${id}`,
       isBot: true,
+      isReviewBot: true,
+    };
+  }
+
+  function codexReview(overrides: Record<string, unknown> = {}) {
+    return {
+      author: "chatgpt-codex-connector[bot]",
+      state: "commented",
+      body: "",
+      submittedAt: new Date(),
+      isBot: true,
+      isReviewBot: true,
+      ...overrides,
     };
   }
 
@@ -5015,15 +5028,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
     const mockSCM = createMockSCM({
       getReviewThreads: vi.fn().mockResolvedValue({
         threads: [],
-        reviews: [
-          {
-            author: "chatgpt-codex-connector[bot]",
-            state: "commented",
-            body: "",
-            submittedAt: new Date(),
-            isBot: true,
-          },
-        ],
+        reviews: [codexReview()],
       }),
     });
     const registry = createMockRegistry({
@@ -5177,6 +5182,231 @@ describe("review loop round-cap + completion detection (#4)", () => {
     await lm.check("app-1");
     expect(lm.getStates().get("app-1")).toBe("merged");
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBeFalsy();
+  });
+
+  it("forces a fresh thread fetch on a ready-for-review recheck", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [], reviews: [] });
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const session = makeSession({ status: "pr_open", pr: makePR() });
+    const lm = setupCheck("app-1", { session, registry });
+
+    await lm.check("app-1"); // normal fetch — not forced
+    expect(getReviewThreads.mock.calls[0]?.[1]).toMatchObject({ forceFresh: false });
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    getReviewThreads.mockClear();
+    vi.mocked(mockSessionManager.get).mockResolvedValue({
+      ...session,
+      metadata: {
+        ...session.metadata,
+        agent: "mock-agent",
+        agentReportedState: "ready_for_review",
+        agentReportedAt: new Date().toISOString(),
+      },
+    });
+    await lm.check("app-1"); // ready recheck → forceFresh bypasses the cache
+    expect(getReviewThreads.mock.calls[0]?.[1]).toMatchObject({ forceFresh: true });
+  });
+
+  it("does not satisfy on a non-reviewer bot review", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    // A CI/coverage bot submitted a review, but it is not a code reviewer.
+    const mockSCM = createMockSCM({
+      getReviewThreads: vi.fn().mockResolvedValue({
+        threads: [],
+        reviews: [codexReview({ author: "github-actions[bot]", isReviewBot: false })],
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["botReviewObserved"]).toBeFalsy();
+    expect(meta?.["reviewSatisfiedAt"]).toBeFalsy();
+  });
+
+  it("does not satisfy while a changes_requested review is open", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    // Codex reviewed (clean, no inline threads) but a human requested changes
+    // at the top level — no inline threads, CI green.
+    const mockSCM = createMockSCM({
+      getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [codexReview()] }),
+      getReviewDecision: vi.fn().mockResolvedValue("changes_requested"),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeFalsy();
+  });
+
+  it("satisfies via live CI when batch enrichment is unavailable", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    const mockSCM = createMockSCM({
+      getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [codexReview()] }),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi.fn().mockResolvedValue("none"),
+      // No batch enrichment → completion must fall back to live getCISummary.
+      enrichSessionsPRBatch: vi.fn().mockResolvedValue(new Map()),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeTruthy();
+  });
+
+  it("clears the satisfied mark when a secondary PR thread reappears", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    const pr1 = makePR({ number: 42 });
+    const pr2 = makePR({ number: 43, url: "https://github.com/org/my-app/pull/43" });
+    let primaryHasBot = true;
+    let secondaryHasThread = false;
+    const getReviewThreads = vi.fn().mockImplementation(async (pr: PRInfo) => {
+      if (pr.number === 42) return { threads: primaryHasBot ? [botThread("b1")] : [], reviews: [] };
+      return { threads: secondaryHasThread ? [botThread("b2")] : [], reviews: [] };
+    });
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: pr1, prs: [pr1, pr2] }),
+      registry,
+    });
+
+    await lm.check("app-1"); // primary bot round → botReviewObserved
+    primaryHasBot = false;
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1"); // all clear → satisfied
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeTruthy();
+
+    // A secondary PR later gets a fresh unresolved thread → clear the mark.
+    secondaryHasThread = true;
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeFalsy();
+  });
+
+  it("requires a fresh review after CI regresses on a new head", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    let ci = "passing";
+    let hasReview = true; // Codex review present
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({
+      threads: [],
+      reviews: hasReview ? [codexReview()] : [],
+    }));
+    const mockSCM = createMockSCM({
+      getReviewThreads,
+      getCISummary: vi.fn().mockImplementation(async () => ci),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1"); // clean review + CI green → satisfied
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeTruthy();
+
+    // New push: CI regresses. The prior review no longer covers the new head, so
+    // both the satisfied mark AND the engagement signal must clear.
+    ci = "pending";
+    hasReview = false; // reviewer has not re-reviewed the new head yet
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    let meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["reviewSatisfiedAt"]).toBeFalsy();
+    expect(meta?.["botReviewObserved"]).toBeFalsy();
+
+    // CI passes again but the reviewer still hasn't re-reviewed → NOT satisfied.
+    ci = "passing";
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeFalsy();
+
+    // The reviewer re-reviews the new head → satisfied again.
+    hasReview = true;
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeTruthy();
   });
 });
 

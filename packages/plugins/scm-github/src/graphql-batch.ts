@@ -60,6 +60,7 @@ export function setExecGhAsync(
 const MAX_PR_LIST_ETAGS = 100; // Number of repos to cache
 const MAX_COMMIT_STATUS_ETAGS = 500; // Number of commits to cache
 const MAX_REVIEW_COMMENTS_ETAGS = 500; // Number of PRs to cache review ETags
+const MAX_PULL_REVIEWS_ETAGS = 500; // Number of PRs to cache review-submission ETags
 const MAX_PR_METADATA = 200; // Number of PRs to cache full data
 
 /**
@@ -74,6 +75,7 @@ interface ETagCache {
   prList: LRUCache<string, string>; // Key: "owner/repo", Value: ETag
   commitStatus: LRUCache<string, string>; // Key: "owner/repo#sha", Value: ETag
   reviewComments: LRUCache<string, string>; // Key: "owner/repo#number", Value: ETag
+  pullReviews: LRUCache<string, string>; // Key: "owner/repo#number", Value: ETag
 }
 
 /**
@@ -87,6 +89,7 @@ const etagCache: ETagCache = {
   prList: new LRUCache(MAX_PR_LIST_ETAGS),
   commitStatus: new LRUCache(MAX_COMMIT_STATUS_ETAGS),
   reviewComments: new LRUCache(MAX_REVIEW_COMMENTS_ETAGS),
+  pullReviews: new LRUCache(MAX_PULL_REVIEWS_ETAGS),
 };
 
 /**
@@ -622,6 +625,66 @@ export async function checkReviewCommentsETag(
       "warn",
       `[ETag Guard 3] Review comments check failed for ${cacheKey}: ${errorMsg}`,
     );
+    return true; // Assume changed to be safe
+  }
+}
+
+/**
+ * Guard 3b: Pull Reviews ETag Check (per PR)
+ *
+ * Complements Guard 3: detects changes to PR *review submissions*
+ * (GET /repos/{owner}/{repo}/pulls/{number}/reviews), which the review-comments
+ * ETag does not cover. A clean bot review with no inline comments changes the
+ * reviews resource but not the comments resource — without this guard, the
+ * cached getReviewThreads result would hide it and completion detection would
+ * never observe the review.
+ *
+ * - Cost: 0 REST points on 304, 1 REST point on 200
+ */
+export async function checkPullReviewsETag(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  observer?: BatchObserver,
+): Promise<boolean> {
+  const cacheKey = `${owner}/${repo}#${prNumber}`;
+  const cachedETag = etagCache.pullReviews.get(cacheKey);
+
+  const url = `repos/${owner}/${repo}/pulls/${prNumber}/reviews`;
+  const args = ["api", "--method", "GET", url, "-i"];
+
+  if (cachedETag) {
+    args.push("-H", `If-None-Match: ${cachedETag}`);
+  }
+
+  try {
+    const output = await execGhAsync(args, 10_000, "gh.api.guard-pull-reviews");
+
+    if (is304(output)) {
+      const rotatedETag = extractETag(output);
+      if (rotatedETag) etagCache.pullReviews.set(cacheKey, rotatedETag);
+      return false;
+    }
+
+    const newETag = extractETag(output);
+    if (newETag) {
+      etagCache.pullReviews.set(cacheKey, newETag);
+    }
+
+    return true;
+  } catch (err) {
+    const output = extractErrorOutput(err);
+    if (output && is304(output)) {
+      const rotatedETag = extractETag(output);
+      if (rotatedETag) etagCache.pullReviews.set(cacheKey, rotatedETag);
+      return false;
+    }
+
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    if (is304(errorMsg)) {
+      return false;
+    }
+    observer?.log("warn", `[ETag Guard 3b] Pull reviews check failed for ${cacheKey}: ${errorMsg}`);
     return true; // Assume changed to be safe
   }
 }

@@ -27,6 +27,7 @@ import {
   clearPRMetadataCache,
   shouldRefreshPREnrichment,
   checkReviewCommentsETag,
+  checkPullReviewsETag,
   setExecFileAsync,
 } from "../src/graphql-batch.js";
 
@@ -1340,6 +1341,45 @@ describe("shouldRefreshPREnrichment - ETag Guard Strategy", () => {
 
       expect(result).toBe(true); // Not a cache hit
       expect(mockObserver.log).toHaveBeenCalledWith("warn", expect.stringContaining("[ETag Guard 3]"));
+    });
+  });
+
+  describe("Guard 3b: Pull Reviews ETag", () => {
+    it("should return true (changed) on 200 response", async () => {
+      mockExecFileImpl.mockResolvedValueOnce({
+        stdout: 'HTTP/2 200\netag: "reviews-etag"',
+        stderr: "",
+      });
+
+      const result = await checkPullReviewsETag("owner", "repo", 42);
+      expect(result).toBe(true);
+    });
+
+    it("should return false (unchanged) on 304 response", async () => {
+      mockExecFileImpl.mockResolvedValueOnce({
+        stdout: "HTTP/2 304",
+        stderr: "",
+      });
+
+      const result = await checkPullReviewsETag("owner", "repo", 42);
+      expect(result).toBe(false);
+    });
+
+    it("should return true on error and log warning via observer", async () => {
+      const mockObserver = {
+        recordSuccess: vi.fn(),
+        recordFailure: vi.fn(),
+        log: vi.fn(),
+      };
+      mockExecFileImpl.mockRejectedValueOnce(new Error("gh CLI failed"));
+
+      const result = await checkPullReviewsETag("owner", "repo", 42, mockObserver);
+
+      expect(result).toBe(true); // Fail-safe: assume changed
+      expect(mockObserver.log).toHaveBeenCalledWith(
+        "warn",
+        expect.stringContaining("[ETag Guard 3b]"),
+      );
     });
   });
 });

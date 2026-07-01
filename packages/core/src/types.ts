@@ -941,7 +941,18 @@ export interface SCM {
    *
    * @since 0.6.0 — replaces the removed `getAutomatedComments` method.
    */
-  getReviewThreads?(pr: PRInfo): Promise<ReviewThreadsResult>;
+  getReviewThreads?(
+    pr: PRInfo,
+    options?: {
+      /**
+       * Bypass any internal ETag/response caching and fetch fresh thread state.
+       * Needed when the caller must observe changes the review-comments ETag
+       * can't see — e.g. thread resolution (GraphQL-only) after the agent
+       * resolves comments and reports ready-for-review.
+       */
+      forceFresh?: boolean;
+    },
+  ): Promise<ReviewThreadsResult>;
 
   // --- Merge Readiness ---
 
@@ -1141,6 +1152,12 @@ export interface ReviewComment {
   url: string;
   /** Whether the comment was authored by a known bot */
   isBot?: boolean;
+  /**
+   * Whether the author is a known automated *code reviewer* (e.g. Codex,
+   * Cursor) — a strict subset of `isBot` that excludes CI/coverage/dependency
+   * bots. Used to gate review-loop completion on the intended reviewer.
+   */
+  isReviewBot?: boolean;
 }
 
 export interface ReviewSummary {
@@ -1148,8 +1165,14 @@ export interface ReviewSummary {
   state: string;
   body: string;
   submittedAt: Date;
-  /** Whether the review was submitted by a known bot reviewer (e.g. Codex). */
+  /** Whether the review was submitted by a known bot. */
   isBot?: boolean;
+  /**
+   * Whether the review was submitted by a known automated *code reviewer*
+   * (e.g. Codex, Cursor) — a strict subset of `isBot`. Used to gate review-loop
+   * completion so a CI/coverage bot review does not count as the code review.
+   */
+  isReviewBot?: boolean;
 }
 
 export interface ReviewThreadsResult {

@@ -38,6 +38,7 @@ import {
 import {
   enrichSessionsPRBatch as enrichSessionsPRBatchImpl,
   checkReviewCommentsETag,
+  checkPullReviewsETag,
 } from "./graphql-batch.js";
 import {
   getWebhookHeader,
@@ -62,6 +63,13 @@ const BOT_AUTHORS = new Set([
   "lgtm-com[bot]",
   "chatgpt-codex-connector[bot]",
 ]);
+
+/**
+ * Automated *code reviewers* — a strict subset of BOT_AUTHORS. Excludes CI,
+ * coverage, security, and dependency bots so review-loop completion is gated on
+ * the intended reviewer (Codex/Cursor), not any bot that happens to comment.
+ */
+const CODE_REVIEW_BOT_AUTHORS = new Set(["cursor[bot]", "chatgpt-codex-connector[bot]"]);
 
 const CI_FAILURE_LOG_TAIL_LINES = 120;
 const ciSummaryFailClosedEmitted = new Set<string>();
@@ -1153,19 +1161,27 @@ function createGitHubSCM(): SCM {
       });
     },
 
-    async getReviewThreads(pr: PRInfo): Promise<ReviewThreadsResult> {
+    async getReviewThreads(
+      pr: PRInfo,
+      options?: { forceFresh?: boolean },
+    ): Promise<ReviewThreadsResult> {
       const cacheKey = `${pr.owner}/${pr.repo}#${pr.number}`;
 
-      // Guard 3: check if review comments changed via REST ETag
-      const reviewsChanged = await checkReviewCommentsETag(
-        pr.owner,
-        pr.repo,
-        pr.number,
-        instanceObserver,
-      );
-      if (!reviewsChanged) {
-        const cached = reviewThreadsCache.get(cacheKey);
-        if (cached) return cached;
+      // forceFresh bypasses both ETag guards and the response cache. Required
+      // when the caller must see GraphQL-only changes (thread resolution) that
+      // no REST ETag reflects — e.g. after the agent resolves comments.
+      if (!options?.forceFresh) {
+        // Guard 3: inline review comments changed? Guard 3b: review submissions
+        // changed? A clean bot review with no inline comments only moves the
+        // reviews resource, so both must be consulted before serving the cache.
+        const [commentsChanged, pullReviewsChanged] = await Promise.all([
+          checkReviewCommentsETag(pr.owner, pr.repo, pr.number, instanceObserver),
+          checkPullReviewsETag(pr.owner, pr.repo, pr.number, instanceObserver),
+        ]);
+        if (!commentsChanged && !pullReviewsChanged) {
+          const cached = reviewThreadsCache.get(cacheKey);
+          if (cached) return cached;
+        }
       }
 
       try {
@@ -1273,6 +1289,7 @@ function createGitHubSCM(): SCM {
               createdAt: parseDate(c.createdAt),
               url: c.url,
               isBot: BOT_AUTHORS.has(author),
+              isReviewBot: CODE_REVIEW_BOT_AUTHORS.has(author),
             };
           });
 
@@ -1292,6 +1309,7 @@ function createGitHubSCM(): SCM {
               body: r.body,
               submittedAt: parseDate(r.submittedAt),
               isBot: BOT_AUTHORS.has(author),
+              isReviewBot: CODE_REVIEW_BOT_AUTHORS.has(author),
             };
           });
 
