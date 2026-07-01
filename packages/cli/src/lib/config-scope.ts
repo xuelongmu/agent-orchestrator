@@ -344,6 +344,10 @@ function mergeScopeProjects(
       if (!routing) continue;
       for (const aliases of Object.values(routing)) {
         for (const alias of aliases) {
+          // `dashboard` is a built-in the user can't rename, and it's always
+          // resolved to the startup store below — so it's never an ambiguous
+          // collision. Exempt it from the rename-or-abort guard.
+          if (alias === DASHBOARD_NOTIFIER_NAME) continue;
           if (collidingNotifierAliases.has(alias)) {
             throw new Error(
               `Notifier alias collision in merged scope: carried project "${id}" routes ` +
@@ -369,12 +373,13 @@ function mergeScopeProjects(
   }
 
   // Also scope IMPLICIT notifier aliases (no `notifiers:` entry in either config —
-  // e.g. the built-in `dashboard` reached via `defaults.notifiers` or a project's
-  // `notificationRouting`) that a carried project routes to. Without an entry the
-  // registry instantiates them with the merged (global) `configPath`, so the
-  // carried project's dashboard notifications land in the global store where the
-  // startup dashboard UI never reads them. Bake a startup-scoped entry so they land
-  // in the startup store.
+  // reached via `defaults.notifiers` or a project's `notificationRouting`) that a
+  // carried project routes to. Without an entry the registry instantiates them
+  // with the merged (global) `configPath`, so their notifications land in the
+  // global store. Bake a startup-scoped entry so they land in the startup store.
+  // Skip any alias the GLOBAL scope also uses — one registration can't serve two
+  // stores, and the global definition governs external targets. `dashboard` is the
+  // exception (a LOCAL store), handled authoritatively below, so skip it here.
   const globalReferencedAliases = new Set<string>([
     ...(Array.isArray(globalConfig.defaults?.notifiers) ? globalConfig.defaults.notifiers : []),
     ...Object.values(globalConfig.notificationRouting ?? {}).flatMap((v) =>
@@ -384,25 +389,46 @@ function mergeScopeProjects(
       Object.values(project?.notificationRouting ?? {}).flatMap((v) => (Array.isArray(v) ? v : [])),
     ),
   ]);
+  let carriedRoutesToDashboard = false;
   for (const id of carriedProjectIds) {
     const routing = projects[id].notificationRouting;
     if (!routing) continue;
     for (const aliases of Object.values(routing)) {
       for (const alias of aliases) {
+        if (alias === DASHBOARD_NOTIFIER_NAME) {
+          carriedRoutesToDashboard = true;
+          continue; // startup-scoped unconditionally, post-merge (see below)
+        }
         if (alias in startupNotifiers) continue; // explicit startup entry handled above
         if (alias in globalNotifiers) continue; // explicit global definition wins
-        // The `dashboard` notifier writes to the LOCAL store the running dashboard
-        // UI reads, and THIS `ao start` launched that UI against the startup config.
-        // So it must use the startup configPath even when a global project also
-        // routes to `dashboard` — the single registration serves the one running
-        // dashboard, and global notifications belong in that same store to be
-        // visible. Other shared aliases target external services, so the global
-        // definition governs them (one registration can't serve two stores).
-        if (alias !== DASHBOARD_NOTIFIER_NAME && globalReferencedAliases.has(alias)) continue;
+        if (globalReferencedAliases.has(alias)) continue; // shared with global → global store
         if (alias in bakedStartupNotifiers) continue; // already baked this pass
         bakedStartupNotifiers[alias] = { plugin: alias, configPath: startupConfig.configPath };
       }
     }
+  }
+
+  // The `dashboard` notifier writes to a LOCAL store read by the dashboard UI THIS
+  // `ao start` launched (against the startup config). So whenever a carried
+  // startup-only project routes to `dashboard`, its entry MUST carry the startup
+  // configPath — regardless of whether the global config references it implicitly
+  // OR defines an explicit `notifiers.dashboard` entry (which would otherwise win
+  // the merge below and route the carried project's notifications to the global
+  // store, invisible in the running UI). Apply this after the merge so it beats a
+  // global explicit entry; prefer the startup config's own dashboard fields, then
+  // the global entry's, then a bare implicit entry — always with startup configPath.
+  const mergedNotifiers: Record<string, (typeof startupNotifiers)[string]> = {
+    ...bakedStartupNotifiers,
+    ...globalNotifiers,
+  };
+  if (carriedRoutesToDashboard) {
+    const dashboardBase = startupNotifiers[DASHBOARD_NOTIFIER_NAME] ??
+      globalNotifiers[DASHBOARD_NOTIFIER_NAME] ?? { plugin: DASHBOARD_NOTIFIER_NAME };
+    mergedNotifiers[DASHBOARD_NOTIFIER_NAME] = {
+      ...dashboardBase,
+      plugin: dashboardBase.plugin ?? DASHBOARD_NOTIFIER_NAME,
+      configPath: startupConfig.configPath,
+    };
   }
 
   return {
@@ -413,9 +439,10 @@ function mergeScopeProjects(
     // with `AO_PORT` from `config.port` and must reach THIS daemon, not the port
     // recorded in the global registry.
     port: startupConfig.port,
-    // Add startup-only notifier definitions (global wins on alias collision) so a
-    // carried project routing to a startup alias doesn't hit `target_missing`.
-    notifiers: { ...bakedStartupNotifiers, ...globalNotifiers },
+    // Add startup-only notifier definitions (global wins on alias collision, except
+    // the local `dashboard` store) so a carried project routing to a startup alias
+    // doesn't hit `target_missing`.
+    notifiers: mergedNotifiers,
     plugins: mergeInstalledPlugins(
       globalConfig.plugins,
       startupConfig.plugins,

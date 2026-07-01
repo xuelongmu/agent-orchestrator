@@ -544,6 +544,33 @@ describe("loadMergedScopeConfig", () => {
     });
   });
 
+  it("startup-scopes the dashboard notifier even when GLOBAL has an explicit notifiers.dashboard", () => {
+    // The carried project relies on the implicit dashboard, but the global config
+    // defines an explicit `notifiers.dashboard`. That entry must NOT win the merge
+    // and route the carried project's notifications to the global store — the
+    // running dashboard reads the startup store, so dashboard is forced to the
+    // startup configPath regardless of the global explicit entry.
+    const startup = {
+      configPath: STARTUP,
+      defaults: { ...startupDefaults, notifiers: ["dashboard"] },
+      projects: { local: project("local", "l") },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: globalDefaults,
+      projects: { reg: project("reg", "r") },
+      notifiers: { dashboard: { plugin: "dashboard", configPath: GLOBAL } },
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    expect(merged.notifiers.dashboard).toEqual({
+      plugin: "dashboard",
+      configPath: STARTUP,
+    });
+  });
+
   it("keeps both same-name/different-identity plugins (collision deferred to the registry)", () => {
     // config.plugins entries carry no slot, and the registry keys instances by
     // slot:manifest.name — so a same-name clash isn't necessarily a real collision
