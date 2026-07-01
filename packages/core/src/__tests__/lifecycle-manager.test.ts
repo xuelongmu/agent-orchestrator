@@ -5548,6 +5548,97 @@ describe("review loop round-cap + completion detection (#4)", () => {
     expect(getReviewThreads.mock.calls[0]?.[1]).toMatchObject({ forceFresh: true });
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeFalsy();
   });
+
+  it("accumulates the round count across re-reviews that clear without satisfying", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+        maxRounds: 2,
+      },
+    };
+    // CI stays pending, so a threads-clear between rounds never satisfies — the
+    // round counter must persist so maxRounds eventually fires.
+    let threads: unknown[] = [botThread("b1")];
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({
+      threads,
+      reviews: [codexReview({ commitSha: "h1" })],
+      headSha: "h1",
+    }));
+    const mockSCM = createMockSCM({
+      getReviewThreads,
+      getCISummary: vi.fn().mockResolvedValue("pending"),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1"); // round 1: dispatch b1
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundCount"]).toBe("1");
+
+    // Agent resolves b1; CI still pending → not satisfied → counter must NOT reset.
+    threads = [];
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundCount"]).toBe("1");
+
+    // Codex re-reviews (round 2).
+    threads = [botThread("b2")];
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundCount"]).toBe("2");
+
+    threads = [];
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1"); // clears again, still pending → no reset
+
+    // Third distinct review exceeds maxRounds → escalate (would never happen if
+    // the counter reset on each threads-clear).
+    threads = [botThread("b3")];
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBe("true");
+  });
+
+  it("emits a review.satisfied notification when the loop completes", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    const notifier = createMockNotifier();
+    const mockSCM = createMockSCM({
+      getReviewThreads: vi.fn().mockResolvedValue(reviewedResult()),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeTruthy();
+    expect(notifier.notify).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "review.satisfied" }),
+    );
+  });
 });
 
 describe("summary pinning", () => {

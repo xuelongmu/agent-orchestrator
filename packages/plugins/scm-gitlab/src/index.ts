@@ -748,6 +748,23 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
 
     async getReviewThreads(pr: PRInfo): Promise<ReviewThreadsResult> {
       const hostname = resolveHostname(pr);
+
+      // Fetch the MR head SHA so completion detection can head-scope reviews the
+      // same way the GitHub plugin does. Best-effort: without it, satisfaction
+      // fails closed (defers to the merge gate) rather than emitting a possibly
+      // stale clean signal.
+      let headSha: string | undefined;
+      try {
+        const mrRaw = await glab(["api", mrApiPath(pr)], hostname);
+        const mrData = parseJSON<{ sha?: string; diff_refs?: { head_sha?: string } }>(
+          mrRaw,
+          `getReviewThreads MR head for MR !${pr.number}`,
+        );
+        headSha = mrData.diff_refs?.head_sha ?? mrData.sha ?? undefined;
+      } catch {
+        // Best-effort — leave headSha undefined (satisfaction fails closed).
+      }
+
       const discussions = await fetchDiscussions(
         pr,
         hostname,
@@ -794,13 +811,19 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
             submittedAt: new Date(0),
             isBot: isBot(username),
             isReviewBot: isReviewBot(username),
+            // A GitLab approval applies to the current MR head. Scope a review
+            // bot's approval to headSha so completion detection treats it as a
+            // review of the current head. (Under the recommended "remove all
+            // approvals when commits are added" project setting, an approval
+            // present here genuinely reflects the current head.)
+            commitSha: isReviewBot(username) ? headSha : undefined,
           });
         }
       } catch {
         // Best-effort — threads are the critical data
       }
 
-      return { threads, reviews };
+      return { threads, reviews, headSha };
     },
 
     async getMergeability(pr: PRInfo): Promise<MergeReadiness> {

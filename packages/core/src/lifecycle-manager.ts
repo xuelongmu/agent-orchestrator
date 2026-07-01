@@ -2325,22 +2325,36 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       }
 
       if (!automatedFingerprint) {
-        // No unresolved bot review threads → the review→fix loop is complete.
-        // Clear all loop tracking (round counter + escalation latch) so a later
-        // re-review starts with a fresh budget, then run completion detection.
+        // No unresolved bot review threads right now. Clear the dispatch-dedup
+        // state so a later re-review is dispatched fresh, then run completion
+        // detection. NOTE: this does NOT reset reviewRoundCount — see below.
         clearReactionTracker(session.id, automatedReactionKey);
         updateSessionMetadata(session, {
           lastAutomatedReviewFingerprint: "",
           lastAutomatedReviewDispatchHash: "",
           lastAutomatedReviewDispatchAt: "",
-          reviewRoundCount: "",
-          reviewRoundsEscalated: "",
         });
-        await maybeMarkReviewSatisfied(session, scm, {
+        const wasEscalated = session.metadata["reviewRoundsEscalated"] === "true";
+        const satisfied = await maybeMarkReviewSatisfied(session, scm, {
           primaryHumanThreadsClear: pendingComments.length === 0,
           headSha: currentHeadSha,
           threadsTruncated: primaryThreadsTruncated,
         });
+        // Reset the round budget + escalation latch ONLY when the loop genuinely
+        // ends: the review is satisfied, or a human resolved an escalated loop.
+        // A mere threads-clear mid-loop (current head not yet reviewed / CI still
+        // pending, so maybeMarkReviewSatisfied returned false) must NOT reset the
+        // counter — otherwise every review→fix→re-review cycle restarts at round 0
+        // and maxReviewRounds could never fire. Invariant preserved: an escalated
+        // loop still releases its needs_input latch when a human clears the
+        // threads (wasEscalated branch), and the terminal reset above still clears
+        // everything when the PR closes/merges.
+        if (satisfied || wasEscalated) {
+          updateSessionMetadata(session, {
+            reviewRoundCount: "",
+            reviewRoundsEscalated: "",
+          });
+        }
       } else if (roundEscalated) {
         // Already escalated after exceeding the round cap. Stay latched — no
         // further auto-dispatch — until the bot threads clear (handled by the
@@ -2444,25 +2458,25 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     session: Session,
     scm: SCM,
     ctx: { primaryHumanThreadsClear: boolean; headSha: string | undefined; threadsTruncated: boolean },
-  ): Promise<void> {
-    if (session.metadata["reviewSatisfiedAt"]) return; // already marked
-    if (normalizeSessionPRs(session).length > 1) return; // multi-PR deferred to #15
-    if (!ctx.primaryHumanThreadsClear) return; // human comments unresolved
+  ): Promise<boolean> {
+    if (session.metadata["reviewSatisfiedAt"]) return false; // already marked
+    if (normalizeSessionPRs(session).length > 1) return false; // multi-PR deferred to #15
+    if (!ctx.primaryHumanThreadsClear) return false; // human comments unresolved
     // Fail closed when the thread set may be incomplete — an unresolved thread
     // outside the fetched page must not read as "clean".
-    if (ctx.threadsTruncated) return;
+    if (ctx.threadsTruncated) return false;
     // Require a code-reviewer review of the CURRENT head. The SCM must report a
     // head SHA and the recorded review head must match it — a stale review of an
     // older push does not count. Fail CLOSED when no head SHA is available (e.g.
-    // GitLab, or the getPendingComments fallback): a head-agnostic "ever engaged"
-    // signal would let a later push be satisfied without a fresh review, so we
-    // defer those to the merge gate rather than emit a possibly-stale signal.
-    if (!ctx.headSha) return;
-    if (session.metadata["botReviewObservedSha"] !== ctx.headSha) return;
+    // the getPendingComments fallback): a head-agnostic "ever engaged" signal
+    // would let a later push be satisfied without a fresh review, so we defer
+    // those to the merge gate rather than emit a possibly-stale signal.
+    if (!ctx.headSha) return false;
+    if (session.metadata["botReviewObservedSha"] !== ctx.headSha) return false;
     // A top-level changes_requested review (even with no inline threads) blocks
     // merge-readiness.
-    if (!(await primaryPRNotChangesRequested(session, scm))) return;
-    if (!(await primaryPRCIGreen(session, scm))) return;
+    if (!(await primaryPRNotChangesRequested(session, scm))) return false;
+    if (!(await primaryPRCIGreen(session, scm))) return false;
 
     const satisfiedAt = new Date().toISOString();
     updateSessionMetadata(session, { reviewSatisfiedAt: satisfiedAt });
@@ -2477,6 +2491,29 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         prUrl: session.pr?.url,
       },
     });
+
+    // Give the completion signal operational effect NOW (not just metadata):
+    // emit a first-class, notifiable event so notifiers/reactions can act on the
+    // merge-ready state. Auto-merge itself remains the merge gate's job (#15),
+    // which consumes reviewSatisfiedAt.
+    const context = buildEventContext(session, prEnrichmentCache);
+    const event = createEvent("review.satisfied", {
+      sessionId: session.id,
+      projectId: session.projectId,
+      priority: "action",
+      message: `Automated review loop complete on PR #${session.pr?.number}: no unresolved threads + CI green — ready to merge.`,
+      data: buildPRStateNotificationData({
+        eventType: "review.satisfied",
+        sessionId: session.id,
+        projectId: session.projectId,
+        context,
+        oldPRState: session.lifecycle.pr.state,
+        newPRState: session.lifecycle.pr.state,
+        enrichment: getPREnrichmentForSession(session),
+      }),
+    });
+    await notifyHuman(event, "action");
+    return true;
   }
 
   /**
@@ -2491,23 +2528,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     rounds: number,
     maxRounds: number,
   ): Promise<void> {
-    updateSessionMetadata(session, { reviewRoundsEscalated: "true" });
-
-    recordActivityEvent({
-      projectId: session.projectId,
-      sessionId: session.id,
-      source: "reaction",
-      kind: "reaction.escalated",
-      level: "warn",
-      summary: `bot review loop hit ${maxRounds}-round cap for PR #${session.pr?.number}`,
-      data: {
-        reactionKey: "bugbot-comments",
-        rounds,
-        maxRounds,
-        prNumber: session.pr?.number,
-      },
-    });
-
     const context = buildEventContext(session, prEnrichmentCache);
     const event = createEvent("reaction.escalated", {
       sessionId: session.id,
@@ -2526,7 +2546,30 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       }),
     });
     const reactionConfig = getReactionConfigForSession(session, "bugbot-comments");
+
+    // Notify FIRST, then latch. If notifier delivery throws (outage/misconfig),
+    // the latch is NOT set, so the next poll retries the escalation instead of
+    // silently parking the session in needs_input without notifying anyone.
+    // Invariant preserved: reviewRoundsEscalated is only ever set once a human
+    // has actually been notified, so an escalated (needs_input) session always
+    // has a delivered escalation behind it.
     await notifyHuman(event, reactionConfig?.priority ?? "urgent");
+
+    updateSessionMetadata(session, { reviewRoundsEscalated: "true" });
+    recordActivityEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      source: "reaction",
+      kind: "reaction.escalated",
+      level: "warn",
+      summary: `bot review loop hit ${maxRounds}-round cap for PR #${session.pr?.number}`,
+      data: {
+        reactionKey: "bugbot-comments",
+        rounds,
+        maxRounds,
+        prNumber: session.pr?.number,
+      },
+    });
   }
 
   /**

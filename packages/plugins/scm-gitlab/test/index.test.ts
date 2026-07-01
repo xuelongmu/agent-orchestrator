@@ -953,6 +953,32 @@ describe("scm-gitlab plugin", () => {
     });
   });
 
+  // ---- getReviewThreads --------------------------------------------------
+
+  describe("getReviewThreads", () => {
+    it("returns head-scoped review data (headSha + review-bot commitSha)", async () => {
+      mockGlab({ diff_refs: { head_sha: "abc123" } }); // MR head fetch
+      mockGlab([]); // discussions (none)
+      mockGlab({ approved_by: [{ user: { username: "cursor[bot]" } }] }); // approvals
+
+      const result = await scm.getReviewThreads(pr);
+
+      expect(result.headSha).toBe("abc123");
+      const botReview = result.reviews.find((r) => r.author === "cursor[bot]");
+      expect(botReview?.isReviewBot).toBe(true);
+      expect(botReview?.commitSha).toBe("abc123"); // scoped to the current head
+    });
+
+    it("leaves headSha undefined when the MR head cannot be read", async () => {
+      mockGlabError("mr fetch failed"); // MR head fetch fails
+      mockGlab([]); // discussions
+      mockGlab({ approved_by: [] }); // approvals
+
+      const result = await scm.getReviewThreads(pr);
+      expect(result.headSha).toBeUndefined();
+    });
+  });
+
   // ---- getReviewDecision -------------------------------------------------
 
   describe("getReviewDecision", () => {
