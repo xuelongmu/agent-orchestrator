@@ -51,6 +51,7 @@ import {
 import { parse as yamlParse, stringify as yamlStringify } from "yaml";
 import { exec, execSilent, git } from "../lib/shell.js";
 import { getSessionManager } from "../lib/create-session-manager.js";
+import { loadMergedScopeConfig } from "../lib/config-scope.js";
 import { listLifecycleWorkers } from "../lib/lifecycle-service.js";
 import { startBunTmpJanitor } from "../lib/bun-tmp-janitor.js";
 import {
@@ -1063,13 +1064,14 @@ async function runStartup(
                 stoppedAt: lastStop.stoppedAt,
               },
             });
-            // Use global config so the session manager can see all projects
+            // Use the MERGED scope (startup + global) so the session manager can
+            // see BOTH the startup-only project(s) and the registered ones being
+            // restored. A plain global config would drop a non-registered startup
+            // project, so its primary session would restore against a manager that
+            // can't see it and fail/retry forever.
             let restoreConfig = config;
-            if (otherProjects.length > 0) {
-              const globalPath = getGlobalConfigPath();
-              if (existsSync(globalPath)) {
-                restoreConfig = loadConfig(globalPath);
-              }
+            if (otherProjects.length > 0 && config.configPath) {
+              restoreConfig = loadMergedScopeConfig(config.configPath);
             }
             const sm = await getSessionManager(restoreConfig);
             const restoreSpinner = ora(`Restoring ${allRestoreSessions.length} session(s)`).start();

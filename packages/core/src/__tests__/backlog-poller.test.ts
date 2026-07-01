@@ -780,6 +780,56 @@ describe("backlog poller", () => {
     );
   });
 
+  it("returns a CLI-verified (verified-only) reopened issue to the backlog", async () => {
+    // `ao verify` closes an issue with only `verified` (no `agent:done`). When
+    // reopened, the scan must still return it to agent:backlog — the reopened
+    // scan looks for `verified` in addition to `agent:done`.
+    const reopenedIssue = { ...makeIssue("42"), labels: ["verified"] } as Issue;
+    const listIssues = vi.fn(async (filters: { labels?: string[] }) =>
+      filters.labels?.includes("verified") ? [reopenedIssue] : [],
+    );
+    const updateIssue = vi.fn(async () => undefined);
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const kill = vi.fn(async () => ({ cleaned: true, alreadyTerminated: false }));
+    const tracker = { name: "github", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
+
+    const services: BacklogServices = {
+      config: {
+        projects: {
+          proj: {
+            name: "proj",
+            path: "/tmp/proj",
+            defaultBranch: "main",
+            sessionPrefix: "ao",
+            tracker: { plugin: "github" },
+          },
+        },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => []),
+        spawn,
+        kill,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(updateIssue).toHaveBeenCalledWith(
+      "42",
+      expect.objectContaining({ labels: ["agent:backlog"] }),
+      expect.anything(),
+    );
+  });
+
   it("does not respawn a backlog issue that is awaiting verification", async () => {
     // On trackers whose updateIssue ignores removeLabels (Linear, GitLab), a
     // merged issue keeps `agent:backlog` alongside `merged-unverified`. Its

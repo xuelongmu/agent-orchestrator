@@ -430,8 +430,17 @@ async function labelIssuesForVerification(
 }
 
 /**
- * Detect reopened issues (open + agent:done label) and swap the label
- * back to agent:backlog so the poller picks them up on the next cycle.
+ * Labels marking an issue as *completed* — a reopened (state:open) issue
+ * carrying any of these was finished and is being returned for rework. Web
+ * verification closes with `agent:done` (+ `verified`); the `ao verify` CLI
+ * closes with only `verified`, so both must be scanned or a CLI-verified
+ * reopened issue is never returned to the backlog.
+ */
+const REOPENED_COMPLETION_LABELS = ["agent:done", "verified"];
+
+/**
+ * Detect reopened issues (open + a completion label) and swap the label back to
+ * agent:backlog so the poller picks them up on the next cycle.
  */
 async function relabelReopenedIssues(
   config: OrchestratorConfig,
@@ -443,15 +452,21 @@ async function relabelReopenedIssues(
     const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
     if (!tracker?.listIssues || !tracker.updateIssue) continue;
 
-    let reopened: Issue[];
-    try {
-      reopened = await tracker.listIssues(
-        { state: "open", labels: ["agent:done"], limit: 20 },
-        project,
-      );
-    } catch {
-      continue;
+    // Scan per completion label and union by id (the `labels` filter is AND, so a
+    // single call for both would miss issues carrying only one of them).
+    const reopenedById = new Map<string, Issue>();
+    for (const label of REOPENED_COMPLETION_LABELS) {
+      try {
+        const issues = await tracker.listIssues(
+          { state: "open", labels: [label], limit: 20 },
+          project,
+        );
+        for (const issue of issues) reopenedById.set(issue.id, issue);
+      } catch {
+        // Tracker error for this label — try the others; retry the rest next cycle.
+      }
     }
+    const reopened = [...reopenedById.values()];
 
     for (const issue of reopened) {
       try {

@@ -728,4 +728,43 @@ describe("loadMergedScopeConfig", () => {
     mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global2 : startup2));
     expect(loadMergedScopeConfig(STARTUP).port).toBe(4100);
   });
+
+  it("pauses spawns for a cached startup config when no global registry exists", () => {
+    // First-run scope (no global). After a good load, the startup file becomes
+    // unreadable — the cached copy is served, but its projects must be
+    // supervision/shutdown-only so the poller doesn't spawn with a stale path.
+    const startup = {
+      configPath: STARTUP,
+      defaults: startupDefaults,
+      projects: { local: project("local", "l") },
+      notifiers: {},
+    };
+    const missingGlobal = (): never => {
+      const err = new Error("ENOENT") as NodeJS.ErrnoException & { path?: string };
+      err.code = "ENOENT";
+      err.path = GLOBAL;
+      throw err;
+    };
+    let startupGone = false;
+    mockLoadConfig.mockImplementation((p: string) => {
+      if (p === GLOBAL) return missingGlobal();
+      if (startupGone) {
+        const err = new Error("ENOENT") as NodeJS.ErrnoException & { path?: string };
+        err.code = "ENOENT";
+        err.path = STARTUP;
+        throw err;
+      }
+      return startup;
+    });
+
+    // Fresh load (no global): startup returned as-is, spawnable.
+    const first = loadMergedScopeConfig(STARTUP);
+    expect(first.projects.local._spawnPaused).toBeUndefined();
+
+    // Startup file vanishes: cached copy served with projects spawn-paused.
+    startupGone = true;
+    const second = loadMergedScopeConfig(STARTUP);
+    expect(second.projects.local).toBeDefined();
+    expect(second.projects.local._spawnPaused).toBe(true);
+  });
 });

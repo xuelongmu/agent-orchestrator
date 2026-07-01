@@ -445,6 +445,17 @@ export function __resetMergedScopeCache(): void {
   lastStartupConfig.clear();
 }
 
+/** Return a shallow copy of `config` with every project flagged `_spawnPaused`.
+ *  Used when the scope is built from a cached (currently-unreadable) startup
+ *  config: its projects stay supervision/shutdown-only until the file reloads. */
+function withProjectsSpawnPaused(config: OrchestratorConfig): OrchestratorConfig {
+  const projects: Record<string, ProjectConfig> = {};
+  for (const [id, project] of Object.entries(config.projects)) {
+    projects[id] = { ...project, _spawnPaused: true };
+  }
+  return { ...config, projects };
+}
+
 /**
  * Load the config spanning both the global registry and the config that started
  * this `ao start` process. Falls back to the startup config alone when no global
@@ -491,6 +502,13 @@ export function loadMergedScopeConfig(startupConfigPath: string): OrchestratorCo
     throw startupError ?? new Error(`Unable to load startup config at ${startupConfigPath}`);
   }
 
-  if (!globalConfig) return startupConfig;
+  if (!globalConfig) {
+    // No global registry (first-run `ao start <path|url>` scope). When the
+    // startup config is a cached copy (source unreadable), pause spawning for its
+    // projects the same way the merged-with-global path does — otherwise the
+    // poller would launch a worker with an AO_CONFIG_PATH pointing at the missing
+    // file.
+    return startupFromCache ? withProjectsSpawnPaused(startupConfig) : startupConfig;
+  }
   return mergeScopeProjects(globalConfig, startupConfig, startupFromCache);
 }
