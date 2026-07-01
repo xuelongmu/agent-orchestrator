@@ -235,18 +235,37 @@ function tryAcquireLock(lockPath: string): LockHandle | null {
       }
       // The file we grabbed could be one a peer recreated fresh between our stat
       // and our rename. Re-check its mtime: if it's no longer stale we stole a
-      // live lock. The peer keeps running via its still-open fd, so back off —
-      // but LEAVE our placeholder in place so no third poller acquires while the
-      // peer runs (the peer's release removes `lockPath`).
+      // live lock. Restore the peer's lock to `lockPath` so its heartbeat keeps
+      // it fresh (leaving OUR placeholder there instead would go stale after
+      // LOCK_STALE_MS with no heartbeat and let a third poller reclaim it while
+      // the peer still runs). Close our placeholder fd first, then atomically
+      // replace it with the peer's still-live lock file.
       try {
         const reclaimed = statSync(reclaimPath);
         if (Date.now() - reclaimed.mtimeMs <= LOCK_STALE_MS) {
           try {
             closeSync(fd);
           } catch {
-            // Ignore — the placeholder file stays as the visible blocker.
+            // Ignore — we still restore the peer's lock over the placeholder.
           }
-          rmSync(reclaimPath, { force: true });
+          try {
+            // Atomic replace on POSIX and Windows (MoveFileEx). `lockPath` never
+            // goes absent, so no third poller can slip in during the handoff.
+            renameSync(reclaimPath, lockPath);
+          } catch {
+            // Rare: replace-over-existing unsupported here. Remove the placeholder
+            // then restore (a single tight syscall gap in this already-rare race).
+            try {
+              rmSync(lockPath, { force: true });
+            } catch {
+              // Best-effort.
+            }
+            try {
+              renameSync(reclaimPath, lockPath);
+            } catch {
+              rmSync(reclaimPath, { force: true });
+            }
+          }
           return null;
         }
       } catch {

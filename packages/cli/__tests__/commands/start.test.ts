@@ -1573,6 +1573,29 @@ describe("start command — orchestrator session strategy display", () => {
     expect(mockSessionManager.kill).toHaveBeenCalledWith("app-orchestrator");
   });
 
+  it("does not tear down a REUSED orchestrator when the supervisor fails to start", async () => {
+    // ensureOrchestrator reuses a pre-existing session (before non-null, not
+    // restored). A later supervisor failure must NOT kill it — this startup
+    // didn't create it.
+    mockConfigRef.current = makeConfig({ "my-app": makeProject() });
+    mockSessionManager.get.mockResolvedValue({
+      id: "app-orchestrator",
+      projectId: "my-app",
+      status: "working",
+      activity: "active",
+      metadata: { role: "orchestrator" },
+    });
+    mockStartProjectSupervisor.mockRejectedValue(
+      new Error("Session prefix collision in merged scope"),
+    );
+
+    await expect(
+      program.parseAsync(["node", "test", "start", "--no-dashboard"]),
+    ).rejects.toThrow("process.exit(1)");
+
+    expect(mockSessionManager.kill).not.toHaveBeenCalled();
+  });
+
   it("reports startup lock acquisition failures through the normal CLI error path", async () => {
     mockConfigRef.current = makeConfig({ "my-app": makeProject() });
     mockAcquireStartupLock.mockRejectedValueOnce(

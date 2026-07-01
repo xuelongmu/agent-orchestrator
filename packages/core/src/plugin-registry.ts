@@ -543,10 +543,14 @@ export function createPluginRegistry(): PluginRegistry {
       // Track which specifier registered each resolved `slot:manifest.name`. An
       // inline external plugin declared without an explicit `plugin` carries only a
       // temporary basename at merge time, so a merge-time collision check can't see
-      // it; if two DIFFERENT declared plugins import to the same final manifest
-      // name, keep the FIRST (global plugins iterate before startup ones) so a
-      // startup plugin can't silently overwrite a registered project's implementation.
+      // it. If two DIFFERENT declared plugins import to the same final manifest
+      // name, the merged config is ambiguous: `updateConfigWithManifestName` has
+      // already rewritten each project's reference to that name, so silently
+      // keeping either implementation would make some project poll/spawn/update
+      // through the wrong plugin. Collect such collisions and FAIL loudly after
+      // the load rather than picking one.
       const registeredBySpecifier = new Map<string, string>();
+      const nameCollisions: string[] = [];
 
       for (const plugin of config.plugins ?? []) {
         if (plugin.enabled === false) continue;
@@ -612,14 +616,15 @@ export function createPluginRegistry(): PluginRegistry {
             }
           }
 
-          // Post-import collision guard: if a different declared plugin already
-          // registered this `slot:manifest.name`, don't let this one overwrite it.
+          // Post-import collision guard: if a DIFFERENT declared plugin already
+          // registered this `slot:manifest.name`, the merged config is ambiguous.
+          // Record it (don't overwrite the first) and fail after the load.
           const manifestKey = makeKey(mod.manifest.slot, mod.manifest.name);
           const priorSpecifier = registeredBySpecifier.get(manifestKey);
           if (priorSpecifier !== undefined && priorSpecifier !== specifier) {
+            const detail = `"${manifestKey}" (${priorSpecifier} vs ${specifier})`;
             process.stderr.write(
-              `[plugin-registry] Plugin name collision for "${manifestKey}": "${specifier}" ` +
-                `resolves to the same manifest name as "${priorSpecifier}" — keeping the first, skipping this one.\n`,
+              `[plugin-registry] Plugin name collision for ${detail} — two plugins resolve to the same manifest name.\n`,
             );
             recordActivityEvent({
               source: "plugin-registry",
@@ -629,10 +634,11 @@ export function createPluginRegistry(): PluginRegistry {
               data: {
                 manifestKey,
                 keptSpecifier: priorSpecifier,
-                skippedSpecifier: specifier,
+                conflictingSpecifier: specifier,
                 plugin: plugin.name,
               },
             });
+            nameCollisions.push(detail);
             continue;
           }
           registeredBySpecifier.set(manifestKey, specifier);
@@ -661,6 +667,14 @@ export function createPluginRegistry(): PluginRegistry {
             },
           });
         }
+      }
+
+      if (nameCollisions.length > 0) {
+        throw new Error(
+          `Plugin name collision in merged config: ${nameCollisions.join("; ")}. ` +
+            `Two plugins resolve to the same manifest name, so projects can't unambiguously ` +
+            `select one. Rename one of the colliding plugins before launching ao start.`,
+        );
       }
     },
   };

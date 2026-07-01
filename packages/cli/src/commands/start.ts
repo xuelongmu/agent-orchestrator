@@ -933,6 +933,9 @@ async function runStartup(
   }
 
   let selectedOrchestratorId: string | null = null;
+  // Whether THIS startup attempt created (or restored) the orchestrator — a
+  // reused pre-existing session must not be torn down if startup later aborts.
+  let orchestratorCreatedThisStartup = false;
 
   if (opts?.orchestrator !== false) {
     const sm = await getSessionManager(config);
@@ -947,8 +950,10 @@ async function runStartup(
       if (before && session.id === before.id && !restored) {
         spinner.succeed(`Using orchestrator session: ${session.id}`);
       } else if (restored) {
+        orchestratorCreatedThisStartup = true;
         spinner.succeed(`Restored orchestrator session: ${session.id}`);
       } else {
+        orchestratorCreatedThisStartup = true;
         spinner.succeed(`Orchestrator session ready: ${session.id}`);
       }
     } catch (err) {
@@ -999,8 +1004,9 @@ async function runStartup(
       // sessionPrefix/project-id collision between this startup config and the
       // global registry) AFTER the orchestrator session/runtime was created above.
       // Tear it down so a failed startup doesn't leave a managed orchestrator
-      // running.
-      if (selectedOrchestratorId) {
+      // running — but only if THIS startup created/restored it (never a reused
+      // pre-existing session).
+      if (selectedOrchestratorId && orchestratorCreatedThisStartup) {
         try {
           const sm = await getSessionManager(config);
           await sm.kill(selectedOrchestratorId);

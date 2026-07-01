@@ -645,11 +645,11 @@ describe("loadFromConfig", () => {
     expect(registry.get("agent", "goose")).not.toBeNull();
   });
 
-  it("keeps the first of two plugins that resolve to the same manifest name", async () => {
+  it("fails when two plugins resolve to the same manifest name", async () => {
     // Two DIFFERENT declared plugins (e.g. a global one and a startup inline
-    // external whose package manifest resolves to the same slot:name). The first
-    // registered (global iterates first) must be kept; the second must not
-    // silently overwrite it.
+    // external whose package manifest resolves to the same slot:name). The merged
+    // config is ambiguous — each project's reference was already rewritten to that
+    // name — so loading must FAIL rather than silently pick one implementation.
     const registry = createPluginRegistry();
     const first = makePlugin("tracker", "github");
     const second = makePlugin("tracker", "github");
@@ -661,16 +661,16 @@ describe("loadFromConfig", () => {
       ],
     });
 
-    await registry.loadFromConfig(config, async (specifier: string) => {
-      if (specifier === "@global/ao-plugin-tracker-github") return { default: first };
-      if (specifier === "@startup/ao-plugin-tracker-github") return { default: second };
-      throw new Error(`Not found: ${specifier}`);
-    });
+    await expect(
+      registry.loadFromConfig(config, async (specifier: string) => {
+        if (specifier === "@global/ao-plugin-tracker-github") return { default: first };
+        if (specifier === "@startup/ao-plugin-tracker-github") return { default: second };
+        throw new Error(`Not found: ${specifier}`);
+      }),
+    ).rejects.toThrow(/name collision/i);
 
-    // First is registered; the colliding second is skipped (its create never runs).
-    expect(first.create).toHaveBeenCalledTimes(1);
+    // The colliding second implementation was never registered.
     expect(second.create).not.toHaveBeenCalled();
-    expect(registry.get("tracker", "github")).not.toBeNull();
   });
 
   it("loads local plugins relative to the config file", async () => {
