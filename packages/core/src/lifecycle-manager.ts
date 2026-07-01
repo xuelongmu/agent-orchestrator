@@ -570,6 +570,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   const REVIEW_BACKLOG_THROTTLE_MS = 2 * 60 * 1000;
 
   /**
+   * Default cap on bot review→fix rounds (Codex PR-comment loop) before the
+   * loop stops auto-dispatching and escalates to a human. Overridable per
+   * project/reaction via the `bugbot-comments` reaction's `maxRounds`.
+   */
+  const DEFAULT_MAX_REVIEW_ROUNDS = 5;
+
+  /**
    * Populate the PR enrichment cache using batch GraphQL queries.
    * This is called once per poll cycle to fetch data for all PRs efficiently.
    */
@@ -1371,6 +1378,27 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // By this point, session.pr is already set if a PR was discovered.
 
     if (session.pr && scm) {
+      // The bot review→fix loop escalated after exceeding its round cap. Park
+      // the session in needs_input until the loop resolves (maybeDispatchReviewBacklog
+      // clears the latch once the bot threads clear). Without this, SCM enrichment
+      // below — which sees bot comments only as generic threads, not a "changes
+      // requested" review — would re-derive pr_open/mergeable and bury the
+      // escalation. This is the one place SCM ground truth yields to an explicit
+      // loop-control decision.
+      if (session.metadata["reviewRoundsEscalated"] === "true") {
+        if (lifecycle.pr.state === "none") lifecycle.pr.state = "open";
+        if (lifecycle.pr.reason === "not_created") lifecycle.pr.reason = "in_progress";
+        lifecycle.pr.number = session.pr.number;
+        lifecycle.pr.url = session.pr.url;
+        lifecycle.pr.lastObservedAt = nowIso;
+        return commit({
+          status: SESSION_STATUS.NEEDS_INPUT,
+          evidence: "review_rounds_escalated",
+          detecting: { attempts: 0 },
+          sessionState: "needs_input",
+          sessionReason: "awaiting_user_input",
+        });
+      }
       try {
         const prKey = `${session.pr.owner}/${session.pr.repo}#${session.pr.number}`;
         const cachedData = prEnrichmentCache.get(prKey);
@@ -1939,6 +1967,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         lastAutomatedReviewFingerprint: "",
         lastAutomatedReviewDispatchHash: "",
         lastAutomatedReviewDispatchAt: "",
+        reviewRoundCount: "",
+        reviewRoundsEscalated: "",
+        reviewSatisfiedAt: "",
       });
       return;
     }
@@ -1952,11 +1983,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // from the API so it can fire and record the hash in the same cycle. If we
     // throttle here, the next unthrottled poll sees a "new" fingerprint, clears
     // the reaction tracker, and fires a duplicate dispatch.
+    // When the agent freshly declares the PR ready for review, force a single
+    // re-check so newly resolved/added comment threads are picked up promptly
+    // instead of waiting out the 2-minute throttle. Comparing the report
+    // timestamp against the last successful fetch ensures exactly one forced
+    // re-check per ready-for-review report (the next fetch stamps a newer time).
+    const lastCheckAt = lastReviewBacklogCheckAt.get(session.id) ?? 0;
+    const agentReport = readAgentReport(session.metadata);
+    const readyForReviewRecheck =
+      agentReport?.state === "ready_for_review" &&
+      isAgentReportFresh(agentReport) &&
+      Date.parse(agentReport.timestamp) > lastCheckAt;
+
     const hasRelevantTransition =
       transitionReaction?.key === humanReactionKey ||
       transitionReaction?.key === automatedReactionKey;
-    if (!hasRelevantTransition) {
-      const lastCheckAt = lastReviewBacklogCheckAt.get(session.id) ?? 0;
+    if (!hasRelevantTransition && !readyForReviewRecheck) {
       if (Date.now() - lastCheckAt < REVIEW_BACKLOG_THROTTLE_MS) {
         return;
       }
@@ -2142,60 +2184,163 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       }
     }
 
-    // --- Automated (bot) review comments ---
+    // --- Automated (bot) review comments — the Codex review→fix loop ---
     {
       const automatedFingerprint = makeFingerprint(automatedComments.map((comment) => comment.id));
       const lastAutomatedFingerprint = session.metadata["lastAutomatedReviewFingerprint"] ?? "";
       const lastAutomatedDispatchHash = session.metadata["lastAutomatedReviewDispatchHash"] ?? "";
+      const roundEscalated = session.metadata["reviewRoundsEscalated"] === "true";
+      const reviewRounds = parseAttemptCount(session.metadata["reviewRoundCount"]);
+      const maxReviewRounds =
+        getReactionConfigForSession(session, automatedReactionKey)?.maxRounds ??
+        DEFAULT_MAX_REVIEW_ROUNDS;
 
       if (automatedFingerprint !== lastAutomatedFingerprint) {
         clearReactionTracker(session.id, automatedReactionKey);
         updateSessionMetadata(session, {
           lastAutomatedReviewFingerprint: automatedFingerprint,
+          // Newly changed bot threads mean the PR is no longer review-clean, so
+          // drop any prior "satisfied" mark; it can re-fire once they clear.
+          ...(automatedFingerprint ? { reviewSatisfiedAt: "" } : {}),
         });
       }
 
       if (!automatedFingerprint) {
+        // No unresolved bot review threads → the review→fix loop is complete.
+        // Clear all loop tracking (round counter + escalation latch) so a later
+        // re-review starts with a fresh budget, then run completion detection.
         clearReactionTracker(session.id, automatedReactionKey);
         updateSessionMetadata(session, {
           lastAutomatedReviewFingerprint: "",
           lastAutomatedReviewDispatchHash: "",
           lastAutomatedReviewDispatchAt: "",
+          reviewRoundCount: "",
+          reviewRoundsEscalated: "",
         });
+        maybeMarkReviewSatisfied(session, pendingComments.length === 0);
+      } else if (roundEscalated) {
+        // Already escalated after exceeding the round cap. Stay latched — no
+        // further auto-dispatch — until the bot threads clear (handled by the
+        // branch above) or a human intervenes. determineStatus keeps the
+        // session parked in needs_input while this flag is set.
       } else if (automatedFingerprint !== lastAutomatedDispatchHash) {
-        const reactionConfig = getReactionConfigForSession(session, automatedReactionKey);
-        if (
-          reactionConfig &&
-          reactionConfig.action &&
-          (reactionConfig.auto !== false || reactionConfig.action === "notify")
-        ) {
-          const enrichedMessage = formatReviewCommentsMessage(automatedComments, "bot");
-
-          let success = false;
+        // A new, distinct batch of bot review comments = a new review round.
+        if (reviewRounds >= maxReviewRounds) {
+          await escalateReviewRoundCap(session, reviewRounds, maxReviewRounds);
+        } else {
+          const reactionConfig = getReactionConfigForSession(session, automatedReactionKey);
           if (
-            transitionReaction?.key === automatedReactionKey &&
-            reactionConfig.action === "send-to-agent"
+            reactionConfig &&
+            reactionConfig.action &&
+            (reactionConfig.auto !== false || reactionConfig.action === "notify")
           ) {
-            try {
-              await sessionManager.send(session.id, enrichedMessage);
-              success = true;
-            } catch {
-              // Send failed — will retry on next unthrottled poll
+            const enrichedMessage = formatReviewCommentsMessage(automatedComments, "bot");
+
+            let success = false;
+            if (
+              transitionReaction?.key === automatedReactionKey &&
+              reactionConfig.action === "send-to-agent"
+            ) {
+              try {
+                await sessionManager.send(session.id, enrichedMessage);
+                success = true;
+              } catch {
+                // Send failed — will retry on next unthrottled poll
+              }
+            } else {
+              const enrichedConfig = { ...reactionConfig, message: enrichedMessage };
+              const result = await executeReaction(session, automatedReactionKey, enrichedConfig);
+              success = result.success;
             }
-          } else {
-            const enrichedConfig = { ...reactionConfig, message: enrichedMessage };
-            const result = await executeReaction(session, automatedReactionKey, enrichedConfig);
-            success = result.success;
-          }
-          if (success) {
-            updateSessionMetadata(session, {
-              lastAutomatedReviewDispatchHash: automatedFingerprint,
-              lastAutomatedReviewDispatchAt: new Date().toISOString(),
-            });
+            if (success) {
+              updateSessionMetadata(session, {
+                lastAutomatedReviewDispatchHash: automatedFingerprint,
+                lastAutomatedReviewDispatchAt: new Date().toISOString(),
+                reviewRoundCount: String(reviewRounds + 1),
+              });
+            }
           }
         }
       }
     }
+  }
+
+  /**
+   * Completion detection for the bot review→fix loop: when no unresolved review
+   * threads remain (bot AND human) and CI is green, record that the review is
+   * satisfied so the merge gate (#15) can advance the PR toward merge. Latches
+   * on `reviewSatisfiedAt` so the signal is emitted once per satisfied
+   * transition; the latch is cleared when new bot threads appear.
+   */
+  function maybeMarkReviewSatisfied(session: Session, humanThreadsClear: boolean): void {
+    if (session.metadata["reviewSatisfiedAt"]) return; // already marked
+    if (!humanThreadsClear) return; // unresolved human comments still block merge-readiness
+    const enrichment = getPREnrichmentForSession(session);
+    if (enrichment?.ciStatus !== "passing") return; // CI not green (or status unknown)
+
+    const satisfiedAt = new Date().toISOString();
+    updateSessionMetadata(session, { reviewSatisfiedAt: satisfiedAt });
+    recordActivityEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      source: "scm",
+      kind: "review.satisfied",
+      summary: `review satisfied for PR #${session.pr?.number}: no unresolved threads + CI green`,
+      data: {
+        prNumber: session.pr?.number,
+        prUrl: session.pr?.url,
+      },
+    });
+  }
+
+  /**
+   * Round-cap escalation for the bot review→fix loop. Once `maxRounds` distinct
+   * rounds of bot review comments have been dispatched without the threads
+   * clearing, stop auto-dispatching and notify a human. The `reviewRoundsEscalated`
+   * latch both silences further dispatches and (via determineStatus) parks the
+   * session in needs_input until the loop resolves.
+   */
+  async function escalateReviewRoundCap(
+    session: Session,
+    rounds: number,
+    maxRounds: number,
+  ): Promise<void> {
+    updateSessionMetadata(session, { reviewRoundsEscalated: "true" });
+
+    recordActivityEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      source: "reaction",
+      kind: "reaction.escalated",
+      level: "warn",
+      summary: `bot review loop hit ${maxRounds}-round cap for PR #${session.pr?.number}`,
+      data: {
+        reactionKey: "bugbot-comments",
+        rounds,
+        maxRounds,
+        prNumber: session.pr?.number,
+      },
+    });
+
+    const context = buildEventContext(session, prEnrichmentCache);
+    const event = createEvent("reaction.escalated", {
+      sessionId: session.id,
+      projectId: session.projectId,
+      message: `Automated review→fix loop reached the ${maxRounds}-round cap on PR #${session.pr?.number} without resolving. Human review needed.`,
+      data: buildReactionEscalationNotificationData({
+        eventType: "reaction.escalated",
+        sessionId: session.id,
+        projectId: session.projectId,
+        context,
+        reactionKey: "bugbot-comments",
+        action: "escalated",
+        attempts: rounds,
+        cause: "max_attempts",
+        enrichment: getPREnrichmentForSession(session),
+      }),
+    });
+    const reactionConfig = getReactionConfigForSession(session, "bugbot-comments");
+    await notifyHuman(event, reactionConfig?.priority ?? "urgent");
   }
 
   /**

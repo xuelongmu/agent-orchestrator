@@ -4625,6 +4625,207 @@ describe("rate limiting optimizations", () => {
     expect(getAutomatedMock).not.toHaveBeenCalled();
   });
 });
+
+describe("review loop round-cap + completion detection (#4)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const THROTTLE_STEP_MS = 2 * 60 * 1000 + 100;
+
+  function botThread(id: string) {
+    return {
+      id,
+      author: "chatgpt-codex-connector[bot]",
+      body: "Potential issue here",
+      path: "src/worker.ts",
+      line: 9,
+      isResolved: false,
+      createdAt: new Date(),
+      url: `https://example.com/comment/${id}`,
+      isBot: true,
+    };
+  }
+
+  it("stops the bot review loop and escalates to needs_input after maxRounds", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+        maxRounds: 2,
+      },
+    };
+
+    let currentBotId = "r1";
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({
+      threads: [botThread(currentBotId)],
+      reviews: [],
+    }));
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    // Rounds 1 and 2: each distinct batch of bot comments is dispatched.
+    await lm.check("app-1");
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    currentBotId = "r2";
+    await lm.check("app-1");
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(2);
+
+    // Round 3 exceeds maxRounds → escalate instead of dispatching again.
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    currentBotId = "r3";
+    vi.mocked(recordActivityEvent).mockClear();
+    await lm.check("app-1");
+
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(2); // no new dispatch
+    const escalateMeta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(escalateMeta?.["reviewRoundsEscalated"]).toBe("true");
+    expect(escalateMeta?.["reviewRoundCount"]).toBe("2");
+    const escalateKinds = vi
+      .mocked(recordActivityEvent)
+      .mock.calls.map((c) => (c[0] as { kind: string }).kind);
+    expect(escalateKinds).toContain("reaction.escalated");
+
+    // Next poll parks the session in needs_input — the loop no longer spins.
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(2);
+  });
+
+  it("marks the review satisfied when bot threads clear and CI is green", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+
+    let hasBotThreads = true;
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({
+      threads: hasBotThreads ? [botThread("b1")] : [],
+      reviews: [],
+    }));
+    // Default createMockSCM enrichment reports ciStatus "passing".
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1"); // dispatch round 1
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+
+    // Codex resolves everything — no unresolved bot threads remain.
+    hasBotThreads = false;
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    vi.mocked(recordActivityEvent).mockClear();
+    await lm.check("app-1");
+
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["reviewSatisfiedAt"]).toBeTruthy();
+    expect(meta?.["reviewRoundCount"]).toBeFalsy();
+    const satisfiedKinds = vi
+      .mocked(recordActivityEvent)
+      .mock.calls.map((c) => (c[0] as { kind: string }).kind);
+    expect(satisfiedKinds).toContain("review.satisfied");
+  });
+
+  it("does not mark satisfied while CI is not green", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    const mockSCM = createMockSCM({
+      getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [] }),
+      getCISummary: vi.fn().mockResolvedValue("pending"),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["reviewSatisfiedAt"]).toBeFalsy();
+  });
+
+  it("re-checks review threads immediately when the agent reports ready_for_review", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [], reviews: [] });
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const session = makeSession({ status: "pr_open", pr: makePR() });
+    const lm = setupCheck("app-1", { session, registry });
+
+    // First poll fetches and stamps the throttle timestamp.
+    await lm.check("app-1");
+    expect(getReviewThreads).toHaveBeenCalledTimes(1);
+
+    // Within the throttle window and with no report → throttled, no fetch.
+    await vi.advanceTimersByTimeAsync(10_000);
+    getReviewThreads.mockClear();
+    await lm.check("app-1");
+    expect(getReviewThreads).not.toHaveBeenCalled();
+
+    // A fresh ready_for_review report forces an immediate re-check.
+    vi.mocked(mockSessionManager.get).mockResolvedValue({
+      ...session,
+      metadata: {
+        ...session.metadata,
+        agent: "mock-agent",
+        agentReportedState: "ready_for_review",
+        agentReportedAt: new Date().toISOString(),
+      },
+    });
+    await lm.check("app-1");
+    expect(getReviewThreads).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("summary pinning", () => {
   it("pins first quality summary when pinnedSummary not set", async () => {
     const session = makeSession({

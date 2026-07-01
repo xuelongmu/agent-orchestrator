@@ -1379,6 +1379,15 @@ export interface ReactionConfig {
 
   /** Whether to include a summary in the notification */
   includeSummary?: boolean;
+
+  /**
+   * Maximum number of review→fix rounds an iterative reviewer loop may run
+   * before it stops auto-dispatching and escalates to a human. Applies to the
+   * bot-comment review loop (e.g. Codex as a PR-comment reviewer). Each distinct
+   * batch of new bot review comments that is dispatched to the agent counts as
+   * one round. Defaults to 5 for `bugbot-comments`.
+   */
+  maxRounds?: number;
 }
 
 export interface ReactionResult {
