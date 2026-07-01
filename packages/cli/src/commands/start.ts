@@ -946,10 +946,20 @@ async function runStartup(
       const before = await sm.get(getOrchestratorSessionId(project));
       const session = await sm.ensureOrchestrator({ projectId, systemPrompt });
       selectedOrchestratorId = session.id;
-      restored = Boolean(session.restoredAt);
-      if (before && session.id === before.id && !restored) {
+      // A restore performed by THIS call stamps a fresh `restoredAt`; an
+      // orchestrator restored in an EARLIER `ao start` keeps that old timestamp.
+      // Keying off `Boolean(session.restoredAt)` alone would misclassify a mere
+      // REUSE of an already-running, previously-restored session as a restore —
+      // and tear it down if startup later aborts. Compare against the pre-existing
+      // session's timestamp so only a restore this call actually performed counts.
+      const restoredThisCall =
+        session.restoredAt !== undefined &&
+        session.restoredAt.getTime() !== before?.restoredAt?.getTime();
+      const reused = Boolean(before) && session.id === before?.id && !restoredThisCall;
+      restored = restoredThisCall;
+      if (reused) {
         spinner.succeed(`Using orchestrator session: ${session.id}`);
-      } else if (restored) {
+      } else if (restoredThisCall) {
         orchestratorCreatedThisStartup = true;
         spinner.succeed(`Restored orchestrator session: ${session.id}`);
       } else {
