@@ -51,6 +51,7 @@ import {
 import { parse as yamlParse, stringify as yamlStringify } from "yaml";
 import { exec, execSilent, git } from "../lib/shell.js";
 import { getSessionManager } from "../lib/create-session-manager.js";
+import { loadMergedScopeConfig } from "../lib/config-scope.js";
 import { listLifecycleWorkers } from "../lib/lifecycle-service.js";
 import { startBunTmpJanitor } from "../lib/bun-tmp-janitor.js";
 import {
@@ -80,6 +81,7 @@ import {
 } from "../lib/running-state.js";
 import { attachToDaemon, killExistingDaemon } from "../lib/daemon.js";
 import { startProjectSupervisor } from "../lib/project-supervisor.js";
+import { startBacklogPoller } from "../lib/backlog-service.js";
 import { isHumanCaller } from "../lib/caller-context.js";
 import { detectEnvironment } from "../lib/detect-env.js";
 import {
@@ -931,6 +933,9 @@ async function runStartup(
   }
 
   let selectedOrchestratorId: string | null = null;
+  // Whether THIS startup attempt created (or restored) the orchestrator — a
+  // reused pre-existing session must not be torn down if startup later aborts.
+  let orchestratorCreatedThisStartup = false;
 
   if (opts?.orchestrator !== false) {
     const sm = await getSessionManager(config);
@@ -941,12 +946,24 @@ async function runStartup(
       const before = await sm.get(getOrchestratorSessionId(project));
       const session = await sm.ensureOrchestrator({ projectId, systemPrompt });
       selectedOrchestratorId = session.id;
-      restored = Boolean(session.restoredAt);
-      if (before && session.id === before.id && !restored) {
+      // A restore performed by THIS call stamps a fresh `restoredAt`; an
+      // orchestrator restored in an EARLIER `ao start` keeps that old timestamp.
+      // Keying off `Boolean(session.restoredAt)` alone would misclassify a mere
+      // REUSE of an already-running, previously-restored session as a restore —
+      // and tear it down if startup later aborts. Compare against the pre-existing
+      // session's timestamp so only a restore this call actually performed counts.
+      const restoredThisCall =
+        session.restoredAt !== undefined &&
+        session.restoredAt.getTime() !== before?.restoredAt?.getTime();
+      const reused = Boolean(before) && session.id === before?.id && !restoredThisCall;
+      restored = restoredThisCall;
+      if (reused) {
         spinner.succeed(`Using orchestrator session: ${session.id}`);
-      } else if (restored) {
+      } else if (restoredThisCall) {
+        orchestratorCreatedThisStartup = true;
         spinner.succeed(`Restored orchestrator session: ${session.id}`);
       } else {
+        orchestratorCreatedThisStartup = true;
         spinner.succeed(`Orchestrator session ready: ${session.id}`);
       }
     } catch (err) {
@@ -992,6 +1009,20 @@ async function runStartup(
       });
       if (dashboardProcess) {
         dashboardProcess.kill();
+      }
+      // The supervisor builds the merged daemon scope and can abort here (e.g. a
+      // sessionPrefix/project-id collision between this startup config and the
+      // global registry) AFTER the orchestrator session/runtime was created above.
+      // Tear it down so a failed startup doesn't leave a managed orchestrator
+      // running — but only if THIS startup created/restored it (never a reused
+      // pre-existing session).
+      if (selectedOrchestratorId && orchestratorCreatedThisStartup) {
+        try {
+          const sm = await getSessionManager(config);
+          await sm.kill(selectedOrchestratorId);
+        } catch {
+          // Best-effort teardown.
+        }
       }
       throw new CliFailureEventRecordedError(
         `Failed to start project supervisor: ${err instanceof Error ? err.message : String(err)}`,
@@ -1062,12 +1093,20 @@ async function runStartup(
                 stoppedAt: lastStop.stoppedAt,
               },
             });
-            // Use global config so the session manager can see all projects
+            // Use the MERGED scope (startup + global) so the session manager can
+            // see BOTH the startup-only project(s) and the registered ones being
+            // restored. A plain global config would drop a non-registered startup
+            // project, so its primary session would restore against a manager that
+            // can't see it and fail/retry forever. Fall back to the current config
+            // if the merged scope can't be built (e.g. the global registry is
+            // unreadable) — a partial view still lets the restore loop run and
+            // attribute per-session failures rather than aborting entirely.
             let restoreConfig = config;
-            if (otherProjects.length > 0) {
-              const globalPath = getGlobalConfigPath();
-              if (existsSync(globalPath)) {
-                restoreConfig = loadConfig(globalPath);
+            if (otherProjects.length > 0 && config.configPath) {
+              try {
+                restoreConfig = loadMergedScopeConfig(config.configPath);
+              } catch {
+                restoreConfig = config;
               }
             }
             const sm = await getSessionManager(restoreConfig);
@@ -1176,6 +1215,19 @@ async function runStartup(
       });
       // Non-fatal: don't block startup if last-stop handling fails
     }
+  }
+
+  // Drive labeled backlog issues to execution without needing the dashboard
+  // (headless autonomy). Started after session restore so the first poll
+  // counts restored workers against the per-project cap rather than racing
+  // them — otherwise it could spawn new workers up to the cap while the
+  // restored sessions are still being brought back. The poller's
+  // cross-process lock prevents double-spawning with the dashboard's poller.
+  if (shouldStartLifecycle) {
+    // Pass the RESOLVED port (may differ from config.port if the requested port
+    // was busy and the dashboard fell back) so backlog-spawned sessions get
+    // AO_PORT for the daemon that actually bound, not the stale config value.
+    startBacklogPoller(config.configPath, port);
   }
 
   // Print summary

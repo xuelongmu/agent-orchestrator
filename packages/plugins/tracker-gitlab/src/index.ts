@@ -232,6 +232,24 @@ function createGitLabTracker(config?: Record<string, unknown>): Tracker {
         );
       }
 
+      // Subtractive labels via `--unlabel`. The backlog poller's claim and
+      // verification flows rely on removeLabels to drop `agent:backlog`; without
+      // it a merged GitLab issue keeps the label and gets respawned.
+      if (update.removeLabels && update.removeLabels.length > 0) {
+        await glab(
+          [
+            "issue",
+            "update",
+            identifier,
+            "--repo",
+            repo,
+            "--unlabel",
+            update.removeLabels.join(","),
+          ],
+          hostname,
+        );
+      }
+
       if (update.comment) {
         await glab(
           ["issue", "note", identifier, "--repo", repo, "-m", update.comment],

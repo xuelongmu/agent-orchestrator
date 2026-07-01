@@ -6,6 +6,7 @@ const {
   MockConfigNotFoundError,
   mockRegister,
   mockCreateSessionManager,
+  mockCreateBacklogPoller,
   mockRegistry,
   tmuxPlugin,
   claudePlugin,
@@ -19,6 +20,7 @@ const {
 } = vi.hoisted(() => {
   const mockLoadConfig = vi.fn();
   const mockGetGlobalConfigPath = vi.fn();
+  const mockCreateBacklogPoller = vi.fn();
   class MockConfigNotFoundError extends Error {
     constructor(message?: string) {
       super(message ?? "Config not found");
@@ -41,6 +43,7 @@ const {
     MockConfigNotFoundError,
     mockRegister,
     mockCreateSessionManager,
+    mockCreateBacklogPoller,
     mockRegistry,
     tmuxPlugin: { manifest: { name: "tmux" } },
     claudePlugin: { manifest: { name: "claude-code" } },
@@ -66,6 +69,8 @@ vi.mock("@aoagents/ao-core", () => ({
     getStates: vi.fn(),
     check: vi.fn(),
   }),
+  createBacklogPoller: mockCreateBacklogPoller,
+  BACKLOG_LABEL: "agent:backlog",
   TERMINAL_STATUSES: new Set(["merged", "killed"]) as ReadonlySet<string>,
 }));
 
@@ -177,94 +182,57 @@ describe("services", () => {
   });
 });
 
-describe("pollBacklog", () => {
-  const mockUpdateIssue = vi.fn();
-  const mockListIssues = vi.fn();
-  const mockSpawn = vi.fn();
+describe("backlog poller wiring", () => {
+  const mockPollOnce = vi.fn();
+  const mockStart = vi.fn();
 
-  beforeEach(async () => {
+  beforeEach(() => {
     vi.resetModules();
-    mockRegister.mockClear();
-    mockCreateSessionManager.mockReset();
-    mockLoadConfig.mockReset();
-    mockUpdateIssue.mockClear();
-    mockListIssues.mockClear();
-    mockSpawn.mockClear();
-
+    mockCreateBacklogPoller.mockReset();
+    mockPollOnce.mockReset().mockResolvedValue(undefined);
+    mockStart.mockReset();
+    mockGetGlobalConfigPath.mockReturnValue("/tmp/global-config.yaml");
     mockLoadConfig.mockReturnValue({
       configPath: "/tmp/agent-orchestrator.yaml",
       port: 3000,
       readyThresholdMs: 300_000,
       defaults: { runtime: "tmux", agent: "claude-code", workspace: "worktree", notifiers: [] },
-      projects: {
-        "test-project": {
-          path: "/tmp/test-project",
-          tracker: { plugin: "github" },
-          backlog: { label: "agent:backlog", maxConcurrent: 5 },
-        },
-      },
+      projects: {},
       notifiers: {},
       notificationRouting: { urgent: [], action: [], warning: [], info: [] },
       reactions: {},
     });
-
-    mockCreateSessionManager.mockReturnValue({
-      spawn: mockSpawn,
-      list: vi.fn().mockResolvedValue([]),
+    mockCreateSessionManager.mockReturnValue({});
+    mockCreateBacklogPoller.mockReturnValue({
+      start: mockStart,
+      stop: vi.fn(),
+      pollOnce: mockPollOnce,
     });
 
+    delete (globalThis as typeof globalThis & { _aoBacklogPoller?: unknown })._aoBacklogPoller;
     delete (globalThis as typeof globalThis & { _aoServices?: unknown })._aoServices;
     delete (globalThis as typeof globalThis & { _aoServicesInit?: unknown })._aoServicesInit;
   });
 
   afterEach(() => {
+    delete (globalThis as typeof globalThis & { _aoBacklogPoller?: unknown })._aoBacklogPoller;
     delete (globalThis as typeof globalThis & { _aoServices?: unknown })._aoServices;
     delete (globalThis as typeof globalThis & { _aoServicesInit?: unknown })._aoServicesInit;
   });
 
-  it("removes agent:backlog label when claiming an issue", async () => {
-    mockListIssues.mockResolvedValue([
-      {
-        id: "123",
-        title: "Test Issue",
-        description: "Test description",
-        url: "https://github.com/test/test/issues/123",
-        state: "open",
-        labels: ["agent:backlog"],
-      },
-    ]);
+  it("starts the core backlog poller", async () => {
+    const { startBacklogPoller } = await import("../lib/services");
+    startBacklogPoller();
+    startBacklogPoller(); // idempotent — poller is cached on globalThis
 
-    mockRegistry.get.mockImplementation((slot: string) => {
-      if (slot === "tracker") {
-        return {
-          name: "github",
-          listIssues: mockListIssues,
-          updateIssue: mockUpdateIssue,
-        };
-      }
-      if (slot === "agent") {
-        return { name: "claude-code" };
-      }
-      if (slot === "runtime") {
-        return { name: "tmux" };
-      }
-      if (slot === "workspace") {
-        return { name: "worktree" };
-      }
-      return null;
-    });
+    expect(mockCreateBacklogPoller).toHaveBeenCalledTimes(1);
+    expect(mockStart).toHaveBeenCalledTimes(2);
+  });
 
+  it("delegates pollBacklog to the core poller", async () => {
     const { pollBacklog } = await import("../lib/services");
     await pollBacklog();
 
-    expect(mockUpdateIssue).toHaveBeenCalledWith(
-      "123",
-      {
-        labels: ["agent:in-progress"],
-        removeLabels: ["agent:backlog"],
-        comment: "Claimed by agent orchestrator — session spawned.",
-      },
-      expect.objectContaining({ tracker: { plugin: "github" } }),
-    );
+    expect(mockPollOnce).toHaveBeenCalledTimes(1);
   });
 });

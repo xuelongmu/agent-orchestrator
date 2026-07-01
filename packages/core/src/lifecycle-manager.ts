@@ -1163,7 +1163,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           }
         }
 
-        const detectedActivity = await agent.getActivityState(session, config.readyThresholdMs);
+        // Prefer this project's idle/ready threshold (preserves a carried
+        // startup-only project's own threshold) over the top-level default.
+        const readyThresholdMs =
+          config.projects[session.projectId]?.readyThresholdMs ?? config.readyThresholdMs;
+        const detectedActivity = await agent.getActivityState(session, readyThresholdMs);
         if (detectedActivity) {
           activitySignal = classifyActivitySignal(detectedActivity, "native");
           activityEvidence = formatActivitySignalEvidence(activitySignal);
@@ -2548,7 +2552,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   /** Send a notification to all configured notifiers. */
   async function notifyHuman(event: OrchestratorEvent, priority: EventPriority): Promise<void> {
     const eventWithPriority = { ...event, priority };
-    const notifierNames = config.notificationRouting[priority] ?? config.defaults.notifiers;
+    // Prefer a per-project routing override (preserves a startup-only project's
+    // own routing when merged into a global scope), then top-level, then default.
+    const project = config.projects[event.projectId];
+    const notifierNames =
+      project?.notificationRouting?.[priority] ??
+      config.notificationRouting[priority] ??
+      config.defaults.notifiers;
 
     for (const name of notifierNames) {
       const target = resolveNotifierTarget(config, name);
@@ -2603,12 +2613,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   async function maybeAutoCleanupOnMerge(session: Session): Promise<void> {
     if (session.status !== SESSION_STATUS.MERGED) return;
 
-    // config.lifecycle is typed optional to support hand-constructed
-    // configs in tests. When loaded from YAML via Zod, the schema's
-    // .default({}) always populates it. The destructure below handles
-    // both paths uniformly.
-    const { autoCleanupOnMerge = true, mergeCleanupIdleGraceMs: graceMs = 300_000 } =
-      config.lifecycle ?? {};
+    // Merge the per-project lifecycle override FIELD-BY-FIELD over the top-level
+    // config (a partial project override only changes the fields it sets, so it
+    // can't accidentally re-enable cleanup the user disabled globally). Defaults
+    // apply only when neither level sets a field.
+    const project = config.projects[session.projectId];
+    const projectLifecycle = project?.lifecycle;
+    const topLifecycle = config.lifecycle;
+    const autoCleanupOnMerge =
+      projectLifecycle?.autoCleanupOnMerge ?? topLifecycle?.autoCleanupOnMerge ?? true;
+    const graceMs =
+      projectLifecycle?.mergeCleanupIdleGraceMs ?? topLifecycle?.mergeCleanupIdleGraceMs ?? 300_000;
     if (!autoCleanupOnMerge) return;
 
     // Check for idleness: if the agent is still working, defer cleanup.
@@ -3573,13 +3588,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         // Execute all-complete reaction if configured
         const reactionKey = eventToReactionKey("summary.all_complete");
         if (reactionKey) {
-          const reactionConfig = config.reactions[reactionKey];
+          // Per-project worker: honor this project's reaction override (merged over
+          // the top-level), so a carried startup-only project's baked all-complete
+          // policy applies instead of the unrelated global one. The synthetic
+          // system session below doesn't flow through getReactionConfigForSession,
+          // so resolve the override explicitly here.
+          const allCompleteProject = scopedProjectId ? config.projects[scopedProjectId] : undefined;
+          const projectReaction = allCompleteProject?.reactions?.[reactionKey];
+          const reactionConfig = projectReaction
+            ? { ...config.reactions[reactionKey], ...projectReaction }
+            : config.reactions[reactionKey];
           if (reactionConfig && reactionConfig.action) {
             if (reactionConfig.auto !== false || reactionConfig.action === "notify") {
               // Create a minimal session context for system events (no PR/issue context)
               const systemSession: ReactionSessionContext = {
                 id: "system" as SessionId,
-                projectId: "all",
+                projectId: scopedProjectId ?? "all",
                 pr: null,
                 issueId: null,
                 branch: null,

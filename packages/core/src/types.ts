@@ -1294,6 +1294,9 @@ export interface Terminal {
 /** Priority levels for events — determines notification routing */
 export type EventPriority = "urgent" | "action" | "warning" | "info";
 
+/** All event priorities, for iterating routing maps. Keep in sync with {@link EventPriority}. */
+export const EVENT_PRIORITIES: readonly EventPriority[] = ["urgent", "action", "warning", "info"];
+
 /** All orchestrator event types */
 export type EventType =
   // Session lifecycle
@@ -1496,6 +1499,18 @@ export interface OrchestratorConfig {
    * Used by plugin-registry for manifest validation. Set automatically during config validation.
    */
   _externalPluginEntries?: ExternalPluginEntryRef[];
+
+  /**
+   * Internal: Overrides the plugin-registry cache key for this config object.
+   * Set only for a *merged scope* (the `ao start` daemon's union of the global
+   * registry with a startup-only config) so its registry — which carries the
+   * startup config's extra plugin declarations — is cached separately from the
+   * plain global config's. Without it, the CLI registry cache (keyed by
+   * `configPath`, which the merged scope keeps as the global path) would serve a
+   * global-only registry built earlier by the project supervisor, and a
+   * startup-only project's external tracker/agent plugin would fail to resolve.
+   */
+  _registryScopeKey?: string;
 }
 
 export interface DegradedProjectEntry {
@@ -1637,6 +1652,32 @@ export interface ProjectConfig {
   /** Override default workspace */
   workspace?: string;
 
+  /**
+   * Absolute path to the config file that actually defines this project. Set
+   * only when projects from more than one config are merged into a single scope
+   * (e.g. the `ao start` daemon unions the global registry with a startup
+   * config). When present it overrides the top-level `config.configPath` for the
+   * worker's `AO_CONFIG_PATH`, so an agent spawned for a startup-only project
+   * can still resolve its own project via `ao`. Unset for normal single-config
+   * projects, which fall back to `config.configPath`.
+   */
+  sourceConfigPath?: string;
+
+  /**
+   * Internal: set when this carried project's source (startup) config is
+   * currently unreadable and only a cached copy is in scope. The backlog poller
+   * must NOT spawn new workers for it (a worker would get an `AO_CONFIG_PATH`
+   * pointing at the missing file and fail to resolve its config); supervision and
+   * shutdown of its existing sessions still proceed. Unset for normal projects.
+   */
+  _spawnPaused?: boolean;
+
+  /**
+   * Maximum number of concurrent worker sessions the backlog poller will spawn
+   * for this project. Defaults to 5 when unset.
+   */
+  maxConcurrentAgents?: number;
+
   /** Environment variables forwarded into worker session runtimes (AO_* internals always win) */
   env?: Record<string, string>;
 
@@ -1664,6 +1705,31 @@ export interface ProjectConfig {
 
   /** Per-project reaction overrides */
   reactions?: Record<string, Partial<ReactionConfig>>;
+
+  /**
+   * Per-project notification routing override (by event priority). When set, it
+   * takes precedence over the top-level `notificationRouting` for this project.
+   * Used to preserve a startup-only project's own routing when its config is
+   * merged into a global scope (see the `ao start` merged-scope wiring).
+   */
+  notificationRouting?: Record<EventPriority, string[]>;
+
+  /**
+   * Per-project lifecycle override (auto-cleanup-on-merge policy, grace window).
+   * Merged FIELD-BY-FIELD over the top-level `lifecycle` (a partial override only
+   * changes the fields it sets), so it must not carry schema defaults — hence
+   * `Partial`. Used to preserve a startup-only project's own merge-cleanup policy
+   * when its config is merged into a global scope.
+   */
+  lifecycle?: Partial<LifecycleConfig>;
+
+  /**
+   * Per-project idle/ready threshold (ms) override. When set, it takes precedence
+   * over the top-level `readyThresholdMs` in the scoped lifecycle worker's
+   * `getActivityState` call. Used to preserve a startup-only project's own
+   * threshold when its config is merged into a global scope.
+   */
+  readyThresholdMs?: number;
 
   /** Inline rules/instructions passed to every agent prompt */
   agentRules?: string;

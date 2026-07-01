@@ -51,6 +51,40 @@ describe("resolveBudget", () => {
       perProjectUsd: undefined,
     });
   });
+
+  it("does not inherit the global budget for a carried startup-only project", () => {
+    // A project whose definition was merged in from a different config
+    // (sourceConfigPath set) must not be capped by the merged scope's global
+    // budget — if its own config sets none, it is intentionally uncapped.
+    const config = makeConfig({
+      budget: { perSessionUsd: 5, perProjectUsd: 50 },
+      projects: {
+        carried: {
+          sourceConfigPath: "/repo/agent-orchestrator.yaml",
+        } as OrchestratorConfig["projects"][string],
+      },
+    });
+    expect(resolveBudget(config, "carried")).toEqual({
+      perSessionUsd: undefined,
+      perProjectUsd: undefined,
+    });
+  });
+
+  it("uses a carried project's own budget without inheriting unset fields from global", () => {
+    const config = makeConfig({
+      budget: { perSessionUsd: 5, perProjectUsd: 50 },
+      projects: {
+        carried: {
+          sourceConfigPath: "/repo/agent-orchestrator.yaml",
+          budget: { perSessionUsd: 3 },
+        } as OrchestratorConfig["projects"][string],
+      },
+    });
+    expect(resolveBudget(config, "carried")).toEqual({
+      perSessionUsd: 3,
+      perProjectUsd: undefined,
+    });
+  });
 });
 
 describe("evaluateBudgetBreach", () => {

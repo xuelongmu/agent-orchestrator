@@ -19,7 +19,9 @@ const {
   mockStopBunTmpJanitor,
   mockStopProjectSupervisor,
   mockStopAllLifecycleWorkers,
+  mockStopBacklogPoller,
   mockLoadConfig,
+  mockLoadMergedScopeConfig,
   mockIsTerminalSession,
 } = vi.hoisted(() => ({
   mockListSessions: vi.fn(),
@@ -30,7 +32,9 @@ const {
   mockStopBunTmpJanitor: vi.fn(),
   mockStopProjectSupervisor: vi.fn(),
   mockStopAllLifecycleWorkers: vi.fn(),
+  mockStopBacklogPoller: vi.fn(),
   mockLoadConfig: vi.fn(),
+  mockLoadMergedScopeConfig: vi.fn(),
   mockIsTerminalSession: vi.fn(),
 }));
 
@@ -44,6 +48,10 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
     recordActivityEvent: vi.fn(),
   };
 });
+
+vi.mock("../../src/lib/config-scope.js", () => ({
+  loadMergedScopeConfig: (...args: unknown[]) => mockLoadMergedScopeConfig(...args),
+}));
 
 vi.mock("../../src/lib/create-session-manager.js", () => ({
   getSessionManager: (...args: unknown[]) => mockGetSessionManager(...args),
@@ -64,6 +72,10 @@ vi.mock("../../src/lib/running-state.js", () => ({
 
 vi.mock("../../src/lib/bun-tmp-janitor.js", () => ({
   stopBunTmpJanitor: (...args: unknown[]) => mockStopBunTmpJanitor(...args),
+}));
+
+vi.mock("../../src/lib/backlog-service.js", () => ({
+  stopBacklogPoller: (...args: unknown[]) => mockStopBacklogPoller(...args),
 }));
 
 const recordedEvents = (): Array<Record<string, unknown>> =>
@@ -92,10 +104,16 @@ describe("shutdown handlers — activity events", () => {
     mockStopBunTmpJanitor.mockReset();
     mockStopProjectSupervisor.mockReset();
     mockStopAllLifecycleWorkers.mockReset();
+    mockStopBacklogPoller.mockReset();
     mockLoadConfig.mockReset();
+    mockLoadMergedScopeConfig.mockReset();
     mockIsTerminalSession.mockReset();
 
+    // Default: no in-flight poll — stop resolves immediately.
+    mockStopBacklogPoller.mockResolvedValue(undefined);
+
     mockLoadConfig.mockReturnValue({ projects: {} });
+    mockLoadMergedScopeConfig.mockReturnValue({ projects: {} });
     mockIsTerminalSession.mockReturnValue(false);
     mockGetSessionManager.mockResolvedValue({
       list: mockListSessions,
@@ -228,6 +246,102 @@ describe("shutdown handlers — activity events", () => {
       }),
     );
     expect(events.filter((e) => e.kind === "cli.shutdown_failed")).toHaveLength(0);
+  });
+
+  it("falls back to the base config and still kills sessions when the merged scope fails to load", async () => {
+    const { installShutdownHandlers } = await import("../../src/lib/shutdown.js");
+    // Config drift while the daemon ran (corrupt global registry, prefix/notifier
+    // collision) makes the merged scope unbuildable. Shutdown must fall back to the
+    // plain config so sessions are still killed instead of throwing to the outer
+    // catch (shutdown_failed) and leaving managed runtimes running.
+    mockLoadMergedScopeConfig.mockImplementation(() => {
+      throw new Error("merged scope boom");
+    });
+    mockLoadConfig.mockReturnValue({ projects: {} });
+    mockListSessions.mockResolvedValue([{ id: "s1", projectId: "p1", status: "working" }]);
+
+    installShutdownHandlers({ configPath: "/tmp/cfg.yaml", projectId: "p1" });
+
+    process.emit("SIGTERM", "SIGTERM");
+    await flushAsync();
+
+    // Fell back to the base config, killed the session, and completed cleanly.
+    expect(mockLoadConfig).toHaveBeenCalledWith("/tmp/cfg.yaml");
+    expect(mockKillSession).toHaveBeenCalledWith("s1");
+
+    const events = recordedEvents();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "cli.shutdown_merged_scope_fallback",
+        source: "cli",
+        level: "warn",
+        data: expect.objectContaining({ errorMessage: "merged scope boom" }),
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({ kind: "cli.shutdown_completed", projectId: "p1" }),
+    );
+    expect(events.filter((e) => e.kind === "cli.shutdown_failed")).toHaveLength(0);
+  });
+
+  it("proceeds with shutdown (bounded drain) when the backlog poll is stuck", async () => {
+    vi.useFakeTimers();
+    try {
+      const { installShutdownHandlers } = await import("../../src/lib/shutdown.js");
+      // Backlog poll never settles — shutdown must not block on it.
+      mockStopBacklogPoller.mockReturnValue(new Promise(() => {}));
+      mockListSessions.mockResolvedValue([{ id: "s1", projectId: "p1", status: "working" }]);
+
+      installShutdownHandlers({ configPath: "/tmp/cfg.yaml", projectId: "p1" });
+
+      process.emit("SIGTERM", "SIGTERM");
+      // Advance only past the 3s drain bound — well under the 10s force-exit.
+      await vi.advanceTimersByTimeAsync(3_000);
+
+      // The stuck poll did not prevent the kill loop from running.
+      expect(mockKillSession).toHaveBeenCalledWith("s1");
+
+      const events = recordedEvents();
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "cli.shutdown_backlog_drain_timeout",
+          source: "cli",
+          level: "warn",
+          data: expect.objectContaining({ timeoutMs: 3_000 }),
+        }),
+      );
+      // Force-exit (10s) must NOT have fired within the bounded drain window.
+      expect(events.filter((e) => e.kind === "cli.shutdown_force_exit")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-enumerates and kills a worker that appears after the first kill pass", async () => {
+    vi.useFakeTimers();
+    try {
+      const { installShutdownHandlers } = await import("../../src/lib/shutdown.js");
+      // Backlog poll never settles → both the first and second drains time out.
+      mockStopBacklogPoller.mockReturnValue(new Promise(() => {}));
+      // First enumeration sees nothing; an in-flight spawn produces a worker that
+      // only surfaces on the second pass.
+      mockListSessions
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ id: "escaped", projectId: "p1", status: "working" }]);
+
+      installShutdownHandlers({ configPath: "/tmp/cfg.yaml", projectId: "p1" });
+
+      process.emit("SIGTERM", "SIGTERM");
+      // Advance past both bounded drains (3s + 3s), still under the 10s force-exit.
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      // The escapee, absent from the first pass, is killed by the second.
+      expect(mockKillSession).toHaveBeenCalledWith("escaped");
+      const events = recordedEvents();
+      expect(events.filter((e) => e.kind === "cli.shutdown_force_exit")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("emits cli.shutdown_force_exit when the 10s timer fires", async () => {

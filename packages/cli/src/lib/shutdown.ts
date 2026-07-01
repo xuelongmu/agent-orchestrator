@@ -19,14 +19,26 @@ import {
   markDaemonShutdownHandlerInstalled,
   recordActivityEvent,
   sweepDaemonChildren,
+  type Session,
 } from "@aoagents/ao-core";
+import { loadMergedScopeConfig } from "./config-scope.js";
 import { stopBunTmpJanitor } from "./bun-tmp-janitor.js";
 import { getSessionManager } from "./create-session-manager.js";
 import { stopAllLifecycleWorkers } from "./lifecycle-service.js";
 import { stopProjectSupervisor } from "./project-supervisor.js";
+import { stopBacklogPoller } from "./backlog-service.js";
 import { unregister, writeLastStop } from "./running-state.js";
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
+
+/**
+ * Upper bound on how long shutdown waits for an in-flight backlog poll to
+ * settle before proceeding to kill sessions. Comfortably under
+ * {@link SHUTDOWN_TIMEOUT_MS} so a poll stuck in a slow tracker call or
+ * `sessionManager.spawn()` can never let the force-exit timer fire before the
+ * kill loop and last-stop write run.
+ */
+const BACKLOG_DRAIN_TIMEOUT_MS = 3_000;
 
 export interface ShutdownContext {
   /** Path to the orchestrator config; re-read at shutdown time so any
@@ -73,7 +85,9 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
       data: { signal, exitCode },
     });
 
+    let backlogStopped: Promise<void> = Promise.resolve();
     try {
+      backlogStopped = stopBacklogPoller();
       stopProjectSupervisor();
       stopAllLifecycleWorkers();
     } catch {
@@ -95,46 +109,127 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
 
     void (async () => {
       try {
-        const shutdownConfig = loadConfig(ctx.configPath);
+        // Wait for an in-flight backlog poll to settle so a session it spawned
+        // right before the signal is enumerated below and killed cleanly. A
+        // rejection here must not abort the kill path, so swallow it. Bound the
+        // wait: if the poll is stuck in a slow tracker call or spawn, proceed
+        // anyway rather than let the 10s force-exit fire with sessions un-killed
+        // and last-stop unwritten.
+        let drainTimer: ReturnType<typeof setTimeout> | undefined;
+        const drained = await Promise.race([
+          backlogStopped.then(
+            () => true,
+            () => true,
+          ),
+          new Promise<boolean>((resolve) => {
+            // NOT unref'd: this timeout gates the kill / last-stop cleanup below.
+            // On a headless daemon with `backlogStopped` still pending, an
+            // unref'd timer plus a pending promise leaves nothing keeping the
+            // event loop alive, so Node could exit before cleanup runs. Cleared
+            // once the race settles so a fast drain leaves no dangling handle.
+            drainTimer = setTimeout(() => resolve(false), BACKLOG_DRAIN_TIMEOUT_MS);
+          }),
+        ]);
+        if (drainTimer) clearTimeout(drainTimer);
+        if (!drained) {
+          recordActivityEvent({
+            projectId: ctx.projectId,
+            source: "cli",
+            kind: "cli.shutdown_backlog_drain_timeout",
+            level: "warn",
+            summary: `backlog poll did not settle within ${BACKLOG_DRAIN_TIMEOUT_MS}ms; proceeding with shutdown`,
+            data: { signal, timeoutMs: BACKLOG_DRAIN_TIMEOUT_MS },
+          });
+        }
+        // Best-effort like the restore path (start.ts): if the merged scope can't
+        // be built — a corrupt global registry, or a project/sessionPrefix/notifier
+        // collision introduced while the daemon ran — fall back to the plain config
+        // so we still enumerate and kill THIS daemon's sessions, write last-stop,
+        // sweep children, and unregister. Throwing to the outer catch here would
+        // record `cli.shutdown_failed` and exit with managed runtimes still running.
+        let shutdownConfig;
+        try {
+          shutdownConfig = loadMergedScopeConfig(ctx.configPath);
+        } catch (err) {
+          recordActivityEvent({
+            projectId: ctx.projectId,
+            source: "cli",
+            kind: "cli.shutdown_merged_scope_fallback",
+            level: "warn",
+            summary: `merged shutdown scope failed to load; falling back to base config`,
+            data: { errorMessage: err instanceof Error ? err.message : String(err) },
+          });
+          shutdownConfig = loadConfig(ctx.configPath);
+        }
         const sm = await getSessionManager(shutdownConfig);
-        const allSessions = await sm.list();
-        // Held (blocked-by-dependency) sessions own no runtime — there is nothing
-        // to stop. Leave their reservation on disk so the scheduler resumes them
-        // on the next `ao start` instead of `kill()` terminating them and losing
-        // the held marker across stop/restore (#10).
-        const activeSessions = allSessions.filter(
-          (s) => !isTerminalSession(s) && !(s.lifecycle && isBlockedByDependency(s.lifecycle)),
-        );
 
-        const killedSessionIds: string[] = [];
-        for (const session of activeSessions) {
-          try {
-            const result = await sm.kill(session.id);
-            if (result.cleaned || result.alreadyTerminated) {
-              killedSessionIds.push(session.id);
+        // Every session killed across one or two enumeration passes, keyed by id
+        // so the second pass never double-kills or double-records a session.
+        const killedSessions = new Map<string, Session>();
+        const killActivePass = async (): Promise<void> => {
+          // Held (blocked-by-dependency) sessions own no runtime — there is
+          // nothing to stop. Leave their reservation on disk so the scheduler
+          // resumes them on the next `ao start` instead of `kill()` terminating
+          // them and losing the held marker across stop/restore (#10).
+          const active = (await sm.list()).filter(
+            (s) => !isTerminalSession(s) && !(s.lifecycle && isBlockedByDependency(s.lifecycle)),
+          );
+          for (const session of active) {
+            if (killedSessions.has(session.id)) continue;
+            try {
+              const result = await sm.kill(session.id);
+              if (result.cleaned || result.alreadyTerminated) {
+                killedSessions.set(session.id, session);
+              }
+            } catch (err) {
+              recordActivityEvent({
+                projectId: session.projectId ?? ctx.projectId,
+                sessionId: session.id,
+                source: "cli",
+                kind: "cli.shutdown_session_kill_failed",
+                level: "warn",
+                summary: `failed to kill session during shutdown`,
+                data: { errorMessage: err instanceof Error ? err.message : String(err) },
+              });
             }
-          } catch (err) {
-            recordActivityEvent({
-              projectId: session.projectId ?? ctx.projectId,
-              sessionId: session.id,
-              source: "cli",
-              kind: "cli.shutdown_session_kill_failed",
-              level: "warn",
-              summary: `failed to kill session during shutdown`,
-              data: { errorMessage: err instanceof Error ? err.message : String(err) },
-            });
           }
+        };
+
+        // First pass: kill everything enumerable right now.
+        await killActivePass();
+
+        // If the bounded drain above gave up, the backlog poll may still be inside
+        // an in-flight `sessionManager.spawn()` — aborting can't cancel it, so a
+        // worker could be created after this first enumeration and escape the kill
+        // loop. Wait (bounded again) for the poll to settle: the poller tears down
+        // a worker it spawned once it observes the abort (see backlog-poller
+        // spawnFromBacklog), so by the time `backlogStopped` resolves the escapee
+        // is gone. Re-enumerate as a safety net in case that teardown failed.
+        if (!drained) {
+          let secondDrainTimer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([
+            backlogStopped.then(
+              () => undefined,
+              () => undefined,
+            ),
+            new Promise<void>((resolve) => {
+              secondDrainTimer = setTimeout(resolve, BACKLOG_DRAIN_TIMEOUT_MS);
+            }),
+          ]);
+          if (secondDrainTimer) clearTimeout(secondDrainTimer);
+          await killActivePass();
         }
 
+        const killedSessionIds = [...killedSessions.keys()];
         if (killedSessionIds.length > 0) {
-          const targetIds = killedSessionIds.filter((id) =>
-            activeSessions.some((s) => s.id === id && s.projectId === ctx.projectId),
+          const killedList = [...killedSessions.values()];
+          const targetIds = killedSessionIds.filter(
+            (id) => killedSessions.get(id)?.projectId === ctx.projectId,
           );
           const otherProjects: Array<{ projectId: string; sessionIds: string[] }> = [];
           const otherByProject = new Map<string, string[]>();
-          for (const s of activeSessions) {
+          for (const s of killedList) {
             if (s.projectId === ctx.projectId) continue;
-            if (!killedSessionIds.includes(s.id)) continue;
             const list = otherByProject.get(s.projectId ?? "unknown") ?? [];
             list.push(s.id);
             otherByProject.set(s.projectId ?? "unknown", list);

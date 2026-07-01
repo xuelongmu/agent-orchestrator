@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockLoadConfig = vi.fn();
+const mockLoadMergedScopeConfig = vi.fn();
 const mockGetSessionManager = vi.fn();
 const mockEnsureLifecycleWorker = vi.fn();
 const mockAddProjectToRunning = vi.fn();
@@ -49,6 +50,10 @@ vi.mock("../../src/lib/create-session-manager.js", () => ({
   getSessionManager: (...args: unknown[]) => mockGetSessionManager(...args),
 }));
 
+vi.mock("../../src/lib/config-scope.js", () => ({
+  loadMergedScopeConfig: (...args: unknown[]) => mockLoadMergedScopeConfig(...args),
+}));
+
 vi.mock("../../src/lib/lifecycle-service.js", () => ({
   ensureLifecycleWorker: async (...args: unknown[]) => {
     const projectId = args[1] as string;
@@ -92,6 +97,7 @@ describe("project-supervisor", () => {
     activeWorkers.clear();
     sessionsByProject = new Map();
     mockLoadConfig.mockReset();
+    mockLoadMergedScopeConfig.mockReset();
     mockGetSessionManager.mockReset();
     mockEnsureLifecycleWorker.mockReset();
     mockAddProjectToRunning.mockReset();
@@ -326,23 +332,27 @@ describe("project-supervisor", () => {
     expect(activeWorkers.has("app")).toBe(true);
   });
 
-  it("ignores the caller-provided configPath when the global config is healthy", async () => {
-    sessionsByProject.set("app", [makeSession("app")]);
-    // Both paths would return a valid config — assert we only ever consult
-    // the global path. The configPath is the fallback, not an override.
+  it("unions the startup scope when the global config is healthy", async () => {
+    // When global is healthy AND a startup configPath is provided, the supervisor
+    // reconciles over the MERGED scope (global ∪ startup) so a startup-only
+    // project — one launched from a non-registered local/URL config — is
+    // supervised too, matching the backlog poller / shutdown scope. The global
+    // config is still probed first (to route a missing global to the fallback).
+    sessionsByProject.set("registered", [makeSession("registered")]);
+    sessionsByProject.set("startup-only", [makeSession("startup-only")]);
     mockLoadConfig.mockImplementation((path?: string) => {
-      if (path === "/tmp/global-config.yaml") return makeConfig(["app"]);
-      if (path === "/repo/agent-orchestrator.yaml") {
-        throw new Error("supervisor should not consult configPath when global is healthy");
-      }
+      if (path === "/tmp/global-config.yaml") return makeConfig(["registered"]);
       throw new Error(`unexpected loadConfig path: ${path}`);
     });
+    mockLoadMergedScopeConfig.mockReturnValue(makeConfig(["registered", "startup-only"]));
 
     await reconcileProjectSupervisor({ configPath: "/repo/agent-orchestrator.yaml" });
 
     expect(mockLoadConfig).toHaveBeenCalledWith("/tmp/global-config.yaml");
-    expect(mockLoadConfig).not.toHaveBeenCalledWith("/repo/agent-orchestrator.yaml");
-    expect(activeWorkers.has("app")).toBe(true);
+    expect(mockLoadMergedScopeConfig).toHaveBeenCalledWith("/repo/agent-orchestrator.yaml");
+    // Both the registered and the startup-only project get lifecycle workers.
+    expect(activeWorkers.has("registered")).toBe(true);
+    expect(activeWorkers.has("startup-only")).toBe(true);
   });
 
   it("preserves workers across a global→fallback transition (multi-tick)", async () => {
@@ -355,11 +365,13 @@ describe("project-supervisor", () => {
     sessionsByProject.set("beta", [makeSession("beta")]);
     sessionsByProject.set("gamma", [makeSession("gamma")]);
 
-    // Tick 1: global is the source.
+    // Tick 1: global is the source; the merged scope (global ∪ startup) lists
+    // all three.
     mockLoadConfig.mockImplementation((path?: string) => {
       if (path === "/tmp/global-config.yaml") return makeConfig(["alpha", "beta", "gamma"]);
       throw new Error(`unexpected path on tick 1: ${path}`);
     });
+    mockLoadMergedScopeConfig.mockReturnValue(makeConfig(["alpha", "beta", "gamma"]));
     await reconcileProjectSupervisor({ configPath: "/repo/agent-orchestrator.yaml" });
     expect(activeWorkers.has("alpha")).toBe(true);
     expect(activeWorkers.has("beta")).toBe(true);
@@ -386,13 +398,13 @@ describe("project-supervisor", () => {
     expect(mockRemoveProjectFromRunning).not.toHaveBeenCalledWith("gamma");
   });
 
-  it("does detach when global is restored after a fallback period (symmetric flip)", async () => {
-    // Documents intentional current behavior: when source flips back to
-    // "global", the detach pass treats the global config as authoritative,
-    // so projects not listed there ARE detached — including any that were
-    // attached during a prior fallback window. The reviewer's guidance was
-    // scoped to the fallback direction; protecting the symmetric flip would
-    // require per-worker source tracking and is out of scope here.
+  it("keeps a startup-only project supervised after the global config appears", async () => {
+    // A daemon started from /repo (defining local-only) first runs under the
+    // local fallback (no global yet). When a global config later appears (e.g.
+    // another `ao start <url>` wrote it), the supervisor reconciles over the
+    // MERGED scope (global ∪ startup), so local-only — still defined by the
+    // startup config — stays supervised instead of being detached. This is the
+    // symmetric flip the previous global-only detach pass could not protect.
     sessionsByProject.set("local-only", [makeSession("local-only")]);
     sessionsByProject.set("from-global", [makeSession("from-global")]);
 
@@ -410,17 +422,19 @@ describe("project-supervisor", () => {
     await reconcileProjectSupervisor({ configPath: "/repo/agent-orchestrator.yaml" });
     expect(activeWorkers.has("local-only")).toBe(true);
 
-    // Tick 2: global appears (e.g. another `ao start <url>` wrote it),
-    // listing only "from-global". Source = "global" → detach pass runs.
+    // Tick 2: global appears listing only "from-global"; the startup config still
+    // defines local-only, so the merged scope = {from-global, local-only}.
     mockLoadConfig.mockImplementation((path?: string) => {
       if (path === "/tmp/global-config.yaml") return makeConfig(["from-global"]);
       throw new Error(`unexpected path on tick 2: ${path}`);
     });
+    mockLoadMergedScopeConfig.mockReturnValue(makeConfig(["from-global", "local-only"]));
     await reconcileProjectSupervisor({ configPath: "/repo/agent-orchestrator.yaml" });
 
     expect(activeWorkers.has("from-global")).toBe(true);
-    expect(activeWorkers.has("local-only")).toBe(false);
-    expect(mockRemoveProjectFromRunning).toHaveBeenCalledWith("local-only");
+    // local-only is in the merged scope → protected from the detach pass.
+    expect(activeWorkers.has("local-only")).toBe(true);
+    expect(mockRemoveProjectFromRunning).not.toHaveBeenCalledWith("local-only");
   });
 
   it("does not detach unrelated active workers when operating from local fallback", async () => {

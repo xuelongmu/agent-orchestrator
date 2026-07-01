@@ -387,6 +387,68 @@ describe("loadBuiltins", () => {
     });
   });
 
+  it("prefers an explicit configPath on the notifier config over the top-level one", async () => {
+    // A carried startup-only notifier is baked with its startup configPath so its
+    // dashboard notifications land in the right store — the registry must honor it.
+    const registry = createPluginRegistry();
+    const fakeDashboard = makePlugin("notifier", "dashboard");
+    const cfg = makeOrchestratorConfig({
+      configPath: "/global/config.yaml",
+      defaults: {
+        runtime: "tmux",
+        agent: "codex",
+        workspace: "worktree",
+        notifiers: ["dashboard"],
+      },
+      notifiers: {
+        dashboard: { plugin: "dashboard", configPath: "/startup/config.yaml" },
+      },
+    });
+
+    await registry.loadBuiltins(cfg, async (pkg: string) => {
+      if (pkg === "@aoagents/ao-plugin-notifier-dashboard") return fakeDashboard;
+      throw new Error(`Not found: ${pkg}`);
+    });
+
+    expect(fakeDashboard.create).toHaveBeenCalledWith({ configPath: "/startup/config.yaml" });
+  });
+
+  it("registers a notifier referenced only by per-project routing", async () => {
+    const registry = createPluginRegistry();
+    const fakeDashboard = makePlugin("notifier", "dashboard");
+    const cfg = makeOrchestratorConfig({
+      configPath: "/test/config.yaml",
+      defaults: {
+        runtime: "tmux",
+        agent: "codex",
+        workspace: "worktree",
+        notifiers: [],
+      },
+      // Not referenced by top-level defaults/routing — only a per-project route.
+      notificationRouting: { urgent: [], action: [], warning: [], info: [] },
+      notifiers: {},
+      projects: {
+        app: {
+          name: "app",
+          path: "/p/app",
+          defaultBranch: "main",
+          sessionPrefix: "app",
+          notificationRouting: { urgent: ["dashboard"] },
+        },
+      },
+    } as unknown as Partial<OrchestratorConfig>);
+
+    await registry.loadBuiltins(cfg, async (pkg: string) => {
+      if (pkg === "@aoagents/ao-plugin-notifier-dashboard") return fakeDashboard;
+      throw new Error(`Not found: ${pkg}`);
+    });
+
+    // Registered with its configPath (not create(undefined)), so project-scoped
+    // notifications aren't silently dropped.
+    expect(fakeDashboard.create).toHaveBeenCalledWith({ configPath: "/test/config.yaml" });
+    expect(registry.get("notifier", "dashboard")).not.toBeNull();
+  });
+
   it("does not create an implicit notifier registration over a conflicting explicit entry", async () => {
     const registry = createPluginRegistry();
     const fakeDashboard = makePlugin("notifier", "dashboard");
@@ -607,6 +669,34 @@ describe("loadFromConfig", () => {
       expect.objectContaining({ name: "goose", slot: "agent" }),
     );
     expect(registry.get("agent", "goose")).not.toBeNull();
+  });
+
+  it("fails when two plugins resolve to the same manifest name", async () => {
+    // Two DIFFERENT declared plugins (e.g. a global one and a startup inline
+    // external whose package manifest resolves to the same slot:name). The merged
+    // config is ambiguous — each project's reference was already rewritten to that
+    // name — so loading must FAIL rather than silently pick one implementation.
+    const registry = createPluginRegistry();
+    const first = makePlugin("tracker", "github");
+    const second = makePlugin("tracker", "github");
+    const config = makeOrchestratorConfig({
+      configPath: "/tmp/agent-orchestrator.yaml",
+      plugins: [
+        { name: "github", source: "npm", package: "@global/ao-plugin-tracker-github" },
+        { name: "github", source: "npm", package: "@startup/ao-plugin-tracker-github" },
+      ],
+    });
+
+    await expect(
+      registry.loadFromConfig(config, async (specifier: string) => {
+        if (specifier === "@global/ao-plugin-tracker-github") return { default: first };
+        if (specifier === "@startup/ao-plugin-tracker-github") return { default: second };
+        throw new Error(`Not found: ${specifier}`);
+      }),
+    ).rejects.toThrow(/name collision/i);
+
+    // The colliding second implementation was never registered.
+    expect(second.create).not.toHaveBeenCalled();
   });
 
   it("loads local plugins relative to the config file", async () => {

@@ -189,6 +189,20 @@ export { memoizeAsync, _clearProcessCacheForTests } from "./process-cache.js";
 export { createLifecycleManager } from "./lifecycle-manager.js";
 export type { LifecycleManagerDeps } from "./lifecycle-manager.js";
 
+// Backlog poller — autonomous spawn-from-issues (CLI daemon + dashboard)
+export {
+  createBacklogPoller,
+  BACKLOG_LABEL,
+  BACKLOG_POLL_INTERVAL_MS,
+  DEFAULT_MAX_CONCURRENT_AGENTS,
+} from "./backlog-poller.js";
+export type {
+  BacklogPoller,
+  BacklogPollerOptions,
+  BacklogServices,
+  BacklogLogger,
+} from "./backlog-poller.js";
+
 // Prompt builder — layered prompt composition
 export { buildPrompt, BASE_AGENT_PROMPT, BASE_AGENT_PROMPT_NO_REPO } from "./prompt-builder.js";
 export type { PromptBuildConfig } from "./prompt-builder.js";

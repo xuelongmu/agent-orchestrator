@@ -251,6 +251,51 @@ const BudgetConfigSchema = z
   })
   .strict();
 
+const LifecycleConfigSchema = z
+  .object({
+    /**
+     * When a session's PR is detected as merged, automatically tear down the
+     * tmux runtime, remove the worktree, and archive the session metadata.
+     * Defaults to true so `ao status` does not retain stale merged entries.
+     */
+    autoCleanupOnMerge: z.boolean().default(true),
+    /**
+     * Maximum time (ms) to wait after a session enters `merged` before forcing
+     * cleanup regardless of agent activity. Defaults to 5 minutes. Use `0` to
+     * disable the grace window (cleanup runs immediately even if the agent is
+     * still active). Values between 1 and 9999 are rejected to catch the common
+     * mistake of writing seconds (e.g. `5`) when milliseconds are expected.
+     */
+    mergeCleanupIdleGraceMs: z
+      .number()
+      .int()
+      .nonnegative()
+      .refine((v) => v === 0 || v >= 10_000, {
+        message:
+          "mergeCleanupIdleGraceMs is in milliseconds; values between 1 and 9999 are likely a units mistake (use 0 to disable the gate, or e.g. 10000 for 10s, 300000 for 5min)",
+      })
+      .default(300_000),
+  })
+  .default({});
+
+// Per-project lifecycle override: optional fields with NO defaults, so a partial
+// override stays partial and merges field-by-field over the top-level lifecycle
+// (the defaulted LifecycleConfigSchema would mask the top-level values).
+const ProjectLifecycleConfigSchema = z
+  .object({
+    autoCleanupOnMerge: z.boolean().optional(),
+    mergeCleanupIdleGraceMs: z
+      .number()
+      .int()
+      .nonnegative()
+      .refine((v) => v === 0 || v >= 10_000, {
+        message:
+          "mergeCleanupIdleGraceMs is in milliseconds; values between 1 and 9999 are likely a units mistake (use 0 to disable the gate, or e.g. 10000 for 10s, 300000 for 5min)",
+      })
+      .optional(),
+  })
+  .optional();
+
 const ProjectConfigSchema = z.object({
   name: z.string().optional(),
   repo: z.string().optional(),
@@ -266,6 +311,8 @@ const ProjectConfigSchema = z.object({
   runtime: z.string().optional(),
   agent: z.string().optional(),
   workspace: z.string().optional(),
+  /** Max concurrent worker sessions the backlog poller spawns for this project. */
+  maxConcurrentAgents: z.number().int().positive().optional(),
   env: z.record(z.string(), z.string()).optional(),
   tracker: TrackerConfigSchema.optional(),
   scm: SCMConfigSchema.optional(),
@@ -276,6 +323,12 @@ const ProjectConfigSchema = z.object({
   worker: RoleAgentConfigSchema,
   decomposer: RoleAgentConfigSchema,
   reactions: z.record(ReactionConfigSchema.partial()).optional(),
+  // Per-project overrides honored by the lifecycle manager (and baked onto
+  // carried startup-only projects by the `ao start` merged-scope wiring). Omitted
+  // → the project falls back to the top-level routing / lifecycle policy.
+  notificationRouting: z.record(z.array(z.string())).optional(),
+  lifecycle: ProjectLifecycleConfigSchema,
+  readyThresholdMs: z.number().int().nonnegative().optional(),
   agentRules: z.string().optional(),
   agentRulesFile: z.string().optional(),
   orchestratorRules: z.string().optional(),
@@ -337,33 +390,6 @@ const PowerConfigSchema = z
 const DashboardConfigSchema = z.object({
   attentionZones: z.enum(["simple", "detailed"]).default("simple"),
 });
-
-const LifecycleConfigSchema = z
-  .object({
-    /**
-     * When a session's PR is detected as merged, automatically tear down the
-     * tmux runtime, remove the worktree, and archive the session metadata.
-     * Defaults to true so `ao status` does not retain stale merged entries.
-     */
-    autoCleanupOnMerge: z.boolean().default(true),
-    /**
-     * Maximum time (ms) to wait after a session enters `merged` before forcing
-     * cleanup regardless of agent activity. Defaults to 5 minutes. Use `0` to
-     * disable the grace window (cleanup runs immediately even if the agent is
-     * still active). Values between 1 and 9999 are rejected to catch the common
-     * mistake of writing seconds (e.g. `5`) when milliseconds are expected.
-     */
-    mergeCleanupIdleGraceMs: z
-      .number()
-      .int()
-      .nonnegative()
-      .refine((v) => v === 0 || v >= 10_000, {
-        message:
-          "mergeCleanupIdleGraceMs is in milliseconds; values between 1 and 9999 are likely a units mistake (use 0 to disable the gate, or e.g. 10000 for 10s, 300000 for 5min)",
-      })
-      .default(300_000),
-  })
-  .default({});
 
 const OrchestratorConfigSchema = z.object({
   $schema: z.string().optional(),

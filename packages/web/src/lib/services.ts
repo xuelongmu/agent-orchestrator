@@ -19,6 +19,9 @@ import {
   createPluginRegistry,
   createSessionManager,
   createLifecycleManager,
+  createBacklogPoller,
+  BACKLOG_LABEL,
+  type BacklogPoller,
   type LoadedConfig,
   type PluginRegistry,
   type OpenCodeSessionManager,
@@ -27,9 +30,6 @@ import {
   type ProjectConfig,
   type Tracker,
   type Issue,
-  type Session,
-  isOrchestratorSession,
-  TERMINAL_STATUSES,
 } from "@aoagents/ao-core";
 
 // Static plugin imports — webpack needs these to be string literals
@@ -153,204 +153,41 @@ function loadDashboardConfig(): LoadedConfig {
 
 // ---------------------------------------------------------------------------
 // Backlog auto-claim — polls for labeled issues and auto-spawns agents
+//
+// The polling logic lives in core (`createBacklogPoller`) so the headless CLI
+// daemon (`ao start`) and this dashboard share one implementation. A
+// cross-process file lock inside the poller prevents the two from
+// double-spawning the same issue when run simultaneously.
 // ---------------------------------------------------------------------------
 
-const BACKLOG_LABEL = "agent:backlog";
-const BACKLOG_POLL_INTERVAL = 60_000; // 1 minute
-const MAX_CONCURRENT_AGENTS = 5; // Max active agent sessions across all projects
-
 const globalForBacklog = globalThis as typeof globalThis & {
-  _aoBacklogStarted?: boolean;
-  _aoBacklogTimer?: ReturnType<typeof setInterval>;
+  _aoBacklogPoller?: BacklogPoller;
 };
+
+function getBacklogPoller(): BacklogPoller {
+  if (!globalForBacklog._aoBacklogPoller) {
+    globalForBacklog._aoBacklogPoller = createBacklogPoller({
+      resolveServices: async () => {
+        const { config, registry, sessionManager } = await getServices();
+        return { config, registry, sessionManager };
+      },
+      logger: {
+        info: (message) => console.log(message),
+        error: (message, err) => console.error(message, err),
+      },
+    });
+  }
+  return globalForBacklog._aoBacklogPoller;
+}
 
 /** Start the backlog auto-claim loop. Idempotent — safe to call multiple times. */
 export function startBacklogPoller(): void {
-  if (globalForBacklog._aoBacklogStarted) return;
-  globalForBacklog._aoBacklogStarted = true;
-
-  // Run immediately, then on interval
-  void pollBacklog();
-  globalForBacklog._aoBacklogTimer = setInterval(() => void pollBacklog(), BACKLOG_POLL_INTERVAL);
+  getBacklogPoller().start();
 }
 
-// Track which issues we've already processed to avoid repeated API calls
-const processedIssues = new Set<string>();
-
-/** Label GitHub issues for verification when their PRs have been merged. */
-async function labelIssuesForVerification(
-  sessions: Session[],
-  config: LoadedConfig,
-  registry: PluginRegistry,
-): Promise<void> {
-  const mergedSessions = sessions.filter(
-    (s) =>
-      s.lifecycle.pr.state === "merged" &&
-      s.issueId &&
-      !processedIssues.has(`${s.projectId}:${s.issueId}`),
-  );
-
-  for (const session of mergedSessions) {
-    const key = `${session.projectId}:${session.issueId}`;
-    const project = config.projects[session.projectId];
-    if (!project?.tracker?.plugin) {
-      processedIssues.add(key);
-      continue;
-    }
-
-    const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
-    if (!tracker?.updateIssue) {
-      processedIssues.add(key);
-      continue;
-    }
-
-    const issueId = session.issueId;
-    if (!issueId) {
-      processedIssues.add(key);
-      continue;
-    }
-
-    try {
-      await tracker.updateIssue(
-        issueId,
-        {
-          labels: ["merged-unverified"],
-          removeLabels: ["agent:backlog", "agent:in-progress"],
-          comment: `PR merged. Issue awaiting human verification on staging.`,
-        },
-        project,
-      );
-    } catch (err) {
-      console.error(`[backlog] Failed to close issue ${session.issueId}:`, err);
-    }
-    processedIssues.add(key);
-  }
-}
-
-/**
- * Detect reopened issues (open + agent:done label) and swap the label
- * back to agent:backlog so pollBacklog picks them up on the next cycle.
- */
-async function relabelReopenedIssues(
-  config: LoadedConfig,
-  registry: PluginRegistry,
-): Promise<void> {
-  for (const [, project] of Object.entries(config.projects)) {
-    if (!project.tracker?.plugin) continue;
-    const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
-    if (!tracker?.listIssues || !tracker.updateIssue) continue;
-
-    let reopened: Issue[];
-    try {
-      reopened = await tracker.listIssues(
-        { state: "open", labels: ["agent:done"], limit: 20 },
-        project,
-      );
-    } catch {
-      continue;
-    }
-
-    for (const issue of reopened) {
-      try {
-        await tracker.updateIssue(
-          issue.id,
-          {
-            labels: [BACKLOG_LABEL],
-            removeLabels: ["agent:done"],
-            comment: "Issue reopened — returning to agent backlog.",
-          },
-          project,
-        );
-        console.log(`[backlog] Relabeled reopened issue ${issue.id} → ${BACKLOG_LABEL}`);
-      } catch (err) {
-        console.error(`[backlog] Failed to relabel reopened issue ${issue.id}:`, err);
-      }
-    }
-  }
-}
-
+/** Run a single backlog poll cycle. */
 export async function pollBacklog(): Promise<void> {
-  try {
-    const { config, registry, sessionManager } = await getServices();
-
-    // Get all sessions
-    const allSessions = await sessionManager.list();
-    // Label issues for verification when PRs are merged
-    await labelIssuesForVerification(allSessions, config, registry);
-
-    // Detect reopened issues: open state + agent:done label → relabel as agent:backlog
-    await relabelReopenedIssues(config, registry);
-
-    const allSessionPrefixes = Object.entries(config.projects).map(
-      ([id, p]) => p.sessionPrefix ?? id,
-    );
-    const workerSessions = allSessions.filter(
-      (session) =>
-        !isOrchestratorSession(
-          session,
-          config.projects[session.projectId]?.sessionPrefix ?? session.projectId,
-          allSessionPrefixes,
-        ) && !TERMINAL_STATUSES.has(session.status),
-    );
-    const activeIssueIds = new Set(
-      workerSessions
-        .map((session) => session.issueId?.toLowerCase())
-        .filter((issueId): issueId is string => Boolean(issueId)),
-    );
-
-    // Auto-scaling: respect max concurrent agents
-    let availableSlots = MAX_CONCURRENT_AGENTS - workerSessions.length;
-    if (availableSlots <= 0) return; // At capacity
-
-    for (const [projectId, project] of Object.entries(config.projects)) {
-      if (availableSlots <= 0) break;
-      if (!project.tracker?.plugin) continue;
-
-      const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
-      if (!tracker?.listIssues) continue;
-
-      let backlogIssues: Issue[];
-      try {
-        backlogIssues = await tracker.listIssues(
-          { state: "open", labels: [BACKLOG_LABEL], limit: 10 },
-          project,
-        );
-      } catch {
-        continue; // Tracker unavailable — skip this project
-      }
-
-      for (const issue of backlogIssues) {
-        if (availableSlots <= 0) break;
-
-        // Skip if already being worked on
-        if (activeIssueIds.has(issue.id.toLowerCase())) continue;
-
-        try {
-          await sessionManager.spawn({ projectId, issueId: issue.id });
-          availableSlots--;
-
-          activeIssueIds.add(issue.id.toLowerCase());
-
-          // Mark as claimed on the tracker
-          if (tracker.updateIssue) {
-            await tracker.updateIssue(
-              issue.id,
-              {
-                labels: ["agent:in-progress"],
-                removeLabels: ["agent:backlog"],
-                comment: "Claimed by agent orchestrator — session spawned.",
-              },
-              project,
-            );
-          }
-        } catch (err) {
-          console.error(`[backlog] Failed to spawn session for issue ${issue.id}:`, err);
-        }
-      }
-    }
-  } catch (err) {
-    console.error("[backlog] Poll failed:", err);
-  }
+  await getBacklogPoller().pollOnce();
 }
 
 /** Get backlog issues across all projects (for dashboard display). */

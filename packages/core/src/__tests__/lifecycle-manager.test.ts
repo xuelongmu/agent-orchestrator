@@ -4230,6 +4230,60 @@ describe("pollAll terminal status accounting", () => {
     lm.stop();
   });
 
+  it("honors a per-project all-complete reaction override on a scoped worker", async () => {
+    const notifier = createMockNotifier();
+    const registryWithNotifier: PluginRegistry = {
+      ...mockRegistry,
+      get: vi.fn().mockImplementation((slot: string, name: string) => {
+        if (slot === "runtime") return plugins.runtime;
+        if (slot === "agent") return plugins.agent;
+        if (slot === "notifier" && name === "desktop") return notifier;
+        return null;
+      }),
+    };
+
+    const terminalSessions = [
+      makeSession({ id: "s-1", status: "done" as SessionStatus }),
+      makeSession({ id: "s-2", status: "merged" as SessionStatus }),
+    ];
+    vi.mocked(mockSessionManager.list).mockResolvedValue(terminalSessions);
+
+    config.notificationRouting.info = ["desktop"];
+    // Top-level all-complete WOULD fire (notify), but the per-project override
+    // disables it (auto:false + non-notify action). A scoped worker must consult
+    // the project's reaction override, not the global top-level reaction.
+    config.reactions = { "all-complete": { auto: true, action: "notify" } };
+    config.projects["my-app"] = {
+      ...config.projects["my-app"],
+      reactions: { "all-complete": { auto: false, action: "send-to-agent" } },
+    };
+
+    const lm = createLifecycleManager({
+      config,
+      registry: registryWithNotifier,
+      sessionManager: mockSessionManager,
+      projectId: "my-app",
+    });
+
+    lm.start(60_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const allCompleteNotifications = vi
+      .mocked(notifier.notify)
+      .mock.calls.filter((call: unknown[]) => {
+        const event = call[0] as Record<string, unknown> | undefined;
+        const data = event?.data as Record<string, unknown> | undefined;
+        const reaction =
+          data?.reaction && typeof data.reaction === "object"
+            ? (data.reaction as Record<string, unknown>)
+            : null;
+        return event?.type === "reaction.triggered" && reaction?.key === "all-complete";
+      });
+    expect(allCompleteNotifications).toHaveLength(0);
+
+    lm.stop();
+  });
+
   it("does not fire all-complete when a session is in non-terminal status like done is missing", async () => {
     const notifier = createMockNotifier();
     const registryWithNotifier: PluginRegistry = {
@@ -4771,6 +4825,35 @@ describe("auto-cleanup on merge (#1309)", () => {
       session: makeSession({ status: "approved", pr: makePR(), activity: "idle" }),
       registry,
       configOverride: configWithLifecycle({ autoCleanupOnMerge: false }),
+    });
+
+    await lm.check("app-1");
+
+    expect(mockSessionManager.kill).not.toHaveBeenCalled();
+    expect(lm.getStates().get("app-1")).toBe("merged");
+  });
+
+  it("merges a partial per-project lifecycle override over the top-level (keeps cleanup disabled)", async () => {
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mergedScm(),
+    });
+    // Top-level disables cleanup; the project overrides ONLY the grace window.
+    // The field-merge must keep autoCleanupOnMerge:false rather than letting the
+    // partial override re-enable cleanup.
+    const base = configWithLifecycle({ autoCleanupOnMerge: false });
+    const configOverride: OrchestratorConfig = {
+      ...base,
+      projects: {
+        ...base.projects,
+        "my-app": { ...base.projects["my-app"], lifecycle: { mergeCleanupIdleGraceMs: 600_000 } },
+      },
+    };
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "approved", pr: makePR(), activity: "idle" }),
+      registry,
+      configOverride,
     });
 
     await lm.check("app-1");

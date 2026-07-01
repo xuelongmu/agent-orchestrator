@@ -15,12 +15,21 @@ export interface BudgetBreach {
 /**
  * Resolve the effective budget caps for a project: per-project config wins over
  * the global default. A field left undefined falls back to the global default.
+ *
+ * Exception: a carried startup-only project (its `sourceConfigPath` is set, i.e.
+ * its definition was merged in from a different config than the scope's global
+ * top-level) does NOT inherit the merged scope's global `budget`. Its caps were
+ * baked from its own startup config — if that config sets no cap, the project is
+ * intentionally uncapped and must not be paused by an unrelated global budget.
  */
 export function resolveBudget(config: OrchestratorConfig, projectId: string): BudgetConfig {
   const project = config.projects[projectId];
+  const inheritGlobal = !project?.sourceConfigPath;
   return {
-    perSessionUsd: project?.budget?.perSessionUsd ?? config.budget?.perSessionUsd,
-    perProjectUsd: project?.budget?.perProjectUsd ?? config.budget?.perProjectUsd,
+    perSessionUsd:
+      project?.budget?.perSessionUsd ?? (inheritGlobal ? config.budget?.perSessionUsd : undefined),
+    perProjectUsd:
+      project?.budget?.perProjectUsd ?? (inheritGlobal ? config.budget?.perProjectUsd : undefined),
   };
 }
 

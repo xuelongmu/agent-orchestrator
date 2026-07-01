@@ -107,8 +107,19 @@ function collectNotifierRegistrations(
   const routingNotifiers = Object.values(config.notificationRouting ?? {}).flatMap((value) =>
     Array.isArray(value) ? value : [],
   );
+  // Per-project routing can reference a notifier name not present in the
+  // top-level routing/defaults; include those so it's registered with its config
+  // (and configPath) instead of falling back to create(undefined) and dropping
+  // the project-scoped notification.
+  const projectRoutingNotifiers = Object.values(config.projects ?? {}).flatMap((project) =>
+    Object.values(project?.notificationRouting ?? {}).flatMap((value) =>
+      Array.isArray(value) ? value : [],
+    ),
+  );
   const isReferencedByName =
-    defaultNotifiers.includes(pluginName) || routingNotifiers.includes(pluginName);
+    defaultNotifiers.includes(pluginName) ||
+    routingNotifiers.includes(pluginName) ||
+    projectRoutingNotifiers.includes(pluginName);
 
   const exactMatch = config.notifiers?.[pluginName];
   if (
@@ -189,7 +200,11 @@ function prepareConfig(
 
   // Strip loading metadata fields (plugin, package, path) from config passed to plugin.
   const { plugin: _plugin, package: _package, path: _path, ...rest } = rawConfig;
-  return configPath ? { ...rest, configPath } : rest;
+  // Prefer an explicit `configPath` on the entry (e.g. a carried startup-only
+  // notifier baked with its startup config path so its dashboard notifications
+  // land in the right store) over the top-level one.
+  const resolvedConfigPath = (rest.configPath as string | undefined) ?? configPath;
+  return resolvedConfigPath !== undefined ? { ...rest, configPath: resolvedConfigPath } : rest;
 }
 
 /**
@@ -529,6 +544,17 @@ export function createPluginRegistry(): PluginRegistry {
       const doImport = importFn ?? ((pkg: string) => import(/* webpackIgnore: true */ pkg));
       // Build index once for O(1) lookups when matching plugins to external entries
       const externalIndex = buildExternalPluginIndex(config._externalPluginEntries);
+      // Track which specifier registered each resolved `slot:manifest.name`. An
+      // inline external plugin declared without an explicit `plugin` carries only a
+      // temporary basename at merge time, so a merge-time collision check can't see
+      // it. If two DIFFERENT declared plugins import to the same final manifest
+      // name, the merged config is ambiguous: `updateConfigWithManifestName` has
+      // already rewritten each project's reference to that name, so silently
+      // keeping either implementation would make some project poll/spawn/update
+      // through the wrong plugin. Collect such collisions and FAIL loudly after
+      // the load rather than picking one.
+      const registeredBySpecifier = new Map<string, string>();
+      const nameCollisions: string[] = [];
 
       for (const plugin of config.plugins ?? []) {
         if (plugin.enabled === false) continue;
@@ -594,6 +620,33 @@ export function createPluginRegistry(): PluginRegistry {
             }
           }
 
+          // Post-import collision guard: if a DIFFERENT declared plugin already
+          // registered this `slot:manifest.name`, the merged config is ambiguous.
+          // Record it (don't overwrite the first) and fail after the load.
+          const manifestKey = makeKey(mod.manifest.slot, mod.manifest.name);
+          const priorSpecifier = registeredBySpecifier.get(manifestKey);
+          if (priorSpecifier !== undefined && priorSpecifier !== specifier) {
+            const detail = `"${manifestKey}" (${priorSpecifier} vs ${specifier})`;
+            process.stderr.write(
+              `[plugin-registry] Plugin name collision for ${detail} — two plugins resolve to the same manifest name.\n`,
+            );
+            recordActivityEvent({
+              source: "plugin-registry",
+              kind: "plugin-registry.name_collision",
+              level: "error",
+              summary: `plugin name collision for ${manifestKey}`,
+              data: {
+                manifestKey,
+                keptSpecifier: priorSpecifier,
+                conflictingSpecifier: specifier,
+                plugin: plugin.name,
+              },
+            });
+            nameCollisions.push(detail);
+            continue;
+          }
+          registeredBySpecifier.set(manifestKey, specifier);
+
           if (mod.manifest.slot === "notifier") {
             registerNotifier(mod, config, true);
           } else {
@@ -618,6 +671,14 @@ export function createPluginRegistry(): PluginRegistry {
             },
           });
         }
+      }
+
+      if (nameCollisions.length > 0) {
+        throw new Error(
+          `Plugin name collision in merged config: ${nameCollisions.join("; ")}. ` +
+            `Two plugins resolve to the same manifest name, so projects can't unambiguously ` +
+            `select one. Rename one of the colliding plugins before launching ao start.`,
+        );
       }
     },
   };

@@ -166,6 +166,14 @@ vi.mock("../../src/lib/create-session-manager.js", () => ({
   getSessionManager: async (): Promise<SessionManager> => mockSessionManager as SessionManager,
 }));
 
+// Stub the backlog poller so start tests never load its real implementation (which
+// imports getPluginRegistry from create-session-manager — only partially mocked
+// above — and would start a real poll timer with side effects on mockSessionManager).
+vi.mock("../../src/lib/backlog-service.js", () => ({
+  startBacklogPoller: vi.fn(),
+  stopBacklogPoller: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../../src/lib/lifecycle-service.js", () => ({
   stopAllLifecycleWorkers: vi.fn(),
   listLifecycleWorkers: () => ["my-app"],
@@ -1553,6 +1561,72 @@ describe("start command — orchestrator session strategy display", () => {
 
     // Should have killed the dashboard
     expect(fakeDashboard.kill).toHaveBeenCalled();
+  });
+
+  it("tears down the orchestrator when the project supervisor fails to start", async () => {
+    // The supervisor builds the merged daemon scope and can abort (e.g. a
+    // sessionPrefix collision between the startup config and the global registry)
+    // AFTER the orchestrator was created — that session must be torn down.
+    mockConfigRef.current = makeConfig({ "my-app": makeProject() });
+    mockSessionManager.get.mockResolvedValue(null);
+    mockSessionManager.spawnOrchestrator.mockResolvedValue({ id: "app-orchestrator" });
+    mockStartProjectSupervisor.mockRejectedValue(
+      new Error("Session prefix collision in merged scope"),
+    );
+
+    await expect(
+      program.parseAsync(["node", "test", "start", "--no-dashboard"]),
+    ).rejects.toThrow("process.exit(1)");
+
+    expect(mockSessionManager.kill).toHaveBeenCalledWith("app-orchestrator");
+  });
+
+  it("does not tear down a REUSED orchestrator when the supervisor fails to start", async () => {
+    // ensureOrchestrator reuses a pre-existing session (before non-null, not
+    // restored). A later supervisor failure must NOT kill it — this startup
+    // didn't create it.
+    mockConfigRef.current = makeConfig({ "my-app": makeProject() });
+    mockSessionManager.get.mockResolvedValue({
+      id: "app-orchestrator",
+      projectId: "my-app",
+      status: "working",
+      activity: "active",
+      metadata: { role: "orchestrator" },
+    });
+    mockStartProjectSupervisor.mockRejectedValue(
+      new Error("Session prefix collision in merged scope"),
+    );
+
+    await expect(
+      program.parseAsync(["node", "test", "start", "--no-dashboard"]),
+    ).rejects.toThrow("process.exit(1)");
+
+    expect(mockSessionManager.kill).not.toHaveBeenCalled();
+  });
+
+  it("does not tear down a REUSED orchestrator that carries a STALE restoredAt", async () => {
+    // The session was restored during an EARLIER `ao start`, so its metadata still
+    // has a `restoredAt` timestamp. This startup merely REUSES the already-running
+    // session (before === returned, same restoredAt) — keying off Boolean(restoredAt)
+    // alone would misread it as a restore and kill it when the supervisor fails.
+    mockConfigRef.current = makeConfig({ "my-app": makeProject() });
+    mockSessionManager.get.mockResolvedValue({
+      id: "app-orchestrator",
+      projectId: "my-app",
+      status: "working",
+      activity: "active",
+      metadata: { role: "orchestrator" },
+      restoredAt: new Date("2020-01-01T00:00:00Z"), // stale — from a prior start
+    });
+    mockStartProjectSupervisor.mockRejectedValue(
+      new Error("Session prefix collision in merged scope"),
+    );
+
+    await expect(
+      program.parseAsync(["node", "test", "start", "--no-dashboard"]),
+    ).rejects.toThrow("process.exit(1)");
+
+    expect(mockSessionManager.kill).not.toHaveBeenCalled();
   });
 
   it("reports startup lock acquisition failures through the normal CLI error path", async () => {
