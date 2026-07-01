@@ -1,5 +1,15 @@
 # @aoagents/ao-plugin-agent-opencode
 
+## 0.10.0
+
+### Patch Changes
+
+- Updated dependencies [669ed4c]
+- Updated dependencies [1b9718a]
+- Updated dependencies [2d456c4]
+- Updated dependencies [c0ef32c]
+  - @aoagents/ao-core@0.10.0
+
 ## 0.9.3
 
 ### Patch Changes

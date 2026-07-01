@@ -1,5 +1,12 @@
 # @aoagents/ao
 
+## 0.10.0
+
+### Patch Changes
+
+- Updated dependencies [669ed4c]
+  - @aoagents/ao-cli@0.10.0
+
 ## 0.9.3
 
 ### Patch Changes

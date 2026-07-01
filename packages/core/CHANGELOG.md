@@ -1,5 +1,83 @@
 # @aoagents/ao-core
 
+## 0.10.0
+
+### Minor Changes
+
+- 669ed4c: feat(cli,core): `ao plan` — decompose a goal into linked tickets with an approval gate
+
+  Add a planner that turns a high-level goal into a reviewable DAG of linked
+  tickets and only creates them after human approval:
+  - `ao plan "<goal>" [--project <id>] [--yes] [--json]` runs a decomposer agent
+    headlessly (read-only), parses and validates the structured plan (unique refs,
+    resolvable relations, acyclic), renders it for review, and — on confirmation —
+    bulk-creates the tickets via the tracker in topological order so blocking and
+    parent relations resolve to real issue numbers. Per-ticket `repo` overrides
+    route tickets to the correct repository.
+  - New `core` planner module: `parsePlan`, `validatePlanGraph`, `topoSortPlan`,
+    `createPlanTickets`, `decomposeGoal`, plus codex/claude headless runners and a
+    `decomposer` agent resolver. The runner is injectable for tests and alternative
+    agents.
+  - Wires the previously-unused `decomposer` config field (`decomposer.agent`,
+    falling back to the orchestrator/worker/default agent) and documents it in
+    `ao config-help`.
+  - Teaches the orchestrator prompt when and how to decompose goals with `ao plan`.
+  - GitHub and GitLab trackers now render and parse repo-qualified cross-repo
+    relation markers (`owner/repo#N`) in issue bodies, which `ao plan` relies on for
+    cross-repo blocker ordering. Both tracker packages are bumped so a released CLI
+    ships the matching tracker behavior.
+
+- 1b9718a: feat(core): dependency-aware scheduler + spawn-session reaction (cross-repo ordering)
+
+  Automatically unblock and launch dependent sessions when their prerequisite work
+  merges — including across repos/projects, the keystone for "backend API merges →
+  start the frontend ticket":
+  - The lifecycle manager runs a dependency scheduler pass each poll over the full
+    session set. When a prerequisite session's PR is merged, it narrows every held
+    dependent's `blockedBy` (persisting immediately so progress survives the
+    prerequisite's post-merge cleanup and an AO restart) and launches a dependent
+    once all of its prerequisites are satisfied. Because the unscoped supervisor
+    lists sessions across every project, a backend repo merge can unblock a
+    frontend repo session.
+  - A dependent with multiple prerequisites stays blocked until all of them merge.
+  - Launches respect a new per-project `maxConcurrent` cap (orchestrators
+    excluded); held sessions whose prerequisites are satisfied wait until the
+    project is under the cap.
+  - `SessionManager` gains `unblock(sessionId)`, which launches a previously-held
+    session reusing its reserved id and branch (so the branch still auto-links to
+    the issue tracker). It is idempotent — a non-held record is returned unchanged.
+  - New `spawn-session` reaction action (on `ReactionConfig.action`) triggers a
+    scheduler pass on demand.
+
+- 2d456c4: feat(core,tracker): model parent/child + blocking relations
+
+  Extend the tracker contract with issue hierarchy and dependency relations:
+  - `CreateIssueInput` gains `parentId`, `blockedBy`, and `relatedTo`.
+  - `Issue` gains `parentId`, `children`, `blockedBy`, `blocks`, and `relatedTo`.
+  - Linear sets the parent on create, creates `blocks`/`related` relations via
+    `issueRelationCreate`, and returns hierarchy + relations from `getIssue`.
+  - GitHub and GitLab emulate relations (best-effort) via a body convention
+    (`Part of #N` / `Blocked by #N` / `Related to #N`) that round-trips through
+    `getIssue`.
+
+- c0ef32c: feat(core): model session dependencies (dependsOn/blockedBy) and a blocked pre-state
+
+  Represent prerequisites on sessions so a scheduler can hold dependent work until
+  its prerequisites resolve:
+  - `Session`, `SessionSpawnConfig`, and `SessionMetadata` gain `dependsOn` and
+    `blockedBy` (session and/or issue ids). They persist as comma-separated ids
+    and survive restart.
+  - At spawn time, `dependsOn` is the union of the explicit config and the
+    tracker's blocking relations (`Issue.blockedBy`, from #7); `blockedBy`
+    defaults to the full set.
+  - A new `blocked_by_dependency` canonical session reason (on the existing
+    `not_started` state) marks held sessions. `isBlockedByDependency()` is
+    exported for consumers.
+  - When a session has unresolved prerequisites, `spawn()` records it as blocked
+    and does **not** start work — no workspace, runtime, or agent launch. The
+    lifecycle manager leaves the blocked pre-state untouched so it is never
+    promoted to `working` until its prerequisites are cleared.
+
 ## 0.9.3
 
 ### Patch Changes
