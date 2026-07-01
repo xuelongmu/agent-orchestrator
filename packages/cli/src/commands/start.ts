@@ -1214,7 +1214,10 @@ async function runStartup(
   // restored sessions are still being brought back. The poller's
   // cross-process lock prevents double-spawning with the dashboard's poller.
   if (shouldStartLifecycle) {
-    startBacklogPoller(config.configPath);
+    // Pass the RESOLVED port (may differ from config.port if the requested port
+    // was busy and the dashboard fell back) so backlog-spawned sessions get
+    // AO_PORT for the daemon that actually bound, not the stale config value.
+    startBacklogPoller(config.configPath, port);
   }
 
   // Print summary

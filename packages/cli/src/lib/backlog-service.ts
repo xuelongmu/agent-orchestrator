@@ -52,13 +52,21 @@ function loadBacklogConfig(configPath?: string): OrchestratorConfig {
  *
  * @param configPath Resolved config path from the caller (used as the
  *   local fallback source when the global config is missing).
+ * @param resolvedPort The port the daemon ACTUALLY bound. When the requested
+ *   port is busy, `ao start` falls back to a free one but the config file still
+ *   records the original value; spawned backlog sessions must inherit `AO_PORT`
+ *   for the port the dashboard actually bound, not the stale requested value the
+ *   reloaded config carries.
  */
-export function startBacklogPoller(configPath?: string): void {
+export function startBacklogPoller(configPath?: string, resolvedPort?: number): void {
   if (activePoller) return;
 
   activePoller = createBacklogPoller({
     resolveServices: async (): Promise<BacklogServices> => {
       const config = loadBacklogConfig(configPath);
+      // Override the reloaded config's port with the port the daemon actually
+      // bound (applied every cycle since the config is re-read each poll).
+      if (resolvedPort !== undefined) config.port = resolvedPort;
       const registry = await getPluginRegistry(config);
       const sessionManager = await getSessionManager(config);
       return { config, registry, sessionManager };
