@@ -977,6 +977,53 @@ describe("backlog poller", () => {
     expect(harness.spawn).not.toHaveBeenCalled();
   });
 
+  it("does not spawn from a read-only tracker that cannot updateIssue", async () => {
+    // A tracker that supports listIssues but not updateIssue can never claim an
+    // issue (drop agent:backlog on spawn) or label a merged/reopened one, so it
+    // would re-spawn the same agent:backlog issues — including already-merged
+    // work — every poll. Backlog automation requires a writable tracker.
+    const issue = { ...makeIssue("42"), labels: ["agent:backlog"] } as Issue;
+    const listIssues = vi.fn(async (filters: { labels?: string[] }) =>
+      filters.labels?.length === 1 && filters.labels[0] === "agent:backlog" ? [issue] : [],
+    );
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const kill = vi.fn(async () => ({ cleaned: true, alreadyTerminated: false }));
+    // No `updateIssue` on this tracker.
+    const tracker = { name: "readonly", listIssues, getIssue, issueUrl: issueUrlFor };
+
+    const services: BacklogServices = {
+      config: {
+        projects: {
+          proj: {
+            name: "proj",
+            path: "/tmp/proj",
+            defaultBranch: "main",
+            sessionPrefix: "ao",
+            tracker: { plugin: "readonly" },
+          },
+        },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => []),
+        spawn,
+        kill,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("aborts pending spawns when stop() is called mid-poll", async () => {
     // A poll stuck in a slow `sessionManager.list()` (or tracker call) that
     // resumes after shutdown began must not spawn a worker the graceful-stop

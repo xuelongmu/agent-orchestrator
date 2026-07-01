@@ -360,6 +360,38 @@ function mergeScopeProjects(
       : notifier;
   }
 
+  // Also scope IMPLICIT notifier aliases (no `notifiers:` entry in either config —
+  // e.g. the built-in `dashboard` reached via `defaults.notifiers` or a project's
+  // `notificationRouting`) that a carried project routes to. Without an entry the
+  // registry instantiates them with the merged (global) `configPath`, so the
+  // carried project's dashboard notifications land in the global store where the
+  // startup dashboard UI never reads them. Bake a startup-scoped entry so they land
+  // in the startup store. Skip any alias the GLOBAL scope also uses — one notifier
+  // registration can't serve two stores, and (as with explicit collisions above)
+  // the global definition governs the global projects.
+  const globalReferencedAliases = new Set<string>([
+    ...(Array.isArray(globalConfig.defaults?.notifiers) ? globalConfig.defaults.notifiers : []),
+    ...Object.values(globalConfig.notificationRouting ?? {}).flatMap((v) =>
+      Array.isArray(v) ? v : [],
+    ),
+    ...Object.values(globalConfig.projects ?? {}).flatMap((project) =>
+      Object.values(project?.notificationRouting ?? {}).flatMap((v) => (Array.isArray(v) ? v : [])),
+    ),
+  ]);
+  for (const id of carriedProjectIds) {
+    const routing = projects[id].notificationRouting;
+    if (!routing) continue;
+    for (const aliases of Object.values(routing)) {
+      for (const alias of aliases) {
+        if (alias in startupNotifiers) continue; // explicit startup entry handled above
+        if (alias in globalNotifiers) continue; // explicit global definition wins
+        if (globalReferencedAliases.has(alias)) continue; // shared with global → global store
+        if (alias in bakedStartupNotifiers) continue; // already baked this pass
+        bakedStartupNotifiers[alias] = { plugin: alias, configPath: startupConfig.configPath };
+      }
+    }
+  }
+
   return {
     ...globalConfig,
     projects,

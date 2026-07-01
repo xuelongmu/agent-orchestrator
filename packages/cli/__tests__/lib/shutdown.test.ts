@@ -21,6 +21,7 @@ const {
   mockStopAllLifecycleWorkers,
   mockStopBacklogPoller,
   mockLoadConfig,
+  mockLoadMergedScopeConfig,
   mockIsTerminalSession,
 } = vi.hoisted(() => ({
   mockListSessions: vi.fn(),
@@ -33,6 +34,7 @@ const {
   mockStopAllLifecycleWorkers: vi.fn(),
   mockStopBacklogPoller: vi.fn(),
   mockLoadConfig: vi.fn(),
+  mockLoadMergedScopeConfig: vi.fn(),
   mockIsTerminalSession: vi.fn(),
 }));
 
@@ -46,6 +48,10 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
     recordActivityEvent: vi.fn(),
   };
 });
+
+vi.mock("../../src/lib/config-scope.js", () => ({
+  loadMergedScopeConfig: (...args: unknown[]) => mockLoadMergedScopeConfig(...args),
+}));
 
 vi.mock("../../src/lib/create-session-manager.js", () => ({
   getSessionManager: (...args: unknown[]) => mockGetSessionManager(...args),
@@ -100,12 +106,14 @@ describe("shutdown handlers — activity events", () => {
     mockStopAllLifecycleWorkers.mockReset();
     mockStopBacklogPoller.mockReset();
     mockLoadConfig.mockReset();
+    mockLoadMergedScopeConfig.mockReset();
     mockIsTerminalSession.mockReset();
 
     // Default: no in-flight poll — stop resolves immediately.
     mockStopBacklogPoller.mockResolvedValue(undefined);
 
     mockLoadConfig.mockReturnValue({ projects: {} });
+    mockLoadMergedScopeConfig.mockReturnValue({ projects: {} });
     mockIsTerminalSession.mockReturnValue(false);
     mockGetSessionManager.mockResolvedValue({
       list: mockListSessions,
@@ -236,6 +244,42 @@ describe("shutdown handlers — activity events", () => {
         source: "cli",
         projectId: "p1",
       }),
+    );
+    expect(events.filter((e) => e.kind === "cli.shutdown_failed")).toHaveLength(0);
+  });
+
+  it("falls back to the base config and still kills sessions when the merged scope fails to load", async () => {
+    const { installShutdownHandlers } = await import("../../src/lib/shutdown.js");
+    // Config drift while the daemon ran (corrupt global registry, prefix/notifier
+    // collision) makes the merged scope unbuildable. Shutdown must fall back to the
+    // plain config so sessions are still killed instead of throwing to the outer
+    // catch (shutdown_failed) and leaving managed runtimes running.
+    mockLoadMergedScopeConfig.mockImplementation(() => {
+      throw new Error("merged scope boom");
+    });
+    mockLoadConfig.mockReturnValue({ projects: {} });
+    mockListSessions.mockResolvedValue([{ id: "s1", projectId: "p1", status: "working" }]);
+
+    installShutdownHandlers({ configPath: "/tmp/cfg.yaml", projectId: "p1" });
+
+    process.emit("SIGTERM", "SIGTERM");
+    await flushAsync();
+
+    // Fell back to the base config, killed the session, and completed cleanly.
+    expect(mockLoadConfig).toHaveBeenCalledWith("/tmp/cfg.yaml");
+    expect(mockKillSession).toHaveBeenCalledWith("s1");
+
+    const events = recordedEvents();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "cli.shutdown_merged_scope_fallback",
+        source: "cli",
+        level: "warn",
+        data: expect.objectContaining({ errorMessage: "merged scope boom" }),
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({ kind: "cli.shutdown_completed", projectId: "p1" }),
     );
     expect(events.filter((e) => e.kind === "cli.shutdown_failed")).toHaveLength(0);
   });

@@ -467,6 +467,57 @@ describe("loadMergedScopeConfig", () => {
     });
   });
 
+  it("bakes an IMPLICIT dashboard notifier (no notifiers: entry) with the startup configPath", () => {
+    // A startup-only project relying on defaults.notifiers: [dashboard] carries a
+    // baked notificationRouting to `dashboard`, but neither config declares a
+    // `notifiers:` entry for it. Without baking, the registry would create the
+    // implicit dashboard notifier with the global configPath and the carried
+    // project's notifications would land in the global store, invisible to the
+    // startup dashboard UI.
+    const startup = {
+      configPath: STARTUP,
+      defaults: { ...startupDefaults, notifiers: ["dashboard"] },
+      projects: { local: project("local", "l") },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: { ...globalDefaults, notifiers: ["desktop"] },
+      projects: { reg: project("reg", "r") },
+      notifiers: {},
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    expect(merged.notifiers.dashboard).toEqual({
+      plugin: "dashboard",
+      configPath: STARTUP,
+    });
+  });
+
+  it("does NOT re-scope an implicit notifier the global scope also uses", () => {
+    // When a GLOBAL project also routes to `dashboard`, one registration can't
+    // serve two stores — the global definition governs, so we must not bake a
+    // startup-scoped entry that would divert global notifications.
+    const startup = {
+      configPath: STARTUP,
+      defaults: { ...startupDefaults, notifiers: ["dashboard"] },
+      projects: { local: project("local", "l") },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: { ...globalDefaults, notifiers: ["dashboard"] },
+      projects: { reg: project("reg", "r") },
+      notifiers: {},
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    // No startup-scoped dashboard entry synthesized — left implicit (global store).
+    expect(merged.notifiers.dashboard).toBeUndefined();
+  });
+
   it("keeps both same-name/different-identity plugins (collision deferred to the registry)", () => {
     // config.plugins entries carry no slot, and the registry keys instances by
     // slot:manifest.name — so a same-name clash isn't necessarily a real collision

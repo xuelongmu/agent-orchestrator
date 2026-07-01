@@ -18,6 +18,7 @@ import {
   futimesSync,
   mkdirSync,
   openSync,
+  readFileSync,
   renameSync,
   rmSync,
   statSync,
@@ -177,9 +178,18 @@ function makeLockHandle(fd: number, lockPath: string): LockHandle {
         // Ignore cleanup races.
       }
       try {
-        rmSync(lockPath, { force: true });
+        // Only unlink the lock file if it's still OURS. If this poller was paused
+        // past LOCK_STALE_MS (laptop sleep, debugger, long stall), a peer may have
+        // reclaimed the stale lock and created its own fresh file at `lockPath`.
+        // An unconditional unlink would delete the peer's live lock and let a third
+        // poller enter mid-cycle → double spawn. The file records the holder's pid
+        // (written at acquire), so a mismatch means a peer owns it now — leave it.
+        const current = readFileSync(lockPath, "utf8").trim();
+        if (current === String(process.pid)) {
+          rmSync(lockPath, { force: true });
+        }
       } catch {
-        // Best-effort cleanup.
+        // File gone or unreadable — nothing to clean up.
       }
     },
   };
@@ -644,6 +654,12 @@ async function spawnFromBacklog(
 
     const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
     if (!tracker?.listIssues) continue;
+    // A tracker that can't `updateIssue` can never claim an issue (drop
+    // `agent:backlog` on spawn), label a merged issue for verification, or
+    // relabel a reopened one — so every poll it would re-spawn the same
+    // `agent:backlog` issues, including work whose PR already merged. Backlog
+    // automation requires a writable tracker; skip spawning for read-only ones.
+    if (!tracker.updateIssue) continue;
 
     const activeIssueIds = new Set(
       projectWorkers

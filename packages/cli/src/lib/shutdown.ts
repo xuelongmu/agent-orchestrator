@@ -15,6 +15,7 @@
 import {
   isBlockedByDependency,
   isTerminalSession,
+  loadConfig,
   markDaemonShutdownHandlerInstalled,
   recordActivityEvent,
   sweepDaemonChildren,
@@ -140,7 +141,26 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
             data: { signal, timeoutMs: BACKLOG_DRAIN_TIMEOUT_MS },
           });
         }
-        const shutdownConfig = loadMergedScopeConfig(ctx.configPath);
+        // Best-effort like the restore path (start.ts): if the merged scope can't
+        // be built — a corrupt global registry, or a project/sessionPrefix/notifier
+        // collision introduced while the daemon ran — fall back to the plain config
+        // so we still enumerate and kill THIS daemon's sessions, write last-stop,
+        // sweep children, and unregister. Throwing to the outer catch here would
+        // record `cli.shutdown_failed` and exit with managed runtimes still running.
+        let shutdownConfig;
+        try {
+          shutdownConfig = loadMergedScopeConfig(ctx.configPath);
+        } catch (err) {
+          recordActivityEvent({
+            projectId: ctx.projectId,
+            source: "cli",
+            kind: "cli.shutdown_merged_scope_fallback",
+            level: "warn",
+            summary: `merged shutdown scope failed to load; falling back to base config`,
+            data: { errorMessage: err instanceof Error ? err.message : String(err) },
+          });
+          shutdownConfig = loadConfig(ctx.configPath);
+        }
         const sm = await getSessionManager(shutdownConfig);
 
         // Every session killed across one or two enumeration passes, keyed by id
