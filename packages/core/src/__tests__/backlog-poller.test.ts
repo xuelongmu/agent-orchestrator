@@ -901,6 +901,59 @@ describe("backlog poller", () => {
     );
   });
 
+  it("does not re-queue a verification-failed issue that was NOT re-backlogged (OR-filter tracker)", async () => {
+    // Linear's multi-label filter is OR (matches at least one label), not AND, so
+    // the [verification-failed, agent:backlog] re-queue scan returns bare
+    // `verification-failed` issues too. An issue a human deliberately failed and
+    // did NOT re-backlog must stay put — require BOTH labels client-side.
+    const issue = {
+      ...makeIssue("42"),
+      labels: ["verification-failed"], // no agent:backlog — human left it failed
+    } as Issue;
+    const listIssues = vi.fn(async (filters: { labels?: string[] }) =>
+      // OR-filter tracker: returns the issue for any scan mentioning one of its labels.
+      filters.labels?.includes("verification-failed") ? [issue] : [],
+    );
+    const updateIssue = vi.fn(async () => undefined);
+    const getIssue = vi.fn(async (id: string) => ({ ...makeIssue(id), labels: [] }));
+    const spawn = vi.fn(async () => ({ id: "spawned" }));
+    const kill = vi.fn(async () => ({ cleaned: true, alreadyTerminated: false }));
+    const tracker = { name: "linear", listIssues, updateIssue, getIssue, issueUrl: issueUrlFor };
+
+    const services: BacklogServices = {
+      config: {
+        projects: {
+          proj: {
+            name: "proj",
+            path: "/tmp/proj",
+            defaultBranch: "main",
+            sessionPrefix: "ao",
+            tracker: { plugin: "linear" },
+          },
+        },
+      } as unknown as BacklogServices["config"],
+      registry: {
+        get: vi.fn((slot: string) => (slot === "tracker" ? tracker : null)),
+      } as unknown as BacklogServices["registry"],
+      sessionManager: {
+        list: vi.fn(async () => []),
+        spawn,
+        kill,
+      } as unknown as BacklogServices["sessionManager"],
+    };
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    // Not both labels → never relabeled back to the backlog, never spawned.
+    expect(updateIssue).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("does not respawn a backlog issue that is awaiting verification", async () => {
     // On trackers whose updateIssue ignores removeLabels (Linear, GitLab), a
     // merged issue keeps `agent:backlog` alongside `merged-unverified`. Its

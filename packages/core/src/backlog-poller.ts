@@ -502,7 +502,17 @@ async function relabelReopenedIssues(
         { state: "open", labels: ["verification-failed", BACKLOG_LABEL], limit: 20 },
         project,
       );
-      for (const issue of requeued) reopenedById.set(issue.id, issue);
+      // Don't trust the tracker's multi-label filter to mean AND. GitHub AND-filters,
+      // but Linear's label filter is OR (matches at least one), so a bare
+      // `verification-failed` issue a human deliberately failed and did NOT
+      // re-backlog would slip through and get re-spawned. Require BOTH labels on the
+      // issue itself so only an explicit human re-backlog (agent:backlog added
+      // alongside verification-failed) re-queues.
+      for (const issue of requeued) {
+        if (issue.labels.includes("verification-failed") && issue.labels.includes(BACKLOG_LABEL)) {
+          reopenedById.set(issue.id, issue);
+        }
+      }
     } catch {
       // Tracker error — retry next cycle.
     }
