@@ -1068,10 +1068,17 @@ async function runStartup(
             // see BOTH the startup-only project(s) and the registered ones being
             // restored. A plain global config would drop a non-registered startup
             // project, so its primary session would restore against a manager that
-            // can't see it and fail/retry forever.
+            // can't see it and fail/retry forever. Fall back to the current config
+            // if the merged scope can't be built (e.g. the global registry is
+            // unreadable) — a partial view still lets the restore loop run and
+            // attribute per-session failures rather than aborting entirely.
             let restoreConfig = config;
             if (otherProjects.length > 0 && config.configPath) {
-              restoreConfig = loadMergedScopeConfig(config.configPath);
+              try {
+                restoreConfig = loadMergedScopeConfig(config.configPath);
+              } catch {
+                restoreConfig = config;
+              }
             }
             const sm = await getSessionManager(restoreConfig);
             const restoreSpinner = ora(`Restoring ${allRestoreSessions.length} session(s)`).start();
