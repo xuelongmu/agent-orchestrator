@@ -1555,6 +1555,24 @@ describe("start command — orchestrator session strategy display", () => {
     expect(fakeDashboard.kill).toHaveBeenCalled();
   });
 
+  it("tears down the orchestrator when the project supervisor fails to start", async () => {
+    // The supervisor builds the merged daemon scope and can abort (e.g. a
+    // sessionPrefix collision between the startup config and the global registry)
+    // AFTER the orchestrator was created — that session must be torn down.
+    mockConfigRef.current = makeConfig({ "my-app": makeProject() });
+    mockSessionManager.get.mockResolvedValue(null);
+    mockSessionManager.spawnOrchestrator.mockResolvedValue({ id: "app-orchestrator" });
+    mockStartProjectSupervisor.mockRejectedValue(
+      new Error("Session prefix collision in merged scope"),
+    );
+
+    await expect(
+      program.parseAsync(["node", "test", "start", "--no-dashboard"]),
+    ).rejects.toThrow("process.exit(1)");
+
+    expect(mockSessionManager.kill).toHaveBeenCalledWith("app-orchestrator");
+  });
+
   it("reports startup lock acquisition failures through the normal CLI error path", async () => {
     mockConfigRef.current = makeConfig({ "my-app": makeProject() });
     mockAcquireStartupLock.mockRejectedValueOnce(

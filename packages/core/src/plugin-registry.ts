@@ -540,6 +540,13 @@ export function createPluginRegistry(): PluginRegistry {
       const doImport = importFn ?? ((pkg: string) => import(/* webpackIgnore: true */ pkg));
       // Build index once for O(1) lookups when matching plugins to external entries
       const externalIndex = buildExternalPluginIndex(config._externalPluginEntries);
+      // Track which specifier registered each resolved `slot:manifest.name`. An
+      // inline external plugin declared without an explicit `plugin` carries only a
+      // temporary basename at merge time, so a merge-time collision check can't see
+      // it; if two DIFFERENT declared plugins import to the same final manifest
+      // name, keep the FIRST (global plugins iterate before startup ones) so a
+      // startup plugin can't silently overwrite a registered project's implementation.
+      const registeredBySpecifier = new Map<string, string>();
 
       for (const plugin of config.plugins ?? []) {
         if (plugin.enabled === false) continue;
@@ -604,6 +611,31 @@ export function createPluginRegistry(): PluginRegistry {
               });
             }
           }
+
+          // Post-import collision guard: if a different declared plugin already
+          // registered this `slot:manifest.name`, don't let this one overwrite it.
+          const manifestKey = makeKey(mod.manifest.slot, mod.manifest.name);
+          const priorSpecifier = registeredBySpecifier.get(manifestKey);
+          if (priorSpecifier !== undefined && priorSpecifier !== specifier) {
+            process.stderr.write(
+              `[plugin-registry] Plugin name collision for "${manifestKey}": "${specifier}" ` +
+                `resolves to the same manifest name as "${priorSpecifier}" — keeping the first, skipping this one.\n`,
+            );
+            recordActivityEvent({
+              source: "plugin-registry",
+              kind: "plugin-registry.name_collision",
+              level: "error",
+              summary: `plugin name collision for ${manifestKey}`,
+              data: {
+                manifestKey,
+                keptSpecifier: priorSpecifier,
+                skippedSpecifier: specifier,
+                plugin: plugin.name,
+              },
+            });
+            continue;
+          }
+          registeredBySpecifier.set(manifestKey, specifier);
 
           if (mod.manifest.slot === "notifier") {
             registerNotifier(mod, config, true);

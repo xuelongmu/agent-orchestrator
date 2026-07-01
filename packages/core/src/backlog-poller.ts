@@ -528,17 +528,20 @@ async function spawnFromBacklog(
     (session) => isWorkerSession(session) && !TERMINAL_STATUSES.has(session.status),
   );
 
-  // Sessions occupying a concurrency slot for the per-project cap. Mirrors the
-  // dependency scheduler's countActiveSessions: non-terminal OR `merged` (a
-  // merged worker keeps a live runtime through the post-merge cleanup grace
-  // window, so it must still count — otherwise maxConcurrent:1 is exceeded the
-  // moment a PR merges but before the old agent exits), excluding held
-  // (blocked-by-dependency) sessions that own no runtime.
+  // Sessions occupying a concurrency slot for the per-project cap: non-terminal
+  // workers, PLUS `merged` workers whose runtime is still ALIVE (the post-merge
+  // cleanup grace window — counting them avoids exceeding maxConcurrent:1 the
+  // moment a PR merges but before the old agent exits). A merged session whose
+  // runtime has exited/gone — or that lingers indefinitely because merge cleanup
+  // is disabled — must NOT keep consuming a slot, or a reopened issue relabeled
+  // to agent:backlog could never spawn. Held (blocked-by-dependency) sessions own
+  // no runtime and never count.
   const slotCountByProject = new Map<string, number>();
   for (const session of allSessions) {
     if (!isWorkerSession(session)) continue;
     const occupiesSlot =
-      !TERMINAL_STATUSES.has(session.status) || session.status === "merged";
+      !TERMINAL_STATUSES.has(session.status) ||
+      (session.status === "merged" && session.lifecycle.runtime?.state === "alive");
     if (!occupiesSlot || isBlockedByDependency(session.lifecycle)) continue;
     slotCountByProject.set(session.projectId, (slotCountByProject.get(session.projectId) ?? 0) + 1);
   }

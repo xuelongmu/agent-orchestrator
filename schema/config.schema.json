@@ -386,6 +386,22 @@
         },
         "budget": {
           "$ref": "#/$defs/budgetConfig"
+        },
+        "maxConcurrentAgents": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Max concurrent worker sessions the backlog poller spawns for this project."
+        },
+        "readyThresholdMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Per-project idle/ready threshold (ms) override."
+        },
+        "notificationRouting": {
+          "$ref": "#/$defs/notificationRouting"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/lifecycleConfig"
         }
       }
     },

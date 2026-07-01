@@ -37,7 +37,11 @@ function makeWorkerSession(id: string, issueId: string, projectId = "proj"): Ses
     issueId,
     status: "working",
     metadata: {},
-    lifecycle: { session: { state: "working", reason: null }, pr: { state: "none" } },
+    lifecycle: {
+      session: { state: "working", reason: null },
+      runtime: { state: "alive" },
+      pr: { state: "none" },
+    },
   } as unknown as Session;
 }
 
@@ -48,7 +52,11 @@ function makeMergedSession(id: string, issueId: string, projectId = "proj"): Ses
     issueId,
     status: "working",
     metadata: {},
-    lifecycle: { session: { state: "working", reason: null }, pr: { state: "merged" } },
+    lifecycle: {
+      session: { state: "working", reason: null },
+      runtime: { state: "alive" },
+      pr: { state: "merged" },
+    },
   } as unknown as Session;
 }
 
@@ -1116,6 +1124,36 @@ describe("backlog poller", () => {
     await poller.pollOnce();
 
     expect(harness.spawn).not.toHaveBeenCalled();
+  });
+
+  it("does not count a merged worker whose runtime has exited against the cap", async () => {
+    // A stale merged session (runtime gone, e.g. cleanup disabled) must NOT keep
+    // consuming a slot — otherwise a reopened issue relabeled to agent:backlog
+    // could never spawn. With cap 1 and one such stale merged worker, the fresh
+    // backlog issue must still spawn.
+    const staleMerged = {
+      ...makeMergedSession("ao-1", "9"),
+      status: "merged",
+      lifecycle: {
+        session: { state: "working", reason: null },
+        runtime: { state: "exited" },
+        pr: { state: "merged" },
+      },
+    } as unknown as Session;
+    const harness = makeHarness({
+      backlogIssues: [makeIssue("10")],
+      sessions: [staleMerged],
+      maxConcurrentAgents: 1,
+    });
+
+    const poller = createBacklogPoller({
+      resolveServices: async () => harness.services,
+      lockPath: null,
+    });
+
+    await poller.pollOnce();
+
+    expect(harness.spawn).toHaveBeenCalledWith({ projectId: "proj", issueId: "10" });
   });
 
   it("does not respawn a merged issue whose verification label update failed this cycle", async () => {

@@ -995,6 +995,19 @@ async function runStartup(
       if (dashboardProcess) {
         dashboardProcess.kill();
       }
+      // The supervisor builds the merged daemon scope and can abort here (e.g. a
+      // sessionPrefix/project-id collision between this startup config and the
+      // global registry) AFTER the orchestrator session/runtime was created above.
+      // Tear it down so a failed startup doesn't leave a managed orchestrator
+      // running.
+      if (selectedOrchestratorId) {
+        try {
+          const sm = await getSessionManager(config);
+          await sm.kill(selectedOrchestratorId);
+        } catch {
+          // Best-effort teardown.
+        }
+      }
       throw new CliFailureEventRecordedError(
         `Failed to start project supervisor: ${err instanceof Error ? err.message : String(err)}`,
         { cause: err },
