@@ -79,7 +79,13 @@ function makeHarness(opts: {
   existingState?: Issue["state"];
 }): Harness {
   const listIssues = vi.fn(async (filters: { labels?: string[] }) => {
-    if (filters.labels?.includes("agent:backlog")) return opts.backlogIssues;
+    // The spawn/over-fetch scan asks for exactly [agent:backlog]. The reopen /
+    // re-queue scans add agent:done / verified / verification-failed — a real
+    // tracker AND-filters, so a plain backlog issue wouldn't match those. Mirror
+    // that here so this generic harness doesn't treat backlog issues as reopened.
+    if (filters.labels?.length === 1 && filters.labels[0] === "agent:backlog") {
+      return opts.backlogIssues;
+    }
     return [];
   });
   const updateIssue = vi.fn(async () => undefined);

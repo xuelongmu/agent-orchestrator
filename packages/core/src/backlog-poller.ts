@@ -319,8 +319,10 @@ async function labelIssuesForVerification(
   registry: PluginRegistry,
   processedIssues: Set<string>,
   logger?: BacklogLogger,
+  signal?: AbortSignal,
 ): Promise<Set<string>> {
   const unlabeledMergedIssues = new Set<string>();
+  if (signal?.aborted) return unlabeledMergedIssues;
   const mergedSessions = sessions.filter(
     (s) =>
       s.lifecycle.pr.state === "merged" &&
@@ -333,6 +335,9 @@ async function labelIssuesForVerification(
   );
 
   for (const session of mergedSessions) {
+    // Shutdown requested mid-cycle (stop() aborted us) — stop mutating tracker
+    // state so a graceful stop leaves issues untouched.
+    if (signal?.aborted) break;
     const key = `${session.projectId}:${session.id}`;
     // Mark this session done with verification, in-memory AND persisted to disk
     // so the dedupe survives a daemon restart.
@@ -465,8 +470,11 @@ async function relabelReopenedIssues(
   config: OrchestratorConfig,
   registry: PluginRegistry,
   logger?: BacklogLogger,
+  signal?: AbortSignal,
 ): Promise<void> {
+  if (signal?.aborted) return;
   for (const [, project] of Object.entries(config.projects)) {
+    if (signal?.aborted) return;
     if (!project.tracker?.plugin) continue;
     const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
     if (!tracker?.listIssues || !tracker.updateIssue) continue;
@@ -501,6 +509,9 @@ async function relabelReopenedIssues(
     const reopened = [...reopenedById.values()];
 
     for (const issue of reopened) {
+      // Shutdown requested mid-cycle (stop() aborted us) — perform no further
+      // tracker mutations so a graceful stop leaves issue state untouched.
+      if (signal?.aborted) return;
       try {
         await tracker.updateIssue(
           issue.id,
@@ -802,8 +813,9 @@ export function createBacklogPoller(options: BacklogPollerOptions): BacklogPolle
         registry,
         processedIssues,
         logger,
+        abort.signal,
       );
-      await relabelReopenedIssues(config, registry, logger);
+      await relabelReopenedIssues(config, registry, logger, abort.signal);
       await spawnFromBacklog(
         allSessions,
         config,
