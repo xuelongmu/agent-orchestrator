@@ -495,10 +495,34 @@ describe("loadMergedScopeConfig", () => {
     });
   });
 
-  it("does NOT re-scope an implicit notifier the global scope also uses", () => {
-    // When a GLOBAL project also routes to `dashboard`, one registration can't
-    // serve two stores — the global definition governs, so we must not bake a
+  it("does NOT re-scope a shared EXTERNAL implicit notifier the global scope also uses", () => {
+    // A non-dashboard alias targets an external service; one registration can't
+    // serve two stores, so the global definition governs and we must not bake a
     // startup-scoped entry that would divert global notifications.
+    const startup = {
+      configPath: STARTUP,
+      defaults: { ...startupDefaults, notifiers: ["team-alerts"] },
+      projects: { local: project("local", "l") },
+    };
+    const global = {
+      configPath: GLOBAL,
+      defaults: { ...globalDefaults, notifiers: ["team-alerts"] },
+      projects: { reg: project("reg", "r") },
+      notifiers: {},
+    };
+    mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
+
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    // No startup-scoped entry synthesized — left implicit (global store).
+    expect(merged.notifiers["team-alerts"]).toBeUndefined();
+  });
+
+  it("ALWAYS scopes the dashboard notifier to startup even when global also uses it", () => {
+    // The dashboard store is local — read by the dashboard UI THIS `ao start`
+    // launched (startup config). So the carried project's dashboard notifications
+    // must go to the startup store, even though a global project routes to
+    // `dashboard` too. The single registration serves the one running dashboard.
     const startup = {
       configPath: STARTUP,
       defaults: { ...startupDefaults, notifiers: ["dashboard"] },
@@ -514,8 +538,10 @@ describe("loadMergedScopeConfig", () => {
 
     const merged = loadMergedScopeConfig(STARTUP);
 
-    // No startup-scoped dashboard entry synthesized — left implicit (global store).
-    expect(merged.notifiers.dashboard).toBeUndefined();
+    expect(merged.notifiers.dashboard).toEqual({
+      plugin: "dashboard",
+      configPath: STARTUP,
+    });
   });
 
   it("keeps both same-name/different-identity plugins (collision deferred to the registry)", () => {

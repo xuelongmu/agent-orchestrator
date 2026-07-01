@@ -41,6 +41,14 @@ import {
 } from "@aoagents/ao-core";
 import { pathsEqual } from "./path-equality.js";
 
+/**
+ * The built-in dashboard notifier. Its notification store is LOCAL (read by the
+ * running dashboard UI), unlike external notifiers (slack/desktop/webhook), so a
+ * carried project's dashboard notifications must be scoped to the startup config
+ * the running UI reads — even when the alias is shared with the global scope.
+ */
+const DASHBOARD_NOTIFIER_NAME = "dashboard";
+
 function isMissingGlobalConfig(error: unknown, globalConfigPath: string): boolean {
   return (
     error instanceof Error &&
@@ -366,9 +374,7 @@ function mergeScopeProjects(
   // registry instantiates them with the merged (global) `configPath`, so the
   // carried project's dashboard notifications land in the global store where the
   // startup dashboard UI never reads them. Bake a startup-scoped entry so they land
-  // in the startup store. Skip any alias the GLOBAL scope also uses — one notifier
-  // registration can't serve two stores, and (as with explicit collisions above)
-  // the global definition governs the global projects.
+  // in the startup store.
   const globalReferencedAliases = new Set<string>([
     ...(Array.isArray(globalConfig.defaults?.notifiers) ? globalConfig.defaults.notifiers : []),
     ...Object.values(globalConfig.notificationRouting ?? {}).flatMap((v) =>
@@ -385,7 +391,14 @@ function mergeScopeProjects(
       for (const alias of aliases) {
         if (alias in startupNotifiers) continue; // explicit startup entry handled above
         if (alias in globalNotifiers) continue; // explicit global definition wins
-        if (globalReferencedAliases.has(alias)) continue; // shared with global → global store
+        // The `dashboard` notifier writes to the LOCAL store the running dashboard
+        // UI reads, and THIS `ao start` launched that UI against the startup config.
+        // So it must use the startup configPath even when a global project also
+        // routes to `dashboard` — the single registration serves the one running
+        // dashboard, and global notifications belong in that same store to be
+        // visible. Other shared aliases target external services, so the global
+        // definition governs them (one registration can't serve two stores).
+        if (alias !== DASHBOARD_NOTIFIER_NAME && globalReferencedAliases.has(alias)) continue;
         if (alias in bakedStartupNotifiers) continue; // already baked this pass
         bakedStartupNotifiers[alias] = { plugin: alias, configPath: startupConfig.configPath };
       }
