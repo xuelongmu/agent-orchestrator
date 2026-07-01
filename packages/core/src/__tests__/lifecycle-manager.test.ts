@@ -4824,6 +4824,173 @@ describe("review loop round-cap + completion detection (#4)", () => {
     await lm.check("app-1");
     expect(getReviewThreads).toHaveBeenCalledTimes(1);
   });
+
+  it("does not mark satisfied until the bot reviewer has engaged", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    // Fresh PR: no threads ever, CI green — the bot reviewer has not run yet.
+    const mockSCM = createMockSCM({
+      getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [] }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["reviewSatisfiedAt"]).toBeFalsy();
+    expect(meta?.["botReviewObserved"]).toBeFalsy();
+  });
+
+  it("clears the satisfied mark when a human thread reappears", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    let phase: "bot" | "clear" | "human" = "bot";
+    const getReviewThreads = vi.fn().mockImplementation(async () => {
+      if (phase === "bot") return { threads: [botThread("b1")], reviews: [] };
+      if (phase === "clear") return { threads: [], reviews: [] };
+      return {
+        threads: [
+          {
+            id: "h1",
+            author: "reviewer",
+            body: "Actually, please revert this",
+            path: "src/worker.ts",
+            line: 3,
+            isResolved: false,
+            createdAt: new Date(),
+            url: "https://example.com/comment/h1",
+            isBot: false,
+          },
+        ],
+        reviews: [],
+      };
+    });
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1"); // bot round → botReviewObserved recorded
+    phase = "clear";
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1"); // threads clear + CI green → satisfied
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeTruthy();
+
+    phase = "human";
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1"); // human thread reappears → satisfied mark cleared
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeFalsy();
+  });
+
+  it("lets a merged PR override the escalation latch", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+        maxRounds: 1,
+      },
+    };
+    let currentBotId = "r1";
+    let prState: "open" | "merged" | "closed" = "open";
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({
+      threads: [botThread(currentBotId)],
+      reviews: [],
+    }));
+    const mockSCM = createMockSCM({
+      getReviewThreads,
+      getPRState: vi.fn().mockImplementation(async () => prState),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1"); // round 1 dispatched
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    currentBotId = "r2";
+    await lm.check("app-1"); // round 2 exceeds maxRounds → escalate
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBe("true");
+
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1"); // parked in needs_input
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+
+    // A human merges the PR while the latch is still set — terminal state wins.
+    prState = "merged";
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("merged");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBeFalsy();
+  });
+
+  it("does not mark multi-PR sessions review-satisfied", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    const pr1 = makePR({ number: 42 });
+    const pr2 = makePR({ number: 43, url: "https://github.com/org/my-app/pull/43" });
+    let hasBotThreads = true;
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({
+      threads: hasBotThreads ? [botThread("b1")] : [],
+      reviews: [],
+    }));
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: pr1, prs: [pr1, pr2] }),
+      registry,
+    });
+
+    await lm.check("app-1"); // primary bot round → botReviewObserved
+    hasBotThreads = false;
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1"); // primary clears, but multi-PR is deferred
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewSatisfiedAt"]).toBeFalsy();
+  });
 });
 
 describe("summary pinning", () => {
