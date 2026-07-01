@@ -200,7 +200,11 @@ function prepareConfig(
 
   // Strip loading metadata fields (plugin, package, path) from config passed to plugin.
   const { plugin: _plugin, package: _package, path: _path, ...rest } = rawConfig;
-  return configPath ? { ...rest, configPath } : rest;
+  // Prefer an explicit `configPath` on the entry (e.g. a carried startup-only
+  // notifier baked with its startup config path so its dashboard notifications
+  // land in the right store) over the top-level one.
+  const resolvedConfigPath = (rest.configPath as string | undefined) ?? configPath;
+  return resolvedConfigPath !== undefined ? { ...rest, configPath: resolvedConfigPath } : rest;
 }
 
 /**

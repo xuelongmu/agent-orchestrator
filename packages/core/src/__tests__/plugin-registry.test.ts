@@ -387,6 +387,32 @@ describe("loadBuiltins", () => {
     });
   });
 
+  it("prefers an explicit configPath on the notifier config over the top-level one", async () => {
+    // A carried startup-only notifier is baked with its startup configPath so its
+    // dashboard notifications land in the right store — the registry must honor it.
+    const registry = createPluginRegistry();
+    const fakeDashboard = makePlugin("notifier", "dashboard");
+    const cfg = makeOrchestratorConfig({
+      configPath: "/global/config.yaml",
+      defaults: {
+        runtime: "tmux",
+        agent: "codex",
+        workspace: "worktree",
+        notifiers: ["dashboard"],
+      },
+      notifiers: {
+        dashboard: { plugin: "dashboard", configPath: "/startup/config.yaml" },
+      },
+    });
+
+    await registry.loadBuiltins(cfg, async (pkg: string) => {
+      if (pkg === "@aoagents/ao-plugin-notifier-dashboard") return fakeDashboard;
+      throw new Error(`Not found: ${pkg}`);
+    });
+
+    expect(fakeDashboard.create).toHaveBeenCalledWith({ configPath: "/startup/config.yaml" });
+  });
+
   it("registers a notifier referenced only by per-project routing", async () => {
     const registry = createPluginRegistry();
     const fakeDashboard = makePlugin("notifier", "dashboard");

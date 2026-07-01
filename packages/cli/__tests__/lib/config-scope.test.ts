@@ -408,8 +408,14 @@ describe("loadMergedScopeConfig", () => {
 
     const merged = loadMergedScopeConfig(STARTUP);
 
-    // Startup-only alias is added; the colliding alias keeps the global value.
-    expect(merged.notifiers.slack).toEqual({ plugin: "slack", webhookUrl: "startup-hook" });
+    // Startup-only alias is added (with the startup configPath baked so its
+    // dashboard notifications land in the startup store); the colliding alias
+    // keeps the global value (no configPath baked).
+    expect(merged.notifiers.slack).toEqual({
+      plugin: "slack",
+      webhookUrl: "startup-hook",
+      configPath: STARTUP,
+    });
     expect(merged.notifiers.shared).toEqual({ plugin: "slack", webhookUrl: "global-shared" });
   });
 
@@ -453,13 +459,19 @@ describe("loadMergedScopeConfig", () => {
     const merged = loadMergedScopeConfig(STARTUP);
 
     expect(merged.projects.local.notificationRouting?.action).toEqual(["startup-slack"]);
-    expect(merged.notifiers["startup-slack"]).toEqual({ plugin: "slack", webhookUrl: "hook" });
+    // The startup-only notifier is instantiated with the startup configPath.
+    expect(merged.notifiers["startup-slack"]).toEqual({
+      plugin: "slack",
+      webhookUrl: "hook",
+      configPath: STARTUP,
+    });
   });
 
-  it("rejects a startup plugin whose name matches an ENABLED global plugin of a different identity", () => {
-    // Same logical name, different implementation, global enabled: the registry
-    // keys instances by slot:name, so loading both would silently overwrite the
-    // global implementation. The merge must abort instead.
+  it("keeps both same-name/different-identity plugins (collision deferred to the registry)", () => {
+    // config.plugins entries carry no slot, and the registry keys instances by
+    // slot:manifest.name — so a same-name clash isn't necessarily a real collision
+    // (e.g. an scm and a tracker both named the same). The merge keeps both and
+    // lets the registry's post-import, slot-aware guard fail only on a real clash.
     const startup = {
       configPath: STARTUP,
       defaults: startupDefaults,
@@ -474,7 +486,10 @@ describe("loadMergedScopeConfig", () => {
     };
     mockLoadConfig.mockImplementation((p: string) => (p === GLOBAL ? global : startup));
 
-    expect(() => loadMergedScopeConfig(STARTUP)).toThrow(/plugin name collision/i);
+    const merged = loadMergedScopeConfig(STARTUP);
+
+    // Both survive the merge (distinct identities); the registry decides.
+    expect(merged.plugins?.filter((p) => p.name === "tracker")).toHaveLength(2);
   });
 
   it("dedupes a startup plugin that is identical to an enabled global plugin", () => {

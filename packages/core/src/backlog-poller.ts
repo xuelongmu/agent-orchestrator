@@ -485,6 +485,19 @@ async function relabelReopenedIssues(
         // Tracker error for this label — try the others; retry the rest next cycle.
       }
     }
+    // A `verification-failed` issue the user explicitly re-backlogged (BOTH labels
+    // present) means "send it back to an agent". `wouldSkipForSpawn` skips any
+    // verification-labeled issue, so it never spawns until `verification-failed` is
+    // cleared — do that here (the relabel below drops all VERIFICATION_LABELS).
+    try {
+      const requeued = await tracker.listIssues(
+        { state: "open", labels: ["verification-failed", BACKLOG_LABEL], limit: 20 },
+        project,
+      );
+      for (const issue of requeued) reopenedById.set(issue.id, issue);
+    } catch {
+      // Tracker error — retry next cycle.
+    }
     const reopened = [...reopenedById.values()];
 
     for (const issue of reopened) {

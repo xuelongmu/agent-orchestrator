@@ -170,42 +170,23 @@ function pluginIdentityKey(plugin: InstalledPluginConfig): string {
   return `${plugin.source}:${plugin.package ?? plugin.name}`;
 }
 
-/** True when a plugin's `name` is an inferred temporary basename (an inline
- *  external plugin declared without an explicit `plugin`), rather than its final
- *  registry name. `loadConfig` fills such names from the package/path basename
- *  and the registry replaces them with the real manifest.name at load time, so
- *  they must NOT be treated as the final `slot:name` for collision detection. */
-function hasInferredName(
-  plugin: InstalledPluginConfig,
-  inferredIdentities: Set<string>,
-): boolean {
-  if (plugin.package && inferredIdentities.has(`package:${plugin.package}`)) return true;
-  if (plugin.path && inferredIdentities.has(`path:${plugin.path}`)) return true;
-  return false;
-}
-
-/** Append startup plugin declarations, absolutizing any relative local `path`
- *  against the startup config dir, with two guards against the registry's
- *  `slot:name` instance keying:
- *   - dedupe by implementation identity (source + path/package) against ENABLED
- *     global plugins, so a redundant re-declaration is skipped (but a startup
- *     plugin whose global namesake is DISABLED is still carried so it loads);
- *   - reject a same-NAME / different-identity collision against an enabled global
- *     plugin — keeping both would have the startup plugin silently overwrite the
- *     global implementation for registered projects, so fail loudly instead. The
- *     name check is skipped when EITHER side's name is an inferred temporary
- *     basename: those are replaced with distinct `slot:manifest.name` keys at
- *     load time, so a basename clash is not a real registry collision. */
+/** Append startup plugin declarations, deduping by implementation identity
+ *  (source + path/package) against ENABLED global plugins and absolutizing any
+ *  relative local `path` against the startup config dir. A same-NAME clash is NOT
+ *  rejected here: config.plugins entries carry no slot, and the registry keys
+ *  instances by `slot:manifest.name`, so cross-slot same-name plugins (e.g. an
+ *  scm and a tracker both named "jira") legitimately coexist. The registry's
+ *  post-import guard (loadFromConfig) is the authority on real collisions — it
+ *  fails only when two plugins resolve to the same slot-qualified name. */
 function mergeInstalledPlugins(
   globalPlugins: InstalledPluginConfig[] | undefined,
   startupPlugins: InstalledPluginConfig[] | undefined,
   startupConfigPath: string,
-  inferredIdentities: Set<string>,
 ): InstalledPluginConfig[] | undefined {
   if (!startupPlugins?.length) return globalPlugins;
-  const enabledGlobal = (globalPlugins ?? []).filter((p) => p.enabled !== false);
-  const seenIdentity = new Set(enabledGlobal.map(pluginIdentityKey));
-  const enabledGlobalByName = new Map(enabledGlobal.map((p) => [p.name, p] as const));
+  const seenIdentity = new Set(
+    (globalPlugins ?? []).filter((p) => p.enabled !== false).map(pluginIdentityKey),
+  );
   const merged = [...(globalPlugins ?? [])];
   for (const plugin of startupPlugins) {
     const baked =
@@ -214,22 +195,6 @@ function mergeInstalledPlugins(
         : plugin;
     const key = pluginIdentityKey(baked);
     if (seenIdentity.has(key)) continue; // Same implementation already present (enabled).
-    const collidingGlobal = enabledGlobalByName.get(baked.name);
-    // Only a clash of FINAL (non-inferred) names is a real registry collision —
-    // use the raw `plugin` (pre-absolutization) so its package/path matches the
-    // external-entry identities collected from the startup config.
-    if (
-      collidingGlobal &&
-      !hasInferredName(plugin, inferredIdentities) &&
-      !hasInferredName(collidingGlobal, inferredIdentities)
-    ) {
-      throw new Error(
-        `Plugin name collision in merged scope: plugin "${baked.name}" is declared by both ` +
-          `the global config (${pluginIdentityKey(collidingGlobal)}) and the startup config ` +
-          `(${key}). They map to the same registry slot and would overwrite each other. ` +
-          `Rename one of the plugins before launching ao start.`,
-      );
-    }
     seenIdentity.add(key);
     merged.push(baked);
   }
@@ -384,18 +349,15 @@ function mergeScopeProjects(
     }
   }
 
-  // External plugin entries that omit an explicit `plugin` carry an inferred
-  // temporary name (basename), which the registry rewrites to the real manifest
-  // name at load time. Track their identities so the plugin-name collision check
-  // ignores basename clashes that aren't real `slot:manifest.name` collisions.
-  const inferredPluginIdentities = new Set<string>();
-  for (const entry of [
-    ...(globalConfig._externalPluginEntries ?? []),
-    ...(startupConfig._externalPluginEntries ?? []),
-  ]) {
-    if (entry.expectedPluginName !== undefined) continue; // explicit `plugin` → final name
-    if (entry.package) inferredPluginIdentities.add(`package:${entry.package}`);
-    else if (entry.path) inferredPluginIdentities.add(`path:${entry.path}`);
+  // Startup-only notifier aliases carry the STARTUP config path so the registry
+  // instantiates them with it. Their dashboard notifications must land in the
+  // startup config's store (the dashboard process reads AO_CONFIG_PATH = the
+  // startup config), not the merged/global store where they'd never surface.
+  const bakedStartupNotifiers: Record<string, (typeof startupNotifiers)[string]> = {};
+  for (const [alias, notifier] of Object.entries(startupNotifiers)) {
+    bakedStartupNotifiers[alias] = startupOnlyNotifierIds.has(alias)
+      ? { ...notifier, configPath: startupConfig.configPath }
+      : notifier;
   }
 
   return {
@@ -408,12 +370,11 @@ function mergeScopeProjects(
     port: startupConfig.port,
     // Add startup-only notifier definitions (global wins on alias collision) so a
     // carried project routing to a startup alias doesn't hit `target_missing`.
-    notifiers: { ...startupNotifiers, ...globalNotifiers },
+    notifiers: { ...bakedStartupNotifiers, ...globalNotifiers },
     plugins: mergeInstalledPlugins(
       globalConfig.plugins,
       startupConfig.plugins,
       startupConfig.configPath,
-      inferredPluginIdentities,
     ),
     _externalPluginEntries: [
       ...(globalConfig._externalPluginEntries ?? []),

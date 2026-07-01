@@ -11,6 +11,7 @@ import {
   createPluginRegistry,
   createSessionManager,
   createLifecycleManager,
+  type ExternalPluginEntryRef,
   type OrchestratorConfig,
   type OpenCodeSessionManager,
   type PluginRegistry,
@@ -35,6 +36,13 @@ function getRegistryCacheKey(config: OrchestratorConfig): string {
   return config._registryScopeKey || config.configPath || "__default__";
 }
 
+/** Stable key for an external-entry location (project slot or notifier alias). */
+function externalLocationKey(location: ExternalPluginEntryRef["location"]): string {
+  return location.kind === "notifier"
+    ? `notifier:${location.notifierId}`
+    : `${location.kind}:${location.projectId}:${location.configType}`;
+}
+
 /**
  * Copy resolved inline-external plugin names from a previously-built config onto
  * a fresh one, so the fresh config's plugin references match what the cached
@@ -44,10 +52,23 @@ function getRegistryCacheKey(config: OrchestratorConfig): string {
  * Iterates the FRESH config's external entries (not the built config's): if a
  * location was edited back to a built-in plugin since the registry was built, the
  * fresh config no longer has an inline-external entry there, so we leave its
- * built-in name intact instead of clobbering it with the stale external name.
+ * built-in name intact. And a location is reconciled ONLY when the fresh entry's
+ * spec (package/path) still matches the built one — if it now points at a
+ * different external package/path, copying the old resolved name would keep using
+ * the stale implementation; leaving the fresh (temp) name lets the mismatch
+ * surface instead.
  */
 function reconcileExternalPluginNames(target: OrchestratorConfig, source: OrchestratorConfig): void {
+  const sourceByLocation = new Map<string, ExternalPluginEntryRef>();
+  for (const entry of source._externalPluginEntries ?? []) {
+    sourceByLocation.set(externalLocationKey(entry.location), entry);
+  }
   for (const entry of target._externalPluginEntries ?? []) {
+    const src = sourceByLocation.get(externalLocationKey(entry.location));
+    if (!src) continue;
+    // Only reconcile when the fresh entry still points at the same external spec.
+    if ((entry.package ?? null) !== (src.package ?? null)) continue;
+    if ((entry.path ?? null) !== (src.path ?? null)) continue;
     const loc = entry.location;
     if (loc.kind === "project") {
       const resolved = source.projects[loc.projectId]?.[loc.configType]?.plugin;

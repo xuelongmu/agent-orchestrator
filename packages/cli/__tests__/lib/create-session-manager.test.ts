@@ -107,4 +107,32 @@ describe("getPluginRegistry — cache reconciliation", () => {
     expect(loadFromConfig).toHaveBeenCalledTimes(1);
     expect(reverted.projects.app.tracker?.plugin).toBe("github");
   });
+
+  it("does not reconcile when the fresh entry points at a different external spec", async () => {
+    // Build with package @acme/tracker.
+    const built = makeConfig("/scope-spec-change");
+    await getPluginRegistry(built);
+    expect(built.projects.app.tracker?.plugin).toBe("real-tracker");
+
+    // The same slot is later edited to a DIFFERENT external package. A cache hit
+    // must NOT copy the old resolved name over the new spec's (temp) name.
+    const edited = {
+      configPath: "/scope-spec-change",
+      projects: { app: { name: "app", path: "/p/app", tracker: { plugin: "tmp-inferred-name" } } },
+      notifiers: {},
+      _externalPluginEntries: [
+        {
+          source: "project app tracker",
+          location: { kind: "project", projectId: "app", configType: "tracker" },
+          slot: "tracker",
+          package: "@other/tracker",
+        },
+      ],
+    } as unknown as OrchestratorConfig;
+    await getPluginRegistry(edited);
+
+    expect(loadFromConfig).toHaveBeenCalledTimes(1);
+    // Spec changed → not reconciled; the fresh (temp) name is left so the mismatch surfaces.
+    expect(edited.projects.app.tracker?.plugin).toBe("tmp-inferred-name");
+  });
 });
