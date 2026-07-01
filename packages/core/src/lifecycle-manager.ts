@@ -1994,6 +1994,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         reviewRoundsEscalated: "",
         reviewSatisfiedAt: "",
         botReviewObserved: "",
+        botReviewObservedSha: "",
       });
       return;
     }
@@ -2022,7 +2023,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const hasRelevantTransition =
       transitionReaction?.key === humanReactionKey ||
       transitionReaction?.key === automatedReactionKey;
-    if (!hasRelevantTransition && !readyForReviewRecheck) {
+    // A session already marked satisfied bypasses the throttle: reviewSatisfiedAt
+    // is the merge-gate clean signal, so a human thread or CI regression must be
+    // observed promptly (and the latch cleared) rather than up to 2 minutes late.
+    const revalidateSatisfied = !!session.metadata["reviewSatisfiedAt"];
+    if (!hasRelevantTransition && !readyForReviewRecheck && !revalidateSatisfied) {
       if (Date.now() - lastCheckAt < REVIEW_BACKLOG_THROTTLE_MS) {
         return;
       }
@@ -2031,6 +2036,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // Split locally by isBot for separate reaction pipelines.
     let allThreads: ReviewComment[];
     let reviewSummaries: ReviewSummary[] = [];
+    let currentHeadSha: string | undefined;
+    let primaryThreadsTruncated = false;
     try {
       if (scm.getReviewThreads) {
         // On a ready-for-review recheck, force a fresh fetch: the agent has just
@@ -2041,6 +2048,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         });
         allThreads = result.threads;
         reviewSummaries = result.reviews;
+        currentHeadSha = result.headSha;
+        primaryThreadsTruncated = result.threadsTruncated ?? false;
       } else {
         // Fallback for SCM plugins that don't implement getReviewThreads yet
         allThreads = await scm.getPendingComments(session.pr);
@@ -2070,12 +2079,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // Only stamp the throttle after a successful SCM fetch. If the fetch failed,
     // we returned above so the next poll can retry without waiting 2 minutes.
     lastReviewBacklogCheckAt.set(session.id, Date.now());
-
-    // Tracks whether every secondary PR in the session is free of unresolved
-    // review threads (bot or human). Completion detection requires this so a
-    // multi-PR session is not marked satisfied while a secondary PR still has
-    // open threads. Fetch failures leave it false (can't confirm clean).
-    let secondaryPRsThreadClear = true;
 
     // Persist review comments + summaries to metadata for dashboard consumption
     {
@@ -2123,11 +2126,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             secondaryReviews = [];
           }
         } catch {
-          secondaryPRsThreadClear = false; // couldn't confirm this PR is clean
           continue;
-        }
-        if (secondaryThreads.length > 0) {
-          secondaryPRsThreadClear = false;
         }
         const secondaryUnresolved = secondaryThreads.filter((c) => !c.isBot);
         const secondaryBlob = JSON.stringify({
@@ -2155,40 +2154,59 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const pendingComments = allThreads.filter((c) => !c.isBot);
     const automatedComments = allThreads.filter((c) => c.isBot);
 
-    // Re-validate a previously-recorded "satisfied" mark BEFORE re-recording bot
-    // engagement. Clear the mark the moment the session stops being demonstrably
-    // clean — an unresolved thread on ANY PR (primary or secondary), CI no longer
-    // green on any PR, or a changes_requested review — so the merge gate never
-    // acts on a stale signal. Gated on the mark being set so the extra CI/review
-    // checks only run when there is something to invalidate.
+    // Re-validate a previously-recorded "satisfied" mark. Clear it the moment the
+    // session stops being demonstrably clean — a reappearing thread, CI no longer
+    // green, a changes_requested review, a truncated thread page (can't trust the
+    // clean set), or a new head the recorded review no longer covers — so the
+    // merge gate never acts on a stale signal. Gated on the mark being set so the
+    // extra CI/review checks only run when there is something to invalidate.
     if (session.metadata["reviewSatisfiedAt"]) {
-      const anyThreadOpen =
-        pendingComments.length > 0 || automatedComments.length > 0 || !secondaryPRsThreadClear;
-      const ciGreen = await allSessionPRsCIGreen(session, scm);
-      const noChangesRequested = await noSessionPRChangesRequested(session, scm);
-      if (anyThreadOpen || !ciGreen || !noChangesRequested) {
+      const anyThreadOpen = pendingComments.length > 0 || automatedComments.length > 0;
+      const isMultiPR = normalizeSessionPRs(session).length > 1;
+      const ciGreen = await primaryPRCIGreen(session, scm);
+      const notChangesRequested = await primaryPRNotChangesRequested(session, scm);
+      const headMoved =
+        !!currentHeadSha && session.metadata["botReviewObservedSha"] !== currentHeadSha;
+      if (
+        anyThreadOpen ||
+        isMultiPR ||
+        !ciGreen ||
+        !notChangesRequested ||
+        primaryThreadsTruncated ||
+        headMoved
+      ) {
         updateSessionMetadata(session, { reviewSatisfiedAt: "" });
-      }
-      // CI dropping out of green implies a new push/head: the prior bot review no
-      // longer covers the current changes. Clear the engagement signal so the new
-      // head must be reviewed again before it can be satisfied. Because this only
-      // fires while a satisfied mark exists (threads were clear at satisfaction),
-      // any bot engagement re-recorded below is necessarily a fresh review.
-      if (!ciGreen) {
-        updateSessionMetadata(session, { botReviewObserved: "" });
       }
     }
 
     // Record that the automated CODE REVIEWER (Codex/Cursor — not CI/coverage
-    // bots) has actually engaged with this PR. Completion detection requires this
-    // so a brand-new PR the reviewer has never touched is not marked satisfied
-    // just because it starts out thread-free + CI green. A completed review
-    // counts even with NO inline comments (the clean/no-issue success case),
-    // recognized via the review submission.
-    const codeReviewEngaged =
+    // bots) has engaged. Completion requires this, so a brand-new PR the reviewer
+    // has never touched is not satisfied just because it starts thread-free + CI
+    // green. Two signals:
+    //  • botReviewObservedSha — the head a review was actually submitted against
+    //    (authoritative). A stale review of an older push cannot satisfy a newer
+    //    head. Set ONLY from a review submission of the current head, never from
+    //    (possibly outdated) inline threads.
+    //  • botReviewObserved — a head-agnostic "reviewer touched this PR" boolean,
+    //    used only as the fallback when the SCM cannot report a head SHA.
+    const reviewedCurrentHead =
+      !!currentHeadSha &&
+      reviewSummaries.some((r) => r.isReviewBot && r.commitSha === currentHeadSha);
+    const anyReviewBotEngagement =
       automatedComments.some((c) => c.isReviewBot) || reviewSummaries.some((r) => r.isReviewBot);
-    if (codeReviewEngaged && session.metadata["botReviewObserved"] !== "true") {
-      updateSessionMetadata(session, { botReviewObserved: "true" });
+    const engagementUpdates: Record<string, string> = {};
+    if (anyReviewBotEngagement && session.metadata["botReviewObserved"] !== "true") {
+      engagementUpdates["botReviewObserved"] = "true";
+    }
+    if (
+      reviewedCurrentHead &&
+      currentHeadSha &&
+      session.metadata["botReviewObservedSha"] !== currentHeadSha
+    ) {
+      engagementUpdates["botReviewObservedSha"] = currentHeadSha;
+    }
+    if (Object.keys(engagementUpdates).length > 0) {
+      updateSessionMetadata(session, engagementUpdates);
     }
 
     // --- Pending (human) review comments ---
@@ -2304,7 +2322,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         });
         await maybeMarkReviewSatisfied(session, scm, {
           primaryHumanThreadsClear: pendingComments.length === 0,
-          secondaryThreadsClear: secondaryPRsThreadClear,
+          headSha: currentHeadSha,
+          threadsTruncated: primaryThreadsTruncated,
         });
       } else if (roundEscalated) {
         // Already escalated after exceeding the round cap. Stay latched — no
@@ -2354,79 +2373,82 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   /**
-   * True when every PR in the session has green CI. Reads the batch-enrichment
-   * cache first and falls back to a live getCISummary call when enrichment is
+   * True when the session's PR has green CI. Reads the batch-enrichment cache
+   * first and falls back to a live getCISummary call when enrichment is
    * unavailable (unimplemented plugin or failed batch), so completion detection
-   * is not silently disabled under a cache miss. Any PR that cannot be confirmed
-   * green returns false (never satisfy on unknown CI).
+   * is not silently disabled under a cache miss. CI that cannot be confirmed
+   * green returns false (never satisfy on unknown CI). "none" (no configured
+   * checks) counts as green, matching the mergeability path.
    */
-  async function allSessionPRsCIGreen(session: Session, scm: SCM): Promise<boolean> {
-    for (const p of normalizeSessionPRs(session)) {
-      const cached = prEnrichmentCache.get(`${p.owner}/${p.repo}#${p.number}`);
-      if (cached) {
-        if (cached.ciStatus !== "passing") return false;
-        continue;
-      }
-      try {
-        if ((await scm.getCISummary(p)) !== "passing") return false; // live fallback
-      } catch {
-        return false; // couldn't confirm — don't satisfy
-      }
-    }
-    return true;
+  async function primaryPRCIGreen(session: Session, scm: SCM): Promise<boolean> {
+    const p = session.pr;
+    if (!p) return false;
+    const cached = prEnrichmentCache.get(`${p.owner}/${p.repo}#${p.number}`);
+    const ci = cached
+      ? cached.ciStatus
+      : await scm.getCISummary(p).catch(() => undefined); // live fallback
+    return ci === "passing" || ci === "none";
   }
 
   /**
-   * True when no PR in the session has a changes_requested review decision.
+   * True when the session's PR does NOT have a changes_requested review decision.
    * Reads the enrichment cache first (authoritative) and falls back to live
-   * getReviewDecision on a cache miss. A transient inability to read the decision
-   * does not block satisfaction (CI-green is the stronger gate).
+   * getReviewDecision on a cache miss. Fails CLOSED: if the decision cannot be
+   * determined (transient/permission error), returns false so a hidden
+   * changes_requested cannot produce a false clean signal.
    */
-  async function noSessionPRChangesRequested(session: Session, scm: SCM): Promise<boolean> {
-    for (const p of normalizeSessionPRs(session)) {
-      const cached = prEnrichmentCache.get(`${p.owner}/${p.repo}#${p.number}`);
-      let decision = cached?.reviewDecision;
-      if (!cached) {
-        try {
-          decision = await scm.getReviewDecision(p); // live fallback
-        } catch {
-          decision = undefined; // couldn't confirm — fall through, don't block
-        }
+  async function primaryPRNotChangesRequested(session: Session, scm: SCM): Promise<boolean> {
+    const p = session.pr;
+    if (!p) return false;
+    const cached = prEnrichmentCache.get(`${p.owner}/${p.repo}#${p.number}`);
+    let decision = cached?.reviewDecision;
+    if (!cached) {
+      try {
+        decision = await scm.getReviewDecision(p); // live fallback
+      } catch {
+        return false; // fail closed — can't confirm the PR isn't changes_requested
       }
-      if (decision === "changes_requested") return false;
     }
-    return true;
+    return decision !== "changes_requested";
   }
 
   /**
    * Completion detection for the bot review→fix loop: when no unresolved review
-   * threads remain (bot AND human, across every PR in the session), CI is green
-   * on every PR, no PR has changes_requested, and the code reviewer has actually
-   * engaged, record that the review is satisfied so the merge gate (#15) can
-   * advance the PR toward merge. Latches on `reviewSatisfiedAt` so the signal is
-   * emitted once per satisfied transition; the latch is cleared (above) when any
-   * unresolved thread reappears, CI regresses, or a change is requested.
+   * threads remain, CI is green, no changes_requested review is open, and the
+   * code reviewer has reviewed the CURRENT head, record that the review is
+   * satisfied so the merge gate (#15) can advance the PR. Latches on
+   * `reviewSatisfiedAt`; the latch is cleared (above) when a thread reappears, CI
+   * regresses, a change is requested, or the head moves.
+   *
+   * Multi-PR sessions are deferred to the merge gate (#15): this signal is
+   * emitted only for single-PR sessions, so a clean primary can never mask an
+   * unreviewed/failing secondary PR.
    */
   async function maybeMarkReviewSatisfied(
     session: Session,
     scm: SCM,
-    threads: { primaryHumanThreadsClear: boolean; secondaryThreadsClear: boolean },
+    ctx: { primaryHumanThreadsClear: boolean; headSha: string | undefined; threadsTruncated: boolean },
   ): Promise<void> {
     if (session.metadata["reviewSatisfiedAt"]) return; // already marked
-    if (!threads.primaryHumanThreadsClear) return; // primary human comments unresolved
-    if (!threads.secondaryThreadsClear) return; // a secondary PR still has unresolved threads
-    // Require the code reviewer (Codex/Cursor) to have actually engaged — never
-    // satisfy a PR the reviewer has not touched. A completed review counts even
-    // with no inline comments (recorded from the review submission).
-    if (session.metadata["botReviewObserved"] !== "true") return;
+    if (normalizeSessionPRs(session).length > 1) return; // multi-PR deferred to #15
+    if (!ctx.primaryHumanThreadsClear) return; // human comments unresolved
+    // Fail closed when the thread set may be incomplete — an unresolved thread
+    // outside the fetched page must not read as "clean".
+    if (ctx.threadsTruncated) return;
+    // Require a code-reviewer review of the CURRENT head. When the SCM reports a
+    // head SHA, the recorded review head must match it (a stale review of an old
+    // push does not count). When it cannot (degraded plugin), fall back to the
+    // head-agnostic engagement boolean.
+    if (ctx.headSha) {
+      if (session.metadata["botReviewObservedSha"] !== ctx.headSha) return;
+    } else if (session.metadata["botReviewObserved"] !== "true") {
+      return;
+    }
     // A top-level changes_requested review (even with no inline threads) blocks
-    // merge-readiness on any PR.
-    if (!(await noSessionPRChangesRequested(session, scm))) return;
-    // Every PR in the session must be CI-green — a secondary PR failing CI must
-    // not be masked by a clean primary.
-    if (!(await allSessionPRsCIGreen(session, scm))) return;
+    // merge-readiness.
+    if (!(await primaryPRNotChangesRequested(session, scm))) return;
+    if (!(await primaryPRCIGreen(session, scm))) return;
 
-    const sessionPRs = normalizeSessionPRs(session);
     const satisfiedAt = new Date().toISOString();
     updateSessionMetadata(session, { reviewSatisfiedAt: satisfiedAt });
     recordActivityEvent({
@@ -2438,7 +2460,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       data: {
         prNumber: session.pr?.number,
         prUrl: session.pr?.url,
-        prCount: sessionPRs.length,
       },
     });
   }

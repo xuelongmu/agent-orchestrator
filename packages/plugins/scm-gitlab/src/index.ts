@@ -61,6 +61,17 @@ function isBot(username: string): boolean {
   );
 }
 
+/**
+ * Automated *code reviewers* (Codex/Cursor) — a strict subset of bots. Lets
+ * review-loop completion recognize the intended reviewer on GitLab MRs, so a
+ * clean bot-reviewed MR can be marked satisfied (mirrors the GitHub plugin).
+ */
+const CODE_REVIEW_BOT_AUTHORS = new Set(["cursor[bot]", "chatgpt-codex-connector[bot]"]);
+
+function isReviewBot(username: string): boolean {
+  return CODE_REVIEW_BOT_AUTHORS.has(username);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -762,6 +773,7 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
           createdAt: parseDate(note.created_at),
           url: "",
           isBot: isBot(author),
+          isReviewBot: isReviewBot(author),
         });
       }
 
@@ -774,11 +786,14 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
         }>(approvalsRaw, `getReviewThreads approvals for MR !${pr.number}`);
 
         for (const a of approvals.approved_by ?? []) {
+          const username = a.user?.username ?? "unknown";
           reviews.push({
-            author: a.user?.username ?? "unknown",
+            author: username,
             state: "APPROVED",
             body: "",
             submittedAt: new Date(0),
+            isBot: isBot(username),
+            isReviewBot: isReviewBot(username),
           });
         }
       } catch {

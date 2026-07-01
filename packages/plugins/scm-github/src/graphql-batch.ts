@@ -650,7 +650,11 @@ export async function checkPullReviewsETag(
   const cacheKey = `${owner}/${repo}#${prNumber}`;
   const cachedETag = etagCache.pullReviews.get(cacheKey);
 
-  const url = `repos/${owner}/${repo}/pulls/${prNumber}/reviews`;
+  // per_page=100 so the ETag covers up to 100 reviews on page 1. Reviews are
+  // returned chronologically, so a newly submitted (clean) review lands within
+  // page 1 for any PR with <100 reviews and rotates the validator. Without the
+  // high per_page, the default 30/page would miss reviews on later pages.
+  const url = `repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100`;
   const args = ["api", "--method", "GET", url, "-i"];
 
   if (cachedETag) {

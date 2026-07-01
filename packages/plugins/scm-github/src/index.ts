@@ -1199,7 +1199,9 @@ function createGitHubSCM(): SCM {
           `query=query($owner: String!, $name: String!, $number: Int!) {
             repository(owner: $owner, name: $name) {
               pullRequest(number: $number) {
+                headRefOid
                 reviewThreads(last: 100) {
+                  totalCount
                   nodes {
                     id
                     isResolved
@@ -1216,12 +1218,13 @@ function createGitHubSCM(): SCM {
                     }
                   }
                 }
-                reviews(last: 5) {
+                reviews(last: 20) {
                   nodes {
                     author { login }
                     state
                     body
                     submittedAt
+                    commit { oid }
                   }
                 }
               }
@@ -1236,7 +1239,9 @@ function createGitHubSCM(): SCM {
           data: {
             repository: {
               pullRequest: {
+                headRefOid: string | null;
                 reviewThreads: {
+                  totalCount: number;
                   nodes: Array<{
                     id: string;
                     isResolved: boolean;
@@ -1259,6 +1264,7 @@ function createGitHubSCM(): SCM {
                     state: string;
                     body: string;
                     submittedAt: string;
+                    commit: { oid: string } | null;
                   }>;
                 };
               };
@@ -1266,8 +1272,14 @@ function createGitHubSCM(): SCM {
           };
         } = JSON.parse(raw);
 
-        const threadNodes = data.data.repository.pullRequest.reviewThreads.nodes;
-        const reviewNodes = data.data.repository.pullRequest.reviews.nodes;
+        const pullRequest = data.data.repository.pullRequest;
+        const threadNodes = pullRequest.reviewThreads.nodes;
+        const reviewNodes = pullRequest.reviews.nodes;
+        const headSha = pullRequest.headRefOid ?? undefined;
+        // We fetch the 100 most-recent threads; if the PR has more, an older
+        // unresolved thread may be outside the window. Flag truncation so callers
+        // don't treat an empty set as authoritatively clean.
+        const threadsTruncated = pullRequest.reviewThreads.totalCount > threadNodes.length;
 
         const threads: ReviewComment[] = threadNodes
           .filter((t) => {
@@ -1310,10 +1322,11 @@ function createGitHubSCM(): SCM {
               submittedAt: parseDate(r.submittedAt),
               isBot: BOT_AUTHORS.has(author),
               isReviewBot: CODE_REVIEW_BOT_AUTHORS.has(author),
+              commitSha: r.commit?.oid ?? undefined,
             };
           });
 
-        const result: ReviewThreadsResult = { threads, reviews };
+        const result: ReviewThreadsResult = { threads, reviews, headSha, threadsTruncated };
         reviewThreadsCache.set(cacheKey, result);
         return result;
       } catch (err) {

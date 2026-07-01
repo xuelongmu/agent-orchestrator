@@ -1173,11 +1173,25 @@ export interface ReviewSummary {
    * completion so a CI/coverage bot review does not count as the code review.
    */
   isReviewBot?: boolean;
+  /**
+   * Commit SHA the review was submitted against. Lets completion detection scope
+   * a review to the current PR head — a review of an older commit must not count
+   * as reviewing new pushes.
+   */
+  commitSha?: string;
 }
 
 export interface ReviewThreadsResult {
   threads: ReviewComment[];
   reviews: ReviewSummary[];
+  /** Current head commit SHA of the PR, when the SCM can provide it. */
+  headSha?: string;
+  /**
+   * True when the returned `threads` may be incomplete (the PR has more review
+   * threads than the plugin fetched in one page). Callers must fail closed —
+   * never treat an empty/clean thread set as authoritative — when this is set.
+   */
+  threadsTruncated?: boolean;
 }
 
 export interface AutomatedComment {
