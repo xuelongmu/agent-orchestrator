@@ -5684,6 +5684,233 @@ describe("review loop round-cap + completion detection (#4)", () => {
   });
 });
 
+describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const THROTTLE_STEP_MS = 2 * 60 * 1000 + 100;
+
+  function botThread(id: string) {
+    return {
+      id,
+      author: "chatgpt-codex-connector[bot]",
+      body: "Potential issue here",
+      path: "src/worker.ts",
+      line: 9,
+      isResolved: false,
+      createdAt: new Date(),
+      url: `https://example.com/comment/${id}`,
+      isBot: true,
+      isReviewBot: true,
+    };
+  }
+
+  /**
+   * Build a lifecycle manager for a session that will be judged STUCK: it has an
+   * open, non-mergeable PR (unresolved Codex threads) and its agent reports idle
+   * beyond the agent-stuck threshold.
+   */
+  function setupStuckSession(
+    getReviewThreads: ReturnType<typeof vi.fn>,
+    opts: { nudgeRetries?: number; withNotifier?: boolean; metaOverrides?: Record<string, string> } = {},
+  ) {
+    config.reactions = {
+      "agent-stuck": {
+        auto: true,
+        action: "notify",
+        priority: "urgent",
+        threshold: "1m",
+        ...(opts.nudgeRetries !== undefined ? { nudgeRetries: opts.nudgeRetries } : {}),
+      },
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+
+    // Idle beyond the 1m threshold → stuck; the timestamp is recomputed on every
+    // call so it stays a fixed 2 min old as the fake clock advances.
+    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
+      state: "idle" as ActivityState,
+      timestamp: new Date(Date.now() - 120_000),
+    }));
+
+    const mockSCM = createMockSCM({
+      getReviewThreads,
+      // Open, not mergeable, no formal review decision → idle-beyond-threshold
+      // resolves to STUCK (not changes_requested / mergeable).
+      enrichSessionsPRBatch: mockBatchEnrichment({
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "none",
+        mergeable: false,
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      ...(opts.withNotifier ? { notifier: createMockNotifier() } : {}),
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    return setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR(), metadata: { agent: "mock-agent" } }),
+      metaOverrides: { agent: "mock-agent", ...opts.metaOverrides },
+      registry,
+    });
+  }
+
+  it("re-delivers already-dispatched comments to a stuck agent (bypassing the fingerprint guard)", async () => {
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, { nudgeRetries: 3, withNotifier: true });
+
+    // Poll 1: session is stuck; the bugbot loop delivers the comment once.
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+
+    // Poll 2: no new comments (unchanged fingerprint) — the normal loop would
+    // stay silent, but the stuck-agent nudge re-delivers them.
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(2);
+    const nudgeMessage = vi.mocked(mockSessionManager.send).mock.calls[1][1] as string;
+    expect(nudgeMessage).toContain("unaddressed review comment");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBe("1");
+  });
+
+  it("escalates to needs_input + notify after nudgeRetries are exhausted", async () => {
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    const notifier = createMockNotifier();
+    config.reactions = {
+      "agent-stuck": {
+        auto: true,
+        action: "notify",
+        priority: "urgent",
+        threshold: "1m",
+        nudgeRetries: 2,
+      },
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
+      state: "idle" as ActivityState,
+      timestamp: new Date(Date.now() - 120_000),
+    }));
+    const mockSCM = createMockSCM({
+      getReviewThreads,
+      enrichSessionsPRBatch: mockBatchEnrichment({
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "none",
+        mergeable: false,
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR(), metadata: { agent: "mock-agent" } }),
+      metaOverrides: { agent: "mock-agent" },
+      registry,
+    });
+
+    await lm.check("app-1"); // dispatch (send #1)
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1"); // nudge 1 (send #2)
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1"); // nudge 2 (send #3)
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(3);
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBe("2");
+
+    // Next poll exhausts the budget → escalate instead of nudging again.
+    vi.mocked(recordActivityEvent).mockClear();
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(3); // no further nudge
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["stuckNudgeEscalated"]).toBe("true");
+    const kinds = vi
+      .mocked(recordActivityEvent)
+      .mock.calls.map((c) => (c[0] as { kind: string }).kind);
+    expect(kinds).toContain("reaction.escalated");
+
+    // The escalation latch parks the session in needs_input on the next poll.
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(3);
+  });
+
+  it("clears the nudge latch once the agent addresses the comments", async () => {
+    let threads: ReturnType<typeof botThread>[] = [botThread("c1")];
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({ threads, reviews: [] }));
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 1,
+      withNotifier: true,
+      // Start already-escalated (latched in needs_input) so we only verify the release path.
+      metaOverrides: {
+        stuckNudgeEscalated: "true",
+        stuckNudgeCount: "1",
+        stuckNudgeFingerprint: "stale",
+      },
+    });
+
+    // Comments resolved → the backlog is empty, so the latch and counters clear.
+    threads = [];
+    await lm.check("app-1");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["stuckNudgeEscalated"]).toBeFalsy();
+    expect(meta?.["stuckNudgeCount"]).toBeFalsy();
+  });
+
+  it("does not nudge an actively working agent that has pending comments", async () => {
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    config.reactions = {
+      "agent-stuck": { auto: true, action: "notify", threshold: "1m", nudgeRetries: 3 },
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    // Active agent — never stuck.
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR(), metadata: { agent: "mock-agent" } }),
+      metaOverrides: { agent: "mock-agent" },
+      registry,
+    });
+
+    await lm.check("app-1"); // bugbot dispatch (send #1)
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1"); // still active → no nudge
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
+  });
+});
+
 describe("summary pinning", () => {
   it("pins first quality summary when pinnedSummary not set", async () => {
     const session = makeSession({

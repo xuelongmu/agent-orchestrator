@@ -1428,6 +1428,16 @@ export interface ReactionConfig {
    * one round. Defaults to 5 for `bugbot-comments`.
    */
   maxRounds?: number;
+
+  /**
+   * Maximum number of automatic nudges to re-deliver unaddressed PR review
+   * comments to a stuck/idle agent before escalating to a human (needs_input +
+   * notify). Applies to the `agent-stuck` reaction. Each poll cycle that finds
+   * the agent still idle on the same already-delivered comments counts as one
+   * nudge. Defaults to 3. Distinct from runtime recovery, which handles dead
+   * processes rather than alive-but-idle agents.
+   */
+  nudgeRetries?: number;
 }
 
 export interface ReactionResult {
