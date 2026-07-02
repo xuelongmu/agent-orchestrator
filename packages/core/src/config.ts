@@ -159,6 +159,7 @@ const ReactionConfigSchema = z.object({
   escalateAfter: z.union([z.number(), z.string()]).optional(),
   threshold: z.string().optional(),
   includeSummary: z.boolean().optional(),
+  maxRounds: z.number().int().positive().optional(),
 });
 
 const TrackerConfigSchema = z
@@ -731,6 +732,7 @@ function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
       action: "send-to-agent",
       message: "Automated review comments found on your PR. Details will follow shortly.",
       escalateAfter: "30m",
+      maxRounds: 5,
     },
     "merge-conflicts": {
       auto: true,

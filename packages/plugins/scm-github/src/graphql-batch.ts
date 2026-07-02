@@ -60,6 +60,7 @@ export function setExecGhAsync(
 const MAX_PR_LIST_ETAGS = 100; // Number of repos to cache
 const MAX_COMMIT_STATUS_ETAGS = 500; // Number of commits to cache
 const MAX_REVIEW_COMMENTS_ETAGS = 500; // Number of PRs to cache review ETags
+const MAX_PULL_REVIEWS_ETAGS = 500; // Number of PRs to cache review-submission ETags
 const MAX_PR_METADATA = 200; // Number of PRs to cache full data
 
 /**
@@ -74,6 +75,8 @@ interface ETagCache {
   prList: LRUCache<string, string>; // Key: "owner/repo", Value: ETag
   commitStatus: LRUCache<string, string>; // Key: "owner/repo#sha", Value: ETag
   reviewComments: LRUCache<string, string>; // Key: "owner/repo#number", Value: ETag
+  pullReviews: LRUCache<string, string>; // Key: "owner/repo#number", Value: ETag
+  pullMeta: LRUCache<string, string>; // Key: "owner/repo#number", Value: ETag
 }
 
 /**
@@ -87,6 +90,8 @@ const etagCache: ETagCache = {
   prList: new LRUCache(MAX_PR_LIST_ETAGS),
   commitStatus: new LRUCache(MAX_COMMIT_STATUS_ETAGS),
   reviewComments: new LRUCache(MAX_REVIEW_COMMENTS_ETAGS),
+  pullReviews: new LRUCache(MAX_PULL_REVIEWS_ETAGS),
+  pullMeta: new LRUCache(MAX_PULL_REVIEWS_ETAGS),
 };
 
 /**
@@ -114,6 +119,8 @@ export function clearETagCache(): void {
   etagCache.prList.clear();
   etagCache.commitStatus.clear();
   etagCache.reviewComments.clear();
+  etagCache.pullReviews.clear();
+  etagCache.pullMeta.clear();
 }
 
 /**
@@ -422,6 +429,16 @@ function extractETag(output: string): string | undefined {
 }
 
 /**
+ * Whether the HTTP response advertises a `rel="next"` pagination link — i.e. the
+ * resource spans more than the requested page. Used to detect PRs whose review
+ * list exceeds one page, where a single-page ETag can't validate newer entries.
+ */
+function hasNextPageLink(output: string): boolean {
+  const match = output.match(/^link:\s*(.+)$/im);
+  return match ? /rel="next"/i.test(match[1]) : false;
+}
+
+/**
  * Guard 1: PR List ETag Check (per repo)
  *
  * Detects if PR metadata has changed in a repository using REST ETag.
@@ -622,6 +639,140 @@ export async function checkReviewCommentsETag(
       "warn",
       `[ETag Guard 3] Review comments check failed for ${cacheKey}: ${errorMsg}`,
     );
+    return true; // Assume changed to be safe
+  }
+}
+
+/**
+ * Guard 3b: Pull Reviews ETag Check (per PR)
+ *
+ * Complements Guard 3: detects changes to PR *review submissions*
+ * (GET /repos/{owner}/{repo}/pulls/{number}/reviews), which the review-comments
+ * ETag does not cover. A clean bot review with no inline comments changes the
+ * reviews resource but not the comments resource — without this guard, the
+ * cached getReviewThreads result would hide it and completion detection would
+ * never observe the review.
+ *
+ * - Cost: 0 REST points on 304, 1 REST point on 200
+ */
+export async function checkPullReviewsETag(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  observer?: BatchObserver,
+): Promise<boolean> {
+  const cacheKey = `${owner}/${repo}#${prNumber}`;
+  const cachedETag = etagCache.pullReviews.get(cacheKey);
+
+  // per_page=100 so the ETag covers up to 100 reviews on page 1. Reviews are
+  // returned chronologically, so a newly submitted (clean) review lands within
+  // page 1 for any PR with <100 reviews and rotates the validator. Without the
+  // high per_page, the default 30/page would miss reviews on later pages.
+  const url = `repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100`;
+  const args = ["api", "--method", "GET", url, "-i"];
+
+  if (cachedETag) {
+    args.push("-H", `If-None-Match: ${cachedETag}`);
+  }
+
+  try {
+    const output = await execGhAsync(args, 10_000, "gh.api.guard-pull-reviews");
+
+    if (is304(output)) {
+      const rotatedETag = extractETag(output);
+      if (rotatedETag) etagCache.pullReviews.set(cacheKey, rotatedETag);
+      return false;
+    }
+
+    // >100 review submissions span multiple pages. A page-1 ETag can't observe a
+    // newer review on a later page, so don't cache a validator — drop any prior
+    // one and force a fresh fetch every poll. (A new submission also bumps the PR
+    // updated_at, so Guard 3c backstops the exact 100→101 boundary while page 1's
+    // ETag is still cached.)
+    if (hasNextPageLink(output)) {
+      etagCache.pullReviews.delete(cacheKey);
+      return true;
+    }
+
+    const newETag = extractETag(output);
+    if (newETag) {
+      etagCache.pullReviews.set(cacheKey, newETag);
+    }
+
+    return true;
+  } catch (err) {
+    const output = extractErrorOutput(err);
+    if (output && is304(output)) {
+      const rotatedETag = extractETag(output);
+      if (rotatedETag) etagCache.pullReviews.set(cacheKey, rotatedETag);
+      return false;
+    }
+
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    if (is304(errorMsg)) {
+      return false;
+    }
+    observer?.log("warn", `[ETag Guard 3b] Pull reviews check failed for ${cacheKey}: ${errorMsg}`);
+    return true; // Assume changed to be safe
+  }
+}
+
+/**
+ * Guard 3c: Pull Request Metadata ETag Check (per PR)
+ *
+ * Detects any change to the PR resource — in particular a new HEAD commit
+ * (push/force-push), which neither the review-comments nor the review-submission
+ * ETag reflects. Without this, a push with no new comments/reviews leaves both
+ * of those validators at 304 and getReviewThreads serves a cached result with a
+ * stale headSha, defeating head-scoped completion detection.
+ *
+ * - Endpoint: GET /repos/{owner}/{repo}/pulls/{number}
+ * - Cost: 0 REST points on 304, 1 REST point on 200
+ */
+export async function checkPullRequestETag(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  observer?: BatchObserver,
+): Promise<boolean> {
+  const cacheKey = `${owner}/${repo}#${prNumber}`;
+  const cachedETag = etagCache.pullMeta.get(cacheKey);
+
+  const url = `repos/${owner}/${repo}/pulls/${prNumber}`;
+  const args = ["api", "--method", "GET", url, "-i"];
+
+  if (cachedETag) {
+    args.push("-H", `If-None-Match: ${cachedETag}`);
+  }
+
+  try {
+    const output = await execGhAsync(args, 10_000, "gh.api.guard-pull-meta");
+
+    if (is304(output)) {
+      const rotatedETag = extractETag(output);
+      if (rotatedETag) etagCache.pullMeta.set(cacheKey, rotatedETag);
+      return false;
+    }
+
+    const newETag = extractETag(output);
+    if (newETag) {
+      etagCache.pullMeta.set(cacheKey, newETag);
+    }
+
+    return true;
+  } catch (err) {
+    const output = extractErrorOutput(err);
+    if (output && is304(output)) {
+      const rotatedETag = extractETag(output);
+      if (rotatedETag) etagCache.pullMeta.set(cacheKey, rotatedETag);
+      return false;
+    }
+
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    if (is304(errorMsg)) {
+      return false;
+    }
+    observer?.log("warn", `[ETag Guard 3c] Pull metadata check failed for ${cacheKey}: ${errorMsg}`);
     return true; // Assume changed to be safe
   }
 }
