@@ -4702,6 +4702,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
       runtime: plugins.runtime,
       agent: plugins.agent,
       scm: mockSCM,
+      notifier: createMockNotifier(), // escalation latches only on delivered notify
     });
     vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
 
@@ -4737,6 +4738,44 @@ describe("review loop round-cap + completion detection (#4)", () => {
     await lm.check("app-1");
     expect(lm.getStates().get("app-1")).toBe("needs_input");
     expect(mockSessionManager.send).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not latch the escalation when no notification was delivered", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+        maxRounds: 1,
+      },
+    };
+    let currentBotId = "r1";
+    const getReviewThreads = vi.fn().mockImplementation(async () => ({
+      threads: [botThread(currentBotId)],
+      reviews: [],
+    }));
+    // No notifier registered — urgent routes to "desktop", which is missing, so
+    // notifyHuman delivers nothing. The escalation must NOT latch (it retries).
+    const mockSCM = createMockSCM({ getReviewThreads });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR() }),
+      registry,
+    });
+
+    await lm.check("app-1"); // round 1 dispatched
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    currentBotId = "r2";
+    await lm.check("app-1"); // exceeds maxRounds → escalation attempted but undelivered
+
+    // Not latched → the session is not silently parked; the next poll retries.
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundsEscalated"]).toBeFalsy();
   });
 
   it("marks the review satisfied when bot threads clear and CI is green", async () => {
@@ -4957,6 +4996,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
       runtime: plugins.runtime,
       agent: plugins.agent,
       scm: mockSCM,
+      notifier: createMockNotifier(), // escalation latches only on delivered notify
     });
     vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
 
@@ -5157,6 +5197,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
       runtime: plugins.runtime,
       agent: plugins.agent,
       scm: mockSCM,
+      notifier: createMockNotifier(), // escalation latches only on delivered notify
     });
     vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
 
@@ -5205,6 +5246,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
       runtime: plugins.runtime,
       agent: plugins.agent,
       scm: mockSCM,
+      notifier: createMockNotifier(), // escalation latches only on delivered notify
     });
     vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
 
@@ -5574,6 +5616,7 @@ describe("review loop round-cap + completion detection (#4)", () => {
       runtime: plugins.runtime,
       agent: plugins.agent,
       scm: mockSCM,
+      notifier: createMockNotifier(), // escalation latches only on delivered notify
     });
     vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
 

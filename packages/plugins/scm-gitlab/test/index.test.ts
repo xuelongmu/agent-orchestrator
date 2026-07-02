@@ -956,17 +956,68 @@ describe("scm-gitlab plugin", () => {
   // ---- getReviewThreads --------------------------------------------------
 
   describe("getReviewThreads", () => {
-    it("returns head-scoped review data (headSha + review-bot commitSha)", async () => {
+    it("head-scopes a bot review from the diff head it engaged on", async () => {
       mockGlab({ diff_refs: { head_sha: "abc123" } }); // MR head fetch
-      mockGlab([]); // discussions (none)
-      mockGlab({ approved_by: [{ user: { username: "cursor[bot]" } }] }); // approvals
+      // A cursor[bot] diff note (already resolved) carrying its engaged head_sha.
+      mockGlab([
+        {
+          id: "d1",
+          notes: [
+            {
+              id: 1,
+              author: { username: "cursor[bot]" },
+              body: "issue",
+              resolvable: true,
+              resolved: true,
+              position: { new_path: "a.ts", new_line: 3, head_sha: "abc123" },
+              created_at: "2025-01-01T00:00:00Z",
+            },
+          ],
+        },
+      ]);
+      mockGlab({ approved_by: [] }); // approvals
 
       const result = await scm.getReviewThreads(pr);
 
       expect(result.headSha).toBe("abc123");
-      const botReview = result.reviews.find((r) => r.author === "cursor[bot]");
-      expect(botReview?.isReviewBot).toBe(true);
-      expect(botReview?.commitSha).toBe("abc123"); // scoped to the current head
+      const botReview = result.reviews.find((r) => r.isReviewBot);
+      expect(botReview?.commitSha).toBe("abc123"); // derived from the note, not assumed
+      // The note was resolved, so no unresolved thread remains.
+      expect(result.threads).toHaveLength(0);
+    });
+
+    it("does not head-scope a bare GitLab approval (no commit SHA)", async () => {
+      mockGlab({ diff_refs: { head_sha: "abc123" } });
+      mockGlab([]); // no discussions
+      mockGlab({ approved_by: [{ user: { username: "cursor[bot]" } }] });
+
+      const result = await scm.getReviewThreads(pr);
+      const approval = result.reviews.find((r) => r.author === "cursor[bot]");
+      expect(approval?.isReviewBot).toBe(true);
+      // An approval carries no commit, so it must NOT be stamped onto the head.
+      expect(approval?.commitSha).toBeUndefined();
+    });
+
+    it("flags truncation when discussions fill the page", async () => {
+      mockGlab({ diff_refs: { head_sha: "abc123" } });
+      const many = Array.from({ length: 100 }, (_, i) => ({
+        id: `d${i}`,
+        notes: [
+          {
+            id: i,
+            author: { username: "human" },
+            body: "x",
+            resolvable: false,
+            resolved: false,
+            created_at: "2025-01-01T00:00:00Z",
+          },
+        ],
+      }));
+      mockGlab(many); // full page → possibly more on later pages
+      mockGlab({ approved_by: [] });
+
+      const result = await scm.getReviewThreads(pr);
+      expect(result.threadsTruncated).toBe(true);
     });
 
     it("leaves headSha undefined when the MR head cannot be read", async () => {

@@ -2547,13 +2547,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     });
     const reactionConfig = getReactionConfigForSession(session, "bugbot-comments");
 
-    // Notify FIRST, then latch. If notifier delivery throws (outage/misconfig),
-    // the latch is NOT set, so the next poll retries the escalation instead of
-    // silently parking the session in needs_input without notifying anyone.
-    // Invariant preserved: reviewRoundsEscalated is only ever set once a human
-    // has actually been notified, so an escalated (needs_input) session always
-    // has a delivered escalation behind it.
-    await notifyHuman(event, reactionConfig?.priority ?? "urgent");
+    // Notify FIRST, then latch — and ONLY latch when a notifier actually accepted
+    // the escalation. notifyHuman catches per-notifier failures (missing target /
+    // delivery error) and does not throw, so we must check its delivered result:
+    // if nothing was delivered, leave the latch unset so the next poll retries
+    // instead of silently parking the session in needs_input with no human aware.
+    // Invariant preserved: reviewRoundsEscalated is only ever set once a human has
+    // actually been notified, so an escalated (needs_input) session always has a
+    // delivered escalation behind it.
+    const delivered = await notifyHuman(event, reactionConfig?.priority ?? "urgent");
+    if (!delivered) return;
 
     updateSessionMetadata(session, { reviewRoundsEscalated: "true" });
     recordActivityEvent({
@@ -2924,7 +2927,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   /** Send a notification to all configured notifiers. */
-  async function notifyHuman(event: OrchestratorEvent, priority: EventPriority): Promise<void> {
+  /**
+   * Deliver an event to the routed notifiers. Returns true when at least one
+   * notifier accepted the event (used by callers that must not latch state on a
+   * failed/undelivered notification, e.g. the round-cap escalation).
+   */
+  async function notifyHuman(event: OrchestratorEvent, priority: EventPriority): Promise<boolean> {
     const eventWithPriority = { ...event, priority };
     // Prefer a per-project routing override (preserves a startup-only project's
     // own routing when merged into a global scope), then top-level, then default.
@@ -2934,6 +2942,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       config.notificationRouting[priority] ??
       config.defaults.notifiers;
 
+    let delivered = false;
     for (const name of notifierNames) {
       const target = resolveNotifierTarget(config, name);
       const notifier =
@@ -2955,6 +2964,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
       try {
         await notifier.notify(eventWithPriority);
+        delivered = true;
         recordNotificationDelivery({
           observer,
           event: eventWithPriority,
@@ -2975,6 +2985,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         });
       }
     }
+    return delivered;
   }
 
   /**

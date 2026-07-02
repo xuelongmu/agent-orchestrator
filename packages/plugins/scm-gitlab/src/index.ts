@@ -359,7 +359,7 @@ interface GitLabNote {
   body: string;
   resolvable: boolean;
   resolved: boolean;
-  position?: { new_path?: string; new_line?: number | null };
+  position?: { new_path?: string; new_line?: number | null; head_sha?: string };
   created_at: string;
 }
 
@@ -770,32 +770,64 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
         hostname,
         `getReviewThreads for MR !${pr.number}`,
       );
+      // fetchDiscussions caps at per_page=100. If a full page came back there may
+      // be unresolved discussions on later pages, so signal truncation and let the
+      // core loop fail closed rather than treat a clean first page as authoritative.
+      const threadsTruncated = discussions.length >= 100;
 
       // Unresolved threads — includes both human and bot comments (with isBot flag)
       const threads: ReviewComment[] = [];
+      const reviews: ReviewSummary[] = [];
+      const seenBotEngagement = new Set<string>();
       for (const d of discussions) {
-        const note = d.notes[0];
-        if (!note) continue;
-        if (!note.resolvable || note.resolved) continue;
+        for (const note of d.notes) {
+          const author = note.author?.username ?? "unknown";
+          // Head-scoped bot engagement: a review-bot diff note carries the SHA the
+          // bot actually reviewed (position.head_sha). Emit a head-scoped
+          // ReviewSummary from it — resolved OR unresolved — so a comment-only
+          // review loop still records botReviewObservedSha, and so the SHA reflects
+          // what the bot engaged with (never an assumed current head).
+          const engagedSha = note.position?.head_sha;
+          if (isReviewBot(author) && engagedSha) {
+            const key = `${author}@${engagedSha}`;
+            if (!seenBotEngagement.has(key)) {
+              seenBotEngagement.add(key);
+              reviews.push({
+                author,
+                state: "COMMENTED",
+                body: "",
+                submittedAt: parseDate(note.created_at),
+                isBot: true,
+                isReviewBot: true,
+                commitSha: engagedSha,
+              });
+            }
+          }
+        }
 
-        const author = note.author?.username ?? "unknown";
+        const first = d.notes[0];
+        if (!first) continue;
+        if (!first.resolvable || first.resolved) continue;
+        const author = first.author?.username ?? "unknown";
         threads.push({
-          id: String(note.id),
+          id: String(first.id),
           threadId: d.id,
           author,
-          body: note.body,
-          path: note.position?.new_path || undefined,
-          line: note.position?.new_line ?? undefined,
+          body: first.body,
+          path: first.position?.new_path || undefined,
+          line: first.position?.new_line ?? undefined,
           isResolved: false,
-          createdAt: parseDate(note.created_at),
+          createdAt: parseDate(first.created_at),
           url: "",
           isBot: isBot(author),
           isReviewBot: isReviewBot(author),
         });
       }
 
-      // Review summaries from approvals
-      const reviews: ReviewSummary[] = [];
+      // Approvals → reviews (for visibility). NOTE: a GitLab approval carries no
+      // commit SHA and projects may not reset approvals on push, so it is NOT
+      // head-scoped (commitSha undefined) — stamping the current head onto a
+      // possibly-stale approval would let the merge gate trust an old review.
       try {
         const approvalsRaw = await glab(["api", `${mrApiPath(pr)}/approvals`], hostname);
         const approvals = parseJSON<{
@@ -811,19 +843,13 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
             submittedAt: new Date(0),
             isBot: isBot(username),
             isReviewBot: isReviewBot(username),
-            // A GitLab approval applies to the current MR head. Scope a review
-            // bot's approval to headSha so completion detection treats it as a
-            // review of the current head. (Under the recommended "remove all
-            // approvals when commits are added" project setting, an approval
-            // present here genuinely reflects the current head.)
-            commitSha: isReviewBot(username) ? headSha : undefined,
           });
         }
       } catch {
         // Best-effort — threads are the critical data
       }
 
-      return { threads, reviews, headSha };
+      return { threads, reviews, headSha, threadsTruncated };
     },
 
     async getMergeability(pr: PRInfo): Promise<MergeReadiness> {
