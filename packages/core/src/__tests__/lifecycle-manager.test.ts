@@ -6117,6 +6117,14 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
         stuckNudgeFingerprint: "c1",
       },
     });
+    // setupCheck's writeMetadata only persists an allowlist of known keys, so the
+    // escalation latch must be injected into the metadata FILE that readMetadataRaw
+    // reads (the mocked sessionManager.get already carries it for determineStatus).
+    updateMetadata(env.sessionsDir, "app-1", {
+      stuckNudgeEscalated: "true",
+      stuckNudgeCount: "3",
+      stuckNudgeFingerprint: "c1",
+    });
 
     await lm.check("app-1");
     expect(lm.getStates().get("app-1")).toBe("needs_input");
