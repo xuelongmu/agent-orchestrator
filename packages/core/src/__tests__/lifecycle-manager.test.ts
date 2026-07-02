@@ -6017,6 +6017,66 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(nudgeMessage).not.toContain("comment/c1");
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBe("1");
   });
+
+  // Round-2 finding: a notify-only review reaction records a dispatch hash after
+  // a human notification; the nudge must NOT turn those into an agent send.
+  it("does not nudge comments whose review reaction is notify-only (opt-out preserved)", async () => {
+    const notifier = createMockNotifier();
+    config.reactions = {
+      "agent-stuck": {
+        auto: true,
+        action: "notify",
+        priority: "urgent",
+        threshold: "1m",
+        nudgeRetries: 3,
+      },
+      // bugbot-comments in watch/notify-only mode.
+      "bugbot-comments": {
+        auto: true,
+        action: "notify",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
+      state: "idle" as ActivityState,
+      timestamp: new Date(Date.now() - 120_000),
+    }));
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    const mockSCM = createMockSCM({
+      getReviewThreads,
+      enrichSessionsPRBatch: mockBatchEnrichment({
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "none",
+        mergeable: false,
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR(), metadata: { agent: "mock-agent" } }),
+      metaOverrides: {
+        agent: "mock-agent",
+        // A prior notify-only dispatch recorded the hash (surfaced to a human only).
+        lastAutomatedReviewFingerprint: "c1",
+        lastAutomatedReviewDispatchHash: "c1",
+      },
+      registry,
+    });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // Notify-only bot comments are never re-sent to the agent...
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
+    // ...and the stuck human notify is NOT deferred (no nudge path to take over).
+    expect(notifier.notify).toHaveBeenCalled();
+  });
 });
 
 describe("summary pinning", () => {

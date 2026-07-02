@@ -1983,18 +1983,33 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   /**
+   * True when the review reaction for `key` re-delivers comments to the AGENT
+   * (an enabled send-to-agent action). Notify-only or auto:false configs surface
+   * comments to humans only, so the nudge must not turn them into agent sends.
+   */
+  function reviewReactionSendsToAgent(session: Session, key: string): boolean {
+    const reaction = getReactionConfigForSession(session, key);
+    return reaction?.action === "send-to-agent" && reaction.auto !== false;
+  }
+
+  /**
    * True when the session has an open PR whose review comments were already
-   * delivered to the agent — the precondition for maybeNudgeStuckAgent to take
-   * over waking/escalating it. Used to defer the immediate agent-stuck human
-   * notify on the stuck transition so the nudge budget is spent first.
+   * delivered to the agent by a send-to-agent reaction — the precondition for
+   * maybeNudgeStuckAgent to take over waking/escalating it. Used to defer the
+   * immediate agent-stuck human notify on the stuck transition so the nudge
+   * budget is spent first. Notify-only categories are excluded: their dispatch
+   * hash is recorded after a human notification, and the nudge won't re-send
+   * them, so the human notify must still fire (not be deferred).
    */
   function hasDeliveredReviewBacklog(session: Session): boolean {
-    return (
-      !!session.pr &&
-      session.lifecycle.pr.state === "open" &&
-      (!!session.metadata["lastPendingReviewDispatchHash"] ||
-        !!session.metadata["lastAutomatedReviewDispatchHash"])
-    );
+    if (!session.pr || session.lifecycle.pr.state !== "open") return false;
+    const botDelivered =
+      !!session.metadata["lastAutomatedReviewDispatchHash"] &&
+      reviewReactionSendsToAgent(session, "bugbot-comments");
+    const humanDelivered =
+      !!session.metadata["lastPendingReviewDispatchHash"] &&
+      reviewReactionSendsToAgent(session, "changes-requested");
+    return botDelivered || humanDelivered;
   }
 
   async function maybeDispatchReviewBacklog(
@@ -2073,6 +2088,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // force a fresh fetch below) so the agent/human resolving the comments
     // clears the latch without waiting out the throttle.
     const stuckNudgeEscalated = session.metadata["stuckNudgeEscalated"] === "true";
+    // While actively spending the nudge budget on an idle-beyond-threshold agent
+    // with already-delivered comments, force a fresh (cache-bypassing) fetch below
+    // so a comment the agent resolved via a GraphQL-only isResolved change is seen
+    // this cycle rather than counted as still-unresolved — otherwise a stale cache
+    // would burn nudges or escalate unnecessarily. This does not bypass the
+    // throttle (fetch cadence is unchanged); it only upgrades the fetch to fresh.
+    const idleSignalForFetch = session.activitySignal;
+    const nudgeInProgress =
+      hasPositiveIdleEvidence(idleSignalForFetch) &&
+      isIdleBeyondThreshold(session, idleSignalForFetch.timestamp) &&
+      hasDeliveredReviewBacklog(session);
     if (
       !hasRelevantTransition &&
       !readyForReviewRecheck &&
@@ -2091,7 +2117,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // unresolved is a GraphQL-only isResolved change that REST 304s would hide,
     // leaving the merge-ready latch stale).
     const forceFreshFetch =
-      readyForReviewRecheck || roundEscalated || revalidateSatisfied || stuckNudgeEscalated;
+      readyForReviewRecheck ||
+      roundEscalated ||
+      revalidateSatisfied ||
+      stuckNudgeEscalated ||
+      nudgeInProgress;
     // Single GraphQL call for all review threads (human + bot) + review summaries.
     // Split locally by isBot for separate reaction pipelines.
     let allThreads: ReviewComment[];
@@ -2527,6 +2557,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     if (session.metadata["reviewRoundsEscalated"] === "true") return;
     if (session.metadata["stuckNudgeEscalated"] === "true") return;
 
+    // Preserve each review reaction's own opt-out. The dispatch hash is recorded
+    // whenever a category's reaction fires — including notify-only or auto:false
+    // configs where the comments were only surfaced to a human, never sent to the
+    // agent. Re-delivering those to the agent would bypass the opt-out, so only
+    // nudge a category whose reaction is an enabled send-to-agent action.
+    const pendingSendable = reviewReactionSendsToAgent(session, "changes-requested");
+    const automatedSendable = reviewReactionSendsToAgent(session, "bugbot-comments");
+
     // Only nudge comments the agent has ALREADY received. Fresh comments were
     // just delivered by the dispatch blocks above this cycle — the normal path
     // handles those. Treat a backlog whose IDs are all a SUBSET of a previously
@@ -2536,9 +2574,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const priorPendingIds = splitFingerprintIds(ctx.priorPendingDispatchHash);
     const priorAutomatedIds = splitFingerprintIds(ctx.priorAutomatedDispatchHash);
     const pendingAlreadyDelivered =
-      pendingComments.length > 0 && pendingComments.every((c) => priorPendingIds.has(c.id));
+      pendingSendable &&
+      pendingComments.length > 0 &&
+      pendingComments.every((c) => priorPendingIds.has(c.id));
     const automatedAlreadyDelivered =
-      automatedComments.length > 0 && automatedComments.every((c) => priorAutomatedIds.has(c.id));
+      automatedSendable &&
+      automatedComments.length > 0 &&
+      automatedComments.every((c) => priorAutomatedIds.has(c.id));
     if (!pendingAlreadyDelivered && !automatedAlreadyDelivered) return;
 
     const nudgeRetries = stuckReaction?.nudgeRetries ?? DEFAULT_STUCK_NUDGE_RETRIES;
