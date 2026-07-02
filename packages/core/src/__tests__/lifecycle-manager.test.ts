@@ -6077,6 +6077,52 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     // ...and the stuck human notify is NOT deferred (no nudge path to take over).
     expect(notifier.notify).toHaveBeenCalled();
   });
+
+  // Round-2 finding: deferring off stale dispatch hashes must not lose the alert.
+  // If the agent resolved every thread since the last fetch, the deferred stuck
+  // notify must still fire (the transition suppressed it).
+  it("fires the deferred stuck notify when the delivered backlog turns out resolved", async () => {
+    const notifier = createMockNotifier();
+    // Stale hash from a prior delivery, but every thread is now resolved (empty fetch).
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 3,
+      notifier,
+      metaOverrides: {
+        lastAutomatedReviewFingerprint: "c1",
+        lastAutomatedReviewDispatchHash: "c1",
+      },
+    });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // Nothing to nudge → no agent send, but the human IS alerted (alert not lost).
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(notifier.notify).toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
+  });
+
+  // Round-2 finding: an empty but TRUNCATED page is not trustworthy as clean —
+  // an unresolved thread may lie off-page, so the escalation latch must hold.
+  it("fails closed on a truncated empty page (preserves the needs_input latch)", async () => {
+    const getReviewThreads = vi
+      .fn()
+      .mockResolvedValue({ threads: [], reviews: [], threadsTruncated: true });
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 3,
+      withNotifier: true,
+      metaOverrides: {
+        stuckNudgeEscalated: "true",
+        stuckNudgeCount: "3",
+        stuckNudgeFingerprint: "c1",
+      },
+    });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("needs_input");
+    // Truncated → do NOT declare clean; the escalation latch is preserved.
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeEscalated"]).toBe("true");
+  });
 });
 
 describe("summary pinning", () => {
