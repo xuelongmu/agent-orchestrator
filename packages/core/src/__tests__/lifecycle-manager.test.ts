@@ -21,6 +21,7 @@ import type {
   SessionStatus,
   SessionMetadata,
   PRInfo,
+  SCM,
 } from "../types.js";
 import {
   createTestEnvironment,
@@ -5716,8 +5717,12 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
    * beyond the agent-stuck threshold.
    */
   function setupStuckSession(
-    getReviewThreads: ReturnType<typeof vi.fn>,
-    opts: { nudgeRetries?: number; withNotifier?: boolean; metaOverrides?: Record<string, string> } = {},
+    getReviewThreads: SCM["getReviewThreads"],
+    opts: {
+      nudgeRetries?: number;
+      withNotifier?: boolean;
+      metaOverrides?: Record<string, string>;
+    } = {},
   ) {
     config.reactions = {
       "agent-stuck": {
