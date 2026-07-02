@@ -61,6 +61,17 @@ function isBot(username: string): boolean {
   );
 }
 
+/**
+ * Automated *code reviewers* (Codex/Cursor) — a strict subset of bots. Lets
+ * review-loop completion recognize the intended reviewer on GitLab MRs, so a
+ * clean bot-reviewed MR can be marked satisfied (mirrors the GitHub plugin).
+ */
+const CODE_REVIEW_BOT_AUTHORS = new Set(["cursor[bot]", "chatgpt-codex-connector[bot]"]);
+
+function isReviewBot(username: string): boolean {
+  return CODE_REVIEW_BOT_AUTHORS.has(username);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -348,7 +359,7 @@ interface GitLabNote {
   body: string;
   resolvable: boolean;
   resolved: boolean;
-  position?: { new_path?: string; new_line?: number | null };
+  position?: { new_path?: string; new_line?: number | null; head_sha?: string };
   created_at: string;
 }
 
@@ -737,36 +748,86 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
 
     async getReviewThreads(pr: PRInfo): Promise<ReviewThreadsResult> {
       const hostname = resolveHostname(pr);
+
+      // Fetch the MR head SHA so completion detection can head-scope reviews the
+      // same way the GitHub plugin does. Best-effort: without it, satisfaction
+      // fails closed (defers to the merge gate) rather than emitting a possibly
+      // stale clean signal.
+      let headSha: string | undefined;
+      try {
+        const mrRaw = await glab(["api", mrApiPath(pr)], hostname);
+        const mrData = parseJSON<{ sha?: string; diff_refs?: { head_sha?: string } }>(
+          mrRaw,
+          `getReviewThreads MR head for MR !${pr.number}`,
+        );
+        headSha = mrData.diff_refs?.head_sha ?? mrData.sha ?? undefined;
+      } catch {
+        // Best-effort — leave headSha undefined (satisfaction fails closed).
+      }
+
       const discussions = await fetchDiscussions(
         pr,
         hostname,
         `getReviewThreads for MR !${pr.number}`,
       );
+      // fetchDiscussions caps at per_page=100. If a full page came back there may
+      // be unresolved discussions on later pages, so signal truncation and let the
+      // core loop fail closed rather than treat a clean first page as authoritative.
+      const threadsTruncated = discussions.length >= 100;
 
       // Unresolved threads — includes both human and bot comments (with isBot flag)
       const threads: ReviewComment[] = [];
+      const reviews: ReviewSummary[] = [];
+      const seenBotEngagement = new Set<string>();
       for (const d of discussions) {
-        const note = d.notes[0];
-        if (!note) continue;
-        if (!note.resolvable || note.resolved) continue;
+        for (const note of d.notes) {
+          const author = note.author?.username ?? "unknown";
+          // Head-scoped bot engagement: a review-bot diff note carries the SHA the
+          // bot actually reviewed (position.head_sha). Emit a head-scoped
+          // ReviewSummary from it — resolved OR unresolved — so a comment-only
+          // review loop still records botReviewObservedSha, and so the SHA reflects
+          // what the bot engaged with (never an assumed current head).
+          const engagedSha = note.position?.head_sha;
+          if (isReviewBot(author) && engagedSha) {
+            const key = `${author}@${engagedSha}`;
+            if (!seenBotEngagement.has(key)) {
+              seenBotEngagement.add(key);
+              reviews.push({
+                author,
+                state: "COMMENTED",
+                body: "",
+                submittedAt: parseDate(note.created_at),
+                isBot: true,
+                isReviewBot: true,
+                commitSha: engagedSha,
+              });
+            }
+          }
+        }
 
-        const author = note.author?.username ?? "unknown";
+        const first = d.notes[0];
+        if (!first) continue;
+        if (!first.resolvable || first.resolved) continue;
+        const author = first.author?.username ?? "unknown";
         threads.push({
-          id: String(note.id),
+          id: String(first.id),
           threadId: d.id,
           author,
-          body: note.body,
-          path: note.position?.new_path || undefined,
-          line: note.position?.new_line ?? undefined,
+          body: first.body,
+          path: first.position?.new_path || undefined,
+          line: first.position?.new_line ?? undefined,
           isResolved: false,
-          createdAt: parseDate(note.created_at),
+          createdAt: parseDate(first.created_at),
           url: "",
           isBot: isBot(author),
+          isReviewBot: isReviewBot(author),
         });
       }
 
-      // Review summaries from approvals
-      const reviews: ReviewSummary[] = [];
+      // Approvals → reviews (for visibility). NOTE: a GitLab approval carries no
+      // commit SHA and projects may not reset approvals on push, so it is NOT
+      // head-scoped (commitSha undefined) — stamping the current head onto a
+      // possibly-stale approval would let the merge gate trust an old review.
       try {
         const approvalsRaw = await glab(["api", `${mrApiPath(pr)}/approvals`], hostname);
         const approvals = parseJSON<{
@@ -774,18 +835,21 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
         }>(approvalsRaw, `getReviewThreads approvals for MR !${pr.number}`);
 
         for (const a of approvals.approved_by ?? []) {
+          const username = a.user?.username ?? "unknown";
           reviews.push({
-            author: a.user?.username ?? "unknown",
+            author: username,
             state: "APPROVED",
             body: "",
             submittedAt: new Date(0),
+            isBot: isBot(username),
+            isReviewBot: isReviewBot(username),
           });
         }
       } catch {
         // Best-effort — threads are the critical data
       }
 
-      return { threads, reviews };
+      return { threads, reviews, headSha, threadsTruncated };
     },
 
     async getMergeability(pr: PRInfo): Promise<MergeReadiness> {

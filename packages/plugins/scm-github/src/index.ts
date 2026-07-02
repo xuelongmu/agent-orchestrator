@@ -38,6 +38,8 @@ import {
 import {
   enrichSessionsPRBatch as enrichSessionsPRBatchImpl,
   checkReviewCommentsETag,
+  checkPullReviewsETag,
+  checkPullRequestETag,
 } from "./graphql-batch.js";
 import {
   getWebhookHeader,
@@ -62,6 +64,13 @@ const BOT_AUTHORS = new Set([
   "lgtm-com[bot]",
   "chatgpt-codex-connector[bot]",
 ]);
+
+/**
+ * Automated *code reviewers* — a strict subset of BOT_AUTHORS. Excludes CI,
+ * coverage, security, and dependency bots so review-loop completion is gated on
+ * the intended reviewer (Codex/Cursor), not any bot that happens to comment.
+ */
+const CODE_REVIEW_BOT_AUTHORS = new Set(["cursor[bot]", "chatgpt-codex-connector[bot]"]);
 
 const CI_FAILURE_LOG_TAIL_LINES = 120;
 const ciSummaryFailClosedEmitted = new Set<string>();
@@ -1153,19 +1162,30 @@ function createGitHubSCM(): SCM {
       });
     },
 
-    async getReviewThreads(pr: PRInfo): Promise<ReviewThreadsResult> {
+    async getReviewThreads(
+      pr: PRInfo,
+      options?: { forceFresh?: boolean },
+    ): Promise<ReviewThreadsResult> {
       const cacheKey = `${pr.owner}/${pr.repo}#${pr.number}`;
 
-      // Guard 3: check if review comments changed via REST ETag
-      const reviewsChanged = await checkReviewCommentsETag(
-        pr.owner,
-        pr.repo,
-        pr.number,
-        instanceObserver,
-      );
-      if (!reviewsChanged) {
-        const cached = reviewThreadsCache.get(cacheKey);
-        if (cached) return cached;
+      // forceFresh bypasses both ETag guards and the response cache. Required
+      // when the caller must see GraphQL-only changes (thread resolution) that
+      // no REST ETag reflects — e.g. after the agent resolves comments.
+      if (!options?.forceFresh) {
+        // Guard 3: inline review comments changed? Guard 3b: review submissions
+        // changed? Guard 3c: PR metadata (esp. a new HEAD commit) changed? A clean
+        // review moves only the reviews resource, and a bare push moves only the
+        // PR head — so all three must be 304 before serving the cache, otherwise
+        // a stale headSha/thread set would defeat head-scoped completion.
+        const [commentsChanged, pullReviewsChanged, pullMetaChanged] = await Promise.all([
+          checkReviewCommentsETag(pr.owner, pr.repo, pr.number, instanceObserver),
+          checkPullReviewsETag(pr.owner, pr.repo, pr.number, instanceObserver),
+          checkPullRequestETag(pr.owner, pr.repo, pr.number, instanceObserver),
+        ]);
+        if (!commentsChanged && !pullReviewsChanged && !pullMetaChanged) {
+          const cached = reviewThreadsCache.get(cacheKey);
+          if (cached) return cached;
+        }
       }
 
       try {
@@ -1183,7 +1203,9 @@ function createGitHubSCM(): SCM {
           `query=query($owner: String!, $name: String!, $number: Int!) {
             repository(owner: $owner, name: $name) {
               pullRequest(number: $number) {
+                headRefOid
                 reviewThreads(last: 100) {
+                  totalCount
                   nodes {
                     id
                     isResolved
@@ -1200,12 +1222,13 @@ function createGitHubSCM(): SCM {
                     }
                   }
                 }
-                reviews(last: 5) {
+                reviews(last: 20) {
                   nodes {
                     author { login }
                     state
                     body
                     submittedAt
+                    commit { oid }
                   }
                 }
               }
@@ -1220,7 +1243,9 @@ function createGitHubSCM(): SCM {
           data: {
             repository: {
               pullRequest: {
+                headRefOid: string | null;
                 reviewThreads: {
+                  totalCount: number;
                   nodes: Array<{
                     id: string;
                     isResolved: boolean;
@@ -1243,6 +1268,7 @@ function createGitHubSCM(): SCM {
                     state: string;
                     body: string;
                     submittedAt: string;
+                    commit: { oid: string } | null;
                   }>;
                 };
               };
@@ -1250,8 +1276,14 @@ function createGitHubSCM(): SCM {
           };
         } = JSON.parse(raw);
 
-        const threadNodes = data.data.repository.pullRequest.reviewThreads.nodes;
-        const reviewNodes = data.data.repository.pullRequest.reviews.nodes;
+        const pullRequest = data.data.repository.pullRequest;
+        const threadNodes = pullRequest.reviewThreads.nodes;
+        const reviewNodes = pullRequest.reviews.nodes;
+        const headSha = pullRequest.headRefOid ?? undefined;
+        // We fetch the 100 most-recent threads; if the PR has more, an older
+        // unresolved thread may be outside the window. Flag truncation so callers
+        // don't treat an empty set as authoritatively clean.
+        const threadsTruncated = pullRequest.reviewThreads.totalCount > threadNodes.length;
 
         const threads: ReviewComment[] = threadNodes
           .filter((t) => {
@@ -1273,22 +1305,41 @@ function createGitHubSCM(): SCM {
               createdAt: parseDate(c.createdAt),
               url: c.url,
               isBot: BOT_AUTHORS.has(author),
+              isReviewBot: CODE_REVIEW_BOT_AUTHORS.has(author),
             };
           });
 
         const reviews: ReviewSummary[] = reviewNodes
-          .filter((r) => r.body && r.body.trim().length > 0)
-          .map((r) => ({
-            author: r.author?.login ?? "unknown",
-            state: r.state,
-            body: r.body,
-            submittedAt: parseDate(r.submittedAt),
-          }));
+          // Keep non-empty human reviews for display, and ALL bot reviews (even
+          // with an empty body) so completion detection can recognize a clean,
+          // no-inline-comment bot review as a real review-submission signal.
+          .filter((r) => {
+            const author = r.author?.login ?? "unknown";
+            return (r.body && r.body.trim().length > 0) || BOT_AUTHORS.has(author);
+          })
+          .map((r) => {
+            const author = r.author?.login ?? "unknown";
+            return {
+              author,
+              state: r.state,
+              body: r.body,
+              submittedAt: parseDate(r.submittedAt),
+              isBot: BOT_AUTHORS.has(author),
+              isReviewBot: CODE_REVIEW_BOT_AUTHORS.has(author),
+              commitSha: r.commit?.oid ?? undefined,
+            };
+          });
 
-        const result: ReviewThreadsResult = { threads, reviews };
+        const result: ReviewThreadsResult = { threads, reviews, headSha, threadsTruncated };
         reviewThreadsCache.set(cacheKey, result);
         return result;
       } catch (err) {
+        // The ETag guards already advanced their validators before this GraphQL
+        // refresh ran, so on the next poll all three can return 304. Drop any
+        // cached ReviewThreadsResult so that poll re-fetches instead of serving
+        // stale threads/reviews (a newly submitted clean review or new head SHA
+        // would otherwise stay hidden until an unrelated PR change occurs).
+        reviewThreadsCache.delete(cacheKey);
         const errorMsg = err instanceof Error ? err.message : String(err);
         instanceObserver?.log("warn", `[getReviewThreads] Failed for ${cacheKey}: ${errorMsg}`);
         throw new Error("Failed to fetch review threads", { cause: err });
