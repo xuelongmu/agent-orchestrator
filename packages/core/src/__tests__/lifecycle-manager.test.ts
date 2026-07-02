@@ -5712,21 +5712,27 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
   }
 
   /**
-   * Build a lifecycle manager for a session that will be judged STUCK: it has an
-   * open, non-mergeable PR (unresolved Codex threads) and its agent reports idle
-   * beyond the agent-stuck threshold.
+   * Build a lifecycle manager for a session whose agent is idle beyond the
+   * agent-stuck threshold and whose PR has unresolved Codex threads. By default
+   * the PR resolves to STUCK (open, non-mergeable, no formal review), but callers
+   * can pass an `enrichment` override to exercise the overlay statuses
+   * (review_pending, changes_requested, mergeable, …) where the agent is still
+   * idle-beyond-threshold but never surfaces as legacy `stuck`.
    */
   function setupStuckSession(
     getReviewThreads: SCM["getReviewThreads"],
     opts: {
       nudgeRetries?: number;
       withNotifier?: boolean;
+      stuckAuto?: boolean;
       metaOverrides?: Record<string, string>;
+      notifier?: ReturnType<typeof createMockNotifier>;
+      enrichment?: Parameters<typeof mockBatchEnrichment>[0];
     } = {},
   ) {
     config.reactions = {
       "agent-stuck": {
-        auto: true,
+        auto: opts.stuckAuto ?? true,
         action: "notify",
         priority: "urgent",
         threshold: "1m",
@@ -5739,8 +5745,8 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
       },
     };
 
-    // Idle beyond the 1m threshold → stuck; the timestamp is recomputed on every
-    // call so it stays a fixed 2 min old as the fake clock advances.
+    // Idle beyond the 1m threshold; the timestamp is recomputed on every call so
+    // it stays a fixed 2 min old as the fake clock advances.
     vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
       state: "idle" as ActivityState,
       timestamp: new Date(Date.now() - 120_000),
@@ -5748,20 +5754,21 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
 
     const mockSCM = createMockSCM({
       getReviewThreads,
-      // Open, not mergeable, no formal review decision → idle-beyond-threshold
-      // resolves to STUCK (not changes_requested / mergeable).
-      enrichSessionsPRBatch: mockBatchEnrichment({
-        state: "open",
-        ciStatus: "passing",
-        reviewDecision: "none",
-        mergeable: false,
-      }),
+      enrichSessionsPRBatch: mockBatchEnrichment(
+        opts.enrichment ?? {
+          state: "open",
+          ciStatus: "passing",
+          reviewDecision: "none",
+          mergeable: false,
+        },
+      ),
     });
+    const notifier = opts.notifier ?? (opts.withNotifier ? createMockNotifier() : undefined);
     const registry = createMockRegistry({
       runtime: plugins.runtime,
       agent: plugins.agent,
       scm: mockSCM,
-      ...(opts.withNotifier ? { notifier: createMockNotifier() } : {}),
+      ...(notifier ? { notifier } : {}),
     });
     vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
 
@@ -5913,6 +5920,102 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     await lm.check("app-1"); // still active → no nudge
     expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
+  });
+
+  // Finding #1: nudge must fire for an idle-beyond-threshold agent even when the
+  // PR resolves to an overlay status (never legacy `stuck`).
+  it("nudges an idle agent whose PR is in an overlay status (review_pending), not just stuck", async () => {
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    // reviewDecision "pending" → resolveOpenPRDecision returns review_pending
+    // BEFORE it would ever escalate idle→stuck, so newStatus is never "stuck".
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 3,
+      withNotifier: true,
+      enrichment: { state: "open", ciStatus: "passing", reviewDecision: "pending", mergeable: false },
+    });
+
+    await lm.check("app-1"); // bugbot delivers the comment once
+    expect(lm.getStates().get("app-1")).toBe("review_pending");
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    // Still review_pending (never stuck), yet the idle-beyond-threshold agent is nudged.
+    expect(lm.getStates().get("app-1")).toBe("review_pending");
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(2);
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBe("1");
+  });
+
+  // Finding #2: the immediate agent-stuck notify must be deferred when the nudge
+  // path will handle the session (PR comments already delivered before it stuck).
+  it("defers the agent-stuck human notify to the nudge path when comments were already delivered", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    // Simulate a prior poll having already dispatched the comment (hash set),
+    // then the session goes stuck this poll.
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 3,
+      notifier,
+      metaOverrides: {
+        lastAutomatedReviewFingerprint: "c1",
+        lastAutomatedReviewDispatchHash: "c1",
+      },
+    });
+
+    await lm.check("app-1"); // pr_open → stuck transition
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // The stuck transition notify is suppressed — the nudge (send-to-agent) fires instead.
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBe("1");
+  });
+
+  // Finding #3: agent-stuck configured with auto:false must NOT message the agent.
+  it("does not nudge when the agent-stuck reaction is disabled (auto:false)", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    // Comments already delivered so bugbot won't re-dispatch — isolates the nudge.
+    const lm = setupStuckSession(getReviewThreads, {
+      stuckAuto: false,
+      notifier,
+      metaOverrides: {
+        lastAutomatedReviewFingerprint: "c1",
+        lastAutomatedReviewDispatchHash: "c1",
+      },
+    });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // No automatic agent message; auto:false routes stuck handling to humans, so
+    // the transition notify still fires.
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
+    expect(notifier.notify).toHaveBeenCalled();
+  });
+
+  // Finding #4: a backlog that is a SUBSET of a previously delivered batch (the
+  // agent resolved part of it) is still "already delivered" and must be nudged.
+  it("nudges a partially-addressed backlog (subset of the delivered batch)", async () => {
+    // AO previously dispatched {c1,c2}; the agent resolved c1, leaving {c2}.
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c2")], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 3,
+      withNotifier: true,
+      metaOverrides: {
+        lastAutomatedReviewFingerprint: "c1,c2",
+        lastAutomatedReviewDispatchHash: "c1,c2",
+      },
+    });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // The remaining subset {c2} is re-delivered even though its fingerprint no
+    // longer equals the prior dispatch hash "c1,c2".
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+    const nudgeMessage = vi.mocked(mockSessionManager.send).mock.calls[0][1] as string;
+    expect(nudgeMessage).toContain("comment/c2");
+    expect(nudgeMessage).not.toContain("comment/c1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBe("1");
   });
 });
 

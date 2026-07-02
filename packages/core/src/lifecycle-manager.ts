@@ -1977,6 +1977,26 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return [...ids].sort().join(",");
   }
 
+  /** Parse a comma-joined fingerprint (see makeFingerprint) back into an ID set. */
+  function splitFingerprintIds(fingerprint: string): Set<string> {
+    return new Set(fingerprint ? fingerprint.split(",") : []);
+  }
+
+  /**
+   * True when the session has an open PR whose review comments were already
+   * delivered to the agent — the precondition for maybeNudgeStuckAgent to take
+   * over waking/escalating it. Used to defer the immediate agent-stuck human
+   * notify on the stuck transition so the nudge budget is spent first.
+   */
+  function hasDeliveredReviewBacklog(session: Session): boolean {
+    return (
+      !!session.pr &&
+      session.lifecycle.pr.state === "open" &&
+      (!!session.metadata["lastPendingReviewDispatchHash"] ||
+        !!session.metadata["lastAutomatedReviewDispatchHash"])
+    );
+  }
+
   async function maybeDispatchReviewBacklog(
     session: Session,
     _oldStatus: SessionStatus,
@@ -2432,7 +2452,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
 
     // --- Auto-nudge a stuck/idle agent sitting on already-delivered comments ---
-    await maybeNudgeStuckAgent(session, newStatus, {
+    await maybeNudgeStuckAgent(session, {
       pendingComments,
       automatedComments,
       reviewSummaries,
@@ -2458,7 +2478,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    */
   async function maybeNudgeStuckAgent(
     session: Session,
-    newStatus: SessionStatus,
     ctx: {
       pendingComments: ReviewComment[];
       automatedComments: ReviewComment[];
@@ -2487,32 +2506,54 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       return;
     }
 
-    // Only nudge a stuck/idle agent. An actively-working agent will pick the
-    // comments up on its own; the bot round-cap latch owns its own escalation.
-    if (newStatus !== SESSION_STATUS.STUCK) return;
+    const stuckReaction = getReactionConfigForSession(session, "agent-stuck");
+    // Honor `auto: false`: installations that route stuck handling only to
+    // humans must not have their agents messaged automatically. The transition
+    // handler still emits the human-facing notify for the stuck reaction.
+    if (stuckReaction?.auto === false) return;
+
+    // Gate on idle-beyond-threshold, NOT the derived legacy status. An agent
+    // that is idle past the agent-stuck threshold but whose PR resolves to an
+    // overlay status (changes_requested, review_pending, mergeable, approved,
+    // ci_failed) never surfaces as `stuck`, yet it is exactly the alive-but-idle
+    // agent this nudge targets. resolveOpenPRDecision returns those overlays
+    // before it would escalate idle→stuck, so keying on the status would miss
+    // the common cases. session.activitySignal is the signal determineStatus
+    // committed this poll. An actively-working agent has no positive idle
+    // evidence, so it is never nudged.
+    const idleSignal = session.activitySignal;
+    if (!hasPositiveIdleEvidence(idleSignal)) return;
+    if (!isIdleBeyondThreshold(session, idleSignal.timestamp)) return;
     if (session.metadata["reviewRoundsEscalated"] === "true") return;
     if (session.metadata["stuckNudgeEscalated"] === "true") return;
 
     // Only nudge comments the agent has ALREADY received. Fresh comments were
-    // just delivered by the dispatch blocks above this cycle — don't double-send.
-    const pendingFingerprint = makeFingerprint(pendingComments.map((c) => c.id));
-    const automatedFingerprint = makeFingerprint(automatedComments.map((c) => c.id));
+    // just delivered by the dispatch blocks above this cycle — the normal path
+    // handles those. Treat a backlog whose IDs are all a SUBSET of a previously
+    // dispatched batch as already-delivered so that partial resolution (e.g. the
+    // agent resolved c1 of a dispatched {c1,c2}, leaving {c2}) still nudges and
+    // can reach exhaustion escalation, rather than silently receiving nothing.
+    const priorPendingIds = splitFingerprintIds(ctx.priorPendingDispatchHash);
+    const priorAutomatedIds = splitFingerprintIds(ctx.priorAutomatedDispatchHash);
     const pendingAlreadyDelivered =
-      pendingComments.length > 0 && pendingFingerprint === ctx.priorPendingDispatchHash;
+      pendingComments.length > 0 && pendingComments.every((c) => priorPendingIds.has(c.id));
     const automatedAlreadyDelivered =
-      automatedComments.length > 0 && automatedFingerprint === ctx.priorAutomatedDispatchHash;
+      automatedComments.length > 0 && automatedComments.every((c) => priorAutomatedIds.has(c.id));
     if (!pendingAlreadyDelivered && !automatedAlreadyDelivered) return;
 
-    const stuckReaction = getReactionConfigForSession(session, "agent-stuck");
     const nudgeRetries = stuckReaction?.nudgeRetries ?? DEFAULT_STUCK_NUDGE_RETRIES;
 
-    // Budget is per distinct backlog: a changed comment set resets the count so
-    // the agent gets a fresh set of nudges for genuinely new work.
-    const backlogFingerprint = makeFingerprint(
-      [...pendingComments, ...automatedComments].map((c) => c.id),
-    );
-    const sameBacklog = session.metadata["stuckNudgeFingerprint"] === backlogFingerprint;
-    const nudgeCount = sameBacklog ? parseAttemptCount(session.metadata["stuckNudgeCount"]) : 0;
+    // Budget accrues across a shrinking backlog: the count resets to 0 only when
+    // genuinely NEW comment IDs appear (fresh work), not when the agent resolves
+    // part of the batch — otherwise resolving one comment per poll would refill
+    // the budget forever and exhaustion escalation could never fire.
+    const currentBacklog = [...pendingComments, ...automatedComments];
+    const lastNudgedIds = splitFingerprintIds(session.metadata["stuckNudgeFingerprint"] ?? "");
+    const newContentSinceLastNudge = currentBacklog.some((c) => !lastNudgedIds.has(c.id));
+    const backlogFingerprint = makeFingerprint(currentBacklog.map((c) => c.id));
+    const nudgeCount = newContentSinceLastNudge
+      ? 0
+      : parseAttemptCount(session.metadata["stuckNudgeCount"]);
 
     if (nudgeCount >= nudgeRetries) {
       // Nudges exhausted — escalate to needs_input + notify. The latch parks the
@@ -3677,7 +3718,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         let reactionHandledNotify = false;
         const reactionKey = eventToReactionKey(eventType);
 
-        if (reactionKey) {
+        // Defer the agent-stuck human notify when the auto-nudge path will handle
+        // this session: an open PR with already-delivered review comments means
+        // maybeDispatchReviewBacklog (later this poll) re-delivers them and
+        // escalates to needs_input only if the nudge budget is exhausted. Firing
+        // notify here would alert a human on the very first stuck poll, defeating
+        // the budget. Only defer the plain `notify` action with auto enabled —
+        // a send-to-agent override already wakes the agent, and auto:false routes
+        // stuck handling to humans (notify must stand).
+        const stuckReactionConfig =
+          reactionKey === "agent-stuck" ? getReactionConfigForSession(session, "agent-stuck") : null;
+        const deferStuckNotifyToNudge =
+          stuckReactionConfig?.action === "notify" &&
+          stuckReactionConfig.auto !== false &&
+          hasDeliveredReviewBacklog(session);
+
+        if (reactionKey && !deferStuckNotifyToNudge) {
           let reactionConfig = getReactionConfigForSession(session, reactionKey);
           let messageEnriched = false;
 
@@ -3736,6 +3792,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
               reactionHandledNotify = true;
             }
           }
+        }
+
+        // Deferring the stuck notify to the nudge path also suppresses the
+        // fall-through human notify below — the nudge (or its exhaustion
+        // escalation) is now the notification authority for this session.
+        if (deferStuckNotifyToNudge) {
+          reactionHandledNotify = true;
         }
 
         // For transitions not already notified by a reaction, notify humans.
