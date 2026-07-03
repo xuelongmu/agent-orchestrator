@@ -6320,6 +6320,179 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(notifier.notify).toHaveBeenCalled();
     expect(mockSessionManager.send).not.toHaveBeenCalled();
   });
+
+  // Round-6 finding (id 3521778850): a `stuck` status reached for a NON-idle reason
+  // (dead/unprobeable runtime) must NOT be deferred — the nudge path only emits its
+  // fallback for isStuckByIdle() sessions, so deferring would drop the alert.
+  it("does not defer the stuck notify for a non-idle (probe-failure) stuck transition", async () => {
+    const notifier = createMockNotifier();
+    config.reactions = {
+      "agent-stuck": { auto: true, action: "notify", priority: "urgent", threshold: "1m" },
+    };
+    // Runtime + process probes fail while activity is "active" (NOT idle) and the
+    // detecting budget is already spent → the escalation to stuck is a probe failure,
+    // so isStuckByIdle() is false.
+    vi.mocked(plugins.runtime.isAlive).mockResolvedValue(false);
+    vi.mocked(plugins.agent.isProcessRunning).mockResolvedValue(false);
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({
+      state: "active" as ActivityState,
+      timestamp: new Date(Date.now() - 30_000),
+    });
+    const mockSCM = createMockSCM({
+      getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [] }),
+      enrichSessionsPRBatch: mockBatchEnrichment({
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "none",
+        mergeable: false,
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+    const session = makeSession({
+      status: "pr_open",
+      pr: makePR(),
+      metadata: { agent: "mock-agent", detectingAttempts: "3" },
+    });
+    session.lifecycle.pr.state = "open";
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { agent: "mock-agent", detectingAttempts: "3" },
+      registry,
+    });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // Non-idle stuck → not deferred → the transition notify fires here.
+    expect(notifier.notify).toHaveBeenCalled();
+  });
+
+  // Round-6 finding (id 3521778853): a truncated page whose only comments are
+  // non-actionable (notify-only reaction) must still alert — totalUnaddressed > 0
+  // confirms the agent is stuck, so truncation cannot make it a false positive.
+  it("notifies a stuck agent when a truncated page has only non-actionable comments", async () => {
+    const notifier = createMockNotifier();
+    config.reactions = {
+      "agent-stuck": {
+        auto: true,
+        action: "notify",
+        priority: "urgent",
+        threshold: "1m",
+        nudgeRetries: 3,
+      },
+      // Notify-only → not sendable, so the nudge has no actionable category.
+      "bugbot-comments": { auto: true, action: "notify", message: DEFAULT_BUGBOT_COMMENTS_MESSAGE },
+    };
+    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
+      state: "idle" as ActivityState,
+      timestamp: new Date(Date.now() - 120_000),
+    }));
+    const getReviewThreads = vi
+      .fn()
+      .mockResolvedValue({ threads: [botThread("c1")], reviews: [], threadsTruncated: true });
+    const mockSCM = createMockSCM({
+      getReviewThreads,
+      enrichSessionsPRBatch: mockBatchEnrichment({
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "none",
+        mergeable: false,
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR(), metadata: { agent: "mock-agent" } }),
+      metaOverrides: {
+        agent: "mock-agent",
+        // A prior notify-only dispatch recorded the hash (surfaced to a human only).
+        lastAutomatedReviewFingerprint: "c1",
+        lastAutomatedReviewDispatchHash: "c1",
+      },
+      registry,
+    });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // Non-actionable + truncated → cannot nudge, but the confirmed unresolved backlog
+    // means the agent is genuinely stuck → alert (previously dropped by truncation).
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(notifier.notify).toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
+  });
+
+  // Round-6 finding (id 3521778856): on recovery during a still-broken fetch, the
+  // fetch-catch must clear the notify latch so a later stuck episode still alerts.
+  it("clears the deferred-notify latch on recovery so a later stuck episode still alerts", async () => {
+    const notifier = createMockNotifier();
+    config.reactions = {
+      "agent-stuck": {
+        auto: true,
+        action: "notify",
+        priority: "urgent",
+        threshold: "1m",
+        nudgeRetries: 3,
+      },
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+    // Review fetch stays broken throughout.
+    const getReviewThreads = vi.fn().mockRejectedValue(new Error("rate limited"));
+    let activity = { state: "idle" as ActivityState, timestamp: new Date(Date.now() - 120_000) };
+    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => activity);
+    const mockSCM = createMockSCM({
+      getReviewThreads,
+      enrichSessionsPRBatch: mockBatchEnrichment({
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "none",
+        mergeable: false,
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makePR(), metadata: { agent: "mock-agent" } }),
+      metaOverrides: { agent: "mock-agent" },
+      registry,
+    });
+
+    // Poll 1: stuck (idle) + broken fetch → alert, latch set.
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
+
+    // Poll 2: agent resumed (active) + still-broken fetch → the catch clears the latch.
+    activity = { state: "active" as ActivityState, timestamp: new Date() };
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeFalsy();
+
+    // Poll 3: stuck again (idle) + still-broken fetch → a NEW episode alerts again
+    // (only possible because the latch was cleared on recovery — a stale latch would
+    // make emitDeferredStuckNotify no-op and leave the new episode silent).
+    activity = { state: "idle" as ActivityState, timestamp: new Date(Date.now() - 120_000) };
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
+  });
 });
 
 describe("summary pinning", () => {
