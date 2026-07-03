@@ -6226,6 +6226,100 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(meta?.["stuckNudgeCount"]).toBeFalsy();
     expect(meta?.["stuckNudgeFingerprint"]).toBeFalsy();
   });
+
+  // Round-4 finding (id 3521704230): when fresh sendable comments exist but the
+  // dispatch failed to reach the agent, the dispatch hash is NOT advanced, so the
+  // stuck agent must still be alerted rather than assumed engaged.
+  it("fires the deferred stuck notify when the fresh review dispatch fails to reach the agent", async () => {
+    const notifier = createMockNotifier();
+    // Fresh bot comment, never dispatched before (no prior dispatch hash).
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, { nudgeRetries: 3, notifier });
+    // The dispatch's send-to-agent fails to reach the agent.
+    vi.mocked(mockSessionManager.send).mockRejectedValue(new Error("pane is dead"));
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // Dispatch was attempted but failed → hash not advanced → human alerted exactly once.
+    expect(mockSessionManager.send).toHaveBeenCalled();
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
+    // The failed dispatch did not record a dispatch hash.
+    expect(
+      readMetadataRaw(env.sessionsDir, "app-1")?.["lastAutomatedReviewDispatchHash"],
+    ).toBeFalsy();
+  });
+
+  // Round-4 finding (id 3521704232): a persistently broken send path must notify
+  // the human EXACTLY ONCE per episode, not re-arm the latch and spam every poll.
+  it("notifies the human exactly once when the nudge send keeps failing across polls", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 3,
+      notifier,
+      // Already delivered so the nudge SEND path (not a fresh dispatch) runs.
+      metaOverrides: {
+        lastAutomatedReviewFingerprint: "c1",
+        lastAutomatedReviewDispatchHash: "c1",
+      },
+    });
+    vi.mocked(mockSessionManager.send).mockRejectedValue(new Error("pane is dead"));
+
+    // Three consecutive polls, the nudge send fails every time.
+    await lm.check("app-1");
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+
+    // Nudge attempted each poll, but the human is alerted only ONCE per episode.
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(3);
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    // A failing send never consumes the nudge budget.
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
+  });
+
+  // Round-4 finding (id 3521704233): the deferral must not fire when the project
+  // has no resolvable SCM plugin — the nudge path returns early there, so the
+  // transition notify would otherwise be suppressed and never re-emitted.
+  it("does not defer the stuck notify when the project has no SCM plugin", async () => {
+    const notifier = createMockNotifier();
+    config.reactions = {
+      "agent-stuck": { auto: true, action: "notify", priority: "urgent", threshold: "1m" },
+    };
+    // Idle beyond the 1m threshold.
+    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
+      state: "idle" as ActivityState,
+      timestamp: new Date(Date.now() - 120_000),
+    }));
+    // Registry WITHOUT an scm plugin → registry.get("scm", …) returns null.
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      notifier,
+    });
+    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
+    const session = makeSession({
+      status: "pr_open",
+      pr: makePR(),
+      metadata: { agent: "mock-agent" },
+    });
+    // PR metadata exists and is open (set on a prior poll when SCM was available).
+    session.lifecycle.pr.state = "open";
+    const lm = setupCheck("app-1", {
+      session,
+      metaOverrides: { agent: "mock-agent" },
+      registry,
+    });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // No SCM → the nudge path can never run, so the transition notify fires here
+    // rather than being deferred and silently dropped.
+    expect(notifier.notify).toHaveBeenCalled();
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+  });
 });
 
 describe("summary pinning", () => {

@@ -2713,10 +2713,33 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         (pendingSendable && pendingComments.length > 0) ||
         (automatedSendable && automatedComments.length > 0);
       if (hasSendableUnresolved) {
-        // Fresh sendable comments the normal dispatch path just delivered — the
-        // agent is engaged, so no bare stuck notify (only "not already delivered"
-        // because new IDs arrived this cycle).
-        clearStuckNotifyLatch(session);
+        // Fresh sendable comments arrived this cycle — the normal dispatch above
+        // OWNS delivering them. Suppress the bare stuck notify ONLY when that
+        // dispatch actually reached the agent: on success it advances the category
+        // dispatch hash to the current fingerprint. If the send/executeReaction
+        // failed, the hash is unchanged, the agent got nothing, and the transition
+        // notify was already deferred — so the stuck agent must still be alerted.
+        const currentPendingIds = splitFingerprintIds(
+          session.metadata["lastPendingReviewDispatchHash"] ?? "",
+        );
+        const currentAutomatedIds = splitFingerprintIds(
+          session.metadata["lastAutomatedReviewDispatchHash"] ?? "",
+        );
+        const pendingReached =
+          !(pendingSendable && pendingComments.length > 0) ||
+          pendingComments.every((c) => currentPendingIds.has(c.id));
+        const automatedReached =
+          !(automatedSendable && automatedComments.length > 0) ||
+          automatedComments.every((c) => currentAutomatedIds.has(c.id));
+        if (pendingReached && automatedReached) {
+          // Delivered → agent engaged; release the latch and defer to the dispatch.
+          clearStuckNotifyLatch(session);
+          return;
+        }
+        // Dispatch did not reach the agent → fall back to the deferred human notify
+        // (fail closed on a truncated page, matching the notify-only branch below).
+        if (primaryThreadsTruncated) return;
+        await emitDeferredStuckNotify(session, stuckReaction);
         return;
       }
       // Only notify-only / non-actionable comments remain and the page is complete
@@ -2726,9 +2749,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       return;
     }
 
-    // An agent-actionable delivered backlog exists → the nudge path engages the
-    // agent, so the bare stuck notify is not needed this episode.
-    clearStuckNotifyLatch(session);
+    // An agent-actionable delivered backlog exists. The bare stuck notify is not
+    // needed WHILE the nudge is actually reaching the agent — but the latch is
+    // cleared only after a successful send below, never here. Clearing it up front
+    // would re-arm emitDeferredStuckNotify every poll when the runtime send path
+    // stays broken (the send-catch notifies + latches, then the next poll would
+    // clear it and notify again), spamming the human instead of once per episode.
 
     const nudgeRetries = stuckReaction?.nudgeRetries ?? DEFAULT_STUCK_NUDGE_RETRIES;
 
@@ -2803,6 +2829,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     try {
       await sessionManager.send(session.id, parts.join("\n"));
+      // The nudge reached the agent → it is re-engaged, so release the per-episode
+      // stuck-notify latch (the send-catch below re-arms it only when delivery
+      // fails). Doing this here rather than before the send keeps a persistently
+      // broken send path from re-notifying the human every poll.
+      clearStuckNotifyLatch(session);
       updateSessionMetadata(session, {
         stuckNudgeCount: String(nudgeCount + 1),
         stuckNudgeFingerprint: backlogFingerprint,
@@ -2839,8 +2870,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // would retry forever, never reaching nudgeRetries escalation and never
       // alerting anyone (the transition notify was deferred to this path). Emit the
       // deferred human notify so a stuck agent with an undeliverable nudge still
-      // surfaces to a human (idempotent per episode; the actionable-backlog branch
-      // cleared the latch above, so this re-arms and fires).
+      // surfaces to a human. The latch is NOT cleared before the send (only after a
+      // successful one), so this fires exactly once per episode: subsequent failing
+      // polls hit the stuckNotifiedAt latch and emitDeferredStuckNotify no-ops.
       await emitDeferredStuckNotify(session, stuckReaction);
     }
   }
@@ -3927,13 +3959,24 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         // the agent, and auto:false routes stuck handling to humans (notify stands).
         // Sessions without an open PR are not deferred: the nudge path never runs
         // for them, so their transition notify must fire here.
+        //
+        // The nudge path also bails immediately when the project has no resolvable
+        // SCM plugin (maybeDispatchReviewBacklog returns before reaching the nudge),
+        // so deferring for an SCM-less project would suppress the transition notify
+        // AND never emit the fallback — leaving the stuck agent silent. Only defer
+        // when an SCM plugin is actually available.
         const stuckReactionConfig =
           reactionKey === "agent-stuck" ? getReactionConfigForSession(session, "agent-stuck") : null;
+        const stuckProject = config.projects[session.projectId];
+        const stuckScm = stuckProject?.scm?.plugin
+          ? registry.get<SCM>("scm", stuckProject.scm.plugin)
+          : null;
         const deferStuckNotifyToNudge =
           stuckReactionConfig?.action === "notify" &&
           stuckReactionConfig.auto !== false &&
           !!session.pr &&
-          session.lifecycle.pr.state === "open";
+          session.lifecycle.pr.state === "open" &&
+          !!stuckScm;
 
         if (reactionKey && !deferStuckNotifyToNudge) {
           let reactionConfig = getReactionConfigForSession(session, reactionKey);
