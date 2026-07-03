@@ -2163,6 +2163,24 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       });
       // Don't update the throttle timestamp so the next poll retries immediately
       // instead of being blocked for 2 minutes with the agent left on a bare notification.
+      //
+      // The transition handler deferred the agent-stuck human notify to the nudge
+      // path (maybeNudgeStuckAgent), which we won't reach because the fetch failed.
+      // A genuinely stuck agent must not be left silent while review-thread fetching
+      // stays broken, so emit the deferred notify here (idempotent per episode via
+      // the stuckNotifiedAt latch). Only for the deferred `notify` action on an idle-
+      // beyond-threshold agent — auto:false and send-to-agent were already actioned
+      // at transition time.
+      const stuckReaction = getReactionConfigForSession(session, "agent-stuck");
+      const idleSignal = session.activitySignal;
+      if (
+        stuckReaction?.action === "notify" &&
+        stuckReaction.auto !== false &&
+        hasPositiveIdleEvidence(idleSignal) &&
+        isIdleBeyondThreshold(session, idleSignal.timestamp)
+      ) {
+        await emitDeferredStuckNotify(session, stuckReaction);
+      }
       return;
     }
 
@@ -2579,7 +2597,28 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // Honor `auto: false`: installations that route stuck handling only to
     // humans must not have their agents messaged automatically. The transition
     // handler still emits the human-facing notify for the stuck reaction.
-    if (stuckReaction?.auto === false) return;
+    if (stuckReaction?.auto === false) {
+      // …but a nudge latch persisted from a prior config (auto was enabled, the
+      // session escalated, then the project was restarted/reconfigured with
+      // auto:false) must still be cleared once the backlog is confirmably clean —
+      // otherwise determineStatus keeps parking the open PR in needs_input forever
+      // after the threads are resolved. Skip sends, but not this cleanup. Fail
+      // closed on a truncated page (an unresolved thread may lie outside it).
+      if (
+        totalUnaddressed === 0 &&
+        !primaryThreadsTruncated &&
+        (session.metadata["stuckNudgeCount"] ||
+          session.metadata["stuckNudgeEscalated"] === "true" ||
+          session.metadata["stuckNudgeFingerprint"])
+      ) {
+        updateSessionMetadata(session, {
+          stuckNudgeCount: "",
+          stuckNudgeEscalated: "",
+          stuckNudgeFingerprint: "",
+        });
+      }
+      return;
+    }
 
     // The bot review→fix loop owns its own escalation / needs_input latch.
     if (session.metadata["reviewRoundsEscalated"] === "true") return;
@@ -2600,7 +2639,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // on a truncated page — an unresolved thread may lie outside the fetched page,
     // so an empty page is NOT trustworthy as clean (finding: fail closed).
     if (totalUnaddressed === 0) {
-      if (primaryThreadsTruncated) return;
+      if (primaryThreadsTruncated) {
+        // Fail closed on clearing the latch (an unresolved thread may lie outside
+        // the truncated last-100 window), but a genuinely stuck agent must still
+        // receive the deferred human notify — otherwise a stuck agent on a large PR
+        // gets neither a nudge nor an alert. Skip when a nudge escalation already
+        // notified the human; idempotent per episode via stuckNotifiedAt.
+        if (stuck && session.metadata["stuckNudgeEscalated"] !== "true") {
+          await emitDeferredStuckNotify(session, stuckReaction);
+        }
+        return;
+      }
       const wasEscalated = session.metadata["stuckNudgeEscalated"] === "true";
       if (
         session.metadata["stuckNudgeCount"] ||
@@ -2785,6 +2834,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           errorMessage: err instanceof Error ? err.message : String(err),
         },
       });
+      // The nudge never reached the agent (broken tmux pane / runtime send path),
+      // so it isn't engaged and the budget isn't consumed — without this the session
+      // would retry forever, never reaching nudgeRetries escalation and never
+      // alerting anyone (the transition notify was deferred to this path). Emit the
+      // deferred human notify so a stuck agent with an undeliverable nudge still
+      // surfaces to a human (idempotent per episode; the actionable-backlog branch
+      // cleared the latch above, so this re-arms and fires).
+      await emitDeferredStuckNotify(session, stuckReaction);
     }
   }
 

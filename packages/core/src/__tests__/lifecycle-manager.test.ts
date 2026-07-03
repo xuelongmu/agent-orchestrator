@@ -6131,6 +6131,101 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     // Truncated → do NOT declare clean; the escalation latch is preserved.
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeEscalated"]).toBe("true");
   });
+
+  // Round-3 finding (id 3516001443): when the review fetch itself fails, the nudge
+  // path never runs — but the transition handler deferred the stuck notify to it.
+  // The fetch-catch must still alert a human, or a stuck agent stays silent for as
+  // long as review-thread fetching is broken.
+  it("fires the deferred stuck notify when the review fetch fails", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockRejectedValue(new Error("rate limited"));
+    const lm = setupStuckSession(getReviewThreads, { nudgeRetries: 3, notifier });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // Fetch failed → nothing to nudge, but the human IS alerted (not left silent).
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(notifier.notify).toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
+  });
+
+  // Round-3 finding (id 3516001448): a truncated empty page cannot be trusted as
+  // clean (fail closed on latch clearing) but a stuck agent must still be alerted —
+  // otherwise a stuck agent on a large PR gets neither a nudge nor a human alert.
+  it("notifies a stuck agent on a truncated empty page (cannot nudge, must alert)", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi
+      .fn()
+      .mockResolvedValue({ threads: [], reviews: [], threadsTruncated: true });
+    const lm = setupStuckSession(getReviewThreads, { nudgeRetries: 3, notifier });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // Page too incomplete to nudge or declare clean → still alert the human.
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(notifier.notify).toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
+  });
+
+  // Round-3 finding (id 3516001451): when the nudge send keeps failing (broken
+  // runtime send path), the budget isn't consumed and escalation is never reached.
+  // The send-catch must alert a human so the session isn't retried silently forever.
+  it("alerts a human when the nudge send keeps failing", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 3,
+      notifier,
+      // Comment already delivered so the nudge path (not bugbot dispatch) runs it.
+      metaOverrides: {
+        lastAutomatedReviewFingerprint: "c1",
+        lastAutomatedReviewDispatchHash: "c1",
+      },
+    });
+    // The runtime send path is broken.
+    vi.mocked(mockSessionManager.send).mockRejectedValue(new Error("pane is dead"));
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // Send failed → agent not engaged; a human is alerted and the budget is NOT spent.
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+    expect(notifier.notify).toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
+  });
+
+  // Round-3 finding (id 3516065043): honoring auto:false must not skip cleanup of a
+  // latch persisted from a prior auto-enabled config — otherwise determineStatus
+  // keeps parking the resolved PR in needs_input forever.
+  it("clears a persisted nudge latch under auto:false once the backlog is clean", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, {
+      stuckAuto: false,
+      notifier,
+      metaOverrides: {
+        stuckNudgeEscalated: "true",
+        stuckNudgeCount: "3",
+        stuckNudgeFingerprint: "c1",
+      },
+    });
+    // setupCheck's writeMetadata only persists an allowlist, so inject the latch
+    // directly into the metadata FILE that readMetadataRaw reads.
+    updateMetadata(env.sessionsDir, "app-1", {
+      stuckNudgeEscalated: "true",
+      stuckNudgeCount: "3",
+      stuckNudgeFingerprint: "c1",
+    });
+
+    await lm.check("app-1");
+    // auto:false skips sends, but the stale latch must still clear now that the
+    // backlog is confirmably clean (empty + not truncated).
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["stuckNudgeEscalated"]).toBeFalsy();
+    expect(meta?.["stuckNudgeCount"]).toBeFalsy();
+    expect(meta?.["stuckNudgeFingerprint"]).toBeFalsy();
+  });
 });
 
 describe("summary pinning", () => {
