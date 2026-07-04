@@ -2082,6 +2082,13 @@ export interface SessionMetadata {
   /** Stacked PR: id of the session this one is stacked on. */
   parentSessionId?: string;
   /**
+   * Stacked PR: the resolved base branch this session is stacked on (the branch
+   * its workspace is cut from and its PR targets). Persisted so a held session
+   * resumes from the right branch on relaunch, and so a merging parent knows
+   * which branch to retarget its children onto.
+   */
+  baseRef?: string;
+  /**
    * Human-readable display name for the session.
    *
    * Populated automatically at spawn time from the best available task context

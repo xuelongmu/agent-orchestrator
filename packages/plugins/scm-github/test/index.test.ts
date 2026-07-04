@@ -623,9 +623,19 @@ describe("scm-github plugin", () => {
       expect(ghMock).toHaveBeenCalledTimes(1);
     });
 
-    it("no-ops when the PR is unreachable", async () => {
-      ghMock.mockRejectedValueOnce(new Error("not found")); // pr view fails
+    it("no-ops when the PR is confirmed not-found", async () => {
+      ghMock.mockRejectedValueOnce(
+        new Error("GraphQL: Could not resolve to a PullRequest with the number of 42"),
+      );
       await scm.retargetPR!(pr, "main", "feat/parent");
+      // Only the `pr view` lookup happened — swallowed, no `pr edit`.
+      expect(ghMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("propagates transient lookup failures instead of succeeding", async () => {
+      ghMock.mockRejectedValueOnce(new Error("HTTP 503: server error"));
+      await expect(scm.retargetPR!(pr, "main", "feat/parent")).rejects.toThrow("503");
+      // No `pr edit` was attempted.
       expect(ghMock).toHaveBeenCalledTimes(1);
     });
   });

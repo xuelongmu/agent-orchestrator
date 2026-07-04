@@ -91,10 +91,23 @@ export function create(config?: Record<string, unknown>): Workspace {
       }
 
       // Stacked PR: clone/checkout the parent's branch as the base instead of
-      // the project default, so the feature branch below stacks on it. The
-      // base ref must exist on the remote (clone's source) — for clones the
-      // parent must have pushed its branch.
-      const cloneBaseBranch = cfg.baseRef ?? cfg.project.defaultBranch;
+      // the project default, so the feature branch below stacks on it. Prefer
+      // the remote (clone source), but fall back to the local source repo when
+      // the parent hasn't pushed its branch yet — mirroring the worktree
+      // plugin's local fallback so clone-based stacks aren't remote-only.
+      let baseOnRemote = true;
+      if (cfg.baseRef) {
+        try {
+          const ls = await git(repoPath, "ls-remote", "--heads", remoteUrl, cfg.baseRef);
+          baseOnRemote = ls.trim().length > 0;
+        } catch {
+          baseOnRemote = false;
+        }
+      }
+      const localBaseFallback = Boolean(cfg.baseRef) && !baseOnRemote;
+      const cloneBaseBranch = localBaseFallback
+        ? cfg.project.defaultBranch
+        : (cfg.baseRef ?? cfg.project.defaultBranch);
 
       // Clone using --reference for faster clone with shared objects
       try {
@@ -116,6 +129,27 @@ export function create(config?: Record<string, unknown>): Workspace {
         throw new Error(`Failed to clone repo for session "${cfg.sessionId}": ${msg}`, {
           cause: cloneErr,
         });
+      }
+
+      // Stacked base exists only in the local source repo — fetch it into the
+      // clone and check it out so the feature branch below stacks on it.
+      if (localBaseFallback && cfg.baseRef) {
+        try {
+          await git(
+            clonePath,
+            "fetch",
+            repoPath,
+            `refs/heads/${cfg.baseRef}:refs/heads/${cfg.baseRef}`,
+          );
+          await git(clonePath, "checkout", cfg.baseRef);
+        } catch (fetchErr: unknown) {
+          rmSync(clonePath, { recursive: true, force: true });
+          const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+          throw new Error(
+            `Failed to materialize stacked base "${cfg.baseRef}" from local repo for session "${cfg.sessionId}": ${msg}`,
+            { cause: fetchErr },
+          );
+        }
       }
 
       // Create and checkout the feature branch

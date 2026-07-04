@@ -536,6 +536,21 @@ function repoFlag(pr: PRInfo): string {
   return `${pr.owner}/${pr.repo}`;
 }
 
+/**
+ * Whether a `gh pr view` failure is a confirmed "PR does not exist" (safe to
+ * treat as a no-op), as opposed to a transient auth/network error (which must
+ * propagate). gh reports missing PRs via GraphQL "Could not resolve to a
+ * PullRequest" or "no pull requests found".
+ */
+function isPRNotFoundError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes("could not resolve to a pullrequest") ||
+    msg.includes("no pull requests found") ||
+    msg.includes("no pull request found")
+  );
+}
+
 function prEventKey(pr: PRInfo): string {
   return `${repoFlag(pr)}#${pr.number}`;
 }
@@ -879,9 +894,12 @@ function createGitHubSCM(): SCM {
             "-q",
             ".baseRefName",
           ]);
-        } catch {
-          // PR unreachable (closed/deleted) — nothing to retarget.
-          return;
+        } catch (err) {
+          // Only swallow a confirmed not-found (PR deleted / gone — nothing to
+          // retarget). Propagate transient auth/network errors so the caller's
+          // warning path runs and the failure is visible, not silently "done".
+          if (isPRNotFoundError(err)) return;
+          throw err;
         }
         if (liveBase.trim() !== expectedCurrentBase) return;
       }

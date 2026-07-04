@@ -3081,10 +3081,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     if (!scm?.retargetPR) return;
     const retargetPR = scm.retargetPR.bind(scm);
 
-    // The base the children should re-point at = the branch the parent merged
-    // into. Enrichment may not have populated pr.baseBranch, so fall back to the
-    // project default branch (the common single-level-stack case).
-    const targetBase = parent.pr?.baseBranch || project.defaultBranch;
+    // The base the children should re-point at = the branch the parent actually
+    // merged into. Prefer the live PR base if enrichment populated it, then the
+    // parent's persisted stacked base (so a middle session merging while its own
+    // parent is still open moves grandchildren onto that parent's branch, not
+    // `main`), then the project default for a plain root parent.
+    const targetBase =
+      parent.pr?.baseBranch || parent.metadata["baseRef"] || project.defaultBranch;
     if (!targetBase) return;
 
     let sessions: Session[];
@@ -3095,40 +3098,43 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       return;
     }
 
-    const children = sessions.filter((s) => s.parentSessionId === parent.id && s.pr);
+    const children = sessions.filter((s) => s.parentSessionId === parent.id && s.prs.length > 0);
     for (const child of children) {
-      const childPr = child.pr;
-      if (!childPr) continue;
-      try {
-        // Only retarget PRs still pointing at the parent's branch.
-        await retargetPR(childPr, targetBase, parentBranch);
-        recordActivityEvent({
-          projectId: child.projectId,
-          sessionId: child.id,
-          source: "lifecycle",
-          kind: "stacked.pr_retargeted",
-          summary: `retargeted ${child.id} PR onto ${targetBase} after parent ${parent.id} merged`,
-          data: {
-            parentSessionId: parent.id,
-            parentBranch,
-            newBase: targetBase,
-            prUrl: childPr.url,
-          },
-        });
-      } catch (err) {
-        recordActivityEvent({
-          projectId: child.projectId,
-          sessionId: child.id,
-          source: "lifecycle",
-          kind: "stacked.pr_retarget_failed",
-          level: "warn",
-          summary: `failed to retarget ${child.id} PR after parent ${parent.id} merged`,
-          data: {
-            parentSessionId: parent.id,
-            newBase: targetBase,
-            errorMessage: err instanceof Error ? err.message : String(err),
-          },
-        });
+      // A dependent session may have opened multiple PRs (e.g. multi-repo).
+      // Retarget every one still based on the parent's branch — retargetPR
+      // no-ops on the rest via its live-base guard.
+      for (const childPr of child.prs) {
+        try {
+          await retargetPR(childPr, targetBase, parentBranch);
+          recordActivityEvent({
+            projectId: child.projectId,
+            sessionId: child.id,
+            source: "lifecycle",
+            kind: "stacked.pr_retargeted",
+            summary: `retargeted ${child.id} PR onto ${targetBase} after parent ${parent.id} merged`,
+            data: {
+              parentSessionId: parent.id,
+              parentBranch,
+              newBase: targetBase,
+              prUrl: childPr.url,
+            },
+          });
+        } catch (err) {
+          recordActivityEvent({
+            projectId: child.projectId,
+            sessionId: child.id,
+            source: "lifecycle",
+            kind: "stacked.pr_retarget_failed",
+            level: "warn",
+            summary: `failed to retarget ${child.id} PR after parent ${parent.id} merged`,
+            data: {
+              parentSessionId: parent.id,
+              newBase: targetBase,
+              prUrl: childPr.url,
+              errorMessage: err instanceof Error ? err.message : String(err),
+            },
+          });
+        }
       }
     }
   }

@@ -229,6 +229,80 @@ describe("workspace.create()", () => {
     ]);
   });
 
+  it("clones the stacked base branch directly when it exists on the remote", async () => {
+    const workspace = create();
+
+    mockGitSuccess("https://github.com/test/repo.git"); // 1: remote get-url
+    (fs.existsSync as ReturnType<typeof vi.fn>).mockReturnValue(false);
+    mockGitSuccess("abc123\trefs/heads/feat/parent"); // 2: ls-remote (present)
+    mockGitSuccess(""); // 3: git clone
+    mockGitSuccess(""); // 4: git checkout -b
+
+    await workspace.create({
+      projectId: "proj",
+      sessionId: "sess",
+      branch: "feat/child",
+      project: makeProject(),
+      baseRef: "feat/parent",
+    });
+
+    // Clone (3rd call) checks out the parent branch directly — no local fetch.
+    expect(mockExecFileAsync).toHaveBeenNthCalledWith(3, "git", [
+      "clone",
+      "--reference",
+      "/repo/path",
+      "--branch",
+      "feat/parent",
+      "https://github.com/test/repo.git",
+      "/mock-home/.ao-clones/proj/sess",
+    ]);
+    const fetchedFromLocal = mockExecFileAsync.mock.calls.some(
+      (c) => Array.isArray(c[1]) && (c[1] as string[])[0] === "fetch",
+    );
+    expect(fetchedFromLocal).toBe(false);
+  });
+
+  it("materializes the stacked base from the local repo when the remote lacks it", async () => {
+    const workspace = create();
+
+    mockGitSuccess("https://github.com/test/repo.git"); // 1: remote get-url
+    (fs.existsSync as ReturnType<typeof vi.fn>).mockReturnValue(false);
+    mockGitSuccess(""); // 2: ls-remote (empty — parent unpushed)
+    mockGitSuccess(""); // 3: git clone (default branch)
+    mockGitSuccess(""); // 4: git fetch <repoPath> refs/heads/feat/parent:...
+    mockGitSuccess(""); // 5: git checkout feat/parent
+    mockGitSuccess(""); // 6: git checkout -b feat/child
+
+    await workspace.create({
+      projectId: "proj",
+      sessionId: "sess",
+      branch: "feat/child",
+      project: makeProject(),
+      baseRef: "feat/parent",
+    });
+
+    // Clone (3rd call) falls back to the default branch...
+    expect(mockExecFileAsync).toHaveBeenNthCalledWith(3, "git", [
+      "clone",
+      "--reference",
+      "/repo/path",
+      "--branch",
+      "main",
+      "https://github.com/test/repo.git",
+      "/mock-home/.ao-clones/proj/sess",
+    ]);
+    // ...then fetches the base from the local source repo and checks it out.
+    expect(mockExecFileAsync).toHaveBeenNthCalledWith(
+      4,
+      "git",
+      ["fetch", "/repo/path", "refs/heads/feat/parent:refs/heads/feat/parent"],
+      { cwd: "/mock-home/.ao-clones/proj/sess" },
+    );
+    expect(mockExecFileAsync).toHaveBeenNthCalledWith(5, "git", ["checkout", "feat/parent"], {
+      cwd: "/mock-home/.ao-clones/proj/sess",
+    });
+  });
+
   it("creates feature branch via checkout -b", async () => {
     const workspace = create();
 

@@ -1438,8 +1438,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       const parentSessionId = spawnConfig.parentSessionId;
       let stackBaseBranch = spawnConfig.baseRef;
       if (!stackBaseBranch && parentSessionId) {
-        const parentRaw = readMetadataRaw(sessionsDir, parentSessionId);
-        const parentBranch = parentRaw?.["branch"];
+        // Session ids are globally unique (the dependency scheduler and the
+        // retarget hook both treat them cross-project), so resolve the parent
+        // across every project's sessions dir — not just this child's.
+        const parentBranch = findSessionRecord(parentSessionId)?.raw?.["branch"];
         if (parentBranch) {
           stackBaseBranch = parentBranch;
         } else if (options?.reuseIdentity) {
@@ -1518,6 +1520,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           dependsOn,
           blockedBy,
           ...(parentSessionId ? { parentSessionId } : {}),
+          // Persist the resolved stacked base so unblock() relaunches from the
+          // intended branch (baseRef-only stacks would otherwise lose it).
+          ...(stackBaseBranch ? { baseRef: stackBaseBranch } : {}),
           userPrompt: spawnConfig.prompt,
           displayName,
         });
@@ -1776,6 +1781,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         opencodeSessionId: reusedOpenCodeSessionId,
         dependsOn,
         ...(parentSessionId ? { parentSessionId } : {}),
+        ...(stackBaseBranch ? { baseRef: stackBaseBranch } : {}),
         userPrompt: spawnConfig.prompt,
         displayName,
         ...(heldDisplayNameUserSet ? { displayNameUserSet: true } : {}),
@@ -1903,6 +1909,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       // Carry stacked-PR linkage so the relaunch re-resolves its base branch
       // off the parent and persists the parent id (retarget-on-merge needs it).
       ...(raw["parentSessionId"] ? { parentSessionId: raw["parentSessionId"] } : {}),
+      // Carry the resolved base ref so baseRef-only stacks (and explicit
+      // overrides) resume from the intended branch, not project.defaultBranch.
+      ...(raw["baseRef"] ? { baseRef: raw["baseRef"] } : {}),
       // Explicit empty unblocked set: prevents collectSessionDependencies from
       // re-deriving a non-empty `blockedBy` from the tracker and re-holding the
       // session we are deliberately launching.

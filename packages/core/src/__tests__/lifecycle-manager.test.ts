@@ -6497,6 +6497,61 @@ describe("auto-cleanup on merge (#1309)", () => {
   });
 });
 
+describe("stacked PR retarget on parent merge (#11)", () => {
+  it("retargets a dependent child PR onto the parent's live/persisted base, not the default branch", async () => {
+    // Parent is a middle session in a stack: its own PR still targets a
+    // grandparent branch (persisted as baseRef). pr.baseBranch is empty because
+    // metadata reconstruction only stores PR URLs — the fix must fall back to
+    // the persisted baseRef, NOT the project default ("main").
+    const parentPr = makeMatchingPR({ number: 100, baseBranch: "" });
+    const childPr = makeMatchingPR({
+      number: 200,
+      url: "https://github.com/org/my-app/pull/200",
+      branch: "feat/child",
+      baseBranch: "feat/parent",
+    });
+    const retargetPR = vi.fn().mockResolvedValue(undefined);
+    const mockSCM = createMockSCM({
+      getPRState: vi.fn().mockResolvedValue("merged"),
+      enrichSessionsPRBatch: mockBatchEnrichment({ state: "merged", ciStatus: "none" }),
+      retargetPR,
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    const child = makeSession({
+      id: "app-2",
+      status: "working",
+      branch: "feat/child",
+      pr: childPr,
+      parentSessionId: "app-1",
+    });
+    const parentStub = makeSession({ id: "app-1", status: "approved", branch: "feat/parent" });
+    vi.mocked(mockSessionManager.list).mockResolvedValue([parentStub, child]);
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({
+        status: "approved",
+        branch: "feat/parent",
+        pr: parentPr,
+        // Active so merge auto-cleanup defers — keeps the parent alive through
+        // the retarget assertion without tearing it down mid-test.
+        activity: "active",
+      }),
+      registry,
+      metaOverrides: { branch: "feat/parent", baseRef: "feat/grandparent" },
+    });
+
+    await lm.check("app-1");
+
+    expect(retargetPR).toHaveBeenCalledTimes(1);
+    expect(retargetPR).toHaveBeenCalledWith(childPr, "feat/grandparent", "feat/parent");
+  });
+});
+
 describe("event enrichment", () => {
   it("includes PR context in event data when session has PR", async () => {
     const notifier = createMockNotifier();
