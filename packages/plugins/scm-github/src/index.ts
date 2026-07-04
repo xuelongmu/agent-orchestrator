@@ -860,6 +860,36 @@ function createGitHubSCM(): SCM {
       invalidatePRCache(pr);
     },
 
+    async retargetPR(pr: PRInfo, newBase: string, expectedCurrentBase?: string): Promise<void> {
+      // Idempotency guard: only retarget when the PR's live base still matches
+      // what the caller expected. If GitHub already auto-retargeted (the merged
+      // head branch was deleted), a human moved it, or the PR closed, the live
+      // base won't match and we leave it alone.
+      if (expectedCurrentBase) {
+        let liveBase = "";
+        try {
+          liveBase = await gh([
+            "pr",
+            "view",
+            String(pr.number),
+            "--repo",
+            repoFlag(pr),
+            "--json",
+            "baseRefName",
+            "-q",
+            ".baseRefName",
+          ]);
+        } catch {
+          // PR unreachable (closed/deleted) — nothing to retarget.
+          return;
+        }
+        if (liveBase.trim() !== expectedCurrentBase) return;
+      }
+
+      await gh(["pr", "edit", String(pr.number), "--repo", repoFlag(pr), "--base", newBase]);
+      invalidatePRCache(pr);
+    },
+
     async getCIChecks(pr: PRInfo): Promise<CICheck[]> {
       // 5s TTL — CI state can flip quickly; within one poll cycle is acceptable
       // per the agreed fast-changing-fields policy. Fallback to statusCheckRollup

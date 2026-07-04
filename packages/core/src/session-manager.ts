@@ -1430,6 +1430,39 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         branch = `session/${sessionId}`;
       }
 
+      // Stacked PR: resolve the base branch this session stacks on. Explicit
+      // `baseRef` wins; otherwise derive it from the parent session's branch.
+      // `stackBaseBranch` differing from the default branch signals a stacked
+      // session — the workspace branches off it and the agent targets it with
+      // `gh pr create --base`.
+      const parentSessionId = spawnConfig.parentSessionId;
+      let stackBaseBranch = spawnConfig.baseRef;
+      if (!stackBaseBranch && parentSessionId) {
+        const parentRaw = readMetadataRaw(sessionsDir, parentSessionId);
+        const parentBranch = parentRaw?.["branch"];
+        if (parentBranch) {
+          stackBaseBranch = parentBranch;
+        } else if (options?.reuseIdentity) {
+          // Relaunch of a held stacked child (#10 + #11): the parent may have
+          // merged and been cleaned up while this child was blocked. Its work
+          // is now in the default branch, so drop the stacking and branch off
+          // the default rather than failing the launch.
+          recordActivityEvent({
+            projectId: spawnConfig.projectId,
+            sessionId,
+            source: "session-manager",
+            kind: "stacked.parent_unresolved_on_relaunch",
+            level: "warn",
+            summary: `parent "${parentSessionId}" gone on relaunch; branching off default`,
+            data: { parentSessionId },
+          });
+        } else {
+          throw new Error(
+            `Cannot stack session on parent "${parentSessionId}": parent not found or has no branch`,
+          );
+        }
+      }
+
       // Held by an unresolved prerequisite: record a blocked session and stop
       // before any work begins (no workspace, no runtime, no agent launch). The
       // scheduler (#10) clears `blockedBy` and launches it once prerequisites
@@ -1462,6 +1495,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           lastActivityAt: createdAt,
           dependsOn,
           blockedBy,
+          ...(parentSessionId ? { parentSessionId } : {}),
           metadata: {
             ...(spawnConfig.prompt ? { userPrompt: spawnConfig.prompt } : {}),
             ...(displayName ? { displayName } : {}),
@@ -1483,6 +1517,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           createdAt: createdAt.toISOString(),
           dependsOn,
           blockedBy,
+          ...(parentSessionId ? { parentSessionId } : {}),
           userPrompt: spawnConfig.prompt,
           displayName,
         });
@@ -1512,6 +1547,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           sessionId,
           branch,
           worktreeDir: getProjectWorktreesDir(spawnConfig.projectId),
+          ...(stackBaseBranch ? { baseRef: stackBaseBranch } : {}),
         });
         workspacePath = wsInfo.path;
         // Only register destroy when the path is inside a managed root —
@@ -1565,6 +1601,11 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         issueContext,
         userPrompt: spawnConfig.prompt,
         ...(orchestratorExists && { orchestratorSessionId }),
+        // Only surface stacked-PR instructions when the base differs from the
+        // project default — a same-as-default base is a plain (non-stacked) PR.
+        ...(stackBaseBranch && stackBaseBranch !== project.defaultBranch
+          ? { baseBranch: stackBaseBranch }
+          : {}),
       });
 
       const baseDir = getProjectDir(spawnConfig.projectId);
@@ -1702,6 +1743,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         createdAt,
         lastActivityAt: createdAt,
         ...(dependsOn.length > 0 ? { dependsOn } : {}),
+        ...(parentSessionId ? { parentSessionId } : {}),
         metadata: {
           ...(reusedOpenCodeSessionId ? { opencodeSessionId: reusedOpenCodeSessionId } : {}),
           ...(spawnConfig.prompt ? { userPrompt: spawnConfig.prompt } : {}),
@@ -1733,6 +1775,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         runtimeHandle: handle,
         opencodeSessionId: reusedOpenCodeSessionId,
         dependsOn,
+        ...(parentSessionId ? { parentSessionId } : {}),
         userPrompt: spawnConfig.prompt,
         displayName,
         ...(heldDisplayNameUserSet ? { displayNameUserSet: true } : {}),
@@ -1857,6 +1900,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       // the tracker alone, dropping any explicit spawn-time prerequisites and
       // losing the dependency history once the session launches (#10).
       ...(originalDependsOn.length > 0 ? { dependsOn: originalDependsOn } : {}),
+      // Carry stacked-PR linkage so the relaunch re-resolves its base branch
+      // off the parent and persists the parent id (retarget-on-merge needs it).
+      ...(raw["parentSessionId"] ? { parentSessionId: raw["parentSessionId"] } : {}),
       // Explicit empty unblocked set: prevents collectSessionDependencies from
       // re-deriving a non-empty `blockedBy` from the tracker and re-holding the
       // session we are deliberately launching.

@@ -90,6 +90,12 @@ export function create(config?: Record<string, unknown>): Workspace {
         );
       }
 
+      // Stacked PR: clone/checkout the parent's branch as the base instead of
+      // the project default, so the feature branch below stacks on it. The
+      // base ref must exist on the remote (clone's source) — for clones the
+      // parent must have pushed its branch.
+      const cloneBaseBranch = cfg.baseRef ?? cfg.project.defaultBranch;
+
       // Clone using --reference for faster clone with shared objects
       try {
         await execFileAsync("git", [
@@ -97,7 +103,7 @@ export function create(config?: Record<string, unknown>): Workspace {
           "--reference",
           repoPath,
           "--branch",
-          cfg.project.defaultBranch,
+          cloneBaseBranch,
           remoteUrl,
           clonePath,
         ]);

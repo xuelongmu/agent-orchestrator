@@ -140,6 +140,14 @@ describe("sessionFromMetadata — multi-PR (issue #1821)", () => {
     expect(session.blockedBy).toBeUndefined();
   });
 
+  it("1.12b — parentSessionId parsed from metadata (stacked PRs)", () => {
+    const withParent = sessionFromMetadata("app-2", { parentSessionId: "app-1" }, baseOptions);
+    expect(withParent.parentSessionId).toBe("app-1");
+
+    const without = sessionFromMetadata("app-3", {}, baseOptions);
+    expect(without.parentSessionId).toBeUndefined();
+  });
+
   it("1.13 — blocked session keeps workspacePath null despite fallback", () => {
     const blockedLifecycle = {
       version: 2,

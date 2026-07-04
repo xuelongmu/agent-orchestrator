@@ -592,6 +592,44 @@ describe("scm-github plugin", () => {
     });
   });
 
+  // ---- retargetPR --------------------------------------------------------
+
+  describe("retargetPR", () => {
+    it("edits the PR base when no expected base is given", async () => {
+      ghMock.mockResolvedValueOnce({ stdout: "" });
+      await scm.retargetPR!(pr, "main");
+      expect(ghMock).toHaveBeenCalledWith(
+        expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
+        ["pr", "edit", "42", "--repo", "acme/repo", "--base", "main"],
+        expect.any(Object),
+      );
+    });
+
+    it("retargets when the live base still matches the expected base", async () => {
+      ghMock.mockResolvedValueOnce({ stdout: "feat/parent\n" }); // pr view baseRefName
+      ghMock.mockResolvedValueOnce({ stdout: "" }); // pr edit
+      await scm.retargetPR!(pr, "main", "feat/parent");
+      expect(ghMock).toHaveBeenCalledWith(
+        expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
+        ["pr", "edit", "42", "--repo", "acme/repo", "--base", "main"],
+        expect.any(Object),
+      );
+    });
+
+    it("no-ops when the live base already moved off the expected base", async () => {
+      ghMock.mockResolvedValueOnce({ stdout: "main\n" }); // already retargeted (e.g. GitHub auto)
+      await scm.retargetPR!(pr, "main", "feat/parent");
+      // Only the `pr view` call happened — no `pr edit`.
+      expect(ghMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("no-ops when the PR is unreachable", async () => {
+      ghMock.mockRejectedValueOnce(new Error("not found")); // pr view fails
+      await scm.retargetPR!(pr, "main", "feat/parent");
+      expect(ghMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
   // ---- getCIChecks -------------------------------------------------------
 
   describe("getCIChecks", () => {

@@ -344,6 +344,14 @@ export interface Session {
    */
   blockedBy?: string[];
 
+  /**
+   * Stacked PR linkage — the session this one is stacked on. Set at spawn time
+   * from `SessionSpawnConfig.parentSessionId`. Used to retarget this session's
+   * child PRs when it merges, and to find children to retarget. Absent for
+   * non-stacked sessions.
+   */
+  parentSessionId?: SessionId;
+
   /** Metadata key-value pairs */
   metadata: Record<string, string>;
 }
@@ -405,6 +413,19 @@ export interface SessionSpawnConfig {
    * `dependsOn` set (every declared prerequisite is presumed unresolved).
    */
   blockedBy?: string[];
+  /**
+   * Stacked PR: the session this one stacks on. When set, the workspace
+   * branches off the parent's branch (instead of `defaultBranch`) and the
+   * agent is instructed to open its PR with `--base <parent branch>`. When the
+   * parent PR merges the child PR is auto-retargeted to the parent's base.
+   */
+  parentSessionId?: SessionId;
+  /**
+   * Explicit base ref to branch the workspace from (e.g. a parent's branch).
+   * Overrides `defaultBranch`. Derived from `parentSessionId` when that is set
+   * and this is omitted. The bare branch name (no `origin/` prefix).
+   */
+  baseRef?: string;
 }
 
 /** Config for creating an orchestrator session */
@@ -751,6 +772,12 @@ export interface WorkspaceCreateConfig {
   branch: string;
   /** Override the base directory for worktrees (e.g. V2 project-scoped dir). */
   worktreeDir?: string;
+  /**
+   * Base ref to branch from, overriding `project.defaultBranch`. Used for
+   * stacked PRs (branch off a parent session's branch). Bare branch name — the
+   * workspace resolves `origin/<baseRef>` / `refs/heads/<baseRef>` as needed.
+   */
+  baseRef?: string;
 }
 
 export interface WorkspaceInfo {
@@ -907,6 +934,18 @@ export interface SCM {
 
   /** Close a PR without merging */
   closePR(pr: PRInfo): Promise<void>;
+
+  /**
+   * Retarget an open PR onto a new base branch (stacked PRs). Called when a
+   * parent PR merges so its dependent PRs re-point at the parent's base.
+   *
+   * When `expectedCurrentBase` is provided, implementations should no-op unless
+   * the PR's live base still equals it — this keeps the call idempotent and
+   * avoids clobbering a base GitHub already auto-retargeted (which happens when
+   * the merged head branch is deleted) or one a human changed. Optional: SCMs
+   * that can't edit a PR base simply omit it.
+   */
+  retargetPR?(pr: PRInfo, newBase: string, expectedCurrentBase?: string): Promise<void>;
 
   // --- CI Tracking ---
 
@@ -2040,6 +2079,8 @@ export interface SessionMetadata {
   dependsOn?: string[];
   /** Unresolved prerequisite session/issue ids (persisted comma-separated). */
   blockedBy?: string[];
+  /** Stacked PR: id of the session this one is stacked on. */
+  parentSessionId?: string;
   /**
    * Human-readable display name for the session.
    *

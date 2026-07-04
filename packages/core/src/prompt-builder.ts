@@ -102,6 +102,13 @@ export interface PromptBuildConfig {
    * orchestrator session actually exists for the project.
    */
   orchestratorSessionId?: SessionId;
+
+  /**
+   * Stacked PR: the branch this session is stacked on. When set (and different
+   * from the default branch), the prompt instructs the agent to open its PR
+   * with `--base <baseBranch>`. Caller passes this only for stacked sessions.
+   */
+  baseBranch?: string;
 }
 
 // =============================================================================
@@ -109,7 +116,7 @@ export interface PromptBuildConfig {
 // =============================================================================
 
 function buildConfigLayer(config: PromptBuildConfig): string {
-  const { project, projectId, issueId, issueContext } = config;
+  const { project, projectId, issueId, issueContext, baseBranch } = config;
   const lines: string[] = [];
 
   lines.push("## Project Context");
@@ -135,6 +142,22 @@ function buildConfigLayer(config: PromptBuildConfig): string {
   if (issueContext) {
     lines.push(`\n## Issue Details`);
     lines.push(issueContext);
+  }
+
+  // Stacked PR: this session branches off a parent's branch rather than the
+  // default branch. Instruct the agent to open its PR against that base — the
+  // orchestrator retargets it to the default branch once the parent merges.
+  if (baseBranch && baseBranch !== project.defaultBranch) {
+    lines.push(`\n## Stacked PR`);
+    lines.push(
+      `- This session is stacked on branch \`${baseBranch}\` — your work is branched off it, not \`${project.defaultBranch}\`.`,
+    );
+    lines.push(
+      `- When you open your PR, target that branch: \`gh pr create --base ${baseBranch} ...\` (do NOT target \`${project.defaultBranch}\`).`,
+    );
+    lines.push(
+      `- The orchestrator automatically retargets your PR to \`${project.defaultBranch}\` once the parent PR merges — no action needed from you.`,
+    );
   }
 
   // Include reaction rules so the agent knows what to expect

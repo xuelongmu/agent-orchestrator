@@ -3053,6 +3053,86 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return makeFingerprint(failedChecks.map((c) => `${c.name}:${c.status}:${c.conclusion ?? ""}`));
   }
 
+  /**
+   * Stacked PRs (#11): when a parent session's PR merges, retarget the open PRs
+   * of its dependent (stacked) sessions onto the parent's own base branch, so a
+   * child PR that was targeting the parent's branch re-points at the default
+   * branch. Fires once, on the merge transition edge, before merge auto-cleanup
+   * tears the parent down.
+   *
+   * GitHub already auto-retargets child PRs when the merged head branch is
+   * deleted (AO merges with `--delete-branch`), so this is a safety net for the
+   * cases it doesn't cover; the SCM's `retargetPR` no-ops when the live base has
+   * already moved off the parent's branch, keeping this idempotent.
+   */
+  async function maybeRetargetDependentPRs(
+    parent: Session,
+    oldStatus: SessionStatus,
+    newStatus: SessionStatus,
+  ): Promise<void> {
+    if (newStatus !== SESSION_STATUS.MERGED || oldStatus === SESSION_STATUS.MERGED) return;
+    if (!parent.branch) return;
+    // Capture into a const so the non-null narrowing survives the awaits below.
+    const parentBranch = parent.branch;
+
+    const project = config.projects[parent.projectId];
+    if (!project) return;
+    const scm = project.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
+    if (!scm?.retargetPR) return;
+    const retargetPR = scm.retargetPR.bind(scm);
+
+    // The base the children should re-point at = the branch the parent merged
+    // into. Enrichment may not have populated pr.baseBranch, so fall back to the
+    // project default branch (the common single-level-stack case).
+    const targetBase = parent.pr?.baseBranch || project.defaultBranch;
+    if (!targetBase) return;
+
+    let sessions: Session[];
+    try {
+      // Unscoped: a stacked child may live in another project scope.
+      sessions = await sessionManager.list();
+    } catch {
+      return;
+    }
+
+    const children = sessions.filter((s) => s.parentSessionId === parent.id && s.pr);
+    for (const child of children) {
+      const childPr = child.pr;
+      if (!childPr) continue;
+      try {
+        // Only retarget PRs still pointing at the parent's branch.
+        await retargetPR(childPr, targetBase, parentBranch);
+        recordActivityEvent({
+          projectId: child.projectId,
+          sessionId: child.id,
+          source: "lifecycle",
+          kind: "stacked.pr_retargeted",
+          summary: `retargeted ${child.id} PR onto ${targetBase} after parent ${parent.id} merged`,
+          data: {
+            parentSessionId: parent.id,
+            parentBranch,
+            newBase: targetBase,
+            prUrl: childPr.url,
+          },
+        });
+      } catch (err) {
+        recordActivityEvent({
+          projectId: child.projectId,
+          sessionId: child.id,
+          source: "lifecycle",
+          kind: "stacked.pr_retarget_failed",
+          level: "warn",
+          summary: `failed to retarget ${child.id} PR after parent ${parent.id} merged`,
+          data: {
+            parentSessionId: parent.id,
+            newBase: targetBase,
+            errorMessage: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }
+    }
+  }
+
   async function maybeDispatchCIFailureDetails(
     session: Session,
     _oldStatus: SessionStatus,
@@ -3983,6 +4063,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       maybeDispatchReviewBacklog(session, oldStatus, newStatus, transitionReaction),
       maybeDispatchMergeConflicts(session, newStatus),
       maybeDispatchCIFailureDetails(session, oldStatus, newStatus, transitionReaction),
+      maybeRetargetDependentPRs(session, oldStatus, newStatus),
     ]);
 
     // Report watcher: audit agent reports for issues (#140)

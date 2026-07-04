@@ -64,6 +64,41 @@ describe("buildPrompt split output", () => {
     expect(taskPrompt).not.toContain("Layered Prompt System");
   });
 
+  it("renders stacked-PR instructions when baseBranch differs from default", () => {
+    const { systemPrompt } = buildPrompt({
+      project,
+      projectId: "test-app",
+      issueId: "11",
+      baseBranch: "feat/10-parent",
+    });
+
+    expect(systemPrompt).toContain("## Stacked PR");
+    expect(systemPrompt).toContain("stacked on branch `feat/10-parent`");
+    expect(systemPrompt).toContain("gh pr create --base feat/10-parent");
+    expect(systemPrompt).toContain("retargets your PR to `main`");
+  });
+
+  it("omits stacked-PR section when baseBranch equals the default branch", () => {
+    const { systemPrompt } = buildPrompt({
+      project,
+      projectId: "test-app",
+      issueId: "11",
+      baseBranch: "main",
+    });
+
+    expect(systemPrompt).not.toContain("## Stacked PR");
+  });
+
+  it("omits stacked-PR section when baseBranch is absent", () => {
+    const { systemPrompt } = buildPrompt({
+      project,
+      projectId: "test-app",
+      issueId: "11",
+    });
+
+    expect(systemPrompt).not.toContain("## Stacked PR");
+  });
+
   it("omits taskPrompt for bare spawns", () => {
     const { taskPrompt } = buildPrompt({
       project,

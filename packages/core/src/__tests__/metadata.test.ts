@@ -115,6 +115,35 @@ describe("writeMetadata + readMetadata", () => {
     expect(meta!.blockedBy).toEqual(["7"]);
   });
 
+  it("round-trips parentSessionId (stacked PRs)", () => {
+    writeMetadata(dataDir, "app-child", {
+      worktree: "/tmp/w",
+      branch: "feat/11-child",
+      status: "spawning",
+      parentSessionId: "app-1",
+    });
+
+    const content = readFileSync(join(dataDir, "app-child.json"), "utf-8");
+    expect(JSON.parse(content).parentSessionId).toBe("app-1");
+
+    const meta = readMetadata(dataDir, "app-child");
+    expect(meta!.parentSessionId).toBe("app-1");
+  });
+
+  it("omits parentSessionId when unset", () => {
+    writeMetadata(dataDir, "app-noparent", {
+      worktree: "/tmp/w",
+      branch: "feat/x",
+      status: "working",
+    });
+
+    const content = readFileSync(join(dataDir, "app-noparent.json"), "utf-8");
+    expect(JSON.parse(content).parentSessionId).toBeUndefined();
+
+    const meta = readMetadata(dataDir, "app-noparent");
+    expect(meta!.parentSessionId).toBeUndefined();
+  });
+
   it("omits dependsOn / blockedBy when empty", () => {
     writeMetadata(dataDir, "app-nodep", {
       worktree: "/tmp/w",
