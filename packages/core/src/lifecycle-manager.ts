@@ -3775,7 +3775,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             });
             delivered = await notifyHuman(event, reactionConfig.priority ?? "warning");
           } catch {
-            delivered = false;
+            // Delivery failed — `delivered` stays false so we retry next poll.
           }
           // Latch + record the fingerprint ONLY once the human actually received
           // the detailed report — an undelivered hold retries next poll rather than
