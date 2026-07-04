@@ -15,7 +15,7 @@ A recurring loop touches three kinds of content with opposite lifecycles. Keep t
 | Content | Store | Write discipline |
 |---|---|---|
 | **Policy** — merge bar, safety rules, do-not-touch list | A versioned file (this skill / a project HANDOFF doc) | Edited deliberately and rarely; never rewritten per-cycle |
-| **Volatile state** — decisions made, dispatch log, finding ledger, current phase | A machine-written `STATE.json` (see `STATE.template.json`) | Updated ONLY from command output, never from recollection |
+| **Volatile state** — decisions made, dispatch log, finding ledger, current phase | A machine-written `STATE.json` (see `STATE.template.json`) | Updated only from command output or VERBATIM human input (quote the human, with timestamp) — never from the agent's own paraphrased recollection |
 | **Everything derivable** — CI status, HEAD SHA, review lists, session states | Nowhere. | Re-derive fresh every cycle from `gh` / the API |
 
 **Why:** carrying state inside a self-scheduled prompt mutates it by paraphrase — a lossy copy with no integrity checks. Observed: round counts drifted, and one loop prompt recorded a deliverable as "done" that was never sent; the next cycle believed its own forged record.
