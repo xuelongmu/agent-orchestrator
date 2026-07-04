@@ -137,15 +137,33 @@ interface NeedsDecisionContext {
   question: string;
 }
 
-/** Read a fresh `needs_decision` report (with a question) off a session, else null. */
+/** Tolerance (ms) when matching a needs_decision report to the current block. */
+const NEEDS_DECISION_ENTRY_TOLERANCE_MS = 2_000;
+
+/**
+ * Read the `needs_decision` report backing the session's CURRENT needs_input
+ * block, else null. `needs_decision` reports are sticky (exempt from
+ * stale-report handling until a later `ao report` clears them), so a wall-clock
+ * freshness window would wrongly drop the context for a genuinely-still-blocked
+ * session (e.g. a delayed poll or daemon restart). Instead we anchor to the
+ * session's last transition: applyAgentReport stamps the report time AND
+ * lastTransitionAt together, so a report predating the current state entry
+ * belongs to a prior, resolved block (lifecycle inference left and re-entered
+ * needs_input) and must not leak into an unrelated later needs-input (#12).
+ */
 function readNeedsDecisionReport(session: Session): NeedsDecisionContext | null {
   const report = readAgentReport(session.metadata);
   if (report?.state !== "needs_decision" || !report.question) return null;
-  // The decision metadata is only cleared by a later `ao report`, so lifecycle
-  // inference can move the session out of needs_input while a stale question
-  // lingers. Require freshness so an unrelated later needs-input notification
-  // never reuses an expired decision (#12 review).
-  if (!isAgentReportFresh(report)) return null;
+  const reportedAt = Date.parse(report.timestamp);
+  const enteredAtRaw = session.lifecycle.session.lastTransitionAt;
+  const enteredAt = enteredAtRaw ? Date.parse(enteredAtRaw) : NaN;
+  if (
+    Number.isFinite(reportedAt) &&
+    Number.isFinite(enteredAt) &&
+    reportedAt < enteredAt - NEEDS_DECISION_ENTRY_TOLERANCE_MS
+  ) {
+    return null;
+  }
   return { confidence: report.confidence, question: report.question };
 }
 
@@ -1750,7 +1768,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * data simply contributes no penalty.
    */
   function gatherConfidenceSignals(session: Session): ConfidenceSignals {
-    const reviewRounds = parseAttemptCount(session.metadata["reviewRoundCount"]);
+    // Use the CUMULATIVE round count: the review backlog loop clears
+    // reviewRoundCount as soon as the bot-review loop is satisfied, so a PR that
+    // churned through several rounds then went review-clean (while CI was still
+    // pending) would otherwise score as zero churn for a later approved-and-green
+    // check. reviewRoundCountTotal survives satisfaction and is only reset when
+    // the PR reaches a terminal state (#12 review). Fall back to the live count.
+    const reviewRounds = Math.max(
+      parseAttemptCount(session.metadata["reviewRoundCountTotal"]),
+      parseAttemptCount(session.metadata["reviewRoundCount"]),
+    );
     const ciTracker = reactionTrackers.get(`${session.id}:ci-failed`);
     const ciFailureCount = ciTracker?.attempts ?? 0;
 
@@ -2287,6 +2314,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         lastAutomatedReviewDispatchHash: "",
         lastAutomatedReviewDispatchAt: "",
         reviewRoundCount: "",
+        // Cumulative churn signal for the confidence gate (#12): reset only here,
+        // at a terminal PR state — NOT on bot-review-satisfied — so a later
+        // auto-action still scores the rounds this PR actually went through.
+        reviewRoundCountTotal: "",
         reviewRoundsEscalated: "",
         reviewSatisfiedAt: "",
         botReviewObserved: "",
@@ -2618,7 +2649,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           } else {
             const enrichedConfig = { ...reactionConfig, message: enrichedMessage };
             const result = await executeReaction(session, humanReactionKey, enrichedConfig);
-            success = result.success;
+            // A confidence-held reaction returns escalated (success:true) but
+            // delivered nothing to the agent — don't stamp the dispatch hash, or
+            // these exact comments get suppressed on later polls (#12 review).
+            success = result.success && !result.escalated;
           }
           if (success) {
             updateSessionMetadata(session, {
@@ -2727,13 +2761,19 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             } else {
               const enrichedConfig = { ...reactionConfig, message: enrichedMessage };
               const result = await executeReaction(session, automatedReactionKey, enrichedConfig);
-              success = result.success;
+              // A confidence-held reaction returns escalated (success:true) but
+              // delivered nothing — don't stamp the dispatch hash or count a round,
+              // or this batch gets suppressed on later polls (#12 review).
+              success = result.success && !result.escalated;
             }
             if (success) {
               updateSessionMetadata(session, {
                 lastAutomatedReviewDispatchHash: automatedFingerprint,
                 lastAutomatedReviewDispatchAt: new Date().toISOString(),
                 reviewRoundCount: String(reviewRounds + 1),
+                reviewRoundCountTotal: String(
+                  parseAttemptCount(session.metadata["reviewRoundCountTotal"]) + 1,
+                ),
               });
             }
           }
@@ -4533,12 +4573,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     );
     // A `needs_decision` report shares the `agent_needs_input` trigger with a
     // generic needs_input, but carries distinct decision context. Fold the
-    // reported state into the activation identity so refining needs_input →
-    // needs_decision (which produces no status transition) still counts as a NEW
-    // activation and re-fires the report reaction / activity event (#12 review).
+    // reported state AND the report timestamp into the activation identity so
+    // that (a) refining needs_input → needs_decision and (b) a SECOND
+    // needs_decision with a new question/confidence each count as a NEW
+    // activation — re-firing the report reaction / notification even without a
+    // status transition. Each `ao report` stamps a fresh timestamp (#12 review).
     const activationIdentity =
       auditResult.report?.state === "needs_decision"
-        ? `${auditResult.trigger}:needs_decision`
+        ? `${auditResult.trigger}:needs_decision:${auditResult.report.timestamp}`
         : auditResult.trigger;
     const isNewTrigger =
       session.metadata[REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER] !== activationIdentity;

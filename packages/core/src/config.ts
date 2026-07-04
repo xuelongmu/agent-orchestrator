@@ -795,9 +795,20 @@ function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
   // refines the default instead of dropping `action`/`auto` back to schema
   // defaults and silently disabling the autonomous action (#12 review).
   const mergedReactions: Record<string, ReactionConfig> = { ...defaults };
-  for (const [key, override] of Object.entries(config.reactions ?? {})) {
+  for (const [key, rawOverride] of Object.entries(config.reactions ?? {})) {
+    // Runtime shape is partial (root reactions parse via ReactionConfigSchema
+    // .partial()); the OrchestratorConfig type over-declares it as full.
+    const override = rawOverride as Partial<ReactionConfig>;
     const base: ReactionConfig = mergedReactions[key] ?? { auto: true, action: "notify" };
-    mergedReactions[key] = { ...base, ...override };
+    const merged: ReactionConfig = { ...base, ...override };
+    // Explicitly overriding to an autonomous action signals intent to ENABLE it,
+    // so don't inherit `auto: false` from a default like approved-and-green — the
+    // transition handler skips non-notify reactions when auto === false, which
+    // would leave both the confidence gate AND the action dead (#12 review).
+    if (override.action !== undefined && override.auto === undefined && merged.action !== "notify") {
+      merged.auto = true;
+    }
+    mergedReactions[key] = merged;
   }
   config.reactions = mergedReactions;
 

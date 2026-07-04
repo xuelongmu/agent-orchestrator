@@ -1344,3 +1344,40 @@ describe("Config Validation - Reaction default merging (#12)", () => {
     expect(config.reactions["custom-key"].auto).toBe(true);
   });
 });
+
+describe("Config Validation - Enabling autonomous actions (#12)", () => {
+  it("enables auto when an autonomous action is explicitly set over an auto:false default", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        // approved-and-green defaults to auto:false; an explicit auto-merge
+        // override must actually run (auto -> true), not inherit the default.
+        "approved-and-green": { action: "auto-merge", confidenceThreshold: 0.75 },
+      },
+    });
+    expect(config.reactions["approved-and-green"].auto).toBe(true);
+    expect(config.reactions["approved-and-green"].action).toBe("auto-merge");
+    expect(config.reactions["approved-and-green"].confidenceThreshold).toBe(0.75);
+  });
+
+  it("respects an explicit auto:false alongside an action override", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        "approved-and-green": { action: "auto-merge", auto: false },
+      },
+    });
+    expect(config.reactions["approved-and-green"].auto).toBe(false);
+  });
+
+  it("does not force auto for a notify action override", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        "approved-and-green": { action: "notify" },
+      },
+    });
+    // approved-and-green default auto is false; a notify override keeps it.
+    expect(config.reactions["approved-and-green"].auto).toBe(false);
+  });
+});

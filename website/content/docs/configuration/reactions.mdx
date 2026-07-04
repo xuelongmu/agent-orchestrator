@@ -131,6 +131,7 @@ independently each poll, so the reaction-level hold could not stop the spawn.)
 ```yaml
 reactions:
   approved-and-green:
+    auto: true # approved-and-green defaults to auto: false — enable it
     action: auto-merge
     confidenceThreshold: 0.75 # hold auto-merge below 75% confidence
 ```
