@@ -166,6 +166,14 @@ export type {
   AgentReportTransitionResult,
 } from "./agent-report.js";
 
+// Confidence scoring for autonomous-action escalation gating (#12)
+export { computeConfidence, summarizeConfidenceFactors } from "./confidence.js";
+export type {
+  ConfidenceSignals,
+  ConfidenceFactor,
+  ConfidenceAssessment,
+} from "./confidence.js";
+
 // tmux — command wrappers
 export {
   isTmuxAvailable,

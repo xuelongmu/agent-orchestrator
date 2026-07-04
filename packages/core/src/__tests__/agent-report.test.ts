@@ -247,6 +247,61 @@ describe("applyAgentReport", () => {
     });
   });
 
+  it("records needs_decision with confidence + question and parks needs_input", () => {
+    const now = new Date("2025-01-01T13:00:00.000Z");
+    const result = applyAgentReport(dataDir, sessionId, {
+      state: "needs_decision",
+      confidence: 0.35,
+      question: " Should I drop the legacy column or keep it? ",
+      now,
+    });
+
+    expect(result.report.state).toBe("needs_decision");
+    expect(result.report.confidence).toBe(0.35);
+    expect(result.report.question).toBe("Should I drop the legacy column or keep it?");
+    expect(result.nextState).toBe("needs_input");
+
+    const meta = readMetadataRaw(dataDir, sessionId)!;
+    expect(meta[AGENT_REPORT_METADATA_KEYS.STATE]).toBe("needs_decision");
+    expect(meta[AGENT_REPORT_METADATA_KEYS.CONFIDENCE]).toBe("0.35");
+    expect(meta[AGENT_REPORT_METADATA_KEYS.QUESTION]).toBe(
+      "Should I drop the legacy column or keep it?",
+    );
+
+    const roundTripped = readAgentReport(meta);
+    expect(roundTripped?.state).toBe("needs_decision");
+    expect(roundTripped?.confidence).toBe(0.35);
+    expect(roundTripped?.question).toBe("Should I drop the legacy column or keep it?");
+  });
+
+  it("clamps out-of-range confidence into [0,1]", () => {
+    const now = new Date("2025-01-01T13:05:00.000Z");
+    const result = applyAgentReport(dataDir, sessionId, {
+      state: "needs_decision",
+      confidence: 1.7,
+      question: "proceed?",
+      now,
+    });
+    expect(result.report.confidence).toBe(1);
+  });
+
+  it("clears stale decision metadata on a subsequent non-decision report", () => {
+    applyAgentReport(dataDir, sessionId, {
+      state: "needs_decision",
+      confidence: 0.2,
+      question: "keep or drop?",
+      now: new Date("2025-01-01T13:10:00.000Z"),
+    });
+    applyAgentReport(dataDir, sessionId, {
+      state: "working",
+      now: new Date("2025-01-01T13:11:00.000Z"),
+    });
+    const meta = readMetadataRaw(dataDir, sessionId)!;
+    expect(meta[AGENT_REPORT_METADATA_KEYS.CONFIDENCE]).toBe("");
+    expect(meta[AGENT_REPORT_METADATA_KEYS.QUESTION]).toBe("");
+    expect(readAgentReport(meta)?.confidence).toBeUndefined();
+  });
+
   it("records pr_created with PR metadata and pr_open lifecycle", () => {
     const now = new Date("2025-01-02T09:30:00.000Z");
     const result = applyAgentReport(dataDir, sessionId, {

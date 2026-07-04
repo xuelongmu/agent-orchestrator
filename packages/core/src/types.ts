@@ -1489,6 +1489,18 @@ export interface ReactionConfig {
    * processes rather than alive-but-idle agents.
    */
   nudgeRetries?: number;
+
+  /**
+   * Minimum confidence (0..1) required for this reaction to run its autonomous
+   * action (`auto-merge`, `send-to-agent` auto-fix, or `spawn-session`). Before
+   * acting, AO folds cheap risk signals (review rounds, open finding severity,
+   * CI failures, diff size) into a heuristic confidence score. When the score is
+   * below this threshold the action is held and escalated to a human with a
+   * question instead of running (#12). Undefined disables the gate — reactions
+   * behave exactly as before. Does not apply to `notify` actions (they already
+   * defer to a human).
+   */
+  confidenceThreshold?: number;
 }
 
 export interface ReactionResult {

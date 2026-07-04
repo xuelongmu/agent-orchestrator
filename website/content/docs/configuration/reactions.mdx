@@ -100,6 +100,7 @@ Each reaction accepts:
 | `escalateAfter` | `number` or duration string | Escalate after attempts or time, whichever applies |
 | `threshold` | duration string | Used by stuck/idle style reactions |
 | `includeSummary` | `boolean` | Include session summary in the notification |
+| `confidenceThreshold` | `number` (0..1) | Minimum heuristic confidence to run the autonomous action; below it AO holds and escalates to a human with a question |
 
 Example:
 
@@ -113,6 +114,32 @@ reactions:
       Reviewers requested changes. Read the unresolved comments,
       make the requested fixes, and push an update.
 ```
+
+## Confidence Gate
+
+Set `confidenceThreshold` on any reaction with an autonomous action (`auto-merge`,
+`send-to-agent`, `spawn-session`) to require human sign-off when AO is not confident
+enough. Before acting, AO folds cheap risk signals — review-round churn, the severity
+and confidence of open automated review findings, CI failures on the branch, and diff
+size — into a heuristic score between 0 and 1. When the score is below the threshold,
+the action is **held** and escalated to a human with a question explaining why, instead
+of running. Omit the field to keep the reaction's original behavior.
+
+```yaml
+reactions:
+  approved-and-green:
+    action: auto-merge
+    confidenceThreshold: 0.75 # hold auto-merge below 75% confidence
+```
+
+Workers can also hand a judgment call up explicitly:
+
+```bash
+ao report needs-decision --confidence 0.4 --question "Drop the legacy column or keep it?"
+```
+
+This parks the session in `needs_input` and surfaces the confidence and question to the
+human, so the agent never guesses on a risky call it is unsure about.
 
 ## Notification Routing
 

@@ -70,6 +70,13 @@ import {
   isWeakActivityEvidence,
 } from "./activity-signal.js";
 import { isAgentReportFresh, mapAgentReportToLifecycle, readAgentReport } from "./agent-report.js";
+import {
+  computeConfidence,
+  summarizeConfidenceFactors,
+  type ConfidenceAssessment,
+  type ConfidenceSignals,
+} from "./confidence.js";
+import { createCodeReviewStore, type CodeReviewSeverity } from "./code-review-store.js";
 import { evaluateBudgetBreach, resolveBudget } from "./budget.js";
 import {
   auditAgentReports,
@@ -115,6 +122,29 @@ function parseDuration(str: string): number {
     default:
       return 0;
   }
+}
+
+/** Severity ordering for picking the riskiest open review finding. */
+const CODE_REVIEW_SEVERITY_RANK: Record<CodeReviewSeverity, number> = {
+  info: 1,
+  warning: 2,
+  error: 3,
+};
+
+/** Compose the human-facing question when a low-confidence action is held (#12). */
+function buildConfidenceEscalationQuestion(
+  reactionKey: string,
+  action: string,
+  threshold: number,
+  assessment: ConfidenceAssessment,
+): string {
+  const pct = Math.round(assessment.score * 100);
+  const thresholdPct = Math.round(threshold * 100);
+  return (
+    `Confidence ${pct}% is below the ${thresholdPct}% threshold to auto-run '${action}' ` +
+    `for '${reactionKey}'. Reasons: ${summarizeConfidenceFactors(assessment)}. ` +
+    `Proceed manually or intervene?`
+  );
 }
 
 /** Reaction keys for conditions that can oscillate (e.g. CI failing→pending→failing).
@@ -1685,6 +1715,50 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     });
   }
 
+  /**
+   * Gather cheap, already-available risk signals for confidence scoring (#12).
+   * Reads review-round churn from metadata, CI-failure count from the ci-failed
+   * reaction tracker, diff size from cached PR enrichment, and the riskiest open
+   * automated review finding from the code-review store. Never throws — missing
+   * data simply contributes no penalty.
+   */
+  function gatherConfidenceSignals(session: Session): ConfidenceSignals {
+    const reviewRounds = parseAttemptCount(session.metadata["reviewRoundCount"]);
+    const ciTracker = reactionTrackers.get(`${session.id}:ci-failed`);
+    const ciFailureCount = ciTracker?.attempts ?? 0;
+
+    const enrichment = getPREnrichmentForSession(session);
+    const diffSize =
+      enrichment && (enrichment.additions != null || enrichment.deletions != null)
+        ? (enrichment.additions ?? 0) + (enrichment.deletions ?? 0)
+        : undefined;
+
+    let maxFindingSeverity: CodeReviewSeverity | null = null;
+    let maxFindingConfidence: number | null = null;
+    try {
+      const openFindings = createCodeReviewStore(session.projectId).listFindings({
+        linkedSessionId: session.id,
+        status: "open",
+      });
+      for (const finding of openFindings) {
+        const currentRank = maxFindingSeverity ? CODE_REVIEW_SEVERITY_RANK[maxFindingSeverity] : 0;
+        const findingRank = CODE_REVIEW_SEVERITY_RANK[finding.severity];
+        const isRiskier =
+          findingRank > currentRank ||
+          (findingRank === currentRank &&
+            (finding.confidence ?? 0) > (maxFindingConfidence ?? 0));
+        if (isRiskier) {
+          maxFindingSeverity = finding.severity;
+          maxFindingConfidence = finding.confidence ?? null;
+        }
+      }
+    } catch {
+      // No code-review store / findings for this project yet — treat as none.
+    }
+
+    return { reviewRounds, ciFailureCount, diffSize, maxFindingSeverity, maxFindingConfidence };
+  }
+
   /** Execute a reaction for a session. */
   async function executeReaction(
     session: Session | ReactionSessionContext,
@@ -1788,6 +1862,70 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     // Execute the reaction action
     const action = reactionConfig.action ?? "notify";
+
+    // Confidence gate (#12): when a reaction opts into confidence scoring, fold
+    // cheap risk signals into a heuristic score and hold the autonomous action
+    // below the configured threshold — escalating to a human with a question
+    // instead of acting. `notify` already defers to a human, so it is never
+    // gated. Synthetic system sessions (no lifecycle) are skipped: they carry no
+    // metadata/PR to score and never run autonomous actions.
+    const confidenceThreshold = reactionConfig.confidenceThreshold;
+    if (confidenceThreshold != null && action !== "notify" && "lifecycle" in session) {
+      const assessment = computeConfidence(gatherConfidenceSignals(session));
+      if (assessment.score < confidenceThreshold) {
+        const question = buildConfidenceEscalationQuestion(
+          reactionKey,
+          action,
+          confidenceThreshold,
+          assessment,
+        );
+        recordActivityEvent({
+          projectId,
+          sessionId,
+          source: "reaction",
+          kind: "reaction.escalated",
+          level: "warn",
+          summary: `reaction ${reactionKey} held: confidence ${assessment.score.toFixed(2)} < ${confidenceThreshold}`,
+          data: {
+            reactionKey,
+            action,
+            cause: "low_confidence",
+            confidence: assessment.score,
+            confidenceThreshold,
+            factors: assessment.factors,
+          },
+        });
+        const context = buildEventContext(session, prEnrichmentCache);
+        const event = createEvent("reaction.escalated", {
+          sessionId,
+          projectId,
+          message: question,
+          data: buildReactionEscalationNotificationData({
+            eventType: "reaction.escalated",
+            sessionId,
+            projectId,
+            context,
+            reactionKey,
+            action: "escalated",
+            attempts: tracker.attempts,
+            cause: "low_confidence",
+            confidence: assessment.score,
+            question,
+            enrichment: getPREnrichmentForSession(session),
+          }),
+        });
+        await notifyHuman(event, reactionConfig.priority ?? "urgent");
+        // Latch escalated so the action stays held (mirrors escalateAfter) until
+        // the underlying condition resolves and the tracker is cleared.
+        tracker.escalated = true;
+        return {
+          reactionType: reactionKey,
+          success: true,
+          action: "escalated",
+          escalated: true,
+        };
+      }
+    }
 
     switch (action) {
       case "send-to-agent": {

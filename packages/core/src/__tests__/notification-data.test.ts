@@ -144,6 +144,28 @@ describe("notification data v3", () => {
     });
   });
 
+  it("carries confidence + question on a low_confidence escalation", () => {
+    const data = buildReactionEscalationNotificationData({
+      eventType: "reaction.escalated",
+      sessionId: "worker-1",
+      projectId: "demo",
+      context,
+      reactionKey: "approved-and-green",
+      action: "escalated",
+      attempts: 1,
+      cause: "low_confidence",
+      confidence: 0.42,
+      question: "Proceed with auto-merge?",
+    });
+
+    expect(data.escalation).toEqual({
+      attempts: 1,
+      cause: "low_confidence",
+      confidence: 0.42,
+      question: "Proceed with auto-merge?",
+    });
+  });
+
   it("builds PR state transition data", () => {
     const data = buildPRStateNotificationData({
       eventType: "pr.closed",

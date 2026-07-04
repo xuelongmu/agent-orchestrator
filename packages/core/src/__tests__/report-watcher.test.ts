@@ -212,6 +212,22 @@ describe("checkBlockedAgent", () => {
     expect(result?.trigger).toBe("agent_needs_input");
     expect(result?.timeSinceReportMs).toBeGreaterThan(0);
   });
+
+  it("surfaces the confidence + question for a needs_decision report", () => {
+    const now = new Date();
+    const session = createMockSession();
+    const report: AgentReport = {
+      state: "needs_decision",
+      timestamp: now.toISOString(),
+      confidence: 0.3,
+      question: "Drop the legacy column?",
+    };
+
+    const result = checkBlockedAgent(session, report, now, config);
+    expect(result?.trigger).toBe("agent_needs_input");
+    expect(result?.message).toContain("30%");
+    expect(result?.message).toContain("Drop the legacy column?");
+  });
 });
 
 describe("auditAgentReports", () => {

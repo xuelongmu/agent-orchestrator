@@ -99,8 +99,12 @@ export interface NotificationReaction {
 
 export interface NotificationEscalation {
   attempts: number;
-  cause: "max_retries" | "max_attempts" | "max_duration";
+  cause: "max_retries" | "max_attempts" | "max_duration" | "low_confidence";
   durationMs?: number;
+  /** Confidence score (0..1) that triggered a `low_confidence` escalation. */
+  confidence?: number;
+  /** Human-facing question posed to the reviewer when handing the decision up. */
+  question?: string;
 }
 
 export interface NotificationDataV3 {
@@ -152,6 +156,10 @@ export interface ReactionEscalationNotificationInput extends ReactionNotificatio
   attempts: number;
   cause: NotificationEscalation["cause"];
   durationMs?: number;
+  /** Confidence score (0..1) that triggered a `low_confidence` escalation. */
+  confidence?: number;
+  /** Human-facing question posed to the reviewer when handing the decision up. */
+  question?: string;
 }
 
 const REACTION_SEMANTIC_TYPES: Record<string, string> = {
@@ -374,6 +382,8 @@ export function buildReactionEscalationNotificationData(
     attempts: input.attempts,
     cause: input.cause,
     ...(typeof input.durationMs === "number" ? { durationMs: input.durationMs } : {}),
+    ...(typeof input.confidence === "number" ? { confidence: input.confidence } : {}),
+    ...(input.question ? { question: input.question } : {}),
   };
   return data;
 }

@@ -161,6 +161,7 @@ const ReactionConfigSchema = z.object({
   includeSummary: z.boolean().optional(),
   maxRounds: z.number().int().positive().optional(),
   nudgeRetries: z.number().int().positive().optional(),
+  confidenceThreshold: z.number().min(0).max(1).optional(),
 });
 
 const TrackerConfigSchema = z

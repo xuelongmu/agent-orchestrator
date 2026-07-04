@@ -149,7 +149,13 @@ export function checkStaleReport(
   if (timeSinceReport < config.staleReportTimeoutMs) return null;
 
   // Don't flag as stale if agent is in a waiting state (that's expected)
-  if (report.state === "waiting" || report.state === "needs_input") return null;
+  if (
+    report.state === "waiting" ||
+    report.state === "needs_input" ||
+    report.state === "needs_decision"
+  ) {
+    return null;
+  }
 
   return {
     trigger: "stale_report",
@@ -174,12 +180,20 @@ export function checkBlockedAgent(
   // If no report, nothing to check
   if (!report) return null;
 
-  if (report.state === "needs_input") {
+  if (report.state === "needs_input" || report.state === "needs_decision") {
     const reportTime = Date.parse(report.timestamp);
     const timeSinceReportMs = Number.isNaN(reportTime) ? undefined : now.getTime() - reportTime;
+    // needs_decision carries an explicit confidence + question (#12); surface
+    // both so the notification hands the human the full judgment call.
+    const message =
+      report.state === "needs_decision"
+        ? `Agent needs a decision${
+            report.confidence != null ? ` (confidence ${Math.round(report.confidence * 100)}%)` : ""
+          }: ${report.question ?? report.note ?? "waiting for user decision"}`
+        : `Agent needs input: ${report.note ?? "waiting for user decision"}`;
     return {
       trigger: "agent_needs_input",
-      message: `Agent needs input: ${report.note ?? "waiting for user decision"}`,
+      message,
       checkedAt: now.toISOString(),
       report,
       timeSinceReportMs,
