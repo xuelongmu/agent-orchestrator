@@ -127,6 +127,11 @@
         },
         "includeSummary": {
           "type": "boolean"
+        },
+        "nudgeRetries": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Max auto-nudges re-delivering unaddressed PR review comments to a stuck/idle agent before escalating to a human (agent-stuck reaction)."
         }
       }
     },

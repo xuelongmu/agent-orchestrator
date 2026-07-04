@@ -160,6 +160,7 @@ const ReactionConfigSchema = z.object({
   threshold: z.string().optional(),
   includeSummary: z.boolean().optional(),
   maxRounds: z.number().int().positive().optional(),
+  nudgeRetries: z.number().int().positive().optional(),
 });
 
 const TrackerConfigSchema = z
@@ -759,6 +760,10 @@ function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
       action: "notify",
       priority: "urgent",
       threshold: "10m",
+      // Before falling back to `notify`, re-deliver unaddressed PR review
+      // comments to the idle agent up to this many times (auto-nudge); after
+      // that, escalate to needs_input + notify. See maybeNudgeStuckAgent.
+      nudgeRetries: 3,
     },
     "agent-needs-input": {
       auto: true,

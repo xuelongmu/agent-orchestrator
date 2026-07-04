@@ -577,6 +577,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   const DEFAULT_MAX_REVIEW_ROUNDS = 5;
 
   /**
+   * Default cap on automatic nudges re-delivering unaddressed PR review comments
+   * to a stuck/idle agent before escalating to a human (needs_input + notify).
+   * Overridable per project/reaction via the `agent-stuck` reaction's
+   * `nudgeRetries`.
+   */
+  const DEFAULT_STUCK_NUDGE_RETRIES = 3;
+
+  /**
    * Populate the PR enrichment cache using batch GraphQL queries.
    * This is called once per poll cycle to fetch data for all PRs efficiently.
    */
@@ -1378,20 +1386,25 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // By this point, session.pr is already set if a PR was discovered.
 
     if (session.pr && scm) {
-      // The bot review→fix loop escalated after exceeding its round cap. Park
-      // the session in needs_input until the loop resolves (maybeDispatchReviewBacklog
-      // clears the latch once the bot threads clear). Without this, SCM enrichment
-      // below — which sees bot comments only as generic threads, not a "changes
-      // requested" review — would re-derive pr_open/mergeable and bury the
-      // escalation. This is the one place SCM ground truth yields to an explicit
-      // loop-control decision.
+      // Two explicit loop-control escalations park the session in needs_input
+      // while its PR stays open, overriding SCM-derived status:
+      //  • reviewRoundsEscalated — the bot review→fix loop exceeded its round cap.
+      //  • stuckNudgeEscalated   — a stuck/idle agent exhausted its auto-nudge
+      //    budget for unaddressed review comments (see maybeNudgeStuckAgent).
+      // Without this, SCM enrichment below — which sees bot comments only as
+      // generic threads, not a "changes requested" review — would re-derive
+      // pr_open/mergeable/stuck and bury the escalation. Both latches are cleared
+      // by maybeDispatchReviewBacklog once the underlying comments clear. This is
+      // the one place SCM ground truth yields to an explicit loop-control decision.
       //
       // Terminal PR states still win: a human may resolve the loop by merging or
-      // closing the PR directly while bot threads are unresolved. In that case
+      // closing the PR directly while threads are unresolved. In that case
       // fall through so the enrichment/live-API path returns merged/closed —
       // which also drops the pr.state to non-open, letting maybeDispatchReviewBacklog
       // clear the latch and unblock merge cleanup / close notifications.
-      if (session.metadata["reviewRoundsEscalated"] === "true") {
+      const reviewRoundsEscalated = session.metadata["reviewRoundsEscalated"] === "true";
+      const stuckNudgeEscalated = session.metadata["stuckNudgeEscalated"] === "true";
+      if (reviewRoundsEscalated || stuckNudgeEscalated) {
         const escalatedPRKey = `${session.pr.owner}/${session.pr.repo}#${session.pr.number}`;
         const escalatedEnrichment = prEnrichmentCache.get(escalatedPRKey);
         let prIsTerminal =
@@ -1415,7 +1428,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           lifecycle.pr.lastObservedAt = nowIso;
           return commit({
             status: SESSION_STATUS.NEEDS_INPUT,
-            evidence: "review_rounds_escalated",
+            evidence: reviewRoundsEscalated ? "review_rounds_escalated" : "stuck_nudge_escalated",
             detecting: { attempts: 0 },
             sessionState: "needs_input",
             sessionReason: "awaiting_user_input",
@@ -1964,6 +1977,50 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return [...ids].sort().join(",");
   }
 
+  /** Parse a comma-joined fingerprint (see makeFingerprint) back into an ID set. */
+  function splitFingerprintIds(fingerprint: string): Set<string> {
+    return new Set(fingerprint ? fingerprint.split(",") : []);
+  }
+
+  /**
+   * True when the review reaction for `key` re-delivers comments to the AGENT
+   * (an enabled send-to-agent action). Notify-only or auto:false configs surface
+   * comments to humans only, so the nudge must not turn them into agent sends.
+   */
+  function reviewReactionSendsToAgent(session: Session, key: string): boolean {
+    const reaction = getReactionConfigForSession(session, key);
+    return reaction?.action === "send-to-agent" && reaction.auto !== false;
+  }
+
+  /**
+   * True when the review reaction for `key` has ESCALATED (exhausted its
+   * retries/escalateAfter and handed off to a human). executeReaction records the
+   * dispatch hash on escalation even though nothing reached the agent, so the
+   * nudge must NOT treat that hash as a delivered backlog and re-send it.
+   */
+  function isReviewReactionEscalated(session: Session, key: string): boolean {
+    return reactionTrackers.get(`${session.id}:${key}`)?.escalated === true;
+  }
+
+  /**
+   * True when the session has an open PR whose review comments were already
+   * delivered to the agent by a send-to-agent reaction. Used only to force a
+   * cache-bypassing review-thread fetch while the nudge is actively spending its
+   * budget, so a GraphQL-only thread resolution is observed promptly. Notify-only
+   * categories are excluded (their dispatch hash is recorded after a human
+   * notification, not an agent send).
+   */
+  function hasDeliveredReviewBacklog(session: Session): boolean {
+    if (!session.pr || session.lifecycle.pr.state !== "open") return false;
+    const botDelivered =
+      !!session.metadata["lastAutomatedReviewDispatchHash"] &&
+      reviewReactionSendsToAgent(session, "bugbot-comments");
+    const humanDelivered =
+      !!session.metadata["lastPendingReviewDispatchHash"] &&
+      reviewReactionSendsToAgent(session, "changes-requested");
+    return botDelivered || humanDelivered;
+  }
+
   async function maybeDispatchReviewBacklog(
     session: Session,
     _oldStatus: SessionStatus,
@@ -1995,6 +2052,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         reviewSatisfiedAt: "",
         botReviewObserved: "",
         botReviewObservedSha: "",
+        stuckNudgeCount: "",
+        stuckNudgeEscalated: "",
+        stuckNudgeFingerprint: "",
       });
       return;
     }
@@ -2032,11 +2092,28 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // REST ETag reflects — so re-check promptly AND force a fresh fetch (below) so
     // the resolution is observed and the loop can unblock.
     const roundEscalated = session.metadata["reviewRoundsEscalated"] === "true";
+    // Same rationale as roundEscalated: while a stuck agent is parked in
+    // needs_input after exhausting its nudge budget, re-check promptly (and
+    // force a fresh fetch below) so the agent/human resolving the comments
+    // clears the latch without waiting out the throttle.
+    const stuckNudgeEscalated = session.metadata["stuckNudgeEscalated"] === "true";
+    // While actively spending the nudge budget on an idle-beyond-threshold agent
+    // with already-delivered comments, force a fresh (cache-bypassing) fetch below
+    // so a comment the agent resolved via a GraphQL-only isResolved change is seen
+    // this cycle rather than counted as still-unresolved — otherwise a stale cache
+    // would burn nudges or escalate unnecessarily. This does not bypass the
+    // throttle (fetch cadence is unchanged); it only upgrades the fetch to fresh.
+    const idleSignalForFetch = session.activitySignal;
+    const nudgeInProgress =
+      hasPositiveIdleEvidence(idleSignalForFetch) &&
+      isIdleBeyondThreshold(session, idleSignalForFetch.timestamp) &&
+      hasDeliveredReviewBacklog(session);
     if (
       !hasRelevantTransition &&
       !readyForReviewRecheck &&
       !revalidateSatisfied &&
-      !roundEscalated
+      !roundEscalated &&
+      !stuckNudgeEscalated
     ) {
       if (Date.now() - lastCheckAt < REVIEW_BACKLOG_THROTTLE_MS) {
         return;
@@ -2048,7 +2125,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // revalidating a satisfied session (an existing thread flipping back to
     // unresolved is a GraphQL-only isResolved change that REST 304s would hide,
     // leaving the merge-ready latch stale).
-    const forceFreshFetch = readyForReviewRecheck || roundEscalated || revalidateSatisfied;
+    const forceFreshFetch =
+      readyForReviewRecheck ||
+      roundEscalated ||
+      revalidateSatisfied ||
+      stuckNudgeEscalated ||
+      nudgeInProgress;
     // Single GraphQL call for all review threads (human + bot) + review summaries.
     // Split locally by isBot for separate reaction pipelines.
     let allThreads: ReviewComment[];
@@ -2088,7 +2170,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         },
       });
       // Don't update the throttle timestamp so the next poll retries immediately
-      // instead of being blocked for 2 minutes with the agent left on a bare notification.
+      // instead of being blocked for 2 minutes. The agent-stuck notify already
+      // fired at the transition (the nudge is purely additive), so a fetch failure
+      // only delays the optional comment re-delivery — it never silences an alert.
       return;
     }
 
@@ -2169,6 +2253,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     const pendingComments = allThreads.filter((c) => !c.isBot);
     const automatedComments = allThreads.filter((c) => c.isBot);
+
+    // Snapshot the dispatch hashes BEFORE the human/bot blocks below mutate them,
+    // so the stuck-agent nudge can distinguish "already delivered, agent went
+    // idle" (fingerprint == prior dispatch hash) from "fresh comments delivered
+    // this cycle" (which the blocks below handle on their own).
+    const priorPendingDispatchHash = session.metadata["lastPendingReviewDispatchHash"] ?? "";
+    const priorAutomatedDispatchHash = session.metadata["lastAutomatedReviewDispatchHash"] ?? "";
 
     // Re-validate a previously-recorded "satisfied" mark. Clear it the moment the
     // session stops being demonstrably clean — a reappearing thread, CI no longer
@@ -2399,6 +2490,260 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           }
         }
       }
+    }
+
+    // --- Auto-nudge a stuck/idle agent sitting on already-delivered comments ---
+    await maybeNudgeStuckAgent(session, {
+      pendingComments,
+      automatedComments,
+      reviewSummaries,
+      priorPendingDispatchHash,
+      priorAutomatedDispatchHash,
+      primaryThreadsTruncated,
+    });
+  }
+
+  /**
+   * Re-deliver unaddressed PR review comments to a stuck/idle agent, escalating
+   * to needs_input after the nudge budget is spent.
+   *
+   * This is PURELY ADDITIVE to the existing agent-stuck reaction: the transition
+   * handler still fires the `agent-stuck` notify exactly as it did before #5 — the
+   * nudge NEVER suppresses or defers that notification. The dispatch blocks in
+   * maybeDispatchReviewBacklog only re-deliver comments when their fingerprint
+   * CHANGES. An agent that is alive but stops noticing already-delivered comments
+   * and goes idle leaves the fingerprint unchanged, so the comments would never be
+   * re-sent. This re-delivers the outstanding, already-delivered comments
+   * (bypassing the fingerprint guard) up to `nudgeRetries` times, then escalates to
+   * needs_input so a human takes over.
+   *
+   * Distinct from runtime-death recovery (packages/core/src/recovery/*), which
+   * handles dead processes — this handles alive agents that stopped progressing.
+   */
+  async function maybeNudgeStuckAgent(
+    session: Session,
+    ctx: {
+      pendingComments: ReviewComment[];
+      automatedComments: ReviewComment[];
+      reviewSummaries: ReviewSummary[];
+      priorPendingDispatchHash: string;
+      priorAutomatedDispatchHash: string;
+      primaryThreadsTruncated: boolean;
+    },
+  ): Promise<void> {
+    const { pendingComments, automatedComments, reviewSummaries, primaryThreadsTruncated } = ctx;
+    const totalUnaddressed = pendingComments.length + automatedComments.length;
+
+    const stuckReaction = getReactionConfigForSession(session, "agent-stuck");
+    // Honor `auto: false`: installations that route stuck handling only to
+    // humans must not have their agents messaged automatically. The transition
+    // handler still emits the human-facing notify for the stuck reaction.
+    if (stuckReaction?.auto === false) {
+      // …but a nudge latch persisted from a prior config (auto was enabled, the
+      // session escalated, then the project was restarted/reconfigured with
+      // auto:false) must still be cleared once the backlog is confirmably clean —
+      // otherwise determineStatus keeps parking the open PR in needs_input forever
+      // after the threads are resolved. Skip sends, but not this cleanup. Fail
+      // closed on a truncated page (an unresolved thread may lie outside it).
+      if (
+        totalUnaddressed === 0 &&
+        !primaryThreadsTruncated &&
+        (session.metadata["stuckNudgeCount"] ||
+          session.metadata["stuckNudgeEscalated"] === "true" ||
+          session.metadata["stuckNudgeFingerprint"])
+      ) {
+        updateSessionMetadata(session, {
+          stuckNudgeCount: "",
+          stuckNudgeEscalated: "",
+          stuckNudgeFingerprint: "",
+        });
+      }
+      return;
+    }
+
+    // The bot review→fix loop owns its own escalation / needs_input latch.
+    if (session.metadata["reviewRoundsEscalated"] === "true") return;
+
+    // Gate on idle-beyond-threshold, NOT the derived legacy status. An agent that
+    // is idle past the agent-stuck threshold but whose PR resolves to an overlay
+    // status (changes_requested, review_pending, mergeable, approved, ci_failed)
+    // never surfaces as `stuck`, yet it is exactly the alive-but-idle agent this
+    // targets. session.activitySignal is the signal determineStatus committed this
+    // poll; an actively-working agent has no positive idle evidence.
+    const idleSignal = session.activitySignal;
+    const stuck =
+      hasPositiveIdleEvidence(idleSignal) && isIdleBeyondThreshold(session, idleSignal.timestamp);
+
+    // Backlog confirmably clean (empty AND the fetched page is complete): release
+    // the nudge budget + escalation latch so a resolved session leaves needs_input,
+    // regardless of idle state (a resumed agent must be released too). Fail closed
+    // on a truncated page — an unresolved thread may lie outside the fetched page,
+    // so an empty page is NOT trustworthy as clean (fail closed on latch clearing).
+    if (totalUnaddressed === 0) {
+      if (
+        !primaryThreadsTruncated &&
+        (session.metadata["stuckNudgeCount"] ||
+          session.metadata["stuckNudgeEscalated"] === "true" ||
+          session.metadata["stuckNudgeFingerprint"])
+      ) {
+        updateSessionMetadata(session, {
+          stuckNudgeCount: "",
+          stuckNudgeEscalated: "",
+          stuckNudgeFingerprint: "",
+        });
+      }
+      return;
+    }
+
+    // Already escalated (parked in needs_input): don't re-nudge.
+    if (session.metadata["stuckNudgeEscalated"] === "true") return;
+
+    // Not idle-beyond-threshold → not stuck; nothing to nudge.
+    if (!stuck) return;
+
+    // Preserve each review reaction's own opt-out. The dispatch hash is recorded
+    // whenever a category's reaction fires — including notify-only or auto:false
+    // configs where the comments were only surfaced to a human, never sent to the
+    // agent. Re-delivering those to the agent would bypass the opt-out, so only
+    // nudge a category whose reaction is an enabled send-to-agent action.
+    //
+    // AND skip a category whose review reaction has ESCALATED: executeReaction
+    // returns success (recording the dispatch hash) with action "escalated" even
+    // though nothing reached the agent, so nudging off that hash would re-send
+    // comments the agent never received and fight the reaction's human handoff.
+    const pendingSendable =
+      reviewReactionSendsToAgent(session, "changes-requested") &&
+      !isReviewReactionEscalated(session, "changes-requested");
+    const automatedSendable =
+      reviewReactionSendsToAgent(session, "bugbot-comments") &&
+      !isReviewReactionEscalated(session, "bugbot-comments");
+
+    // Only nudge comments the agent has ALREADY received. Fresh comments were
+    // just delivered by the dispatch blocks above this cycle — the normal path
+    // handles those. Treat a backlog whose IDs are all a SUBSET of a previously
+    // dispatched batch as already-delivered so that partial resolution (e.g. the
+    // agent resolved c1 of a dispatched {c1,c2}, leaving {c2}) still nudges and
+    // can reach exhaustion escalation, rather than silently receiving nothing.
+    const priorPendingIds = splitFingerprintIds(ctx.priorPendingDispatchHash);
+    const priorAutomatedIds = splitFingerprintIds(ctx.priorAutomatedDispatchHash);
+    const pendingAlreadyDelivered =
+      pendingSendable &&
+      pendingComments.length > 0 &&
+      pendingComments.every((c) => priorPendingIds.has(c.id));
+    const automatedAlreadyDelivered =
+      automatedSendable &&
+      automatedComments.length > 0 &&
+      automatedComments.every((c) => priorAutomatedIds.has(c.id));
+
+    // Nothing agent-actionable to re-deliver → nudge does nothing this poll. The
+    // transition handler already fired (and owns) the agent-stuck notify.
+    if (!pendingAlreadyDelivered && !automatedAlreadyDelivered) return;
+
+    const nudgeRetries = stuckReaction?.nudgeRetries ?? DEFAULT_STUCK_NUDGE_RETRIES;
+
+    // Budget accrues across a shrinking backlog: the count resets to 0 only when
+    // genuinely NEW comment IDs appear (fresh work), not when the agent resolves
+    // part of the batch — otherwise resolving one comment per poll would refill
+    // the budget forever and exhaustion escalation could never fire.
+    const currentBacklog = [...pendingComments, ...automatedComments];
+    const lastNudgedIds = splitFingerprintIds(session.metadata["stuckNudgeFingerprint"] ?? "");
+    const newContentSinceLastNudge = currentBacklog.some((c) => !lastNudgedIds.has(c.id));
+    const backlogFingerprint = makeFingerprint(currentBacklog.map((c) => c.id));
+    const nudgeCount = newContentSinceLastNudge
+      ? 0
+      : parseAttemptCount(session.metadata["stuckNudgeCount"]);
+
+    if (nudgeCount >= nudgeRetries) {
+      // Nudges exhausted — escalate to needs_input + notify. The latch parks the
+      // session in needs_input (honored by determineStatus) until the agent
+      // addresses the comments (clearing the backlog above) or a human steps in.
+      const context = buildEventContext(session, prEnrichmentCache);
+      const event = createEvent("reaction.escalated", {
+        sessionId: session.id,
+        projectId: session.projectId,
+        message: `Agent idle on ${totalUnaddressed} unaddressed review comment(s) after ${nudgeCount} nudge(s) on PR #${session.pr?.number}. Human review needed.`,
+        data: buildReactionEscalationNotificationData({
+          eventType: "reaction.escalated",
+          sessionId: session.id,
+          projectId: session.projectId,
+          context,
+          reactionKey: "agent-stuck",
+          action: "escalated",
+          attempts: nudgeCount,
+          cause: "max_attempts",
+          enrichment: getPREnrichmentForSession(session),
+        }),
+      });
+      // Notify FIRST, then latch — and ONLY latch when a notifier accepted the
+      // escalation, so we never silently park a session in needs_input with no
+      // human aware (mirrors escalateReviewRoundCap).
+      const delivered = await notifyHuman(event, stuckReaction?.priority ?? "urgent");
+      if (!delivered) return;
+      updateSessionMetadata(session, { stuckNudgeEscalated: "true" });
+      recordActivityEvent({
+        projectId: session.projectId,
+        sessionId: session.id,
+        source: "reaction",
+        kind: "reaction.escalated",
+        level: "warn",
+        summary: `agent-stuck nudge exhausted (${nudgeCount}) for PR #${session.pr?.number}`,
+        data: {
+          reactionKey: "agent-stuck",
+          nudges: nudgeCount,
+          nudgeRetries,
+          prNumber: session.pr?.number,
+        },
+      });
+      return;
+    }
+
+    // Re-deliver the outstanding comments directly (bypassing the fingerprint
+    // guard the dispatch blocks enforce).
+    const parts = [
+      `You have ${totalUnaddressed} unaddressed review comment(s) on your PR and appear to be idle. Address them now, push fixes, and resolve each thread.`,
+      "",
+    ];
+    if (pendingAlreadyDelivered) {
+      parts.push(formatReviewCommentsMessage(pendingComments, "reviewer", reviewSummaries));
+    }
+    if (automatedAlreadyDelivered) {
+      parts.push(formatReviewCommentsMessage(automatedComments, "bot"));
+    }
+
+    try {
+      await sessionManager.send(session.id, parts.join("\n"));
+      updateSessionMetadata(session, {
+        stuckNudgeCount: String(nudgeCount + 1),
+        stuckNudgeFingerprint: backlogFingerprint,
+      });
+      recordActivityEvent({
+        projectId: session.projectId,
+        sessionId: session.id,
+        source: "reaction",
+        kind: "reaction.action_succeeded",
+        summary: `agent-stuck nudge ${nudgeCount + 1}/${nudgeRetries} for PR #${session.pr?.number}`,
+        data: {
+          reactionKey: "agent-stuck",
+          action: "send-to-agent",
+          nudge: nudgeCount + 1,
+          unaddressed: totalUnaddressed,
+        },
+      });
+    } catch (err) {
+      // Send failed — retry on the next poll cycle (don't consume the budget). The
+      // agent-stuck notify already fired at the transition, so a human is aware.
+      recordActivityEvent({
+        projectId: session.projectId,
+        sessionId: session.id,
+        source: "reaction",
+        kind: "reaction.send_to_agent_failed",
+        level: "warn",
+        summary: `agent-stuck nudge failed for ${session.id}`,
+        data: {
+          reactionKey: "agent-stuck",
+          errorMessage: err instanceof Error ? err.message : String(err),
+        },
+      });
     }
   }
 

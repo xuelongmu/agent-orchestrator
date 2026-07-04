@@ -446,6 +446,23 @@ describe("config schema", () => {
       type: "string",
     });
   });
+
+  it("constrains reactionConfig.nudgeRetries to positive integers (mirrors runtime Zod)", () => {
+    const schema = JSON.parse(
+      readFileSync(new URL("../../../../schema/config.schema.json", import.meta.url), "utf-8"),
+    ) as {
+      $defs: {
+        reactionConfig: { properties: Record<string, { type?: string; exclusiveMinimum?: number }> };
+      };
+    };
+
+    // Runtime validation is z.number().int().positive(); the published schema must
+    // agree so editor validation doesn't accept 0 or 1.5 that then fail loadConfig().
+    expect(schema.$defs.reactionConfig.properties["nudgeRetries"]).toMatchObject({
+      type: "integer",
+      exclusiveMinimum: 0,
+    });
+  });
 });
 
 // =============================================================================
