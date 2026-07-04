@@ -131,6 +131,28 @@ const CODE_REVIEW_SEVERITY_RANK: Record<CodeReviewSeverity, number> = {
   error: 3,
 };
 
+/** The agent's explicit judgment call, when the current report is `needs_decision`. */
+interface NeedsDecisionContext {
+  confidence?: number;
+  question: string;
+}
+
+/** Read a fresh `needs_decision` report (with a question) off a session, else null. */
+function readNeedsDecisionReport(session: Session): NeedsDecisionContext | null {
+  const report = readAgentReport(session.metadata);
+  if (report?.state !== "needs_decision" || !report.question) return null;
+  return { confidence: report.confidence, question: report.question };
+}
+
+/** Human-facing notification message for an agent-initiated decision (#12). */
+function formatNeedsDecisionMessage(decision: NeedsDecisionContext): string {
+  const confidence =
+    decision.confidence !== undefined
+      ? ` (confidence ${Math.round(decision.confidence * 100)}%)`
+      : "";
+  return `Decision needed${confidence}: ${decision.question}`;
+}
+
 /** Compose the human-facing question when a low-confidence action is held (#12). */
 function buildConfidenceEscalationQuestion(
   reactionKey: string,
@@ -1736,11 +1758,24 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     let maxFindingSeverity: CodeReviewSeverity | null = null;
     let maxFindingConfidence: number | null = null;
     try {
-      const openFindings = createCodeReviewStore(session.projectId).listFindings({
-        linkedSessionId: session.id,
-        status: "open",
-      });
-      for (const finding of openFindings) {
+      const store = createCodeReviewStore(session.projectId);
+      // Findings from a superseded (outdated) run describe a stale target SHA the
+      // agent has since pushed past — they must not keep holding autonomous
+      // actions, so drop them entirely.
+      const outdatedRunIds = new Set(
+        store.listRuns({ linkedSessionId: session.id, status: "outdated" }).map((run) => run.id),
+      );
+      // An "unresolved" finding is one still awaiting a fix: freshly surfaced
+      // (`open`) OR already delivered to the agent but not yet resolved
+      // (`sent_to_agent`). Both represent outstanding review risk.
+      const unresolvedFindings = store
+        .listFindings({ linkedSessionId: session.id })
+        .filter(
+          (finding) =>
+            (finding.status === "open" || finding.status === "sent_to_agent") &&
+            !outdatedRunIds.has(finding.runId),
+        );
+      for (const finding of unresolvedFindings) {
         const currentRank = maxFindingSeverity ? CODE_REVIEW_SEVERITY_RANK[maxFindingSeverity] : 0;
         const findingRank = CODE_REVIEW_SEVERITY_RANK[finding.severity];
         const isRiskier =
@@ -1975,10 +2010,23 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
       case "notify": {
         const context = buildEventContext(session, prEnrichmentCache);
+        // A `needs_decision` report parks the session in needs_input, which fires
+        // the needs-input notify reaction here. Surface the agent's explicit
+        // question + confidence so the human keeps the decision context instead of
+        // a generic "needs input" ping (#12). Scoped to the needs-input reactions
+        // so unrelated notifications (agent-exited, etc.) are never relabeled.
+        const decision =
+          (reactionKey === "agent-needs-input" || reactionKey === "report-needs-input") &&
+          "lifecycle" in session
+            ? readNeedsDecisionReport(session)
+            : null;
+        const notifyMessage = decision
+          ? formatNeedsDecisionMessage(decision)
+          : (reactionConfig.message ?? `Reaction '${reactionKey}' triggered notification`);
         const event = createEvent("reaction.triggered", {
           sessionId,
           projectId,
-          message: reactionConfig.message ?? `Reaction '${reactionKey}' triggered notification`,
+          message: notifyMessage,
           data: buildReactionNotificationData({
             eventType: "reaction.triggered",
             sessionId,
@@ -2500,10 +2548,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           // escalate on the very first transition poll.
           // Only bypass for "send-to-agent" — "notify" actions must go through
           // executeReaction so they route to notifyHuman instead of the agent.
+          // And NOT when the transition reaction escalated (e.g. a confidence hold
+          // or exhausted retries): the direct send would bypass the hold and leak
+          // the message to the agent. Routing back through executeReaction lets its
+          // `tracker.escalated` guard keep the action held (#12).
           let success = false;
           if (
             transitionReaction?.key === humanReactionKey &&
-            reactionConfig.action === "send-to-agent"
+            reactionConfig.action === "send-to-agent" &&
+            !transitionReaction.result.escalated
           ) {
             try {
               await sessionManager.send(session.id, enrichedMessage);
@@ -2604,10 +2657,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           ) {
             const enrichedMessage = formatReviewCommentsMessage(automatedComments, "bot");
 
+            // Skip the direct-send bypass when the transition reaction escalated
+            // (confidence hold or exhausted retries) — route back through
+            // executeReaction so its `tracker.escalated` guard keeps the action
+            // held instead of leaking the message to the agent (#12).
             let success = false;
             if (
               transitionReaction?.key === automatedReactionKey &&
-              reactionConfig.action === "send-to-agent"
+              reactionConfig.action === "send-to-agent" &&
+              !transitionReaction.result.escalated
             ) {
               try {
                 await sessionManager.send(session.id, enrichedMessage);
