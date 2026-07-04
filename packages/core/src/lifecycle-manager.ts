@@ -2556,7 +2556,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           if (
             transitionReaction?.key === humanReactionKey &&
             reactionConfig.action === "send-to-agent" &&
-            !transitionReaction.result.escalated
+            !transitionReaction?.result.escalated
           ) {
             try {
               await sessionManager.send(session.id, enrichedMessage);
@@ -2665,7 +2665,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             if (
               transitionReaction?.key === automatedReactionKey &&
               reactionConfig.action === "send-to-agent" &&
-              !transitionReaction.result.escalated
+              !transitionReaction?.result.escalated
             ) {
               try {
                 await sessionManager.send(session.id, enrichedMessage);
