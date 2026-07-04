@@ -43,7 +43,7 @@ The reviewer bot (`chatgpt-codex-connector[bot]`) never submits a formal GitHub 
 
 Hard-won gotchas (each cost a real half-day stall):
 
-1. **Check ALL THREE channels, paginated.** Clean verdicts can post as **issue comments**, not review submissions; findings live in a third place. Poll `pulls/N/reviews` (submissions), `pulls/N/comments` (inline findings), AND `issues/N/comments` (verdict/status comments) every cycle — always with `--paginate` (defaults return 30 ascending; on a high-churn PR the current verdict is beyond page 1).
+1. **Check ALL THREE channels, paginated.** Clean verdicts can post as **issue comments**, not review submissions; findings live in a third place. Poll `pulls/N/reviews` (submissions), `pulls/N/comments` (inline findings), AND `issues/N/comments` (verdict/status comments) every cycle — always with `--paginate` (defaults return 30 ascending; on a high-churn PR the current verdict is beyond page 1). For the merge gate's unresolved-thread checks, REST comments don't carry resolution state — query GraphQL `pullRequest.reviewThreads` (`isResolved`, author) to distinguish unresolved human threads from bot bookkeeping.
 2. **Verify `Reviewed commit == current HEAD`** before trusting any verdict — the bot auto-reviews on push and can lag the head.
 3. **Count ≠ content.** Read finding **bodies** each cycle. A large unresolved-thread count is usually stale bookkeeping (bots don't click "Resolve") — a fresh clean verdict on the exact HEAD supersedes it. Conversely, an unchanged count can hide N-resolved/N-new churn.
 4. **👀 = looking, not approval.** If the bot reacts 👀 but posts nothing for ~20–24 min, re-trigger (`@codex review`) automatically — don't ask the human.

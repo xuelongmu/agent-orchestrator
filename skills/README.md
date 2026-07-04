@@ -10,6 +10,7 @@ Reusable skill documents for AI coding agents working on this repository. Each s
 | [`agent-orchestrator/`](agent-orchestrator/SKILL.md) | Architecture and conventions for working on the agent-orchestrator codebase |
 | [`release-notes/`](release-notes/ao-weekly-release/SKILL.md) | Generate weekly release notes from git history |
 | [`social-media/`](social-media/SKILL.md) | Social media post generation |
+| [`autonomous-drive-loop/`](autonomous-drive-loop/SKILL.md) | Drive PRs through a bot-review→fix→merge loop — reviewer signals, merge gates, anti-treadmill policy, state-file discipline |
 
 ## How to Use
 

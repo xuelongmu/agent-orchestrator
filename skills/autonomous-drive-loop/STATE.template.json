@@ -18,7 +18,7 @@
       "loc": "<file:line>",
       "classTag": "<tag>",
       "fixCommit": null,
-      "disposition": "<dispatched|deferred-to-issue-N|absorbed-by-invariant|fixed>"
+      "disposition": "<dispatched|deferred-to-issue-N|absorbed-by-invariant|fixed> — NEVER delete entries; update disposition/fixCommit so per-round class history survives for the >=3-recurrence trigger"
     },
     "dispatchLog[]": {
       "at": "<ISO>",
