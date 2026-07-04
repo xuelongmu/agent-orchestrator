@@ -3069,18 +3069,27 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   ): string {
     const branch = childBranch ?? "<your branch>";
     const editHints = prNumbers.map((n) => `gh pr edit ${n} --base ${targetBase}`).join("\n   ");
+    const hasPr = prNumbers.length > 0;
+    const header = hasPr
+      ? `Your stacked PR's parent branch \`${oldBase}\` has merged into \`${targetBase}\`. The orchestrator already pointed your PR base at \`${targetBase}\`, but your branch still carries the parent's now-merged commits — rebase to drop them so your PR shows only your changes:`
+      : `Your parent branch \`${oldBase}\` has merged into \`${targetBase}\` and no longer exists. Rebase your branch onto the new base, then open your PR against it:`;
     return [
-      `Your stacked PR's parent branch \`${oldBase}\` has merged into \`${targetBase}\`.`,
-      `The orchestrator already pointed your PR base at \`${targetBase}\`, but your branch still`,
-      `carries the parent's now-merged commits. Rebase to drop them so your PR shows only your changes:`,
+      header,
       ``,
       `1. \`git fetch origin\``,
-      `2. \`git rebase --onto origin/${targetBase} ${oldBase} ${branch}\``,
+      // The old base may only exist as a remote-tracking ref (a child cut from
+      // `origin/<base>` never creates a local branch), so resolve a concrete
+      // upstream before rebasing rather than assuming a bare local branch name.
+      `2. Rebase onto the new base, dropping the parent's now-merged commits:`,
+      "   ```",
+      `   upstream="$(git rev-parse -q --verify "${oldBase}" || git rev-parse -q --verify "origin/${oldBase}")"`,
+      `   git rebase --onto "origin/${targetBase}" "$upstream" ${branch}`,
+      "   ```",
       `   (resolve any conflicts, then \`git rebase --continue\`)`,
       `3. \`git push --force-with-lease\``,
-      prNumbers.length > 0
+      hasPr
         ? `4. Confirm the PR base (no-op if already set):\n   ${editHints}`
-        : `4. You haven't opened your PR yet — the old base \`${oldBase}\` is gone, so open it against the new base: \`gh pr create --base ${targetBase} ...\`.`,
+        : `4. Open your PR against the new base: \`gh pr create --base ${targetBase} ...\`.`,
     ].join("\n");
   }
 
@@ -3102,6 +3111,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     if (!parentSessionId) return;
     if (child.metadata["stackRetargetedAt"]) return; // already handled
     if (TERMINAL_STATUSES.has(child.status)) return; // child itself is wrapping up
+    // A held (blocked_by_dependency) child has no runtime yet, so a handoff would
+    // just fail-to-send every poll. `unblock()` re-resolves the base off the
+    // (now-merged) parent when the scheduler launches it, so skip it here.
+    if (isBlockedByDependency(child.lifecycle)) return;
     // NOTE: we intentionally do NOT require an open PR here. A child that hasn't
     // opened its PR yet still needs to hear that the parent merged — its prompt
     // told it to `gh pr create --base <parent>`, and that branch is now gone.
@@ -3140,11 +3153,32 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       return;
     }
 
+    const scm = project.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
+
+    // If the child already has open PR(s) but the SCM can't edit a PR base, the
+    // daemon cannot move them off the merged/deleted parent branch. Do NOT latch
+    // or tell the agent the base was "already moved" — surface the limitation
+    // once and leave it retryable.
+    if (child.prs.length > 0 && !scm?.retargetPR) {
+      if (!child.metadata["stackRetargetUnsupportedAt"]) {
+        updateSessionMetadata(child, { stackRetargetUnsupportedAt: nowIso });
+        recordActivityEvent({
+          projectId: child.projectId,
+          sessionId: child.id,
+          source: "lifecycle",
+          kind: "stacked.retarget_unsupported",
+          level: "warn",
+          summary: `${child.id}: SCM cannot retarget a PR base; leaving ${child.prs.length} PR(s) retryable`,
+          data: { parentSessionId, newBase: targetBase },
+        });
+      }
+      return;
+    }
+
     // Point every open PR at the new base. A transient failure must NOT latch
     // (retry next poll); a divergence — the live base is neither `oldBase` nor
     // `targetBase`, i.e. a human moved it — must NOT be clobbered: surface it and
     // latch so we neither overwrite the human's choice nor keep nagging.
-    const scm = project.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
     if (scm?.retargetPR) {
       const retargetPR = scm.retargetPR.bind(scm);
       for (const pr of child.prs) {

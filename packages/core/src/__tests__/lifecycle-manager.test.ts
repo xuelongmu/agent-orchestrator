@@ -6572,9 +6572,10 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
     await lm.check("app-2");
 
     expect(retargetPR).toHaveBeenCalledWith(childPr, "feat/grandparent", "feat/parent");
-    expect(rebaseMessage()).toContain(
-      "git rebase --onto origin/feat/grandparent feat/parent feat/child",
-    );
+    const msg = rebaseMessage()!;
+    // Resolvable upstream (local ref, then origin fallback) + rebase onto the new base.
+    expect(msg).toContain('git rev-parse -q --verify "feat/parent"');
+    expect(msg).toContain('git rebase --onto "origin/feat/grandparent" "$upstream" feat/child');
     const meta = readMetadataRaw(env.sessionsDir, "app-2");
     expect(meta?.["stackRetargetedAt"]).toBeTruthy();
     expect(meta?.["baseRef"]).toBe("feat/grandparent");
@@ -6619,7 +6620,7 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
     await lm.check("app-2");
 
     expect(retargetPR).toHaveBeenCalledWith(childPr, "main", "feat/parent");
-    expect(rebaseMessage()).toContain("git rebase --onto origin/main feat/parent feat/child");
+    expect(rebaseMessage()).toContain('git rebase --onto "origin/main" "$upstream" feat/child');
     expect(readMetadataRaw(env.sessionsDir, "app-2")?.["baseRef"]).toBe("main");
   });
 
@@ -6670,6 +6671,55 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
     expect(retargetPR).not.toHaveBeenCalled();
     expect(rebaseMessage()).toContain("gh pr create --base feat/grandparent");
     expect(readMetadataRaw(env.sessionsDir, "app-2")?.["baseRef"]).toBe("feat/grandparent");
+  });
+
+  it("does not latch (stays retryable) when the SCM cannot retarget a PR base", async () => {
+    const parent = makeSession({
+      id: "app-1",
+      status: "merged",
+      branch: "feat/parent",
+      pr: makeMatchingPR({ number: 100, baseBranch: "" }),
+      metadata: { agent: "mock-agent", baseRef: "feat/grandparent" },
+    });
+    // SCM without retargetPR — the child already has an open PR on the old base.
+    const scm = createMockSCM(); // default mock omits the optional retargetPR
+    const lm = wire({ parent, scm });
+
+    await lm.check("app-2");
+
+    // No false "already moved" handoff, and NOT latched as done.
+    expect(rebaseMessage()).toBeUndefined();
+    const meta = readMetadataRaw(env.sessionsDir, "app-2");
+    expect(meta?.["stackRetargetedAt"]).toBeFalsy();
+    expect(meta?.["stackRetargetUnsupportedAt"]).toBeTruthy(); // surfaced once
+  });
+
+  it("skips the handoff for a held (blocked-by-dependency) child", async () => {
+    const retargetPR = vi.fn().mockResolvedValue("retargeted");
+    const parent = makeSession({
+      id: "app-1",
+      status: "merged",
+      branch: "feat/parent",
+      pr: makeMatchingPR({ number: 100, baseBranch: "" }),
+      metadata: { agent: "mock-agent", baseRef: "feat/grandparent" },
+    });
+    // Held child: blocked_by_dependency pre-state, no runtime — unblock() owns it.
+    const heldChild = makeSession({
+      id: "app-2",
+      status: "spawning",
+      branch: "feat/child",
+      pr: childPr,
+      parentSessionId: "app-1",
+      metadata: { agent: "mock-agent", baseRef: "feat/parent" },
+    });
+    heldChild.lifecycle.session.state = "not_started";
+    heldChild.lifecycle.session.reason = "blocked_by_dependency";
+    const lm = wire({ parent, scm: createMockSCM({ retargetPR }), child: heldChild });
+
+    await lm.check("app-2");
+
+    expect(retargetPR).not.toHaveBeenCalled();
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
   });
 
   it("is idempotent — already-retargeted children are skipped", async () => {

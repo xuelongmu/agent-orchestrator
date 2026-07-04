@@ -90,22 +90,24 @@ export function create(config?: Record<string, unknown>): Workspace {
         );
       }
 
-      // Stacked PR: clone/checkout the parent's branch as the base instead of
-      // the project default, so the feature branch below stacks on it. Prefer
-      // the remote (clone source), but fall back to the local source repo when
-      // the parent hasn't pushed its branch yet — mirroring the worktree
-      // plugin's local fallback so clone-based stacks aren't remote-only.
-      let baseOnRemote = true;
+      // Stacked PR: cut the feature branch below from the parent's branch instead
+      // of the project default. Prefer the LOCAL source repo's branch — like the
+      // worktree plugin — because it is the parent's freshest state (it may carry
+      // commits not yet pushed while the parent is still working). Only when the
+      // local repo lacks the branch do we clone the remote ref directly.
+      let localBaseExists = false;
       if (cfg.baseRef) {
         try {
-          const ls = await git(repoPath, "ls-remote", "--heads", remoteUrl, cfg.baseRef);
-          baseOnRemote = ls.trim().length > 0;
+          await git(repoPath, "rev-parse", "--verify", "--quiet", `refs/heads/${cfg.baseRef}`);
+          localBaseExists = true;
         } catch {
-          baseOnRemote = false;
+          localBaseExists = false;
         }
       }
-      const localBaseFallback = Boolean(cfg.baseRef) && !baseOnRemote;
-      const cloneBaseBranch = localBaseFallback
+      const useLocalBase = Boolean(cfg.baseRef) && localBaseExists;
+      // With a local base we clone the default branch and materialize the base
+      // from the local repo below; otherwise clone the target branch directly.
+      const cloneBaseBranch = useLocalBase
         ? cfg.project.defaultBranch
         : (cfg.baseRef ?? cfg.project.defaultBranch);
 
@@ -131,9 +133,9 @@ export function create(config?: Record<string, unknown>): Workspace {
         });
       }
 
-      // Stacked base exists only in the local source repo — fetch it into the
-      // clone and check it out so the feature branch below stacks on it.
-      if (localBaseFallback && cfg.baseRef) {
+      // Materialize the (preferred) local base into the clone and check it out so
+      // the feature branch below stacks on the parent's freshest commits.
+      if (useLocalBase && cfg.baseRef) {
         try {
           await git(
             clonePath,

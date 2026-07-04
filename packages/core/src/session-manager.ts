@@ -1439,40 +1439,49 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       const parentSessionId = spawnConfig.parentSessionId;
       let stackBaseBranch = spawnConfig.baseRef;
       if (parentSessionId) {
-        // A parent link always re-resolves the base from the parent's CURRENT
-        // lifecycle — it must NOT replay a stale persisted `baseRef`. A held child
-        // carries `baseRef` = parent branch, but by the time it unblocks the
-        // parent has usually merged; branching off that (deleted) branch would
-        // reintroduce the parent's work. Session ids are globally unique, so
-        // resolve across every project's sessions dir, not just this child's.
-        const parentRecord = findSessionRecord(parentSessionId);
-        if (!parentRecord && !options?.reuseIdentity) {
-          // Fresh spawn with an unknown parent — a genuine misconfiguration.
-          throw new Error(
-            `Cannot stack session on parent "${parentSessionId}": parent not found`,
+        if (spawnConfig.baseRef && !options?.reuseIdentity) {
+          // Explicit override on a fresh spawn: `SessionSpawnConfig.baseRef` is
+          // derived from `parentSessionId` only when omitted, so honor a
+          // deliberately-supplied base (the parent link is still persisted for
+          // retarget-on-merge). A relaunch (`reuseIdentity`) carries a *replayed*
+          // baseRef, not a fresh user choice, so it re-resolves below instead.
+          stackBaseBranch = spawnConfig.baseRef;
+        } else {
+          // Re-resolve the base from the parent's CURRENT lifecycle — never replay
+          // a stale persisted `baseRef`. A held child carries `baseRef` = parent
+          // branch, but by the time it unblocks the parent has usually merged;
+          // branching off that (deleted) branch would reintroduce the parent's
+          // work. Session ids are globally unique, so resolve across every
+          // project's sessions dir, not just this child's.
+          const parentRecord = findSessionRecord(parentSessionId);
+          if (!parentRecord && !options?.reuseIdentity) {
+            // Fresh spawn with an unknown parent — a genuine misconfiguration.
+            throw new Error(
+              `Cannot stack session on parent "${parentSessionId}": parent not found`,
+            );
+          }
+          // Single source of truth for the base (see resolveStackedChildBase).
+          const resolved = resolveStackedChildBase(
+            parentRecord
+              ? {
+                  lifecycle: parseLifecycleFromRaw(parentRecord.raw),
+                  branch: parentRecord.raw["branch"],
+                  ownBase: parentRecord.raw["baseRef"],
+                }
+              : null,
           );
-        }
-        // Single source of truth for the base (see resolveStackedChildBase).
-        const resolved = resolveStackedChildBase(
-          parentRecord
-            ? {
-                lifecycle: parseLifecycleFromRaw(parentRecord.raw),
-                branch: parentRecord.raw["branch"],
-                ownBase: parentRecord.raw["baseRef"],
-              }
-            : null,
-        );
-        stackBaseBranch = resolved.base;
-        if (resolved.parentMerged) {
-          recordActivityEvent({
-            projectId: spawnConfig.projectId,
-            sessionId,
-            source: "session-manager",
-            kind: "stacked.parent_merged_no_stack",
-            level: "info",
-            summary: `parent "${parentSessionId}" merged; branching off ${resolved.base ?? "default"}`,
-            data: { parentSessionId, resolvedBase: resolved.base ?? "" },
-          });
+          stackBaseBranch = resolved.base;
+          if (resolved.parentMerged) {
+            recordActivityEvent({
+              projectId: spawnConfig.projectId,
+              sessionId,
+              source: "session-manager",
+              kind: "stacked.parent_merged_no_stack",
+              level: "info",
+              summary: `parent "${parentSessionId}" merged; branching off ${resolved.base ?? "default"}`,
+              data: { parentSessionId, resolvedBase: resolved.base ?? "" },
+            });
+          }
         }
       }
 
