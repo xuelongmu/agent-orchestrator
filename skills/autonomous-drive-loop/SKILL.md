@@ -38,8 +38,8 @@ Expect gaps: self-scheduled wake-ups don't fire while the host machine sleeps. O
 The reviewer bot (`chatgpt-codex-connector[bot]`) never submits a formal GitHub `APPROVED` review. Treat ANY of these as approval — but **every signal must be bound to the current HEAD** before it satisfies the gate:
 
 - a body containing **"Didn't find any major issues"** / **"Chef's kiss"** whose `Reviewed commit:` equals the current HEAD;
-- a review of the current HEAD with **zero new inline findings**;
-- a **👍 / +1 reaction** by the bot — reactions carry no commit reference, so a reaction counts ONLY if no push has occurred since the reaction's `created_at` (compare against the HEAD commit's `committedDate`). A 👍 left on an older head does not approve the commits pushed after it.
+- a review whose `Reviewed commit` equals the current HEAD with **zero new inline findings AND a clean body** — the empty boilerplate template or an explicit clean phrase. A body-only summary that reports a problem, an error, or quota exhaustion is NOT approval even with no inline comments;
+- a **👍 / +1 reaction** by the bot is **advisory only, never sufficient**: reactions carry no commit reference, and a commit's `committedDate` is creation time, not push time (a commit created before the reaction can be pushed after it). On seeing a 👍, re-trigger a review (`@codex review`) and merge on the resulting head-bound verdict.
 
 Hard-won gotchas (each cost a real half-day stall):
 
@@ -51,7 +51,7 @@ Hard-won gotchas (each cost a real half-day stall):
 
 ## 4. Merge gate
 
-Merge only when **(reviewer approval signal on current HEAD OR explicit human approval) AND CI fully green AND mergeable**. Then squash-merge, delete the branch, fast-forward local main, and advance to the next roadmap item. Keep a do-not-touch list (e.g. release-bot PRs) in policy. If a safety layer blocks a merge, surface it — never work around.
+Merge only when **(reviewer approval signal on current HEAD OR explicit human approval) AND CI fully green AND mergeable AND no unresolved HUMAN feedback** — no human `CHANGES_REQUESTED` review and no unresolved human-authored threads. Stale *bot* thread bookkeeping may be superseded by a fresh clean current-head verdict; human feedback may NOT — surface it instead. Then squash-merge, delete the branch, fast-forward local main, and advance to the next roadmap item. Keep a do-not-touch list (e.g. release-bot PRs) in policy. If a safety layer blocks a merge, surface it — never work around.
 
 ## 5. Anti-treadmill review policy
 
