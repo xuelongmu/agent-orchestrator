@@ -82,6 +82,7 @@ import {
   type ConfidenceSignals,
 } from "./confidence.js";
 import { createCodeReviewStore, type CodeReviewSeverity } from "./code-review-store.js";
+import { mergeReactionOverride } from "./config.js";
 import { evaluateBudgetBreach, resolveBudget } from "./budget.js";
 import {
   auditAgentReports,
@@ -2281,9 +2282,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const project = config.projects[session.projectId];
     const globalReaction = config.reactions[reactionKey];
     const projectReaction = project?.reactions?.[reactionKey];
-    const reactionConfig = projectReaction
-      ? { ...globalReaction, ...projectReaction }
-      : globalReaction;
+    // Merge a project override the SAME way top-level defaults are merged, so an
+    // explicit autonomous action override enables `auto` here too (a per-project
+    // `approved-and-green: { action: auto-merge, confidenceThreshold }` must not
+    // inherit the global default's auto:false and stay dead) (#12 review).
+    const reactionConfig =
+      projectReaction && globalReaction
+        ? mergeReactionOverride(globalReaction, projectReaction as Partial<ReactionConfig>)
+        : (projectReaction ?? globalReaction);
     return reactionConfig ? (reactionConfig as ReactionConfig) : null;
   }
 

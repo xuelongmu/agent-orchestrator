@@ -703,6 +703,28 @@ function validateProjectUniqueness(config: OrchestratorConfig): void {
 }
 
 /**
+ * Merge a partial reaction override over a base reaction. Shared by top-level
+ * reaction defaulting (applyDefaultReactions) and per-project override merging
+ * (getReactionConfigForSession) so both behave identically.
+ *
+ * Explicitly overriding to an autonomous action (`auto-merge`, `send-to-agent`,
+ * `spawn-session`) signals intent to ENABLE the reaction, so it does NOT inherit
+ * `auto: false` from a default like `approved-and-green` — the transition handler
+ * skips non-notify reactions when `auto === false`, which would otherwise leave
+ * both the action AND its confidence gate dead (#12 review).
+ */
+export function mergeReactionOverride(
+  base: ReactionConfig,
+  override: Partial<ReactionConfig>,
+): ReactionConfig {
+  const merged: ReactionConfig = { ...base, ...override };
+  if (override.action !== undefined && override.auto === undefined && merged.action !== "notify") {
+    merged.auto = true;
+  }
+  return merged;
+}
+
+/**
  * Sentinel string for the default `bugbot-comments` reaction message.
  * The lifecycle dispatcher replaces this exact value with a formatted listing
  * of the actual automated comments + correct-API guidance (see #895). If a
@@ -800,15 +822,7 @@ function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
     // .partial()); the OrchestratorConfig type over-declares it as full.
     const override = rawOverride as Partial<ReactionConfig>;
     const base: ReactionConfig = mergedReactions[key] ?? { auto: true, action: "notify" };
-    const merged: ReactionConfig = { ...base, ...override };
-    // Explicitly overriding to an autonomous action signals intent to ENABLE it,
-    // so don't inherit `auto: false` from a default like approved-and-green — the
-    // transition handler skips non-notify reactions when auto === false, which
-    // would leave both the confidence gate AND the action dead (#12 review).
-    if (override.action !== undefined && override.auto === undefined && merged.action !== "notify") {
-      merged.auto = true;
-    }
-    mergedReactions[key] = merged;
+    mergedReactions[key] = mergeReactionOverride(base, override);
   }
   config.reactions = mergedReactions;
 

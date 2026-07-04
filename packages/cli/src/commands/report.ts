@@ -202,7 +202,10 @@ export function registerReport(program: Command): void {
         }
         let confidence: number | undefined;
         if (opts.confidence !== undefined) {
-          confidence = Number.parseFloat(opts.confidence);
+          // Validate the WHOLE string first — parseFloat accepts numeric prefixes
+          // ("0.8abc" → 0.8, "0x1" → 0), which would record a bogus score.
+          const raw = opts.confidence.trim();
+          confidence = /^\d*\.?\d+$/.test(raw) ? Number.parseFloat(raw) : NaN;
           if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
             console.error(chalk.red(`Invalid confidence: ${opts.confidence} (expected 0..1).`));
             process.exit(1);

@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { validateConfig } from "../config.js";
+import { mergeReactionOverride, validateConfig } from "../config.js";
 
 describe("Config Validation - Project Uniqueness", () => {
   it("accepts projects that share a basename when projectIds differ", () => {
@@ -1379,5 +1379,41 @@ describe("Config Validation - Enabling autonomous actions (#12)", () => {
     });
     // approved-and-green default auto is false; a notify override keeps it.
     expect(config.reactions["approved-and-green"].auto).toBe(false);
+  });
+});
+
+describe("mergeReactionOverride (#12) — shared top-level + project-override merge", () => {
+  it("enables auto when an autonomous action is set over an auto:false base", () => {
+    const merged = mergeReactionOverride(
+      { auto: false, action: "notify", priority: "action" },
+      { action: "auto-merge", confidenceThreshold: 0.75 },
+    );
+    expect(merged.auto).toBe(true);
+    expect(merged.action).toBe("auto-merge");
+    expect(merged.confidenceThreshold).toBe(0.75);
+    expect(merged.priority).toBe("action"); // base fields preserved
+  });
+
+  it("preserves the base action/auto for a threshold-only override", () => {
+    const merged = mergeReactionOverride(
+      { auto: true, action: "send-to-agent", retries: 2 },
+      { confidenceThreshold: 0.8 },
+    );
+    expect(merged.action).toBe("send-to-agent");
+    expect(merged.auto).toBe(true);
+    expect(merged.retries).toBe(2);
+  });
+
+  it("respects an explicit auto:false alongside an action override", () => {
+    const merged = mergeReactionOverride(
+      { auto: false, action: "notify" },
+      { action: "auto-merge", auto: false },
+    );
+    expect(merged.auto).toBe(false);
+  });
+
+  it("does not force auto for a notify override", () => {
+    const merged = mergeReactionOverride({ auto: false, action: "notify" }, { action: "notify" });
+    expect(merged.auto).toBe(false);
   });
 });
