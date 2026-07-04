@@ -6177,16 +6177,17 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
   });
 
-  // #12: a CONFIDENCE-held review send (distinct from a retry escalation) delivered
-  // nothing to the agent, so it must NOT stamp the dispatch hash — otherwise the
-  // real comments are suppressed on later polls with no one having seen them.
-  it("does not mark a confidence-HELD review send as delivered", async () => {
+  // #12: a CONFIDENCE-held review send (distinct from a retry escalation) reaches
+  // the agent with nothing — so the enriched comments must be surfaced to the
+  // HUMAN instead, never silently dropped.
+  it("surfaces a confidence-HELD review send to the human instead of the agent", async () => {
+    const notifier = createMockNotifier();
     const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
     // High cumulative churn drops computeConfidence below the 0.9 threshold, so the
-    // bugbot send-to-agent reaction is HELD rather than delivered.
+    // bugbot send-to-agent reaction is HELD rather than delivered to the agent.
     const lm = setupStuckSession(getReviewThreads, {
       nudgeRetries: 3,
-      withNotifier: true,
+      notifier,
       metaOverrides: { reviewRoundCountTotal: "5" },
     });
     config.reactions = {
@@ -6200,12 +6201,13 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     };
 
     await lm.check("app-1");
-    // Held from the agent, and NOT recorded as dispatched (unlike a retry
-    // escalation) so the comments remain deliverable once the hold clears.
+    // Held from the agent, but surfaced to the human so nothing is lost.
     expect(mockSessionManager.send).not.toHaveBeenCalled();
-    expect(
-      readMetadataRaw(env.sessionsDir, "app-1")?.["lastAutomatedReviewDispatchHash"],
-    ).toBeFalsy();
+    expect(notifier.notify).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.stringContaining("need a human decision"),
+      }),
+    );
   });
 
   // Round-7 finding (id 3521898192): the agent-stuck notify is no longer deferred,
