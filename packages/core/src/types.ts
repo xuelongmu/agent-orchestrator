@@ -1512,6 +1512,14 @@ export interface ReactionResult {
   action: string;
   message?: string;
   escalated: boolean;
+  /**
+   * True when this reaction escalated specifically because a confidence gate
+   * HELD the autonomous action (#12) — as opposed to exhausting retries/duration.
+   * Callers that stamp a "delivered" dispatch hash on ordinary escalation (so the
+   * nudge treats the human handoff as delivered) must NOT do so for a confidence
+   * hold, or the still-undelivered comments/CI details get suppressed.
+   */
+  heldForConfidence?: boolean;
 }
 
 // =============================================================================

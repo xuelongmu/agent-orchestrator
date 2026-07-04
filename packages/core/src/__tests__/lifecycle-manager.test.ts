@@ -6177,6 +6177,37 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
   });
 
+  // #12: a CONFIDENCE-held review send (distinct from a retry escalation) delivered
+  // nothing to the agent, so it must NOT stamp the dispatch hash — otherwise the
+  // real comments are suppressed on later polls with no one having seen them.
+  it("does not mark a confidence-HELD review send as delivered", async () => {
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    // High cumulative churn drops computeConfidence below the 0.9 threshold, so the
+    // bugbot send-to-agent reaction is HELD rather than delivered.
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 3,
+      withNotifier: true,
+      metaOverrides: { reviewRoundCountTotal: "5" },
+    });
+    config.reactions = {
+      ...config.reactions,
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+        confidenceThreshold: 0.9,
+      },
+    };
+
+    await lm.check("app-1");
+    // Held from the agent, and NOT recorded as dispatched (unlike a retry
+    // escalation) so the comments remain deliverable once the hold clears.
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(
+      readMetadataRaw(env.sessionsDir, "app-1")?.["lastAutomatedReviewDispatchHash"],
+    ).toBeFalsy();
+  });
+
   // Round-7 finding (id 3521898192): the agent-stuck notify is no longer deferred,
   // so it fires immediately at the stuck transition — never delayed behind the
   // review-thread throttle.

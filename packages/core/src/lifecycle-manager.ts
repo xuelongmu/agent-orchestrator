@@ -2037,6 +2037,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         success: true,
         action: "escalated",
         escalated: true,
+        heldForConfidence: true,
       };
     }
 
@@ -2649,10 +2650,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           } else {
             const enrichedConfig = { ...reactionConfig, message: enrichedMessage };
             const result = await executeReaction(session, humanReactionKey, enrichedConfig);
-            // A confidence-held reaction returns escalated (success:true) but
+            // A CONFIDENCE-held reaction returns escalated (success:true) but
             // delivered nothing to the agent — don't stamp the dispatch hash, or
             // these exact comments get suppressed on later polls (#12 review).
-            success = result.success && !result.escalated;
+            // A retry/duration escalation, by contrast, DOES stamp (human handoff,
+            // preserved by the #5 nudge invariant) — hence heldForConfidence, not
+            // escalated.
+            success = result.success && !result.heldForConfidence;
           }
           if (success) {
             updateSessionMetadata(session, {
@@ -2761,10 +2765,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             } else {
               const enrichedConfig = { ...reactionConfig, message: enrichedMessage };
               const result = await executeReaction(session, automatedReactionKey, enrichedConfig);
-              // A confidence-held reaction returns escalated (success:true) but
+              // A CONFIDENCE-held reaction returns escalated (success:true) but
               // delivered nothing — don't stamp the dispatch hash or count a round,
-              // or this batch gets suppressed on later polls (#12 review).
-              success = result.success && !result.escalated;
+              // or this batch gets suppressed on later polls (#12 review). A
+              // retry/duration escalation DOES stamp (human handoff, #5 invariant),
+              // so key off heldForConfidence, not escalated.
+              success = result.success && !result.heldForConfidence;
             }
             if (success) {
               updateSessionMetadata(session, {
@@ -3606,13 +3612,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     // If the transition reaction already delivered an enriched agent message,
     // or handled a non-agent action, record the dispatch hash so subsequent
-    // polls don't re-send the same failure details. A confidence-HELD transition
-    // (result.escalated) is excluded: it only sent the generic escalation
-    // question, so the detailed failed-check follow-up below must still run (#12).
+    // polls don't re-send the same failure details. A CONFIDENCE-held transition
+    // is excluded: it only sent the generic escalation question, so the detailed
+    // failed-check follow-up below must still run (#12). A retry/duration
+    // escalation still records here (human handoff) — hence heldForConfidence,
+    // not escalated.
     if (
       transitionReaction?.key === ciReactionKey &&
       transitionReaction.result?.success &&
-      !transitionReaction.result.escalated &&
+      !transitionReaction.result.heldForConfidence &&
       (transitionReaction.messageEnriched === true ||
         transitionReaction.result.action !== "send-to-agent")
     ) {
