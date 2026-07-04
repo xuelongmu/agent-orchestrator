@@ -118,15 +118,17 @@ async function resolveBaseRef(
   const hasOrigin = options?.hasOrigin ?? (await hasOriginRemote(repoPath));
 
   // Stacked PR: an explicit base ref (e.g. a parent session's branch) takes
-  // priority. Prefer the pushed remote ref, then the local branch — the parent
-  // worktree creates the branch locally, and pushes it once it opens its PR.
+  // priority. Prefer the LOCAL branch — all worktrees share this repo, so the
+  // parent session's local branch is its freshest state (it may have unpushed
+  // commits while still working after opening its PR). Fall back to the pushed
+  // remote ref only when there is no local branch (e.g. clone-style setups).
   if (options?.baseRef) {
+    const localBaseRef = `refs/heads/${options.baseRef}`;
+    if (await refExists(repoPath, localBaseRef)) return localBaseRef;
     if (hasOrigin) {
       const remoteBaseRef = `origin/${options.baseRef}`;
       if (await refExists(repoPath, remoteBaseRef)) return remoteBaseRef;
     }
-    const localBaseRef = `refs/heads/${options.baseRef}`;
-    if (await refExists(repoPath, localBaseRef)) return localBaseRef;
     throw new Error(`Unable to resolve stacked base ref "${options.baseRef}"`);
   }
 

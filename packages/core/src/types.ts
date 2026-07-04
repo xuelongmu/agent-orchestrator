@@ -939,13 +939,22 @@ export interface SCM {
    * Retarget an open PR onto a new base branch (stacked PRs). Called when a
    * parent PR merges so its dependent PRs re-point at the parent's base.
    *
-   * When `expectedCurrentBase` is provided, implementations should no-op unless
-   * the PR's live base still equals it — this keeps the call idempotent and
-   * avoids clobbering a base GitHub already auto-retargeted (which happens when
-   * the merged head branch is deleted) or one a human changed. Optional: SCMs
-   * that can't edit a PR base simply omit it.
+   * When `expectedCurrentBase` is provided, the implementation must consult the
+   * PR's live base and report the outcome so callers can distinguish an actual
+   * retarget / already-correct base from a divergence they must NOT clobber:
+   *   - `"retargeted"` — the base was edited to `newBase`.
+   *   - `"unchanged"`  — the live base already equals `newBase` (e.g. GitHub
+   *                      auto-retargeted when the merged head branch was deleted).
+   *   - `"diverged"`   — the live base is neither `newBase` nor
+   *                      `expectedCurrentBase` (a human moved it); left untouched.
+   *   - `"not_found"`  — the PR no longer exists.
+   * Optional: SCMs that can't edit a PR base simply omit it.
    */
-  retargetPR?(pr: PRInfo, newBase: string, expectedCurrentBase?: string): Promise<void>;
+  retargetPR?(
+    pr: PRInfo,
+    newBase: string,
+    expectedCurrentBase?: string,
+  ): Promise<PRRetargetOutcome>;
 
   // --- CI Tracking ---
 
@@ -1091,6 +1100,9 @@ export interface PRInfo {
 }
 
 export type PRState = "open" | "merged" | "closed";
+
+/** Outcome of {@link SCM.retargetPR}. */
+export type PRRetargetOutcome = "retargeted" | "unchanged" | "diverged" | "not_found";
 
 /** PR state constants */
 export const PR_STATE = {

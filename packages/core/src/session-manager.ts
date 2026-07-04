@@ -70,6 +70,7 @@ import {
   parseCanonicalLifecycle,
 } from "./lifecycle-state.js";
 import { buildPrompt } from "./prompt-builder.js";
+import { resolveStackedChildBase } from "./stacked.js";
 import { classifyActivitySignal, createActivitySignal } from "./activity-signal.js";
 import {
   getProjectSessionsDir,
@@ -1439,36 +1440,39 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       let stackBaseBranch = spawnConfig.baseRef;
       if (parentSessionId) {
         // A parent link always re-resolves the base from the parent's CURRENT
-        // state — it must NOT replay a stale persisted `baseRef`. A held child
+        // lifecycle — it must NOT replay a stale persisted `baseRef`. A held child
         // carries `baseRef` = parent branch, but by the time it unblocks the
         // parent has usually merged; branching off that (deleted) branch would
         // reintroduce the parent's work. Session ids are globally unique, so
         // resolve across every project's sessions dir, not just this child's.
         const parentRecord = findSessionRecord(parentSessionId);
-        const parentBranch = parentRecord?.raw?.["branch"];
-        const parentMerged = parentRecord?.raw?.["status"] === "merged";
-        if (parentBranch && !parentMerged) {
-          // Parent still open — stack on its branch.
-          stackBaseBranch = parentBranch;
-        } else if (parentRecord || options?.reuseIdentity) {
-          // Parent already merged, or gone (merged + cleaned up) on relaunch:
-          // its work is in the base now, so drop the stacking and branch off the
-          // default instead of a stale/deleted parent branch.
-          stackBaseBranch = undefined;
+        if (!parentRecord && !options?.reuseIdentity) {
+          // Fresh spawn with an unknown parent — a genuine misconfiguration.
+          throw new Error(
+            `Cannot stack session on parent "${parentSessionId}": parent not found`,
+          );
+        }
+        // Single source of truth for the base (see resolveStackedChildBase).
+        const resolved = resolveStackedChildBase(
+          parentRecord
+            ? {
+                lifecycle: parseLifecycleFromRaw(parentRecord.raw),
+                branch: parentRecord.raw["branch"],
+                ownBase: parentRecord.raw["baseRef"],
+              }
+            : null,
+        );
+        stackBaseBranch = resolved.base;
+        if (resolved.parentMerged) {
           recordActivityEvent({
             projectId: spawnConfig.projectId,
             sessionId,
             source: "session-manager",
             kind: "stacked.parent_merged_no_stack",
             level: "info",
-            summary: `parent "${parentSessionId}" already merged/gone; branching off default`,
-            data: { parentSessionId },
+            summary: `parent "${parentSessionId}" merged; branching off ${resolved.base ?? "default"}`,
+            data: { parentSessionId, resolvedBase: resolved.base ?? "" },
           });
-        } else {
-          // Fresh spawn with an unknown parent — a genuine misconfiguration.
-          throw new Error(
-            `Cannot stack session on parent "${parentSessionId}": parent not found`,
-          );
         }
       }
 

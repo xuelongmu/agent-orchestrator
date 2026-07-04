@@ -41,6 +41,7 @@ import {
   type CICheck,
   type CIFailureSummary,
   type PRInfo,
+  type PRRetargetOutcome,
   type ReviewComment,
   type ReviewSummary,
   type ProcessProbeResult,
@@ -58,6 +59,7 @@ import {
   countActiveSessions,
 } from "./dependency-scheduler.js";
 import { updateMetadata } from "./metadata.js";
+import { resolveStackedChildBase } from "./stacked.js";
 import { getProjectSessionsDir } from "./paths.js";
 import { applyDecisionToLifecycle as commitLifecycleDecisionInPlace } from "./lifecycle-transition.js";
 import {
@@ -3078,7 +3080,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       `3. \`git push --force-with-lease\``,
       prNumbers.length > 0
         ? `4. Confirm the PR base (no-op if already set):\n   ${editHints}`
-        : `4. Confirm your PR now targets \`${targetBase}\`.`,
+        : `4. You haven't opened your PR yet — the old base \`${oldBase}\` is gone, so open it against the new base: \`gh pr create --base ${targetBase} ...\`.`,
     ].join("\n");
   }
 
@@ -3098,32 +3100,35 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   async function maybeRetargetStackedChild(child: Session): Promise<void> {
     const parentSessionId = child.parentSessionId;
     if (!parentSessionId) return;
-    if (child.prs.length === 0) return;
     if (child.metadata["stackRetargetedAt"]) return; // already handled
     if (TERMINAL_STATUSES.has(child.status)) return; // child itself is wrapping up
+    // NOTE: we intentionally do NOT require an open PR here. A child that hasn't
+    // opened its PR yet still needs to hear that the parent merged — its prompt
+    // told it to `gh pr create --base <parent>`, and that branch is now gone.
 
     const project = config.projects[child.projectId];
     if (!project) return;
 
-    // Resolve the parent's merge state and the base it merged into.
+    // Resolve the parent's merge state and the base it merged into — same rules
+    // as the session-manager spawn path (see resolveStackedChildBase).
     let parent: Session | null;
     try {
       parent = await sessionManager.get(parentSessionId);
     } catch {
       parent = null;
     }
-    let targetBase: string;
-    if (parent) {
-      const parentMerged =
-        parent.status === SESSION_STATUS.MERGED || parent.lifecycle.pr.state === "merged";
-      if (!parentMerged) return; // parent still open — wait for the merge
-      targetBase = parent.pr?.baseBranch || parent.metadata["baseRef"] || project.defaultBranch;
-    } else {
-      // Parent gone from the session store — merged and auto-cleaned up. Its work
-      // is in the default branch now (a deeper stack would have had its own
-      // retarget move it there first).
-      targetBase = project.defaultBranch;
-    }
+    const resolved = resolveStackedChildBase(
+      parent
+        ? {
+            lifecycle: parent.lifecycle,
+            branch: parent.branch,
+            // The parent's own base: prefer live enrichment, then persisted baseRef.
+            ownBase: parent.pr?.baseBranch || parent.metadata["baseRef"],
+          }
+        : null,
+    );
+    if (!resolved.parentMerged) return; // parent still open — wait for the merge
+    const targetBase = resolved.base || project.defaultBranch;
 
     // The branch the child currently stacks on (persisted at spawn). Without it
     // we can't compute the `--onto` cut point, so there's nothing safe to do.
@@ -3135,15 +3140,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       return;
     }
 
-    // Best-effort: point every open PR at the new base immediately. Idempotent —
-    // retargetPR no-ops when the live base already moved off `oldBase`. A failure
-    // here must NOT latch, so the next poll retries.
+    // Point every open PR at the new base. A transient failure must NOT latch
+    // (retry next poll); a divergence — the live base is neither `oldBase` nor
+    // `targetBase`, i.e. a human moved it — must NOT be clobbered: surface it and
+    // latch so we neither overwrite the human's choice nor keep nagging.
     const scm = project.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
     if (scm?.retargetPR) {
       const retargetPR = scm.retargetPR.bind(scm);
       for (const pr of child.prs) {
+        let outcome: PRRetargetOutcome;
         try {
-          await retargetPR(pr, targetBase, oldBase);
+          outcome = await retargetPR(pr, targetBase, oldBase);
         } catch (err) {
           recordActivityEvent({
             projectId: child.projectId,
@@ -3160,6 +3167,21 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             },
           });
           return; // retry next poll
+        }
+        if (outcome === "diverged") {
+          recordActivityEvent({
+            projectId: child.projectId,
+            sessionId: child.id,
+            source: "lifecycle",
+            kind: "stacked.pr_base_diverged",
+            level: "warn",
+            summary: `${child.id} PR base was moved elsewhere; leaving it and skipping the rebase handoff`,
+            data: { parentSessionId, expectedBase: oldBase, newBase: targetBase, prUrl: pr.url },
+          });
+          // Don't rebase/edit — a human owns the base now. Latch so we surface
+          // once and stop nagging; we neither overwrote nor falsely "retargeted".
+          updateSessionMetadata(child, { stackRetargetedAt: nowIso });
+          return;
         }
       }
     }

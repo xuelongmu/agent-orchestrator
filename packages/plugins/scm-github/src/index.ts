@@ -22,6 +22,7 @@ import {
   type ProjectConfig,
   type PRInfo,
   type PRState,
+  type PRRetargetOutcome,
   type MergeMethod,
   type CICheck,
   type CIFailureSummary,
@@ -875,11 +876,14 @@ function createGitHubSCM(): SCM {
       invalidatePRCache(pr);
     },
 
-    async retargetPR(pr: PRInfo, newBase: string, expectedCurrentBase?: string): Promise<void> {
-      // Idempotency guard: only retarget when the PR's live base still matches
-      // what the caller expected. If GitHub already auto-retargeted (the merged
-      // head branch was deleted), a human moved it, or the PR closed, the live
-      // base won't match and we leave it alone.
+    async retargetPR(
+      pr: PRInfo,
+      newBase: string,
+      expectedCurrentBase?: string,
+    ): Promise<PRRetargetOutcome> {
+      // Consult the live base so the caller can tell an actual retarget from a
+      // no-op or a divergence it must not clobber (GitHub auto-retarget, or a
+      // human moving the base).
       if (expectedCurrentBase) {
         let liveBase: string;
         try {
@@ -895,17 +899,20 @@ function createGitHubSCM(): SCM {
             ".baseRefName",
           ]);
         } catch (err) {
-          // Only swallow a confirmed not-found (PR deleted / gone — nothing to
-          // retarget). Propagate transient auth/network errors so the caller's
-          // warning path runs and the failure is visible, not silently "done".
-          if (isPRNotFoundError(err)) return;
+          // Only swallow a confirmed not-found (PR deleted / gone). Propagate
+          // transient auth/network errors so the caller's warning path runs and
+          // the failure is visible, not silently "done".
+          if (isPRNotFoundError(err)) return "not_found";
           throw err;
         }
-        if (liveBase.trim() !== expectedCurrentBase) return;
+        const live = liveBase.trim();
+        if (live === newBase) return "unchanged"; // already on target
+        if (live !== expectedCurrentBase) return "diverged"; // human/other moved it
       }
 
       await gh(["pr", "edit", String(pr.number), "--repo", repoFlag(pr), "--base", newBase]);
       invalidatePRCache(pr);
+      return "retargeted";
     },
 
     async getCIChecks(pr: PRInfo): Promise<CICheck[]> {

@@ -6559,7 +6559,7 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
     // the target must fall back to the parent's persisted baseRef (grandparent),
     // NOT the project default. And a base-edit alone is insufficient under the
     // default squash merge, so the agent must be told to rebase.
-    const retargetPR = vi.fn().mockResolvedValue(undefined);
+    const retargetPR = vi.fn().mockResolvedValue("retargeted");
     const parent = makeSession({
       id: "app-1",
       status: "merged",
@@ -6612,7 +6612,7 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
   });
 
   it("targets the default branch when the parent has been merged and cleaned up", async () => {
-    const retargetPR = vi.fn().mockResolvedValue(undefined);
+    const retargetPR = vi.fn().mockResolvedValue("retargeted");
     // parent: null → archived (merged + auto-cleaned).
     const lm = wire({ parent: null, scm: createMockSCM({ retargetPR }) });
 
@@ -6623,8 +6623,57 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
     expect(readMetadataRaw(env.sessionsDir, "app-2")?.["baseRef"]).toBe("main");
   });
 
+  it("does not clobber a diverged base (human moved it) and skips the rebase handoff", async () => {
+    const retargetPR = vi.fn().mockResolvedValue("diverged");
+    const parent = makeSession({
+      id: "app-1",
+      status: "merged",
+      branch: "feat/parent",
+      pr: makeMatchingPR({ number: 100, baseBranch: "" }),
+      metadata: { agent: "mock-agent", baseRef: "feat/grandparent" },
+    });
+    const lm = wire({ parent, scm: createMockSCM({ retargetPR }) });
+
+    await lm.check("app-2");
+
+    expect(retargetPR).toHaveBeenCalled();
+    // Human owns the base — no rebase handoff, and baseRef is NOT overwritten.
+    expect(rebaseMessage()).toBeUndefined();
+    const meta = readMetadataRaw(env.sessionsDir, "app-2");
+    expect(meta?.["stackRetargetedAt"]).toBeTruthy(); // latched (surfaced once, no nag)
+    expect(meta?.["baseRef"]).toBe("feat/parent"); // unchanged
+  });
+
+  it("notifies a stacked child that has not opened its PR yet", async () => {
+    const retargetPR = vi.fn().mockResolvedValue("retargeted");
+    const parent = makeSession({
+      id: "app-1",
+      status: "merged",
+      branch: "feat/parent",
+      pr: makeMatchingPR({ number: 100, baseBranch: "" }),
+      metadata: { agent: "mock-agent", baseRef: "feat/grandparent" },
+    });
+    // Child with NO PR yet (prs === []).
+    const child = makeSession({
+      id: "app-2",
+      status: "working",
+      branch: "feat/child",
+      parentSessionId: "app-1",
+      metadata: { agent: "mock-agent", baseRef: "feat/parent" },
+    });
+    const lm = wire({ parent, scm: createMockSCM({ retargetPR }), child });
+
+    await lm.check("app-2");
+
+    // No PR to edit, but the agent is still told the base moved so it opens
+    // against the new base instead of the deleted parent branch.
+    expect(retargetPR).not.toHaveBeenCalled();
+    expect(rebaseMessage()).toContain("gh pr create --base feat/grandparent");
+    expect(readMetadataRaw(env.sessionsDir, "app-2")?.["baseRef"]).toBe("feat/grandparent");
+  });
+
   it("is idempotent — already-retargeted children are skipped", async () => {
-    const retargetPR = vi.fn().mockResolvedValue(undefined);
+    const retargetPR = vi.fn().mockResolvedValue("retargeted");
     const parent = makeSession({
       id: "app-1",
       status: "merged",

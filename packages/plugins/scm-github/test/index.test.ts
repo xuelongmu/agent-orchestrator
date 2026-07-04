@@ -595,9 +595,10 @@ describe("scm-github plugin", () => {
   // ---- retargetPR --------------------------------------------------------
 
   describe("retargetPR", () => {
-    it("edits the PR base when no expected base is given", async () => {
+    it("edits the PR base (retargeted) when no expected base is given", async () => {
       ghMock.mockResolvedValueOnce({ stdout: "" });
-      await scm.retargetPR!(pr, "main");
+      const outcome = await scm.retargetPR!(pr, "main");
+      expect(outcome).toBe("retargeted");
       expect(ghMock).toHaveBeenCalledWith(
         expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
         ["pr", "edit", "42", "--repo", "acme/repo", "--base", "main"],
@@ -608,7 +609,8 @@ describe("scm-github plugin", () => {
     it("retargets when the live base still matches the expected base", async () => {
       ghMock.mockResolvedValueOnce({ stdout: "feat/parent\n" }); // pr view baseRefName
       ghMock.mockResolvedValueOnce({ stdout: "" }); // pr edit
-      await scm.retargetPR!(pr, "main", "feat/parent");
+      const outcome = await scm.retargetPR!(pr, "main", "feat/parent");
+      expect(outcome).toBe("retargeted");
       expect(ghMock).toHaveBeenCalledWith(
         expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
         ["pr", "edit", "42", "--repo", "acme/repo", "--base", "main"],
@@ -616,27 +618,33 @@ describe("scm-github plugin", () => {
       );
     });
 
-    it("no-ops when the live base already moved off the expected base", async () => {
-      ghMock.mockResolvedValueOnce({ stdout: "main\n" }); // already retargeted (e.g. GitHub auto)
-      await scm.retargetPR!(pr, "main", "feat/parent");
-      // Only the `pr view` call happened — no `pr edit`.
-      expect(ghMock).toHaveBeenCalledTimes(1);
+    it("reports 'unchanged' when the live base already equals the new base", async () => {
+      ghMock.mockResolvedValueOnce({ stdout: "main\n" }); // already on target (e.g. GitHub auto)
+      const outcome = await scm.retargetPR!(pr, "main", "feat/parent");
+      expect(outcome).toBe("unchanged");
+      expect(ghMock).toHaveBeenCalledTimes(1); // only `pr view`, no `pr edit`
     });
 
-    it("no-ops when the PR is confirmed not-found", async () => {
+    it("reports 'diverged' (and leaves it alone) when a human moved the base", async () => {
+      ghMock.mockResolvedValueOnce({ stdout: "some/other-branch\n" });
+      const outcome = await scm.retargetPR!(pr, "main", "feat/parent");
+      expect(outcome).toBe("diverged");
+      expect(ghMock).toHaveBeenCalledTimes(1); // no `pr edit` — do not clobber
+    });
+
+    it("reports 'not_found' when the PR is confirmed gone", async () => {
       ghMock.mockRejectedValueOnce(
         new Error("GraphQL: Could not resolve to a PullRequest with the number of 42"),
       );
-      await scm.retargetPR!(pr, "main", "feat/parent");
-      // Only the `pr view` lookup happened — swallowed, no `pr edit`.
+      const outcome = await scm.retargetPR!(pr, "main", "feat/parent");
+      expect(outcome).toBe("not_found");
       expect(ghMock).toHaveBeenCalledTimes(1);
     });
 
     it("propagates transient lookup failures instead of succeeding", async () => {
       ghMock.mockRejectedValueOnce(new Error("HTTP 503: server error"));
       await expect(scm.retargetPR!(pr, "main", "feat/parent")).rejects.toThrow("503");
-      // No `pr edit` was attempted.
-      expect(ghMock).toHaveBeenCalledTimes(1);
+      expect(ghMock).toHaveBeenCalledTimes(1); // no `pr edit` attempted
     });
   });
 

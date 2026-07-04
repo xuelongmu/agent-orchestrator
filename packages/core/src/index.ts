@@ -207,6 +207,10 @@ export type {
 export { buildPrompt, BASE_AGENT_PROMPT, BASE_AGENT_PROMPT_NO_REPO } from "./prompt-builder.js";
 export type { PromptBuildConfig } from "./prompt-builder.js";
 
+// Stacked PRs — centralized base resolution given a parent's lifecycle state
+export { resolveStackedChildBase } from "./stacked.js";
+export type { StackedParentState, StackedChildBase } from "./stacked.js";
+
 // Orchestrator prompt — generates orchestrator context for `ao start`
 export { generateOrchestratorPrompt } from "./orchestrator-prompt.js";
 export type { OrchestratorPromptConfig } from "./orchestrator-prompt.js";
