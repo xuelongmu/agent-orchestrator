@@ -3106,7 +3106,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     if (!project) return;
 
     // Resolve the parent's merge state and the base it merged into.
-    let parent: Session | null = null;
+    let parent: Session | null;
     try {
       parent = await sessionManager.get(parentSessionId);
     } catch {
