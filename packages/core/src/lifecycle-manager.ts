@@ -1993,13 +1993,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   /**
+   * True when the review reaction for `key` has ESCALATED (exhausted its
+   * retries/escalateAfter and handed off to a human). executeReaction records the
+   * dispatch hash on escalation even though nothing reached the agent, so the
+   * nudge must NOT treat that hash as a delivered backlog and re-send it.
+   */
+  function isReviewReactionEscalated(session: Session, key: string): boolean {
+    return reactionTrackers.get(`${session.id}:${key}`)?.escalated === true;
+  }
+
+  /**
    * True when the session has an open PR whose review comments were already
-   * delivered to the agent by a send-to-agent reaction — the precondition for
-   * maybeNudgeStuckAgent to take over waking/escalating it. Used to defer the
-   * immediate agent-stuck human notify on the stuck transition so the nudge
-   * budget is spent first. Notify-only categories are excluded: their dispatch
-   * hash is recorded after a human notification, and the nudge won't re-send
-   * them, so the human notify must still fire (not be deferred).
+   * delivered to the agent by a send-to-agent reaction. Used only to force a
+   * cache-bypassing review-thread fetch while the nudge is actively spending its
+   * budget, so a GraphQL-only thread resolution is observed promptly. Notify-only
+   * categories are excluded (their dispatch hash is recorded after a human
+   * notification, not an agent send).
    */
   function hasDeliveredReviewBacklog(session: Session): boolean {
     if (!session.pr || session.lifecycle.pr.state !== "open") return false;
@@ -2046,7 +2055,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         stuckNudgeCount: "",
         stuckNudgeEscalated: "",
         stuckNudgeFingerprint: "",
-        stuckNotifiedAt: "",
       });
       return;
     }
@@ -2162,25 +2170,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         },
       });
       // Don't update the throttle timestamp so the next poll retries immediately
-      // instead of being blocked for 2 minutes with the agent left on a bare notification.
-      //
-      // The transition handler deferred the agent-stuck human notify to the nudge
-      // path (maybeNudgeStuckAgent), which we won't reach because the fetch failed.
-      // Route through the single notify authority so a stuck-by-idle agent is
-      // alerted (once per episode) while review-thread fetching stays broken — AND
-      // so the latch is cleared when the agent is no longer stuck-by-idle, otherwise
-      // a later stuck episode during a still-broken fetch would find a stale
-      // stuckNotifiedAt and stay silent. Only the deferred `notify` action with auto
-      // enabled is owned here (send-to-agent / auto:false were actioned at
-      // transition time and never deferred).
-      const stuckReaction = getReactionConfigForSession(session, "agent-stuck");
-      if (stuckReaction?.action === "notify" && stuckReaction.auto !== false) {
-        await resolveDeferredStuckNotify(
-          session,
-          isStuckByIdle(session) ? "alert" : "resolved",
-          stuckReaction,
-        );
-      }
+      // instead of being blocked for 2 minutes. The agent-stuck notify already
+      // fired at the transition (the nudge is purely additive), so a fetch failure
+      // only delays the optional comment re-delivery — it never silences an alert.
       return;
     }
 
@@ -2511,124 +2503,19 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     });
   }
 
-  /** Clear the per-episode fail-safe-notify latch if set. */
-  function clearStuckNotifyLatch(session: Session): void {
-    if (session.metadata["stuckNotifiedAt"]) {
-      updateSessionMetadata(session, { stuckNotifiedAt: "" });
-    }
-  }
-
-  /**
-   * Fire the agent-stuck human notify that the transition handler deferred, once
-   * per stuck episode (stuckNotifiedAt latch). Only the plain `notify` action is
-   * owned here — a send-to-agent override was already actioned by the transition
-   * handler. The latch is set only when a notifier actually accepted delivery so
-   * an undelivered notify retries on the next poll instead of being silently lost.
-   */
-  async function emitDeferredStuckNotify(
-    session: Session,
-    stuckReaction: ReactionConfig | null,
-  ): Promise<void> {
-    if (stuckReaction?.action !== "notify") return;
-    if (session.metadata["stuckNotifiedAt"]) return;
-    const context = buildEventContext(session, prEnrichmentCache);
-    const event = createEvent("reaction.triggered", {
-      sessionId: session.id,
-      projectId: session.projectId,
-      message:
-        stuckReaction.message ??
-        "Agent appears stuck (idle beyond the agent-stuck threshold) with no review comments to re-deliver.",
-      data: buildReactionNotificationData({
-        eventType: "reaction.triggered",
-        sessionId: session.id,
-        projectId: session.projectId,
-        context,
-        reactionKey: "agent-stuck",
-        action: "notify",
-        enrichment: getPREnrichmentForSession(session),
-      }),
-    });
-    const delivered = await notifyHuman(event, stuckReaction.priority ?? "urgent");
-    if (!delivered) return;
-    updateSessionMetadata(session, { stuckNotifiedAt: new Date().toISOString() });
-    recordActivityEvent({
-      projectId: session.projectId,
-      sessionId: session.id,
-      source: "reaction",
-      kind: "reaction.action_succeeded",
-      summary: `notify agent-stuck (no actionable review backlog)`,
-      data: { reactionKey: "agent-stuck", action: "notify" },
-    });
-  }
-
-  /**
-   * The single precondition under which the agent-stuck human notify is deferred
-   * to (and owned by) the nudge path: the agent is idle beyond the agent-stuck
-   * threshold THIS poll. A `stuck` legacy status reached for a non-idle reason
-   * (dead/unprobeable runtime) does NOT satisfy this — the nudge path would never
-   * emit its fallback for such a session, so the transition handler must NOT defer
-   * and instead notify directly. session.activitySignal is the signal
-   * determineStatus committed this poll (an actively-working agent has no positive
-   * idle evidence).
-   */
-  function isStuckByIdle(session: Session): boolean {
-    const signal = session.activitySignal;
-    return hasPositiveIdleEvidence(signal) && isIdleBeyondThreshold(session, signal.timestamp);
-  }
-
-  /**
-   * Single authority for the deferred agent-stuck human notify + its per-episode
-   * latch. The transition handler defers the notify to the nudge path only when
-   * isStuckByIdle() holds; every exit of that path routes its outcome through here
-   * so the alert is neither lost nor duplicated. Centralizing this collapses the
-   * ~10 scattered clear/emit/return points into ONE contract:
-   *
-   *  - "engaged":   a nudge reached the agent (or fresh comments were just
-   *                 delivered) → agent re-engaged, suppress the bare notify and
-   *                 clear the latch so a later relapse can notify again.
-   *  - "resolved":  the agent is no longer stuck-by-idle (resumed / recovered) →
-   *                 clear the latch so the next episode is not silenced by a stale
-   *                 stuckNotifiedAt.
-   *  - "escalated": the nudge-exhaustion escalation (or a persisted needs_input
-   *                 latch) already owns the human alert → leave the latch as-is.
-   *  - "alert":     genuinely stuck with nothing delivered to the agent → emit the
-   *                 deferred notify (idempotent per episode via stuckNotifiedAt).
-   *
-   * Invariant: no path returns without resolving to one of these, so the deferred
-   * alert is never permanently silenced.
-   */
-  async function resolveDeferredStuckNotify(
-    session: Session,
-    outcome: "engaged" | "resolved" | "escalated" | "alert",
-    stuckReaction: ReactionConfig | null,
-  ): Promise<void> {
-    switch (outcome) {
-      case "engaged":
-      case "resolved":
-        clearStuckNotifyLatch(session);
-        return;
-      case "escalated":
-        return;
-      case "alert":
-        await emitDeferredStuckNotify(session, stuckReaction);
-        return;
-    }
-  }
-
   /**
    * Re-deliver unaddressed PR review comments to a stuck/idle agent, escalating
-   * to needs_input + notify after the nudge budget is spent — and the single
-   * authority for the agent-stuck human notify the transition handler deferred.
+   * to needs_input after the nudge budget is spent.
    *
-   * The dispatch blocks in maybeDispatchReviewBacklog only re-deliver comments
-   * when their fingerprint CHANGES. An agent that is alive but stops noticing
-   * new comments and goes idle leaves the fingerprint unchanged, so — with the
-   * default `agent-stuck` action being `notify` — it would sit forever on a bare
-   * human notification without the comments ever being re-sent. This nudges the
-   * agent back to work by re-delivering the outstanding comments (bypassing the
-   * fingerprint guard) up to `nudgeRetries` times, then escalates. When there is
-   * nothing agent-actionable to re-deliver, it fires the deferred human notify so
-   * a genuinely stuck agent is never silently suppressed.
+   * This is PURELY ADDITIVE to the existing agent-stuck reaction: the transition
+   * handler still fires the `agent-stuck` notify exactly as it did before #5 — the
+   * nudge NEVER suppresses or defers that notification. The dispatch blocks in
+   * maybeDispatchReviewBacklog only re-deliver comments when their fingerprint
+   * CHANGES. An agent that is alive but stops noticing already-delivered comments
+   * and goes idle leaves the fingerprint unchanged, so the comments would never be
+   * re-sent. This re-delivers the outstanding, already-delivered comments
+   * (bypassing the fingerprint guard) up to `nudgeRetries` times, then escalates to
+   * needs_input so a human takes over.
    *
    * Distinct from runtime-death recovery (packages/core/src/recovery/*), which
    * handles dead processes — this handles alive agents that stopped progressing.
@@ -2681,24 +2568,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // is idle past the agent-stuck threshold but whose PR resolves to an overlay
     // status (changes_requested, review_pending, mergeable, approved, ci_failed)
     // never surfaces as `stuck`, yet it is exactly the alive-but-idle agent this
-    // targets. isStuckByIdle is the SAME predicate the transition handler uses to
-    // decide whether to defer the notify here, so the two never disagree.
-    const stuck = isStuckByIdle(session);
+    // targets. session.activitySignal is the signal determineStatus committed this
+    // poll; an actively-working agent has no positive idle evidence.
+    const idleSignal = session.activitySignal;
+    const stuck =
+      hasPositiveIdleEvidence(idleSignal) && isIdleBeyondThreshold(session, idleSignal.timestamp);
 
     // Backlog confirmably clean (empty AND the fetched page is complete): release
     // the nudge budget + escalation latch so a resolved session leaves needs_input,
     // regardless of idle state (a resumed agent must be released too). Fail closed
     // on a truncated page — an unresolved thread may lie outside the fetched page,
-    // so an empty page is NOT trustworthy as clean (finding: fail closed).
+    // so an empty page is NOT trustworthy as clean (fail closed on latch clearing).
     if (totalUnaddressed === 0) {
-      const wasEscalated = session.metadata["stuckNudgeEscalated"] === "true";
-      // Fail closed on clearing the escalation latch when the page is truncated (an
-      // unresolved thread may lie outside the last-100 window) — but the NOTIFY
-      // decision is independent of that and always resolves below.
       if (
         !primaryThreadsTruncated &&
         (session.metadata["stuckNudgeCount"] ||
-          wasEscalated ||
+          session.metadata["stuckNudgeEscalated"] === "true" ||
           session.metadata["stuckNudgeFingerprint"])
       ) {
         updateSessionMetadata(session, {
@@ -2707,37 +2592,31 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           stuckNudgeFingerprint: "",
         });
       }
-      // Resolve the deferred notify: resumed → clear the latch; escalation already
-      // owns the alert → leave it; genuinely stuck with nothing to re-deliver →
-      // alert once per episode.
-      await resolveDeferredStuckNotify(
-        session,
-        !stuck ? "resolved" : wasEscalated ? "escalated" : "alert",
-        stuckReaction,
-      );
       return;
     }
 
-    // Already escalated (parked in needs_input): the escalation notify owns the
-    // alert; don't re-nudge or re-notify.
-    if (session.metadata["stuckNudgeEscalated"] === "true") {
-      await resolveDeferredStuckNotify(session, "escalated", stuckReaction);
-      return;
-    }
+    // Already escalated (parked in needs_input): don't re-nudge.
+    if (session.metadata["stuckNudgeEscalated"] === "true") return;
 
-    // Not idle-beyond-threshold → not stuck; reset the episode notify latch.
-    if (!stuck) {
-      await resolveDeferredStuckNotify(session, "resolved", stuckReaction);
-      return;
-    }
+    // Not idle-beyond-threshold → not stuck; nothing to nudge.
+    if (!stuck) return;
 
     // Preserve each review reaction's own opt-out. The dispatch hash is recorded
     // whenever a category's reaction fires — including notify-only or auto:false
     // configs where the comments were only surfaced to a human, never sent to the
     // agent. Re-delivering those to the agent would bypass the opt-out, so only
     // nudge a category whose reaction is an enabled send-to-agent action.
-    const pendingSendable = reviewReactionSendsToAgent(session, "changes-requested");
-    const automatedSendable = reviewReactionSendsToAgent(session, "bugbot-comments");
+    //
+    // AND skip a category whose review reaction has ESCALATED: executeReaction
+    // returns success (recording the dispatch hash) with action "escalated" even
+    // though nothing reached the agent, so nudging off that hash would re-send
+    // comments the agent never received and fight the reaction's human handoff.
+    const pendingSendable =
+      reviewReactionSendsToAgent(session, "changes-requested") &&
+      !isReviewReactionEscalated(session, "changes-requested");
+    const automatedSendable =
+      reviewReactionSendsToAgent(session, "bugbot-comments") &&
+      !isReviewReactionEscalated(session, "bugbot-comments");
 
     // Only nudge comments the agent has ALREADY received. Fresh comments were
     // just delivered by the dispatch blocks above this cycle — the normal path
@@ -2756,56 +2635,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       automatedComments.length > 0 &&
       automatedComments.every((c) => priorAutomatedIds.has(c.id));
 
-    if (!pendingAlreadyDelivered && !automatedAlreadyDelivered) {
-      // Unresolved comments remain but none are agent-actionable via the nudge.
-      const hasSendableUnresolved =
-        (pendingSendable && pendingComments.length > 0) ||
-        (automatedSendable && automatedComments.length > 0);
-      if (hasSendableUnresolved) {
-        // Fresh sendable comments arrived this cycle — the normal dispatch above
-        // OWNS delivering them. Suppress the bare stuck notify ONLY when that
-        // dispatch actually reached the agent: on success it advances the category
-        // dispatch hash to the current fingerprint. If the send/executeReaction
-        // failed, the hash is unchanged, the agent got nothing, and the transition
-        // notify was already deferred — so the stuck agent must still be alerted.
-        const currentPendingIds = splitFingerprintIds(
-          session.metadata["lastPendingReviewDispatchHash"] ?? "",
-        );
-        const currentAutomatedIds = splitFingerprintIds(
-          session.metadata["lastAutomatedReviewDispatchHash"] ?? "",
-        );
-        const pendingReached =
-          !(pendingSendable && pendingComments.length > 0) ||
-          pendingComments.every((c) => currentPendingIds.has(c.id));
-        const automatedReached =
-          !(automatedSendable && automatedComments.length > 0) ||
-          automatedComments.every((c) => currentAutomatedIds.has(c.id));
-        // Delivered → agent engaged (suppress + clear). Dispatch failed to reach the
-        // agent → alert. Truncation does NOT suppress the alert here: totalUnaddressed
-        // > 0 already proves unresolved comments exist, so an off-page thread cannot
-        // make this a false positive (truncation only matters for the empty-page
-        // "confirmably clean" check above).
-        await resolveDeferredStuckNotify(
-          session,
-          pendingReached && automatedReached ? "engaged" : "alert",
-          stuckReaction,
-        );
-        return;
-      }
-      // Only notify-only / non-actionable comments remain (confirmed unresolved) →
-      // genuinely stuck with nothing to re-deliver: alert once per episode. As above,
-      // truncation is irrelevant because totalUnaddressed > 0 already confirms the
-      // unresolved backlog.
-      await resolveDeferredStuckNotify(session, "alert", stuckReaction);
-      return;
-    }
-
-    // An agent-actionable delivered backlog exists. The notify decision is resolved
-    // below by the send outcome ("engaged" on success, "alert" on failure) — never
-    // up front. Clearing the latch before the send would re-arm the alert every poll
-    // when the runtime send path stays broken (the send-catch alerts + latches, then
-    // the next poll would clear it and alert again), spamming the human instead of
-    // notifying once per episode.
+    // Nothing agent-actionable to re-deliver → nudge does nothing this poll. The
+    // transition handler already fired (and owns) the agent-stuck notify.
+    if (!pendingAlreadyDelivered && !automatedAlreadyDelivered) return;
 
     const nudgeRetries = stuckReaction?.nudgeRetries ?? DEFAULT_STUCK_NUDGE_RETRIES;
 
@@ -2880,11 +2712,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     try {
       await sessionManager.send(session.id, parts.join("\n"));
-      // The nudge reached the agent → re-engaged. Resolve as "engaged" (release the
-      // per-episode latch). The send-catch re-arms the alert only on failure; doing
-      // this after the send (not before) keeps a broken send path from re-notifying
-      // the human every poll.
-      await resolveDeferredStuckNotify(session, "engaged", stuckReaction);
       updateSessionMetadata(session, {
         stuckNudgeCount: String(nudgeCount + 1),
         stuckNudgeFingerprint: backlogFingerprint,
@@ -2903,7 +2730,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         },
       });
     } catch (err) {
-      // Send failed — retry on the next poll cycle (don't consume the budget).
+      // Send failed — retry on the next poll cycle (don't consume the budget). The
+      // agent-stuck notify already fired at the transition, so a human is aware.
       recordActivityEvent({
         projectId: session.projectId,
         sessionId: session.id,
@@ -2916,15 +2744,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           errorMessage: err instanceof Error ? err.message : String(err),
         },
       });
-      // The nudge never reached the agent (broken tmux pane / runtime send path),
-      // so it isn't engaged and the budget isn't consumed — without this the session
-      // would retry forever, never reaching nudgeRetries escalation and never
-      // alerting anyone (the transition notify was deferred to this path). Resolve
-      // as "alert" so a stuck agent with an undeliverable nudge surfaces to a human.
-      // The latch is NOT cleared before the send (only after a successful one), so
-      // this fires exactly once per episode: subsequent failing polls hit the
-      // stuckNotifiedAt latch and the alert no-ops.
-      await resolveDeferredStuckNotify(session, "alert", stuckReaction);
     }
   }
 
@@ -3998,45 +3817,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         let reactionHandledNotify = false;
         const reactionKey = eventToReactionKey(eventType);
 
-        // Defer the agent-stuck human notify for open-PR sessions to the nudge
-        // path (maybeNudgeStuckAgent), which owns it: it re-delivers unresolved
-        // comments and escalates to needs_input only after the nudge budget is
-        // exhausted, and fires the plain human notify itself once it confirms —
-        // from a FRESH fetch — that there is nothing agent-actionable to re-deliver.
-        // Firing notify here would alert a human on the very first stuck poll off
-        // possibly-stale dispatch hashes, defeating the budget (and could suppress
-        // the alert entirely if the backlog turned out clean). Only defer the plain
-        // `notify` action with auto enabled — a send-to-agent override already wakes
-        // the agent, and auto:false routes stuck handling to humans (notify stands).
-        // Sessions without an open PR are not deferred: the nudge path never runs
-        // for them, so their transition notify must fire here.
-        //
-        // The nudge path also bails immediately when the project has no resolvable
-        // SCM plugin (maybeDispatchReviewBacklog returns before reaching the nudge),
-        // so deferring for an SCM-less project would suppress the transition notify
-        // AND never emit the fallback — leaving the stuck agent silent. Only defer
-        // when an SCM plugin is actually available.
-        //
-        // And only when the session is stuck BY IDLE-beyond-threshold: the nudge
-        // path emits its deferred fallback solely for isStuckByIdle() sessions, so a
-        // `stuck` status reached for a non-idle reason (dead/unprobeable runtime)
-        // would be deferred and then silently dropped. Gate on the same predicate so
-        // non-idle stuck transitions notify here instead.
-        const stuckReactionConfig =
-          reactionKey === "agent-stuck" ? getReactionConfigForSession(session, "agent-stuck") : null;
-        const stuckProject = config.projects[session.projectId];
-        const stuckScm = stuckProject?.scm?.plugin
-          ? registry.get<SCM>("scm", stuckProject.scm.plugin)
-          : null;
-        const deferStuckNotifyToNudge =
-          stuckReactionConfig?.action === "notify" &&
-          stuckReactionConfig.auto !== false &&
-          !!session.pr &&
-          session.lifecycle.pr.state === "open" &&
-          !!stuckScm &&
-          isStuckByIdle(session);
-
-        if (reactionKey && !deferStuckNotifyToNudge) {
+        if (reactionKey) {
           let reactionConfig = getReactionConfigForSession(session, reactionKey);
           let messageEnriched = false;
 
@@ -4095,13 +3876,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
               reactionHandledNotify = true;
             }
           }
-        }
-
-        // Deferring the stuck notify to the nudge path also suppresses the
-        // fall-through human notify below — the nudge (or its exhaustion
-        // escalation) is now the notification authority for this session.
-        if (deferStuckNotifyToNudge) {
-          reactionHandledNotify = true;
         }
 
         // For transitions not already notified by a reaction, notify humans.

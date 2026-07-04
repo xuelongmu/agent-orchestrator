@@ -5946,9 +5946,10 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBe("1");
   });
 
-  // Finding #2: the immediate agent-stuck notify must be deferred when the nudge
-  // path will handle the session (PR comments already delivered before it stuck).
-  it("defers the agent-stuck human notify to the nudge path when comments were already delivered", async () => {
+  // The nudge is ADDITIVE: the agent-stuck notify still fires at the stuck
+  // transition (pre-#5 behavior) AND the nudge re-delivers already-delivered
+  // comments — the nudge never suppresses or defers the notification.
+  it("fires the agent-stuck notify AND nudges when comments were already delivered", async () => {
     const notifier = createMockNotifier();
     const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
     // Simulate a prior poll having already dispatched the comment (hash set),
@@ -5964,8 +5965,8 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
 
     await lm.check("app-1"); // pr_open → stuck transition
     expect(lm.getStates().get("app-1")).toBe("stuck");
-    // The stuck transition notify is suppressed — the nudge (send-to-agent) fires instead.
-    expect(notifier.notify).not.toHaveBeenCalled();
+    // The transition notify fires (not deferred) AND the nudge re-delivers the comment.
+    expect(notifier.notify).toHaveBeenCalled();
     expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBe("1");
   });
@@ -6078,30 +6079,6 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(notifier.notify).toHaveBeenCalled();
   });
 
-  // Round-2 finding: deferring off stale dispatch hashes must not lose the alert.
-  // If the agent resolved every thread since the last fetch, the deferred stuck
-  // notify must still fire (the transition suppressed it).
-  it("fires the deferred stuck notify when the delivered backlog turns out resolved", async () => {
-    const notifier = createMockNotifier();
-    // Stale hash from a prior delivery, but every thread is now resolved (empty fetch).
-    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [], reviews: [] });
-    const lm = setupStuckSession(getReviewThreads, {
-      nudgeRetries: 3,
-      notifier,
-      metaOverrides: {
-        lastAutomatedReviewFingerprint: "c1",
-        lastAutomatedReviewDispatchHash: "c1",
-      },
-    });
-
-    await lm.check("app-1");
-    expect(lm.getStates().get("app-1")).toBe("stuck");
-    // Nothing to nudge → no agent send, but the human IS alerted (alert not lost).
-    expect(mockSessionManager.send).not.toHaveBeenCalled();
-    expect(notifier.notify).toHaveBeenCalled();
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
-  });
-
   // Round-2 finding: an empty but TRUNCATED page is not trustworthy as clean —
   // an unresolved thread may lie off-page, so the escalation latch must hold.
   it("fails closed on a truncated empty page (preserves the needs_input latch)", async () => {
@@ -6130,68 +6107,6 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(lm.getStates().get("app-1")).toBe("needs_input");
     // Truncated → do NOT declare clean; the escalation latch is preserved.
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeEscalated"]).toBe("true");
-  });
-
-  // Round-3 finding (id 3516001443): when the review fetch itself fails, the nudge
-  // path never runs — but the transition handler deferred the stuck notify to it.
-  // The fetch-catch must still alert a human, or a stuck agent stays silent for as
-  // long as review-thread fetching is broken.
-  it("fires the deferred stuck notify when the review fetch fails", async () => {
-    const notifier = createMockNotifier();
-    const getReviewThreads = vi.fn().mockRejectedValue(new Error("rate limited"));
-    const lm = setupStuckSession(getReviewThreads, { nudgeRetries: 3, notifier });
-
-    await lm.check("app-1");
-    expect(lm.getStates().get("app-1")).toBe("stuck");
-    // Fetch failed → nothing to nudge, but the human IS alerted (not left silent).
-    expect(mockSessionManager.send).not.toHaveBeenCalled();
-    expect(notifier.notify).toHaveBeenCalled();
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
-  });
-
-  // Round-3 finding (id 3516001448): a truncated empty page cannot be trusted as
-  // clean (fail closed on latch clearing) but a stuck agent must still be alerted —
-  // otherwise a stuck agent on a large PR gets neither a nudge nor a human alert.
-  it("notifies a stuck agent on a truncated empty page (cannot nudge, must alert)", async () => {
-    const notifier = createMockNotifier();
-    const getReviewThreads = vi
-      .fn()
-      .mockResolvedValue({ threads: [], reviews: [], threadsTruncated: true });
-    const lm = setupStuckSession(getReviewThreads, { nudgeRetries: 3, notifier });
-
-    await lm.check("app-1");
-    expect(lm.getStates().get("app-1")).toBe("stuck");
-    // Page too incomplete to nudge or declare clean → still alert the human.
-    expect(mockSessionManager.send).not.toHaveBeenCalled();
-    expect(notifier.notify).toHaveBeenCalled();
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
-  });
-
-  // Round-3 finding (id 3516001451): when the nudge send keeps failing (broken
-  // runtime send path), the budget isn't consumed and escalation is never reached.
-  // The send-catch must alert a human so the session isn't retried silently forever.
-  it("alerts a human when the nudge send keeps failing", async () => {
-    const notifier = createMockNotifier();
-    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
-    const lm = setupStuckSession(getReviewThreads, {
-      nudgeRetries: 3,
-      notifier,
-      // Comment already delivered so the nudge path (not bugbot dispatch) runs it.
-      metaOverrides: {
-        lastAutomatedReviewFingerprint: "c1",
-        lastAutomatedReviewDispatchHash: "c1",
-      },
-    });
-    // The runtime send path is broken.
-    vi.mocked(mockSessionManager.send).mockRejectedValue(new Error("pane is dead"));
-
-    await lm.check("app-1");
-    expect(lm.getStates().get("app-1")).toBe("stuck");
-    // Send failed → agent not engaged; a human is alerted and the budget is NOT spent.
-    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
-    expect(notifier.notify).toHaveBeenCalled();
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
   });
 
   // Round-3 finding (id 3516065043): honoring auto:false must not skip cleanup of a
@@ -6227,271 +6142,83 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(meta?.["stuckNudgeFingerprint"]).toBeFalsy();
   });
 
-  // Round-4 finding (id 3521704230): when fresh sendable comments exist but the
-  // dispatch failed to reach the agent, the dispatch hash is NOT advanced, so the
-  // stuck agent must still be alerted rather than assumed engaged.
-  it("fires the deferred stuck notify when the fresh review dispatch fails to reach the agent", async () => {
-    const notifier = createMockNotifier();
-    // Fresh bot comment, never dispatched before (no prior dispatch hash).
+  // Round-7 finding (id 3521898190): when a review reaction ESCALATES,
+  // executeReaction records the dispatch hash even though nothing reached the
+  // agent. The nudge must NOT treat that as a delivered backlog and re-send it.
+  it("does not nudge comments whose review reaction has escalated", async () => {
+    // Fresh bot comment (no prior dispatch hash) so the dispatch block runs
+    // executeReaction and — with retries:0 — escalates on the first attempt.
     const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
-    const lm = setupStuckSession(getReviewThreads, { nudgeRetries: 3, notifier });
-    // The dispatch's send-to-agent fails to reach the agent.
-    vi.mocked(mockSessionManager.send).mockRejectedValue(new Error("pane is dead"));
-
-    await lm.check("app-1");
-    expect(lm.getStates().get("app-1")).toBe("stuck");
-    // Dispatch was attempted but failed → hash not advanced → human alerted exactly once.
-    expect(mockSessionManager.send).toHaveBeenCalled();
-    expect(notifier.notify).toHaveBeenCalledTimes(1);
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
-    // The failed dispatch did not record a dispatch hash.
-    expect(
-      readMetadataRaw(env.sessionsDir, "app-1")?.["lastAutomatedReviewDispatchHash"],
-    ).toBeFalsy();
-  });
-
-  // Round-4 finding (id 3521704232): a persistently broken send path must notify
-  // the human EXACTLY ONCE per episode, not re-arm the latch and spam every poll.
-  it("notifies the human exactly once when the nudge send keeps failing across polls", async () => {
-    const notifier = createMockNotifier();
-    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
-    const lm = setupStuckSession(getReviewThreads, {
-      nudgeRetries: 3,
-      notifier,
-      // Already delivered so the nudge SEND path (not a fresh dispatch) runs.
-      metaOverrides: {
-        lastAutomatedReviewFingerprint: "c1",
-        lastAutomatedReviewDispatchHash: "c1",
-      },
-    });
-    vi.mocked(mockSessionManager.send).mockRejectedValue(new Error("pane is dead"));
-
-    // Three consecutive polls, the nudge send fails every time.
-    await lm.check("app-1");
-    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
-    await lm.check("app-1");
-    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
-    await lm.check("app-1");
-
-    // Nudge attempted each poll, but the human is alerted only ONCE per episode.
-    expect(mockSessionManager.send).toHaveBeenCalledTimes(3);
-    expect(notifier.notify).toHaveBeenCalledTimes(1);
-    // A failing send never consumes the nudge budget.
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
-  });
-
-  // Round-4 finding (id 3521704233): the deferral must not fire when the project
-  // has no resolvable SCM plugin — the nudge path returns early there, so the
-  // transition notify would otherwise be suppressed and never re-emitted.
-  it("does not defer the stuck notify when the project has no SCM plugin", async () => {
-    const notifier = createMockNotifier();
+    const lm = setupStuckSession(getReviewThreads, { nudgeRetries: 3, withNotifier: true });
     config.reactions = {
-      "agent-stuck": { auto: true, action: "notify", priority: "urgent", threshold: "1m" },
-    };
-    // Idle beyond the 1m threshold.
-    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
-      state: "idle" as ActivityState,
-      timestamp: new Date(Date.now() - 120_000),
-    }));
-    // Registry WITHOUT an scm plugin → registry.get("scm", …) returns null.
-    const registry = createMockRegistry({
-      runtime: plugins.runtime,
-      agent: plugins.agent,
-      notifier,
-    });
-    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
-    const session = makeSession({
-      status: "pr_open",
-      pr: makePR(),
-      metadata: { agent: "mock-agent" },
-    });
-    // PR metadata exists and is open (set on a prior poll when SCM was available).
-    session.lifecycle.pr.state = "open";
-    const lm = setupCheck("app-1", {
-      session,
-      metaOverrides: { agent: "mock-agent" },
-      registry,
-    });
-
-    await lm.check("app-1");
-    expect(lm.getStates().get("app-1")).toBe("stuck");
-    // No SCM → the nudge path can never run, so the transition notify fires here
-    // rather than being deferred and silently dropped.
-    expect(notifier.notify).toHaveBeenCalled();
-    expect(mockSessionManager.send).not.toHaveBeenCalled();
-  });
-
-  // Round-6 finding (id 3521778850): a `stuck` status reached for a NON-idle reason
-  // (dead/unprobeable runtime) must NOT be deferred — the nudge path only emits its
-  // fallback for isStuckByIdle() sessions, so deferring would drop the alert.
-  it("does not defer the stuck notify for a non-idle (probe-failure) stuck transition", async () => {
-    const notifier = createMockNotifier();
-    config.reactions = {
-      "agent-stuck": { auto: true, action: "notify", priority: "urgent", threshold: "1m" },
-    };
-    // Runtime + process probes fail while activity is "active" (NOT idle) and the
-    // detecting budget is already spent → the escalation to stuck is a probe failure,
-    // so isStuckByIdle() is false.
-    vi.mocked(plugins.runtime.isAlive).mockResolvedValue(false);
-    vi.mocked(plugins.agent.isProcessRunning).mockResolvedValue(false);
-    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({
-      state: "active" as ActivityState,
-      timestamp: new Date(Date.now() - 30_000),
-    });
-    const mockSCM = createMockSCM({
-      getReviewThreads: vi.fn().mockResolvedValue({ threads: [], reviews: [] }),
-      enrichSessionsPRBatch: mockBatchEnrichment({
-        state: "open",
-        ciStatus: "passing",
-        reviewDecision: "none",
-        mergeable: false,
-      }),
-    });
-    const registry = createMockRegistry({
-      runtime: plugins.runtime,
-      agent: plugins.agent,
-      scm: mockSCM,
-      notifier,
-    });
-    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
-    const session = makeSession({
-      status: "pr_open",
-      pr: makePR(),
-      metadata: { agent: "mock-agent", detectingAttempts: "3" },
-    });
-    session.lifecycle.pr.state = "open";
-    const lm = setupCheck("app-1", {
-      session,
-      metaOverrides: { agent: "mock-agent", detectingAttempts: "3" },
-      registry,
-    });
-
-    await lm.check("app-1");
-    expect(lm.getStates().get("app-1")).toBe("stuck");
-    // Non-idle stuck → not deferred → the transition notify fires here.
-    expect(notifier.notify).toHaveBeenCalled();
-  });
-
-  // Round-6 finding (id 3521778853): a truncated page whose only comments are
-  // non-actionable (notify-only reaction) must still alert — totalUnaddressed > 0
-  // confirms the agent is stuck, so truncation cannot make it a false positive.
-  it("notifies a stuck agent when a truncated page has only non-actionable comments", async () => {
-    const notifier = createMockNotifier();
-    config.reactions = {
-      "agent-stuck": {
-        auto: true,
-        action: "notify",
-        priority: "urgent",
-        threshold: "1m",
-        nudgeRetries: 3,
-      },
-      // Notify-only → not sendable, so the nudge has no actionable category.
-      "bugbot-comments": { auto: true, action: "notify", message: DEFAULT_BUGBOT_COMMENTS_MESSAGE },
-    };
-    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
-      state: "idle" as ActivityState,
-      timestamp: new Date(Date.now() - 120_000),
-    }));
-    const getReviewThreads = vi
-      .fn()
-      .mockResolvedValue({ threads: [botThread("c1")], reviews: [], threadsTruncated: true });
-    const mockSCM = createMockSCM({
-      getReviewThreads,
-      enrichSessionsPRBatch: mockBatchEnrichment({
-        state: "open",
-        ciStatus: "passing",
-        reviewDecision: "none",
-        mergeable: false,
-      }),
-    });
-    const registry = createMockRegistry({
-      runtime: plugins.runtime,
-      agent: plugins.agent,
-      scm: mockSCM,
-      notifier,
-    });
-    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
-    const lm = setupCheck("app-1", {
-      session: makeSession({ status: "pr_open", pr: makePR(), metadata: { agent: "mock-agent" } }),
-      metaOverrides: {
-        agent: "mock-agent",
-        // A prior notify-only dispatch recorded the hash (surfaced to a human only).
-        lastAutomatedReviewFingerprint: "c1",
-        lastAutomatedReviewDispatchHash: "c1",
-      },
-      registry,
-    });
-
-    await lm.check("app-1");
-    expect(lm.getStates().get("app-1")).toBe("stuck");
-    // Non-actionable + truncated → cannot nudge, but the confirmed unresolved backlog
-    // means the agent is genuinely stuck → alert (previously dropped by truncation).
-    expect(mockSessionManager.send).not.toHaveBeenCalled();
-    expect(notifier.notify).toHaveBeenCalled();
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
-  });
-
-  // Round-6 finding (id 3521778856): on recovery during a still-broken fetch, the
-  // fetch-catch must clear the notify latch so a later stuck episode still alerts.
-  it("clears the deferred-notify latch on recovery so a later stuck episode still alerts", async () => {
-    const notifier = createMockNotifier();
-    config.reactions = {
-      "agent-stuck": {
-        auto: true,
-        action: "notify",
-        priority: "urgent",
-        threshold: "1m",
-        nudgeRetries: 3,
-      },
+      ...config.reactions,
       "bugbot-comments": {
         auto: true,
         action: "send-to-agent",
+        retries: 0,
         message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
       },
     };
-    // Review fetch stays broken throughout.
-    const getReviewThreads = vi.fn().mockRejectedValue(new Error("rate limited"));
-    let activity = { state: "idle" as ActivityState, timestamp: new Date(Date.now() - 120_000) };
-    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => activity);
-    const mockSCM = createMockSCM({
-      getReviewThreads,
-      enrichSessionsPRBatch: mockBatchEnrichment({
-        state: "open",
-        ciStatus: "passing",
-        reviewDecision: "none",
-        mergeable: false,
-      }),
-    });
-    const registry = createMockRegistry({
-      runtime: plugins.runtime,
-      agent: plugins.agent,
-      scm: mockSCM,
+
+    // Poll 1: bugbot dispatch escalates (retries:0) — it records the dispatch hash
+    // but escalates without sending anything to the agent.
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["lastAutomatedReviewDispatchHash"]).toBe(
+      "c1",
+    );
+
+    // Poll 2: the recorded hash looks "delivered", but the reaction is escalated, so
+    // the nudge must NOT re-send it to the agent (would fight the human handoff).
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
+  });
+
+  // Round-7 finding (id 3521898192): the agent-stuck notify is no longer deferred,
+  // so it fires immediately at the stuck transition — never delayed behind the
+  // review-thread throttle.
+  it("fires the agent-stuck notify immediately at the stuck transition (no throttle delay)", async () => {
+    const notifier = createMockNotifier();
+    // A recent successful fetch stamps the throttle so maybeDispatchReviewBacklog
+    // would be throttled this cycle — the transition notify must fire regardless.
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, { nudgeRetries: 3, notifier });
+
+    await lm.check("app-1");
+    expect(lm.getStates().get("app-1")).toBe("stuck");
+    // The agent-stuck reaction fired at the transition (pre-#5 behavior restored).
+    expect(notifier.notify).toHaveBeenCalled();
+  });
+
+  // Round-7 finding (id 3521898193): a clean PR overlay state (review_pending) with
+  // an EMPTY backlog must NOT fire an agent-stuck alert — there is no stuck
+  // transition, and the deferred empty-backlog alert has been removed.
+  it("does not alert stuck on a clean overlay state with an empty backlog", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [], reviews: [] });
+    // reviewDecision "pending" → review_pending overlay; the agent is idle-beyond-
+    // threshold but never surfaces as `stuck`, so no agent-stuck transition occurs.
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 3,
       notifier,
-    });
-    vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
-    const lm = setupCheck("app-1", {
-      session: makeSession({ status: "pr_open", pr: makePR(), metadata: { agent: "mock-agent" } }),
-      metaOverrides: { agent: "mock-agent" },
-      registry,
+      enrichment: { state: "open", ciStatus: "passing", reviewDecision: "pending", mergeable: false },
     });
 
-    // Poll 1: stuck (idle) + broken fetch → alert, latch set.
+    // Poll 1 settles into review_pending (a review.pending transition notify may fire).
     await lm.check("app-1");
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
+    expect(lm.getStates().get("app-1")).toBe("review_pending");
 
-    // Poll 2: agent resumed (active) + still-broken fetch → the catch clears the latch.
-    activity = { state: "active" as ActivityState, timestamp: new Date() };
+    // Poll 2 has no transition, so the ONLY notify that could fire is the (removed)
+    // deferred empty-backlog stuck alert — which must not happen on a clean overlay.
+    vi.mocked(notifier.notify).mockClear();
     await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
     await lm.check("app-1");
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeFalsy();
-
-    // Poll 3: stuck again (idle) + still-broken fetch → a NEW episode alerts again
-    // (only possible because the latch was cleared on recovery — a stale latch would
-    // make emitDeferredStuckNotify no-op and leave the new episode silent).
-    activity = { state: "idle" as ActivityState, timestamp: new Date(Date.now() - 120_000) };
-    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
-    await lm.check("app-1");
-    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNotifiedAt"]).toBeTruthy();
+    expect(lm.getStates().get("app-1")).toBe("review_pending");
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
   });
 });
 
