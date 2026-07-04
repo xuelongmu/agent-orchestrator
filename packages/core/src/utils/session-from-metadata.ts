@@ -132,6 +132,7 @@ export function sessionFromMetadata(
       options.restoredAt ?? (meta["restoredAt"] ? new Date(meta["restoredAt"]) : undefined),
     ...(dependsOn.length > 0 ? { dependsOn } : {}),
     ...(blockedBy.length > 0 ? { blockedBy } : {}),
+    ...(meta["parentSessionId"] ? { parentSessionId: meta["parentSessionId"] } : {}),
     metadata: meta,
   };
 }

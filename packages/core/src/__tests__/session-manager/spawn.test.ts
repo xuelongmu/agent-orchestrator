@@ -82,6 +82,30 @@ describe("spawn", () => {
     expect(mockRuntime.create).toHaveBeenCalled();
   });
 
+  it("derives a stacked child's base from an open parent's branch (#11)", async () => {
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    const parent = await sm.spawn({ projectId: "my-app" }); // app-1
+    vi.mocked(mockWorkspace.create).mockClear();
+
+    await sm.spawn({ projectId: "my-app", parentSessionId: "app-1" });
+
+    const createCfg = vi.mocked(mockWorkspace.create).mock.calls[0]![0];
+    expect(createCfg.baseRef).toBe(parent.branch);
+  });
+
+  it("honors an explicit baseRef override alongside a parentSessionId on a fresh spawn (#11)", async () => {
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await sm.spawn({ projectId: "my-app" }); // app-1 (the parent)
+    vi.mocked(mockWorkspace.create).mockClear();
+
+    // baseRef is only derived from parentSessionId when omitted — a deliberate
+    // override must win even with a parent link.
+    await sm.spawn({ projectId: "my-app", parentSessionId: "app-1", baseRef: "custom/base" });
+
+    const createCfg = vi.mocked(mockWorkspace.create).mock.calls[0]![0];
+    expect(createCfg.baseRef).toBe("custom/base");
+  });
+
   it("forwards AO_AGENT_GH_TRACE into spawned agent runtime env when configured", async () => {
     const previousTrace = process.env["AO_AGENT_GH_TRACE"];
     process.env["AO_AGENT_GH_TRACE"] = "/tmp/agent-gh-trace-test.jsonl";

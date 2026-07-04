@@ -113,9 +113,24 @@ async function refExists(cwd: string, ref: string): Promise<boolean> {
 async function resolveBaseRef(
   repoPath: string,
   defaultBranch: string,
-  options?: { branch?: string; hasOrigin?: boolean },
+  options?: { branch?: string; baseRef?: string; hasOrigin?: boolean },
 ): Promise<string> {
   const hasOrigin = options?.hasOrigin ?? (await hasOriginRemote(repoPath));
+
+  // Stacked PR: an explicit base ref (e.g. a parent session's branch) takes
+  // priority. Prefer the LOCAL branch — all worktrees share this repo, so the
+  // parent session's local branch is its freshest state (it may have unpushed
+  // commits while still working after opening its PR). Fall back to the pushed
+  // remote ref only when there is no local branch (e.g. clone-style setups).
+  if (options?.baseRef) {
+    const localBaseRef = `refs/heads/${options.baseRef}`;
+    if (await refExists(repoPath, localBaseRef)) return localBaseRef;
+    if (hasOrigin) {
+      const remoteBaseRef = `origin/${options.baseRef}`;
+      if (await refExists(repoPath, remoteBaseRef)) return remoteBaseRef;
+    }
+    throw new Error(`Unable to resolve stacked base ref "${options.baseRef}"`);
+  }
 
   if (hasOrigin) {
     if (options?.branch) {
@@ -346,7 +361,10 @@ export function create(config?: Record<string, unknown>): Workspace {
         }
       }
 
-      const baseRef = await resolveBaseRef(repoPath, cfg.project.defaultBranch, { hasOrigin });
+      const baseRef = await resolveBaseRef(repoPath, cfg.project.defaultBranch, {
+        hasOrigin,
+        ...(cfg.baseRef ? { baseRef: cfg.baseRef } : {}),
+      });
 
       // Create worktree with a new branch
       try {

@@ -259,6 +259,59 @@ describe("workspace.create()", () => {
     );
   });
 
+  it("branches off the local parent branch for a stacked session", async () => {
+    const ws = create();
+
+    mockOriginRemote();
+    mockGitSuccess(""); // git rev-parse --verify --quiet refs/heads/feat/parent
+    mockGitSuccess(""); // worktree add
+
+    await ws.create(makeCreateConfig({ baseRef: "feat/parent" }));
+
+    // resolveBaseRef prefers the local branch (freshest, shared repo).
+    expect(mockExecFileAsync).toHaveBeenCalledWith(
+      "git",
+      ["rev-parse", "--verify", "--quiet", "refs/heads/feat/parent"],
+      { cwd: "/repo/path", windowsHide: true, timeout: 30_000 },
+    );
+    expect(mockExecFileAsync).toHaveBeenCalledWith(
+      "git",
+      [
+        "worktree",
+        "add",
+        "-b",
+        "feat/TEST-1",
+        "/mock-home/.worktrees/myproject/session-1",
+        "refs/heads/feat/parent",
+      ],
+      { cwd: "/repo/path", windowsHide: true, timeout: 30_000 },
+    );
+  });
+
+  it("falls back to origin/<baseRef> when no local stacked base exists", async () => {
+    const ws = create();
+
+    mockOriginRemote();
+    mockGitError("not found"); // git rev-parse --verify --quiet refs/heads/feat/parent (missing)
+    mockGitSuccess(""); // git rev-parse --verify --quiet origin/feat/parent
+    mockGitSuccess(""); // worktree add
+
+    await ws.create(makeCreateConfig({ baseRef: "feat/parent" }));
+
+    expect(mockExecFileAsync).toHaveBeenCalledWith(
+      "git",
+      [
+        "worktree",
+        "add",
+        "-b",
+        "feat/TEST-1",
+        "/mock-home/.worktrees/myproject/session-1",
+        "origin/feat/parent",
+      ],
+      { cwd: "/repo/path", windowsHide: true, timeout: 30_000 },
+    );
+  });
+
   it("creates the project worktree directory", async () => {
     const ws = create();
 

@@ -70,6 +70,7 @@ import {
   parseCanonicalLifecycle,
 } from "./lifecycle-state.js";
 import { buildPrompt } from "./prompt-builder.js";
+import { resolveStackedChildBase } from "./stacked.js";
 import { classifyActivitySignal, createActivitySignal } from "./activity-signal.js";
 import {
   getProjectSessionsDir,
@@ -1430,6 +1431,60 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         branch = `session/${sessionId}`;
       }
 
+      // Stacked PR: resolve the base branch this session stacks on. Explicit
+      // `baseRef` wins; otherwise derive it from the parent session's branch.
+      // `stackBaseBranch` differing from the default branch signals a stacked
+      // session — the workspace branches off it and the agent targets it with
+      // `gh pr create --base`.
+      const parentSessionId = spawnConfig.parentSessionId;
+      let stackBaseBranch = spawnConfig.baseRef;
+      if (parentSessionId) {
+        if (spawnConfig.baseRef && !options?.reuseIdentity) {
+          // Explicit override on a fresh spawn: `SessionSpawnConfig.baseRef` is
+          // derived from `parentSessionId` only when omitted, so honor a
+          // deliberately-supplied base (the parent link is still persisted for
+          // retarget-on-merge). A relaunch (`reuseIdentity`) carries a *replayed*
+          // baseRef, not a fresh user choice, so it re-resolves below instead.
+          stackBaseBranch = spawnConfig.baseRef;
+        } else {
+          // Re-resolve the base from the parent's CURRENT lifecycle — never replay
+          // a stale persisted `baseRef`. A held child carries `baseRef` = parent
+          // branch, but by the time it unblocks the parent has usually merged;
+          // branching off that (deleted) branch would reintroduce the parent's
+          // work. Session ids are globally unique, so resolve across every
+          // project's sessions dir, not just this child's.
+          const parentRecord = findSessionRecord(parentSessionId);
+          if (!parentRecord && !options?.reuseIdentity) {
+            // Fresh spawn with an unknown parent — a genuine misconfiguration.
+            throw new Error(
+              `Cannot stack session on parent "${parentSessionId}": parent not found`,
+            );
+          }
+          // Single source of truth for the base (see resolveStackedChildBase).
+          const resolved = resolveStackedChildBase(
+            parentRecord
+              ? {
+                  lifecycle: parseLifecycleFromRaw(parentRecord.raw),
+                  branch: parentRecord.raw["branch"],
+                  ownBase: parentRecord.raw["baseRef"],
+                }
+              : null,
+          );
+          stackBaseBranch = resolved.base;
+          if (resolved.parentMerged) {
+            recordActivityEvent({
+              projectId: spawnConfig.projectId,
+              sessionId,
+              source: "session-manager",
+              kind: "stacked.parent_merged_no_stack",
+              level: "info",
+              summary: `parent "${parentSessionId}" merged; branching off ${resolved.base ?? "default"}`,
+              data: { parentSessionId, resolvedBase: resolved.base ?? "" },
+            });
+          }
+        }
+      }
+
       // Held by an unresolved prerequisite: record a blocked session and stop
       // before any work begins (no workspace, no runtime, no agent launch). The
       // scheduler (#10) clears `blockedBy` and launches it once prerequisites
@@ -1462,6 +1517,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           lastActivityAt: createdAt,
           dependsOn,
           blockedBy,
+          ...(parentSessionId ? { parentSessionId } : {}),
           metadata: {
             ...(spawnConfig.prompt ? { userPrompt: spawnConfig.prompt } : {}),
             ...(displayName ? { displayName } : {}),
@@ -1483,6 +1539,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           createdAt: createdAt.toISOString(),
           dependsOn,
           blockedBy,
+          ...(parentSessionId ? { parentSessionId } : {}),
+          // Persist the resolved stacked base so unblock() relaunches from the
+          // intended branch (baseRef-only stacks would otherwise lose it).
+          ...(stackBaseBranch ? { baseRef: stackBaseBranch } : {}),
           userPrompt: spawnConfig.prompt,
           displayName,
         });
@@ -1512,6 +1572,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           sessionId,
           branch,
           worktreeDir: getProjectWorktreesDir(spawnConfig.projectId),
+          ...(stackBaseBranch ? { baseRef: stackBaseBranch } : {}),
         });
         workspacePath = wsInfo.path;
         // Only register destroy when the path is inside a managed root —
@@ -1565,6 +1626,11 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         issueContext,
         userPrompt: spawnConfig.prompt,
         ...(orchestratorExists && { orchestratorSessionId }),
+        // Only surface stacked-PR instructions when the base differs from the
+        // project default — a same-as-default base is a plain (non-stacked) PR.
+        ...(stackBaseBranch && stackBaseBranch !== project.defaultBranch
+          ? { baseBranch: stackBaseBranch }
+          : {}),
       });
 
       const baseDir = getProjectDir(spawnConfig.projectId);
@@ -1702,6 +1768,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         createdAt,
         lastActivityAt: createdAt,
         ...(dependsOn.length > 0 ? { dependsOn } : {}),
+        ...(parentSessionId ? { parentSessionId } : {}),
         metadata: {
           ...(reusedOpenCodeSessionId ? { opencodeSessionId: reusedOpenCodeSessionId } : {}),
           ...(spawnConfig.prompt ? { userPrompt: spawnConfig.prompt } : {}),
@@ -1733,6 +1800,8 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         runtimeHandle: handle,
         opencodeSessionId: reusedOpenCodeSessionId,
         dependsOn,
+        ...(parentSessionId ? { parentSessionId } : {}),
+        ...(stackBaseBranch ? { baseRef: stackBaseBranch } : {}),
         userPrompt: spawnConfig.prompt,
         displayName,
         ...(heldDisplayNameUserSet ? { displayNameUserSet: true } : {}),
@@ -1857,6 +1926,12 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       // the tracker alone, dropping any explicit spawn-time prerequisites and
       // losing the dependency history once the session launches (#10).
       ...(originalDependsOn.length > 0 ? { dependsOn: originalDependsOn } : {}),
+      // Carry stacked-PR linkage so the relaunch re-resolves its base branch
+      // off the parent and persists the parent id (retarget-on-merge needs it).
+      ...(raw["parentSessionId"] ? { parentSessionId: raw["parentSessionId"] } : {}),
+      // Carry the resolved base ref so baseRef-only stacks (and explicit
+      // overrides) resume from the intended branch, not project.defaultBranch.
+      ...(raw["baseRef"] ? { baseRef: raw["baseRef"] } : {}),
       // Explicit empty unblocked set: prevents collectSessionDependencies from
       // re-deriving a non-empty `blockedBy` from the tracker and re-holding the
       // session we are deliberately launching.

@@ -90,6 +90,27 @@ export function create(config?: Record<string, unknown>): Workspace {
         );
       }
 
+      // Stacked PR: cut the feature branch below from the parent's branch instead
+      // of the project default. Prefer the LOCAL source repo's branch — like the
+      // worktree plugin — because it is the parent's freshest state (it may carry
+      // commits not yet pushed while the parent is still working). Only when the
+      // local repo lacks the branch do we clone the remote ref directly.
+      let localBaseExists = false;
+      if (cfg.baseRef) {
+        try {
+          await git(repoPath, "rev-parse", "--verify", "--quiet", `refs/heads/${cfg.baseRef}`);
+          localBaseExists = true;
+        } catch {
+          localBaseExists = false;
+        }
+      }
+      const useLocalBase = Boolean(cfg.baseRef) && localBaseExists;
+      // With a local base we clone the default branch and materialize the base
+      // from the local repo below; otherwise clone the target branch directly.
+      const cloneBaseBranch = useLocalBase
+        ? cfg.project.defaultBranch
+        : (cfg.baseRef ?? cfg.project.defaultBranch);
+
       // Clone using --reference for faster clone with shared objects
       try {
         await execFileAsync("git", [
@@ -97,7 +118,7 @@ export function create(config?: Record<string, unknown>): Workspace {
           "--reference",
           repoPath,
           "--branch",
-          cfg.project.defaultBranch,
+          cloneBaseBranch,
           remoteUrl,
           clonePath,
         ]);
@@ -110,6 +131,27 @@ export function create(config?: Record<string, unknown>): Workspace {
         throw new Error(`Failed to clone repo for session "${cfg.sessionId}": ${msg}`, {
           cause: cloneErr,
         });
+      }
+
+      // Materialize the (preferred) local base into the clone and check it out so
+      // the feature branch below stacks on the parent's freshest commits.
+      if (useLocalBase && cfg.baseRef) {
+        try {
+          await git(
+            clonePath,
+            "fetch",
+            repoPath,
+            `refs/heads/${cfg.baseRef}:refs/heads/${cfg.baseRef}`,
+          );
+          await git(clonePath, "checkout", cfg.baseRef);
+        } catch (fetchErr: unknown) {
+          rmSync(clonePath, { recursive: true, force: true });
+          const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+          throw new Error(
+            `Failed to materialize stacked base "${cfg.baseRef}" from local repo for session "${cfg.sessionId}": ${msg}`,
+            { cause: fetchErr },
+          );
+        }
       }
 
       // Create and checkout the feature branch

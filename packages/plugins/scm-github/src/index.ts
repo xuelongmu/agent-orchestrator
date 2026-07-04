@@ -22,6 +22,7 @@ import {
   type ProjectConfig,
   type PRInfo,
   type PRState,
+  type PRRetargetOutcome,
   type MergeMethod,
   type CICheck,
   type CIFailureSummary,
@@ -536,6 +537,21 @@ function repoFlag(pr: PRInfo): string {
   return `${pr.owner}/${pr.repo}`;
 }
 
+/**
+ * Whether a `gh pr view` failure is a confirmed "PR does not exist" (safe to
+ * treat as a no-op), as opposed to a transient auth/network error (which must
+ * propagate). gh reports missing PRs via GraphQL "Could not resolve to a
+ * PullRequest" or "no pull requests found".
+ */
+function isPRNotFoundError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes("could not resolve to a pullrequest") ||
+    msg.includes("no pull requests found") ||
+    msg.includes("no pull request found")
+  );
+}
+
 function prEventKey(pr: PRInfo): string {
   return `${repoFlag(pr)}#${pr.number}`;
 }
@@ -858,6 +874,45 @@ function createGitHubSCM(): SCM {
     async closePR(pr: PRInfo): Promise<void> {
       await gh(["pr", "close", String(pr.number), "--repo", repoFlag(pr)]);
       invalidatePRCache(pr);
+    },
+
+    async retargetPR(
+      pr: PRInfo,
+      newBase: string,
+      expectedCurrentBase?: string,
+    ): Promise<PRRetargetOutcome> {
+      // Consult the live base so the caller can tell an actual retarget from a
+      // no-op or a divergence it must not clobber (GitHub auto-retarget, or a
+      // human moving the base).
+      if (expectedCurrentBase) {
+        let liveBase: string;
+        try {
+          liveBase = await gh([
+            "pr",
+            "view",
+            String(pr.number),
+            "--repo",
+            repoFlag(pr),
+            "--json",
+            "baseRefName",
+            "-q",
+            ".baseRefName",
+          ]);
+        } catch (err) {
+          // Only swallow a confirmed not-found (PR deleted / gone). Propagate
+          // transient auth/network errors so the caller's warning path runs and
+          // the failure is visible, not silently "done".
+          if (isPRNotFoundError(err)) return "not_found";
+          throw err;
+        }
+        const live = liveBase.trim();
+        if (live === newBase) return "unchanged"; // already on target
+        if (live !== expectedCurrentBase) return "diverged"; // human/other moved it
+      }
+
+      await gh(["pr", "edit", String(pr.number), "--repo", repoFlag(pr), "--base", newBase]);
+      invalidatePRCache(pr);
+      return "retargeted";
     },
 
     async getCIChecks(pr: PRInfo): Promise<CICheck[]> {

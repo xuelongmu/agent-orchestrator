@@ -41,6 +41,7 @@ import {
   type CICheck,
   type CIFailureSummary,
   type PRInfo,
+  type PRRetargetOutcome,
   type ReviewComment,
   type ReviewSummary,
   type ProcessProbeResult,
@@ -58,6 +59,7 @@ import {
   countActiveSessions,
 } from "./dependency-scheduler.js";
 import { updateMetadata } from "./metadata.js";
+import { resolveStackedChildBase } from "./stacked.js";
 import { getProjectSessionsDir } from "./paths.js";
 import { applyDecisionToLifecycle as commitLifecycleDecisionInPlace } from "./lifecycle-transition.js";
 import {
@@ -3053,6 +3055,211 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return makeFingerprint(failedChecks.map((c) => `${c.name}:${c.status}:${c.conclusion ?? ""}`));
   }
 
+  /** Instructions the child agent follows to rebase its branch onto the new
+   *  base after its parent merged. A base-edit alone is not enough under the
+   *  default squash merge: the child branch still carries the parent's original
+   *  commits, so the PR would re-show the parent's changes until the branch is
+   *  rebased (dropping those commits) onto the new base. The rebase is delegated
+   *  to the agent because it owns the workspace — the daemon must not force-push. */
+  function buildStackedRebaseMessage(
+    childBranch: string | null,
+    oldBase: string,
+    targetBase: string,
+    prNumbers: number[],
+  ): string {
+    const branch = childBranch ?? "<your branch>";
+    const editHints = prNumbers.map((n) => `gh pr edit ${n} --base ${targetBase}`).join("\n   ");
+    const hasPr = prNumbers.length > 0;
+    const header = hasPr
+      ? `Your stacked PR's parent branch \`${oldBase}\` has merged into \`${targetBase}\`. The orchestrator already pointed your PR base at \`${targetBase}\`, but your branch still carries the parent's now-merged commits — rebase to drop them so your PR shows only your changes:`
+      : `Your parent branch \`${oldBase}\` has merged into \`${targetBase}\` and no longer exists. Rebase your branch onto the new base, then open your PR against it:`;
+    return [
+      header,
+      ``,
+      `1. \`git fetch origin\``,
+      // The old base may only exist as a remote-tracking ref (a child cut from
+      // `origin/<base>` never creates a local branch), so resolve a concrete
+      // upstream before rebasing rather than assuming a bare local branch name.
+      `2. Rebase onto the new base, dropping the parent's now-merged commits:`,
+      "   ```",
+      `   upstream="$(git rev-parse -q --verify "${oldBase}" || git rev-parse -q --verify "origin/${oldBase}")"`,
+      `   git rebase --onto "origin/${targetBase}" "$upstream" ${branch}`,
+      "   ```",
+      `   (resolve any conflicts, then \`git rebase --continue\`)`,
+      `3. \`git push --force-with-lease\``,
+      hasPr
+        ? `4. Confirm the PR base (no-op if already set):\n   ${editHints}`
+        : `4. Open your PR against the new base: \`gh pr create --base ${targetBase} ...\`.`,
+    ].join("\n");
+  }
+
+  /**
+   * Stacked PRs (#11): once a dependent (stacked) session's parent PR has merged,
+   * re-point the child's open PRs onto the parent's base AND ask the child agent
+   * to rebase its branch onto that base (dropping the parent's merged commits).
+   *
+   * Child-driven and idempotent: it runs on every poll of the child and latches
+   * via `stackRetargetedAt` only after both the base-edit and the agent handoff
+   * succeed — so a transient `retargetPR`/`send` failure, or an AO restart after
+   * the parent merged, simply retries on the next poll instead of leaving the
+   * child stranded on the merged parent branch. GitHub auto-retargets the PR
+   * base when the merged head branch is deleted, but that still leaves a wrong
+   * diff under squash merge, which is why the agent rebase is required.
+   */
+  async function maybeRetargetStackedChild(child: Session): Promise<void> {
+    const parentSessionId = child.parentSessionId;
+    if (!parentSessionId) return;
+    if (child.metadata["stackRetargetedAt"]) return; // already handled
+    if (TERMINAL_STATUSES.has(child.status)) return; // child itself is wrapping up
+    // A held (blocked_by_dependency) child has no runtime yet, so a handoff would
+    // just fail-to-send every poll. `unblock()` re-resolves the base off the
+    // (now-merged) parent when the scheduler launches it, so skip it here.
+    if (isBlockedByDependency(child.lifecycle)) return;
+    // NOTE: we intentionally do NOT require an open PR here. A child that hasn't
+    // opened its PR yet still needs to hear that the parent merged — its prompt
+    // told it to `gh pr create --base <parent>`, and that branch is now gone.
+
+    const project = config.projects[child.projectId];
+    if (!project) return;
+
+    // Resolve the parent's merge state and the base it merged into — same rules
+    // as the session-manager spawn path (see resolveStackedChildBase).
+    let parent: Session | null;
+    try {
+      parent = await sessionManager.get(parentSessionId);
+    } catch {
+      parent = null;
+    }
+    const resolved = resolveStackedChildBase(
+      parent
+        ? {
+            lifecycle: parent.lifecycle,
+            branch: parent.branch,
+            // The parent's own base: prefer live enrichment, then persisted baseRef.
+            ownBase: parent.pr?.baseBranch || parent.metadata["baseRef"],
+          }
+        : null,
+    );
+    if (!resolved.parentMerged) return; // parent still open — wait for the merge
+    const targetBase = resolved.base || project.defaultBranch;
+
+    // The branch the child currently stacks on (persisted at spawn). Without it
+    // we can't compute the `--onto` cut point, so there's nothing safe to do.
+    const oldBase = child.metadata["baseRef"] || parent?.branch;
+    const nowIso = new Date().toISOString();
+    if (!targetBase || !oldBase || oldBase === targetBase) {
+      // Already on the target (or nothing resolvable) — latch so we stop polling.
+      updateSessionMetadata(child, { stackRetargetedAt: nowIso });
+      return;
+    }
+
+    const scm = project.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
+
+    // If the child already has open PR(s) but the SCM can't edit a PR base, the
+    // daemon cannot move them off the merged/deleted parent branch. Do NOT latch
+    // or tell the agent the base was "already moved" — surface the limitation
+    // once and leave it retryable.
+    if (child.prs.length > 0 && !scm?.retargetPR) {
+      if (!child.metadata["stackRetargetUnsupportedAt"]) {
+        updateSessionMetadata(child, { stackRetargetUnsupportedAt: nowIso });
+        recordActivityEvent({
+          projectId: child.projectId,
+          sessionId: child.id,
+          source: "lifecycle",
+          kind: "stacked.retarget_unsupported",
+          level: "warn",
+          summary: `${child.id}: SCM cannot retarget a PR base; leaving ${child.prs.length} PR(s) retryable`,
+          data: { parentSessionId, newBase: targetBase },
+        });
+      }
+      return;
+    }
+
+    // Point every open PR at the new base. A transient failure must NOT latch
+    // (retry next poll); a divergence — the live base is neither `oldBase` nor
+    // `targetBase`, i.e. a human moved it — must NOT be clobbered: surface it and
+    // latch so we neither overwrite the human's choice nor keep nagging.
+    if (scm?.retargetPR) {
+      const retargetPR = scm.retargetPR.bind(scm);
+      for (const pr of child.prs) {
+        let outcome: PRRetargetOutcome;
+        try {
+          outcome = await retargetPR(pr, targetBase, oldBase);
+        } catch (err) {
+          recordActivityEvent({
+            projectId: child.projectId,
+            sessionId: child.id,
+            source: "lifecycle",
+            kind: "stacked.pr_retarget_failed",
+            level: "warn",
+            summary: `failed to retarget ${child.id} PR onto ${targetBase}`,
+            data: {
+              parentSessionId,
+              newBase: targetBase,
+              prUrl: pr.url,
+              errorMessage: err instanceof Error ? err.message : String(err),
+            },
+          });
+          return; // retry next poll
+        }
+        if (outcome === "diverged") {
+          recordActivityEvent({
+            projectId: child.projectId,
+            sessionId: child.id,
+            source: "lifecycle",
+            kind: "stacked.pr_base_diverged",
+            level: "warn",
+            summary: `${child.id} PR base was moved elsewhere; leaving it and skipping the rebase handoff`,
+            data: { parentSessionId, expectedBase: oldBase, newBase: targetBase, prUrl: pr.url },
+          });
+          // Don't rebase/edit — a human owns the base now. Latch so we surface
+          // once and stop nagging; we neither overwrote nor falsely "retargeted".
+          updateSessionMetadata(child, { stackRetargetedAt: nowIso });
+          return;
+        }
+      }
+    }
+
+    // Delegate the branch rebase to the agent (it owns the workspace). Only latch
+    // once the handoff succeeds, so a send failure retries.
+    const message = buildStackedRebaseMessage(
+      child.branch,
+      oldBase,
+      targetBase,
+      child.prs.map((p) => p.number).filter((n) => n > 0),
+    );
+    try {
+      await sessionManager.send(child.id, message);
+    } catch (err) {
+      recordActivityEvent({
+        projectId: child.projectId,
+        sessionId: child.id,
+        source: "lifecycle",
+        kind: "stacked.rebase_handoff_failed",
+        level: "warn",
+        summary: `failed to notify ${child.id} to rebase onto ${targetBase}`,
+        data: {
+          parentSessionId,
+          newBase: targetBase,
+          errorMessage: err instanceof Error ? err.message : String(err),
+        },
+      });
+      return; // retry next poll
+    }
+
+    // Persist the new base so a later retarget of this child's own children
+    // targets the right branch, and latch to stop re-processing.
+    updateSessionMetadata(child, { stackRetargetedAt: nowIso, baseRef: targetBase });
+    recordActivityEvent({
+      projectId: child.projectId,
+      sessionId: child.id,
+      source: "lifecycle",
+      kind: "stacked.pr_retargeted",
+      summary: `retargeted ${child.id} onto ${targetBase} and asked the agent to rebase`,
+      data: { parentSessionId, oldBase, newBase: targetBase },
+    });
+  }
+
   async function maybeDispatchCIFailureDetails(
     session: Session,
     _oldStatus: SessionStatus,
@@ -3983,6 +4190,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       maybeDispatchReviewBacklog(session, oldStatus, newStatus, transitionReaction),
       maybeDispatchMergeConflicts(session, newStatus),
       maybeDispatchCIFailureDetails(session, oldStatus, newStatus, transitionReaction),
+      maybeRetargetStackedChild(session),
     ]);
 
     // Report watcher: audit agent reports for issues (#140)

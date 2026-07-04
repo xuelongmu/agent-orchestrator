@@ -122,4 +122,90 @@ describe("unblock", () => {
 
     expect(mockRuntime.create).not.toHaveBeenCalled();
   });
+
+  /** Held stacked child whose persisted baseRef points at its parent's branch. */
+  function writeHeldStackedChild(sessionId: string): void {
+    const createdAt = new Date("2024-01-01T00:00:00.000Z");
+    const lifecycle = createInitialCanonicalLifecycle("worker", createdAt);
+    lifecycle.session.reason = "blocked_by_dependency";
+    writeMetadata(sessionsDir, sessionId, {
+      worktree: "",
+      branch: `feat/${sessionId}`,
+      status: deriveLegacyStatus(lifecycle),
+      lifecycle,
+      project: "my-app",
+      agent: "mock-agent",
+      createdAt: createdAt.toISOString(),
+      dependsOn: ["app-1"],
+      blockedBy: [],
+      parentSessionId: "app-1",
+      baseRef: "feat/parent",
+    } as unknown as SessionMetadata);
+  }
+
+  it("re-resolves a held stacked child off the default base when its parent has merged (#11)", async () => {
+    // Parent app-1 is absent (merged + auto-cleaned). The persisted baseRef must
+    // NOT be replayed — its branch is gone; the child branches off the default.
+    writeHeldStackedChild("app-2");
+    const sm = createSessionManager({ config, registry: mockRegistry });
+
+    await sm.unblock("app-2");
+
+    expect(ctx.mockWorkspace.create).toHaveBeenCalledTimes(1);
+    const createCfg = vi.mocked(ctx.mockWorkspace.create).mock.calls[0]![0];
+    expect(createCfg.baseRef).toBeUndefined();
+    // The stale baseRef is dropped from metadata too.
+    expect(readMetadataRaw(sessionsDir, "app-2")?.["baseRef"]).toBeFalsy();
+  });
+
+  it("re-resolves a held stacked child onto the parent's current branch when it is still open (#11)", async () => {
+    // Parent app-1 still open with its branch present.
+    const parentCreatedAt = new Date("2024-01-01T00:00:00.000Z");
+    const parentLifecycle = createInitialCanonicalLifecycle("worker", parentCreatedAt);
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp/ws-1",
+      branch: "feat/parent",
+      status: deriveLegacyStatus(parentLifecycle),
+      lifecycle: parentLifecycle,
+      project: "my-app",
+      agent: "mock-agent",
+      createdAt: parentCreatedAt.toISOString(),
+    } as unknown as SessionMetadata);
+    writeHeldStackedChild("app-2");
+    const sm = createSessionManager({ config, registry: mockRegistry });
+
+    await sm.unblock("app-2");
+
+    const createCfg = vi.mocked(ctx.mockWorkspace.create).mock.calls[0]![0];
+    expect(createCfg.baseRef).toBe("feat/parent");
+    expect(readMetadataRaw(sessionsDir, "app-2")?.["baseRef"]).toBe("feat/parent");
+  });
+
+  it("re-resolves a held stacked child onto the parent's merged-into base for a middle stack (#11)", async () => {
+    // Parent app-1 has merged; it was itself stacked on feat/grandparent. The
+    // child must branch off the base the parent merged INTO, not the merged
+    // parent branch nor the project default.
+    const createdAt = new Date("2024-01-01T00:00:00.000Z");
+    const mergedLifecycle = createInitialCanonicalLifecycle("worker", createdAt);
+    mergedLifecycle.pr.state = "merged";
+    mergedLifecycle.pr.reason = "merged";
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp/ws-1",
+      branch: "feat/parent",
+      status: deriveLegacyStatus(mergedLifecycle),
+      lifecycle: mergedLifecycle,
+      project: "my-app",
+      agent: "mock-agent",
+      createdAt: createdAt.toISOString(),
+      baseRef: "feat/grandparent",
+    } as unknown as SessionMetadata);
+    writeHeldStackedChild("app-2");
+    const sm = createSessionManager({ config, registry: mockRegistry });
+
+    await sm.unblock("app-2");
+
+    const createCfg = vi.mocked(ctx.mockWorkspace.create).mock.calls[0]![0];
+    expect(createCfg.baseRef).toBe("feat/grandparent");
+    expect(readMetadataRaw(sessionsDir, "app-2")?.["baseRef"]).toBe("feat/grandparent");
+  });
 });
