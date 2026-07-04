@@ -866,7 +866,7 @@ function createGitHubSCM(): SCM {
       // head branch was deleted), a human moved it, or the PR closed, the live
       // base won't match and we leave it alone.
       if (expectedCurrentBase) {
-        let liveBase = "";
+        let liveBase: string;
         try {
           liveBase = await gh([
             "pr",
