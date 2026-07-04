@@ -1305,3 +1305,42 @@ describe("Config Validation - Observability Config", () => {
     ).toThrow();
   });
 });
+
+describe("Config Validation - Reaction default merging (#12)", () => {
+  it("preserves the built-in action for a threshold-only root override", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        // Only confidenceThreshold — action/auto must stay from the built-in default.
+        "ci-failed": { confidenceThreshold: 0.8 },
+      },
+    });
+    expect(config.reactions["ci-failed"].action).toBe("send-to-agent");
+    expect(config.reactions["ci-failed"].auto).toBe(true);
+    expect(config.reactions["ci-failed"].confidenceThreshold).toBe(0.8);
+    // Other built-in fields survive the merge.
+    expect(config.reactions["ci-failed"].retries).toBe(2);
+  });
+
+  it("lets an explicit action override the default while keeping other defaults", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        "ci-failed": { action: "notify" },
+      },
+    });
+    expect(config.reactions["ci-failed"].action).toBe("notify");
+    expect(config.reactions["ci-failed"].retries).toBe(2);
+  });
+
+  it("applies notify/auto defaults to a brand-new custom reaction key", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        "custom-key": { confidenceThreshold: 0.5 },
+      },
+    });
+    expect(config.reactions["custom-key"].action).toBe("notify");
+    expect(config.reactions["custom-key"].auto).toBe(true);
+  });
+});

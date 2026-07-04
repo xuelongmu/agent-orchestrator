@@ -23,6 +23,7 @@ import {
   type ExternalPluginEntryRef,
   type LoadedConfig,
   type OrchestratorConfig,
+  type ReactionConfig,
 } from "./types.js";
 import { generateSessionPrefix } from "./paths.js";
 import { getDefaultRuntime } from "./platform.js";
@@ -418,7 +419,11 @@ const OrchestratorConfigSchema = z.object({
   ),
   notifiers: z.record(NotifierConfigSchema).default({}),
   notificationRouting: z.record(z.array(z.string())).default({}),
-  reactions: z.record(ReactionConfigSchema).default({}),
+  // Partial like project overrides: a top-level entry that sets only some fields
+  // (e.g. just `confidenceThreshold`) must NOT get `action`/`auto` schema
+  // defaults, so applyDefaultReactions can merge it over the built-in default
+  // without silently replacing the built-in `action` (#12 review).
+  reactions: z.record(ReactionConfigSchema.partial()).default({}),
 });
 
 // =============================================================================
@@ -784,8 +789,17 @@ function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
     },
   };
 
-  // Merge defaults with user-specified reactions (user wins)
-  config.reactions = { ...defaults, ...config.reactions };
+  // Merge each user-specified reaction OVER the built-in default for that key
+  // (or a notify base for custom keys), per-key like project overrides. A partial
+  // override — e.g. adding only `confidenceThreshold` to `ci-failed` — then
+  // refines the default instead of dropping `action`/`auto` back to schema
+  // defaults and silently disabling the autonomous action (#12 review).
+  const mergedReactions: Record<string, ReactionConfig> = { ...defaults };
+  for (const [key, override] of Object.entries(config.reactions ?? {})) {
+    const base: ReactionConfig = mergedReactions[key] ?? { auto: true, action: "notify" };
+    mergedReactions[key] = { ...base, ...override };
+  }
+  config.reactions = mergedReactions;
 
   return config;
 }

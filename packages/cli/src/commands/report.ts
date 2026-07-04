@@ -208,6 +208,20 @@ export function registerReport(program: Command): void {
             process.exit(1);
           }
         }
+        // needs-decision must carry an actionable question — the notification path
+        // drops the decision context without one. Fall back to --note if given.
+        let question = opts.question?.trim() || undefined;
+        if (canonical === "needs_decision" && !question) {
+          question = opts.note?.trim() || undefined;
+          if (!question) {
+            console.error(
+              chalk.red(
+                "needs-decision requires --question (or --note) stating the decision for the human.",
+              ),
+            );
+            process.exit(1);
+          }
+        }
         const sessionId = resolveSessionId(opts.session);
         await writeReport({
           sessionName: sessionId,
@@ -216,7 +230,7 @@ export function registerReport(program: Command): void {
           prUrl: opts.prUrl,
           prNumber,
           confidence,
-          question: opts.question,
+          question,
           source: "report",
         });
       },

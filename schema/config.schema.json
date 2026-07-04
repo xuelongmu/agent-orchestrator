@@ -137,7 +137,7 @@
           "type": "number",
           "minimum": 0,
           "maximum": 1,
-          "description": "Minimum heuristic confidence (0..1) required to run this reaction's autonomous action (auto-merge, send-to-agent auto-fix, spawn-session). Below it, the action is held and escalated to a human with a question. Omit to disable the gate."
+          "description": "Minimum heuristic confidence (0..1) required to run this reaction's autonomous action (auto-merge or send-to-agent auto-fix). Below it, the action is held and escalated to a human with a question. Omit to disable the gate. Not applied to spawn-session (the dependency scheduler runs independently)."
         }
       }
     },

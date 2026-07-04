@@ -117,13 +117,16 @@ reactions:
 
 ## Confidence Gate
 
-Set `confidenceThreshold` on any reaction with an autonomous action (`auto-merge`,
-`send-to-agent`, `spawn-session`) to require human sign-off when AO is not confident
-enough. Before acting, AO folds cheap risk signals — review-round churn, the severity
-and confidence of open automated review findings, CI failures on the branch, and diff
-size — into a heuristic score between 0 and 1. When the score is below the threshold,
-the action is **held** and escalated to a human with a question explaining why, instead
-of running. Omit the field to keep the reaction's original behavior.
+Set `confidenceThreshold` on a reaction with an `auto-merge` or `send-to-agent`
+(auto-fix) action to require human sign-off when AO is not confident enough. Before
+acting, AO folds cheap risk signals — review-round churn, the severity and confidence
+of open automated review findings, CI failures on the branch, and diff size across the
+session's PRs — into a heuristic score between 0 and 1. When the score is below the
+threshold, the action is **held** and escalated to a human with a question explaining
+why, instead of running. Omit the field to keep the reaction's original behavior.
+
+(`spawn-session` is not gated: the dependency scheduler launches held dependents
+independently each poll, so the reaction-level hold could not stop the spawn.)
 
 ```yaml
 reactions:
