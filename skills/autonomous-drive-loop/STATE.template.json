@@ -26,7 +26,14 @@
         { "tag": "<class-tag>", "occurrences": 0, "note": "" }
       ],
       "openFindings": [
-        { "id": null, "loc": "<file:line>", "disposition": "<dispatched|deferred-to-issue-N|absorbed-by-invariant>" }
+        {
+          "id": null,
+          "round": null,
+          "loc": "<file:line>",
+          "classTag": "<class-tag matching classes[].tag>",
+          "fixCommit": "<sha once addressed, else null>",
+          "disposition": "<dispatched|deferred-to-issue-N|absorbed-by-invariant|fixed>"
+        }
       ],
       "contractInvariants": []
     }

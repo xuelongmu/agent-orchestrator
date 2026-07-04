@@ -35,11 +35,11 @@ Expect gaps: self-scheduled wake-ups don't fire while the host machine sleeps. O
 
 ## 3. Reviewer-bot signal handling (worked example: Codex)
 
-The reviewer bot (`chatgpt-codex-connector[bot]`) never submits a formal GitHub `APPROVED` review. Treat ANY of these as approval of the **current HEAD**:
+The reviewer bot (`chatgpt-codex-connector[bot]`) never submits a formal GitHub `APPROVED` review. Treat ANY of these as approval — but **every signal must be bound to the current HEAD** before it satisfies the gate:
 
-- a **👍 / +1 reaction** by the bot on the PR;
-- a body containing **"Didn't find any major issues"** / **"Chef's kiss"**;
-- a review of the current HEAD with **zero new inline findings**.
+- a body containing **"Didn't find any major issues"** / **"Chef's kiss"** whose `Reviewed commit:` equals the current HEAD;
+- a review of the current HEAD with **zero new inline findings**;
+- a **👍 / +1 reaction** by the bot — reactions carry no commit reference, so a reaction counts ONLY if no push has occurred since the reaction's `created_at` (compare against the HEAD commit's `committedDate`). A 👍 left on an older head does not approve the commits pushed after it.
 
 Hard-won gotchas (each cost a real half-day stall):
 
