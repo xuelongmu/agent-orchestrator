@@ -1437,30 +1437,37 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       // `gh pr create --base`.
       const parentSessionId = spawnConfig.parentSessionId;
       let stackBaseBranch = spawnConfig.baseRef;
-      if (!stackBaseBranch && parentSessionId) {
-        // Session ids are globally unique (the dependency scheduler and the
-        // retarget hook both treat them cross-project), so resolve the parent
-        // across every project's sessions dir — not just this child's.
-        const parentBranch = findSessionRecord(parentSessionId)?.raw?.["branch"];
-        if (parentBranch) {
+      if (parentSessionId) {
+        // A parent link always re-resolves the base from the parent's CURRENT
+        // state — it must NOT replay a stale persisted `baseRef`. A held child
+        // carries `baseRef` = parent branch, but by the time it unblocks the
+        // parent has usually merged; branching off that (deleted) branch would
+        // reintroduce the parent's work. Session ids are globally unique, so
+        // resolve across every project's sessions dir, not just this child's.
+        const parentRecord = findSessionRecord(parentSessionId);
+        const parentBranch = parentRecord?.raw?.["branch"];
+        const parentMerged = parentRecord?.raw?.["status"] === "merged";
+        if (parentBranch && !parentMerged) {
+          // Parent still open — stack on its branch.
           stackBaseBranch = parentBranch;
-        } else if (options?.reuseIdentity) {
-          // Relaunch of a held stacked child (#10 + #11): the parent may have
-          // merged and been cleaned up while this child was blocked. Its work
-          // is now in the default branch, so drop the stacking and branch off
-          // the default rather than failing the launch.
+        } else if (parentRecord || options?.reuseIdentity) {
+          // Parent already merged, or gone (merged + cleaned up) on relaunch:
+          // its work is in the base now, so drop the stacking and branch off the
+          // default instead of a stale/deleted parent branch.
+          stackBaseBranch = undefined;
           recordActivityEvent({
             projectId: spawnConfig.projectId,
             sessionId,
             source: "session-manager",
-            kind: "stacked.parent_unresolved_on_relaunch",
-            level: "warn",
-            summary: `parent "${parentSessionId}" gone on relaunch; branching off default`,
+            kind: "stacked.parent_merged_no_stack",
+            level: "info",
+            summary: `parent "${parentSessionId}" already merged/gone; branching off default`,
             data: { parentSessionId },
           });
         } else {
+          // Fresh spawn with an unknown parent — a genuine misconfiguration.
           throw new Error(
-            `Cannot stack session on parent "${parentSessionId}": parent not found or has no branch`,
+            `Cannot stack session on parent "${parentSessionId}": parent not found`,
           );
         }
       }

@@ -3053,72 +3053,97 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return makeFingerprint(failedChecks.map((c) => `${c.name}:${c.status}:${c.conclusion ?? ""}`));
   }
 
+  /** Instructions the child agent follows to rebase its branch onto the new
+   *  base after its parent merged. A base-edit alone is not enough under the
+   *  default squash merge: the child branch still carries the parent's original
+   *  commits, so the PR would re-show the parent's changes until the branch is
+   *  rebased (dropping those commits) onto the new base. The rebase is delegated
+   *  to the agent because it owns the workspace — the daemon must not force-push. */
+  function buildStackedRebaseMessage(
+    childBranch: string | null,
+    oldBase: string,
+    targetBase: string,
+    prNumbers: number[],
+  ): string {
+    const branch = childBranch ?? "<your branch>";
+    const editHints = prNumbers.map((n) => `gh pr edit ${n} --base ${targetBase}`).join("\n   ");
+    return [
+      `Your stacked PR's parent branch \`${oldBase}\` has merged into \`${targetBase}\`.`,
+      `The orchestrator already pointed your PR base at \`${targetBase}\`, but your branch still`,
+      `carries the parent's now-merged commits. Rebase to drop them so your PR shows only your changes:`,
+      ``,
+      `1. \`git fetch origin\``,
+      `2. \`git rebase --onto origin/${targetBase} ${oldBase} ${branch}\``,
+      `   (resolve any conflicts, then \`git rebase --continue\`)`,
+      `3. \`git push --force-with-lease\``,
+      prNumbers.length > 0
+        ? `4. Confirm the PR base (no-op if already set):\n   ${editHints}`
+        : `4. Confirm your PR now targets \`${targetBase}\`.`,
+    ].join("\n");
+  }
+
   /**
-   * Stacked PRs (#11): when a parent session's PR merges, retarget the open PRs
-   * of its dependent (stacked) sessions onto the parent's own base branch, so a
-   * child PR that was targeting the parent's branch re-points at the default
-   * branch. Fires once, on the merge transition edge, before merge auto-cleanup
-   * tears the parent down.
+   * Stacked PRs (#11): once a dependent (stacked) session's parent PR has merged,
+   * re-point the child's open PRs onto the parent's base AND ask the child agent
+   * to rebase its branch onto that base (dropping the parent's merged commits).
    *
-   * GitHub already auto-retargets child PRs when the merged head branch is
-   * deleted (AO merges with `--delete-branch`), so this is a safety net for the
-   * cases it doesn't cover; the SCM's `retargetPR` no-ops when the live base has
-   * already moved off the parent's branch, keeping this idempotent.
+   * Child-driven and idempotent: it runs on every poll of the child and latches
+   * via `stackRetargetedAt` only after both the base-edit and the agent handoff
+   * succeed — so a transient `retargetPR`/`send` failure, or an AO restart after
+   * the parent merged, simply retries on the next poll instead of leaving the
+   * child stranded on the merged parent branch. GitHub auto-retargets the PR
+   * base when the merged head branch is deleted, but that still leaves a wrong
+   * diff under squash merge, which is why the agent rebase is required.
    */
-  async function maybeRetargetDependentPRs(
-    parent: Session,
-    oldStatus: SessionStatus,
-    newStatus: SessionStatus,
-  ): Promise<void> {
-    if (newStatus !== SESSION_STATUS.MERGED || oldStatus === SESSION_STATUS.MERGED) return;
-    if (!parent.branch) return;
-    // Capture into a const so the non-null narrowing survives the awaits below.
-    const parentBranch = parent.branch;
+  async function maybeRetargetStackedChild(child: Session): Promise<void> {
+    const parentSessionId = child.parentSessionId;
+    if (!parentSessionId) return;
+    if (child.prs.length === 0) return;
+    if (child.metadata["stackRetargetedAt"]) return; // already handled
+    if (TERMINAL_STATUSES.has(child.status)) return; // child itself is wrapping up
 
-    const project = config.projects[parent.projectId];
+    const project = config.projects[child.projectId];
     if (!project) return;
-    const scm = project.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
-    if (!scm?.retargetPR) return;
-    const retargetPR = scm.retargetPR.bind(scm);
 
-    // The base the children should re-point at = the branch the parent actually
-    // merged into. Prefer the live PR base if enrichment populated it, then the
-    // parent's persisted stacked base (so a middle session merging while its own
-    // parent is still open moves grandchildren onto that parent's branch, not
-    // `main`), then the project default for a plain root parent.
-    const targetBase =
-      parent.pr?.baseBranch || parent.metadata["baseRef"] || project.defaultBranch;
-    if (!targetBase) return;
-
-    let sessions: Session[];
+    // Resolve the parent's merge state and the base it merged into.
+    let parent: Session | null = null;
     try {
-      // Unscoped: a stacked child may live in another project scope.
-      sessions = await sessionManager.list();
+      parent = await sessionManager.get(parentSessionId);
     } catch {
+      parent = null;
+    }
+    let targetBase: string;
+    if (parent) {
+      const parentMerged =
+        parent.status === SESSION_STATUS.MERGED || parent.lifecycle.pr.state === "merged";
+      if (!parentMerged) return; // parent still open — wait for the merge
+      targetBase = parent.pr?.baseBranch || parent.metadata["baseRef"] || project.defaultBranch;
+    } else {
+      // Parent gone from the session store — merged and auto-cleaned up. Its work
+      // is in the default branch now (a deeper stack would have had its own
+      // retarget move it there first).
+      targetBase = project.defaultBranch;
+    }
+
+    // The branch the child currently stacks on (persisted at spawn). Without it
+    // we can't compute the `--onto` cut point, so there's nothing safe to do.
+    const oldBase = child.metadata["baseRef"] || parent?.branch;
+    const nowIso = new Date().toISOString();
+    if (!targetBase || !oldBase || oldBase === targetBase) {
+      // Already on the target (or nothing resolvable) — latch so we stop polling.
+      updateSessionMetadata(child, { stackRetargetedAt: nowIso });
       return;
     }
 
-    const children = sessions.filter((s) => s.parentSessionId === parent.id && s.prs.length > 0);
-    for (const child of children) {
-      // A dependent session may have opened multiple PRs (e.g. multi-repo).
-      // Retarget every one still based on the parent's branch — retargetPR
-      // no-ops on the rest via its live-base guard.
-      for (const childPr of child.prs) {
+    // Best-effort: point every open PR at the new base immediately. Idempotent —
+    // retargetPR no-ops when the live base already moved off `oldBase`. A failure
+    // here must NOT latch, so the next poll retries.
+    const scm = project.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
+    if (scm?.retargetPR) {
+      const retargetPR = scm.retargetPR.bind(scm);
+      for (const pr of child.prs) {
         try {
-          await retargetPR(childPr, targetBase, parentBranch);
-          recordActivityEvent({
-            projectId: child.projectId,
-            sessionId: child.id,
-            source: "lifecycle",
-            kind: "stacked.pr_retargeted",
-            summary: `retargeted ${child.id} PR onto ${targetBase} after parent ${parent.id} merged`,
-            data: {
-              parentSessionId: parent.id,
-              parentBranch,
-              newBase: targetBase,
-              prUrl: childPr.url,
-            },
-          });
+          await retargetPR(pr, targetBase, oldBase);
         } catch (err) {
           recordActivityEvent({
             projectId: child.projectId,
@@ -3126,17 +3151,57 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             source: "lifecycle",
             kind: "stacked.pr_retarget_failed",
             level: "warn",
-            summary: `failed to retarget ${child.id} PR after parent ${parent.id} merged`,
+            summary: `failed to retarget ${child.id} PR onto ${targetBase}`,
             data: {
-              parentSessionId: parent.id,
+              parentSessionId,
               newBase: targetBase,
-              prUrl: childPr.url,
+              prUrl: pr.url,
               errorMessage: err instanceof Error ? err.message : String(err),
             },
           });
+          return; // retry next poll
         }
       }
     }
+
+    // Delegate the branch rebase to the agent (it owns the workspace). Only latch
+    // once the handoff succeeds, so a send failure retries.
+    const message = buildStackedRebaseMessage(
+      child.branch,
+      oldBase,
+      targetBase,
+      child.prs.map((p) => p.number).filter((n) => n > 0),
+    );
+    try {
+      await sessionManager.send(child.id, message);
+    } catch (err) {
+      recordActivityEvent({
+        projectId: child.projectId,
+        sessionId: child.id,
+        source: "lifecycle",
+        kind: "stacked.rebase_handoff_failed",
+        level: "warn",
+        summary: `failed to notify ${child.id} to rebase onto ${targetBase}`,
+        data: {
+          parentSessionId,
+          newBase: targetBase,
+          errorMessage: err instanceof Error ? err.message : String(err),
+        },
+      });
+      return; // retry next poll
+    }
+
+    // Persist the new base so a later retarget of this child's own children
+    // targets the right branch, and latch to stop re-processing.
+    updateSessionMetadata(child, { stackRetargetedAt: nowIso, baseRef: targetBase });
+    recordActivityEvent({
+      projectId: child.projectId,
+      sessionId: child.id,
+      source: "lifecycle",
+      kind: "stacked.pr_retargeted",
+      summary: `retargeted ${child.id} onto ${targetBase} and asked the agent to rebase`,
+      data: { parentSessionId, oldBase, newBase: targetBase },
+    });
   }
 
   async function maybeDispatchCIFailureDetails(
@@ -4069,7 +4134,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       maybeDispatchReviewBacklog(session, oldStatus, newStatus, transitionReaction),
       maybeDispatchMergeConflicts(session, newStatus),
       maybeDispatchCIFailureDetails(session, oldStatus, newStatus, transitionReaction),
-      maybeRetargetDependentPRs(session, oldStatus, newStatus),
+      maybeRetargetStackedChild(session),
     ]);
 
     // Report watcher: audit agent reports for issues (#140)

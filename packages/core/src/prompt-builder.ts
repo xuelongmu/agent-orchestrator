@@ -156,7 +156,7 @@ function buildConfigLayer(config: PromptBuildConfig): string {
       `- When you open your PR, target that branch: \`gh pr create --base ${baseBranch} ...\` (do NOT target \`${project.defaultBranch}\`).`,
     );
     lines.push(
-      `- The orchestrator automatically retargets your PR to \`${project.defaultBranch}\` once the parent PR merges — no action needed from you.`,
+      `- Once the parent PR merges, the orchestrator retargets your PR base to \`${project.defaultBranch}\` and messages you to rebase your branch onto it (dropping the parent's now-merged commits). Follow those instructions when they arrive.`,
     );
   }
 

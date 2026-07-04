@@ -75,7 +75,8 @@ describe("buildPrompt split output", () => {
     expect(systemPrompt).toContain("## Stacked PR");
     expect(systemPrompt).toContain("stacked on branch `feat/10-parent`");
     expect(systemPrompt).toContain("gh pr create --base feat/10-parent");
-    expect(systemPrompt).toContain("retargets your PR to `main`");
+    expect(systemPrompt).toContain("retargets your PR base to `main`");
+    expect(systemPrompt).toContain("rebase your branch");
   });
 
   it("omits stacked-PR section when baseBranch equals the default branch", () => {
