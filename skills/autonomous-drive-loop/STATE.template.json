@@ -41,8 +41,5 @@
   "dispatchLog": [
     { "at": "<ISO>", "to": "<session>", "file": "<message file>", "what": "<summary>" }
   ],
-  "cleanupPending": [],
-  "standingConstraints": [
-    "<hard rules copied from policy that must survive any context loss, e.g. do-not-merge list>"
-  ]
+  "cleanupPending": []
 }
