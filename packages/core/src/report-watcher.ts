@@ -188,7 +188,9 @@ export function checkBlockedAgent(
     const message =
       report.state === "needs_decision"
         ? `Agent needs a decision${
-            report.confidence != null ? ` (confidence ${Math.round(report.confidence * 100)}%)` : ""
+            report.confidence !== undefined
+              ? ` (confidence ${Math.round(report.confidence * 100)}%)`
+              : ""
           }: ${report.question ?? report.note ?? "waiting for user decision"}`
         : `Agent needs input: ${report.note ?? "waiting for user decision"}`;
     return {

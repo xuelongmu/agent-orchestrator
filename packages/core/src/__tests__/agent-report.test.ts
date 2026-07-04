@@ -297,9 +297,15 @@ describe("applyAgentReport", () => {
       now: new Date("2025-01-01T13:11:00.000Z"),
     });
     const meta = readMetadataRaw(dataDir, sessionId)!;
-    expect(meta[AGENT_REPORT_METADATA_KEYS.CONFIDENCE]).toBe("");
-    expect(meta[AGENT_REPORT_METADATA_KEYS.QUESTION]).toBe("");
-    expect(readAgentReport(meta)?.confidence).toBeUndefined();
+    // The metadata layer drops empty-string values, so clearing a field to "" on
+    // the non-decision report removes it entirely — the stale decision no longer
+    // lingers, and a fresh read surfaces neither confidence nor question.
+    expect(meta[AGENT_REPORT_METADATA_KEYS.CONFIDENCE]).toBeUndefined();
+    expect(meta[AGENT_REPORT_METADATA_KEYS.QUESTION]).toBeUndefined();
+    const cleared = readAgentReport(meta);
+    expect(cleared?.state).toBe("working");
+    expect(cleared?.confidence).toBeUndefined();
+    expect(cleared?.question).toBeUndefined();
   });
 
   it("records pr_created with PR metadata and pr_open lifecycle", () => {

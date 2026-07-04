@@ -1729,7 +1729,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     const enrichment = getPREnrichmentForSession(session);
     const diffSize =
-      enrichment && (enrichment.additions != null || enrichment.deletions != null)
+      enrichment && (enrichment.additions !== undefined || enrichment.deletions !== undefined)
         ? (enrichment.additions ?? 0) + (enrichment.deletions ?? 0)
         : undefined;
 
@@ -1870,7 +1870,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // gated. Synthetic system sessions (no lifecycle) are skipped: they carry no
     // metadata/PR to score and never run autonomous actions.
     const confidenceThreshold = reactionConfig.confidenceThreshold;
-    if (confidenceThreshold != null && action !== "notify" && "lifecycle" in session) {
+    if (confidenceThreshold !== undefined && action !== "notify" && "lifecycle" in session) {
       const assessment = computeConfidence(gatherConfidenceSignals(session));
       if (assessment.score < confidenceThreshold) {
         const question = buildConfidenceEscalationQuestion(

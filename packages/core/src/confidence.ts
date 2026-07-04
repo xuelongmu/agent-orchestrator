@@ -101,7 +101,7 @@ export function computeConfidence(signals: ConfidenceSignals): ConfidenceAssessm
     const penalty = SEVERITY_WEIGHT[signals.maxFindingSeverity] * findingConfidence;
     if (penalty > 0) {
       const confidenceSuffix =
-        signals.maxFindingConfidence != null
+        signals.maxFindingConfidence !== null && signals.maxFindingConfidence !== undefined
           ? ` (confidence ${Math.round(findingConfidence * 100)}%)`
           : "";
       factors.push({

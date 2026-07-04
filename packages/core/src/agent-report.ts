@@ -580,7 +580,8 @@ export function applyAgentReport(
       // Confidence + question travel with `needs_decision` reports; clear them on
       // every other report so a stale judgment call never lingers on the session.
       if (input.state === "needs_decision") {
-        next[AGENT_REPORT_METADATA_KEYS.CONFIDENCE] = confidence != null ? String(confidence) : "";
+        next[AGENT_REPORT_METADATA_KEYS.CONFIDENCE] =
+          confidence !== undefined ? String(confidence) : "";
         next[AGENT_REPORT_METADATA_KEYS.QUESTION] = trimmedQuestion ?? "";
       } else {
         next[AGENT_REPORT_METADATA_KEYS.CONFIDENCE] = "";
