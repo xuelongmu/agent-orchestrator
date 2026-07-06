@@ -87,6 +87,7 @@ import { evaluateBudgetBreach, resolveBudget } from "./budget.js";
 import {
   auditAgentReports,
   getReactionKeyForTrigger,
+  isNeedsDecisionActive,
   REPORT_WATCHER_METADATA_KEYS,
 } from "./report-watcher.js";
 import { createCorrelationId, createProjectObserver } from "./observability.js";
@@ -152,9 +153,8 @@ interface NeedsDecisionContext {
  * decision context, and a resolved record can never act as an active block (#12).
  */
 function getActiveDecision(session: Session): NeedsDecisionContext | null {
-  if (session.lifecycle.session.state !== "needs_input") return null;
   const report = readAgentReport(session.metadata);
-  if (report?.state !== "needs_decision" || !report.question) return null;
+  if (!report?.question || !isNeedsDecisionActive(session, report)) return null;
   return { confidence: report.confidence, question: report.question };
 }
 
@@ -194,14 +194,6 @@ const PERSISTENT_REACTION_KEYS = new Set(["ci-failed"]);
 /** Metadata key: reactionKey of a confidence hold whose escalation was undelivered
  *  and is awaiting a per-poll retry (Class B chokepoint, #12). */
 const CONFIDENCE_HOLD_PENDING_KEY = "confidenceHoldPending";
-
-/** Reactions whose real content (enriched review comments / CI failure details) is
- *  computed in a per-poll dispatcher, not at the status transition. The dispatcher
- *  owns their confidence escalation (question + content = ONE notification) and the
- *  latch; the executeReaction transition gate only WITHHOLDS the transition send for
- *  them (no notify/latch) to avoid a generic-then-detailed double. Each self-
- *  re-dispatches every poll, so it needs no pending-retry marker. */
-const DISPATCH_GATED_REACTIONS = new Set(["ci-failed", "changes-requested", "bugbot-comments"]);
 
 /** Number of consecutive CI-passing polls required before the ci-failed tracker
  *  (including its escalated flag) is cleared, allowing a fresh budget for the
@@ -2004,11 +1996,49 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   /**
-   * Retry an undelivered confidence hold each poll — the single guaranteed retry
-   * for transition-only gated actions (e.g. approved-and-green auto-merge) that
-   * have no later same-state dispatcher to re-run the gate (#12 review). Re-runs
-   * the chokepoint: on delivery it latches + clears; when confidence recovers it
-   * releases; otherwise it stays pending for the next poll.
+   * Dispatch-site confidence gate: when held, deliver the ONE actionable escalation
+   * (confidence question + enriched review comments / CI details) to the human and
+   * latch. Unlike withholdForConfidence it ALWAYS re-delivers the detail (the caller
+   * dedups via its own dispatch hash), so a generic transition/retry escalation that
+   * already latched never suppresses the detailed one (#12 review). Returns
+   * `{ withhold, delivered }`; stamp the dispatch hash only when delivered.
+   */
+  async function withholdDispatchForConfidence(
+    session: Session,
+    reactionKey: string,
+    reactionConfig: ReactionConfig,
+    detail: string,
+  ): Promise<{ withhold: boolean; delivered: boolean }> {
+    const evaluated = evaluateConfidenceHold(session, "send-to-agent", reactionConfig);
+    if (!evaluated) return { withhold: false, delivered: false };
+    const delivered = await notifyConfidenceEscalation(
+      session,
+      reactionKey,
+      "send-to-agent",
+      evaluated.threshold,
+      evaluated.assessment,
+      detail,
+      reactionConfig.priority,
+    );
+    if (delivered) {
+      const trackerKey = `${session.id}:${reactionKey}`;
+      const tracker = reactionTrackers.get(trackerKey) ?? { attempts: 0, firstTriggered: new Date() };
+      tracker.escalated = true;
+      tracker.heldForConfidence = true;
+      reactionTrackers.set(trackerKey, tracker);
+      clearPendingConfidenceHold(session, reactionKey);
+    }
+    return { withhold: true, delivered };
+  }
+
+  /**
+   * Retry a pending confidence hold each poll — the guaranteed terminal outcome for
+   * a transition-only gated action (e.g. approved-and-green auto-merge, an idle
+   * send-to-agent) whose escalation was undelivered and which has no per-poll
+   * dispatcher. Re-runs the reaction through executeReaction so its gate either
+   * re-escalates (still low confidence) or RUNS the action now that confidence
+   * recovered — the hold's terminal outcome includes "executed on recovery", not
+   * just re-notify (#12 review).
    */
   async function retryPendingConfidenceHold(session: Session): Promise<void> {
     const reactionKey = session.metadata[CONFIDENCE_HOLD_PENDING_KEY];
@@ -2018,7 +2048,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       clearPendingConfidenceHold(session, reactionKey);
       return;
     }
-    await withholdForConfidence(session, reactionKey, reactionConfig.action, reactionConfig);
+    await executeReaction(session, reactionKey, reactionConfig);
   }
 
   /** Execute a reaction for a session. */
@@ -2133,26 +2163,23 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // Execute the reaction action
     const action = reactionConfig.action ?? "notify";
 
-    // Confidence gate (#12), routed through the single withholdForConfidence
-    // chokepoint. Synthetic system sessions (no lifecycle) carry nothing to score.
-    // For DISPATCH_GATED_REACTIONS the per-poll dispatcher owns the escalation
-    // (its enriched review/CI content makes ONE actionable notification) and the
-    // latch — so here we only WITHHOLD the transition send below threshold, without
-    // notifying/latching, to avoid a generic escalation here plus a detailed one
-    // there.
-    const heldEscalation: ReactionResult = {
-      reactionType: reactionKey,
-      success: true,
-      action: "escalated",
-      escalated: true,
-      heldForConfidence: true,
-    };
+    // Confidence gate (#12): withholdForConfidence is the transition chokepoint —
+    // it guarantees a (generic) human escalation for a held action and drives the
+    // undelivered→retry outcome. The per-poll dispatchers (review/CI) additionally
+    // deliver the ENRICHED detail via withholdDispatchForConfidence, deduped by
+    // their own dispatch hash — so the transition escalation here is the guaranteed
+    // baseline even if a later detail fetch fails. Synthetic system sessions (no
+    // lifecycle) carry nothing to score.
     if ("lifecycle" in session) {
-      if (DISPATCH_GATED_REACTIONS.has(reactionKey)) {
-        if (evaluateConfidenceHold(session, action, reactionConfig)) return heldEscalation;
-      } else {
-        const hold = await withholdForConfidence(session, reactionKey, action, reactionConfig);
-        if (hold.withhold) return heldEscalation;
+      const hold = await withholdForConfidence(session, reactionKey, action, reactionConfig);
+      if (hold.withhold) {
+        return {
+          reactionType: reactionKey,
+          success: true,
+          action: "escalated",
+          escalated: true,
+          heldForConfidence: true,
+        };
       }
     }
 
@@ -2361,20 +2388,20 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   /**
-   * Resolve an agent decision exactly once: clear the sticky question/confidence
-   * as soon as the session leaves needs_input. The report state itself is only
-   * cleared by a later `ao report`, but lifecycle inference can move the session
-   * out without one — so without this a resolved decision would leak into a later,
-   * unrelated needs-input via a re-entry (#12 review). Once cleared,
-   * getActiveDecision returns null (no question) for that resolved report.
+   * Resolve an agent decision exactly once (Class A durable store). When a
+   * needs_decision report is no longer ACTIVE (isNeedsDecisionActive false — the
+   * agent left needs_input AND the report went stale), clear the WHOLE record —
+   * reported state, timestamp, question, confidence — so every stale/blocked check
+   * sees a consistent, resolved report and a later re-entry can't reuse it. A fresh
+   * decision (even on a pr_open/mergeable session) stays active and is untouched
+   * (#12 review).
    */
   function clearStaleDecisionContext(session: Session): void {
-    if (session.lifecycle.session.state === "needs_input") return;
-    const hasDecision =
-      !!session.metadata[AGENT_REPORT_METADATA_KEYS.QUESTION] ||
-      !!session.metadata[AGENT_REPORT_METADATA_KEYS.CONFIDENCE];
-    if (!hasDecision) return;
+    const report = readAgentReport(session.metadata);
+    if (report?.state !== "needs_decision" || isNeedsDecisionActive(session, report)) return;
     updateSessionMetadata(session, {
+      [AGENT_REPORT_METADATA_KEYS.STATE]: "",
+      [AGENT_REPORT_METADATA_KEYS.AT]: "",
       [AGENT_REPORT_METADATA_KEYS.QUESTION]: "",
       [AGENT_REPORT_METADATA_KEYS.CONFIDENCE]: "",
     });
@@ -2765,16 +2792,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             reviewSummaries,
           );
 
-          // Confidence gate at the dispatch site (Class B chokepoint) — the
-          // enriched comments are available here, so a low-confidence hold sends
-          // ONE actionable escalation (question + comments) to the human. Stamp
-          // only on delivery so an undelivered hold retries next poll (#12).
+          // Dispatch-site confidence gate (Class B chokepoint) — the enriched
+          // comments are available here, so a low-confidence hold sends ONE
+          // actionable escalation (question + comments) to the human. Stamp only on
+          // delivery so an undelivered hold retries next poll (#12).
           const hold =
             reactionConfig.action === "send-to-agent"
-              ? await withholdForConfidence(
+              ? await withholdDispatchForConfidence(
                   session,
                   humanReactionKey,
-                  "send-to-agent",
                   reactionConfig,
                   enrichedMessage,
                 )
@@ -2894,16 +2920,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           ) {
             const enrichedMessage = formatReviewCommentsMessage(automatedComments, "bot");
 
-            // Confidence gate at the dispatch site (Class B chokepoint): a
-            // low-confidence hold sends ONE escalation (question + comments) to the
-            // human; stamp/count the round only on delivery so an undelivered hold
-            // retries next poll (#12).
+            // Dispatch-site confidence gate (Class B chokepoint): a low-confidence
+            // hold sends ONE escalation (question + comments) to the human;
+            // stamp/count the round only on delivery so an undelivered hold retries
+            // next poll (#12).
             const hold =
               reactionConfig.action === "send-to-agent"
-                ? await withholdForConfidence(
+                ? await withholdDispatchForConfidence(
                     session,
                     automatedReactionKey,
-                    "send-to-agent",
                     reactionConfig,
                     enrichedMessage,
                   )
@@ -3728,10 +3753,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     const ciReactionKey = "ci-failed";
 
-    // Clear tracking when PR is closed/merged. The cumulative CI-failure signal is
-    // reset ONLY here (terminal) — never on CI recovery — so a later auto-action
-    // still scores the CI churn this PR went through (#12 review).
-    if (newStatus === "merged" || newStatus === "killed") {
+    // The cumulative CI-failure signal is reset ONLY at a TERMINAL PR (merged, or
+    // closed-unmerged) — never on CI recovery — so a later auto-action still scores
+    // the CI churn this PR went through, while a replacement PR opened in the same
+    // session starts clean (#12 review). A closed PR reaches here as newStatus
+    // idle/working with pr.state "closed", so gate on the PR state, not newStatus.
+    const prTerminal =
+      newStatus === "merged" ||
+      newStatus === "killed" ||
+      session.lifecycle.pr.state === "merged" ||
+      session.lifecycle.pr.state === "closed";
+    if (prTerminal) {
       clearReactionTracker(session.id, ciReactionKey);
       updateSessionMetadata(session, {
         lastCIFailureFingerprint: "",
@@ -3812,16 +3844,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     ) {
       const detailedMessage = await formatCIFailureMessage(scm, session.pr, failedChecks);
 
-      // Confidence gate at the dispatch site (Class B chokepoint): this direct
-      // dispatch is the only gate point for ci-failed (excluded from the transition
-      // gate), so the ONE escalation carries the confidence question + the detailed
-      // failed checks. Held → withhold from the agent; stamp only on delivery so an
-      // undelivered hold retries next poll (#12 review).
+      // Dispatch-site confidence gate (Class B chokepoint): the ONE escalation
+      // carries the confidence question + the detailed failed checks. Held →
+      // withhold from the agent; stamp only on delivery so an undelivered hold
+      // retries next poll (#12 review). The transition gate already delivered a
+      // generic escalation, so the human is covered even if this detail fetch fails.
       if (reactionConfig.action === "send-to-agent") {
-        const hold = await withholdForConfidence(
+        const hold = await withholdDispatchForConfidence(
           session,
           ciReactionKey,
-          "send-to-agent",
           reactionConfig,
           detailedMessage,
         );

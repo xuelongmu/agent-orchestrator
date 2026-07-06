@@ -173,6 +173,28 @@ describe("checkStaleReport", () => {
       expect(result).toBeNull();
     }
   });
+
+  // #12 Class A (#3): a RESOLVED needs_decision (stale + out of needs_input) is no
+  // longer exempt from stale-report handling, so a working agent gets flagged.
+  it("flags a resolved (stale, working) needs_decision as stale", () => {
+    const now = new Date();
+    const reportTime = new Date(now.getTime() - 45 * 60 * 1000); // 45 min old
+    const session = createMockSession(); // state === "working"
+    const report: AgentReport = { state: "needs_decision", timestamp: reportTime.toISOString() };
+
+    expect(checkStaleReport(session, report, now, config)?.trigger).toBe("stale_report");
+  });
+
+  // Still exempt while the decision is an ACTIVE block (parked in needs_input).
+  it("does not flag an active (needs_input) needs_decision as stale", () => {
+    const now = new Date();
+    const reportTime = new Date(now.getTime() - 45 * 60 * 1000);
+    const session = createMockSession();
+    session.lifecycle.session.state = "needs_input";
+    const report: AgentReport = { state: "needs_decision", timestamp: reportTime.toISOString() };
+
+    expect(checkStaleReport(session, report, now, config)).toBeNull();
+  });
 });
 
 describe("checkBlockedAgent", () => {
@@ -230,12 +252,29 @@ describe("checkBlockedAgent", () => {
     expect(result?.message).toContain("Drop the legacy column?");
   });
 
-  // #12 Class A invariant: a resolved decision (lifecycle inference moved the
-  // session out of needs_input) must NOT keep the trigger active, so
-  // auditAgentReports can reach the stale-report check.
-  it("does not treat a needs_decision report as blocked once out of needs_input", () => {
+  // #12 Class A invariant: a RESOLVED decision (agent left needs_input AND the
+  // report went stale) must NOT keep the trigger active, so auditAgentReports can
+  // reach the stale-report check.
+  it("does not treat a resolved (stale, out-of-needs_input) needs_decision as blocked", () => {
     const now = new Date();
+    const staleTs = new Date(now.getTime() - 30 * 60 * 1000).toISOString(); // 30 min old
     const session = createMockSession(); // state === "working"
+    const report: AgentReport = {
+      state: "needs_decision",
+      timestamp: staleTs,
+      confidence: 0.3,
+      question: "Drop the legacy column?",
+    };
+
+    expect(checkBlockedAgent(session, report, now, config)).toBeNull();
+  });
+
+  // #12 Class A invariant (#4): a FRESH needs_decision stays active even when
+  // PR-enrichment ordering leaves the derived state as pr_open/mergeable.
+  it("keeps a fresh needs_decision active on a non-needs_input (pr_open) session", () => {
+    const now = new Date();
+    const session = createMockSession();
+    session.lifecycle.session.state = "idle"; // e.g. derived from pr_open
     const report: AgentReport = {
       state: "needs_decision",
       timestamp: now.toISOString(),
@@ -243,7 +282,8 @@ describe("checkBlockedAgent", () => {
       question: "Drop the legacy column?",
     };
 
-    expect(checkBlockedAgent(session, report, now, config)).toBeNull();
+    const result = checkBlockedAgent(session, report, now, config);
+    expect(result?.trigger).toBe("agent_needs_input");
   });
 });
 
