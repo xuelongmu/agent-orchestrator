@@ -213,9 +213,10 @@ describe("checkBlockedAgent", () => {
     expect(result?.timeSinceReportMs).toBeGreaterThan(0);
   });
 
-  it("surfaces the confidence + question for a needs_decision report", () => {
+  it("surfaces the confidence + question for a needs_decision report in needs_input", () => {
     const now = new Date();
     const session = createMockSession();
+    session.lifecycle.session.state = "needs_input";
     const report: AgentReport = {
       state: "needs_decision",
       timestamp: now.toISOString(),
@@ -227,6 +228,22 @@ describe("checkBlockedAgent", () => {
     expect(result?.trigger).toBe("agent_needs_input");
     expect(result?.message).toContain("30%");
     expect(result?.message).toContain("Drop the legacy column?");
+  });
+
+  // #12 Class A invariant: a resolved decision (lifecycle inference moved the
+  // session out of needs_input) must NOT keep the trigger active, so
+  // auditAgentReports can reach the stale-report check.
+  it("does not treat a needs_decision report as blocked once out of needs_input", () => {
+    const now = new Date();
+    const session = createMockSession(); // state === "working"
+    const report: AgentReport = {
+      state: "needs_decision",
+      timestamp: now.toISOString(),
+      confidence: 0.3,
+      question: "Drop the legacy column?",
+    };
+
+    expect(checkBlockedAgent(session, report, now, config)).toBeNull();
   });
 });
 

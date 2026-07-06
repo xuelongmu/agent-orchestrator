@@ -6201,13 +6201,19 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     };
 
     await lm.check("app-1");
-    // Held from the agent, but surfaced to the human so nothing is lost.
+    // Held from the agent, but surfaced to the human as ONE actionable escalation:
+    // the confidence question plus the enriched review comments.
     expect(mockSessionManager.send).not.toHaveBeenCalled();
-    expect(notifier.notify).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: expect.stringContaining("need a human decision"),
-      }),
-    );
+    const escalation = vi
+      .mocked(notifier.notify)
+      .mock.calls.find((call) =>
+        String((call[0] as { message?: string }).message ?? "").includes(
+          "Proceed manually or intervene",
+        ),
+      );
+    expect(escalation).toBeDefined();
+    // The enriched bot comment travels with the escalation.
+    expect(String((escalation![0] as { message?: string }).message)).toContain("Potential issue");
   });
 
   // Round-7 finding (id 3521898192): the agent-stuck notify is no longer deferred,

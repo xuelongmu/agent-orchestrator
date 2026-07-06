@@ -170,7 +170,7 @@ export function checkStaleReport(
  * Check for blocked agent: agent reported blocked or needs_input state.
  */
 export function checkBlockedAgent(
-  _session: Session,
+  session: Session,
   report: AgentReport | null,
   now: Date,
   config: ReportWatcherConfig,
@@ -179,6 +179,18 @@ export function checkBlockedAgent(
 
   // If no report, nothing to check
   if (!report) return null;
+
+  // A needs_decision report is an active block ONLY while the session is still
+  // parked in needs_input. When lifecycle inference resolves the block (the agent
+  // resumes working) the reported state lingers, but it must NOT keep this trigger
+  // active — otherwise auditAgentReports never reaches the stale-report check. Gate
+  // on the current lifecycle state so a resolved decision falls through (#12).
+  if (
+    report.state === "needs_decision" &&
+    session.lifecycle?.session.state !== "needs_input"
+  ) {
+    return null;
+  }
 
   if (report.state === "needs_input" || report.state === "needs_decision") {
     const reportTime = Date.parse(report.timestamp);
