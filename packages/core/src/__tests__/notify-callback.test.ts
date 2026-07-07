@@ -16,6 +16,8 @@ import type { EventType, OrchestratorEvent } from "../types.js";
 import { NOTIFICATION_DATA_SCHEMA_VERSION } from "../notification-data.js";
 
 const SECRET = "test-secret-abc123";
+// A report-decision nonce is required to emit mutating buttons.
+const NONCE = "2026-07-07T00:00:00.000Z";
 
 function makePayload(overrides: Partial<NotifyCallbackPayload> = {}): NotifyCallbackPayload {
   return {
@@ -166,8 +168,8 @@ describe("getNotifyCallbackSecret", () => {
 });
 
 describe("buildNotifyActions", () => {
-  it("builds Approve/Deny/Nudge/Kill for a decision event", () => {
-    const actions = buildNotifyActions(makeEvent(), { secret: SECRET });
+  it("builds Approve/Deny/Nudge/Kill for a report-backed decision event", () => {
+    const actions = buildNotifyActions(makeEvent(), { secret: SECRET, nonce: NONCE });
     expect(actions.map((a) => a.label)).toEqual(["Approve", "Deny", "Nudge", "Kill"]);
     for (const action of actions) {
       expect(action.callbackEndpoint).toMatch(/^\/api\/notify-callback\//);
@@ -176,10 +178,15 @@ describe("buildNotifyActions", () => {
     }
   });
 
+  it("emits no mutating buttons for a needs_input without a report nonce", () => {
+    // A bare detected prompt (no agent decision report) has no stable identity.
+    expect(buildNotifyActions(makeEvent(), { secret: SECRET })).toEqual([]);
+  });
+
   it("encodes the session, project, and action in each token", () => {
     const actions = buildNotifyActions(
       makeEvent({ sessionId: "sess-9", projectId: "proj-9" }),
-      { secret: SECRET },
+      { secret: SECRET, nonce: NONCE },
     );
     const approve = actions.find((a) => a.label === "Approve")!;
     const payload = verifyCallbackToken(
@@ -230,7 +237,7 @@ describe("buildNotifyActions", () => {
         },
       },
     });
-    const actions = buildNotifyActions(event, { secret: SECRET });
+    const actions = buildNotifyActions(event, { secret: SECRET, nonce: NONCE });
     expect(actions.map((a) => a.label)).toEqual(["Approve", "Deny", "Nudge", "Kill", "View PR"]);
   });
 
@@ -242,16 +249,6 @@ describe("buildNotifyActions", () => {
       SECRET,
     );
     expect(payload?.nonce).toBe("trigger:abc:123");
-  });
-
-  it("omits the nonce field when none is provided", () => {
-    const actions = buildNotifyActions(makeEvent(), { secret: SECRET });
-    const approve = actions.find((a) => a.label === "Approve")!;
-    const payload = verifyCallbackToken(
-      approve.callbackEndpoint!.replace("/api/notify-callback/", ""),
-      SECRET,
-    );
-    expect(payload?.nonce).toBeUndefined();
   });
 
   it("returns no actions for non-decision events", () => {
@@ -269,7 +266,7 @@ describe("buildNotifyActions", () => {
         subject: { session: { id: "ao-5", projectId: "ao" } },
       },
     });
-    const actions = buildNotifyActions(event, { secret: SECRET });
+    const actions = buildNotifyActions(event, { secret: SECRET, nonce: NONCE });
     expect(actions.map((a) => a.label)).toEqual(["Approve", "Deny", "Nudge", "Kill"]);
   });
 
@@ -287,7 +284,7 @@ describe("buildNotifyActions", () => {
 
   it("respects a custom ttl", () => {
     const now = 1_000_000;
-    const actions = buildNotifyActions(makeEvent(), { secret: SECRET, ttlMs: 5_000, now });
+    const actions = buildNotifyActions(makeEvent(), { secret: SECRET, nonce: NONCE, ttlMs: 5_000, now });
     const token = actions[0].callbackEndpoint!.replace("/api/notify-callback/", "");
     expect(verifyCallbackToken(token, SECRET, now + 4_999)).not.toBeNull();
     expect(verifyCallbackToken(token, SECRET, now + 5_001)).toBeNull();

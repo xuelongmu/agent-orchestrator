@@ -19,6 +19,9 @@ function reportMeta(atIso: string, state = "needs_input"): Record<string, string
 }
 
 const SECRET = "route-test-secret";
+// Default decision instant: a report-backed needs_input at this timestamp, with
+// the token's nonce bound to it, is the "decision still pending & matching" case.
+const DECISION_AT = "2026-07-07T00:00:00.000Z";
 
 // Record activity events without touching the real SQLite layer.
 const recordActivityEvent = vi.fn();
@@ -49,7 +52,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     projectId: "ao",
     status: "working",
     activity: "waiting_input",
-    metadata: {},
+    metadata: reportMeta(DECISION_AT),
     ...overrides,
   } as unknown as Session;
 }
@@ -84,7 +87,7 @@ function makeRequest(): Request {
 
 function token(action: "approve" | "deny" | "nudge" | "kill", overrides = {}) {
   return signCallbackToken(
-    { sessionId: "ao-5", projectId: "ao", action, exp: Date.now() + 60_000, ...overrides },
+    { sessionId: "ao-5", projectId: "ao", action, exp: Date.now() + 60_000, nonce: DECISION_AT, ...overrides },
     SECRET,
   );
 }
@@ -210,6 +213,15 @@ describe("GET /api/notify-callback/[token]", () => {
     const res = await callGet(token("approve", { nonce: "2026-07-07T00:00:00.000Z" }));
     expect(res.status).toBe(200);
     expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+  });
+
+  it("rejects when the session no longer has a decision report (409)", async () => {
+    // The decision was resolved (report cleared / moved to a non-decision state),
+    // so there is no identity to match even though activity is still waiting.
+    get.mockResolvedValueOnce(makeSession({ metadata: reportMeta(DECISION_AT, "working") }));
+    const res = await callGet(token("approve"));
+    expect(res.status).toBe(409);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("rejects a blocked (error/stuck) session — not a human prompt (409)", async () => {

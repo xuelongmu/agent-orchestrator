@@ -197,14 +197,17 @@ export interface BuildNotifyActionsOptions {
 /**
  * Build the notification buttons for a decision event.
  *
- * Approve / Deny / Nudge / Kill are attached only for `session.needs_input`,
- * the one event that represents a genuine pending human decision the callback
- * can resolve. Each becomes a {@link NotifyAction} whose `callbackEndpoint` is a
- * relative, signed path (`/api/notify-callback/<token>`); action-capable
- * notifiers prepend their own public base URL. `review.changes_requested` and
- * `merge.ready` get only a `View PR` link (no session-mutating buttons, since
- * the session isn't awaiting a decision those buttons would answer). A `View PR`
- * url button is appended for any decision event that carries a PR URL.
+ * Approve / Deny / Nudge / Kill are attached only for a `session.needs_input`
+ * that is backed by an agent decision report — i.e. `options.nonce` is set to
+ * that report's timestamp. That report is a stable, per-decision identity the
+ * callback route re-checks, so an old link can't answer a later, different
+ * decision. A needs_input with no report identity (e.g. a bare detected prompt)
+ * gets no mutating buttons, because there'd be nothing reliable to bind them to.
+ * Each button's `callbackEndpoint` is a relative, signed path
+ * (`/api/notify-callback/<token>`); action-capable notifiers prepend their own
+ * public base URL. `review.changes_requested` and `merge.ready` get only a
+ * `View PR` link. A `View PR` url button is appended for any decision event that
+ * carries a PR URL.
  *
  * Returns `[]` for non-decision events, so callers can pass any event through.
  */
@@ -220,16 +223,10 @@ export function buildNotifyActions(
 
   const actions: NotifyAction[] = [];
 
-  if (decisionType === "session.needs_input") {
+  if (decisionType === "session.needs_input" && options.nonce !== undefined) {
     for (const action of NOTIFY_CALLBACK_ACTIONS) {
       const token = signCallbackToken(
-        {
-          sessionId: event.sessionId,
-          projectId: event.projectId,
-          action,
-          exp,
-          ...(options.nonce !== undefined ? { nonce: options.nonce } : {}),
-        },
+        { sessionId: event.sessionId, projectId: event.projectId, action, exp, nonce: options.nonce },
         options.secret,
       );
       actions.push({

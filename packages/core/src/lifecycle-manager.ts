@@ -4022,21 +4022,24 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       config.defaults.notifiers;
 
     // Build notification actions for decision events when a shared callback
-    // secret is configured (opt-in via env). buildNotifyActions resolves the
-    // decision type from the notification data's semanticType, so a reaction-
-    // wrapped needs_input (agent-needs-input, sent as `reaction.triggered`) still
-    // gets Approve/Deny/Nudge/Kill buttons; review/merge decisions get a View PR
-    // link; non-decision events yield no actions and fall back to plain notify.
-    // Bind the tokens to the agent report's instant (each `ao report` carries a
-    // fresh timestamp) so a token can't answer a later, different decision. The
-    // report is written before this notification fires — unlike the report-
-    // watcher trigger, which a later audit pass stamps — so a fresh callback is
-    // never mis-rejected. (#13)
+    // secret is configured (opt-in via env). Mutating Approve/Deny/Nudge/Kill
+    // buttons are emitted only for a needs_input that is backed by an agent
+    // decision report (`needs_input`/`needs_decision`); the report's timestamp is
+    // a stable per-decision identity bound into each token so a link can't answer
+    // a later, different decision. The report is written by `ao report` before
+    // this notification fires (unlike the report-watcher trigger, which a later
+    // audit pass stamps), so a fresh callback is never mis-rejected. review/merge
+    // decisions get a View PR link; non-decision events fall back to plain
+    // notify. (#13)
     const callbackSecret = getNotifyCallbackSecret();
     let actions: NotifyAction[] = [];
     if (callbackSecret && isNotifyActionEvent(resolveDecisionEventType(eventWithPriority))) {
       const subject = await sessionManager.get(eventWithPriority.sessionId);
-      const nonce = readAgentReport(subject?.metadata)?.timestamp;
+      const report = readAgentReport(subject?.metadata);
+      const nonce =
+        report?.state === "needs_input" || report?.state === "needs_decision"
+          ? report.timestamp
+          : undefined;
       actions = buildNotifyActions(eventWithPriority, { secret: callbackSecret, nonce });
     }
 

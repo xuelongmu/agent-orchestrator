@@ -151,12 +151,17 @@ export async function GET(
       (session.lifecycle?.session.state === "needs_input" ||
         session.activity === ACTIVITY_STATE.WAITING_INPUT);
 
-    // The token is bound to the decision instance it was minted for (the agent
-    // report's timestamp at mint time). If the session has since reported a
-    // different decision, the identity no longer matches — so an old token can't
-    // answer a newer, unrelated decision. Both-absent counts as a match.
-    const currentIdentity = readAgentReport(session.metadata)?.timestamp ?? "";
-    const decisionMatches = (payload.nonce ?? "") === currentIdentity;
+    // The token is bound to the decision instance it was minted for: the agent
+    // decision report's timestamp. Only a current `needs_input`/`needs_decision`
+    // report is a valid identity, so a resolved/superseded decision (or a bare
+    // detected prompt with a stale non-decision report) no longer matches. Tokens
+    // are always minted with a nonce, so an absent nonce never matches.
+    const report = readAgentReport(session.metadata);
+    const currentIdentity =
+      report?.state === "needs_input" || report?.state === "needs_decision"
+        ? report.timestamp
+        : "";
+    const decisionMatches = payload.nonce !== undefined && payload.nonce === currentIdentity;
 
     if (!decisionPending || !decisionMatches) {
       recordApiObservation({

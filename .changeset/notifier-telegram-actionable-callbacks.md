@@ -17,10 +17,10 @@ resolve them from the notification — closing the loop back into AO (#13).
   `callbackBaseUrl` (your dashboard's public URL).
 - Core now builds those actions for decision events and routes them through
   `notifyWithActions` when a notifier supports it. Approve/Deny/Nudge/Kill are
-  attached to `session.needs_input` (the genuine pending decision the callback
-  resolves); `review.changes_requested` and `merge.ready` get a View PR link.
-  Each button is an HMAC-signed, expiring token bound to the session's current
-  decision instance and minted with the shared `AO_NOTIFY_CALLBACK_SECRET`;
+  attached to a report-backed `session.needs_input` (the genuine pending decision
+  the callback resolves); `review.changes_requested` and `merge.ready` get a View
+  PR link. Each button is an HMAC-signed, expiring token bound to the decision
+  report's timestamp and minted with the shared `AO_NOTIFY_CALLBACK_SECRET`;
   without the secret set, notifications behave exactly as before (opt-in). New
   core exports: `buildNotifyActions`, `signCallbackToken`, `verifyCallbackToken`,
   `getNotifyCallbackSecret`, `isNotifyActionEvent`, `resolveDecisionEventType`,
