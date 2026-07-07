@@ -33,6 +33,7 @@ import {
   type Agent,
   type SCM,
   type Notifier,
+  type NotifyAction,
   type Session,
   type CanonicalSessionLifecycle,
   type EventPriority,
@@ -93,7 +94,12 @@ import {
 import { createCorrelationId, createProjectObserver } from "./observability.js";
 import { resolveNotifierTarget } from "./notifier-resolution.js";
 import { recordNotificationDelivery } from "./notification-observability.js";
-import { buildNotifyActions, getNotifyCallbackSecret } from "./notify-callback.js";
+import {
+  buildNotifyActions,
+  getNotifyCallbackSecret,
+  isNotifyActionEvent,
+  resolveDecisionEventType,
+} from "./notify-callback.js";
 import { resolveSessionRole } from "./agent-selection.js";
 import {
   DETECTING_MAX_ATTEMPTS,
@@ -4015,16 +4021,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       config.notificationRouting[priority] ??
       config.defaults.notifiers;
 
-    // Build actionable Approve/Deny/Nudge/Kill buttons for decision events when
-    // a shared callback secret is configured (opt-in via env). buildNotifyActions
-    // resolves the decision type from the notification data's semanticType, so
-    // reaction-wrapped decisions (agent-needs-input / approved-and-green, sent as
-    // `reaction.triggered`) get buttons too; non-decision events yield no actions
-    // and fall back to plain notify — preserving existing behavior. (#13)
+    // Build notification actions for decision events when a shared callback
+    // secret is configured (opt-in via env). buildNotifyActions resolves the
+    // decision type from the notification data's semanticType, so a reaction-
+    // wrapped needs_input (agent-needs-input, sent as `reaction.triggered`) still
+    // gets Approve/Deny/Nudge/Kill buttons; review/merge decisions get a View PR
+    // link; non-decision events yield no actions and fall back to plain notify.
+    // Bind the tokens to the session's current decision-instance identity
+    // (ACTIVE_TRIGGER) so a token can't answer a later, different decision. (#13)
     const callbackSecret = getNotifyCallbackSecret();
-    const actions = callbackSecret
-      ? buildNotifyActions(eventWithPriority, { secret: callbackSecret })
-      : [];
+    let actions: NotifyAction[] = [];
+    if (callbackSecret && isNotifyActionEvent(resolveDecisionEventType(eventWithPriority))) {
+      const subject = await sessionManager.get(eventWithPriority.sessionId);
+      const nonce =
+        subject?.metadata[REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER] || undefined;
+      actions = buildNotifyActions(eventWithPriority, { secret: callbackSecret, nonce });
+    }
 
     let delivered = false;
     for (const name of notifierNames) {

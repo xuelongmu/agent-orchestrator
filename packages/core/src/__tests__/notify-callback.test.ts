@@ -48,6 +48,12 @@ describe("callback token signing", () => {
     expect(verifyCallbackToken(token, SECRET)).toEqual(payload);
   });
 
+  it("round-trips an optional nonce", () => {
+    const payload = makePayload({ nonce: "agent_needs_input:needs_decision:2026-07-07T00:00:00Z" });
+    const token = signCallbackToken(payload, SECRET);
+    expect(verifyCallbackToken(token, SECRET)).toEqual(payload);
+  });
+
   it("rejects a token signed with a different secret", () => {
     const token = signCallbackToken(makePayload(), SECRET);
     expect(verifyCallbackToken(token, "other-secret")).toBeNull();
@@ -183,7 +189,7 @@ describe("buildNotifyActions", () => {
     expect(payload).toMatchObject({ sessionId: "sess-9", projectId: "proj-9", action: "approve" });
   });
 
-  it("appends a View PR url button when a PR url is present", () => {
+  it("gives review.changes_requested only a View PR link, no action buttons", () => {
     const event = makeEvent({
       type: "review.changes_requested",
       data: {
@@ -195,8 +201,57 @@ describe("buildNotifyActions", () => {
       },
     });
     const actions = buildNotifyActions(event, { secret: SECRET });
-    const viewPr = actions.at(-1)!;
-    expect(viewPr).toEqual({ label: "View PR", url: "https://github.com/acme/x/pull/7" });
+    expect(actions).toEqual([{ label: "View PR", url: "https://github.com/acme/x/pull/7" }]);
+  });
+
+  it("gives merge.ready only a View PR link, no action buttons", () => {
+    const event = makeEvent({
+      type: "merge.ready",
+      data: {
+        schemaVersion: NOTIFICATION_DATA_SCHEMA_VERSION,
+        subject: {
+          session: { id: "my-app-1", projectId: "my-app" },
+          pr: { number: 7, url: "https://github.com/acme/x/pull/7" },
+        },
+      },
+    });
+    expect(buildNotifyActions(event, { secret: SECRET })).toEqual([
+      { label: "View PR", url: "https://github.com/acme/x/pull/7" },
+    ]);
+  });
+
+  it("appends a View PR link after the action buttons for needs_input with a PR", () => {
+    const event = makeEvent({
+      data: {
+        schemaVersion: NOTIFICATION_DATA_SCHEMA_VERSION,
+        subject: {
+          session: { id: "my-app-1", projectId: "my-app" },
+          pr: { number: 7, url: "https://github.com/acme/x/pull/7" },
+        },
+      },
+    });
+    const actions = buildNotifyActions(event, { secret: SECRET });
+    expect(actions.map((a) => a.label)).toEqual(["Approve", "Deny", "Nudge", "Kill", "View PR"]);
+  });
+
+  it("binds the token to the nonce when provided", () => {
+    const actions = buildNotifyActions(makeEvent(), { secret: SECRET, nonce: "trigger:abc:123" });
+    const approve = actions.find((a) => a.label === "Approve")!;
+    const payload = verifyCallbackToken(
+      approve.callbackEndpoint!.replace("/api/notify-callback/", ""),
+      SECRET,
+    );
+    expect(payload?.nonce).toBe("trigger:abc:123");
+  });
+
+  it("omits the nonce field when none is provided", () => {
+    const actions = buildNotifyActions(makeEvent(), { secret: SECRET });
+    const approve = actions.find((a) => a.label === "Approve")!;
+    const payload = verifyCallbackToken(
+      approve.callbackEndpoint!.replace("/api/notify-callback/", ""),
+      SECRET,
+    );
+    expect(payload?.nonce).toBeUndefined();
   });
 
   it("returns no actions for non-decision events", () => {

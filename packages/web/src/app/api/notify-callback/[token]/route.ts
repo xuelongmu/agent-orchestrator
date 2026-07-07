@@ -3,6 +3,7 @@ import { getServices } from "@/lib/services";
 import { validateIdentifier } from "@/lib/validation";
 import {
   ACTIVITY_STATE,
+  REPORT_WATCHER_METADATA_KEYS,
   SessionNotFoundError,
   getNotifyCallbackSecret,
   isTerminalSession,
@@ -137,7 +138,16 @@ export async function GET(
       (session.lifecycle?.session.state === "needs_input" ||
         session.activity === ACTIVITY_STATE.WAITING_INPUT ||
         session.activity === ACTIVITY_STATE.BLOCKED);
-    if (!decisionPending) {
+
+    // The token is bound to the decision instance it was minted for (the
+    // session's ACTIVE_TRIGGER at mint time). If the session has since resolved
+    // that decision and activated a different one, the identity no longer
+    // matches — so an old token can't answer a newer, unrelated decision.
+    const currentTrigger =
+      session.metadata[REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER] ?? "";
+    const decisionMatches = (payload.nonce ?? "") === currentTrigger;
+
+    if (!decisionPending || !decisionMatches) {
       recordApiObservation({
         config,
         method: "GET",
@@ -148,8 +158,8 @@ export async function GET(
         statusCode: 409,
         projectId: resolvedProjectId,
         sessionId,
-        reason: "stale callback action",
-        data: { action, activity: session.activity, status: session.status },
+        reason: decisionPending ? "callback decision mismatch" : "stale callback action",
+        data: { action, activity: session.activity, status: session.status, decisionMatches },
       });
       recordActivityEvent({
         projectId: resolvedProjectId,
@@ -158,7 +168,7 @@ export async function GET(
         kind: "api.notify_callback.stale",
         level: "warn",
         summary: `notification action "${action}" ignored as stale for session ${sessionId}`,
-        data: { action, activity: session.activity, status: session.status },
+        data: { action, activity: session.activity, status: session.status, decisionMatches },
       });
       return htmlResponse(
         409,

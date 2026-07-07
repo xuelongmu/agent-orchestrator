@@ -3,10 +3,13 @@ import {
   signCallbackToken,
   SessionNotFoundError,
   NOTIFY_CALLBACK_MESSAGES,
+  REPORT_WATCHER_METADATA_KEYS,
   type Session,
   type SessionManager,
   type OrchestratorConfig,
 } from "@aoagents/ao-core";
+
+const ACTIVE_TRIGGER = REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER;
 
 const SECRET = "route-test-secret";
 
@@ -39,6 +42,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     projectId: "ao",
     status: "working",
     activity: "waiting_input",
+    metadata: {},
     ...overrides,
   } as unknown as Session;
 }
@@ -178,6 +182,24 @@ describe("GET /api/notify-callback/[token]", () => {
   it("applies when the canonical state is needs_input even if activity is idle", async () => {
     get.mockResolvedValueOnce(makeSession({ activity: "idle", lifecycle: makeLifecycle("needs_input") }));
     const res = await callGet(token("approve"));
+    expect(res.status).toBe(200);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+  });
+
+  it("rejects when the decision nonce no longer matches the session (409)", async () => {
+    // Token minted for decision A; session has since activated decision B.
+    get.mockResolvedValueOnce(makeSession({ metadata: { [ACTIVE_TRIGGER]: "trigger:B" } }));
+    const res = await callGet(token("approve", { nonce: "trigger:A" }));
+    expect(res.status).toBe(409);
+    expect(send).not.toHaveBeenCalled();
+    expect(recordActivityEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "api.notify_callback.stale" }),
+    );
+  });
+
+  it("applies when the decision nonce matches the session's active trigger", async () => {
+    get.mockResolvedValueOnce(makeSession({ metadata: { [ACTIVE_TRIGGER]: "trigger:A" } }));
+    const res = await callGet(token("approve", { nonce: "trigger:A" }));
     expect(res.status).toBe(200);
     expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
   });

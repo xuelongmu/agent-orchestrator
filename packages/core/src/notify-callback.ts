@@ -66,6 +66,15 @@ export interface NotifyCallbackPayload {
   action: NotifyCallbackAction;
   /** Expiry, epoch milliseconds. */
   exp: number;
+  /**
+   * Decision-instance identity at mint time (the session's report-watcher
+   * ACTIVE_TRIGGER, which folds in the decision's report timestamp). The
+   * callback route requires this to still match the session's current identity,
+   * so a token minted for one decision can't answer a later, different one.
+   * Absent for decisions with no report-driven trigger (e.g. a permission
+   * prompt); the callback then requires the current identity to be absent too.
+   */
+  nonce?: string;
 }
 
 export function isNotifyCallbackAction(value: unknown): value is NotifyCallbackAction {
@@ -155,7 +164,8 @@ export function verifyCallbackToken(
     typeof candidate.sessionId !== "string" ||
     typeof candidate.projectId !== "string" ||
     typeof candidate.exp !== "number" ||
-    !isNotifyCallbackAction(candidate.action)
+    !isNotifyCallbackAction(candidate.action) ||
+    (candidate.nonce !== undefined && typeof candidate.nonce !== "string")
   ) {
     return null;
   }
@@ -166,12 +176,18 @@ export function verifyCallbackToken(
     projectId: candidate.projectId,
     action: candidate.action,
     exp: candidate.exp,
+    ...(typeof candidate.nonce === "string" ? { nonce: candidate.nonce } : {}),
   };
 }
 
 export interface BuildNotifyActionsOptions {
   /** Shared HMAC secret. Required — without it no callback actions are built. */
   secret: string;
+  /**
+   * Decision-instance identity to bind the tokens to (the session's current
+   * ACTIVE_TRIGGER). Persisted into each token as its {@link NotifyCallbackPayload.nonce}.
+   */
+  nonce?: string;
   /** Token lifetime in ms. Defaults to {@link NOTIFY_CALLBACK_DEFAULT_TTL_MS}. */
   ttlMs?: number;
   /** Injectable clock for tests. */
@@ -179,11 +195,16 @@ export interface BuildNotifyActionsOptions {
 }
 
 /**
- * Build the actionable buttons for a decision event. Each of Approve / Deny /
- * Nudge / Kill becomes a {@link NotifyAction} whose `callbackEndpoint` is a
- * relative, signed path (`/api/notify-callback/<token>`). Action-capable
- * notifiers prepend their own public base URL to form the tappable link. A
- * `View PR` url button is appended when the event carries a PR URL.
+ * Build the notification buttons for a decision event.
+ *
+ * Approve / Deny / Nudge / Kill are attached only for `session.needs_input`,
+ * the one event that represents a genuine pending human decision the callback
+ * can resolve. Each becomes a {@link NotifyAction} whose `callbackEndpoint` is a
+ * relative, signed path (`/api/notify-callback/<token>`); action-capable
+ * notifiers prepend their own public base URL. `review.changes_requested` and
+ * `merge.ready` get only a `View PR` link (no session-mutating buttons, since
+ * the session isn't awaiting a decision those buttons would answer). A `View PR`
+ * url button is appended for any decision event that carries a PR URL.
  *
  * Returns `[]` for non-decision events, so callers can pass any event through.
  */
@@ -191,21 +212,32 @@ export function buildNotifyActions(
   event: OrchestratorEvent,
   options: BuildNotifyActionsOptions,
 ): NotifyAction[] {
-  if (!isNotifyActionEvent(resolveDecisionEventType(event))) return [];
+  const decisionType = resolveDecisionEventType(event);
+  if (!isNotifyActionEvent(decisionType)) return [];
 
   const now = options.now ?? Date.now();
   const exp = now + (options.ttlMs ?? NOTIFY_CALLBACK_DEFAULT_TTL_MS);
 
-  const actions: NotifyAction[] = NOTIFY_CALLBACK_ACTIONS.map((action) => {
-    const token = signCallbackToken(
-      { sessionId: event.sessionId, projectId: event.projectId, action, exp },
-      options.secret,
-    );
-    return {
-      label: NOTIFY_CALLBACK_LABELS[action],
-      callbackEndpoint: `/api/notify-callback/${token}`,
-    };
-  });
+  const actions: NotifyAction[] = [];
+
+  if (decisionType === "session.needs_input") {
+    for (const action of NOTIFY_CALLBACK_ACTIONS) {
+      const token = signCallbackToken(
+        {
+          sessionId: event.sessionId,
+          projectId: event.projectId,
+          action,
+          exp,
+          ...(options.nonce !== undefined ? { nonce: options.nonce } : {}),
+        },
+        options.secret,
+      );
+      actions.push({
+        label: NOTIFY_CALLBACK_LABELS[action],
+        callbackEndpoint: `/api/notify-callback/${token}`,
+      });
+    }
+  }
 
   const prUrl = getNotificationDataV3(event.data)?.subject.pr?.url;
   if (prUrl) actions.push({ label: "View PR", url: prUrl });
