@@ -3,10 +3,10 @@ import { getServices } from "@/lib/services";
 import { validateIdentifier } from "@/lib/validation";
 import {
   ACTIVITY_STATE,
-  REPORT_WATCHER_METADATA_KEYS,
   SessionNotFoundError,
   getNotifyCallbackSecret,
   isTerminalSession,
+  readAgentReport,
   verifyCallbackToken,
   NOTIFY_CALLBACK_MESSAGES,
   recordActivityEvent,
@@ -116,11 +116,9 @@ export async function GET(
     // acting. A signed link stays valid for its TTL, so a human could tap an
     // older notification after they already answered and the agent resumed —
     // applying a stale Approve/Deny/Nudge would inject an unrelated instruction,
-    // and a stale Kill would terminate resumed work. The buttons answer a
-    // pending human decision, so require the session to be non-terminal AND
-    // still awaiting input: canonical `needs_input`, or a live waiting_input/
-    // blocked prompt. Once the agent has moved back to ready/idle/working, the
-    // decision has moved on. (#13, review)
+    // and a stale Kill would terminate resumed work. The checks below require the
+    // right project, a still-pending decision, and a matching decision instance.
+    // (#13, review)
     const session = await sessionManager.get(sessionId);
     const resolvedProjectId =
       session?.projectId ?? resolveProjectIdForSessionId(config, sessionId) ?? projectId;
@@ -133,19 +131,32 @@ export async function GET(
       );
     }
 
+    // Session lookups scan every project and return the first id match, so a
+    // token minted for project B's session could otherwise act on a same-id
+    // session in project A. Require the resolved session to belong to the
+    // project the token was signed for. (#13, review)
+    if (session.projectId !== projectId) {
+      return htmlResponse(
+        404,
+        "Session not found",
+        "That session no longer exists — it may have already finished or been cleaned up.",
+      );
+    }
+
+    // The buttons answer a pending human decision, so require the session to be
+    // non-terminal AND still awaiting input. `blocked` is an error/stuck state,
+    // not a human prompt, so it does not count.
     const decisionPending =
       !isTerminalSession(session) &&
       (session.lifecycle?.session.state === "needs_input" ||
-        session.activity === ACTIVITY_STATE.WAITING_INPUT ||
-        session.activity === ACTIVITY_STATE.BLOCKED);
+        session.activity === ACTIVITY_STATE.WAITING_INPUT);
 
-    // The token is bound to the decision instance it was minted for (the
-    // session's ACTIVE_TRIGGER at mint time). If the session has since resolved
-    // that decision and activated a different one, the identity no longer
-    // matches — so an old token can't answer a newer, unrelated decision.
-    const currentTrigger =
-      session.metadata[REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER] ?? "";
-    const decisionMatches = (payload.nonce ?? "") === currentTrigger;
+    // The token is bound to the decision instance it was minted for (the agent
+    // report's timestamp at mint time). If the session has since reported a
+    // different decision, the identity no longer matches — so an old token can't
+    // answer a newer, unrelated decision. Both-absent counts as a match.
+    const currentIdentity = readAgentReport(session.metadata)?.timestamp ?? "";
+    const decisionMatches = (payload.nonce ?? "") === currentIdentity;
 
     if (!decisionPending || !decisionMatches) {
       recordApiObservation({

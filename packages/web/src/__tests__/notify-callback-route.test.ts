@@ -3,13 +3,20 @@ import {
   signCallbackToken,
   SessionNotFoundError,
   NOTIFY_CALLBACK_MESSAGES,
-  REPORT_WATCHER_METADATA_KEYS,
+  AGENT_REPORT_METADATA_KEYS,
   type Session,
   type SessionManager,
   type OrchestratorConfig,
 } from "@aoagents/ao-core";
 
-const ACTIVE_TRIGGER = REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER;
+// Build session metadata carrying an agent report, whose timestamp is the
+// decision-instance identity the callback nonce is checked against.
+function reportMeta(atIso: string, state = "needs_input"): Record<string, string> {
+  return {
+    [AGENT_REPORT_METADATA_KEYS.STATE]: state,
+    [AGENT_REPORT_METADATA_KEYS.AT]: atIso,
+  };
+}
 
 const SECRET = "route-test-secret";
 
@@ -187,9 +194,10 @@ describe("GET /api/notify-callback/[token]", () => {
   });
 
   it("rejects when the decision nonce no longer matches the session (409)", async () => {
-    // Token minted for decision A; session has since activated decision B.
-    get.mockResolvedValueOnce(makeSession({ metadata: { [ACTIVE_TRIGGER]: "trigger:B" } }));
-    const res = await callGet(token("approve", { nonce: "trigger:A" }));
+    // Token minted for the decision reported at A; session has since reported a
+    // newer decision at B.
+    get.mockResolvedValueOnce(makeSession({ metadata: reportMeta("2026-07-08T00:00:00.000Z") }));
+    const res = await callGet(token("approve", { nonce: "2026-07-07T00:00:00.000Z" }));
     expect(res.status).toBe(409);
     expect(send).not.toHaveBeenCalled();
     expect(recordActivityEvent).toHaveBeenCalledWith(
@@ -197,11 +205,27 @@ describe("GET /api/notify-callback/[token]", () => {
     );
   });
 
-  it("applies when the decision nonce matches the session's active trigger", async () => {
-    get.mockResolvedValueOnce(makeSession({ metadata: { [ACTIVE_TRIGGER]: "trigger:A" } }));
-    const res = await callGet(token("approve", { nonce: "trigger:A" }));
+  it("applies when the decision nonce matches the reported decision instant", async () => {
+    get.mockResolvedValueOnce(makeSession({ metadata: reportMeta("2026-07-07T00:00:00.000Z") }));
+    const res = await callGet(token("approve", { nonce: "2026-07-07T00:00:00.000Z" }));
     expect(res.status).toBe(200);
     expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+  });
+
+  it("rejects a blocked (error/stuck) session — not a human prompt (409)", async () => {
+    get.mockResolvedValueOnce(makeSession({ activity: "blocked" }));
+    const res = await callGet(token("approve"));
+    expect(res.status).toBe(409);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("rejects a cross-project session id collision (404)", async () => {
+    // Token signed for project "ao"; the unscoped lookup resolved a same-id
+    // session in a different project.
+    get.mockResolvedValueOnce(makeSession({ projectId: "other-project" }));
+    const res = await callGet(token("approve"));
+    expect(res.status).toBe(404);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("returns 400 for a malformed session id in a validly-signed token", async () => {

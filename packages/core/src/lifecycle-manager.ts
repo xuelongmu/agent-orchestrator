@@ -4027,14 +4027,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // wrapped needs_input (agent-needs-input, sent as `reaction.triggered`) still
     // gets Approve/Deny/Nudge/Kill buttons; review/merge decisions get a View PR
     // link; non-decision events yield no actions and fall back to plain notify.
-    // Bind the tokens to the session's current decision-instance identity
-    // (ACTIVE_TRIGGER) so a token can't answer a later, different decision. (#13)
+    // Bind the tokens to the agent report's instant (each `ao report` carries a
+    // fresh timestamp) so a token can't answer a later, different decision. The
+    // report is written before this notification fires — unlike the report-
+    // watcher trigger, which a later audit pass stamps — so a fresh callback is
+    // never mis-rejected. (#13)
     const callbackSecret = getNotifyCallbackSecret();
     let actions: NotifyAction[] = [];
     if (callbackSecret && isNotifyActionEvent(resolveDecisionEventType(eventWithPriority))) {
       const subject = await sessionManager.get(eventWithPriority.sessionId);
-      const nonce =
-        subject?.metadata[REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER] || undefined;
+      const nonce = readAgentReport(subject?.metadata)?.timestamp;
       actions = buildNotifyActions(eventWithPriority, { secret: callbackSecret, nonce });
     }
 
