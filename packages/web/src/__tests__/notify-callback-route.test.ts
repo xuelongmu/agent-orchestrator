@@ -43,6 +43,16 @@ function makeSession(overrides: Partial<Session> = {}): Session {
   } as unknown as Session;
 }
 
+// isTerminalSession reads lifecycle.session/pr/runtime.state, so all three
+// branches must exist. Defaults are non-terminal.
+function makeLifecycle(sessionState: string): Session["lifecycle"] {
+  return {
+    session: { state: sessionState },
+    pr: { state: "none" },
+    runtime: { state: "alive" },
+  } as unknown as Session["lifecycle"];
+}
+
 const send = vi.fn(async () => {});
 const kill = vi.fn(async () => {});
 const get = vi.fn(async () => makeSession());
@@ -155,6 +165,21 @@ describe("GET /api/notify-callback/[token]", () => {
     const res = await callGet(token("kill"));
     expect(res.status).toBe(409);
     expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("rejects when the human already answered and the agent went back to idle (409)", async () => {
+    // Codex scenario: link tapped later in its TTL after the decision resolved.
+    get.mockResolvedValueOnce(makeSession({ activity: "idle" }));
+    const res = await callGet(token("approve"));
+    expect(res.status).toBe(409);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("applies when the canonical state is needs_input even if activity is idle", async () => {
+    get.mockResolvedValueOnce(makeSession({ activity: "idle", lifecycle: makeLifecycle("needs_input") }));
+    const res = await callGet(token("approve"));
+    expect(res.status).toBe(200);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
   });
 
   it("returns 400 for a malformed session id in a validly-signed token", async () => {

@@ -111,12 +111,15 @@ export async function GET(
   try {
     const { config, sessionManager } = await getServices();
 
-    // Re-read the session and confirm it's still in a state where this decision
-    // applies. A signed link stays valid for its TTL, so a human could tap an
-    // older notification after the agent has moved on — applying a stale
-    // Approve/Deny/Nudge would inject an unrelated instruction, and a stale Kill
-    // would terminate active work. Reject when the session is gone, terminal, or
-    // actively working again. (#13, review)
+    // Re-read the session and confirm the decision is still pending before
+    // acting. A signed link stays valid for its TTL, so a human could tap an
+    // older notification after they already answered and the agent resumed —
+    // applying a stale Approve/Deny/Nudge would inject an unrelated instruction,
+    // and a stale Kill would terminate resumed work. The buttons answer a
+    // pending human decision, so require the session to be non-terminal AND
+    // still awaiting input: canonical `needs_input`, or a live waiting_input/
+    // blocked prompt. Once the agent has moved back to ready/idle/working, the
+    // decision has moved on. (#13, review)
     const session = await sessionManager.get(sessionId);
     const resolvedProjectId =
       session?.projectId ?? resolveProjectIdForSessionId(config, sessionId) ?? projectId;
@@ -129,8 +132,12 @@ export async function GET(
       );
     }
 
-    const isStale = isTerminalSession(session) || session.activity === ACTIVITY_STATE.ACTIVE;
-    if (isStale) {
+    const decisionPending =
+      !isTerminalSession(session) &&
+      (session.lifecycle?.session.state === "needs_input" ||
+        session.activity === ACTIVITY_STATE.WAITING_INPUT ||
+        session.activity === ACTIVITY_STATE.BLOCKED);
+    if (!decisionPending) {
       recordApiObservation({
         config,
         method: "GET",
@@ -156,7 +163,7 @@ export async function GET(
       return htmlResponse(
         409,
         "Action no longer applies",
-        "This decision has already moved on — the session finished or is working again, so no action was taken.",
+        "This decision is no longer pending — it was already answered, or the session has finished or moved on, so no action was taken.",
       );
     }
 
