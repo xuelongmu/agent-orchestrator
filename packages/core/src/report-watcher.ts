@@ -10,7 +10,24 @@
  */
 
 import type { Session, SessionStatus } from "./types.js";
-import { readAgentReport, type AgentReport } from "./agent-report.js";
+import { isAgentReportFresh, readAgentReport, type AgentReport } from "./agent-report.js";
+
+/**
+ * Whether a `needs_decision` report is an ACTIVE block (#12). Active while EITHER
+ * the session is currently parked in needs_input, OR the report is still fresh —
+ * so a fresh decision request stays active even when PR-enrichment ordering leaves
+ * the derived state as pr_open/mergeable, while a decision resolved by inference
+ * (agent resumed working, report gone stale) is no longer active and stops being
+ * exempted from stale-report handling.
+ */
+export function isNeedsDecisionActive(
+  session: Session,
+  report: AgentReport | null,
+  now: Date = new Date(),
+): boolean {
+  if (report?.state !== "needs_decision") return false;
+  return session.lifecycle?.session.state === "needs_input" || isAgentReportFresh(report, now);
+}
 
 /**
  * Report watcher trigger types.
@@ -148,8 +165,11 @@ export function checkStaleReport(
   const timeSinceReport = now.getTime() - reportTime;
   if (timeSinceReport < config.staleReportTimeoutMs) return null;
 
-  // Don't flag as stale if agent is in a waiting state (that's expected)
+  // Don't flag as stale if the agent is in a waiting state (that's expected).
+  // needs_decision is exempt ONLY while it is an ACTIVE block — once resolved by
+  // inference, a stale needs_decision must NOT shield a working agent forever (#12).
   if (report.state === "waiting" || report.state === "needs_input") return null;
+  if (isNeedsDecisionActive(session, report, now)) return null;
 
   return {
     trigger: "stale_report",
@@ -164,7 +184,7 @@ export function checkStaleReport(
  * Check for blocked agent: agent reported blocked or needs_input state.
  */
 export function checkBlockedAgent(
-  _session: Session,
+  session: Session,
   report: AgentReport | null,
   now: Date,
   config: ReportWatcherConfig,
@@ -174,12 +194,32 @@ export function checkBlockedAgent(
   // If no report, nothing to check
   if (!report) return null;
 
-  if (report.state === "needs_input") {
+  // A needs_decision report is an active block only while active (in needs_input OR
+  // still fresh). A decision resolved by inference — reported state lingers but the
+  // agent has resumed working — must NOT keep this trigger active (so
+  // auditAgentReports reaches the stale-report check); a FRESH decision on a session
+  // whose derived state is pr_open/mergeable (PR-enrichment ordering) must stay
+  // active so the human is still notified (#12).
+  if (report.state === "needs_decision" && !isNeedsDecisionActive(session, report, now)) {
+    return null;
+  }
+
+  if (report.state === "needs_input" || report.state === "needs_decision") {
     const reportTime = Date.parse(report.timestamp);
     const timeSinceReportMs = Number.isNaN(reportTime) ? undefined : now.getTime() - reportTime;
+    // needs_decision carries an explicit confidence + question (#12); surface
+    // both so the notification hands the human the full judgment call.
+    const message =
+      report.state === "needs_decision"
+        ? `Agent needs a decision${
+            report.confidence !== undefined
+              ? ` (confidence ${Math.round(report.confidence * 100)}%)`
+              : ""
+          }: ${report.question ?? report.note ?? "waiting for user decision"}`
+        : `Agent needs input: ${report.note ?? "waiting for user decision"}`;
     return {
       trigger: "agent_needs_input",
-      message: `Agent needs input: ${report.note ?? "waiting for user decision"}`,
+      message,
       checkedAt: now.toISOString(),
       report,
       timeSinceReportMs,

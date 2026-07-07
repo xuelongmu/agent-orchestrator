@@ -1489,6 +1489,21 @@ export interface ReactionConfig {
    * processes rather than alive-but-idle agents.
    */
   nudgeRetries?: number;
+
+  /**
+   * Minimum confidence (0..1) required for this reaction to run its autonomous
+   * action. Before acting, AO folds cheap risk signals (review rounds, open
+   * finding severity, CI failures, diff size) into a heuristic confidence score;
+   * below this threshold the action is held and escalated to a human with a
+   * question instead of running (#12). Undefined disables the gate — reactions
+   * behave exactly as before.
+   *
+   * Applies to `auto-merge` and `send-to-agent` (auto-fix). `notify` already
+   * defers to a human. `spawn-session` is NOT gated: the dependency scheduler
+   * launches held dependents independently each poll, so holding the reaction
+   * could not actually stop the spawn.
+   */
+  confidenceThreshold?: number;
 }
 
 export interface ReactionResult {
@@ -1497,6 +1512,14 @@ export interface ReactionResult {
   action: string;
   message?: string;
   escalated: boolean;
+  /**
+   * True when this reaction escalated specifically because a confidence gate
+   * HELD the autonomous action (#12) — as opposed to exhausting retries/duration.
+   * Callers that stamp a "delivered" dispatch hash on ordinary escalation (so the
+   * nudge treats the human handoff as delivered) must NOT do so for a confidence
+   * hold, or the still-undelivered comments/CI details get suppressed.
+   */
+  heldForConfidence?: boolean;
 }
 
 // =============================================================================

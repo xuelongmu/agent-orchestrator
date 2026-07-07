@@ -69,11 +69,25 @@ import {
   hasPositiveIdleEvidence,
   isWeakActivityEvidence,
 } from "./activity-signal.js";
-import { isAgentReportFresh, mapAgentReportToLifecycle, readAgentReport } from "./agent-report.js";
+import {
+  AGENT_REPORT_METADATA_KEYS,
+  isAgentReportFresh,
+  mapAgentReportToLifecycle,
+  readAgentReport,
+} from "./agent-report.js";
+import {
+  computeConfidence,
+  summarizeConfidenceFactors,
+  type ConfidenceAssessment,
+  type ConfidenceSignals,
+} from "./confidence.js";
+import { createCodeReviewStore, type CodeReviewSeverity } from "./code-review-store.js";
+import { mergeReactionOverride } from "./config.js";
 import { evaluateBudgetBreach, resolveBudget } from "./budget.js";
 import {
   auditAgentReports,
   getReactionKeyForTrigger,
+  isNeedsDecisionActive,
   REPORT_WATCHER_METADATA_KEYS,
 } from "./report-watcher.js";
 import { createCorrelationId, createProjectObserver } from "./observability.js";
@@ -117,6 +131,58 @@ function parseDuration(str: string): number {
   }
 }
 
+/** Severity ordering for picking the riskiest open review finding. */
+const CODE_REVIEW_SEVERITY_RANK: Record<CodeReviewSeverity, number> = {
+  info: 1,
+  warning: 2,
+  error: 3,
+};
+
+/** The agent's explicit judgment call, when the current report is `needs_decision`. */
+interface NeedsDecisionContext {
+  confidence?: number;
+  question: string;
+}
+
+/**
+ * The SINGLE source of truth for an active agent decision (Class A chokepoint).
+ * A `needs_decision` report is active ONLY while the session is parked in
+ * needs_input: once lifecycle inference (or a later `ao report`) moves it out, the
+ * decision is resolved and clearStaleDecisionContext clears the question, so this
+ * returns null. Every consumer reads through here — no site re-infers or copies
+ * decision context, and a resolved record can never act as an active block (#12).
+ */
+function getActiveDecision(session: Session): NeedsDecisionContext | null {
+  const report = readAgentReport(session.metadata);
+  if (!report?.question || !isNeedsDecisionActive(session, report)) return null;
+  return { confidence: report.confidence, question: report.question };
+}
+
+/** Human-facing notification message for an agent-initiated decision (#12). */
+function formatNeedsDecisionMessage(decision: NeedsDecisionContext): string {
+  const confidence =
+    decision.confidence !== undefined
+      ? ` (confidence ${Math.round(decision.confidence * 100)}%)`
+      : "";
+  return `Decision needed${confidence}: ${decision.question}`;
+}
+
+/** Compose the human-facing question when a low-confidence action is held (#12). */
+function buildConfidenceEscalationQuestion(
+  reactionKey: string,
+  action: string,
+  threshold: number,
+  assessment: ConfidenceAssessment,
+): string {
+  const pct = Math.round(assessment.score * 100);
+  const thresholdPct = Math.round(threshold * 100);
+  return (
+    `Confidence ${pct}% is below the ${thresholdPct}% threshold to auto-run '${action}' ` +
+    `for '${reactionKey}'. Reasons: ${summarizeConfidenceFactors(assessment)}. ` +
+    `Proceed manually or intervene?`
+  );
+}
+
 /** Reaction keys for conditions that can oscillate (e.g. CI failing→pending→failing).
  *  Their trackers survive status exit so the escalation budget accumulates
  *  across oscillations instead of resetting to zero each time.
@@ -124,6 +190,10 @@ function parseDuration(str: string): number {
  *  "merge.conflicts", so the transition handler at line ~1892 can't reach it.
  *  Merge-conflict tracker lifecycle is managed in maybeDispatchMergeConflicts. */
 const PERSISTENT_REACTION_KEYS = new Set(["ci-failed"]);
+
+/** Metadata key: reactionKey of a confidence hold whose escalation was undelivered
+ *  and is awaiting a per-poll retry (Class B chokepoint, #12). */
+const CONFIDENCE_HOLD_PENDING_KEY = "confidenceHoldPending";
 
 /** Number of consecutive CI-passing polls required before the ci-failed tracker
  *  (including its escalated flag) is cleared, allowing a fresh budget for the
@@ -503,6 +573,11 @@ interface ReactionTracker {
   /** True after this reaction has escalated. Short-circuits further dispatches
    *  until the underlying condition resolves and the tracker is explicitly cleared. */
   escalated?: boolean;
+  /** True when the escalation was a confidence HOLD (#12) rather than exhausted
+   *  retries/duration. Distinguishes "held, nothing delivered to the agent" (must
+   *  not stamp a delivered dispatch hash) from a retry escalation (human handoff,
+   *  which does stamp). */
+  heldForConfidence?: boolean;
 }
 
 /** Create a LifecycleManager instance. */
@@ -1685,6 +1760,297 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     });
   }
 
+  /**
+   * Gather cheap, already-available risk signals for confidence scoring (#12).
+   * Reads review-round churn from metadata, CI-failure count from the ci-failed
+   * reaction tracker, diff size from cached PR enrichment, and the riskiest open
+   * automated review finding from the code-review store. Never throws — missing
+   * data simply contributes no penalty.
+   */
+  function gatherConfidenceSignals(session: Session): ConfidenceSignals {
+    // Use the CUMULATIVE round count: the review backlog loop clears
+    // reviewRoundCount as soon as the bot-review loop is satisfied, so a PR that
+    // churned through several rounds then went review-clean (while CI was still
+    // pending) would otherwise score as zero churn for a later approved-and-green
+    // check. reviewRoundCountTotal survives satisfaction and is only reset when
+    // the PR reaches a terminal state (#12 review). Fall back to the live count.
+    const reviewRounds = Math.max(
+      parseAttemptCount(session.metadata["reviewRoundCountTotal"]),
+      parseAttemptCount(session.metadata["reviewRoundCount"]),
+    );
+    // Sum the diff across ALL of the session's PRs (a session can own several),
+    // so a large secondary PR still contributes its risk — mirroring how the
+    // lifecycle code aggregates status over session.prs (#12 review). Deduped
+    // without mutating the session (unlike normalizeSessionPRs).
+    const sessionPRs = dedupePrInfos(
+      session.prs.length > 0 ? session.prs : session.pr ? [session.pr] : [],
+    );
+    let diffSize: number | undefined;
+    let ciCurrentlyFailing = false;
+    for (const pr of sessionPRs) {
+      const prEnrichment = prEnrichmentCache.get(`${pr.owner}/${pr.repo}#${pr.number}`);
+      if (
+        prEnrichment &&
+        (prEnrichment.additions !== undefined || prEnrichment.deletions !== undefined)
+      ) {
+        diffSize = (diffSize ?? 0) + (prEnrichment.additions ?? 0) + (prEnrichment.deletions ?? 0);
+      }
+      if (prEnrichment?.ciStatus === "failing") ciCurrentlyFailing = true;
+    }
+
+    // CI-failure signal (#12 review). Take the max of:
+    //  • the live ci-failed tracker attempts (resets on each new fingerprint),
+    //  • the CUMULATIVE failure count, which survives CI recovery until a terminal
+    //    PR state — so a PR that failed CI then went green before approved-and-green
+    //    still scores that churn, and
+    //  • 1 whenever CI is failing right now (a same-state failure the tracker missed).
+    const ciTracker = reactionTrackers.get(`${session.id}:ci-failed`);
+    const ciFailureCount = Math.max(
+      ciTracker?.attempts ?? 0,
+      parseAttemptCount(session.metadata["ciFailureCountTotal"]),
+      ciCurrentlyFailing ? 1 : 0,
+    );
+
+    let maxFindingSeverity: CodeReviewSeverity | null = null;
+    let maxFindingConfidence: number | null = null;
+    try {
+      const store = createCodeReviewStore(session.projectId);
+      // Findings from a superseded (outdated) run describe a stale target SHA the
+      // agent has since pushed past — they must not keep holding autonomous
+      // actions, so drop them entirely.
+      const outdatedRunIds = new Set(
+        store.listRuns({ linkedSessionId: session.id, status: "outdated" }).map((run) => run.id),
+      );
+      // An "unresolved" finding is one still awaiting a fix: freshly surfaced
+      // (`open`) OR already delivered to the agent but not yet resolved
+      // (`sent_to_agent`). Both represent outstanding review risk.
+      const unresolvedFindings = store
+        .listFindings({ linkedSessionId: session.id })
+        .filter(
+          (finding) =>
+            (finding.status === "open" || finding.status === "sent_to_agent") &&
+            !outdatedRunIds.has(finding.runId),
+        );
+      for (const finding of unresolvedFindings) {
+        const currentRank = maxFindingSeverity ? CODE_REVIEW_SEVERITY_RANK[maxFindingSeverity] : 0;
+        const findingRank = CODE_REVIEW_SEVERITY_RANK[finding.severity];
+        // Tie-break on confidence, treating a MISSING confidence as full (1) —
+        // matching how computeConfidence weights it. Using 0 here would let a
+        // low-confidence finding wrongly displace an unknown-confidence one of the
+        // same severity and shrink the penalty.
+        const isRiskier =
+          findingRank > currentRank ||
+          (findingRank === currentRank &&
+            (finding.confidence ?? 1) > (maxFindingConfidence ?? 1));
+        if (isRiskier) {
+          maxFindingSeverity = finding.severity;
+          maxFindingConfidence = finding.confidence ?? null;
+        }
+      }
+    } catch {
+      // No code-review store / findings for this project yet — treat as none.
+    }
+
+    return { reviewRounds, ciFailureCount, diffSize, maxFindingSeverity, maxFindingConfidence };
+  }
+
+  /**
+   * Pure scoring for the confidence gate (#12): returns the assessment + threshold
+   * when the action should be HELD (opted-in, gated action, score below threshold),
+   * else null. No side effects — the direct CI-detail path reuses this to decide a
+   * hold while delivering its OWN detailed notification (avoiding a double).
+   *
+   * Only `auto-merge` and `send-to-agent` (auto-fix) are gated. `notify` already
+   * defers to a human. `spawn-session` is intentionally NOT gated: the dependency
+   * scheduler launches held dependents unconditionally each poll, independent of
+   * this reaction, so holding the reaction here can't actually stop the spawn.
+   */
+  function evaluateConfidenceHold(
+    session: Session,
+    action: string,
+    reactionConfig: ReactionConfig,
+  ): { assessment: ConfidenceAssessment; threshold: number } | null {
+    const threshold = reactionConfig.confidenceThreshold;
+    if (threshold === undefined || (action !== "auto-merge" && action !== "send-to-agent")) {
+      return null;
+    }
+    const assessment = computeConfidence(gatherConfidenceSignals(session));
+    return assessment.score < threshold ? { assessment, threshold } : null;
+  }
+
+  /**
+   * Deliver the confidence escalation for a held action: the confidence question,
+   * plus (when provided) the content that would have gone to the agent — enriched
+   * review comments / CI details — so a single notification is actionable. Returns
+   * whether a human actually received it.
+   */
+  async function notifyConfidenceEscalation(
+    session: Session,
+    reactionKey: string,
+    action: string,
+    threshold: number,
+    assessment: ConfidenceAssessment,
+    detail: string | undefined,
+    priority: EventPriority | undefined,
+  ): Promise<boolean> {
+    const question = buildConfidenceEscalationQuestion(reactionKey, action, threshold, assessment);
+    const message = detail ? `${question}\n\n${detail}` : question;
+    recordActivityEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      source: "reaction",
+      kind: "reaction.escalated",
+      level: "warn",
+      summary: `reaction ${reactionKey} held: confidence ${assessment.score.toFixed(2)} < ${threshold}`,
+      data: {
+        reactionKey,
+        action,
+        cause: "low_confidence",
+        confidence: assessment.score,
+        confidenceThreshold: threshold,
+        factors: assessment.factors,
+      },
+    });
+    const context = buildEventContext(session, prEnrichmentCache);
+    const event = createEvent("reaction.escalated", {
+      sessionId: session.id,
+      projectId: session.projectId,
+      message,
+      data: buildReactionEscalationNotificationData({
+        eventType: "reaction.escalated",
+        sessionId: session.id,
+        projectId: session.projectId,
+        context,
+        reactionKey,
+        action: "escalated",
+        attempts: reactionTrackers.get(`${session.id}:${reactionKey}`)?.attempts ?? 0,
+        cause: "low_confidence",
+        confidence: assessment.score,
+        question: detail ? `${question}\n\n${detail}` : question,
+        enrichment: getPREnrichmentForSession(session),
+      }),
+    });
+    return notifyHuman(event, priority ?? "urgent");
+  }
+
+  /** Persist / clear the reactionKey of an undelivered confidence hold awaiting retry. */
+  function setPendingConfidenceHold(session: Session, reactionKey: string): void {
+    if (session.metadata[CONFIDENCE_HOLD_PENDING_KEY] === reactionKey) return;
+    updateSessionMetadata(session, { [CONFIDENCE_HOLD_PENDING_KEY]: reactionKey });
+  }
+  function clearPendingConfidenceHold(session: Session, reactionKey: string): void {
+    if (session.metadata[CONFIDENCE_HOLD_PENDING_KEY] !== reactionKey) return;
+    updateSessionMetadata(session, { [CONFIDENCE_HOLD_PENDING_KEY]: "" });
+  }
+
+  /**
+   * The SINGLE confidence-hold chokepoint (Class B). Every gated autonomous send
+   * routes through here, so a hold reaches EXACTLY ONE terminal outcome:
+   *   • proceed   — `{ withhold: false }`: confidence is sufficient (or the reaction
+   *                 isn't gated). Any pending hold is released; the caller acts.
+   *   • escalated — `{ withhold: true, delivered: true }`: a human received the
+   *                 question (+ detail). The tracker is latched and pending cleared.
+   *                 Re-entry while latched short-circuits here (no re-notify).
+   *   • pending   — `{ withhold: true, delivered: false }`: held but the escalation
+   *                 could not be delivered. Persisted so retryPendingConfidenceHold
+   *                 re-attempts every poll; NEVER latched and NEVER marked delivered,
+   *                 so held sends are never stamped as handled without proof.
+   */
+  async function withholdForConfidence(
+    session: Session,
+    reactionKey: string,
+    action: string,
+    reactionConfig: ReactionConfig,
+    detail?: string,
+  ): Promise<{ withhold: boolean; delivered: boolean }> {
+    const trackerKey = `${session.id}:${reactionKey}`;
+    const existing = reactionTrackers.get(trackerKey);
+    if (existing?.escalated && existing.heldForConfidence) {
+      clearPendingConfidenceHold(session, reactionKey);
+      return { withhold: true, delivered: true };
+    }
+    const evaluated = evaluateConfidenceHold(session, action, reactionConfig);
+    if (!evaluated) {
+      clearPendingConfidenceHold(session, reactionKey);
+      return { withhold: false, delivered: false };
+    }
+    const delivered = await notifyConfidenceEscalation(
+      session,
+      reactionKey,
+      action,
+      evaluated.threshold,
+      evaluated.assessment,
+      detail,
+      reactionConfig.priority,
+    );
+    if (delivered) {
+      const tracker = existing ?? { attempts: 0, firstTriggered: new Date() };
+      tracker.escalated = true;
+      tracker.heldForConfidence = true;
+      reactionTrackers.set(trackerKey, tracker);
+      clearPendingConfidenceHold(session, reactionKey);
+    } else {
+      setPendingConfidenceHold(session, reactionKey);
+    }
+    return { withhold: true, delivered };
+  }
+
+  /**
+   * Dispatch-site confidence gate: when held, deliver the ONE actionable escalation
+   * (confidence question + enriched review comments / CI details) to the human and
+   * latch. Unlike withholdForConfidence it ALWAYS re-delivers the detail (the caller
+   * dedups via its own dispatch hash), so a generic transition/retry escalation that
+   * already latched never suppresses the detailed one (#12 review). Returns
+   * `{ withhold, delivered }`; stamp the dispatch hash only when delivered.
+   */
+  async function withholdDispatchForConfidence(
+    session: Session,
+    reactionKey: string,
+    reactionConfig: ReactionConfig,
+    detail: string,
+  ): Promise<{ withhold: boolean; delivered: boolean }> {
+    const evaluated = evaluateConfidenceHold(session, "send-to-agent", reactionConfig);
+    if (!evaluated) return { withhold: false, delivered: false };
+    const delivered = await notifyConfidenceEscalation(
+      session,
+      reactionKey,
+      "send-to-agent",
+      evaluated.threshold,
+      evaluated.assessment,
+      detail,
+      reactionConfig.priority,
+    );
+    if (delivered) {
+      const trackerKey = `${session.id}:${reactionKey}`;
+      const tracker = reactionTrackers.get(trackerKey) ?? { attempts: 0, firstTriggered: new Date() };
+      tracker.escalated = true;
+      tracker.heldForConfidence = true;
+      reactionTrackers.set(trackerKey, tracker);
+      clearPendingConfidenceHold(session, reactionKey);
+    }
+    return { withhold: true, delivered };
+  }
+
+  /**
+   * Retry a pending confidence hold each poll — the guaranteed terminal outcome for
+   * a transition-only gated action (e.g. approved-and-green auto-merge, an idle
+   * send-to-agent) whose escalation was undelivered and which has no per-poll
+   * dispatcher. Re-runs the reaction through executeReaction so its gate either
+   * re-escalates (still low confidence) or RUNS the action now that confidence
+   * recovered — the hold's terminal outcome includes "executed on recovery", not
+   * just re-notify (#12 review).
+   */
+  async function retryPendingConfidenceHold(session: Session): Promise<void> {
+    const reactionKey = session.metadata[CONFIDENCE_HOLD_PENDING_KEY];
+    if (!reactionKey) return;
+    const reactionConfig = getReactionConfigForSession(session, reactionKey);
+    if (!reactionConfig?.action) {
+      clearPendingConfidenceHold(session, reactionKey);
+      return;
+    }
+    await executeReaction(session, reactionKey, reactionConfig);
+  }
+
   /** Execute a reaction for a session. */
   async function executeReaction(
     session: Session | ReactionSessionContext,
@@ -1701,8 +2067,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
 
     // Already escalated — wait for the condition to resolve before resuming.
+    // Carry heldForConfidence so callers keep distinguishing a confidence hold
+    // (never mark delivered) from a retry escalation across subsequent polls.
     if (tracker.escalated) {
-      return { reactionType: reactionKey, success: true, action: "escalated", escalated: true };
+      return {
+        reactionType: reactionKey,
+        success: true,
+        action: "escalated",
+        escalated: true,
+        heldForConfidence: tracker.heldForConfidence,
+      };
     }
 
     // Increment attempts before checking escalation
@@ -1789,6 +2163,26 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // Execute the reaction action
     const action = reactionConfig.action ?? "notify";
 
+    // Confidence gate (#12): withholdForConfidence is the transition chokepoint —
+    // it guarantees a (generic) human escalation for a held action and drives the
+    // undelivered→retry outcome. The per-poll dispatchers (review/CI) additionally
+    // deliver the ENRICHED detail via withholdDispatchForConfidence, deduped by
+    // their own dispatch hash — so the transition escalation here is the guaranteed
+    // baseline even if a later detail fetch fails. Synthetic system sessions (no
+    // lifecycle) carry nothing to score.
+    if ("lifecycle" in session) {
+      const hold = await withholdForConfidence(session, reactionKey, action, reactionConfig);
+      if (hold.withhold) {
+        return {
+          reactionType: reactionKey,
+          success: true,
+          action: "escalated",
+          escalated: true,
+          heldForConfidence: true,
+        };
+      }
+    }
+
     switch (action) {
       case "send-to-agent": {
         if (reactionConfig.message) {
@@ -1837,10 +2231,23 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
       case "notify": {
         const context = buildEventContext(session, prEnrichmentCache);
+        // A `needs_decision` report parks the session in needs_input, which fires
+        // the needs-input notify reaction here. Surface the agent's explicit
+        // question + confidence so the human keeps the decision context instead of
+        // a generic "needs input" ping (#12). Scoped to the needs-input reactions
+        // so unrelated notifications (agent-exited, etc.) are never relabeled.
+        const decision =
+          (reactionKey === "agent-needs-input" || reactionKey === "report-needs-input") &&
+          "lifecycle" in session
+            ? getActiveDecision(session)
+            : null;
+        const notifyMessage = decision
+          ? formatNeedsDecisionMessage(decision)
+          : (reactionConfig.message ?? `Reaction '${reactionKey}' triggered notification`);
         const event = createEvent("reaction.triggered", {
           sessionId,
           projectId,
-          message: reactionConfig.message ?? `Reaction '${reactionKey}' triggered notification`,
+          message: notifyMessage,
           data: buildReactionNotificationData({
             eventType: "reaction.triggered",
             sessionId,
@@ -1945,9 +2352,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const project = config.projects[session.projectId];
     const globalReaction = config.reactions[reactionKey];
     const projectReaction = project?.reactions?.[reactionKey];
-    const reactionConfig = projectReaction
-      ? { ...globalReaction, ...projectReaction }
-      : globalReaction;
+    // Merge a project override the SAME way top-level defaults are merged, so an
+    // explicit autonomous action override enables `auto` here too (a per-project
+    // `approved-and-green: { action: auto-merge, confidenceThreshold }` must not
+    // inherit the global default's auto:false and stay dead) (#12 review).
+    const reactionConfig =
+      projectReaction && globalReaction
+        ? mergeReactionOverride(globalReaction, projectReaction as Partial<ReactionConfig>)
+        : (projectReaction ?? globalReaction);
     return reactionConfig ? (reactionConfig as ReactionConfig) : null;
   }
 
@@ -1973,6 +2385,26 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
     session.metadata = cleaned;
     session.status = deriveLegacyStatus(session.lifecycle);
+  }
+
+  /**
+   * Resolve an agent decision exactly once (Class A durable store). When a
+   * needs_decision report is no longer ACTIVE (isNeedsDecisionActive false — the
+   * agent left needs_input AND the report went stale), clear the WHOLE record —
+   * reported state, timestamp, question, confidence — so every stale/blocked check
+   * sees a consistent, resolved report and a later re-entry can't reuse it. A fresh
+   * decision (even on a pr_open/mergeable session) stays active and is untouched
+   * (#12 review).
+   */
+  function clearStaleDecisionContext(session: Session): void {
+    const report = readAgentReport(session.metadata);
+    if (report?.state !== "needs_decision" || isNeedsDecisionActive(session, report)) return;
+    updateSessionMetadata(session, {
+      [AGENT_REPORT_METADATA_KEYS.STATE]: "",
+      [AGENT_REPORT_METADATA_KEYS.AT]: "",
+      [AGENT_REPORT_METADATA_KEYS.QUESTION]: "",
+      [AGENT_REPORT_METADATA_KEYS.CONFIDENCE]: "",
+    });
   }
 
   function makeFingerprint(ids: string[]): string {
@@ -2050,6 +2482,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         lastAutomatedReviewDispatchHash: "",
         lastAutomatedReviewDispatchAt: "",
         reviewRoundCount: "",
+        // Cumulative churn signal for the confidence gate (#12): reset only here,
+        // at a terminal PR state — NOT on bot-review-satisfied — so a later
+        // auto-action still scores the rounds this PR actually went through.
+        reviewRoundCountTotal: "",
         reviewRoundsEscalated: "",
         reviewSatisfiedAt: "",
         botReviewObserved: "",
@@ -2356,16 +2792,32 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             reviewSummaries,
           );
 
-          // When the transition handler already called executeReaction for this
-          // key, send the enriched payload directly to avoid double-billing the
-          // reaction attempt budget. A project with retries:1 would otherwise
-          // escalate on the very first transition poll.
-          // Only bypass for "send-to-agent" — "notify" actions must go through
-          // executeReaction so they route to notifyHuman instead of the agent.
-          let success = false;
-          if (
-            transitionReaction?.key === humanReactionKey &&
+          // Dispatch-site confidence gate (Class B chokepoint) — the enriched
+          // comments are available here, so a low-confidence hold sends ONE
+          // actionable escalation (question + comments) to the human. Stamp only on
+          // delivery so an undelivered hold retries next poll (#12).
+          const hold =
             reactionConfig.action === "send-to-agent"
+              ? await withholdDispatchForConfidence(
+                  session,
+                  humanReactionKey,
+                  reactionConfig,
+                  enrichedMessage,
+                )
+              : { withhold: false, delivered: false };
+
+          let success = false;
+          if (hold.withhold) {
+            success = hold.delivered;
+          } else if (
+            // When the transition handler already called executeReaction for this
+            // key, send the enriched payload directly to avoid double-billing the
+            // reaction attempt budget. Only bypass for "send-to-agent"; and NOT
+            // when the transition reaction escalated (exhausted retries) — route
+            // back through executeReaction so its tracker.escalated guard holds.
+            transitionReaction?.key === humanReactionKey &&
+            reactionConfig.action === "send-to-agent" &&
+            !transitionReaction?.result?.escalated
           ) {
             try {
               await sessionManager.send(session.id, enrichedMessage);
@@ -2376,6 +2828,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           } else {
             const enrichedConfig = { ...reactionConfig, message: enrichedMessage };
             const result = await executeReaction(session, humanReactionKey, enrichedConfig);
+            // Retry/duration escalation stamps (human handoff, #5 nudge invariant);
+            // a normal send stamps on success. Confidence holds were handled above.
             success = result.success;
           }
           if (success) {
@@ -2466,10 +2920,30 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           ) {
             const enrichedMessage = formatReviewCommentsMessage(automatedComments, "bot");
 
-            let success = false;
-            if (
-              transitionReaction?.key === automatedReactionKey &&
+            // Dispatch-site confidence gate (Class B chokepoint): a low-confidence
+            // hold sends ONE escalation (question + comments) to the human;
+            // stamp/count the round only on delivery so an undelivered hold retries
+            // next poll (#12).
+            const hold =
               reactionConfig.action === "send-to-agent"
+                ? await withholdDispatchForConfidence(
+                    session,
+                    automatedReactionKey,
+                    reactionConfig,
+                    enrichedMessage,
+                  )
+                : { withhold: false, delivered: false };
+
+            let success = false;
+            if (hold.withhold) {
+              success = hold.delivered;
+            } else if (
+              // Direct-send bypass when the transition already called executeReaction;
+              // NOT when it escalated (exhausted retries) — route back so the
+              // tracker.escalated guard keeps it held.
+              transitionReaction?.key === automatedReactionKey &&
+              reactionConfig.action === "send-to-agent" &&
+              !transitionReaction?.result?.escalated
             ) {
               try {
                 await sessionManager.send(session.id, enrichedMessage);
@@ -2480,6 +2954,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             } else {
               const enrichedConfig = { ...reactionConfig, message: enrichedMessage };
               const result = await executeReaction(session, automatedReactionKey, enrichedConfig);
+              // Retry/duration escalation stamps (human handoff, #5 invariant); a
+              // normal send stamps on success. Confidence holds handled above.
               success = result.success;
             }
             if (success) {
@@ -2487,6 +2963,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
                 lastAutomatedReviewDispatchHash: automatedFingerprint,
                 lastAutomatedReviewDispatchAt: new Date().toISOString(),
                 reviewRoundCount: String(reviewRounds + 1),
+                reviewRoundCountTotal: String(
+                  parseAttemptCount(session.metadata["reviewRoundCountTotal"]) + 1,
+                ),
               });
             }
           }
@@ -3274,13 +3753,23 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     const ciReactionKey = "ci-failed";
 
-    // Clear tracking when PR is closed/merged
-    if (newStatus === "merged" || newStatus === "killed") {
+    // The cumulative CI-failure signal is reset ONLY at a TERMINAL PR (merged, or
+    // closed-unmerged) — never on CI recovery — so a later auto-action still scores
+    // the CI churn this PR went through, while a replacement PR opened in the same
+    // session starts clean (#12 review). A closed PR reaches here as newStatus
+    // idle/working with pr.state "closed", so gate on the PR state, not newStatus.
+    const prTerminal =
+      newStatus === "merged" ||
+      newStatus === "killed" ||
+      session.lifecycle.pr.state === "merged" ||
+      session.lifecycle.pr.state === "closed";
+    if (prTerminal) {
       clearReactionTracker(session.id, ciReactionKey);
       updateSessionMetadata(session, {
         lastCIFailureFingerprint: "",
         lastCIFailureDispatchHash: "",
         lastCIFailureDispatchAt: "",
+        ciFailureCountTotal: "",
       });
       return;
     }
@@ -3312,17 +3801,25 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       clearReactionTracker(session.id, ciReactionKey);
     }
     if (ciFingerprint !== lastCIFingerprint) {
+      // Count each distinct failed-check set as CI churn. Cumulative — survives CI
+      // recovery, reset only at a terminal PR state (#12 review).
       updateSessionMetadata(session, {
         lastCIFailureFingerprint: ciFingerprint,
+        ciFailureCountTotal: String(parseAttemptCount(session.metadata["ciFailureCountTotal"]) + 1),
       });
     }
 
     // If the transition reaction already delivered an enriched agent message,
     // or handled a non-agent action, record the dispatch hash so subsequent
-    // polls don't re-send the same failure details.
+    // polls don't re-send the same failure details. A CONFIDENCE-held transition
+    // is excluded: it only sent the generic escalation question, so the detailed
+    // failed-check follow-up below must still run (#12). A retry/duration
+    // escalation still records here (human handoff) — hence heldForConfidence,
+    // not escalated.
     if (
       transitionReaction?.key === ciReactionKey &&
       transitionReaction.result?.success &&
+      !transitionReaction.result.heldForConfidence &&
       (transitionReaction.messageEnriched === true ||
         transitionReaction.result.action !== "send-to-agent")
     ) {
@@ -3346,6 +3843,29 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       (reactionConfig.auto !== false || reactionConfig.action === "notify")
     ) {
       const detailedMessage = await formatCIFailureMessage(scm, session.pr, failedChecks);
+
+      // Dispatch-site confidence gate (Class B chokepoint): the ONE escalation
+      // carries the confidence question + the detailed failed checks. Held →
+      // withhold from the agent; stamp only on delivery so an undelivered hold
+      // retries next poll (#12 review). The transition gate already delivered a
+      // generic escalation, so the human is covered even if this detail fetch fails.
+      if (reactionConfig.action === "send-to-agent") {
+        const hold = await withholdDispatchForConfidence(
+          session,
+          ciReactionKey,
+          reactionConfig,
+          detailedMessage,
+        );
+        if (hold.withhold) {
+          if (hold.delivered) {
+            updateSessionMetadata(session, {
+              lastCIFailureDispatchHash: ciFingerprint,
+              lastCIFailureDispatchAt: new Date().toISOString(),
+            });
+          }
+          return;
+        }
+      }
 
       try {
         if (reactionConfig.action === "send-to-agent") {
@@ -4017,6 +4537,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           clearReactionTracker(session.id, oldReactionKey);
         }
       }
+      // A pending confidence hold is scoped to the status that triggered it; once
+      // the status changes the held condition is stale, so release the retry marker
+      // (a fresh hold re-arms on the new status if still warranted) (#12 review).
+      if (session.metadata[CONFIDENCE_HOLD_PENDING_KEY]) {
+        clearPendingConfidenceHold(session, session.metadata[CONFIDENCE_HOLD_PENDING_KEY]);
+      }
 
       // Handle transition: notify humans and/or trigger reactions
       const eventType = statusToEventType(oldStatus, newStatus);
@@ -4207,6 +4733,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * Called at the end of each checkSession cycle.
    */
   async function auditAndReactToReports(session: Session): Promise<void> {
+    // Drop a resolved needs_decision's sticky question/confidence if the session
+    // has since left needs_input (before reading any report below) (#12 review).
+    clearStaleDecisionContext(session);
+    // Retry an undelivered confidence hold — the single guaranteed retry for
+    // transition-only gated actions (auto-merge) with no per-poll dispatcher (#12).
+    await retryPendingConfidenceHold(session);
     const auditResult = auditAgentReports(session);
     const now = new Date().toISOString();
 
@@ -4232,12 +4764,23 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       session.metadata[REPORT_WATCHER_METADATA_KEYS.TRIGGER_COUNT] ?? "0",
       10,
     );
-    const isNewTrigger =
-      session.metadata[REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER] !== auditResult.trigger;
+    // A `needs_decision` report shares the `agent_needs_input` trigger with a
+    // generic needs_input, but carries distinct decision context. Fold the
+    // reported state AND the report timestamp into the activation identity so
+    // that (a) refining needs_input → needs_decision and (b) a SECOND
+    // needs_decision with a new question/confidence each count as a NEW
+    // activation — re-firing the report reaction / notification even without a
+    // status transition. Each `ao report` stamps a fresh timestamp (#12 review).
+    const activationIdentity =
+      auditResult.report?.state === "needs_decision"
+        ? `${auditResult.trigger}:needs_decision:${auditResult.report.timestamp}`
+        : auditResult.trigger;
+    const priorActiveTrigger = session.metadata[REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER] ?? "";
+    const isNewTrigger = priorActiveTrigger !== activationIdentity;
 
     updateSessionMetadata(session, {
       [REPORT_WATCHER_METADATA_KEYS.LAST_AUDITED_AT]: now,
-      [REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER]: auditResult.trigger,
+      [REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER]: activationIdentity,
       [REPORT_WATCHER_METADATA_KEYS.TRIGGER_ACTIVATED_AT]: isNewTrigger
         ? now
         : (session.metadata[REPORT_WATCHER_METADATA_KEYS.TRIGGER_ACTIVATED_AT] ?? now),
@@ -4296,6 +4839,41 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // Execute reaction if configured
     if (isNewTrigger && reactionConfig && reactionConfig.auto !== false) {
       await executeReaction(session, reactionKey, reactionConfig);
+    }
+
+    // Same-state needs_decision (#12 review): when an agent clarifies an EXISTING
+    // block with a new question/confidence, there is no status transition (so the
+    // built-in agent-needs-input notify never fires). Directly notify the human so
+    // the refined decision is not silently dropped. Skipped on the FIRST block
+    // (prior trigger was not already needs-input — the status transition handled
+    // that), and ONLY when NO report-needs-input reaction is configured — a
+    // configured reaction (even auto:false) owns this ping, so we respect its
+    // opt-out (#12 review) rather than notifying anyway.
+    if (
+      isNewTrigger &&
+      !reactionConfig &&
+      auditResult.report?.state === "needs_decision" &&
+      priorActiveTrigger.startsWith("agent_needs_input")
+    ) {
+      const decision = getActiveDecision(session);
+      if (decision) {
+        const context = buildEventContext(session, prEnrichmentCache);
+        const event = createEvent("reaction.triggered", {
+          sessionId: session.id,
+          projectId: session.projectId,
+          message: formatNeedsDecisionMessage(decision),
+          data: buildReactionNotificationData({
+            eventType: "reaction.triggered",
+            sessionId: session.id,
+            projectId: session.projectId,
+            context,
+            reactionKey,
+            action: "notify",
+            enrichment: getPREnrichmentForSession(session),
+          }),
+        });
+        await notifyHuman(event, "urgent");
+      }
     }
   }
 

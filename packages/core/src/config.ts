@@ -23,6 +23,7 @@ import {
   type ExternalPluginEntryRef,
   type LoadedConfig,
   type OrchestratorConfig,
+  type ReactionConfig,
 } from "./types.js";
 import { generateSessionPrefix } from "./paths.js";
 import { getDefaultRuntime } from "./platform.js";
@@ -161,6 +162,7 @@ const ReactionConfigSchema = z.object({
   includeSummary: z.boolean().optional(),
   maxRounds: z.number().int().positive().optional(),
   nudgeRetries: z.number().int().positive().optional(),
+  confidenceThreshold: z.number().min(0).max(1).optional(),
 });
 
 const TrackerConfigSchema = z
@@ -417,7 +419,11 @@ const OrchestratorConfigSchema = z.object({
   ),
   notifiers: z.record(NotifierConfigSchema).default({}),
   notificationRouting: z.record(z.array(z.string())).default({}),
-  reactions: z.record(ReactionConfigSchema).default({}),
+  // Partial like project overrides: a top-level entry that sets only some fields
+  // (e.g. just `confidenceThreshold`) must NOT get `action`/`auto` schema
+  // defaults, so applyDefaultReactions can merge it over the built-in default
+  // without silently replacing the built-in `action` (#12 review).
+  reactions: z.record(ReactionConfigSchema.partial()).default({}),
 });
 
 // =============================================================================
@@ -697,6 +703,28 @@ function validateProjectUniqueness(config: OrchestratorConfig): void {
 }
 
 /**
+ * Merge a partial reaction override over a base reaction. Shared by top-level
+ * reaction defaulting (applyDefaultReactions) and per-project override merging
+ * (getReactionConfigForSession) so both behave identically.
+ *
+ * Explicitly overriding to an autonomous action (`auto-merge`, `send-to-agent`,
+ * `spawn-session`) signals intent to ENABLE the reaction, so it does NOT inherit
+ * `auto: false` from a default like `approved-and-green` — the transition handler
+ * skips non-notify reactions when `auto === false`, which would otherwise leave
+ * both the action AND its confidence gate dead (#12 review).
+ */
+export function mergeReactionOverride(
+  base: ReactionConfig,
+  override: Partial<ReactionConfig>,
+): ReactionConfig {
+  const merged: ReactionConfig = { ...base, ...override };
+  if (override.action !== undefined && override.auto === undefined && merged.action !== "notify") {
+    merged.auto = true;
+  }
+  return merged;
+}
+
+/**
  * Sentinel string for the default `bugbot-comments` reaction message.
  * The lifecycle dispatcher replaces this exact value with a formatted listing
  * of the actual automated comments + correct-API guidance (see #895). If a
@@ -783,8 +811,20 @@ function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
     },
   };
 
-  // Merge defaults with user-specified reactions (user wins)
-  config.reactions = { ...defaults, ...config.reactions };
+  // Merge each user-specified reaction OVER the built-in default for that key
+  // (or a notify base for custom keys), per-key like project overrides. A partial
+  // override — e.g. adding only `confidenceThreshold` to `ci-failed` — then
+  // refines the default instead of dropping `action`/`auto` back to schema
+  // defaults and silently disabling the autonomous action (#12 review).
+  const mergedReactions: Record<string, ReactionConfig> = { ...defaults };
+  for (const [key, rawOverride] of Object.entries(config.reactions ?? {})) {
+    // Runtime shape is partial (root reactions parse via ReactionConfigSchema
+    // .partial()); the OrchestratorConfig type over-declares it as full.
+    const override = rawOverride as Partial<ReactionConfig>;
+    const base: ReactionConfig = mergedReactions[key] ?? { auto: true, action: "notify" };
+    mergedReactions[key] = mergeReactionOverride(base, override);
+  }
+  config.reactions = mergedReactions;
 
   return config;
 }

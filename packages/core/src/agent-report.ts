@@ -45,6 +45,8 @@ import { validateStatus } from "./utils/validation.js";
  * - `working`           — generic working signal, useful after a pause
  * - `waiting`           — blocked on an external dependency agent cannot unblock
  * - `needs_input`       — blocked on human input
+ * - `needs_decision`    — handing a judgment call up to a human with an explicit
+ *                         confidence (0..1) and question (#12)
  * - `fixing_ci`         — responding to a failing CI run
  * - `addressing_reviews`— responding to requested review changes
  * - `pr_created` / `draft_pr_created` / `ready_for_review`
@@ -60,6 +62,7 @@ export const AGENT_REPORTED_STATES = [
   "working",
   "waiting",
   "needs_input",
+  "needs_decision",
   "fixing_ci",
   "addressing_reviews",
   "pr_created",
@@ -86,6 +89,10 @@ export interface AgentReport {
   actor?: string;
   /** Which CLI surface produced this report. */
   source?: "acknowledge" | "report";
+  /** Agent-declared confidence (0..1) attached to a `needs_decision` report. */
+  confidence?: number;
+  /** The judgment-call question an agent hands up with `needs_decision`. */
+  question?: string;
 }
 
 export interface AgentReportAuditSnapshot {
@@ -118,6 +125,8 @@ export const AGENT_REPORT_METADATA_KEYS = {
   PR_NUMBER: "agentReportedPrNumber",
   PR_URL: "agentReportedPrUrl",
   PR_IS_DRAFT: "agentReportedPrIsDraft",
+  CONFIDENCE: "agentReportedConfidence",
+  QUESTION: "agentReportedQuestion",
 } as const;
 
 /** Freshness window — agent reports older than this are ignored. */
@@ -141,6 +150,9 @@ const INPUT_ALIASES: Record<string, AgentReportedState> = {
   "needs-input": "needs_input",
   needs_input: "needs_input",
   input: "needs_input",
+  "needs-decision": "needs_decision",
+  needs_decision: "needs_decision",
+  decision: "needs_decision",
   "fixing-ci": "fixing_ci",
   fixing_ci: "fixing_ci",
   ci: "fixing_ci",
@@ -176,6 +188,10 @@ export function mapAgentReportToLifecycle(state: AgentReportedState): {
     case "waiting":
       return { sessionState: "idle", sessionReason: "awaiting_external_review" };
     case "needs_input":
+      return { sessionState: "needs_input", sessionReason: "awaiting_user_input" };
+    case "needs_decision":
+      // A judgment call handed up to a human — parks in needs_input like an
+      // ordinary block, but carries a confidence + question for context (#12).
       return { sessionState: "needs_input", sessionReason: "awaiting_user_input" };
     case "fixing_ci":
       return { sessionState: "working", sessionReason: "fixing_ci" };
@@ -244,6 +260,10 @@ export interface ApplyAgentReportInput {
   prUrl?: string;
   actor?: string;
   source?: "acknowledge" | "report";
+  /** Agent-declared confidence (0..1) — attached to `needs_decision` reports. */
+  confidence?: number;
+  /** The judgment-call question handed up with a `needs_decision` report. */
+  question?: string;
   /** Override the current clock — used by tests. */
   now?: Date;
 }
@@ -418,6 +438,11 @@ export function applyAgentReport(
   const source = input.source ?? "report";
   const actor = normalizeActor(input.actor);
   const trimmedNote = input.note?.trim() || undefined;
+  const trimmedQuestion = input.question?.trim() || undefined;
+  const confidence =
+    typeof input.confidence === "number" && Number.isFinite(input.confidence)
+      ? Math.min(1, Math.max(0, input.confidence))
+      : undefined;
   const trimmedPrUrl = input.prUrl?.trim() || undefined;
   const parsedPrNumber =
     typeof input.prNumber === "number" && Number.isInteger(input.prNumber) && input.prNumber > 0
@@ -552,6 +577,16 @@ export function applyAgentReport(
           next[AGENT_REPORT_METADATA_KEYS.PR_IS_DRAFT] = prIsDraft ? "true" : "false";
         }
       }
+      // Confidence + question travel with `needs_decision` reports; clear them on
+      // every other report so a stale judgment call never lingers on the session.
+      if (input.state === "needs_decision") {
+        next[AGENT_REPORT_METADATA_KEYS.CONFIDENCE] =
+          confidence !== undefined ? String(confidence) : "";
+        next[AGENT_REPORT_METADATA_KEYS.QUESTION] = trimmedQuestion ?? "";
+      } else {
+        next[AGENT_REPORT_METADATA_KEYS.CONFIDENCE] = "";
+        next[AGENT_REPORT_METADATA_KEYS.QUESTION] = "";
+      }
       return next;
     },
     { activityEventSource: "api" },
@@ -605,6 +640,8 @@ export function applyAgentReport(
       prIsDraft,
       actor,
       source,
+      confidence: input.state === "needs_decision" ? confidence : undefined,
+      question: input.state === "needs_decision" ? trimmedQuestion : undefined,
     },
     legacyStatus,
     previousState,
@@ -631,6 +668,13 @@ export function readAgentReport(
   const prUrl = meta[AGENT_REPORT_METADATA_KEYS.PR_URL] || undefined;
   const rawPrIsDraft = meta[AGENT_REPORT_METADATA_KEYS.PR_IS_DRAFT];
   const prIsDraft = rawPrIsDraft === "true" ? true : rawPrIsDraft === "false" ? false : undefined;
+  const isDecision = state === "needs_decision";
+  const rawConfidence = meta[AGENT_REPORT_METADATA_KEYS.CONFIDENCE];
+  const parsedConfidence =
+    isDecision && rawConfidence && rawConfidence.length > 0 ? Number.parseFloat(rawConfidence) : NaN;
+  const confidence = Number.isFinite(parsedConfidence) ? parsedConfidence : undefined;
+  const rawQuestion = isDecision ? meta[AGENT_REPORT_METADATA_KEYS.QUESTION] : undefined;
+  const question = rawQuestion && rawQuestion.length > 0 ? rawQuestion : undefined;
   return {
     state: state as AgentReportedState,
     timestamp: new Date(parsed).toISOString(),
@@ -638,6 +682,8 @@ export function readAgentReport(
     prNumber,
     prUrl,
     prIsDraft,
+    confidence,
+    question,
   };
 }
 

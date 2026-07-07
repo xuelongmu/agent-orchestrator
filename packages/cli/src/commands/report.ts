@@ -39,14 +39,19 @@ function resolveSessionId(explicit: string | undefined): string {
   process.exit(1);
 }
 
-async function writeReport(
-  sessionName: string,
-  state: AgentReportedState,
-  note: string | undefined,
-  prUrl: string | undefined,
-  prNumber: number | undefined,
-  source: "acknowledge" | "report",
-): Promise<void> {
+interface WriteReportInput {
+  sessionName: string;
+  state: AgentReportedState;
+  note?: string;
+  prUrl?: string;
+  prNumber?: number;
+  confidence?: number;
+  question?: string;
+  source: "acknowledge" | "report";
+}
+
+async function writeReport(input: WriteReportInput): Promise<void> {
+  const { sessionName, state, note, prUrl, prNumber, confidence, question, source } = input;
   const config = loadConfig();
   const sm = await getSessionManager(config);
   const session = await sm.get(sessionName);
@@ -66,6 +71,8 @@ async function writeReport(
       note,
       prUrl,
       prNumber,
+      confidence,
+      question,
       source,
       actor: process.env["USER"] ?? process.env["LOGNAME"] ?? process.env["USERNAME"],
     });
@@ -81,6 +88,11 @@ async function writeReport(
         (value): value is string => Boolean(value),
       );
       console.log(chalk.dim(`  PR: ${details.join(" ")}`));
+    }
+    if (question) {
+      const confidenceLabel =
+        confidence !== undefined ? ` (confidence ${Math.round(confidence * 100)}%)` : "";
+      console.log(chalk.dim(`  decision${confidenceLabel}: ${question}`));
     }
     if (note) {
       console.log(chalk.dim(`  note: ${note}`));
@@ -102,7 +114,12 @@ export function registerAcknowledge(program: Command): void {
     .option("--note <text>", "Optional brief note to include with the acknowledgment")
     .action(async (session: string | undefined, opts: { note?: string }) => {
       const sessionId = resolveSessionId(session);
-      await writeReport(sessionId, "started", opts.note, undefined, undefined, "acknowledge");
+      await writeReport({
+        sessionName: sessionId,
+        state: "started",
+        note: opts.note,
+        source: "acknowledge",
+      });
     });
 }
 
@@ -115,7 +132,7 @@ export function registerReport(program: Command): void {
     )
     .argument(
       "<state>",
-      `One of: ${allowed} (aliases: fixing-ci, addressing-reviews, needs-input, pr-created, ready-for-review, ...)`,
+      `One of: ${allowed} (aliases: fixing-ci, addressing-reviews, needs-input, needs-decision, pr-created, ready-for-review, ...)`,
     )
     .option("-s, --session <id>", "Session ID (defaults to AO_SESSION_ID)")
     .option("--note <text>", "Optional brief note to include with the report")
@@ -127,16 +144,31 @@ export function registerReport(program: Command): void {
       "--pr-number <number>",
       "Attach a PR number to pr-created / draft-pr-created / ready-for-review reports",
     )
+    .option(
+      "--confidence <0..1>",
+      "Confidence (0..1) in the decision — hand a judgment call up with `needs-decision`",
+    )
+    .option(
+      "--question <text>",
+      "The judgment-call question for a human — used with `needs-decision`",
+    )
     .action(
       async (
         state: string,
-        opts: { session?: string; note?: string; prUrl?: string; prNumber?: string },
+        opts: {
+          session?: string;
+          note?: string;
+          prUrl?: string;
+          prNumber?: string;
+          confidence?: string;
+          question?: string;
+        },
       ) => {
         const canonical = normalizeAgentReportedState(state);
         if (!canonical) {
           console.error(
             chalk.red(
-              `Unknown state: ${state}. Allowed: ${allowed} (or aliases: fixing-ci, addressing-reviews, needs-input, pr-created, ready-for-review).`,
+              `Unknown state: ${state}. Allowed: ${allowed} (or aliases: fixing-ci, addressing-reviews, needs-input, needs-decision, pr-created, ready-for-review).`,
             ),
           );
           process.exit(1);
@@ -162,8 +194,48 @@ export function registerReport(program: Command): void {
           console.error(chalk.red(`Invalid PR number: ${opts.prNumber}`));
           process.exit(1);
         }
+        if ((opts.confidence !== undefined || opts.question) && canonical !== "needs_decision") {
+          console.error(
+            chalk.red("--confidence and --question are only valid with the needs-decision state."),
+          );
+          process.exit(1);
+        }
+        let confidence: number | undefined;
+        if (opts.confidence !== undefined) {
+          // Validate the WHOLE string first — parseFloat accepts numeric prefixes
+          // ("0.8abc" → 0.8, "0x1" → 0), which would record a bogus score.
+          const raw = opts.confidence.trim();
+          confidence = /^\d*\.?\d+$/.test(raw) ? Number.parseFloat(raw) : NaN;
+          if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+            console.error(chalk.red(`Invalid confidence: ${opts.confidence} (expected 0..1).`));
+            process.exit(1);
+          }
+        }
+        // needs-decision must carry an actionable question — the notification path
+        // drops the decision context without one. Fall back to --note if given.
+        let question = opts.question?.trim() || undefined;
+        if (canonical === "needs_decision" && !question) {
+          question = opts.note?.trim() || undefined;
+          if (!question) {
+            console.error(
+              chalk.red(
+                "needs-decision requires --question (or --note) stating the decision for the human.",
+              ),
+            );
+            process.exit(1);
+          }
+        }
         const sessionId = resolveSessionId(opts.session);
-        await writeReport(sessionId, canonical, opts.note, opts.prUrl, prNumber, "report");
+        await writeReport({
+          sessionName: sessionId,
+          state: canonical,
+          note: opts.note,
+          prUrl: opts.prUrl,
+          prNumber,
+          confidence,
+          question,
+          source: "report",
+        });
       },
     );
 }

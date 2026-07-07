@@ -34,6 +34,7 @@ The orchestrator infers your status from runtime signals, but explicit reports a
 - \`ao report working\` — declare you are actively making progress (useful after pauses or long thinking blocks).
 - \`ao report waiting\` — you are blocked on something AO cannot unblock on its own (e.g. waiting for a human, external service).
 - \`ao report needs-input\` — you need a decision or info from the human before proceeding.
+- \`ao report needs-decision --confidence <0..1> --question "..."\` — hand a specific judgment call you are not confident about up to a human, with your confidence and the question.
 - \`ao report fixing-ci\` — you are working specifically on making CI green again.
 - \`ao report addressing-reviews\` — you are working on reviewer-requested changes.
 - \`ao report pr-created --pr-url <url>\` / \`draft-pr-created\` / \`ready-for-review\` — declare PR workflow milestones as soon as you create or update the PR.

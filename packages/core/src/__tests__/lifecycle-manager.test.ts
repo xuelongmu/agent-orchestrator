@@ -6177,6 +6177,45 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
   });
 
+  // #12: a CONFIDENCE-held review send (distinct from a retry escalation) reaches
+  // the agent with nothing — so the enriched comments must be surfaced to the
+  // HUMAN instead, never silently dropped.
+  it("surfaces a confidence-HELD review send to the human instead of the agent", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    // High cumulative churn drops computeConfidence below the 0.9 threshold, so the
+    // bugbot send-to-agent reaction is HELD rather than delivered to the agent.
+    const lm = setupStuckSession(getReviewThreads, {
+      nudgeRetries: 3,
+      notifier,
+      metaOverrides: { reviewRoundCountTotal: "5" },
+    });
+    config.reactions = {
+      ...config.reactions,
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+        confidenceThreshold: 0.9,
+      },
+    };
+
+    await lm.check("app-1");
+    // Held from the agent, but surfaced to the human as ONE actionable escalation:
+    // the confidence question plus the enriched review comments.
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    const escalation = vi
+      .mocked(notifier.notify)
+      .mock.calls.find((call) =>
+        String((call[0] as { message?: string }).message ?? "").includes(
+          "Proceed manually or intervene",
+        ),
+      );
+    expect(escalation).toBeDefined();
+    // The enriched bot comment travels with the escalation.
+    expect(String((escalation![0] as { message?: string }).message)).toContain("Potential issue");
+  });
+
   // Round-7 finding (id 3521898192): the agent-stuck notify is no longer deferred,
   // so it fires immediately at the stuck transition — never delayed behind the
   // review-thread throttle.

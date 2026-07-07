@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { validateConfig } from "../config.js";
+import { mergeReactionOverride, validateConfig } from "../config.js";
 
 describe("Config Validation - Project Uniqueness", () => {
   it("accepts projects that share a basename when projectIds differ", () => {
@@ -1303,5 +1303,117 @@ describe("Config Validation - Observability Config", () => {
         },
       }),
     ).toThrow();
+  });
+});
+
+describe("Config Validation - Reaction default merging (#12)", () => {
+  it("preserves the built-in action for a threshold-only root override", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        // Only confidenceThreshold — action/auto must stay from the built-in default.
+        "ci-failed": { confidenceThreshold: 0.8 },
+      },
+    });
+    expect(config.reactions["ci-failed"].action).toBe("send-to-agent");
+    expect(config.reactions["ci-failed"].auto).toBe(true);
+    expect(config.reactions["ci-failed"].confidenceThreshold).toBe(0.8);
+    // Other built-in fields survive the merge.
+    expect(config.reactions["ci-failed"].retries).toBe(2);
+  });
+
+  it("lets an explicit action override the default while keeping other defaults", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        "ci-failed": { action: "notify" },
+      },
+    });
+    expect(config.reactions["ci-failed"].action).toBe("notify");
+    expect(config.reactions["ci-failed"].retries).toBe(2);
+  });
+
+  it("applies notify/auto defaults to a brand-new custom reaction key", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        "custom-key": { confidenceThreshold: 0.5 },
+      },
+    });
+    expect(config.reactions["custom-key"].action).toBe("notify");
+    expect(config.reactions["custom-key"].auto).toBe(true);
+  });
+});
+
+describe("Config Validation - Enabling autonomous actions (#12)", () => {
+  it("enables auto when an autonomous action is explicitly set over an auto:false default", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        // approved-and-green defaults to auto:false; an explicit auto-merge
+        // override must actually run (auto -> true), not inherit the default.
+        "approved-and-green": { action: "auto-merge", confidenceThreshold: 0.75 },
+      },
+    });
+    expect(config.reactions["approved-and-green"].auto).toBe(true);
+    expect(config.reactions["approved-and-green"].action).toBe("auto-merge");
+    expect(config.reactions["approved-and-green"].confidenceThreshold).toBe(0.75);
+  });
+
+  it("respects an explicit auto:false alongside an action override", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        "approved-and-green": { action: "auto-merge", auto: false },
+      },
+    });
+    expect(config.reactions["approved-and-green"].auto).toBe(false);
+  });
+
+  it("does not force auto for a notify action override", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        "approved-and-green": { action: "notify" },
+      },
+    });
+    // approved-and-green default auto is false; a notify override keeps it.
+    expect(config.reactions["approved-and-green"].auto).toBe(false);
+  });
+});
+
+describe("mergeReactionOverride (#12) — shared top-level + project-override merge", () => {
+  it("enables auto when an autonomous action is set over an auto:false base", () => {
+    const merged = mergeReactionOverride(
+      { auto: false, action: "notify", priority: "action" },
+      { action: "auto-merge", confidenceThreshold: 0.75 },
+    );
+    expect(merged.auto).toBe(true);
+    expect(merged.action).toBe("auto-merge");
+    expect(merged.confidenceThreshold).toBe(0.75);
+    expect(merged.priority).toBe("action"); // base fields preserved
+  });
+
+  it("preserves the base action/auto for a threshold-only override", () => {
+    const merged = mergeReactionOverride(
+      { auto: true, action: "send-to-agent", retries: 2 },
+      { confidenceThreshold: 0.8 },
+    );
+    expect(merged.action).toBe("send-to-agent");
+    expect(merged.auto).toBe(true);
+    expect(merged.retries).toBe(2);
+  });
+
+  it("respects an explicit auto:false alongside an action override", () => {
+    const merged = mergeReactionOverride(
+      { auto: false, action: "notify" },
+      { action: "auto-merge", auto: false },
+    );
+    expect(merged.auto).toBe(false);
+  });
+
+  it("does not force auto for a notify override", () => {
+    const merged = mergeReactionOverride({ auto: false, action: "notify" }, { action: "notify" });
+    expect(merged.auto).toBe(false);
   });
 });
