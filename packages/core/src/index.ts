@@ -329,6 +329,25 @@ export {
 export { execGhObserved, getGhTraceFilePath } from "./gh-trace.js";
 export { resolveNotifierTarget } from "./notifier-resolution.js";
 export {
+  NOTIFY_ACTION_EVENT_TYPES,
+  NOTIFY_CALLBACK_ACTIONS,
+  NOTIFY_CALLBACK_DEFAULT_TTL_MS,
+  NOTIFY_CALLBACK_LABELS,
+  NOTIFY_CALLBACK_MESSAGES,
+  NOTIFY_CALLBACK_SECRET_ENV,
+  buildNotifyActions,
+  getNotifyCallbackSecret,
+  isNotifyActionEvent,
+  isNotifyCallbackAction,
+  signCallbackToken,
+  verifyCallbackToken,
+} from "./notify-callback.js";
+export type {
+  BuildNotifyActionsOptions,
+  NotifyCallbackAction,
+  NotifyCallbackPayload,
+} from "./notify-callback.js";
+export {
   recordNotificationDelivery,
   sanitizeNotificationDeliveryReason,
 } from "./notification-observability.js";

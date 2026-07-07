@@ -1,0 +1,238 @@
+import {
+  getNotificationDataV3,
+  type PluginModule,
+  type Notifier,
+  type OrchestratorEvent,
+  type NotifyAction,
+  type NotifyContext,
+  type EventPriority,
+  type NotificationDataV3,
+} from "@aoagents/ao-core";
+
+export const manifest = {
+  name: "telegram",
+  slot: "notifier" as const,
+  description: "Notifier plugin: Telegram bot push with actionable inline buttons",
+  version: "0.1.0",
+};
+
+/** Telegram caps message text at 4096 chars. */
+const TELEGRAM_TEXT_MAX = 4096;
+/** Inline keyboard buttons per row for the action grid. */
+const BUTTONS_PER_ROW = 2;
+
+interface TelegramButton {
+  text: string;
+  url: string;
+}
+
+interface TelegramReplyMarkup {
+  inline_keyboard: TelegramButton[][];
+}
+
+interface Tone {
+  emoji: string;
+  label: string;
+}
+
+const SUCCESS_TONE: Tone = { emoji: "\u{2705}", label: "Complete" };
+
+const PRIORITY_TONE: Record<EventPriority, Tone> = {
+  urgent: { emoji: "\u{1F6A8}", label: "Urgent" },
+  action: { emoji: "\u{1F449}", label: "Action required" },
+  warning: { emoji: "\u{26A0}\u{FE0F}", label: "Warning" },
+  info: { emoji: "\u{2139}\u{FE0F}", label: "Information" },
+};
+
+/** Escape the five characters Telegram's HTML parse mode is sensitive to. */
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function truncate(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
+}
+
+function titleCase(value: string): string {
+  return value
+    .split(/[_\s.-]+/)
+    .filter(Boolean)
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
+
+function toneForEvent(event: OrchestratorEvent): Tone {
+  if (event.type === "merge.ready") return { ...SUCCESS_TONE, label: "Ready to merge" };
+  if (event.type === "summary.all_complete") return { ...SUCCESS_TONE, label: "All complete" };
+  if (event.type === "ci.failing" || event.type === "session.stuck") return PRIORITY_TONE.urgent;
+  if (event.type === "review.changes_requested") return PRIORITY_TONE.warning;
+  return PRIORITY_TONE[event.priority] ?? PRIORITY_TONE.info;
+}
+
+function eventTitle(event: OrchestratorEvent, data: NotificationDataV3 | null): string {
+  const pr = data?.subject.pr;
+  switch (event.type) {
+    case "ci.failing":
+      return pr ? `CI failing on PR #${pr.number}` : "CI failing";
+    case "merge.ready":
+      return pr ? `PR #${pr.number} ready to merge` : "Pull request ready to merge";
+    case "review.changes_requested":
+      return pr ? `Changes requested on PR #${pr.number}` : "Review changes requested";
+    case "session.needs_input":
+      return "Agent needs your decision";
+    case "session.stuck":
+      return "Agent may be stuck";
+    case "session.killed":
+    case "session.exited":
+      return "Agent exited";
+    case "pr.closed":
+      return pr ? `PR #${pr.number} closed` : "Pull request closed";
+    case "summary.all_complete":
+      return "All sessions complete";
+    default:
+      return titleCase(event.type);
+  }
+}
+
+function field(label: string, value: string | number | undefined | null): string | null {
+  if (value === undefined || value === null || value === "") return null;
+  return `<b>${escapeHtml(label)}:</b> ${escapeHtml(String(value))}`;
+}
+
+function buildText(event: OrchestratorEvent, data: NotificationDataV3 | null): string {
+  const tone = toneForEvent(event);
+  const pr = data?.subject.pr;
+  const issue = data?.subject.issue;
+  const branch =
+    pr?.branch && pr.baseBranch
+      ? `${pr.branch} -> ${pr.baseBranch}`
+      : (pr?.branch ?? pr?.baseBranch ?? data?.subject.branch);
+
+  const lines: string[] = [
+    `${tone.emoji} <b>${escapeHtml(eventTitle(event, data))}</b>`,
+    "",
+    escapeHtml(event.message),
+    "",
+    field("Project", event.projectId),
+    field("Session", event.sessionId),
+    field("Priority", tone.label),
+    pr ? field("Pull Request", `#${pr.number}${pr.title ? ` - ${pr.title}` : ""}`) : null,
+    field("Branch", branch),
+    issue ? field("Issue", `${issue.id}${issue.title ? ` - ${issue.title}` : ""}`) : null,
+    data?.ci?.status ? field("CI", titleCase(data.ci.status)) : null,
+    data?.review?.decision ? field("Review", titleCase(data.review.decision)) : null,
+  ].filter((line): line is string => line !== null);
+
+  return truncate(lines.join("\n"), TELEGRAM_TEXT_MAX);
+}
+
+/**
+ * Resolve an action into an absolute, tappable Telegram URL button.
+ * `url` actions pass through; `callbackEndpoint` actions (relative signed paths
+ * from core) are prefixed with the notifier's public base URL. Returns `null`
+ * when a callback action can't be made absolute (no base URL configured).
+ */
+function actionToButton(action: NotifyAction, callbackBaseUrl: string | null): TelegramButton | null {
+  const text = truncate(action.label, 64);
+  if (action.url) return { text, url: action.url };
+  if (action.callbackEndpoint && callbackBaseUrl) {
+    return { text, url: `${callbackBaseUrl}${action.callbackEndpoint}` };
+  }
+  return null;
+}
+
+function buildReplyMarkup(
+  actions: NotifyAction[],
+  callbackBaseUrl: string | null,
+): TelegramReplyMarkup | null {
+  const buttons = actions
+    .map((action) => actionToButton(action, callbackBaseUrl))
+    .filter((button): button is TelegramButton => button !== null);
+  if (buttons.length === 0) return null;
+
+  const rows: TelegramButton[][] = [];
+  for (let i = 0; i < buttons.length; i += BUTTONS_PER_ROW) {
+    rows.push(buttons.slice(i, i + BUTTONS_PER_ROW));
+  }
+  return { inline_keyboard: rows };
+}
+
+async function sendMessage(
+  botToken: string,
+  chatId: string,
+  text: string,
+  replyMarkup: TelegramReplyMarkup | null,
+): Promise<void> {
+  const payload: Record<string, unknown> = {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+
+  const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Telegram sendMessage failed (${response.status}): ${body}`);
+  }
+}
+
+/** Trim a trailing slash so `${base}${endpoint}` never doubles up. */
+function normalizeBaseUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().replace(/\/+$/, "");
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+export function create(config?: Record<string, unknown>): Notifier {
+  const botToken =
+    (config?.botToken as string | undefined) ?? process.env.TELEGRAM_BOT_TOKEN ?? undefined;
+  const chatId =
+    config?.chatId !== undefined && config?.chatId !== null
+      ? String(config.chatId)
+      : (process.env.TELEGRAM_CHAT_ID ?? undefined);
+  const callbackBaseUrl = normalizeBaseUrl(config?.callbackBaseUrl);
+
+  if (!botToken || !chatId) {
+    console.warn(
+      "[notifier-telegram] Missing botToken or chatId — notifications will be no-ops. " +
+        "Set notifiers.telegram.botToken (or TELEGRAM_BOT_TOKEN) and notifiers.telegram.chatId.",
+    );
+  } else if (!callbackBaseUrl) {
+    console.warn(
+      "[notifier-telegram] No callbackBaseUrl configured — action buttons that call back " +
+        "into AO will be omitted. Set notifiers.telegram.callbackBaseUrl to your dashboard's public URL.",
+    );
+  }
+
+  return {
+    name: "telegram",
+
+    async notify(event: OrchestratorEvent): Promise<void> {
+      if (!botToken || !chatId) return;
+      const data = getNotificationDataV3(event.data);
+      await sendMessage(botToken, chatId, buildText(event, data), null);
+    },
+
+    async notifyWithActions(event: OrchestratorEvent, actions: NotifyAction[]): Promise<void> {
+      if (!botToken || !chatId) return;
+      const data = getNotificationDataV3(event.data);
+      const replyMarkup = buildReplyMarkup(actions, callbackBaseUrl);
+      await sendMessage(botToken, chatId, buildText(event, data), replyMarkup);
+    },
+
+    async post(message: string, _context?: NotifyContext): Promise<string | null> {
+      if (!botToken || !chatId) return null;
+      await sendMessage(botToken, chatId, truncate(escapeHtml(message), TELEGRAM_TEXT_MAX), null);
+      return null;
+    },
+  };
+}
+
+export default { manifest, create } satisfies PluginModule<Notifier>;
