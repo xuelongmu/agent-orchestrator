@@ -1,6 +1,6 @@
 {
   "name": "@aoagents/ao-plugin-notifier-telegram",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "description": "Notifier plugin: Telegram bot push notifications with actionable inline buttons",
   "license": "MIT",
   "type": "module",
