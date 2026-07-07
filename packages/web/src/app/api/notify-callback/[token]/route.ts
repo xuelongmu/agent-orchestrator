@@ -2,8 +2,10 @@ import { type NextRequest } from "next/server";
 import { getServices } from "@/lib/services";
 import { validateIdentifier } from "@/lib/validation";
 import {
+  ACTIVITY_STATE,
   SessionNotFoundError,
   getNotifyCallbackSecret,
+  isTerminalSession,
   verifyCallbackToken,
   NOTIFY_CALLBACK_MESSAGES,
   recordActivityEvent,
@@ -108,7 +110,55 @@ export async function GET(
 
   try {
     const { config, sessionManager } = await getServices();
-    const resolvedProjectId = resolveProjectIdForSessionId(config, sessionId) ?? projectId;
+
+    // Re-read the session and confirm it's still in a state where this decision
+    // applies. A signed link stays valid for its TTL, so a human could tap an
+    // older notification after the agent has moved on — applying a stale
+    // Approve/Deny/Nudge would inject an unrelated instruction, and a stale Kill
+    // would terminate active work. Reject when the session is gone, terminal, or
+    // actively working again. (#13, review)
+    const session = await sessionManager.get(sessionId);
+    const resolvedProjectId =
+      session?.projectId ?? resolveProjectIdForSessionId(config, sessionId) ?? projectId;
+
+    if (!session) {
+      return htmlResponse(
+        404,
+        "Session not found",
+        "That session no longer exists — it may have already finished or been cleaned up.",
+      );
+    }
+
+    const isStale = isTerminalSession(session) || session.activity === ACTIVITY_STATE.ACTIVE;
+    if (isStale) {
+      recordApiObservation({
+        config,
+        method: "GET",
+        path: "/api/notify-callback/[token]",
+        correlationId,
+        startedAt,
+        outcome: "failure",
+        statusCode: 409,
+        projectId: resolvedProjectId,
+        sessionId,
+        reason: "stale callback action",
+        data: { action, activity: session.activity, status: session.status },
+      });
+      recordActivityEvent({
+        projectId: resolvedProjectId,
+        sessionId,
+        source: "api",
+        kind: "api.notify_callback.stale",
+        level: "warn",
+        summary: `notification action "${action}" ignored as stale for session ${sessionId}`,
+        data: { action, activity: session.activity, status: session.status },
+      });
+      return htmlResponse(
+        409,
+        "Action no longer applies",
+        "This decision has already moved on — the session finished or is working again, so no action was taken.",
+      );
+    }
 
     if (action === "kill") {
       await sessionManager.kill(sessionId);

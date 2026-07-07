@@ -18,6 +18,10 @@ export const manifest = {
 
 /** Telegram caps message text at 4096 chars. */
 const TELEGRAM_TEXT_MAX = 4096;
+/** Max escaped length for the free-form message line, leaving room for fields. */
+const MESSAGE_MAX_ESCAPED = 3500;
+/** Max raw length for a single field value before escaping. */
+const FIELD_VALUE_MAX_RAW = 300;
 /** Inline keyboard buttons per row for the action grid. */
 const BUTTONS_PER_ROW = 2;
 
@@ -49,8 +53,43 @@ function escapeHtml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** Truncate raw (unescaped) text with an ellipsis. Safe to escape afterwards. */
 function truncate(value: string, maxLength: number): string {
   return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
+}
+
+/**
+ * Clamp an already-escaped HTML string to `max`, backing off so the cut never
+ * lands inside an entity (e.g. `&amp;`). Used for tag-free content (the message
+ * line, `post()`); tag balance is preserved separately by whole-line assembly.
+ */
+function clampEscapedHtml(escaped: string, max: number): string {
+  if (escaped.length <= max) return escaped;
+  let cut = max;
+  const amp = escaped.lastIndexOf("&", cut - 1);
+  if (amp !== -1) {
+    const semi = escaped.indexOf(";", amp);
+    if (semi === -1 || semi >= cut) cut = amp; // cut is inside an entity → back off
+  }
+  return escaped.slice(0, cut);
+}
+
+/**
+ * Join HTML lines up to `max` chars, dropping whole trailing lines that don't
+ * fit. Because each line carries balanced `<b>` tags and complete entities,
+ * whole-line truncation can never split a tag or entity (which Telegram would
+ * reject as malformed HTML).
+ */
+function joinLinesWithinLimit(lines: string[], max: number): string {
+  const out: string[] = [];
+  let len = 0;
+  for (const line of lines) {
+    const addition = (out.length > 0 ? 1 : 0) + line.length;
+    if (len + addition > max) break;
+    out.push(line);
+    len += addition;
+  }
+  return out.join("\n");
 }
 
 function titleCase(value: string): string {
@@ -96,7 +135,7 @@ function eventTitle(event: OrchestratorEvent, data: NotificationDataV3 | null): 
 
 function field(label: string, value: string | number | undefined | null): string | null {
   if (value === undefined || value === null || value === "") return null;
-  return `<b>${escapeHtml(label)}:</b> ${escapeHtml(String(value))}`;
+  return `<b>${escapeHtml(label)}:</b> ${escapeHtml(truncate(String(value), FIELD_VALUE_MAX_RAW))}`;
 }
 
 function buildText(event: OrchestratorEvent, data: NotificationDataV3 | null): string {
@@ -111,7 +150,9 @@ function buildText(event: OrchestratorEvent, data: NotificationDataV3 | null): s
   const lines: string[] = [
     `${tone.emoji} <b>${escapeHtml(eventTitle(event, data))}</b>`,
     "",
-    escapeHtml(event.message),
+    // Escape first (produces complete entities), then clamp on an entity
+    // boundary so a long message can't split `&amp;` mid-sequence.
+    clampEscapedHtml(escapeHtml(event.message), MESSAGE_MAX_ESCAPED),
     "",
     field("Project", event.projectId),
     field("Session", event.sessionId),
@@ -123,7 +164,8 @@ function buildText(event: OrchestratorEvent, data: NotificationDataV3 | null): s
     data?.review?.decision ? field("Review", titleCase(data.review.decision)) : null,
   ].filter((line): line is string => line !== null);
 
-  return truncate(lines.join("\n"), TELEGRAM_TEXT_MAX);
+  // Assemble on whole-line boundaries so no `<b>` tag or entity is ever split.
+  return joinLinesWithinLimit(lines, TELEGRAM_TEXT_MAX);
 }
 
 /**
@@ -229,7 +271,12 @@ export function create(config?: Record<string, unknown>): Notifier {
 
     async post(message: string, _context?: NotifyContext): Promise<string | null> {
       if (!botToken || !chatId) return null;
-      await sendMessage(botToken, chatId, truncate(escapeHtml(message), TELEGRAM_TEXT_MAX), null);
+      await sendMessage(
+        botToken,
+        chatId,
+        clampEscapedHtml(escapeHtml(message), TELEGRAM_TEXT_MAX),
+        null,
+      );
       return null;
     },
   };

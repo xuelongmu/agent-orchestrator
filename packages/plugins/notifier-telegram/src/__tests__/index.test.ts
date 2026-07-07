@@ -104,6 +104,38 @@ describe("notifier-telegram", () => {
     expect(text).toContain("a &lt;b&gt; &amp; c &gt; d");
   });
 
+  it("truncates a long message without splitting an HTML entity", async () => {
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    // 5000 ampersands each escape to "&amp;" (5 chars) — escaping then a naive
+    // char-truncate would slice through an entity and produce malformed HTML.
+    const notifier = create({ botToken: BOT_TOKEN, chatId: CHAT_ID });
+    await notifier.notify(makeEvent({ message: "&".repeat(5000) }));
+
+    const text = String(lastBody(fetchMock).text);
+    expect(text.length).toBeLessThanOrEqual(4096);
+    // Every "&" in the output must be the start of a complete entity.
+    const withoutEntities = text.replace(/&(amp|lt|gt);/g, "");
+    expect(withoutEntities).not.toContain("&");
+  });
+
+  it("drops whole field lines rather than splitting a <b> tag", async () => {
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const notifier = create({ botToken: BOT_TOKEN, chatId: CHAT_ID });
+    await notifier.notify(makeEvent({ message: "x".repeat(4090) }));
+
+    const text = String(lastBody(fetchMock).text);
+    expect(text.length).toBeLessThanOrEqual(4096);
+    // No unbalanced/partial bold tags.
+    const opens = (text.match(/<b>/g) ?? []).length;
+    const closes = (text.match(/<\/b>/g) ?? []).length;
+    expect(opens).toBe(closes);
+    expect(text).not.toMatch(/<b?$|<\/?b?$/); // no dangling tag fragment at the end
+  });
+
   it("renders inline keyboard buttons with absolute callback URLs", async () => {
     const fetchMock = okFetch();
     vi.stubGlobal("fetch", fetchMock);
