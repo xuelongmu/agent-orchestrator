@@ -93,11 +93,7 @@ import {
 import { createCorrelationId, createProjectObserver } from "./observability.js";
 import { resolveNotifierTarget } from "./notifier-resolution.js";
 import { recordNotificationDelivery } from "./notification-observability.js";
-import {
-  buildNotifyActions,
-  getNotifyCallbackSecret,
-  isNotifyActionEvent,
-} from "./notify-callback.js";
+import { buildNotifyActions, getNotifyCallbackSecret } from "./notify-callback.js";
 import { resolveSessionRole } from "./agent-selection.js";
 import {
   DETECTING_MAX_ATTEMPTS,
@@ -4020,14 +4016,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       config.defaults.notifiers;
 
     // Build actionable Approve/Deny/Nudge/Kill buttons for decision events when
-    // a shared callback secret is configured (opt-in via env). Non-decision
-    // events, or an unset secret, yield no actions and fall back to plain
-    // notify — preserving existing behavior. (#13)
+    // a shared callback secret is configured (opt-in via env). buildNotifyActions
+    // resolves the decision type from the notification data's semanticType, so
+    // reaction-wrapped decisions (agent-needs-input / approved-and-green, sent as
+    // `reaction.triggered`) get buttons too; non-decision events yield no actions
+    // and fall back to plain notify — preserving existing behavior. (#13)
     const callbackSecret = getNotifyCallbackSecret();
-    const actions =
-      callbackSecret && isNotifyActionEvent(eventWithPriority.type)
-        ? buildNotifyActions(eventWithPriority, { secret: callbackSecret })
-        : [];
+    const actions = callbackSecret
+      ? buildNotifyActions(eventWithPriority, { secret: callbackSecret })
+      : [];
 
     let delivered = false;
     for (const name of notifierNames) {

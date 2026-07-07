@@ -74,9 +74,20 @@ export function isNotifyCallbackAction(value: unknown): value is NotifyCallbackA
   );
 }
 
-/** True when an event type carries actionable decision buttons. */
-export function isNotifyActionEvent(type: EventType): boolean {
-  return NOTIFY_ACTION_EVENT_TYPES.includes(type);
+/** True when an event/semantic type carries actionable decision buttons. */
+export function isNotifyActionEvent(type: string): boolean {
+  return (NOTIFY_ACTION_EVENT_TYPES as readonly string[]).includes(type);
+}
+
+/**
+ * The decision type an event actually represents. Reaction-wrapped decisions
+ * (e.g. `agent-needs-input`, `approved-and-green`) are notified as
+ * `reaction.triggered` events whose real decision type lives in the
+ * notification data's `semanticType` — prefer that, falling back to the raw
+ * event type for direct transition notifications.
+ */
+export function resolveDecisionEventType(event: OrchestratorEvent): string {
+  return getNotificationDataV3(event.data)?.semanticType ?? event.type;
 }
 
 /** Read the shared callback secret from the environment (trimmed, non-empty). */
@@ -180,7 +191,7 @@ export function buildNotifyActions(
   event: OrchestratorEvent,
   options: BuildNotifyActionsOptions,
 ): NotifyAction[] {
-  if (!isNotifyActionEvent(event.type)) return [];
+  if (!isNotifyActionEvent(resolveDecisionEventType(event))) return [];
 
   const now = options.now ?? Date.now();
   const exp = now + (options.ttlMs ?? NOTIFY_CALLBACK_DEFAULT_TTL_MS);

@@ -7,6 +7,7 @@ import {
   getNotifyCallbackSecret,
   isNotifyActionEvent,
   isNotifyCallbackAction,
+  resolveDecisionEventType,
   signCallbackToken,
   verifyCallbackToken,
   type NotifyCallbackPayload,
@@ -128,6 +129,26 @@ describe("isNotifyActionEvent", () => {
   });
 });
 
+describe("resolveDecisionEventType", () => {
+  it("prefers data.semanticType over the raw event type", () => {
+    const event = makeEvent({
+      type: "reaction.triggered",
+      data: {
+        schemaVersion: NOTIFICATION_DATA_SCHEMA_VERSION,
+        semanticType: "merge.ready",
+        subject: { session: { id: "ao-5", projectId: "ao" } },
+      },
+    });
+    expect(resolveDecisionEventType(event)).toBe("merge.ready");
+  });
+
+  it("falls back to the raw event type when there is no v3 data", () => {
+    expect(resolveDecisionEventType(makeEvent({ type: "session.needs_input", data: {} }))).toBe(
+      "session.needs_input",
+    );
+  });
+});
+
 describe("getNotifyCallbackSecret", () => {
   it("returns trimmed non-empty secret", () => {
     expect(getNotifyCallbackSecret({ [NOTIFY_CALLBACK_SECRET_ENV]: "  s3cret  " })).toBe("s3cret");
@@ -180,6 +201,33 @@ describe("buildNotifyActions", () => {
 
   it("returns no actions for non-decision events", () => {
     expect(buildNotifyActions(makeEvent({ type: "ci.failing" }), { secret: SECRET })).toEqual([]);
+  });
+
+  it("builds actions for a reaction-wrapped decision via data.semanticType", () => {
+    // agent-needs-input / approved-and-green are notified as `reaction.triggered`
+    // events whose real decision type lives in data.semanticType.
+    const event = makeEvent({
+      type: "reaction.triggered",
+      data: {
+        schemaVersion: NOTIFICATION_DATA_SCHEMA_VERSION,
+        semanticType: "session.needs_input",
+        subject: { session: { id: "ao-5", projectId: "ao" } },
+      },
+    });
+    const actions = buildNotifyActions(event, { secret: SECRET });
+    expect(actions.map((a) => a.label)).toEqual(["Approve", "Deny", "Nudge", "Kill"]);
+  });
+
+  it("returns no actions for a reaction wrapping a non-decision semanticType", () => {
+    const event = makeEvent({
+      type: "reaction.triggered",
+      data: {
+        schemaVersion: NOTIFICATION_DATA_SCHEMA_VERSION,
+        semanticType: "ci.failing",
+        subject: { session: { id: "ao-5", projectId: "ao" } },
+      },
+    });
+    expect(buildNotifyActions(event, { secret: SECRET })).toEqual([]);
   });
 
   it("respects a custom ttl", () => {

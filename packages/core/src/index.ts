@@ -339,6 +339,7 @@ export {
   getNotifyCallbackSecret,
   isNotifyActionEvent,
   isNotifyCallbackAction,
+  resolveDecisionEventType,
   signCallbackToken,
   verifyCallbackToken,
 } from "./notify-callback.js";
