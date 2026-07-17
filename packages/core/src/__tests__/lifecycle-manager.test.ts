@@ -1266,7 +1266,11 @@ describe("check (single session)", () => {
         expect.objectContaining({ type: "session.needs_input" }),
       );
     } finally {
-      process.env.AO_NOTIFY_CALLBACK_SECRET = previousSecret;
+      // Assigning undefined would store the STRING "undefined", which
+      // getNotifyCallbackSecret reads as a perfectly valid secret — silently
+      // enabling callbacks for every later test in this file.
+      if (previousSecret === undefined) delete process.env.AO_NOTIFY_CALLBACK_SECRET;
+      else process.env.AO_NOTIFY_CALLBACK_SECRET = previousSecret;
     }
   });
 
