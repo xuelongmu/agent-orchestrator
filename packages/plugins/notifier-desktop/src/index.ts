@@ -554,6 +554,10 @@ export function create(config?: Record<string, unknown>): Notifier {
   return {
     name: "desktop",
 
+    // Resolves relative callback endpoints against the configured dashboard URL
+    // (and drops the control when unset), so it may receive callback actions.
+    resolvesActionCallbacks: true,
+
     async notify(event: OrchestratorEvent): Promise<void> {
       const content = formatContent(event);
       const sound = shouldPlaySound(event.priority, soundEnabled);

@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import {
   NOTIFY_CALLBACK_ACTIONS,
   NOTIFY_CALLBACK_SECRET_ENV,
+  actionsForNotifier,
   buildNotifyActions,
   getNotifyCallbackSecret,
   isNotifyActionEvent,
@@ -12,7 +13,7 @@ import {
   verifyCallbackToken,
   type NotifyCallbackPayload,
 } from "../notify-callback.js";
-import type { EventType, OrchestratorEvent } from "../types.js";
+import type { EventType, NotifyAction, OrchestratorEvent } from "../types.js";
 import { NOTIFICATION_DATA_SCHEMA_VERSION } from "../notification-data.js";
 
 const SECRET = "test-secret-abc123";
@@ -318,5 +319,37 @@ describe("buildNotifyActions", () => {
     const token = actions[0].callbackEndpoint!.replace("/api/notify-callback/", "");
     expect(verifyCallbackToken(token, SECRET, now + 4_999)).not.toBeNull();
     expect(verifyCallbackToken(token, SECRET, now + 5_001)).toBeNull();
+  });
+});
+
+describe("actionsForNotifier", () => {
+  const approve: NotifyAction = {
+    label: "Approve",
+    callbackEndpoint: "/api/notify-callback/tok",
+  };
+  const deny: NotifyAction = { label: "Deny", callbackEndpoint: "/api/notify-callback/tok2" };
+  const viewPr: NotifyAction = { label: "View PR", url: "https://github.com/acme/x/pull/7" };
+  const absoluteCb: NotifyAction = {
+    label: "Approve",
+    callbackEndpoint: "https://ao.example.com/api/notify-callback/tok",
+  };
+
+  it("passes every action through to a notifier that resolves callbacks", () => {
+    expect(actionsForNotifier([approve, deny, viewPr], true)).toEqual([approve, deny, viewPr]);
+  });
+
+  it("strips relative callback actions for a notifier that cannot resolve them", () => {
+    // Slack/OpenClaw would render Approve/Deny as controls that never reach the
+    // AO route; only the View PR link survives.
+    expect(actionsForNotifier([approve, deny, viewPr], false)).toEqual([viewPr]);
+    expect(actionsForNotifier([approve, deny, viewPr], undefined)).toEqual([viewPr]);
+  });
+
+  it("keeps an already-absolute callback endpoint for any notifier", () => {
+    expect(actionsForNotifier([absoluteCb], false)).toEqual([absoluteCb]);
+  });
+
+  it("returns nothing when a non-resolving notifier has only relative callbacks", () => {
+    expect(actionsForNotifier([approve, deny], false)).toEqual([]);
   });
 });

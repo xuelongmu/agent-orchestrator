@@ -3433,26 +3433,39 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
 
       await runtimePlugin.sendMessage(handle, message);
 
-      for (let attempt = 1; attempt <= SEND_CONFIRMATION_ATTEMPTS; attempt++) {
-        // Sleep before each check (including the first) so the runtime has time
-        // to reflect the message in its output.
-        await sleep(SEND_CONFIRMATION_POLL_MS);
+      // DELIVERY HAS CROSSED THE BOUNDARY. Everything below is best-effort
+      // CONFIRMATION and must never throw — the soft-success contract already
+      // documented at the tail of this function: once the message is on the
+      // runtime, a failure to *confirm* it must not be reported to the caller as a
+      // failed send. `captureOutput` is already catch-guarded; the OpenCode
+      // `session list` probe was not, so a probe failure after delivery rejected
+      // the whole send even though the message went out. Wrapping the loop makes
+      // that contract structural, not incidental to which helpers happen to
+      // swallow their own errors (#13 review).
+      try {
+        for (let attempt = 1; attempt <= SEND_CONFIRMATION_ATTEMPTS; attempt++) {
+          // Sleep before each check (including the first) so the runtime has time
+          // to reflect the message in its output.
+          await sleep(SEND_CONFIRMATION_POLL_MS);
 
-        const output = await captureOutput(handle);
-        const activity = detectActivityFromOutput(output) ?? session.activity;
-        const updatedAt = await getOpenCodeSessionUpdatedAt();
-        const delivered =
-          (baselineUpdatedAt !== undefined &&
-            updatedAt !== undefined &&
-            updatedAt > baselineUpdatedAt) ||
-          hasQueuedMessage(output) ||
-          (output.length > 0 && output !== baselineOutput) ||
-          (baselineActivity !== "active" && activity === "active") ||
-          (baselineActivity !== "waiting_input" && activity === "waiting_input");
+          const output = await captureOutput(handle);
+          const activity = detectActivityFromOutput(output) ?? session.activity;
+          const updatedAt = await getOpenCodeSessionUpdatedAt();
+          const delivered =
+            (baselineUpdatedAt !== undefined &&
+              updatedAt !== undefined &&
+              updatedAt > baselineUpdatedAt) ||
+            hasQueuedMessage(output) ||
+            (output.length > 0 && output !== baselineOutput) ||
+            (baselineActivity !== "active" && activity === "active") ||
+            (baselineActivity !== "waiting_input" && activity === "waiting_input");
 
-        if (delivered) {
-          return;
+          if (delivered) {
+            return;
+          }
         }
+      } catch {
+        // Confirmation failed after delivery — fall through to soft success.
       }
 
       // Message was already sent via runtimePlugin.sendMessage above — if we

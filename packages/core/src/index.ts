@@ -340,6 +340,7 @@ export {
   NOTIFY_CALLBACK_LABELS,
   NOTIFY_CALLBACK_MESSAGES,
   NOTIFY_CALLBACK_SECRET_ENV,
+  actionsForNotifier,
   buildNotifyActions,
   getNotifyCallbackSecret,
   isNotifyActionEvent,
@@ -364,7 +365,6 @@ export {
   isNudgeBlocked,
   isParkedOnDecision,
   isResolvingCallbackAction,
-  releaseDecision,
   storedDecisionId,
 } from "./notify-decision.js";
 export {

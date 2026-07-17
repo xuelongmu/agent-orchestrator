@@ -273,6 +273,10 @@ export function create(config?: Record<string, unknown>): Notifier {
   return {
     name: "telegram",
 
+    // Resolves relative callback endpoints against callbackBaseUrl (and drops the
+    // button when unset), so it may receive the mutating callback actions.
+    resolvesActionCallbacks: true,
+
     async notify(event: OrchestratorEvent): Promise<void> {
       if (!botToken || !chatId) return;
       const data = getNotificationDataV3(event.data);

@@ -256,3 +256,28 @@ export function buildNotifyActions(
 
   return actions;
 }
+
+/** Whether a callback endpoint is already an absolute http(s) URL. */
+function isAbsoluteHttpCallback(endpoint: string | undefined): endpoint is string {
+  return typeof endpoint === "string" && /^https?:\/\//i.test(endpoint);
+}
+
+/**
+ * The subset of `actions` a notifier may render, given whether it can resolve a
+ * RELATIVE callback endpoint (`/api/notify-callback/<token>`) into a working URL.
+ *
+ * Notifiers that resolve them (Telegram/desktop prepend their configured base URL;
+ * the dashboard is same-origin) receive everything. Notifiers that cannot (Slack
+ * turns the endpoint into an interaction value, OpenClaw into a relative markdown
+ * link — neither reaches the AO route) must NOT be handed the mutating callback
+ * actions, or the human sees Approve/Deny/Nudge/Kill controls that can never
+ * resolve the decision. Ordinary URL actions (View PR) and any already-absolute
+ * callback endpoint pass through to every notifier. (#13 review)
+ */
+export function actionsForNotifier(
+  actions: NotifyAction[],
+  resolvesActionCallbacks: boolean | undefined,
+): NotifyAction[] {
+  if (resolvesActionCallbacks) return actions;
+  return actions.filter((action) => action.url || isAbsoluteHttpCallback(action.callbackEndpoint));
+}

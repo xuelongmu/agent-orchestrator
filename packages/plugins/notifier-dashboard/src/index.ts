@@ -40,6 +40,10 @@ export function create(config?: Record<string, unknown>): Notifier {
   return {
     name: "dashboard",
 
+    // The AO web app serves /api/notify-callback at the same origin it renders
+    // these notifications in, so a relative callback endpoint resolves there.
+    resolvesActionCallbacks: true,
+
     async notify(event: OrchestratorEvent): Promise<void> {
       persist(event);
     },

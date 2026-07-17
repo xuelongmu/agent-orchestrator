@@ -97,6 +97,7 @@ import { createCorrelationId, createProjectObserver } from "./observability.js";
 import { resolveNotifierTarget } from "./notifier-resolution.js";
 import { recordNotificationDelivery } from "./notification-observability.js";
 import {
+  actionsForNotifier,
   buildNotifyActions,
   getNotifyCallbackSecret,
   isNotifyActionEvent,
@@ -4160,11 +4161,18 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         continue;
       }
 
-      const useActions = actions.length > 0 && typeof notifier.notifyWithActions === "function";
+      // A notifier that cannot resolve a relative callback endpoint (Slack turns
+      // it into an interaction value, OpenClaw into a relative markdown link —
+      // neither reaches the AO route) must not render mutating callback controls;
+      // ordinary URL actions (View PR) still pass through. (#13 review)
+      const notifierActions = actionsForNotifier(actions, notifier.resolvesActionCallbacks);
+
+      const useActions =
+        notifierActions.length > 0 && typeof notifier.notifyWithActions === "function";
       const method = useActions ? "notifyWithActions" : "notify";
       try {
         if (useActions) {
-          await notifier.notifyWithActions!(eventWithPriority, actions);
+          await notifier.notifyWithActions!(eventWithPriority, notifierActions);
         } else {
           await notifier.notify(eventWithPriority);
         }

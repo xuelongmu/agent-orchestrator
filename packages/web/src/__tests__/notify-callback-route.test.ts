@@ -56,9 +56,6 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
       consumedDecisions.add(key);
       return true;
     },
-    releaseDecision: (projectId: string, sessionId: string, decisionId: string) => {
-      consumedDecisions.delete(consumeKey(projectId, sessionId, decisionId));
-    },
     // Route wiring only: block a nudge once the decision is consumed. The
     // stored-identity-superseded branch is exercised against real metadata in
     // notify-decision.test.ts.
@@ -351,18 +348,29 @@ describe("POST /api/notify-callback/[token]", () => {
     expect(send.mock.calls.length + kill.mock.calls.length).toBe(1);
   });
 
-  it("releases the decision claim when dispatch fails so a retry can succeed", async () => {
-    send.mockRejectedValueOnce(new Error("transient"));
+  it("keeps the claim closed after an ambiguous send failure — no double dispatch", async () => {
+    // `send` can write the message to the runtime and THEN reject (an IPC timeout,
+    // or a post-delivery confirmation probe error). The decision must stay consumed
+    // so a retry cannot deliver the same approval twice. (#13 review)
+    let delivered = 0;
+    // Once-only: the retry is refused before dispatch, so send falls back to the
+    // default resolving impl and never fires again.
+    send.mockImplementationOnce(async () => {
+      delivered += 1;
+      throw new Error("delivered, then the confirmation probe timed out");
+    });
+
     const first = await callGet(token("approve"));
     expect(first.status).toBe(500);
+    expect(delivered).toBe(1);
+
+    // Same token, retried after the ambiguous failure: refused, no second delivery.
     const retry = await callGet(token("approve"));
-    expect(retry.status).toBe(200);
-    expect(send).toHaveBeenCalledTimes(2);
+    expect(retry.status).toBe(409);
+    expect(delivered).toBe(1);
   });
 
-  it("keeps the claim when post-dispatch bookkeeping throws — the action already fired", async () => {
-    // Only a failed dispatch may release the claim. If an audit-trail failure
-    // released it, a second tap could re-fire an action that already ran.
+  it("keeps the claim closed when post-dispatch bookkeeping throws — the action already fired", async () => {
     recordActivityEvent.mockImplementationOnce(() => {
       throw new Error("audit sink down");
     });

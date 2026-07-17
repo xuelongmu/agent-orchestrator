@@ -1333,6 +1333,16 @@ export interface BatchObserver {
 export interface Notifier {
   readonly name: string;
 
+  /**
+   * Whether this notifier can turn a RELATIVE `callbackEndpoint`
+   * (`/api/notify-callback/<token>`) into a working URL — i.e. it prepends its own
+   * configured dashboard base URL (and drops the control when it has none). Only
+   * such notifiers receive the mutating callback actions; others render broken
+   * controls that never reach the AO route. Absolute-URL actions (e.g. View PR)
+   * are unaffected and always delivered. Defaults to false. (#13 review)
+   */
+  readonly resolvesActionCallbacks?: boolean;
+
   /** Push a notification to the human */
   notify(event: OrchestratorEvent): Promise<void>;
 

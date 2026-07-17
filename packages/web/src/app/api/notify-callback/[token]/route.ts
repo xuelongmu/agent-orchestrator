@@ -10,7 +10,6 @@ import {
   isNudgeBlocked,
   isResolvingCallbackAction,
   isTerminalSession,
-  releaseDecision,
   verifyCallbackToken,
   NOTIFY_CALLBACK_LABELS,
   NOTIFY_CALLBACK_MESSAGES,
@@ -370,24 +369,23 @@ export async function POST(
       );
     }
 
-    // Release the instance only when the dispatch itself failed, so a genuine
-    // failure stays retryable. Anything after this point (audit bookkeeping) must
-    // NOT release it — the action already fired, and re-opening the decision
-    // would let a second tap dispatch it twice.
     // Dispatch inside the SIGNED project. Validating the session against the
     // token's project is not enough on its own: unscoped, `send`/`kill` resolve
     // the session by scanning projects in config order, so with a duplicate
     // session id they could act on a different project's session than the one
     // just validated. (#13, review)
-    try {
-      if (action === "kill") {
-        await sessionManager.kill(sessionId, { projectId });
-      } else {
-        await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action], projectId);
-      }
-    } catch (err) {
-      if (consumes) releaseDecision(projectId, sessionId, decisionId);
-      throw err;
+    //
+    // Once the dispatch call is ATTEMPTED the consumed claim stays closed, even if
+    // it rejects: `sessionManager.send` can write the message to the runtime and
+    // then reject (an IPC timeout, or a post-delivery confirmation error), so a
+    // rejection is only SUSPECTED non-delivery, never known. Reopening the claim
+    // would let a retry deliver the same Approve/Deny/Kill a second time. At-most-
+    // once wins over retryability here; a genuinely undelivered action is recovered
+    // by the agent re-reporting needs_input, which mints a fresh decision. (#13 rev)
+    if (action === "kill") {
+      await sessionManager.kill(sessionId, { projectId });
+    } else {
+      await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action], projectId);
     }
 
     recordApiObservation({

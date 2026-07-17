@@ -20,7 +20,6 @@ import {
   decisionEpisodeTransition,
   isNudgeBlocked,
   isResolvingCallbackAction,
-  releaseDecision,
   storedDecisionId,
   NOTIFY_DECISION_METADATA_KEYS,
 } from "../notify-decision.js";
@@ -421,16 +420,10 @@ describe("consumeDecision", () => {
     }
   });
 
-  it("releases only the named instance so a failed dispatch is retryable", () => {
+  it("stays claimed after a failed dispatch — at-most-once holds across retries", () => {
+    // The route no longer reopens a consumed claim on send failure (delivery may
+    // have already crossed the boundary), so a retry with the same id is refused.
     expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(true);
-    releaseDecision(PROJECT_ID, SESSION_ID, ID);
-    expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(true);
-  });
-
-  it("release is a no-op for an instance that is not the consumed one", () => {
-    expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(true);
-    releaseDecision(PROJECT_ID, SESSION_ID, "some-other-decision");
-    // The real claim must survive a release aimed at a different instance.
     expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(false);
   });
 });

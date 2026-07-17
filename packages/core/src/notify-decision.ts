@@ -287,23 +287,6 @@ export function clearSpentDecision(
 }
 
 /**
- * Hand a consumed instance back, so a genuinely failed dispatch stays retryable.
- * Only releases the instance named by `decisionId`, so it can never reopen a
- * different decision that was claimed in the meantime.
- */
-export function releaseDecision(
-  projectId: string,
-  sessionId: SessionId,
-  decisionId: string,
-): void {
-  mutateMetadata(getProjectSessionsDir(projectId), sessionId, (existing) =>
-    existing[NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID] === decisionId
-      ? { ...existing, [NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID]: "" }
-      : existing,
-  );
-}
-
-/**
  * Metadata patch that retires a spent decision instance: the report identity
  * itself plus its consumption marker. Applied by the lifecycle poll when a
  * decision stops being active, so the next decision starts from a clean slate.

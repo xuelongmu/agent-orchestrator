@@ -25,7 +25,10 @@ resolve them from the notification — closing the loop back into AO (#13).
   core exports: `buildNotifyActions`, `signCallbackToken`, `verifyCallbackToken`,
   `getNotifyCallbackSecret`, `isNotifyActionEvent`, `resolveDecisionEventType`,
   and the `NOTIFY_CALLBACK_*` constants.
-- New web route `GET /api/notify-callback/:token` verifies the token, resolves
-  the decision (Approve/Deny/Nudge answer back into the session via
-  `sessionManager.send`; Kill terminates it), and records the action in the
-  audit trail.
+- New web route `/api/notify-callback/:token`. `GET` is inert: it verifies the
+  token and renders a confirmation page whose form submits a `POST` — a signed URL
+  proves AO minted it but not that a human tapped it, so link scanners, URL
+  unfurlers, and browser prefetch must not be able to trigger the action. The
+  `POST` is where the decision is resolved (Approve/Deny/Nudge answer back into the
+  session via `sessionManager.send`; Kill terminates it) and recorded in the audit
+  trail.
