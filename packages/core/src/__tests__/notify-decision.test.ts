@@ -15,23 +15,44 @@ vi.mock("../paths.js", async (importOriginal) => {
 import {
   activeDecisionId,
   consumeDecision,
+  decisionEpisodePatch,
   isResolvingCallbackAction,
   releaseDecision,
   NOTIFY_DECISION_METADATA_KEYS,
 } from "../notify-decision.js";
 import { AGENT_REPORT_METADATA_KEYS } from "../agent-report.js";
-import { readMetadataRaw } from "../metadata.js";
+import { mutateMetadata, readMetadataRaw } from "../metadata.js";
 import type { Session } from "../types.js";
 
 const SESSION_ID = "ao-5";
 const PROJECT_ID = "ao";
 
+/**
+ * Give the session a metadata file, as a real session always has by the time a
+ * callback can reach it: the route only consumes after `get` resolved the session
+ * from this very file. `consumeDecision` deliberately does not create one — that
+ * would fabricate metadata for a session that does not exist.
+ */
+function seedSessionMetadata(dir: string): void {
+  mutateMetadata(dir, SESSION_ID, (existing) => ({ ...existing, sessionName: SESSION_ID }), {
+    createIfMissing: true,
+  });
+}
+
+const EPISODE_AT = "2026-07-17T09:00:00.000Z";
+
 function makeSession(overrides: {
   at?: string;
   state?: string;
   lifecycleState?: string;
+  episodeAt?: string | null;
 }): Session {
-  const { at = new Date().toISOString(), state = "needs_input", lifecycleState } = overrides;
+  const {
+    at = new Date().toISOString(),
+    state = "needs_input",
+    lifecycleState,
+    episodeAt = EPISODE_AT,
+  } = overrides;
   return {
     id: SESSION_ID,
     projectId: PROJECT_ID,
@@ -40,6 +61,7 @@ function makeSession(overrides: {
     metadata: {
       [AGENT_REPORT_METADATA_KEYS.STATE]: state,
       [AGENT_REPORT_METADATA_KEYS.AT]: at,
+      ...(episodeAt ? { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: episodeAt } : {}),
     },
     ...(lifecycleState
       ? {
@@ -58,6 +80,7 @@ const LONG_AGO = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 
 beforeEach(() => {
   sessionsDir = mkdtempSync(join(tmpdir(), "ao-notify-decision-"));
+  seedSessionMetadata(sessionsDir);
 });
 
 afterEach(() => {
@@ -65,23 +88,24 @@ afterEach(() => {
 });
 
 describe("activeDecisionId", () => {
-  it("is the report timestamp while the session is parked on the decision", () => {
+  it("pairs the report instant with the episode while parked on the decision", () => {
     const session = makeSession({ at: LONG_AGO, lifecycleState: "needs_input" });
     // Still parked, so a long-pending decision keeps its identity — a human may
     // take hours to answer.
-    expect(activeDecisionId(session)).toBe(LONG_AGO);
+    expect(activeDecisionId(session)).toBe(`${LONG_AGO}:${EPISODE_AT}`);
   });
 
-  it("is the report timestamp for a fresh decision not yet reflected in lifecycle", () => {
+  it("is available for a fresh decision not yet reflected in lifecycle", () => {
     const at = new Date().toISOString();
-    expect(activeDecisionId(makeSession({ at }))).toBe(at);
+    expect(activeDecisionId(makeSession({ at }))).toBe(`${at}:${EPISODE_AT}`);
   });
 
   it("is null once the decision is spent — agent resumed and the report went stale", () => {
-    // Decision A resolved without a new report: the agent is working again and
-    // the report has aged out. Its identity must not survive to authorise a token
-    // against some later, unrelated prompt.
-    expect(activeDecisionId(makeSession({ at: LONG_AGO }))).toBeNull();
+    expect(activeDecisionId(makeSession({ at: LONG_AGO, episodeAt: null }))).toBeNull();
+  });
+
+  it("is null with no episode marker — nothing a human can answer", () => {
+    expect(activeDecisionId(makeSession({ episodeAt: null }))).toBeNull();
   });
 
   it("is null for a non-decision report", () => {
@@ -90,6 +114,96 @@ describe("activeDecisionId", () => {
 
   it("is null when the session has no report at all", () => {
     expect(activeDecisionId({ metadata: {} } as unknown as Session)).toBeNull();
+  });
+
+  it("does not let decision A's token answer a bare prompt B inside the freshness window", () => {
+    // The sequence the report timestamp alone could not defend against:
+    // A is reported and parks the session...
+    const reportedAt = new Date().toISOString();
+    const parkedOnA = makeSession({
+      at: reportedAt,
+      lifecycleState: "needs_input",
+      episodeAt: "2026-07-17T09:00:00.000Z",
+    });
+    const mintedForA = activeDecisionId(parkedOnA);
+    expect(mintedForA).not.toBeNull();
+
+    // ...A is resolved outside the callback, so nothing is consumed and no new
+    // report is written. The agent resumes; the poll ends the episode.
+    const resumed = makeSession({
+      at: reportedAt,
+      lifecycleState: "working",
+      episodeAt: "2026-07-17T09:00:00.000Z",
+    });
+    expect(decisionEpisodePatch(resumed, "2026-07-17T09:01:00.000Z")).toEqual({
+      [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "",
+    });
+
+    // ...then the agent stops at an unrelated bare prompt B, WELL INSIDE the
+    // report's 5-minute freshness window, so A's report is still present and
+    // still counts as active. B opens a new episode.
+    const promptB = makeSession({
+      at: reportedAt,
+      lifecycleState: "needs_input",
+      episodeAt: "2026-07-17T09:02:00.000Z",
+    });
+    expect(activeDecisionId(promptB)).not.toBe(mintedForA);
+  });
+});
+
+describe("first-entry mint", () => {
+  it("has an identity as soon as the episode is stamped — the first notification gets buttons", () => {
+    // The poll stamps the episode after the lifecycle is committed and BEFORE
+    // anything notifies. Applying that patch must be enough for the very first
+    // notification of the episode to mint a nonce: if it minted without one, the
+    // buttons would be missing and neither the transition (status unchanged) nor
+    // the report reaction (activation identity unchanged) would fire again.
+    const reportedAt = new Date().toISOString();
+    const justParked = makeSession({
+      at: reportedAt,
+      lifecycleState: "needs_input",
+      episodeAt: null,
+    });
+    expect(activeDecisionId(justParked)).toBeNull();
+
+    const patch = decisionEpisodePatch(justParked, "2026-07-17T10:00:00.000Z");
+    expect(patch).toEqual({
+      [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "2026-07-17T10:00:00.000Z",
+    });
+
+    const stamped = {
+      ...justParked,
+      metadata: { ...justParked.metadata, ...patch },
+    } as unknown as Session;
+    expect(activeDecisionId(stamped)).toBe(`${reportedAt}:2026-07-17T10:00:00.000Z`);
+  });
+});
+
+describe("decisionEpisodePatch", () => {
+  it("stamps the episode on entry into needs_input", () => {
+    const session = makeSession({ lifecycleState: "needs_input", episodeAt: null });
+    expect(decisionEpisodePatch(session, "2026-07-17T10:00:00.000Z")).toEqual({
+      [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "2026-07-17T10:00:00.000Z",
+    });
+  });
+
+  it("does not refresh the marker while the session stays parked", () => {
+    // Stability is the point: a marker that moved every poll would invalidate
+    // live tokens within seconds, exactly as lastTransitionAt would.
+    const session = makeSession({ lifecycleState: "needs_input" });
+    expect(decisionEpisodePatch(session, "2026-07-17T10:00:00.000Z")).toBeNull();
+  });
+
+  it("clears the marker once the session leaves needs_input", () => {
+    const session = makeSession({ lifecycleState: "working" });
+    expect(decisionEpisodePatch(session, "2026-07-17T10:00:00.000Z")).toEqual({
+      [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "",
+    });
+  });
+
+  it("is a no-op when unparked and already unmarked", () => {
+    const session = makeSession({ lifecycleState: "working", episodeAt: null });
+    expect(decisionEpisodePatch(session, "2026-07-17T10:00:00.000Z")).toBeNull();
   });
 });
 
@@ -129,14 +243,31 @@ describe("consumeDecision", () => {
 
   it("scopes consumption to the project, so a same-id session elsewhere is unaffected", () => {
     const other = mkdtempSync(join(tmpdir(), "ao-notify-decision-other-"));
+    seedSessionMetadata(other);
     expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(true);
     // getProjectSessionsDir is what scopes the store; a different project resolves
     // to a different directory and therefore a different record.
+    const first = sessionsDir;
     sessionsDir = other;
     try {
       expect(consumeDecision("other", SESSION_ID, ID)).toBe(true);
     } finally {
+      sessionsDir = first;
       rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the session has no metadata — fail closed, never fabricate one", () => {
+    const empty = mkdtempSync(join(tmpdir(), "ao-notify-decision-empty-"));
+    const first = sessionsDir;
+    sessionsDir = empty;
+    try {
+      // Unreachable via the route (it only consumes after `get` resolved the
+      // session from this file), but must never dispatch if it ever happens.
+      expect(consumeDecision(PROJECT_ID, "ghost-session", ID)).toBe(false);
+    } finally {
+      sessionsDir = first;
+      rmSync(empty, { recursive: true, force: true });
     }
   });
 

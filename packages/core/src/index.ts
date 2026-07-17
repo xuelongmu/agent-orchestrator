@@ -357,6 +357,8 @@ export {
   activeDecisionId,
   clearedDecisionMetadata,
   consumeDecision,
+  decisionEpisodePatch,
+  isParkedOnDecision,
   isResolvingCallbackAction,
   releaseDecision,
 } from "./notify-decision.js";

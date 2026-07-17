@@ -135,6 +135,16 @@ export async function GET(
       );
     }
 
+    // Scoping the lookup above should make this unreachable, but this is an auth
+    // path: assert the invariant rather than trust a single call site to hold it.
+    if (session.projectId !== projectId) {
+      return htmlResponse(
+        404,
+        "Session not found",
+        "That session no longer exists — it may have already finished or been cleaned up.",
+      );
+    }
+
     // The buttons answer a pending human decision, so require the session to be
     // non-terminal AND still awaiting input. `blocked` is an error/stuck state,
     // not a human prompt, so it does not count.

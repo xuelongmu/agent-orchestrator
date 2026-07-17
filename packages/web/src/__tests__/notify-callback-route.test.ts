@@ -4,19 +4,29 @@ import {
   SessionNotFoundError,
   NOTIFY_CALLBACK_MESSAGES,
   AGENT_REPORT_METADATA_KEYS,
+  NOTIFY_DECISION_METADATA_KEYS,
   type Session,
   type SessionManager,
   type OrchestratorConfig,
 } from "@aoagents/ao-core";
 
-// Build session metadata carrying an agent report, whose timestamp is the
-// decision-instance identity the callback nonce is checked against.
+// When the session entered its current needs_input episode. The decision
+// identity pairs this with the report instant, so a token minted in one episode
+// cannot answer a prompt raised in the next.
+const EPISODE_AT = "2026-07-17T09:00:00.000Z";
+
+// Build session metadata carrying an agent report plus its episode marker —
+// together these form the decision identity the callback nonce is checked against.
 function reportMeta(atIso: string, state = "needs_input"): Record<string, string> {
   return {
     [AGENT_REPORT_METADATA_KEYS.STATE]: state,
     [AGENT_REPORT_METADATA_KEYS.AT]: atIso,
+    [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: EPISODE_AT,
   };
 }
+
+/** The decision identity for a report made at `atIso` in the current episode. */
+const identityFor = (atIso: string) => `${atIso}:${EPISODE_AT}`;
 
 const SECRET = "route-test-secret";
 // Default decision instant: a report-backed needs_input at this timestamp, with
@@ -111,7 +121,14 @@ function makeRequest(): Request {
 
 function token(action: "approve" | "deny" | "nudge" | "kill", overrides = {}) {
   return signCallbackToken(
-    { sessionId: "ao-5", projectId: "ao", action, exp: Date.now() + 60_000, nonce: DECISION_AT, ...overrides },
+    {
+      sessionId: "ao-5",
+      projectId: "ao",
+      action,
+      exp: Date.now() + 60_000,
+      nonce: identityFor(DECISION_AT),
+      ...overrides,
+    },
     SECRET,
   );
 }
@@ -236,9 +253,26 @@ describe("GET /api/notify-callback/[token]", () => {
   it("applies when the decision nonce matches the reported decision instant", async () => {
     const at = new Date().toISOString();
     get.mockResolvedValueOnce(makeSession({ metadata: reportMeta(at) }));
-    const res = await callGet(token("approve", { nonce: at }));
+    const res = await callGet(token("approve", { nonce: identityFor(at) }));
     expect(res.status).toBe(200);
     expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+  });
+
+  it("rejects a token from the previous episode against a new prompt (409)", async () => {
+    // Decision A resolved outside the callback, the agent resumed, and the poll
+    // ended A's episode. A bare prompt B then opens a NEW episode while A's report
+    // is still inside its freshness window — A's token must not answer B.
+    get.mockResolvedValueOnce(
+      makeSession({
+        metadata: {
+          ...reportMeta(DECISION_AT),
+          [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "2026-07-17T09:30:00.000Z",
+        },
+      }),
+    );
+    const res = await callGet(token("approve"));
+    expect(res.status).toBe(409);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("rejects when the session no longer has a decision report (409)", async () => {

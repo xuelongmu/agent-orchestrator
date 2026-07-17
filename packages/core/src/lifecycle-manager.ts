@@ -101,7 +101,11 @@ import {
   isNotifyActionEvent,
   resolveDecisionEventType,
 } from "./notify-callback.js";
-import { activeDecisionId, clearedDecisionMetadata } from "./notify-decision.js";
+import {
+  activeDecisionId,
+  clearedDecisionMetadata,
+  decisionEpisodePatch,
+} from "./notify-decision.js";
 import { resolveSessionRole } from "./agent-selection.js";
 import {
   DETECTING_MAX_ATTEMPTS,
@@ -2420,6 +2424,32 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     updateSessionMetadata(session, clearedDecisionMetadata());
   }
 
+  /**
+   * Maintain the needs_input episode marker on its entry/exit edges — the
+   * lifetime that bounds a decision identity.
+   *
+   * A decision report stays "active" for its whole freshness window even after
+   * the agent resolves it and resumes, so the report instant alone cannot tell
+   * decision A from an unrelated bare prompt B raised inside that window. The
+   * episode boundary can: B is a new episode, so A's token stops matching.
+   *
+   * Edge-triggered, never refreshed while parked — a marker that moved each poll
+   * would invalidate live tokens within seconds (the same reason `lastTransitionAt`
+   * is unusable here: the poll re-commits `sessionState: "needs_input"` on every
+   * waiting_input cycle).
+   *
+   * BOUND: this is state-edge detection on a polling loop. If the agent resolves A
+   * and stops at prompt B entirely BETWEEN two polls, the loop never observes the
+   * un-parked state, the marker is not cleared, and A's token would still answer B.
+   * That window is one poll interval (default 5s), versus the report freshness
+   * window (5min) it replaces. Closing it entirely needs an event-driven exit
+   * signal rather than polling. (#13 review)
+   */
+  function maintainDecisionEpisode(session: Session): void {
+    const patch = decisionEpisodePatch(session, new Date().toISOString());
+    if (patch) updateSessionMetadata(session, patch);
+  }
+
   function makeFingerprint(ids: string[]): string {
     return [...ids].sort().join(",");
   }
@@ -4531,6 +4561,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         }
       }
     }
+
+    // Stamp/clear the needs_input episode marker BEFORE anything can notify. The
+    // decision identity pairs the report instant with this marker, so it must
+    // exist by the time the first notification for this episode mints its
+    // buttons — a first notification minted without it would carry no nonce and
+    // get no buttons, and neither the transition (status unchanged) nor the
+    // report reaction (activation identity unchanged) would fire again to correct
+    // it. `determineStatus` above has already committed the lifecycle, so the
+    // parked state is settled here. (#13 review)
+    maintainDecisionEpisode(session);
 
     if (newStatus !== oldStatus) {
       const correlationId = createCorrelationId("lifecycle-transition");

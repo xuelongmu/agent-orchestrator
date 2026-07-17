@@ -29,6 +29,14 @@ import type { Session, SessionId } from "./types.js";
 export const NOTIFY_DECISION_METADATA_KEYS = {
   /** Identity of the decision instance already resolved by a callback action. */
   CONSUMED_ID: "notifyDecisionConsumedId",
+  /**
+   * When the session entered the needs_input episode it is currently parked in.
+   * Edge-triggered: stamped on entry, cleared on exit, and NEVER refreshed while
+   * parked — that stability is the whole point, and is why `lastTransitionAt`
+   * cannot serve here (the poll re-commits `sessionState: "needs_input"` on every
+   * waiting_input cycle, so it is rewritten every few seconds).
+   */
+  EPISODE_AT: "notifyDecisionEpisodeAt",
 } as const;
 
 /**
@@ -46,20 +54,54 @@ export function isResolvingCallbackAction(action: NotifyCallbackAction): boolean
   return (RESOLVING_CALLBACK_ACTIONS as readonly string[]).includes(action);
 }
 
+/** True while the session is parked on a human decision. */
+export function isParkedOnDecision(session: Session): boolean {
+  return session.lifecycle?.session.state === "needs_input";
+}
+
+/**
+ * Edge-triggered patch maintaining {@link NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT},
+ * or `null` when nothing changes. Stamps on entry into needs_input and clears on
+ * exit, so the marker stays fixed for the whole episode.
+ */
+export function decisionEpisodePatch(
+  session: Session,
+  nowIso: string,
+): Record<string, string> | null {
+  const parked = isParkedOnDecision(session);
+  const stamped = session.metadata?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT] ?? "";
+  if (parked && !stamped) return { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: nowIso };
+  if (!parked && stamped) return { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "" };
+  return null;
+}
+
 /**
  * Identity of the session's currently active decision instance, or `null` when
  * no decision is live.
  *
- * The identity is the decision report's timestamp, but ONLY while that report is
- * still an active block ({@link isDecisionReportActive}). Once the agent resolves
- * a decision and resumes, the lifecycle poll clears the spent report, so a later
- * unrelated prompt yields no identity (or a different one) and a token minted for
- * the earlier decision can never answer it.
+ * The identity pairs the decision report's timestamp with the needs_input EPISODE
+ * that report activated. Both halves are required, because neither alone is
+ * sufficient:
+ *
+ * - The report timestamp alone survives its own decision. If decision A resolves
+ *   without a new `ao report` and the agent stops at an unrelated bare prompt B
+ *   within the report's freshness window, A's report is still present and still
+ *   "active" (B re-parks the session in needs_input), so A's unused token would
+ *   answer B.
+ * - The episode alone cannot distinguish two successive reports within one
+ *   episode.
+ *
+ * Pairing them means a token is honoured only inside the episode it was minted
+ * for: B is a new episode, so A's token no longer matches.
  */
 export function activeDecisionId(session: Session): string | null {
   const report = readAgentReport(session.metadata);
-  if (!isDecisionReportActive(session, report)) return null;
-  return report?.timestamp ?? null;
+  if (!isDecisionReportActive(session, report) || !report) return null;
+  const episodeAt = session.metadata?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT] ?? "";
+  // No episode marker means the session is not parked on a decision a human can
+  // answer, so there is nothing to bind a mutating action to.
+  if (!episodeAt) return null;
+  return `${report.timestamp}:${episodeAt}`;
 }
 
 /**
@@ -115,5 +157,6 @@ export function clearedDecisionMetadata(): Record<string, string> {
     [AGENT_REPORT_METADATA_KEYS.QUESTION]: "",
     [AGENT_REPORT_METADATA_KEYS.CONFIDENCE]: "",
     [NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID]: "",
+    [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "",
   };
 }
