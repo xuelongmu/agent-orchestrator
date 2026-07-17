@@ -90,6 +90,7 @@ import {
   isDecisionReport,
   isDecisionReportActive,
   isNeedsDecisionActive,
+  reportActivationIdentity,
   REPORT_WATCHER_METADATA_KEYS,
 } from "./report-watcher.js";
 import { createCorrelationId, createProjectObserver } from "./observability.js";
@@ -104,7 +105,6 @@ import {
 import {
   activeDecisionId,
   clearSpentDecision,
-  clearedDecisionMetadata,
   decisionEpisodeTransition,
 } from "./notify-decision.js";
 import { resolveSessionRole } from "./agent-selection.js";
@@ -2432,11 +2432,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const report = readAgentReport(session.metadata);
     const observed =
       report && isDecisionReport(report) ? { state: report.state, at: report.timestamp } : null;
-    if (!clearSpentDecision(session.projectId, session.id, observed)) return;
-    // Mirror the cleared record into this cycle's snapshot WITHOUT a second write:
-    // re-writing the empties here could clobber a report that landed in between,
-    // which is the very race the locked compare above exists to avoid.
-    const clearedKeys = new Set(Object.keys(clearedDecisionMetadata()));
+    const applied = clearSpentDecision(session.projectId, session.id, observed);
+    if (!applied) return;
+    // Mirror EXACTLY the keys the locked clear touched into this cycle's snapshot,
+    // without a second write (re-writing the empties could clobber a report that
+    // landed in between). For an observed===null retirement `applied` holds only
+    // the identity markers, so a preserved successor report (e.g. `ao report
+    // working`) stays visible for the rest of this audit cycle rather than being
+    // filtered out of the snapshot (#13 review).
+    const clearedKeys = new Set(Object.keys(applied));
     session.metadata = Object.fromEntries(
       Object.entries(session.metadata).filter(([key]) => !clearedKeys.has(key)),
     );
@@ -4902,17 +4906,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       session.metadata[REPORT_WATCHER_METADATA_KEYS.TRIGGER_COUNT] ?? "0",
       10,
     );
-    // A `needs_decision` report shares the `agent_needs_input` trigger with a
-    // generic needs_input, but carries distinct decision context. Fold the
-    // reported state AND the report timestamp into the activation identity so
-    // that (a) refining needs_input → needs_decision and (b) a SECOND
-    // needs_decision with a new question/confidence each count as a NEW
-    // activation — re-firing the report reaction / notification even without a
-    // status transition. Each `ao report` stamps a fresh timestamp (#12 review).
-    const activationIdentity =
-      auditResult.report?.state === "needs_decision"
-        ? `${auditResult.trigger}:needs_decision:${auditResult.report.timestamp}`
-        : auditResult.trigger;
+    // Fold the reported state + timestamp into the activation identity for EVERY
+    // decision report (needs_input as well as needs_decision), so a second report
+    // while still parked re-fires the notification with fresh, valid buttons
+    // instead of leaving the human holding the ones the new nonce just
+    // invalidated. See reportActivationIdentity (#12, #13 review).
+    const activationIdentity = reportActivationIdentity(auditResult.trigger, auditResult.report);
     const priorActiveTrigger = session.metadata[REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER] ?? "";
     const isNewTrigger = priorActiveTrigger !== activationIdentity;
 

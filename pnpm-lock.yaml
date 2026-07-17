@@ -726,6 +726,9 @@ importers:
       '@aoagents/ao-core':
         specifier: workspace:*
         version: link:../core
+      '@aoagents/ao-plugin-agent-aider':
+        specifier: workspace:*
+        version: link:../plugins/agent-aider
       '@aoagents/ao-plugin-agent-claude-code':
         specifier: workspace:*
         version: link:../plugins/agent-claude-code

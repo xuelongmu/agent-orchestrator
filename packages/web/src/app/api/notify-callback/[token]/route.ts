@@ -7,7 +7,7 @@ import {
   activeDecisionId,
   consumeDecision,
   getNotifyCallbackSecret,
-  isDecisionConsumed,
+  isNudgeBlocked,
   isResolvingCallbackAction,
   isTerminalSession,
   releaseDecision,
@@ -304,12 +304,13 @@ export async function POST(
     // choice outstanding, so consuming on a nudge would strand a still-pending
     // decision with no way to answer it. (#13, review)
     // A Nudge does not consume, but it must not walk into a decision that a
-    // resolving action already answered: tapping Deny and then Nudge would send
-    // "Continue if you can" into the decision that was just denied. The check is
-    // a locked read at the central helper, so it sees the stored record at
-    // dispatch time rather than a snapshot from earlier in the request.
+    // resolving action already answered (Deny→Nudge would send "continue if you
+    // can" into the decision just denied), NOR into a decision that a new report
+    // superseded between the get() above and now. The check is a locked read at
+    // the central helper, so it authorizes against the stored identity at dispatch
+    // time — the same boundary the resolving path uses.
     const consumes = isResolvingCallbackAction(action);
-    if (!consumes && isDecisionConsumed(projectId, sessionId, decisionId)) {
+    if (!consumes && isNudgeBlocked(projectId, sessionId, decisionId)) {
       recordApiObservation({
         config,
         method: "POST",
@@ -320,7 +321,7 @@ export async function POST(
         statusCode: 409,
         projectId: resolvedProjectId,
         sessionId,
-        reason: "decision already resolved",
+        reason: "decision already resolved or superseded",
         data: { action },
       });
       recordActivityEvent({
@@ -329,13 +330,13 @@ export async function POST(
         source: "api",
         kind: "api.notify_callback.duplicate",
         level: "warn",
-        summary: `notification action "${action}" ignored — decision already resolved for session ${sessionId}`,
+        summary: `notification action "${action}" ignored — decision already resolved or superseded for session ${sessionId}`,
         data: { action },
       });
       return htmlResponse(
         409,
         "Already handled",
-        "This decision was already answered, so no further action was taken.",
+        "This decision was already answered or has moved on, so no further action was taken.",
       );
     }
 

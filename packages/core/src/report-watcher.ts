@@ -296,6 +296,34 @@ export function auditAgentReports(
 }
 
 /**
+ * The activation identity for a report-watcher trigger — what the lifecycle
+ * manager stores as ACTIVE_TRIGGER and diffs to decide whether a poll is a NEW
+ * activation (re-firing the reaction/notification) or the same one continuing.
+ *
+ * For a decision report (needs_input OR needs_decision) it folds in the reported
+ * state AND timestamp. Every `ao report` stamps a fresh timestamp, and
+ * `activeDecisionId` mints the callback nonce from that same timestamp — so a
+ * SECOND decision report while the session stays parked writes a new nonce and
+ * silently invalidates the old callback buttons. Folding the timestamp in here
+ * makes that second report a new activation, so a replacement notification (with
+ * fresh, valid buttons) is emitted. Without it, two successive needs_input reports
+ * share the bare `agent_needs_input` identity, no re-fire happens, and the human
+ * is left holding dead buttons (#12, #13 review).
+ *
+ * The same report across polls keeps the same identity (same timestamp), so this
+ * never causes a per-poll re-fire.
+ */
+export function reportActivationIdentity(
+  trigger: ReportWatcherTrigger,
+  report: AgentReport | null,
+): string {
+  if (report && isDecisionReportState(report.state)) {
+    return `${trigger}:${report.state}:${report.timestamp}`;
+  }
+  return trigger;
+}
+
+/**
  * Get the reaction key for a report watcher trigger.
  * Used to look up the reaction configuration.
  */

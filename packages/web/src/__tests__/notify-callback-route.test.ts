@@ -59,7 +59,10 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
     releaseDecision: (projectId: string, sessionId: string, decisionId: string) => {
       consumedDecisions.delete(consumeKey(projectId, sessionId, decisionId));
     },
-    isDecisionConsumed: (projectId: string, sessionId: string, decisionId: string) =>
+    // Route wiring only: block a nudge once the decision is consumed. The
+    // stored-identity-superseded branch is exercised against real metadata in
+    // notify-decision.test.ts.
+    isNudgeBlocked: (projectId: string, sessionId: string, decisionId: string) =>
       consumedDecisions.has(consumeKey(projectId, sessionId, decisionId)),
   };
 });

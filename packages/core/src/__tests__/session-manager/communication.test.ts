@@ -5,6 +5,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { createSessionManager } from "../../session-manager.js";
+import { getProjectSessionsDir } from "../../paths.js";
 import {
   writeMetadata,
   readMetadataRaw,
@@ -51,6 +52,69 @@ describe("send", () => {
     await sm.send("app-1", "Fix the CI failures");
 
     expect(mockRuntime.sendMessage).toHaveBeenCalledWith(makeHandle("rt-1"), "Fix the CI failures");
+  });
+
+  it("scopes every nested lookup and restore to the token's project, not the first id match", async () => {
+    // Two projects hold the same session id. `other` is FIRST in config and alive;
+    // the scoped target (`my-app`) is dead and needs a restore. A send scoped to
+    // my-app must create/restore MY-APP's session and deliver via the restored
+    // handle — never fall through to `other`'s first-match alive runtime. This
+    // exercises the scope propagation through both prepareSession's get() and the
+    // restore() branch, not only requireSessionRecord (#13 review).
+    const myApp = config.projects["my-app"];
+    config.projects = {
+      other: {
+        name: "Other",
+        repo: "org/other",
+        path: join(tmpDir, "other"),
+        defaultBranch: "main",
+        sessionPrefix: "app",
+        scm: { plugin: "github" },
+        tracker: { plugin: "github" },
+      },
+      "my-app": myApp,
+    };
+    const otherDir = getProjectSessionsDir("other");
+    mkdirSync(otherDir, { recursive: true });
+    const wsTarget = join(tmpDir, "ws-target");
+    mkdirSync(wsTarget, { recursive: true });
+
+    writeMetadata(otherDir, "app-1", {
+      worktree: "/tmp",
+      branch: "main",
+      status: "working",
+      project: "other",
+      runtimeHandle: makeHandle("rt-other"),
+    });
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: wsTarget,
+      branch: "main",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: makeHandle("rt-target"),
+    });
+
+    // rt-target is dead (needs restore); rt-other is alive (would be sent-to if a
+    // nested lookup leaked to the first-match project).
+    vi.mocked(mockRuntime.isAlive).mockImplementation(async (handle) => handle.id !== "rt-target");
+    vi.mocked(mockAgent.isProcessRunning).mockImplementation(
+      async (handle) => handle.id !== "rt-target",
+    );
+    vi.mocked(mockRuntime.create).mockResolvedValue(makeHandle("rt-restored"));
+    vi.mocked(mockRuntime.getOutput)
+      .mockResolvedValueOnce("restored prompt")
+      .mockResolvedValueOnce("before send")
+      .mockResolvedValueOnce("after send");
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await sm.send("app-1", "scoped message", "my-app");
+
+    expect(mockRuntime.create).toHaveBeenCalled();
+    expect(mockRuntime.sendMessage).toHaveBeenCalledWith(makeHandle("rt-restored"), "scoped message");
+    expect(mockRuntime.sendMessage).not.toHaveBeenCalledWith(
+      makeHandle("rt-other"),
+      "scoped message",
+    );
   });
 
   it("restores a dead session before sending the message", async () => {

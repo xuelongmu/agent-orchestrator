@@ -100,24 +100,33 @@ export function decisionEpisodeTransition(
 }
 
 /**
- * Whether a resolving action has already consumed this decision instance, read
- * under the metadata lock so the answer reflects the stored record at call time
- * rather than a snapshot taken earlier in the request.
+ * Whether a non-consuming action (Nudge) must be REFUSED for `decisionId`, read
+ * under the metadata lock so the answer reflects the stored record at dispatch
+ * time rather than a snapshot taken earlier in the request.
  *
- * Non-resolving actions (Nudge) use this to stay out of a decision that has
- * already been answered, without consuming it themselves.
+ * Refuse in either case:
+ *  - The stored identity is missing or no longer equals `decisionId`. A new report
+ *    written between the route's `get()` and this lock supersedes the decision the
+ *    token names, and a stale Nudge ("continue if you can") must not be delivered
+ *    into the successor. This mirrors the in-lock identity check
+ *    {@link consumeDecision} uses for resolving actions, so both the consuming and
+ *    non-consuming paths authorize against the same durable current identity at
+ *    the same last stateful boundary.
+ *  - A resolving action has already consumed this exact decision (Deny→Nudge).
  */
-export function isDecisionConsumed(
+export function isNudgeBlocked(
   projectId: string,
   sessionId: SessionId,
   decisionId: string,
 ): boolean {
-  let consumed = false;
+  let blocked = false;
   mutateMetadata(getProjectSessionsDir(projectId), sessionId, (existing) => {
-    consumed = existing[NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID] === decisionId;
+    const supersededOrGone = storedDecisionId(existing) !== decisionId;
+    const alreadyResolved = existing[NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID] === decisionId;
+    blocked = supersededOrGone || alreadyResolved;
     return existing;
   });
-  return consumed;
+  return blocked;
 }
 
 /**
@@ -158,6 +167,12 @@ export function activeDecisionId(session: Session): string | null {
  * {@link isDecisionReportActive} (which needs the enriched lifecycle): the episode
  * marker is itself cleared when the session leaves needs_input, so its presence
  * already implies the decision is live.
+ *
+ * The timestamp is normalized with the SAME rule `readAgentReport` applies
+ * (`Date.parse` → `toISOString`). `activeDecisionId` derives the nonce from the
+ * report `readAgentReport` returns, so a stored `at` that is valid but not already
+ * in `toISOString` form (e.g. `2026-07-17T12:34:56Z`) would otherwise produce a
+ * different string here than the signed nonce and reject every action with 409.
  */
 export function storedDecisionId(raw: Record<string, string>): string | null {
   const state = raw[AGENT_REPORT_METADATA_KEYS.STATE];
@@ -165,7 +180,9 @@ export function storedDecisionId(raw: Record<string, string>): string | null {
   const episodeAt = raw[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT];
   if (!state || !at || !episodeAt) return null;
   if (!isDecisionReportState(state)) return null;
-  return `${at}:${episodeAt}`;
+  const parsed = Date.parse(at);
+  if (Number.isNaN(parsed)) return null;
+  return `${new Date(parsed).toISOString()}:${episodeAt}`;
 }
 
 /**
@@ -201,43 +218,72 @@ export function consumeDecision(
 }
 
 /**
- * Retire a spent decision, but only if the stored record is still the one the
- * caller observed.
+ * Retire a spent decision, removing only the record the caller actually observed.
  *
  * The lifecycle poll decides a decision is spent from an in-memory session
- * snapshot taken at the top of the cycle. If the agent writes a fresh
- * `ao report` after that load, an unconditional clear would delete the NEW
- * decision — losing it and its callback identity. Comparing the stored state and
- * timestamp under the lock means a superseded observation simply no-ops.
+ * snapshot taken at the top of the cycle. If the agent writes a fresh report
+ * after that load, an unconditional clear would delete the NEW record — losing it
+ * and (for a decision) its callback identity. Everything below runs under the
+ * metadata lock and compares the stored record before touching it.
  *
- * Returns `true` when the record was cleared.
+ * Two observations, two shapes:
+ *  - `observed` is a decision the poll saw: clear the WHOLE record (report fields
+ *    + identity markers) only while the stored state/timestamp still identify that
+ *    decision. A superseded observation no-ops.
+ *  - `observed` is `null` (episode marker lingered but the poll saw no decision
+ *    report): the report fields now belong to a SUCCESSOR — either a non-decision
+ *    report like `ao report working`, which must be preserved so the report
+ *    watcher does not treat the agent as never-acknowledged, or a fresh decision
+ *    with its own identity. Clear ONLY the orphan identity markers (episode +
+ *    consumed), never the report fields; and if the successor is itself a decision
+ *    report, leave even those markers to its own lifecycle.
+ *
+ * Returns the exact patch applied (so callers can mirror it into an in-memory
+ * snapshot key-for-key), or `null` when nothing was cleared. Mirroring a fixed
+ * key set instead would hide a preserved successor report for the rest of the
+ * cycle.
  */
 export function clearSpentDecision(
   projectId: string,
   sessionId: SessionId,
   observed: { state: string; at: string } | null,
-): boolean {
-  let cleared = false;
+): Record<string, string> | null {
+  let applied: Record<string, string> | null = null;
   mutateMetadata(getProjectSessionsDir(projectId), sessionId, (existing) => {
     const storedState = existing[AGENT_REPORT_METADATA_KEYS.STATE] ?? "";
     if (observed === null) {
-      // The caller saw no decision report. If one exists now it was written after
-      // that observation, so it is not ours to retire.
+      // A decision report present now was written after our observation — it is a
+      // successor with its own (possibly just-set) episode identity. Leave it.
       if (isDecisionReportState(storedState)) {
-        cleared = false;
+        applied = null;
         return existing;
       }
-    } else if (
+      // Otherwise drop only the orphaned identity markers, preserving the
+      // successor non-decision report's state/timestamp.
+      const hasOrphanMarker =
+        !!existing[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT] ||
+        !!existing[NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID];
+      if (!hasOrphanMarker) {
+        applied = null;
+        return existing;
+      }
+      applied = {
+        [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "",
+        [NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID]: "",
+      };
+      return { ...existing, ...applied };
+    }
+    if (
       storedState !== observed.state ||
       existing[AGENT_REPORT_METADATA_KEYS.AT] !== observed.at
     ) {
-      cleared = false;
+      applied = null;
       return existing;
     }
-    cleared = true;
-    return { ...existing, ...clearedDecisionMetadata() };
+    applied = clearedDecisionMetadata();
+    return { ...existing, ...applied };
   });
-  return cleared;
+  return applied;
 }
 
 /**

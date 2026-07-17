@@ -136,6 +136,7 @@ export {
   isDecisionReport,
   isDecisionReportActive,
   isDecisionReportState,
+  reportActivationIdentity,
   DEFAULT_REPORT_WATCHER_CONFIG,
   REPORT_WATCHER_METADATA_KEYS,
 } from "./report-watcher.js";
@@ -360,7 +361,7 @@ export {
   clearedDecisionMetadata,
   consumeDecision,
   decisionEpisodeTransition,
-  isDecisionConsumed,
+  isNudgeBlocked,
   isParkedOnDecision,
   isResolvingCallbackAction,
   releaseDecision,

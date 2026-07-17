@@ -15,8 +15,10 @@ vi.mock("../paths.js", async (importOriginal) => {
 import {
   activeDecisionId,
   clearSpentDecision,
+  clearedDecisionMetadata,
   consumeDecision,
   decisionEpisodeTransition,
+  isNudgeBlocked,
   isResolvingCallbackAction,
   releaseDecision,
   storedDecisionId,
@@ -283,6 +285,65 @@ describe("storedDecisionId", () => {
     expect(storedDecisionId(session.metadata)).toBe(activeDecisionId(session));
     expect(activeDecisionId(session)).toBe(STORED_ID);
   });
+
+  it("normalizes a non-canonical timestamp to match the signed nonce", () => {
+    // readAgentReport (and so activeDecisionId / the minted nonce) normalizes the
+    // stored `at` via Date.parse → toISOString. storedDecisionId must apply the
+    // same rule, or a valid but non-canonical `at` would never equal the nonce and
+    // every Approve/Deny/Kill would 409.
+    const nonCanonical = "2026-07-17T08:00:00Z"; // no milliseconds
+    const canonical = "2026-07-17T08:00:00.000Z";
+    const session = makeSession({
+      at: nonCanonical,
+      episodeAt: STORED_EPISODE,
+      lifecycleState: "needs_input",
+    });
+    const nonce = activeDecisionId(session);
+    expect(nonce).toBe(`${canonical}:${STORED_EPISODE}`);
+    expect(
+      storedDecisionId({
+        [AGENT_REPORT_METADATA_KEYS.STATE]: "needs_input",
+        [AGENT_REPORT_METADATA_KEYS.AT]: nonCanonical,
+        [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: STORED_EPISODE,
+      }),
+    ).toBe(nonce);
+  });
+
+  it("is null for an unparseable timestamp", () => {
+    expect(
+      storedDecisionId({
+        [AGENT_REPORT_METADATA_KEYS.STATE]: "needs_input",
+        [AGENT_REPORT_METADATA_KEYS.AT]: "not-a-date",
+        [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: STORED_EPISODE,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("isNudgeBlocked", () => {
+  const ID = STORED_ID;
+
+  it("allows a nudge for the current, unconsumed decision", () => {
+    expect(isNudgeBlocked(PROJECT_ID, SESSION_ID, ID)).toBe(false);
+  });
+
+  it("blocks a nudge once a resolving action has consumed the decision", () => {
+    expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(true);
+    expect(isNudgeBlocked(PROJECT_ID, SESSION_ID, ID)).toBe(true);
+  });
+
+  it("blocks a nudge whose decision was superseded after the route's get()", () => {
+    // A new report landed between the route reading the session and this locked
+    // check, so the stored identity no longer equals the token's. A stale nudge
+    // must not be delivered into the successor decision.
+    seedSessionMetadata(sessionsDir, { at: "2026-07-17T08:15:00.000Z" });
+    expect(isNudgeBlocked(PROJECT_ID, SESSION_ID, ID)).toBe(true);
+  });
+
+  it("blocks a nudge when the decision record is gone entirely", () => {
+    seedSessionMetadata(sessionsDir, { state: "working", at: STORED_AT });
+    expect(isNudgeBlocked(PROJECT_ID, SESSION_ID, ID)).toBe(true);
+  });
 });
 
 describe("consumeDecision", () => {
@@ -375,10 +436,16 @@ describe("consumeDecision", () => {
 });
 
 describe("clearSpentDecision", () => {
-  it("clears the record the poll observed", () => {
-    expect(
-      clearSpentDecision(PROJECT_ID, SESSION_ID, { state: "needs_input", at: STORED_AT }),
-    ).toBe(true);
+  it("clears the whole record the poll observed and returns that patch", () => {
+    const applied = clearSpentDecision(PROJECT_ID, SESSION_ID, {
+      state: "needs_input",
+      at: STORED_AT,
+    });
+    // The returned patch is the exact set of keys touched — callers mirror it.
+    expect(applied).not.toBeNull();
+    expect(Object.keys(applied!).sort()).toEqual(
+      Object.keys(clearedDecisionMetadata()).sort(),
+    );
     const raw = readMetadataRaw(sessionsDir, SESSION_ID);
     expect(raw?.[AGENT_REPORT_METADATA_KEYS.STATE]).toBeFalsy();
     expect(raw?.[AGENT_REPORT_METADATA_KEYS.AT]).toBeFalsy();
@@ -394,7 +461,7 @@ describe("clearSpentDecision", () => {
 
     expect(
       clearSpentDecision(PROJECT_ID, SESSION_ID, { state: "needs_input", at: STORED_AT }),
-    ).toBe(false);
+    ).toBeNull();
 
     const raw = readMetadataRaw(sessionsDir, SESSION_ID);
     expect(raw?.[AGENT_REPORT_METADATA_KEYS.AT]).toBe(fresherAt);
@@ -406,9 +473,45 @@ describe("clearSpentDecision", () => {
     seedSessionMetadata(sessionsDir, { state: "needs_decision" });
     expect(
       clearSpentDecision(PROJECT_ID, SESSION_ID, { state: "needs_input", at: STORED_AT }),
-    ).toBe(false);
+    ).toBeNull();
     expect(readMetadataRaw(sessionsDir, SESSION_ID)?.[AGENT_REPORT_METADATA_KEYS.STATE]).toBe(
       "needs_decision",
     );
+  });
+
+  describe("observed === null (episode marker lingered, no decision seen)", () => {
+    it("preserves a successor non-decision report, clearing only the identity markers", () => {
+      // The agent resolved the decision with `ao report working`. The next poll
+      // sees the session unparked with a leftover episode marker and retires with
+      // observed=null. The successor report's state/timestamp MUST survive.
+      seedSessionMetadata(sessionsDir, { state: "working", at: STORED_AT });
+
+      const applied = clearSpentDecision(PROJECT_ID, SESSION_ID, null);
+      expect(applied).not.toBeNull();
+      // Only identity markers are in the patch — never the report fields.
+      expect(Object.keys(applied!).sort()).toEqual(
+        [
+          NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID,
+          NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT,
+        ].sort(),
+      );
+      const raw = readMetadataRaw(sessionsDir, SESSION_ID);
+      expect(raw?.[AGENT_REPORT_METADATA_KEYS.STATE]).toBe("working");
+      expect(raw?.[AGENT_REPORT_METADATA_KEYS.AT]).toBe(STORED_AT);
+      expect(raw?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]).toBeFalsy();
+    });
+
+    it("leaves a successor DECISION report untouched — it owns its own identity", () => {
+      // A brand-new decision B was reported after the snapshot. Its episode marker
+      // is its own; retirement of the old episode must not touch it.
+      seedSessionMetadata(sessionsDir, {
+        state: "needs_input",
+        at: "2026-07-17T08:40:00.000Z",
+        episodeAt: "2026-07-17T08:40:05.000Z",
+      });
+      expect(clearSpentDecision(PROJECT_ID, SESSION_ID, null)).toBeNull();
+      const raw = readMetadataRaw(sessionsDir, SESSION_ID);
+      expect(raw?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]).toBe("2026-07-17T08:40:05.000Z");
+    });
   });
 });

@@ -6,6 +6,7 @@ import {
   checkBlockedAgent,
   shouldAuditSession,
   getReactionKeyForTrigger,
+  reportActivationIdentity,
   DEFAULT_REPORT_WATCHER_CONFIG,
   type ReportWatcherConfig,
 } from "../report-watcher.js";
@@ -329,5 +330,43 @@ describe("getReactionKeyForTrigger", () => {
     expect(getReactionKeyForTrigger("no_acknowledge")).toBe("report-no-acknowledge");
     expect(getReactionKeyForTrigger("stale_report")).toBe("report-stale");
     expect(getReactionKeyForTrigger("agent_needs_input")).toBe("report-needs-input");
+  });
+});
+
+describe("reportActivationIdentity", () => {
+  const report = (state: string, timestamp: string): AgentReport =>
+    ({ state, timestamp }) as unknown as AgentReport;
+
+  it("folds state and timestamp into the identity for a needs_input report", () => {
+    expect(reportActivationIdentity("agent_needs_input", report("needs_input", "T1"))).toBe(
+      "agent_needs_input:needs_input:T1",
+    );
+  });
+
+  it("folds state and timestamp into the identity for a needs_decision report", () => {
+    expect(reportActivationIdentity("agent_needs_input", report("needs_decision", "T1"))).toBe(
+      "agent_needs_input:needs_decision:T1",
+    );
+  });
+
+  it("changes when a SECOND needs_input report is written — the fix for dead buttons", () => {
+    // Two successive needs_input reports must yield DIFFERENT identities so the
+    // lifecycle manager treats the second as a new activation and re-fires the
+    // notification. Sharing the bare trigger (the bug) would suppress the re-fire
+    // and leave the human holding the buttons the second report's nonce invalidated.
+    const first = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"));
+    const second = reportActivationIdentity("agent_needs_input", report("needs_input", "T2"));
+    expect(first).not.toBe(second);
+  });
+
+  it("is stable across polls for the same report — no per-poll re-fire", () => {
+    const a = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"));
+    const b = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"));
+    expect(a).toBe(b);
+  });
+
+  it("uses the bare trigger for a non-decision or absent report", () => {
+    expect(reportActivationIdentity("no_acknowledge", null)).toBe("no_acknowledge");
+    expect(reportActivationIdentity("stale_report", report("working", "T1"))).toBe("stale_report");
   });
 });

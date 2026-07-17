@@ -3344,7 +3344,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
 
       let restored: Session;
       try {
-        restored = await restore(sessionId);
+        // Scope the restore to the project `send` already resolved, so a same-id
+        // session in another project is never launched in its place (#13 review).
+        restored = await restore(sessionId, projectId);
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         throw new Error(`Cannot send to session ${sessionId}: ${reason} (${detail})`, {
@@ -3370,7 +3372,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     };
 
     const prepareSession = async (forceRestore = false): Promise<Session> => {
-      const current = await get(sessionId);
+      // Scope to the resolved owning project — an unscoped get() could otherwise
+      // prepare a same-id session from a different project than the one
+      // requireSessionRecord picked above (#13 review).
+      const current = await get(sessionId, projectId);
       if (!current) {
         throw new SessionNotFoundError(sessionId);
       }
@@ -3686,9 +3691,11 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     return discovered;
   }
 
-  async function restore(sessionId: SessionId): Promise<Session> {
-    // 1. Find session metadata across all projects
-    const activeRecord = findSessionRecord(sessionId);
+  async function restore(sessionId: SessionId, scopeProjectId?: string): Promise<Session> {
+    // 1. Find session metadata — scoped to the owning project when the caller
+    //    knows it, so a duplicate session id in another project can't be restored
+    //    in its place (#13 review).
+    const activeRecord = findSessionRecord(sessionId, scopeProjectId);
     if (!activeRecord) {
       throw new SessionNotFoundError(sessionId);
     }

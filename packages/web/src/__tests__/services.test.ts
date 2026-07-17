@@ -9,6 +9,7 @@ const {
   mockCreateBacklogPoller,
   mockRegistry,
   tmuxPlugin,
+  aiderPlugin,
   claudePlugin,
   codexPlugin,
   grokPlugin,
@@ -46,6 +47,7 @@ const {
     mockCreateBacklogPoller,
     mockRegistry,
     tmuxPlugin: { manifest: { name: "tmux" } },
+    aiderPlugin: { manifest: { name: "aider" } },
     claudePlugin: { manifest: { name: "claude-code" } },
     codexPlugin: { manifest: { name: "codex" } },
     grokPlugin: { manifest: { name: "grok" } },
@@ -75,6 +77,7 @@ vi.mock("@aoagents/ao-core", () => ({
 }));
 
 vi.mock("@aoagents/ao-plugin-runtime-tmux", () => ({ default: tmuxPlugin }));
+vi.mock("@aoagents/ao-plugin-agent-aider", () => ({ default: aiderPlugin }));
 vi.mock("@aoagents/ao-plugin-agent-claude-code", () => ({ default: claudePlugin }));
 vi.mock("@aoagents/ao-plugin-agent-codex", () => ({ default: codexPlugin }));
 vi.mock("@aoagents/ao-plugin-agent-grok", () => ({ default: grokPlugin }));
@@ -126,6 +129,16 @@ describe("services", () => {
     await getServices();
 
     expect(mockRegister).toHaveBeenCalledWith(codexPlugin);
+  });
+
+  it("registers the Aider agent plugin with web services", async () => {
+    // A built-in agent whose plugin the web service failed to register would make
+    // every callback dispatch to an aider session throw 500 (#13 review).
+    const { getServices } = await import("../lib/services");
+
+    await getServices();
+
+    expect(mockRegister).toHaveBeenCalledWith(aiderPlugin);
   });
 
   it("registers the Grok agent plugin with web services", async () => {
