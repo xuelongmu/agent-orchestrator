@@ -329,6 +329,7 @@ export {
 export { execGhObserved, getGhTraceFilePath } from "./gh-trace.js";
 export { resolveNotifierTarget } from "./notifier-resolution.js";
 export {
+  NEEDS_INPUT_DECISION_TYPES,
   NOTIFY_ACTION_EVENT_TYPES,
   NOTIFY_CALLBACK_ACTIONS,
   NOTIFY_CALLBACK_DEFAULT_TTL_MS,

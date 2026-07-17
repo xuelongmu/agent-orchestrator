@@ -123,8 +123,9 @@ describe("isNotifyCallbackAction", () => {
 
 describe("isNotifyActionEvent", () => {
   it("flags decision events", () => {
-    const decision: EventType[] = [
+    const decision: string[] = [
       "session.needs_input",
+      "report.needs_input",
       "review.changes_requested",
       "merge.ready",
     ];
@@ -268,6 +269,35 @@ describe("buildNotifyActions", () => {
     });
     const actions = buildNotifyActions(event, { secret: SECRET, nonce: NONCE });
     expect(actions.map((a) => a.label)).toEqual(["Approve", "Deny", "Nudge", "Kill"]);
+  });
+
+  it("builds actions for a report-driven decision (report.needs_input semanticType)", () => {
+    // The report-watcher `report-needs-input` reaction — the primary path for
+    // agent needs_input/needs_decision reports — notifies with this semanticType.
+    const event = makeEvent({
+      type: "reaction.triggered",
+      data: {
+        schemaVersion: NOTIFICATION_DATA_SCHEMA_VERSION,
+        semanticType: "report.needs_input",
+        subject: { session: { id: "ao-5", projectId: "ao" } },
+      },
+    });
+    const actions = buildNotifyActions(event, { secret: SECRET, nonce: NONCE });
+    expect(actions.map((a) => a.label)).toEqual(["Approve", "Deny", "Nudge", "Kill"]);
+  });
+
+  it("emits no mutating buttons for a report.needs_input without a report nonce", () => {
+    // Widening the gate to report.needs_input must not weaken the nonce
+    // requirement: no signed decision identity, no mutating buttons.
+    const event = makeEvent({
+      type: "reaction.triggered",
+      data: {
+        schemaVersion: NOTIFICATION_DATA_SCHEMA_VERSION,
+        semanticType: "report.needs_input",
+        subject: { session: { id: "ao-5", projectId: "ao" } },
+      },
+    });
+    expect(buildNotifyActions(event, { secret: SECRET })).toEqual([]);
   });
 
   it("returns no actions for a reaction wrapping a non-decision semanticType", () => {

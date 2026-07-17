@@ -1,12 +1,14 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import type { EventType, NotifyAction, OrchestratorEvent } from "./types.js";
+import type { NotifyAction, OrchestratorEvent } from "./types.js";
 import { getNotificationDataV3 } from "./notification-data.js";
 
 /**
  * Actionable "needs your decision" notifications (#13).
  *
- * A decision event (`session.needs_input`, `review.changes_requested`,
- * `merge.ready`) is pushed to a mobile, action-capable notifier (e.g. Telegram)
+ * A decision event (`session.needs_input`/`report.needs_input`,
+ * `review.changes_requested`, `merge.ready`) — where the needs-input pair may
+ * arrive wrapped in a `reaction.triggered`, carrying the real decision type as
+ * its notification `semanticType` — is pushed to an action-capable notifier
  * with buttons. Each button is a signed, expiring URL back into the AO web
  * server's `/api/notify-callback/<token>` route. Tapping it resolves the
  * decision by sending a message to the session (or killing it) and records the
@@ -29,9 +31,21 @@ export const NOTIFY_CALLBACK_ACTIONS = ["approve", "deny", "nudge", "kill"] as c
 
 export type NotifyCallbackAction = (typeof NOTIFY_CALLBACK_ACTIONS)[number];
 
-/** Event types that carry actionable decision buttons. */
-export const NOTIFY_ACTION_EVENT_TYPES: readonly EventType[] = [
+/**
+ * Decision (semantic) types that a human resolves with Approve/Deny/Nudge/Kill.
+ * Both the direct `session.needs_input` transition and the report-watcher's
+ * `report.needs_input` (reaction key `report-needs-input`, the primary path for
+ * agent `needs_input`/`needs_decision` reports) count. These are semantic types,
+ * not just raw EventTypes, so this list is `string[]`.
+ */
+export const NEEDS_INPUT_DECISION_TYPES: readonly string[] = [
   "session.needs_input",
+  "report.needs_input",
+];
+
+/** Decision types that carry any actionable notification buttons. */
+export const NOTIFY_ACTION_EVENT_TYPES: readonly string[] = [
+  ...NEEDS_INPUT_DECISION_TYPES,
   "review.changes_requested",
   "merge.ready",
 ];
@@ -197,9 +211,10 @@ export interface BuildNotifyActionsOptions {
 /**
  * Build the notification buttons for a decision event.
  *
- * Approve / Deny / Nudge / Kill are attached only for a `session.needs_input`
- * that is backed by an agent decision report — i.e. `options.nonce` is set to
- * that report's timestamp. That report is a stable, per-decision identity the
+ * Approve / Deny / Nudge / Kill are attached only for a needs-input decision
+ * (`session.needs_input` or the report-watcher's `report.needs_input` — see
+ * {@link NEEDS_INPUT_DECISION_TYPES}) that is backed by an agent decision
+ * report — i.e. `options.nonce` is set to that report's timestamp. That report is a stable, per-decision identity the
  * callback route re-checks, so an old link can't answer a later, different
  * decision. A needs_input with no report identity (e.g. a bare detected prompt)
  * gets no mutating buttons, because there'd be nothing reliable to bind them to.
@@ -223,7 +238,7 @@ export function buildNotifyActions(
 
   const actions: NotifyAction[] = [];
 
-  if (decisionType === "session.needs_input" && options.nonce !== undefined) {
+  if (NEEDS_INPUT_DECISION_TYPES.includes(decisionType) && options.nonce !== undefined) {
     for (const action of NOTIFY_CALLBACK_ACTIONS) {
       const token = signCallbackToken(
         { sessionId: event.sessionId, projectId: event.projectId, action, exp, nonce: options.nonce },

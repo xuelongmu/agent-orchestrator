@@ -80,6 +80,7 @@ vi.mock("@/lib/services", () => ({
 }));
 
 import { GET } from "@/app/api/notify-callback/[token]/route";
+import { __resetResolvedDecisions } from "@/lib/notify-callback-dedup";
 
 function makeRequest(): Request {
   return new Request("http://localhost:3000/api/notify-callback/x");
@@ -98,6 +99,7 @@ async function callGet(tok: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  __resetResolvedDecisions();
   process.env.AO_NOTIFY_CALLBACK_SECRET = SECRET;
 });
 
@@ -222,6 +224,52 @@ describe("GET /api/notify-callback/[token]", () => {
     const res = await callGet(token("approve"));
     expect(res.status).toBe(409);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("rejects a second action for the same decision — no double-dispatch (409)", async () => {
+    // get default resolves a fresh pending+matching session each call.
+    const first = await callGet(token("approve"));
+    expect(first.status).toBe(200);
+    const second = await callGet(token("deny"));
+    expect(second.status).toBe(409);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+    expect(recordActivityEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "api.notify_callback.duplicate" }),
+    );
+  });
+
+  it("dispatches once for concurrent double-taps of the same decision", async () => {
+    // Both requests pass the pending/identity checks before either dispatches —
+    // the claim is what serializes them, so exactly one action may fire.
+    const [a, b] = await Promise.all([callGet(token("approve")), callGet(token("kill"))]);
+    const statuses = [a.status, b.status].sort();
+    expect(statuses).toEqual([200, 409]);
+    expect(send.mock.calls.length + kill.mock.calls.length).toBe(1);
+  });
+
+  it("releases the decision claim when dispatch fails so a retry can succeed", async () => {
+    send.mockRejectedValueOnce(new Error("transient"));
+    const first = await callGet(token("approve"));
+    expect(first.status).toBe(500);
+    const retry = await callGet(token("approve"));
+    expect(retry.status).toBe(200);
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the claim when post-dispatch bookkeeping throws — the action already fired", async () => {
+    // Only a failed dispatch may release the claim. If an audit-trail failure
+    // released it, a second tap could re-fire an action that already ran.
+    recordActivityEvent.mockImplementationOnce(() => {
+      throw new Error("audit sink down");
+    });
+    const first = await callGet(token("approve"));
+    expect(first.status).toBe(500);
+    expect(send).toHaveBeenCalledTimes(1);
+
+    const second = await callGet(token("kill"));
+    expect(second.status).toBe(409);
+    expect(kill).not.toHaveBeenCalled();
   });
 
   it("rejects a blocked (error/stuck) session — not a human prompt (409)", async () => {

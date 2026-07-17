@@ -1,6 +1,7 @@
 import { type NextRequest } from "next/server";
 import { getServices } from "@/lib/services";
 import { validateIdentifier } from "@/lib/validation";
+import { claimDecision, decisionKeyFor, releaseDecision } from "@/lib/notify-callback-dedup";
 import {
   ACTIVITY_STATE,
   SessionNotFoundError,
@@ -193,10 +194,54 @@ export async function GET(
       );
     }
 
-    if (action === "kill") {
-      await sessionManager.kill(sessionId);
-    } else {
-      await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action]);
+    // Claim the decision before dispatching so a concurrent/second tap can't
+    // fire a second action for the same decision (a double-tap, or Approve then
+    // Kill before the agent leaves needs_input). The claim is taken after the
+    // pending/identity checks and is synchronous, so two in-flight requests that
+    // both pass those checks still race here and exactly one wins. (#13, review)
+    if (!claimDecision(decisionKeyFor(payload), payload.exp, startedAt)) {
+      recordApiObservation({
+        config,
+        method: "GET",
+        path: "/api/notify-callback/[token]",
+        correlationId,
+        startedAt,
+        outcome: "failure",
+        statusCode: 409,
+        projectId: resolvedProjectId,
+        sessionId,
+        reason: "duplicate callback action",
+        data: { action },
+      });
+      recordActivityEvent({
+        projectId: resolvedProjectId,
+        sessionId,
+        source: "api",
+        kind: "api.notify_callback.duplicate",
+        level: "warn",
+        summary: `notification action "${action}" ignored as already resolved for session ${sessionId}`,
+        data: { action },
+      });
+      return htmlResponse(
+        409,
+        "Already handled",
+        "This decision was already answered from another tap, so no further action was taken.",
+      );
+    }
+
+    // Release the claim only when the dispatch itself failed, so a genuine
+    // failure stays retryable. Anything after this point (audit bookkeeping) must
+    // NOT release it — the action already fired, and re-opening the decision
+    // would let a second tap dispatch it twice.
+    try {
+      if (action === "kill") {
+        await sessionManager.kill(sessionId);
+      } else {
+        await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action]);
+      }
+    } catch (err) {
+      releaseDecision(decisionKeyFor(payload));
+      throw err;
     }
 
     recordApiObservation({
