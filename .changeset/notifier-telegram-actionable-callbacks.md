@@ -18,10 +18,10 @@ resolve them from the notification — closing the loop back into AO (#13).
 - Core now builds those actions for decision events and routes them through
   `notifyWithActions` when a notifier supports it. The relative mutating callbacks
   (Approve/Deny/Nudge/Kill) are passed only to notifiers that declare the new
-  `Notifier.resolvesActionCallbacks` capability — Telegram and desktop (which
-  prepend their own dashboard base URL) and the dashboard (same origin); notifiers
-  that cannot turn a relative endpoint into a working URL (e.g. Slack, OpenClaw)
-  never receive them. Ordinary URL actions (View PR) are delivered generically to
+  `Notifier.resolvesActionCallbacks` capability — Telegram, and the desktop backend
+  only when the actionable AO Notifier.app is selected; notifiers that cannot turn a
+  relative endpoint into a working URL (e.g. Slack, OpenClaw, and the dashboard,
+  whose UI renders only `action.url`) never receive them. Ordinary URL actions (View PR) are delivered generically to
   every notifier. Approve/Deny/Nudge/Kill are attached to a report-backed
   `session.needs_input` (the genuine pending decision the callback resolves);
   `review.changes_requested` and `merge.ready` get a View PR link. Each button is an HMAC-signed, expiring token bound to the decision

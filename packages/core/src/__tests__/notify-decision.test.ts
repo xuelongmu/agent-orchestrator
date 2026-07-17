@@ -452,15 +452,48 @@ describe("clearSpentDecision", () => {
       state: "needs_input",
       at: STORED_AT,
     });
-    // The returned patch is the exact set of keys touched — callers mirror it.
+    // The returned patch is the exact set of keys touched — the cleared decision
+    // fields plus the backfilled acknowledgement marker — so callers mirror it.
     expect(applied).not.toBeNull();
     expect(Object.keys(applied!).sort()).toEqual(
-      Object.keys(clearedDecisionMetadata()).sort(),
+      [
+        ...Object.keys(clearedDecisionMetadata()),
+        AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT,
+      ].sort(),
     );
     const raw = readMetadataRaw(sessionsDir, SESSION_ID);
     expect(raw?.[AGENT_REPORT_METADATA_KEYS.STATE]).toBeFalsy();
     expect(raw?.[AGENT_REPORT_METADATA_KEYS.AT]).toBeFalsy();
     expect(raw?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]).toBeFalsy();
+  });
+
+  it("backfills the acknowledgement marker from a pre-upgrade report before clearing it", () => {
+    // A session restored across an upgrade carries a report but no marker. Clearing
+    // the report must leave durable acknowledgement evidence so the SAME poll's
+    // checkAcknowledgeTimeout does not falsely fire no_acknowledge. (#13 review)
+    const raw0 = readMetadataRaw(sessionsDir, SESSION_ID);
+    expect(raw0?.[AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]).toBeFalsy(); // pre-upgrade: none
+
+    clearSpentDecision(PROJECT_ID, SESSION_ID, { state: "needs_input", at: STORED_AT });
+
+    const raw = readMetadataRaw(sessionsDir, SESSION_ID);
+    expect(raw?.[AGENT_REPORT_METADATA_KEYS.STATE]).toBeFalsy(); // report cleared
+    expect(raw?.[AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]).toBe(STORED_AT); // backfilled
+  });
+
+  it("preserves an existing acknowledgement marker on retirement", () => {
+    const earlier = "2026-07-17T07:00:00.000Z";
+    seedSessionMetadata(sessionsDir, { at: STORED_AT });
+    mutateMetadata(sessionsDir, SESSION_ID, (existing) => ({
+      ...existing,
+      [AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]: earlier,
+    }));
+
+    clearSpentDecision(PROJECT_ID, SESSION_ID, { state: "needs_input", at: STORED_AT });
+
+    expect(readMetadataRaw(sessionsDir, SESSION_ID)?.[AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]).toBe(
+      earlier,
+    );
   });
 
   it("clears a valid but non-canonical stored timestamp (normalized comparison)", () => {

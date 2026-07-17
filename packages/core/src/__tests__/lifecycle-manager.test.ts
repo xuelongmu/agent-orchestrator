@@ -22,6 +22,8 @@ import type {
   SessionMetadata,
   PRInfo,
   SCM,
+  Notifier,
+  NotifyAction,
 } from "../types.js";
 import {
   createTestEnvironment,
@@ -2483,6 +2485,169 @@ describe("reactions", () => {
         { agentReportedQuestion: "Ship it?", agentReportedConfidence: "0.6" },
       );
       expect(notifies.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("re-notifies for the FIRST report that lands after a bare-prompt transition", async () => {
+      // The session is already parked (a prior poll's bare-prompt transition) with
+      // NO active trigger yet; the first report arrives with no transition this
+      // poll, so the fallback is the only path that can deliver its controls.
+      const notifies = await runAudit("needs_input", "2025-01-01T11:55:00.000Z", "", {
+        reportWatcherActiveTrigger: "",
+        reportWatcherTriggerActivatedAt: "",
+        reportWatcherTriggerCount: "",
+      });
+      expect(notifies.length).toBeGreaterThanOrEqual(1);
+    });
+
+    const capturingNotifier = () => {
+      const notify = vi.fn().mockResolvedValue(undefined);
+      const notifyWithActions = vi.fn().mockResolvedValue(undefined);
+      return {
+        notify,
+        notifyWithActions,
+        plugin: {
+          name: "desktop",
+          resolvesActionCallbacks: true,
+          notify,
+          notifyWithActions,
+        } as unknown as Notifier,
+        mutatingButtons: () =>
+          notifyWithActions.mock.calls
+            .flatMap((c) => (c[1] as NotifyAction[] | undefined) ?? [])
+            .filter((a) => a.callbackEndpoint),
+      };
+    };
+
+    const decisionSession = (reportAt: string, priorAt: string) =>
+      makeSession({
+        status: "needs_input",
+        activity: "waiting_input",
+        metadata: {
+          agent: "mock-agent",
+          agentReportedState: "needs_input",
+          agentReportedAt: reportAt,
+          reportWatcherActiveTrigger: `agent_needs_input:needs_input:${priorAt}`,
+          reportWatcherTriggerActivatedAt: priorAt,
+          reportWatcherTriggerCount: "1",
+          notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
+        },
+      });
+
+    it("omits mutating buttons when a superseding report changes the identity during delivery (B→C)", async () => {
+      // The event content is built from report B, but a superseding report C lands
+      // before the notify guard's async get(). The buttons must NOT be minted with
+      // C's identity — a human must not resolve C from B's alert. (#13 review)
+      const cap = capturingNotifier();
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier: cap.plugin,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const lm = setupCheck("app-1", {
+        session: decisionSession("2025-01-01T11:55:00.000Z", "2025-01-01T11:50:00.000Z"),
+        registry,
+        configOverride: {
+          ...config,
+          reactions: {},
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+        },
+      });
+
+      // The poll session B carries the persisted fields setupCheck merges in; C is
+      // the same session with a superseding report timestamp (a different
+      // decision identity).
+      const sessionB = (await mockSessionManager.get("app-1"))!;
+      const sessionC = {
+        ...sessionB,
+        metadata: { ...sessionB.metadata, agentReportedAt: "2025-01-01T11:59:00.000Z" },
+      };
+      // check() reads B (builds the event + expectedDecisionId); the notify guard's
+      // fresh get() sees the superseding C.
+      vi.mocked(mockSessionManager.get).mockReset();
+      vi.mocked(mockSessionManager.get).mockResolvedValueOnce(sessionB).mockResolvedValue(sessionC);
+
+      await lm.check("app-1");
+
+      expect(cap.mutatingButtons()).toHaveLength(0);
+      // The alert itself still went out.
+      expect(cap.notify.mock.calls.length + cap.notifyWithActions.mock.calls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("mints mutating buttons when the identity still matches at delivery (B==B)", async () => {
+      const cap = capturingNotifier();
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier: cap.plugin,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const sessionB = decisionSession("2025-01-01T11:55:00.000Z", "2025-01-01T11:50:00.000Z");
+      const lm = setupCheck("app-1", {
+        session: sessionB,
+        registry,
+        configOverride: {
+          ...config,
+          reactions: {},
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+        },
+      });
+      // Both reads see B: identity matches, so buttons mint.
+      vi.mocked(mockSessionManager.get).mockResolvedValue(sessionB);
+
+      await lm.check("app-1");
+
+      expect(cap.mutatingButtons().map((a) => a.label)).toEqual([
+        "Approve",
+        "Deny",
+        "Nudge",
+        "Kill",
+      ]);
+    });
+
+    it("does not duplicate when THIS poll's transition carried the controls", async () => {
+      // The report parks the session THIS poll (working → needs_input): the status
+      // transition notification carries the buttons, so the report fallback must
+      // stay silent (no report.needs_input reaction.triggered).
+      const notifier = createMockNotifier();
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "working", // transitions to needs_input this poll
+          activity: "waiting_input",
+          metadata: {
+            agent: "mock-agent",
+            agentReportedState: "needs_input",
+            agentReportedAt: "2025-01-01T11:55:00.000Z",
+            notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
+          },
+        }),
+        registry,
+        configOverride: {
+          ...config,
+          reactions: {},
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+        },
+      });
+
+      await lm.check("app-1");
+
+      const reportReNotifies = vi.mocked(notifier.notify).mock.calls.filter((call) => {
+        const event = call[0] as { type?: string; data?: { semanticType?: string } };
+        return (
+          event?.type === "reaction.triggered" &&
+          event?.data?.semanticType === "report.needs_input"
+        );
+      });
+      expect(reportReNotifies).toHaveLength(0);
     });
   });
 

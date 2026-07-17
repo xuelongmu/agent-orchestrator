@@ -324,7 +324,17 @@ export function clearSpentDecision(
       applied = null;
       return existing;
     }
-    applied = clearedDecisionMetadata();
+    // Backfill the durable acknowledgement marker from the report being retired if
+    // it is absent — a session restored across an upgrade may carry a valid report
+    // but no marker (it predates the marker). Clearing the report without this
+    // would let the SAME poll's checkAcknowledgeTimeout see neither report nor
+    // marker and falsely fire no_acknowledge. An existing marker is preserved.
+    // (#13 review)
+    applied = {
+      ...clearedDecisionMetadata(),
+      [AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]:
+        existing[AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT] || observed.at,
+    };
     return { ...existing, ...applied };
   });
   return applied;

@@ -2435,15 +2435,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       report && isDecisionReport(report) ? { state: report.state, at: report.timestamp } : null;
     const applied = clearSpentDecision(session.projectId, session.id, observed);
     if (!applied) return;
-    // Mirror EXACTLY the keys the locked clear touched into this cycle's snapshot,
-    // without a second write (re-writing the empties could clobber a report that
-    // landed in between). For an observed===null retirement `applied` holds only
-    // the identity markers, so a preserved successor report (e.g. `ao report
-    // working`) stays visible for the rest of this audit cycle rather than being
-    // filtered out of the snapshot (#13 review).
-    const clearedKeys = new Set(Object.keys(applied));
+    // Mirror the patch into this cycle's snapshot without a second write (re-writing
+    // the empties could clobber a report that landed in between): apply non-empty
+    // values (e.g. a backfilled acknowledgement marker) and drop emptied keys. For
+    // an observed===null retirement `applied` holds only the identity markers, so a
+    // preserved successor report stays visible for the rest of the cycle (#13 review).
+    const merged = { ...session.metadata, ...applied };
     session.metadata = Object.fromEntries(
-      Object.entries(session.metadata).filter(([key]) => !clearedKeys.has(key)),
+      Object.entries(merged).filter(([, value]) => value !== ""),
     );
     sessionManager.invalidateCache();
   }
@@ -4089,7 +4088,18 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * notifier accepted the event (used by callers that must not latch state on a
    * failed/undelivered notification, e.g. the round-cap escalation).
    */
-  async function notifyHuman(event: OrchestratorEvent, priority: EventPriority): Promise<boolean> {
+  async function notifyHuman(
+    event: OrchestratorEvent,
+    priority: EventPriority,
+    // The decision identity the event's CONTENT was built for, when the caller
+    // constructed it from a decision report. The mutating buttons are minted only
+    // if the freshly-loaded identity still equals this, so a superseding report
+    // that lands during the async load below cannot leave the human resolving a
+    // DIFFERENT decision than the alert describes. `null` means "no decision"
+    // (a bare-prompt transition); `undefined` (default) skips the check for
+    // non-decision callers. (#13 review)
+    expectedDecisionId?: string | null,
+  ): Promise<boolean> {
     const eventWithPriority = { ...event, priority };
     // Prefer a per-project routing override (preserves a startup-only project's
     // own routing when merged into a global scope), then top-level, then default.
@@ -4130,7 +4140,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             eventWithPriority.sessionId,
             eventWithPriority.projectId,
           );
-          nonce = subject ? (activeDecisionId(subject) ?? undefined) : undefined;
+          const freshId = subject ? (activeDecisionId(subject) ?? undefined) : undefined;
+          // Bind the buttons to the decision the event content describes: if the
+          // caller passed the identity it built from and the live identity has since
+          // moved on, omit the mutating actions (the alert still delivers; the new
+          // decision re-notifies on its own path). (#13 review)
+          nonce =
+            expectedDecisionId !== undefined && freshId !== (expectedDecisionId ?? undefined)
+              ? undefined
+              : freshId;
         }
         actions = buildNotifyActions(eventWithPriority, {
           secret: callbackSecret ?? undefined,
@@ -4790,7 +4808,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
               enrichment: getPREnrichmentForSession(session),
             }),
           });
-          await notifyHuman(event, priority);
+          // Bind any minted controls to THIS session's decision identity so a
+          // report that supersedes it during delivery can't repoint the buttons.
+          await notifyHuman(event, priority, activeDecisionId(session));
         }
       }
     } else {
@@ -4878,8 +4898,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       maybeRetargetStackedChild(session),
     ]);
 
-    // Report watcher: audit agent reports for issues (#140)
-    await auditAndReactToReports(session);
+    // Report watcher: audit agent reports for issues (#140). Tell it whether THIS
+    // poll transitioned the session into needs_input — if so, the transition
+    // notification above already carried the decision's controls, and the report
+    // re-notify fallback must not duplicate it. If not (a report arrived while the
+    // session was already parked, e.g. after an earlier bare-prompt transition),
+    // the fallback is the ONLY path that can deliver the new controls (#13 review).
+    const transitionedToNeedsInput =
+      oldStatus !== SESSION_STATUS.NEEDS_INPUT && newStatus === SESSION_STATUS.NEEDS_INPUT;
+    await auditAndReactToReports(session, transitionedToNeedsInput);
 
     // PR-merge auto-cleanup: tear down runtime + worktree + archive metadata
     // once the agent is idle (or grace window elapses). Runs last so reactions
@@ -4891,7 +4918,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * Audit agent reports and trigger reactions when issues are detected.
    * Called at the end of each checkSession cycle.
    */
-  async function auditAndReactToReports(session: Session): Promise<void> {
+  async function auditAndReactToReports(
+    session: Session,
+    transitionedToNeedsInput = false,
+  ): Promise<void> {
     // Drop a resolved needs_decision's sticky question/confidence if the session
     // has since left needs_input (before reading any report below) (#12 review).
     clearStaleDecisionContext(session);
@@ -4995,22 +5025,23 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       await executeReaction(session, reactionKey, reactionConfig);
     }
 
-    // Same-state decision re-notify (#12, #13 review): a SECOND needs_input or
-    // needs_decision report while the session is already parked changes
-    // `activeDecisionId` (invalidating the previous notification's buttons with
-    // 409) but produces no status transition, and with stock config there is no
-    // report-needs-input reaction to fire. Emit a replacement actionable
-    // notification exactly once per new activation, so the human is never left
-    // holding only invalidated controls. Skipped on the FIRST block (prior trigger
-    // was not already needs-input — the status transition handled that), gated on
-    // `isNewTrigger` (no per-poll duplicate), and skipped when a report-needs-input
-    // reaction owns the ping (respect its opt-out).
+    // Report re-notify (#12, #13 review): a needs_input or needs_decision report
+    // whose activation identity is NEW changes `activeDecisionId` (invalidating any
+    // previous notification's buttons with 409), but produces no status transition
+    // in a poll where the session was already parked, and with stock config there
+    // is no report-needs-input reaction to fire. Emit a replacement actionable
+    // notification exactly once per new activation so the human is never left with
+    // only invalidated (or missing) controls. This covers BOTH a second report
+    // while parked AND the first report that lands after an earlier bare-prompt
+    // transition. Skipped when THIS poll's transition already carried the controls
+    // (`transitionedToNeedsInput`), gated on `isNewTrigger` (no per-poll duplicate),
+    // and skipped when a report-needs-input reaction owns the ping (its opt-out).
     const decisionReportState = auditResult.report?.state;
     if (
       isNewTrigger &&
       !reactionConfig &&
       (decisionReportState === "needs_input" || decisionReportState === "needs_decision") &&
-      priorActiveTrigger.startsWith("agent_needs_input")
+      !transitionedToNeedsInput
     ) {
       // needs_decision carries an explicit question/confidence; a plain needs_input
       // uses the audit finding's generic message. A needs_decision with no active
@@ -5039,7 +5070,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             enrichment: getPREnrichmentForSession(session),
           }),
         });
-        await notifyHuman(event, "urgent");
+        // Bind the controls to the identity this message was built for, so a report
+        // superseding it during delivery cannot repoint the buttons (#13 review).
+        await notifyHuman(event, "urgent", activeDecisionId(session));
       }
     }
   }

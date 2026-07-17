@@ -3193,33 +3193,54 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
   ): Promise<void> {
     const { raw, sessionsDir, project, projectId } = requireSessionRecord(sessionId, scopeProjectId);
 
-    const selection = resolveSelectionForSession(project, sessionId, raw);
-    const selectedAgent = selection.agentName;
-    if (selectedAgent === "opencode" && !asValidOpenCodeSessionId(raw["opencodeSessionId"])) {
-      const discovered = await discoverOpenCodeSessionIdByTitle(
-        sessionId,
-        OPENCODE_INTERACTIVE_DISCOVERY_TIMEOUT_MS,
-      );
-      if (discovered) {
-        raw["opencodeSessionId"] = discovered;
-        updateMetadata(sessionsDir, sessionId, { opencodeSessionId: discovered });
-        invalidateCache();
+    // ALL setup below is PRE-DELIVERY: agent selection, OpenCode discovery, and
+    // plugin resolution all run before the runtime send is ever attempted. Classify
+    // any failure here as SessionSendNotDeliveredError so an at-most-once caller can
+    // reopen a claim that delivered nothing — notably for a session whose agent
+    // plugin is not registered in this process (the web service registers only
+    // built-ins), which would otherwise escape as a plain error and permanently
+    // consume the token. `requireSessionRecord` above already throws the typed
+    // SessionNotFoundError the route also treats as pre-delivery. (#13 review)
+    let runtimePlugin: Runtime;
+    let agentPlugin: Agent;
+    let runtimeName: string;
+    let agentName: string;
+    try {
+      const selection = resolveSelectionForSession(project, sessionId, raw);
+      const selectedAgent = selection.agentName;
+      if (selectedAgent === "opencode" && !asValidOpenCodeSessionId(raw["opencodeSessionId"])) {
+        const discovered = await discoverOpenCodeSessionIdByTitle(
+          sessionId,
+          OPENCODE_INTERACTIVE_DISCOVERY_TIMEOUT_MS,
+        );
+        if (discovered) {
+          raw["opencodeSessionId"] = discovered;
+          updateMetadata(sessionsDir, sessionId, { opencodeSessionId: discovered });
+          invalidateCache();
+        }
       }
-    }
-    const parsedHandle = raw["runtimeHandle"]
-      ? safeJsonParse<RuntimeHandle>(raw["runtimeHandle"])
-      : null;
-    const runtimeName = parsedHandle?.runtimeName ?? project.runtime ?? config.defaults.runtime;
-    const agentName = selectedAgent;
+      const parsedHandle = raw["runtimeHandle"]
+        ? safeJsonParse<RuntimeHandle>(raw["runtimeHandle"])
+        : null;
+      runtimeName = parsedHandle?.runtimeName ?? project.runtime ?? config.defaults.runtime;
+      agentName = selectedAgent;
 
-    const runtimePlugin = registry.get<Runtime>("runtime", runtimeName);
-    if (!runtimePlugin) {
-      throw new Error(`No runtime plugin for session ${sessionId}`);
-    }
+      const resolvedRuntime = registry.get<Runtime>("runtime", runtimeName);
+      if (!resolvedRuntime) {
+        throw new Error(`No runtime plugin for session ${sessionId}`);
+      }
+      runtimePlugin = resolvedRuntime;
 
-    const agentPlugin = registry.get<Agent>("agent", agentName);
-    if (!agentPlugin) {
-      throw new Error(`No agent plugin for session ${sessionId}`);
+      const resolvedAgent = registry.get<Agent>("agent", agentName);
+      if (!resolvedAgent) {
+        throw new Error(`No agent plugin for session ${sessionId}`);
+      }
+      agentPlugin = resolvedAgent;
+    } catch (setupErr) {
+      if (setupErr instanceof SessionNotFoundError) throw setupErr;
+      throw new SessionSendNotDeliveredError(sessionId, {
+        cause: setupErr instanceof Error ? setupErr : new Error(String(setupErr)),
+      });
     }
 
     const captureOutput = async (handle: RuntimeHandle): Promise<string> => {

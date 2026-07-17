@@ -207,6 +207,32 @@ describe("send", () => {
     expect(mockRuntime.sendMessage).toHaveBeenCalled();
   });
 
+  it("reports a pre-delivery failure when the agent plugin is not registered", async () => {
+    // A session whose agent plugin is missing in this process (e.g. an external
+    // agent not registered by the web service) throws during plugin resolution —
+    // before any delivery attempt. That must be the typed pre-delivery failure so
+    // the callback route can reopen the claim, not a plain error. (#13 review)
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp",
+      branch: "main",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: makeHandle("rt-1"),
+    });
+    const noAgentRegistry = {
+      ...mockRegistry,
+      get: vi.fn((slot: string, name?: string) =>
+        slot === "agent"
+          ? null
+          : (mockRegistry.get as unknown as (s: string, n?: string) => unknown)(slot, name),
+      ),
+    } as unknown as PluginRegistry;
+
+    const sm = createSessionManager({ config, registry: noAgentRegistry });
+    await expect(sm.send("app-1", "hello")).rejects.toBeInstanceOf(SessionSendNotDeliveredError);
+    expect(mockRuntime.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("waits for spawning sessions to become interactive before considering restore", async () => {
     writeMetadata(sessionsDir, "app-1", {
       worktree: "/tmp",
