@@ -175,7 +175,7 @@ describe("activeDecisionId", () => {
       lifecycleState: "working",
       episodeAt: "2026-07-17T09:00:00.000Z",
     });
-    expect(decisionEpisodeTransition(resumed, "2026-07-17T09:01:00.000Z")).toEqual({
+    expect(decisionEpisodeTransition(resumed, null, "2026-07-17T09:01:00.000Z")).toEqual({
       kind: "retire",
     });
 
@@ -206,7 +206,7 @@ describe("first-entry mint", () => {
     });
     expect(activeDecisionId(justParked)).toBeNull();
 
-    const transition = decisionEpisodeTransition(justParked, "2026-07-17T10:00:00.000Z");
+    const transition = decisionEpisodeTransition(justParked, null, "2026-07-17T10:00:00.000Z");
     expect(transition).toEqual({
       kind: "stamp",
       patch: { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "2026-07-17T10:00:00.000Z" },
@@ -224,30 +224,64 @@ describe("first-entry mint", () => {
 describe("decisionEpisodeTransition", () => {
   it("stamps the episode on entry into needs_input", () => {
     const session = makeSession({ lifecycleState: "needs_input", episodeAt: null });
-    expect(decisionEpisodeTransition(session, "2026-07-17T10:00:00.000Z")).toEqual({
+    expect(decisionEpisodeTransition(session, null, "2026-07-17T10:00:00.000Z")).toEqual({
       kind: "stamp",
       patch: { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "2026-07-17T10:00:00.000Z" },
     });
   });
 
+  it("stamps with the durable agent boundary when one is available", () => {
+    // The marker is bound to the agent's own last-activity instant, not poll time,
+    // so the between-polls advance check below compares like against like.
+    const session = makeSession({ lifecycleState: "needs_input", episodeAt: null });
+    expect(
+      decisionEpisodeTransition(session, "2026-07-17T09:59:50.000Z", "2026-07-17T10:00:00.000Z"),
+    ).toEqual({
+      kind: "stamp",
+      patch: { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "2026-07-17T09:59:50.000Z" },
+    });
+  });
+
   it("does not refresh the marker while the session stays parked", () => {
     // Stability is the point: a marker that moved every poll would invalidate
-    // live tokens within seconds, exactly as lastTransitionAt would.
-    const session = makeSession({ lifecycleState: "needs_input" });
-    expect(decisionEpisodeTransition(session, "2026-07-17T10:00:00.000Z")).toBeNull();
+    // live tokens within seconds, exactly as lastTransitionAt would. A boundary
+    // that has NOT advanced past the marker (agent still blocked at the prompt)
+    // is a no-op.
+    const session = makeSession({ lifecycleState: "needs_input", episodeAt: EPISODE_AT });
+    expect(decisionEpisodeTransition(session, EPISODE_AT, "2026-07-17T10:00:00.000Z")).toBeNull();
+    expect(decisionEpisodeTransition(session, null, "2026-07-17T10:00:00.000Z")).toBeNull();
+  });
+
+  it("retires the spent record when the agent boundary advances past the marker (between-polls re-park)", () => {
+    // A resolves and the agent re-parks on an unrelated bare prompt B entirely
+    // within one poll interval: both snapshots read needs_input, so only the
+    // advancing activity boundary reveals that the agent left A's prompt. Retiring
+    // clears A's report/episode so A's still-live token cannot answer B.
+    const session = makeSession({ lifecycleState: "needs_input", episodeAt: EPISODE_AT });
+    const advanced = new Date(Date.parse(EPISODE_AT) + 30_000).toISOString();
+    expect(decisionEpisodeTransition(session, advanced, "2026-07-17T10:00:00.000Z")).toEqual({
+      kind: "retire",
+    });
+  });
+
+  it("ignores a boundary at or before the marker, or an unparseable one", () => {
+    const session = makeSession({ lifecycleState: "needs_input", episodeAt: EPISODE_AT });
+    const before = new Date(Date.parse(EPISODE_AT) - 30_000).toISOString();
+    expect(decisionEpisodeTransition(session, before, "2026-07-17T10:00:00.000Z")).toBeNull();
+    expect(decisionEpisodeTransition(session, "not-a-date", "2026-07-17T10:00:00.000Z")).toBeNull();
   });
 
   it("clears the marker once the session leaves needs_input", () => {
     const session = makeSession({ lifecycleState: "working" });
     // Retiring is not a patch: the clear must go through the locked compare.
-    expect(decisionEpisodeTransition(session, "2026-07-17T10:00:00.000Z")).toEqual({
+    expect(decisionEpisodeTransition(session, null, "2026-07-17T10:00:00.000Z")).toEqual({
       kind: "retire",
     });
   });
 
   it("is a no-op when unparked and already unmarked", () => {
     const session = makeSession({ lifecycleState: "working", episodeAt: null });
-    expect(decisionEpisodeTransition(session, "2026-07-17T10:00:00.000Z")).toBeNull();
+    expect(decisionEpisodeTransition(session, null, "2026-07-17T10:00:00.000Z")).toBeNull();
   });
 });
 

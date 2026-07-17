@@ -102,6 +102,7 @@ import {
   getNotifyCallbackSecret,
   isNotifyActionEvent,
   resolveDecisionEventType,
+  NEEDS_INPUT_DECISION_TYPES,
 } from "./notify-callback.js";
 import {
   activeDecisionId,
@@ -2462,20 +2463,30 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * decision A from an unrelated bare prompt B raised inside that window. The
    * episode boundary can: B is a new episode, so A's token stops matching.
    *
-   * Edge-triggered, never refreshed while parked — a marker that moved each poll
-   * would invalidate live tokens within seconds (the same reason `lastTransitionAt`
-   * is unusable here: the poll re-commits `sessionState: "needs_input"` on every
+   * Never refreshed while genuinely parked — a marker that moved each poll would
+   * invalidate live tokens within seconds (the same reason `lastTransitionAt` is
+   * unusable here: the poll re-commits `sessionState: "needs_input"` on every
    * waiting_input cycle).
    *
-   * BOUND: this is state-edge detection on a polling loop. If the agent resolves A
-   * and stops at prompt B entirely BETWEEN two polls, the loop never observes the
-   * un-parked state, the marker is not cleared, and A's token would still answer B.
-   * That window is one poll interval (default 5s), versus the report freshness
-   * window (5min) it replaces. Closing it entirely needs an event-driven exit
-   * signal rather than polling. (#13 review)
+   * BETWEEN-POLLS RE-PARK: if the agent resolves A and stops at an unrelated bare
+   * prompt B entirely between two polls, the parked→parked edge never sees the
+   * un-parked state. `decisionEpisodeTransition` closes that with the agent's own
+   * activity timestamp (`session.activitySignal.timestamp`): frozen while the agent
+   * is blocked at a prompt, it advances the instant work resumes, so a marker that
+   * the boundary has moved past means the agent has left the marked prompt and the
+   * spent record is retired. The signal is committed by `determineStatus` above, so
+   * it reflects THIS poll. Agents that expose no activity timestamp fall back to the
+   * old edge-only behaviour (the boundary is null and only the parked/un-parked edge
+   * retires). (#13 review)
    */
   function maintainDecisionEpisode(session: Session): void {
-    const transition = decisionEpisodeTransition(session, new Date().toISOString());
+    const boundaryTs = session.activitySignal?.timestamp;
+    const episodeBoundary = boundaryTs instanceof Date ? boundaryTs.toISOString() : null;
+    const transition = decisionEpisodeTransition(
+      session,
+      episodeBoundary,
+      new Date().toISOString(),
+    );
     if (!transition) return;
     if (transition.kind === "stamp") {
       updateSessionMetadata(session, transition.patch);
@@ -4122,20 +4133,27 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // review/merge decisions get a View PR link; non-decision events fall back to
     // plain notify. (#13)
     const callbackSecret = getNotifyCallbackSecret();
+    const decisionType = resolveDecisionEventType(eventWithPriority);
     let actions: NotifyAction[] = [];
-    if (isNotifyActionEvent(resolveDecisionEventType(eventWithPriority))) {
-      // Build actions for every decision event, secret or not. The read-only View
-      // PR link needs no token, so `review.changes_requested`/`merge.ready` must
-      // keep it even in the default secretless opt-out (#13 review). The MUTATING
-      // buttons are an ENHANCEMENT of the alert, never a precondition: the nonce
-      // lookup runs `get` (live enrichment that can reject — e.g. an OpenCode
-      // session awaiting discovery) outside the per-notifier delivery try blocks,
-      // so an unguarded throw would lose the human alert entirely rather than just
-      // its buttons. It only runs when a secret is set (mutating buttons possible),
-      // and degrades to a plain notification on failure. (#13 review)
-      try {
-        let nonce: string | undefined;
-        if (callbackSecret) {
+    if (isNotifyActionEvent(decisionType)) {
+      // The read-only View PR link needs no token, so EVERY decision event — the
+      // secretless opt-out and `review.changes_requested`/`merge.ready` alike —
+      // builds its unsigned actions unconditionally (#13 review).
+      const unsignedActions = () =>
+        buildNotifyActions(eventWithPriority, {
+          secret: callbackSecret ?? undefined,
+          nonce: undefined,
+        });
+      // The MUTATING Approve/Deny/Nudge/Kill buttons exist ONLY for a needs_input
+      // decision and need a signed nonce resolved from a live `get`. That lookup
+      // runs OUTSIDE the per-notifier delivery try blocks (an unguarded throw would
+      // lose the human alert entirely, not just its buttons) and only when a secret
+      // is set. PR-only events must NOT pay for it: a `get` rejection (e.g. an
+      // OpenCode session still awaiting discovery) would otherwise strip their
+      // read-only View PR link solely because callbacks happen to be enabled. So
+      // scope the lookup to needs-input decision types. (#13 review)
+      if (callbackSecret && NEEDS_INPUT_DECISION_TYPES.includes(decisionType)) {
+        try {
           const subject = await sessionManager.get(
             eventWithPriority.sessionId,
             eventWithPriority.projectId,
@@ -4145,26 +4163,30 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           // caller passed the identity it built from and the live identity has since
           // moved on, omit the mutating actions (the alert still delivers; the new
           // decision re-notifies on its own path). (#13 review)
-          nonce =
+          const nonce =
             expectedDecisionId !== undefined && freshId !== (expectedDecisionId ?? undefined)
               ? undefined
               : freshId;
+          actions = buildNotifyActions(eventWithPriority, {
+            secret: callbackSecret ?? undefined,
+            nonce,
+          });
+        } catch (err) {
+          // Degrade to the unsigned actions (any View PR link survives) rather than
+          // dropping every action for the alert. (#13 review)
+          actions = unsignedActions();
+          observer.recordOperation({
+            metric: "lifecycle_poll",
+            operation: "notify.actions_unavailable",
+            outcome: "failure",
+            correlationId: createCorrelationId("notify-actions"),
+            projectId: eventWithPriority.projectId,
+            sessionId: eventWithPriority.sessionId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
         }
-        actions = buildNotifyActions(eventWithPriority, {
-          secret: callbackSecret ?? undefined,
-          nonce,
-        });
-      } catch (err) {
-        actions = [];
-        observer.recordOperation({
-          metric: "lifecycle_poll",
-          operation: "notify.actions_unavailable",
-          outcome: "failure",
-          correlationId: createCorrelationId("notify-actions"),
-          projectId: eventWithPriority.projectId,
-          sessionId: eventWithPriority.sessionId,
-          reason: err instanceof Error ? err.message : String(err),
-        });
+      } else {
+        actions = unsignedActions();
       }
     }
 

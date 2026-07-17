@@ -6,6 +6,7 @@ import {
   escapeAppleScript,
   getNotificationDataV3,
   isMac,
+  normalizeCallbackBaseUrl,
   resolveCallbackUrl,
   type PluginModule,
   type Notifier,
@@ -552,9 +553,19 @@ export function create(config?: Record<string, unknown>): Notifier {
   // is installed AND the backend is "auto" or "ao-app" (not an explicit
   // terminal-notifier/osascript). Mirror that exactly so the capability is honest.
   // (#13 review)
+  //
+  // ALSO require a valid callback base: the mutating buttons carry a RELATIVE
+  // endpoint (`/api/notify-callback/<token>`) that `nativeActionPayload` can only
+  // render once `resolveCallbackUrl` joins it onto an absolute http(s) dashboard
+  // URL. Without a normalizable base (unset or malformed `dashboardUrl` — common
+  // when desktop setup runs against a config with no explicit dashboard URL), every
+  // mutating button drops and the notification would advertise inert labels. Gate
+  // the capability on the base so core never hands us callbacks we cannot resolve.
+  // (#13 review)
   const aoNotifierAppReady = isMac() && detectAoNotifierApp(appPath);
+  const hasCallbackBase = normalizeCallbackBaseUrl(dashboardUrl) !== null;
   const resolvesActionCallbacks =
-    aoNotifierAppReady && (backend === "auto" || backend === "ao-app");
+    aoNotifierAppReady && (backend === "auto" || backend === "ao-app") && hasCallbackBase;
   const nextNativeNotificationId = (event: OrchestratorEvent): string => {
     nativeNotificationSequence += 1;
     return nativeNotificationId(event, nativeNotificationSequence);

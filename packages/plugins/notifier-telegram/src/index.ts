@@ -26,6 +26,12 @@ const MESSAGE_MAX_ESCAPED = 3500;
 const FIELD_VALUE_MAX_RAW = 300;
 /** Inline keyboard buttons per row for the action grid. */
 const BUTTONS_PER_ROW = 2;
+/**
+ * Hard ceiling on a single Telegram delivery. Lifecycle transitions await notifier
+ * delivery inline, so an unbounded request that connects and then stalls would
+ * pause decision notifications for every session. (#13 review)
+ */
+const TELEGRAM_REQUEST_TIMEOUT_MS = 10_000;
 
 interface TelegramButton {
   text: string;
@@ -230,15 +236,31 @@ async function sendMessage(
   };
   if (replyMarkup) payload.reply_markup = replyMarkup;
 
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  // One AbortController spans BOTH the request and the error-body read: a stall
+  // before headers arrive OR while the non-OK body streams both abort within the
+  // budget, so a hung Telegram endpoint can never block lifecycle processing. The
+  // timer is cleared only after the whole operation settles. (#13 review)
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TELEGRAM_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Telegram sendMessage failed (${response.status}): ${body}`);
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Telegram sendMessage failed (${response.status}): ${body}`);
+    }
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`Telegram sendMessage timed out after ${TELEGRAM_REQUEST_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

@@ -313,4 +313,56 @@ describe("notifier-telegram", () => {
     const notifier = create({ botToken: BOT_TOKEN, chatId: CHAT_ID });
     await expect(notifier.notify(makeEvent())).rejects.toThrow(/Telegram sendMessage failed \(400\)/);
   });
+
+  it("aborts a request that stalls before responding, within the delivery budget", async () => {
+    vi.useFakeTimers();
+    try {
+      // The endpoint connects but never returns headers: the fetch hangs until its
+      // signal aborts. Without the bound this would block lifecycle processing.
+      const fetchMock = vi.fn(
+        (_url: string, opts: { signal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            opts.signal.addEventListener("abort", () => reject(new Error("aborted")));
+          }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const notifier = create({ botToken: BOT_TOKEN, chatId: CHAT_ID });
+      const promise = notifier.notify(makeEvent());
+      promise.catch(() => {}); // pre-attach so the rejection is never "unhandled"
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(promise).rejects.toThrow(/timed out/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a stalled error-body read, within the delivery budget", async () => {
+    vi.useFakeTimers();
+    try {
+      // Headers arrive with a non-OK status, but the error body never finishes
+      // streaming. The SAME controller must abort the `response.text()` read too.
+      const fetchMock = vi.fn((_url: string, opts: { signal: AbortSignal }) =>
+        Promise.resolve({
+          ok: false,
+          status: 500,
+          text: () =>
+            new Promise((_resolve, reject) => {
+              opts.signal.addEventListener("abort", () => reject(new Error("aborted")));
+            }),
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const notifier = create({ botToken: BOT_TOKEN, chatId: CHAT_ID });
+      const promise = notifier.notify(makeEvent());
+      promise.catch(() => {});
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(promise).rejects.toThrow(/timed out/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

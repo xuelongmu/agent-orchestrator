@@ -73,6 +73,21 @@ export function isParkedOnDecision(session: Session): boolean {
  *
  * A decision that has not been parked yet has no marker, so this never touches a
  * fresh report whose lifecycle state has not caught up (#12's pr_open ordering).
+ *
+ * BETWEEN-POLLS RE-PARK: the parked→parked edge alone cannot see a decision that
+ * resolves and re-parks on an unrelated bare prompt entirely within one poll
+ * interval — the loop never observes the un-parked state, so A's report/episode
+ * (and therefore A's still-valid token) would carry into prompt B. The durable
+ * fix is `episodeBoundary`: the agent's own last-activity timestamp (frozen while
+ * genuinely parked, since a blocked prompt emits no activity; advancing the moment
+ * the agent resumes work). When it moves past the stamped marker, the agent has
+ * demonstrably left the parked prompt, so the record is retired even though both
+ * poll snapshots read needs_input. The marker is STAMPED with the same boundary so
+ * the comparison is self-consistent (a still-parked poll re-reads the same instant
+ * and no-ops); only real forward motion retires. Poll wall-clock (`nowIso`) is the
+ * fallback marker for agents that expose no activity timestamp, and can NEVER drive
+ * the advance check — it moves every poll and would false-retire live tokens. (#13
+ * review)
  */
 export type DecisionEpisodeTransition =
   /** Entering needs_input: stamp the marker. A plain write is safe — it adds. */
@@ -86,16 +101,41 @@ export type DecisionEpisodeTransition =
   | { kind: "retire" }
   | null;
 
+/**
+ * Strictly-after comparison on two ISO instants, `false` if either is absent or
+ * unparseable — so a missing/garbled boundary can never trigger a retirement.
+ */
+function isBoundaryAfter(candidate: string | null, stamped: string): boolean {
+  if (!candidate || !stamped) return false;
+  const a = Date.parse(candidate);
+  const b = Date.parse(stamped);
+  if (Number.isNaN(a) || Number.isNaN(b)) return false;
+  return a > b;
+}
+
 export function decisionEpisodeTransition(
   session: Session,
+  episodeBoundary: string | null,
   nowIso: string,
 ): DecisionEpisodeTransition {
   const parked = isParkedOnDecision(session);
   const stamped = session.metadata?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT] ?? "";
-  if (parked && !stamped) {
-    return { kind: "stamp", patch: { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: nowIso } };
+  if (parked) {
+    if (!stamped) {
+      // Prefer the durable agent boundary; fall back to poll time when the agent
+      // exposes no activity timestamp (the between-polls window stays open there,
+      // as it did before this fix, but a fresh decision still gets a marker).
+      return {
+        kind: "stamp",
+        patch: { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: episodeBoundary ?? nowIso },
+      };
+    }
+    // Already parked and stamped: the only reason to touch the record is the agent
+    // demonstrably moving past the marked prompt (see BETWEEN-POLLS RE-PARK above).
+    if (isBoundaryAfter(episodeBoundary, stamped)) return { kind: "retire" };
+    return null;
   }
-  if (!parked && stamped) return { kind: "retire" };
+  if (stamped) return { kind: "retire" };
   return null;
 }
 

@@ -125,10 +125,24 @@ describe("notifier-desktop", () => {
       );
 
     it("is true only when the actionable AO Notifier.app backend is selected", () => {
-      // auto + app installed → resolves to ao-app (renders real buttons).
+      // auto + app installed + a resolvable callback base → resolves to ao-app
+      // (renders real buttons that can reach the AO route).
       appInstalled();
-      expect(create({ backend: "auto" }).resolvesActionCallbacks).toBe(true);
-      expect(create({ backend: "ao-app" }).resolvesActionCallbacks).toBe(true);
+      const dashboardUrl = "https://host";
+      expect(create({ backend: "auto", dashboardUrl }).resolvesActionCallbacks).toBe(true);
+      expect(create({ backend: "ao-app", dashboardUrl }).resolvesActionCallbacks).toBe(true);
+    });
+
+    it("is falsy without a resolvable callback base, even when the app is selected", () => {
+      // The mutating buttons carry a RELATIVE endpoint; with no (or a malformed)
+      // dashboardUrl there is nothing to resolve it against, so nativeActionPayload
+      // would drop every button. The capability must not advertise inert labels.
+      appInstalled();
+      expect(create({ backend: "auto" }).resolvesActionCallbacks).toBeFalsy();
+      expect(create({ backend: "ao-app" }).resolvesActionCallbacks).toBeFalsy();
+      expect(
+        create({ backend: "ao-app", dashboardUrl: "localhost:3000" }).resolvesActionCallbacks,
+      ).toBeFalsy();
     });
 
     it("is falsy when the app is not installed", () => {

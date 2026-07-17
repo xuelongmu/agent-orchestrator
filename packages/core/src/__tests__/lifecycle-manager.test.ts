@@ -1276,6 +1276,68 @@ describe("check (single session)", () => {
     }
   });
 
+  it("keeps the View PR link on a PR-only notification when the decision lookup would reject", async () => {
+    // review.changes_requested / merge.ready carry only the unsigned View PR link,
+    // so notifyHuman must NOT run the needs-input nonce lookup for them: a get()
+    // rejection (e.g. an OpenCode session still awaiting discovery) would otherwise
+    // strip their read-only link purely because callbacks are enabled. (#13 review)
+    const previousSecret = process.env.AO_NOTIFY_CALLBACK_SECRET;
+    process.env.AO_NOTIFY_CALLBACK_SECRET = "pr-only-secret";
+
+    const notify = vi.fn().mockResolvedValue(undefined);
+    const notifyWithActions = vi.fn().mockResolvedValue(undefined);
+    const notifier = { name: "desktop", notify, notifyWithActions } as unknown as Notifier;
+    const mockSCM = createMockSCM({
+      getReviewDecision: vi.fn().mockResolvedValue("approved"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: true,
+        ciPassing: true,
+        approved: true,
+        noConflicts: true,
+        blockers: [],
+      }),
+      enrichSessionsPRBatch: mockBatchEnrichment({ reviewDecision: "approved", mergeable: true }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makeMatchingPR() }),
+      registry,
+      configOverride: {
+        ...config,
+        reactions: {},
+        // merge.ready infers the "action" priority (inferPriority).
+        notificationRouting: { ...config.notificationRouting, action: ["desktop"] },
+      },
+    });
+
+    // check() loads the session first; the needs-input nonce lookup would be the
+    // NEXT get(). Arm it to reject so a regression (running the lookup for a PR-only
+    // event) is caught: it would drop the View PR action.
+    const loaded = await mockSessionManager.get("app-1");
+    vi.mocked(mockSessionManager.get).mockReset();
+    vi.mocked(mockSessionManager.get)
+      .mockResolvedValueOnce(loaded)
+      .mockRejectedValue(new Error("enrichment failed"));
+
+    try {
+      await expect(lm.check("app-1")).resolves.toBeUndefined();
+      expect(lm.getStates().get("app-1")).toBe("mergeable");
+      const delivered = notifyWithActions.mock.calls.flatMap(
+        (c) => (c[1] as NotifyAction[] | undefined) ?? [],
+      );
+      expect(delivered.some((a) => a.label === "View PR" && !!a.url)).toBe(true);
+    } finally {
+      if (previousSecret === undefined) delete process.env.AO_NOTIFY_CALLBACK_SECRET;
+      else process.env.AO_NOTIFY_CALLBACK_SECRET = previousSecret;
+    }
+  });
+
   it("transitions to stuck when idle exceeds agent-stuck threshold (OpenCode-style activity)", async () => {
     config.reactions = {
       "agent-stuck": { auto: true, action: "notify", threshold: "1m" },
@@ -2648,6 +2710,69 @@ describe("reactions", () => {
         );
       });
       expect(reportReNotifies).toHaveLength(0);
+    });
+  });
+
+  describe("between-polls decision re-park (episode boundary)", () => {
+    const decisionMeta = (reportAt: string, episodeAt: string) => ({
+      agent: "mock-agent",
+      agentReportedState: "needs_input",
+      agentReportedAt: reportAt,
+      notifyDecisionEpisodeAt: episodeAt,
+    });
+
+    it("retires the spent report+episode when the agent activity boundary advances while still parked", async () => {
+      const reportAt = new Date(Date.now() - 2 * 60_000).toISOString();
+      const episodeAt = new Date(Date.now() - 2 * 60_000 + 1_000).toISOString();
+      // The agent resolved the prior prompt and re-parked entirely between polls:
+      // its activity timestamp has advanced past the episode marker, though both
+      // poll snapshots read waiting_input/needs_input. The spent record must be
+      // retired so A's still-live token can no longer resolve against this session.
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({
+        state: "waiting_input",
+        timestamp: new Date(),
+      });
+
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "needs_input",
+          activity: "waiting_input",
+          metadata: decisionMeta(reportAt, episodeAt),
+        }),
+        metaOverrides: decisionMeta(reportAt, episodeAt),
+      });
+
+      await lm.check("app-1");
+
+      const meta = readMetadataRaw(env.sessionsDir, "app-1");
+      expect(meta?.["notifyDecisionEpisodeAt"] ?? "").toBe("");
+      expect(meta?.["agentReportedState"] ?? "").toBe("");
+    });
+
+    it("keeps the decision live while the agent stays blocked at the prompt (boundary frozen)", async () => {
+      const reportAt = new Date(Date.now() - 2 * 60_000).toISOString();
+      const episodeAt = new Date(Date.now() - 60_000).toISOString();
+      // The agent is genuinely blocked: its activity boundary is the parked instant
+      // and does NOT advance, so the decision must survive the poll unchanged.
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({
+        state: "waiting_input",
+        timestamp: new Date(episodeAt),
+      });
+
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "needs_input",
+          activity: "waiting_input",
+          metadata: decisionMeta(reportAt, episodeAt),
+        }),
+        metaOverrides: decisionMeta(reportAt, episodeAt),
+      });
+
+      await lm.check("app-1");
+
+      const meta = readMetadataRaw(env.sessionsDir, "app-1");
+      expect(meta?.["notifyDecisionEpisodeAt"]).toBe(episodeAt);
+      expect(meta?.["agentReportedState"]).toBe("needs_input");
     });
   });
 
