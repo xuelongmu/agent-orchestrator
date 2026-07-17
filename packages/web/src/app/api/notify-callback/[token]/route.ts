@@ -7,13 +7,16 @@ import {
   activeDecisionId,
   consumeDecision,
   getNotifyCallbackSecret,
+  isDecisionConsumed,
   isResolvingCallbackAction,
   isTerminalSession,
   releaseDecision,
   verifyCallbackToken,
+  NOTIFY_CALLBACK_LABELS,
   NOTIFY_CALLBACK_MESSAGES,
   recordActivityEvent,
   type NotifyCallbackAction,
+  type NotifyCallbackPayload,
 } from "@aoagents/ao-core";
 import {
   getCorrelationId,
@@ -22,14 +25,22 @@ import {
 } from "@/lib/observability";
 
 /**
- * GET /api/notify-callback/:token — resolve a decision from a mobile
- * notification action button (#13).
+ * /api/notify-callback/:token — resolve a decision from a mobile notification
+ * action button (#13).
  *
  * The token is an HMAC-signed, expiring payload minted by core when it builds
  * Approve/Deny/Nudge/Kill buttons for a decision event. Tapping a button opens
- * this URL in the phone's browser; we verify the signature (so an attacker
- * cannot forge an action — no CSRF token needed, the URL itself is the secret),
- * then answer back into the session and record the action in the audit trail.
+ * this URL in the phone's browser.
+ *
+ * GET IS INERT: it only renders a confirmation page. The signature proves the URL
+ * was minted by AO, but it CANNOT prove a human tapped it — Telegram link
+ * scanning, URL unfurling/expansion, and browser prefetch all issue the GET on
+ * their own. Mutating there would approve, deny, or kill a session nobody
+ * confirmed. The mutation lives in POST, which those scanners do not perform, and
+ * which a human reaches only by pressing the button on the rendered page.
+ * (#13 review)
+ *
+ * POST re-verifies the token from scratch — it trusts nothing from the GET.
  */
 
 function escapeHtml(value: string): string {
@@ -78,7 +89,118 @@ const ACTION_HEADING: Record<NotifyCallbackAction, string> = {
   kill: "Session killed",
 };
 
+const ACTION_PROMPT: Record<NotifyCallbackAction, string> = {
+  approve: "Approve this decision and let the agent proceed?",
+  deny: "Deny this decision and tell the agent not to proceed?",
+  nudge: "Ask the agent for a status update?",
+  kill: "Kill this session? This cannot be undone.",
+};
+
+/**
+ * The confirmation page GET renders. Its form POSTs back to the same signed URL,
+ * which is where the mutation actually happens — so a scanner or prefetcher that
+ * only issues the GET changes nothing.
+ *
+ * The form omits `action` so the browser posts to the CURRENT url. A
+ * root-absolute `/api/...` would break behind a reverse proxy serving AO under a
+ * base path, and the token is already in the address the page was fetched from.
+ */
+function confirmationResponse(action: NotifyCallbackAction): Response {
+  const body = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex" />
+<title>Agent Orchestrator</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0b0d12; color: #e6e8ee; margin: 0;
+    display: flex; min-height: 100vh; align-items: center; justify-content: center; padding: 24px; }
+  .card { max-width: 420px; text-align: center; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  p { font-size: 15px; line-height: 1.5; color: #a9b0c0; margin: 0 0 20px; }
+  button { font: inherit; font-weight: 600; color: #0b0d12; background: #e6e8ee; border: 0;
+    border-radius: 8px; padding: 12px 20px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="card">
+<h1>${escapeHtml(NOTIFY_CALLBACK_LABELS[action])}</h1>
+<p>${escapeHtml(ACTION_PROMPT[action])}</p>
+<form method="POST">
+<button type="submit">${escapeHtml(NOTIFY_CALLBACK_LABELS[action])}</button>
+</form>
+</div>
+</body>
+</html>`;
+  return new Response(body, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+  });
+}
+
+/** Verify the token and reject anything malformed, before any side effect. */
+function verifyRequest(
+  token: string,
+):
+  | { ok: true; payload: NotifyCallbackPayload }
+  | { ok: false; response: Response } {
+  const secret = getNotifyCallbackSecret();
+  if (!secret) {
+    return {
+      ok: false,
+      response: htmlResponse(
+        503,
+        "Callbacks not enabled",
+        "This orchestrator has no AO_NOTIFY_CALLBACK_SECRET configured, so notification actions cannot be verified.",
+      ),
+    };
+  }
+
+  const payload = verifyCallbackToken(token, secret);
+  if (!payload) {
+    return {
+      ok: false,
+      response: htmlResponse(
+        403,
+        "Link invalid or expired",
+        "This action link could not be verified. It may have already been used up, tampered with, or expired.",
+      ),
+    };
+  }
+
+  // The session id came from a token we signed, but validate its shape anyway
+  // before it reaches a shell-based runtime (defense in depth).
+  if (validateIdentifier(payload.sessionId, "sessionId")) {
+    return {
+      ok: false,
+      response: htmlResponse(
+        400,
+        "Invalid session",
+        "The action link referenced a malformed session.",
+      ),
+    };
+  }
+
+  return { ok: true, payload };
+}
+
+/**
+ * Render the confirmation page. Deliberately free of side effects: no session
+ * lookup, no consumption, no dispatch — an automated fetch of this URL must
+ * change nothing.
+ */
 export async function GET(
+  _request: NextRequest,
+  { params }: { params: Promise<{ token: string }> },
+) {
+  const { token } = await params;
+  const verified = verifyRequest(token);
+  if (!verified.ok) return verified.response;
+  return confirmationResponse(verified.payload.action);
+}
+
+export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ token: string }> },
 ) {
@@ -86,31 +208,10 @@ export async function GET(
   const startedAt = Date.now();
   const { token } = await params;
 
-  const secret = getNotifyCallbackSecret();
-  if (!secret) {
-    return htmlResponse(
-      503,
-      "Callbacks not enabled",
-      "This orchestrator has no AO_NOTIFY_CALLBACK_SECRET configured, so notification actions cannot be verified.",
-    );
-  }
-
-  const payload = verifyCallbackToken(token, secret);
-  if (!payload) {
-    return htmlResponse(
-      403,
-      "Link invalid or expired",
-      "This action link could not be verified. It may have already been used up, tampered with, or expired.",
-    );
-  }
-
+  const verified = verifyRequest(token);
+  if (!verified.ok) return verified.response;
+  const { payload } = verified;
   const { sessionId, projectId, action } = payload;
-
-  // The session id came from a token we signed, but validate its shape anyway
-  // before it reaches a shell-based runtime (defense in depth).
-  if (validateIdentifier(sessionId, "sessionId")) {
-    return htmlResponse(400, "Invalid session", "The action link referenced a malformed session.");
-  }
 
   try {
     const { config, sessionManager } = await getServices();
@@ -166,7 +267,7 @@ export async function GET(
     if (!decisionPending || decisionId === null || !decisionMatches) {
       recordApiObservation({
         config,
-        method: "GET",
+        method: "POST",
         path: "/api/notify-callback/[token]",
         correlationId,
         startedAt,
@@ -202,11 +303,46 @@ export async function GET(
     // Nudge is exempt: it only asks the agent for a status update and leaves the
     // choice outstanding, so consuming on a nudge would strand a still-pending
     // decision with no way to answer it. (#13, review)
+    // A Nudge does not consume, but it must not walk into a decision that a
+    // resolving action already answered: tapping Deny and then Nudge would send
+    // "Continue if you can" into the decision that was just denied. The check is
+    // a locked read at the central helper, so it sees the stored record at
+    // dispatch time rather than a snapshot from earlier in the request.
     const consumes = isResolvingCallbackAction(action);
+    if (!consumes && isDecisionConsumed(projectId, sessionId, decisionId)) {
+      recordApiObservation({
+        config,
+        method: "POST",
+        path: "/api/notify-callback/[token]",
+        correlationId,
+        startedAt,
+        outcome: "failure",
+        statusCode: 409,
+        projectId: resolvedProjectId,
+        sessionId,
+        reason: "decision already resolved",
+        data: { action },
+      });
+      recordActivityEvent({
+        projectId: resolvedProjectId,
+        sessionId,
+        source: "api",
+        kind: "api.notify_callback.duplicate",
+        level: "warn",
+        summary: `notification action "${action}" ignored — decision already resolved for session ${sessionId}`,
+        data: { action },
+      });
+      return htmlResponse(
+        409,
+        "Already handled",
+        "This decision was already answered, so no further action was taken.",
+      );
+    }
+
     if (consumes && !consumeDecision(projectId, sessionId, decisionId)) {
       recordApiObservation({
         config,
-        method: "GET",
+        method: "POST",
         path: "/api/notify-callback/[token]",
         correlationId,
         startedAt,
@@ -255,7 +391,7 @@ export async function GET(
 
     recordApiObservation({
       config,
-      method: "GET",
+      method: "POST",
       path: "/api/notify-callback/[token]",
       correlationId,
       startedAt,
@@ -286,7 +422,7 @@ export async function GET(
     if (config) {
       recordApiObservation({
         config,
-        method: "GET",
+        method: "POST",
         path: "/api/notify-callback/[token]",
         correlationId,
         startedAt,

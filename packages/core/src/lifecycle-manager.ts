@@ -105,7 +105,7 @@ import {
   activeDecisionId,
   clearSpentDecision,
   clearedDecisionMetadata,
-  decisionEpisodePatch,
+  decisionEpisodeTransition,
 } from "./notify-decision.js";
 import { resolveSessionRole } from "./agent-selection.js";
 import {
@@ -2419,24 +2419,34 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * new prompt. Retiring the spent report here is what makes a decision identity
    * belong to the transition that activated it.
    */
+  /**
+   * Retire the session's decision record through the locked compare.
+   *
+   * `session.metadata` is a snapshot from the top of this poll cycle. The agent
+   * may have written a fresh `ao report` since, which this stale snapshot would
+   * still classify as retirable — so hand the observation to `clearSpentDecision`
+   * and let it no-op if the stored record has moved on. Clearing the NEW decision
+   * would lose it and its callback identity outright (#13 review).
+   */
+  function retireDecisionRecord(session: Session): void {
+    const report = readAgentReport(session.metadata);
+    const observed =
+      report && isDecisionReport(report) ? { state: report.state, at: report.timestamp } : null;
+    if (!clearSpentDecision(session.projectId, session.id, observed)) return;
+    // Mirror the cleared record into this cycle's snapshot WITHOUT a second write:
+    // re-writing the empties here could clobber a report that landed in between,
+    // which is the very race the locked compare above exists to avoid.
+    const clearedKeys = new Set(Object.keys(clearedDecisionMetadata()));
+    session.metadata = Object.fromEntries(
+      Object.entries(session.metadata).filter(([key]) => !clearedKeys.has(key)),
+    );
+    sessionManager.invalidateCache();
+  }
+
   function clearStaleDecisionContext(session: Session): void {
     const report = readAgentReport(session.metadata);
     if (!report || !isDecisionReport(report) || isDecisionReportActive(session, report)) return;
-    // `session.metadata` is a snapshot from the top of this poll cycle. The agent
-    // may have written a fresh `ao report` since, which this stale snapshot would
-    // still classify as spent — so hand the observation to a locked compare and
-    // let it no-op if the stored record has moved on. Clearing the NEW decision
-    // would lose it and its callback identity outright (#13 review).
-    const cleared = clearSpentDecision(session.projectId, session.id, {
-      state: report.state,
-      at: report.timestamp,
-    });
-    if (!cleared) return;
-    // Reflect the cleared record in this cycle's snapshot WITHOUT a second write:
-    // re-writing the empties here could clobber a report that landed in between,
-    // which is the very race the locked compare above exists to avoid.
-    for (const key of Object.keys(clearedDecisionMetadata())) delete session.metadata[key];
-    sessionManager.invalidateCache();
+    retireDecisionRecord(session);
   }
 
   /**
@@ -2461,8 +2471,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * signal rather than polling. (#13 review)
    */
   function maintainDecisionEpisode(session: Session): void {
-    const patch = decisionEpisodePatch(session, new Date().toISOString());
-    if (patch) updateSessionMetadata(session, patch);
+    const transition = decisionEpisodeTransition(session, new Date().toISOString());
+    if (!transition) return;
+    if (transition.kind === "stamp") {
+      updateSessionMetadata(session, transition.patch);
+      return;
+    }
+    // Episode observably exited: retire the report that activated it. A report
+    // outliving its episode is spent, and leaving it would let the NEXT episode
+    // inherit it — a bare prompt B pairing B's marker with A's retained timestamp,
+    // read as report-backed, minting fresh buttons for a prompt no agent reported.
+    retireDecisionRecord(session);
   }
 
   function makeFingerprint(ids: string[]): string {

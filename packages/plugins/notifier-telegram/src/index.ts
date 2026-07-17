@@ -100,24 +100,41 @@ function titleCase(value: string): string {
     .join(" ");
 }
 
-function toneForEvent(event: OrchestratorEvent): Tone {
-  if (event.type === "merge.ready") return { ...SUCCESS_TONE, label: "Ready to merge" };
-  if (event.type === "summary.all_complete") return { ...SUCCESS_TONE, label: "All complete" };
-  if (event.type === "ci.failing" || event.type === "session.stuck") return PRIORITY_TONE.urgent;
-  if (event.type === "review.changes_requested") return PRIORITY_TONE.warning;
+/**
+ * The decision type an event actually represents.
+ *
+ * A reaction that handles a transition suppresses the direct notification and
+ * delivers a `reaction.triggered` event instead, carrying the real type in
+ * `data.semanticType`. Switching on the raw `event.type` would title the primary
+ * mobile alert "Reaction Triggered" for exactly the events that matter most —
+ * `agent-needs-input` and `approved-and-green`. (#13 review)
+ */
+function semanticEventType(event: OrchestratorEvent, data: NotificationDataV3 | null): string {
+  return data?.semanticType ?? event.type;
+}
+
+function toneForEvent(event: OrchestratorEvent, data: NotificationDataV3 | null): Tone {
+  const type = semanticEventType(event, data);
+  if (type === "merge.ready") return { ...SUCCESS_TONE, label: "Ready to merge" };
+  if (type === "summary.all_complete") return { ...SUCCESS_TONE, label: "All complete" };
+  if (type === "ci.failing" || type === "session.stuck") return PRIORITY_TONE.urgent;
+  if (type === "review.changes_requested") return PRIORITY_TONE.warning;
   return PRIORITY_TONE[event.priority] ?? PRIORITY_TONE.info;
 }
 
 function eventTitle(event: OrchestratorEvent, data: NotificationDataV3 | null): string {
   const pr = data?.subject.pr;
-  switch (event.type) {
+  switch (semanticEventType(event, data)) {
     case "ci.failing":
       return pr ? `CI failing on PR #${pr.number}` : "CI failing";
     case "merge.ready":
       return pr ? `PR #${pr.number} ready to merge` : "Pull request ready to merge";
     case "review.changes_requested":
       return pr ? `Changes requested on PR #${pr.number}` : "Review changes requested";
+    // Both needs-input decision types: the direct transition and the
+    // report-watcher's `report-needs-input`, which is the primary path.
     case "session.needs_input":
+    case "report.needs_input":
       return "Agent needs your decision";
     case "session.stuck":
       return "Agent may be stuck";
@@ -139,7 +156,7 @@ function field(label: string, value: string | number | undefined | null): string
 }
 
 function buildText(event: OrchestratorEvent, data: NotificationDataV3 | null): string {
-  const tone = toneForEvent(event);
+  const tone = toneForEvent(event, data);
   const pr = data?.subject.pr;
   const issue = data?.subject.issue;
   const branch =

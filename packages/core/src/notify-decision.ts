@@ -63,16 +63,61 @@ export function isParkedOnDecision(session: Session): boolean {
  * Edge-triggered patch maintaining {@link NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT},
  * or `null` when nothing changes. Stamps on entry into needs_input and clears on
  * exit, so the marker stays fixed for the whole episode.
+ *
+ * On EXIT the whole decision record is retired, not just the marker. A report
+ * that outlives the episode it activated is spent by definition, and keeping it
+ * would let the next episode inherit it: a bare prompt B would pair B's new
+ * marker with A's retained timestamp, read as report-backed, and mint fresh
+ * Approve/Deny/Kill buttons for a prompt no agent ever reported. Retiring on the
+ * observed exit is what keeps a report bound to the episode it activated.
+ *
+ * A decision that has not been parked yet has no marker, so this never touches a
+ * fresh report whose lifecycle state has not caught up (#12's pr_open ordering).
  */
-export function decisionEpisodePatch(
+export type DecisionEpisodeTransition =
+  /** Entering needs_input: stamp the marker. A plain write is safe — it adds. */
+  | { kind: "stamp"; patch: Record<string, string> }
+  /**
+   * Leaving needs_input: retire the whole record. Deliberately NOT a patch — the
+   * clear must go through {@link clearSpentDecision}'s locked compare, because an
+   * unconditional write here would erase a report the agent may have written
+   * since the caller's snapshot.
+   */
+  | { kind: "retire" }
+  | null;
+
+export function decisionEpisodeTransition(
   session: Session,
   nowIso: string,
-): Record<string, string> | null {
+): DecisionEpisodeTransition {
   const parked = isParkedOnDecision(session);
   const stamped = session.metadata?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT] ?? "";
-  if (parked && !stamped) return { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: nowIso };
-  if (!parked && stamped) return { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "" };
+  if (parked && !stamped) {
+    return { kind: "stamp", patch: { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: nowIso } };
+  }
+  if (!parked && stamped) return { kind: "retire" };
   return null;
+}
+
+/**
+ * Whether a resolving action has already consumed this decision instance, read
+ * under the metadata lock so the answer reflects the stored record at call time
+ * rather than a snapshot taken earlier in the request.
+ *
+ * Non-resolving actions (Nudge) use this to stay out of a decision that has
+ * already been answered, without consuming it themselves.
+ */
+export function isDecisionConsumed(
+  projectId: string,
+  sessionId: SessionId,
+  decisionId: string,
+): boolean {
+  let consumed = false;
+  mutateMetadata(getProjectSessionsDir(projectId), sessionId, (existing) => {
+    consumed = existing[NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID] === decisionId;
+    return existing;
+  });
+  return consumed;
 }
 
 /**
@@ -170,12 +215,20 @@ export function consumeDecision(
 export function clearSpentDecision(
   projectId: string,
   sessionId: SessionId,
-  observed: { state: string; at: string },
+  observed: { state: string; at: string } | null,
 ): boolean {
   let cleared = false;
   mutateMetadata(getProjectSessionsDir(projectId), sessionId, (existing) => {
-    if (
-      existing[AGENT_REPORT_METADATA_KEYS.STATE] !== observed.state ||
+    const storedState = existing[AGENT_REPORT_METADATA_KEYS.STATE] ?? "";
+    if (observed === null) {
+      // The caller saw no decision report. If one exists now it was written after
+      // that observation, so it is not ours to retire.
+      if (isDecisionReportState(storedState)) {
+        cleared = false;
+        return existing;
+      }
+    } else if (
+      storedState !== observed.state ||
       existing[AGENT_REPORT_METADATA_KEYS.AT] !== observed.at
     ) {
       cleared = false;

@@ -16,7 +16,7 @@ import {
   activeDecisionId,
   clearSpentDecision,
   consumeDecision,
-  decisionEpisodePatch,
+  decisionEpisodeTransition,
   isResolvingCallbackAction,
   releaseDecision,
   storedDecisionId,
@@ -156,8 +156,8 @@ describe("activeDecisionId", () => {
       lifecycleState: "working",
       episodeAt: "2026-07-17T09:00:00.000Z",
     });
-    expect(decisionEpisodePatch(resumed, "2026-07-17T09:01:00.000Z")).toEqual({
-      [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "",
+    expect(decisionEpisodeTransition(resumed, "2026-07-17T09:01:00.000Z")).toEqual({
+      kind: "retire",
     });
 
     // ...then the agent stops at an unrelated bare prompt B, WELL INSIDE the
@@ -187,10 +187,12 @@ describe("first-entry mint", () => {
     });
     expect(activeDecisionId(justParked)).toBeNull();
 
-    const patch = decisionEpisodePatch(justParked, "2026-07-17T10:00:00.000Z");
-    expect(patch).toEqual({
-      [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "2026-07-17T10:00:00.000Z",
+    const transition = decisionEpisodeTransition(justParked, "2026-07-17T10:00:00.000Z");
+    expect(transition).toEqual({
+      kind: "stamp",
+      patch: { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "2026-07-17T10:00:00.000Z" },
     });
+    const patch = transition?.kind === "stamp" ? transition.patch : {};
 
     const stamped = {
       ...justParked,
@@ -200,11 +202,12 @@ describe("first-entry mint", () => {
   });
 });
 
-describe("decisionEpisodePatch", () => {
+describe("decisionEpisodeTransition", () => {
   it("stamps the episode on entry into needs_input", () => {
     const session = makeSession({ lifecycleState: "needs_input", episodeAt: null });
-    expect(decisionEpisodePatch(session, "2026-07-17T10:00:00.000Z")).toEqual({
-      [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "2026-07-17T10:00:00.000Z",
+    expect(decisionEpisodeTransition(session, "2026-07-17T10:00:00.000Z")).toEqual({
+      kind: "stamp",
+      patch: { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "2026-07-17T10:00:00.000Z" },
     });
   });
 
@@ -212,19 +215,20 @@ describe("decisionEpisodePatch", () => {
     // Stability is the point: a marker that moved every poll would invalidate
     // live tokens within seconds, exactly as lastTransitionAt would.
     const session = makeSession({ lifecycleState: "needs_input" });
-    expect(decisionEpisodePatch(session, "2026-07-17T10:00:00.000Z")).toBeNull();
+    expect(decisionEpisodeTransition(session, "2026-07-17T10:00:00.000Z")).toBeNull();
   });
 
   it("clears the marker once the session leaves needs_input", () => {
     const session = makeSession({ lifecycleState: "working" });
-    expect(decisionEpisodePatch(session, "2026-07-17T10:00:00.000Z")).toEqual({
-      [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: "",
+    // Retiring is not a patch: the clear must go through the locked compare.
+    expect(decisionEpisodeTransition(session, "2026-07-17T10:00:00.000Z")).toEqual({
+      kind: "retire",
     });
   });
 
   it("is a no-op when unparked and already unmarked", () => {
     const session = makeSession({ lifecycleState: "working", episodeAt: null });
-    expect(decisionEpisodePatch(session, "2026-07-17T10:00:00.000Z")).toBeNull();
+    expect(decisionEpisodeTransition(session, "2026-07-17T10:00:00.000Z")).toBeNull();
   });
 });
 
@@ -267,10 +271,17 @@ describe("storedDecisionId", () => {
     ).toBeNull();
   });
 
-  it("agrees with activeDecisionId for the same record", () => {
-    // The lock-side and session-side derivations must not drift apart.
-    const session = makeSession({ at: STORED_AT, episodeAt: STORED_EPISODE });
+  it("agrees with activeDecisionId for a live record", () => {
+    // The lock-side and session-side derivations must not drift apart while the
+    // decision is live. (They diverge by design once it is not: storedDecisionId
+    // omits the liveness half, which needs the enriched lifecycle.)
+    const session = makeSession({
+      at: STORED_AT,
+      episodeAt: STORED_EPISODE,
+      lifecycleState: "needs_input",
+    });
     expect(storedDecisionId(session.metadata)).toBe(activeDecisionId(session));
+    expect(activeDecisionId(session)).toBe(STORED_ID);
   });
 });
 

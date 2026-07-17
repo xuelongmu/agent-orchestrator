@@ -59,6 +59,8 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
     releaseDecision: (projectId: string, sessionId: string, decisionId: string) => {
       consumedDecisions.delete(consumeKey(projectId, sessionId, decisionId));
     },
+    isDecisionConsumed: (projectId: string, sessionId: string, decisionId: string) =>
+      consumedDecisions.has(consumeKey(projectId, sessionId, decisionId)),
   };
 });
 
@@ -113,10 +115,15 @@ vi.mock("@/lib/services", () => ({
   })),
 }));
 
-import { GET } from "@/app/api/notify-callback/[token]/route";
+import { GET, POST } from "@/app/api/notify-callback/[token]/route";
 
 function makeRequest(): Request {
   return new Request("http://localhost:3000/api/notify-callback/x");
+}
+
+/** GET renders the confirmation page; only POST mutates. */
+async function callRawGet(tok: string) {
+  return GET(makeRequest(), { params: Promise.resolve({ token: tok }) });
 }
 
 function token(action: "approve" | "deny" | "nudge" | "kill", overrides = {}) {
@@ -133,8 +140,9 @@ function token(action: "approve" | "deny" | "nudge" | "kill", overrides = {}) {
   );
 }
 
+// Every dispatch assertion goes through POST — the mutation path.
 async function callGet(tok: string) {
-  return GET(makeRequest(), { params: Promise.resolve({ token: tok }) });
+  return POST(makeRequest(), { params: Promise.resolve({ token: tok }) });
 }
 
 beforeEach(() => {
@@ -143,11 +151,45 @@ beforeEach(() => {
   process.env.AO_NOTIFY_CALLBACK_SECRET = SECRET;
 });
 
-describe("GET /api/notify-callback/[token]", () => {
+describe("GET /api/notify-callback/[token] — confirmation page only", () => {
+  // A signed URL proves AO minted it, never that a human tapped it: Telegram link
+  // scanning, URL unfurling and browser prefetch all issue this GET on their own.
+  // So GET must change nothing.
+  for (const action of ["approve", "deny", "nudge", "kill"] as const) {
+    it(`is inert for ${action} — renders a confirm form, dispatches nothing`, async () => {
+      const res = await callRawGet(token(action));
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toContain('method="POST"');
+      expect(send).not.toHaveBeenCalled();
+      expect(kill).not.toHaveBeenCalled();
+      expect(consumedDecisions.size).toBe(0);
+      // No session lookup either — nothing to observe, nothing to consume.
+      expect(get).not.toHaveBeenCalled();
+    });
+  }
+
+  it("posts back to the current url so a proxy base path survives", async () => {
+    const body = await (await callRawGet(token("approve"))).text();
+    expect(body).not.toContain('action="/api/');
+  });
+
+  it("still fails closed on a tampered token", async () => {
+    const res = await callRawGet(`${token("approve")}tampered`);
+    expect(res.status).toBe(403);
+  });
+
+  it("still reports 503 when no callback secret is configured", async () => {
+    delete process.env.AO_NOTIFY_CALLBACK_SECRET;
+    expect((await callRawGet(token("approve"))).status).toBe(503);
+  });
+});
+
+describe("POST /api/notify-callback/[token]", () => {
   it("approve sends the approval message and records an audit event", async () => {
     const res = await callGet(token("approve"));
     expect(res.status).toBe(200);
-    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve, "ao");
     expect(kill).not.toHaveBeenCalled();
     expect(recordActivityEvent).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "api.notify_callback.approve", sessionId: "ao-5" }),
@@ -157,18 +199,18 @@ describe("GET /api/notify-callback/[token]", () => {
 
   it("deny sends the denial message", async () => {
     await callGet(token("deny"));
-    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.deny);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.deny, "ao");
   });
 
   it("nudge sends the nudge message", async () => {
     await callGet(token("nudge"));
-    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.nudge);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.nudge, "ao");
   });
 
   it("kill terminates the session instead of sending a message", async () => {
     const res = await callGet(token("kill"));
     expect(res.status).toBe(200);
-    expect(kill).toHaveBeenCalledWith("ao-5");
+    expect(kill).toHaveBeenCalledWith("ao-5", { projectId: "ao" });
     expect(send).not.toHaveBeenCalled();
   });
 
@@ -235,7 +277,7 @@ describe("GET /api/notify-callback/[token]", () => {
     get.mockResolvedValueOnce(makeSession({ activity: "idle", lifecycle: makeLifecycle("needs_input") }));
     const res = await callGet(token("approve"));
     expect(res.status).toBe(200);
-    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve, "ao");
   });
 
   it("rejects when the decision nonce no longer matches the session (409)", async () => {
@@ -255,7 +297,7 @@ describe("GET /api/notify-callback/[token]", () => {
     get.mockResolvedValueOnce(makeSession({ metadata: reportMeta(at) }));
     const res = await callGet(token("approve", { nonce: identityFor(at) }));
     expect(res.status).toBe(200);
-    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve, "ao");
   });
 
   it("rejects a token from the previous episode against a new prompt (409)", async () => {
@@ -291,7 +333,7 @@ describe("GET /api/notify-callback/[token]", () => {
     const second = await callGet(token("deny"));
     expect(second.status).toBe(409);
     expect(send).toHaveBeenCalledTimes(1);
-    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve, "ao");
     expect(recordActivityEvent).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "api.notify_callback.duplicate" }),
     );
@@ -335,11 +377,11 @@ describe("GET /api/notify-callback/[token]", () => {
     // outstanding, so Approve must still land afterwards.
     const nudged = await callGet(token("nudge"));
     expect(nudged.status).toBe(200);
-    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.nudge);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.nudge, "ao");
 
     const approved = await callGet(token("approve"));
     expect(approved.status).toBe(200);
-    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve, "ao");
   });
 
   it("still refuses a second resolving action after a nudge", async () => {
@@ -357,7 +399,7 @@ describe("GET /api/notify-callback/[token]", () => {
     expect(first.status).toBe(200);
 
     vi.resetModules();
-    const { GET: freshGET } = await import("@/app/api/notify-callback/[token]/route");
+    const { POST: freshGET } = await import("@/app/api/notify-callback/[token]/route");
     const second = await freshGET(makeRequest(), {
       params: Promise.resolve({ token: token("kill") }),
     });
@@ -374,6 +416,17 @@ describe("GET /api/notify-callback/[token]", () => {
     const foreign = await callGet(token("approve", { projectId: "other" }));
     expect(foreign.status).toBe(404);
     expect(get).toHaveBeenLastCalledWith("ao-5", "other");
+  });
+
+  it("rejects a nudge once a resolving action has answered the decision", async () => {
+    // Deny then Nudge would otherwise send "Continue if you can" into the very
+    // decision that was just denied.
+    expect((await callGet(token("deny"))).status).toBe(200);
+    send.mockClear();
+
+    const nudged = await callGet(token("nudge"));
+    expect(nudged.status).toBe(409);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("dispatches send within the signed project, not the first id match", async () => {

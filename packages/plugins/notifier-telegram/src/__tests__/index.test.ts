@@ -68,6 +68,55 @@ describe("notifier-telegram", () => {
     expect(body.reply_markup).toBeUndefined();
   });
 
+  it("titles a reaction-wrapped decision by its semanticType, not the raw type", async () => {
+    // The default agent-needs-input / report-needs-input reactions suppress the
+    // direct notification and deliver reaction.triggered instead, carrying the
+    // real decision type in data.semanticType. Switching on the raw type would
+    // title the primary mobile alert "Reaction Triggered".
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const notifier = create({ botToken: BOT_TOKEN, chatId: CHAT_ID });
+    await notifier.notify(
+      makeEvent({
+        type: "reaction.triggered",
+        data: {
+          schemaVersion: 3,
+          semanticType: "report.needs_input",
+          subject: { session: { id: "ao-5", projectId: "ao" } },
+        },
+      }),
+    );
+
+    const text = String(lastBody(fetchMock).text);
+    expect(text).toContain("Agent needs your decision");
+    expect(text).not.toContain("Reaction Triggered");
+  });
+
+  it("titles a reaction-wrapped merge.ready by its semanticType", async () => {
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const notifier = create({ botToken: BOT_TOKEN, chatId: CHAT_ID });
+    await notifier.notify(
+      makeEvent({
+        type: "reaction.triggered",
+        data: {
+          schemaVersion: 3,
+          semanticType: "merge.ready",
+          subject: {
+            session: { id: "ao-5", projectId: "ao" },
+            pr: { number: 7, url: "https://github.com/acme/x/pull/7" },
+          },
+        },
+      }),
+    );
+
+    const text = String(lastBody(fetchMock).text);
+    expect(text).toContain("PR #7 ready to merge");
+    expect(text).not.toContain("Reaction Triggered");
+  });
+
   it("no-ops without botToken or chatId", async () => {
     const fetchMock = okFetch();
     vi.stubGlobal("fetch", fetchMock);
