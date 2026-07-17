@@ -2378,7 +2378,15 @@ export class SessionSendNotDeliveredError extends Error {
     public readonly sessionId: string,
     options?: { cause?: unknown },
   ) {
-    super(`Message not delivered to session ${sessionId} (failed before delivery)`, options);
+    // Preserve the underlying cause's message so existing instrumentation and
+    // assertions on the original failure text keep working; the class itself is
+    // the pre-delivery signal callers match on (instanceof), not the message.
+    const cause = options?.cause;
+    const message =
+      cause instanceof Error && cause.message
+        ? cause.message
+        : `Message not delivered to session ${sessionId} (failed before delivery)`;
+    super(message, options);
     this.name = "SessionSendNotDeliveredError";
   }
 }

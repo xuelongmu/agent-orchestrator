@@ -2409,37 +2409,37 @@ describe("reactions", () => {
       vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
 
       const priorState = reportState === "needs_decision" ? "needs_decision" : "needs_input";
-      const session = makeSession({
-        id: "app-1",
-        status: "needs_input",
-        activity: "waiting_input",
-        createdAt: new Date("2025-01-01T11:40:00.000Z"),
-        metadata: {
-          createdAt: "2025-01-01T11:40:00.000Z",
-          agentReportedState: reportState,
-          agentReportedAt: newReportAt,
-          agentAcknowledgedAt: priorTriggerAt,
-          reportWatcherActiveTrigger: `agent_needs_input:${priorState}:${priorTriggerAt}`,
-          reportWatcherTriggerActivatedAt: priorTriggerAt,
-          reportWatcherTriggerCount: "1",
-          notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
-          ...extraMeta,
+      // A single lm.check() runs one poll → one auditAndReactToReports, the
+      // deterministic path (no timer interplay). The session is already parked in
+      // needs_input, so there is NO status transition — only the report-watcher
+      // fallback can produce a notification here.
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "needs_input",
+          activity: "waiting_input",
+          createdAt: new Date("2025-01-01T11:40:00.000Z"),
+          metadata: {
+            agent: "mock-agent",
+            createdAt: "2025-01-01T11:40:00.000Z",
+            agentReportedState: reportState,
+            agentReportedAt: newReportAt,
+            agentAcknowledgedAt: priorTriggerAt,
+            reportWatcherActiveTrigger: `agent_needs_input:${priorState}:${priorTriggerAt}`,
+            reportWatcherTriggerActivatedAt: priorTriggerAt,
+            reportWatcherTriggerCount: "1",
+            notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
+            ...extraMeta,
+          },
+        }),
+        registry: registryWithNotifier,
+        configOverride: {
+          ...config,
+          reactions: {}, // no report-needs-input reaction: the fallback owns the ping
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
         },
       });
-      config.reactions = {}; // no report-needs-input reaction: the fallback owns the ping
-      vi.mocked(mockSessionManager.list).mockResolvedValue([session]);
-      vi.mocked(mockSessionManager.get).mockResolvedValue(session);
 
-      const lm = createLifecycleManager({
-        config,
-        registry: registryWithNotifier,
-        sessionManager: mockSessionManager,
-      });
-      vi.setSystemTime(new Date("2025-01-01T12:00:00.000Z"));
-      lm.start(60_000);
-      await vi.advanceTimersByTimeAsync(0);
-      await vi.advanceTimersByTimeAsync(60_000);
-      lm.stop();
+      await lm.check("app-1");
 
       return vi.mocked(notifier.notify).mock.calls.filter((call) => {
         const event = call[0] as { type?: string; data?: { semanticType?: string } };
@@ -2452,14 +2452,12 @@ describe("reactions", () => {
 
     let previousSecret: string | undefined;
     beforeEach(() => {
-      vi.useFakeTimers();
       previousSecret = process.env.AO_NOTIFY_CALLBACK_SECRET;
       process.env.AO_NOTIFY_CALLBACK_SECRET = "re-notify-secret";
     });
     afterEach(() => {
       if (previousSecret === undefined) delete process.env.AO_NOTIFY_CALLBACK_SECRET;
       else process.env.AO_NOTIFY_CALLBACK_SECRET = previousSecret;
-      vi.useRealTimers();
     });
 
     it("re-notifies for a SECOND needs_input report (new nonce)", async () => {

@@ -266,7 +266,7 @@ export function buildNotifyActions(
 }
 
 /** Whether a callback endpoint is already an absolute http(s) URL. */
-function isAbsoluteHttpCallback(endpoint: string | undefined): endpoint is string {
+function isAbsoluteHttpCallback(endpoint: string | undefined): boolean {
   return typeof endpoint === "string" && /^https?:\/\//i.test(endpoint);
 }
 
