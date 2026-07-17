@@ -237,11 +237,16 @@ export async function GET(
     // failure stays retryable. Anything after this point (audit bookkeeping) must
     // NOT release it — the action already fired, and re-opening the decision
     // would let a second tap dispatch it twice.
+    // Dispatch inside the SIGNED project. Validating the session against the
+    // token's project is not enough on its own: unscoped, `send`/`kill` resolve
+    // the session by scanning projects in config order, so with a duplicate
+    // session id they could act on a different project's session than the one
+    // just validated. (#13, review)
     try {
       if (action === "kill") {
-        await sessionManager.kill(sessionId);
+        await sessionManager.kill(sessionId, { projectId });
       } else {
-        await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action]);
+        await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action], projectId);
       }
     } catch (err) {
       if (consumes) releaseDecision(projectId, sessionId, decisionId);

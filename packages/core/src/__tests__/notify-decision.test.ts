@@ -14,10 +14,12 @@ vi.mock("../paths.js", async (importOriginal) => {
 
 import {
   activeDecisionId,
+  clearSpentDecision,
   consumeDecision,
   decisionEpisodePatch,
   isResolvingCallbackAction,
   releaseDecision,
+  storedDecisionId,
   NOTIFY_DECISION_METADATA_KEYS,
 } from "../notify-decision.js";
 import { AGENT_REPORT_METADATA_KEYS } from "../agent-report.js";
@@ -27,16 +29,35 @@ import type { Session } from "../types.js";
 const SESSION_ID = "ao-5";
 const PROJECT_ID = "ao";
 
+/** The decision instance the seeded session is parked on. */
+const STORED_AT = "2026-07-17T08:00:00.000Z";
+const STORED_EPISODE = "2026-07-17T08:00:05.000Z";
+const STORED_ID = `${STORED_AT}:${STORED_EPISODE}`;
+
 /**
- * Give the session a metadata file, as a real session always has by the time a
- * callback can reach it: the route only consumes after `get` resolved the session
- * from this very file. `consumeDecision` deliberately does not create one — that
- * would fabricate metadata for a session that does not exist.
+ * Give the session a metadata file carrying a real decision record, as it always
+ * has by the time a callback can reach it: the route only consumes after `get`
+ * resolved the session from this very file, and consumption re-checks the stored
+ * identity under the lock. `consumeDecision` deliberately never creates the file —
+ * that would fabricate metadata for a session that does not exist.
  */
-function seedSessionMetadata(dir: string): void {
-  mutateMetadata(dir, SESSION_ID, (existing) => ({ ...existing, sessionName: SESSION_ID }), {
-    createIfMissing: true,
-  });
+function seedSessionMetadata(
+  dir: string,
+  record: { at?: string; episodeAt?: string; state?: string } = {},
+): void {
+  const { at = STORED_AT, episodeAt = STORED_EPISODE, state = "needs_input" } = record;
+  mutateMetadata(
+    dir,
+    SESSION_ID,
+    (existing) => ({
+      ...existing,
+      sessionName: SESSION_ID,
+      [AGENT_REPORT_METADATA_KEYS.STATE]: state,
+      [AGENT_REPORT_METADATA_KEYS.AT]: at,
+      [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: episodeAt,
+    }),
+    { createIfMissing: true },
+  );
 }
 
 const EPISODE_AT = "2026-07-17T09:00:00.000Z";
@@ -219,8 +240,42 @@ describe("isResolvingCallbackAction", () => {
   });
 });
 
+describe("storedDecisionId", () => {
+  it("is the identity recorded in metadata", () => {
+    expect(
+      storedDecisionId({
+        [AGENT_REPORT_METADATA_KEYS.STATE]: "needs_input",
+        [AGENT_REPORT_METADATA_KEYS.AT]: STORED_AT,
+        [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: STORED_EPISODE,
+      }),
+    ).toBe(STORED_ID);
+  });
+
+  it("is null without an episode, or for a non-decision report", () => {
+    expect(
+      storedDecisionId({
+        [AGENT_REPORT_METADATA_KEYS.STATE]: "needs_input",
+        [AGENT_REPORT_METADATA_KEYS.AT]: STORED_AT,
+      }),
+    ).toBeNull();
+    expect(
+      storedDecisionId({
+        [AGENT_REPORT_METADATA_KEYS.STATE]: "working",
+        [AGENT_REPORT_METADATA_KEYS.AT]: STORED_AT,
+        [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: STORED_EPISODE,
+      }),
+    ).toBeNull();
+  });
+
+  it("agrees with activeDecisionId for the same record", () => {
+    // The lock-side and session-side derivations must not drift apart.
+    const session = makeSession({ at: STORED_AT, episodeAt: STORED_EPISODE });
+    expect(storedDecisionId(session.metadata)).toBe(activeDecisionId(session));
+  });
+});
+
 describe("consumeDecision", () => {
-  const ID = "2026-07-17T00:00:00.000Z";
+  const ID = STORED_ID;
 
   it("claims once and refuses every later attempt on the same instance", () => {
     expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(true);
@@ -236,18 +291,41 @@ describe("consumeDecision", () => {
     expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(false);
   });
 
-  it("lets a different decision instance be claimed independently", () => {
+  it("refuses a claim whose decision was superseded after the caller validated it", () => {
+    // The race: the route validated the nonce against the session it read, then a
+    // NEW decision was reported before the claim landed. Claiming the old id here
+    // would stamp it onto the new decision and dispatch into it.
+    const supersededId = "2026-07-17T07:00:00.000Z:2026-07-17T07:00:01.000Z";
+    expect(consumeDecision(PROJECT_ID, SESSION_ID, supersededId)).toBe(false);
+    const raw = readMetadataRaw(sessionsDir, SESSION_ID);
+    expect(raw?.[NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID]).toBeFalsy();
+    // The live decision is untouched and still answerable.
+    expect(consumeDecision(PROJECT_ID, SESSION_ID, STORED_ID)).toBe(true);
+  });
+
+  it("refuses a claim once the episode has moved on", () => {
+    // Same report, new episode — the token belongs to the previous episode.
+    seedSessionMetadata(sessionsDir, { episodeAt: "2026-07-17T08:30:00.000Z" });
+    expect(consumeDecision(PROJECT_ID, SESSION_ID, STORED_ID)).toBe(false);
+  });
+
+  it("lets a genuinely new decision instance be claimed", () => {
     expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(true);
-    expect(consumeDecision(PROJECT_ID, SESSION_ID, "2026-07-17T01:00:00.000Z")).toBe(true);
+    // A new `ao report` writes a new instant; its identity is claimable on its own.
+    const nextAt = "2026-07-17T08:10:00.000Z";
+    seedSessionMetadata(sessionsDir, { at: nextAt });
+    expect(consumeDecision(PROJECT_ID, SESSION_ID, `${nextAt}:${STORED_EPISODE}`)).toBe(true);
   });
 
   it("scopes consumption to the project, so a same-id session elsewhere is unaffected", () => {
     const other = mkdtempSync(join(tmpdir(), "ao-notify-decision-other-"));
+    const first = sessionsDir;
+    sessionsDir = other;
     seedSessionMetadata(other);
+    sessionsDir = first;
     expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(true);
     // getProjectSessionsDir is what scopes the store; a different project resolves
     // to a different directory and therefore a different record.
-    const first = sessionsDir;
     sessionsDir = other;
     try {
       expect(consumeDecision("other", SESSION_ID, ID)).toBe(true);
@@ -282,5 +360,44 @@ describe("consumeDecision", () => {
     releaseDecision(PROJECT_ID, SESSION_ID, "some-other-decision");
     // The real claim must survive a release aimed at a different instance.
     expect(consumeDecision(PROJECT_ID, SESSION_ID, ID)).toBe(false);
+  });
+});
+
+describe("clearSpentDecision", () => {
+  it("clears the record the poll observed", () => {
+    expect(
+      clearSpentDecision(PROJECT_ID, SESSION_ID, { state: "needs_input", at: STORED_AT }),
+    ).toBe(true);
+    const raw = readMetadataRaw(sessionsDir, SESSION_ID);
+    expect(raw?.[AGENT_REPORT_METADATA_KEYS.STATE]).toBeFalsy();
+    expect(raw?.[AGENT_REPORT_METADATA_KEYS.AT]).toBeFalsy();
+    expect(raw?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]).toBeFalsy();
+  });
+
+  it("never deletes a fresher report written after the poll's snapshot", () => {
+    // The race: the poll loaded the session, judged the decision spent, and only
+    // then did the agent write a new `ao report`. Clearing on the stale snapshot
+    // would destroy the new decision and its callback identity.
+    const fresherAt = "2026-07-17T08:20:00.000Z";
+    seedSessionMetadata(sessionsDir, { at: fresherAt });
+
+    expect(
+      clearSpentDecision(PROJECT_ID, SESSION_ID, { state: "needs_input", at: STORED_AT }),
+    ).toBe(false);
+
+    const raw = readMetadataRaw(sessionsDir, SESSION_ID);
+    expect(raw?.[AGENT_REPORT_METADATA_KEYS.AT]).toBe(fresherAt);
+    expect(raw?.[AGENT_REPORT_METADATA_KEYS.STATE]).toBe("needs_input");
+    expect(storedDecisionId(raw!)).toBe(`${fresherAt}:${STORED_EPISODE}`);
+  });
+
+  it("does not clear when the reported state changed under it", () => {
+    seedSessionMetadata(sessionsDir, { state: "needs_decision" });
+    expect(
+      clearSpentDecision(PROJECT_ID, SESSION_ID, { state: "needs_input", at: STORED_AT }),
+    ).toBe(false);
+    expect(readMetadataRaw(sessionsDir, SESSION_ID)?.[AGENT_REPORT_METADATA_KEYS.STATE]).toBe(
+      "needs_decision",
+    );
   });
 });

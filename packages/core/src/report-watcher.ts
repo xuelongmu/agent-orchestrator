@@ -15,9 +15,14 @@ import { isAgentReportFresh, readAgentReport, type AgentReport } from "./agent-r
 /** Reported states that park a session on a human decision. */
 const DECISION_REPORT_STATES: readonly string[] = ["needs_input", "needs_decision"];
 
+/** True when a reported state is one that parks the session on a human decision. */
+export function isDecisionReportState(state: string): boolean {
+  return DECISION_REPORT_STATES.includes(state);
+}
+
 /** True when a report is one that parks the session on a human decision. */
 export function isDecisionReport(report: AgentReport | null): boolean {
-  return !!report && DECISION_REPORT_STATES.includes(report.state);
+  return !!report && isDecisionReportState(report.state);
 }
 
 /**

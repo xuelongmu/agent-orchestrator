@@ -135,6 +135,7 @@ export {
   getReactionKeyForTrigger,
   isDecisionReport,
   isDecisionReportActive,
+  isDecisionReportState,
   DEFAULT_REPORT_WATCHER_CONFIG,
   REPORT_WATCHER_METADATA_KEYS,
 } from "./report-watcher.js";
@@ -355,12 +356,14 @@ export {
   NOTIFY_DECISION_METADATA_KEYS,
   RESOLVING_CALLBACK_ACTIONS,
   activeDecisionId,
+  clearSpentDecision,
   clearedDecisionMetadata,
   consumeDecision,
   decisionEpisodePatch,
   isParkedOnDecision,
   isResolvingCallbackAction,
   releaseDecision,
+  storedDecisionId,
 } from "./notify-decision.js";
 export {
   recordNotificationDelivery,

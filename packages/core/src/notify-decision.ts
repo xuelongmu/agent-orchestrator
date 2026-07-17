@@ -1,7 +1,7 @@
 import { readAgentReport, AGENT_REPORT_METADATA_KEYS } from "./agent-report.js";
 import { mutateMetadata } from "./metadata.js";
 import { getProjectSessionsDir } from "./paths.js";
-import { isDecisionReportActive } from "./report-watcher.js";
+import { isDecisionReportActive, isDecisionReportState } from "./report-watcher.js";
 import { NOTIFY_CALLBACK_ACTIONS, type NotifyCallbackAction } from "./notify-callback.js";
 import type { Session, SessionId } from "./types.js";
 
@@ -105,6 +105,25 @@ export function activeDecisionId(session: Session): string | null {
 }
 
 /**
+ * The decision identity as recorded in a raw metadata record — the same value
+ * {@link activeDecisionId} derives, computed from stored fields alone.
+ *
+ * This is what makes the identity checkable INSIDE the metadata lock, where only
+ * the stored record is in hand. It intentionally omits the liveness half of
+ * {@link isDecisionReportActive} (which needs the enriched lifecycle): the episode
+ * marker is itself cleared when the session leaves needs_input, so its presence
+ * already implies the decision is live.
+ */
+export function storedDecisionId(raw: Record<string, string>): string | null {
+  const state = raw[AGENT_REPORT_METADATA_KEYS.STATE];
+  const at = raw[AGENT_REPORT_METADATA_KEYS.AT];
+  const episodeAt = raw[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT];
+  if (!state || !at || !episodeAt) return null;
+  if (!isDecisionReportState(state)) return null;
+  return `${at}:${episodeAt}`;
+}
+
+/**
  * Atomically move a decision instance from pending to consumed.
  *
  * Returns `true` for the caller that claimed it and `false` for every later or
@@ -118,6 +137,14 @@ export function consumeDecision(
 ): boolean {
   let claimed = false;
   mutateMetadata(getProjectSessionsDir(projectId), sessionId, (existing) => {
+    // Re-check the identity INSIDE the lock. The caller validated the nonce
+    // against a session it read earlier; if a new decision was reported in
+    // between, that validation is already stale and this claim would otherwise
+    // stamp the old id on top of the new decision and dispatch into it.
+    if (storedDecisionId(existing) !== decisionId) {
+      claimed = false;
+      return existing;
+    }
     if (existing[NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID] === decisionId) {
       claimed = false;
       return existing;
@@ -126,6 +153,38 @@ export function consumeDecision(
     return { ...existing, [NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID]: decisionId };
   });
   return claimed;
+}
+
+/**
+ * Retire a spent decision, but only if the stored record is still the one the
+ * caller observed.
+ *
+ * The lifecycle poll decides a decision is spent from an in-memory session
+ * snapshot taken at the top of the cycle. If the agent writes a fresh
+ * `ao report` after that load, an unconditional clear would delete the NEW
+ * decision — losing it and its callback identity. Comparing the stored state and
+ * timestamp under the lock means a superseded observation simply no-ops.
+ *
+ * Returns `true` when the record was cleared.
+ */
+export function clearSpentDecision(
+  projectId: string,
+  sessionId: SessionId,
+  observed: { state: string; at: string },
+): boolean {
+  let cleared = false;
+  mutateMetadata(getProjectSessionsDir(projectId), sessionId, (existing) => {
+    if (
+      existing[AGENT_REPORT_METADATA_KEYS.STATE] !== observed.state ||
+      existing[AGENT_REPORT_METADATA_KEYS.AT] !== observed.at
+    ) {
+      cleared = false;
+      return existing;
+    }
+    cleared = true;
+    return { ...existing, ...clearedDecisionMetadata() };
+  });
+  return cleared;
 }
 
 /**

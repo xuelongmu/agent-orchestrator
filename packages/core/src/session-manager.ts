@@ -1035,8 +1035,17 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     updateMetadata(sessionsDir, sessionName, { opencodeSessionId: discovered });
   }
 
-  function findSessionRecord(sessionId: SessionId): LocatedSession | null {
-    for (const [projectId, project] of Object.entries(config.projects)) {
+  function findSessionRecord(
+    sessionId: SessionId,
+    scopeProjectId?: string,
+  ): LocatedSession | null {
+    // Unscoped, this returns the first id match across projects in config order.
+    // Callers that know the owning project pass it so a same-id session in
+    // another project can never be resolved in its place (#13 review).
+    const candidates = scopeProjectId
+      ? Object.entries(config.projects).filter(([projectId]) => projectId === scopeProjectId)
+      : Object.entries(config.projects);
+    for (const [projectId, project] of candidates) {
       const sessionsDir = getProjectSessionsDir(projectId);
       const raw = readMetadataRaw(sessionsDir, sessionId);
       if (!raw) continue;
@@ -1064,8 +1073,8 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     return null;
   }
 
-  function requireSessionRecord(sessionId: SessionId): LocatedSession {
-    const located = findSessionRecord(sessionId);
+  function requireSessionRecord(sessionId: SessionId, scopeProjectId?: string): LocatedSession {
+    const located = findSessionRecord(sessionId, scopeProjectId);
     if (!located) {
       throw new SessionNotFoundError(sessionId);
     }
@@ -2808,11 +2817,18 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
   }
 
   async function kill(sessionId: SessionId, options?: KillOptions): Promise<KillResult> {
-    const located = findSessionRecord(sessionId);
+    const located = findSessionRecord(sessionId, options?.projectId);
     if (!located) {
       // Session not found via findSessionRecord — check if it exists with
-      // a terminated lifecycle so auto-cleanup retries don't throw.
-      for (const [killProjectId] of Object.entries(config.projects)) {
+      // a terminated lifecycle so auto-cleanup retries don't throw. Scoped the
+      // same way as the lookup above, so it cannot report on another project's
+      // same-id session (#13 review).
+      const terminatedCandidates = options?.projectId
+        ? Object.entries(config.projects).filter(
+            ([projectId]) => projectId === options.projectId,
+          )
+        : Object.entries(config.projects);
+      for (const [killProjectId] of terminatedCandidates) {
         const sessionsDir = getProjectSessionsDir(killProjectId);
         const raw = readMetadataRaw(sessionsDir, sessionId);
         if (raw) {
@@ -3169,8 +3185,12 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     return result;
   }
 
-  async function send(sessionId: SessionId, message: string): Promise<void> {
-    const { raw, sessionsDir, project, projectId } = requireSessionRecord(sessionId);
+  async function send(
+    sessionId: SessionId,
+    message: string,
+    scopeProjectId?: string,
+  ): Promise<void> {
+    const { raw, sessionsDir, project, projectId } = requireSessionRecord(sessionId, scopeProjectId);
 
     const selection = resolveSelectionForSession(project, sessionId, raw);
     const selectedAgent = selection.agentName;

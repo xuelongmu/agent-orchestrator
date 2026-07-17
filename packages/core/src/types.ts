@@ -2169,6 +2169,13 @@ export interface KillResult {
 export interface KillOptions {
   purgeOpenCode?: boolean;
   reason?: LifecycleKillReason;
+  /**
+   * Restrict the lookup to this project. Without it the session is resolved by
+   * scanning every configured project in config order, so two projects holding
+   * the same session id would let a caller kill the wrong one. Callers that know
+   * the owning project MUST pass it.
+   */
+  projectId?: string;
 }
 
 /** Session manager — CRUD for sessions */
@@ -2203,7 +2210,14 @@ export interface SessionManager {
     projectId?: string,
     options?: { dryRun?: boolean; purgeOpenCode?: boolean },
   ): Promise<CleanupResult>;
-  send(sessionId: SessionId, message: string): Promise<void>;
+  /**
+   * Send a message to a session. `projectId` restricts the lookup to that
+   * project; without it the session is resolved by scanning every configured
+   * project in config order, so two projects holding the same session id would
+   * let a caller message the wrong one. Callers that know the owning project
+   * MUST pass it.
+   */
+  send(sessionId: SessionId, message: string, projectId?: string): Promise<void>;
   claimPR(sessionId: SessionId, prRef: string, options?: ClaimPROptions): Promise<ClaimPRResult>;
 }
 

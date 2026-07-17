@@ -103,6 +103,7 @@ import {
 } from "./notify-callback.js";
 import {
   activeDecisionId,
+  clearSpentDecision,
   clearedDecisionMetadata,
   decisionEpisodePatch,
 } from "./notify-decision.js";
@@ -2420,8 +2421,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    */
   function clearStaleDecisionContext(session: Session): void {
     const report = readAgentReport(session.metadata);
-    if (!isDecisionReport(report) || isDecisionReportActive(session, report)) return;
-    updateSessionMetadata(session, clearedDecisionMetadata());
+    if (!report || !isDecisionReport(report) || isDecisionReportActive(session, report)) return;
+    // `session.metadata` is a snapshot from the top of this poll cycle. The agent
+    // may have written a fresh `ao report` since, which this stale snapshot would
+    // still classify as spent — so hand the observation to a locked compare and
+    // let it no-op if the stored record has moved on. Clearing the NEW decision
+    // would lose it and its callback identity outright (#13 review).
+    const cleared = clearSpentDecision(session.projectId, session.id, {
+      state: report.state,
+      at: report.timestamp,
+    });
+    if (!cleared) return;
+    // Reflect the cleared record in this cycle's snapshot WITHOUT a second write:
+    // re-writing the empties here could clobber a report that landed in between,
+    // which is the very race the locked compare above exists to avoid.
+    for (const key of Object.keys(clearedDecisionMetadata())) delete session.metadata[key];
+    sessionManager.invalidateCache();
   }
 
   /**
@@ -4075,12 +4090,31 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const callbackSecret = getNotifyCallbackSecret();
     let actions: NotifyAction[] = [];
     if (callbackSecret && isNotifyActionEvent(resolveDecisionEventType(eventWithPriority))) {
-      const subject = await sessionManager.get(
-        eventWithPriority.sessionId,
-        eventWithPriority.projectId,
-      );
-      const nonce = subject ? (activeDecisionId(subject) ?? undefined) : undefined;
-      actions = buildNotifyActions(eventWithPriority, { secret: callbackSecret, nonce });
+      // Buttons are an ENHANCEMENT of the alert, never a precondition for it.
+      // `get` runs live enrichment and can reject (e.g. an OpenCode session with
+      // no persisted mapping awaits session-list discovery), and this runs outside
+      // the per-notifier delivery try blocks — so an unguarded throw here would
+      // lose the human alert entirely rather than just its buttons. Degrade to a
+      // plain notification instead. (#13 review)
+      try {
+        const subject = await sessionManager.get(
+          eventWithPriority.sessionId,
+          eventWithPriority.projectId,
+        );
+        const nonce = subject ? (activeDecisionId(subject) ?? undefined) : undefined;
+        actions = buildNotifyActions(eventWithPriority, { secret: callbackSecret, nonce });
+      } catch (err) {
+        actions = [];
+        observer.recordOperation({
+          metric: "lifecycle_poll",
+          operation: "notify.actions_unavailable",
+          outcome: "failure",
+          correlationId: createCorrelationId("notify-actions"),
+          projectId: eventWithPriority.projectId,
+          sessionId: eventWithPriority.sessionId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     let delivered = false;

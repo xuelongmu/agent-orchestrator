@@ -376,6 +376,20 @@ describe("GET /api/notify-callback/[token]", () => {
     expect(get).toHaveBeenLastCalledWith("ao-5", "other");
   });
 
+  it("dispatches send within the signed project, not the first id match", async () => {
+    // Validating the session against the token's project is not enough: unscoped,
+    // send/kill rescan projects in config order and could act on project A.
+    const res = await callGet(token("approve"));
+    expect(res.status).toBe(200);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve, "ao");
+  });
+
+  it("dispatches kill within the signed project, not the first id match", async () => {
+    const res = await callGet(token("kill"));
+    expect(res.status).toBe(200);
+    expect(kill).toHaveBeenCalledWith("ao-5", { projectId: "ao" });
+  });
+
   it("rejects a blocked (error/stuck) session — not a human prompt (409)", async () => {
     get.mockResolvedValueOnce(makeSession({ activity: "blocked" }));
     const res = await callGet(token("approve"));

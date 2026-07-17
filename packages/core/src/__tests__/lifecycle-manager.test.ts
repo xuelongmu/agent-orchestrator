@@ -1221,6 +1221,55 @@ describe("check (single session)", () => {
     expect(lm.getStates().get("app-1")).toBe("needs_input");
   });
 
+  it("still delivers the needs_input alert when callback action lookup fails", async () => {
+    // Buttons enhance the alert; they are never a precondition for it. The action
+    // lookup re-reads the session for its decision identity and runs OUTSIDE the
+    // per-notifier delivery try blocks, so an unguarded rejection there would lose
+    // the human alert entirely instead of just its buttons (#13 review).
+    const previousSecret = process.env.AO_NOTIFY_CALLBACK_SECRET;
+    process.env.AO_NOTIFY_CALLBACK_SECRET = "lifecycle-fallback-secret";
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+    const notifier = createMockNotifier();
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      notifier,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "working" }),
+      registry,
+      configOverride: {
+        ...config,
+        // session.needs_input infers "urgent" (inferPriority), so route that.
+        notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+      },
+    });
+
+    // Read back the session setupCheck configured by INVOKING the configured mock
+    // (setupCheck only arms it, so its results list is empty and must not be read).
+    // Then re-arm: check() resolves the session first, and the NEXT lookup is the
+    // action mint — the one that must degrade rather than throw.
+    const loaded = await mockSessionManager.get("app-1");
+    expect(loaded).toBeTruthy();
+    vi.mocked(mockSessionManager.get).mockReset();
+    vi.mocked(mockSessionManager.get)
+      .mockResolvedValueOnce(loaded)
+      .mockRejectedValue(new Error("enrichment failed"));
+
+    try {
+      // Without the guard the rejection escapes notifyHuman and no notifier is
+      // ever reached, so "notify was called at all" is the regression.
+      await expect(lm.check("app-1")).resolves.toBeUndefined();
+      expect(notifier.notify).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "session.needs_input" }),
+      );
+    } finally {
+      process.env.AO_NOTIFY_CALLBACK_SECRET = previousSecret;
+    }
+  });
+
   it("transitions to stuck when idle exceeds agent-stuck threshold (OpenCode-style activity)", async () => {
     config.reactions = {
       "agent-stuck": { auto: true, action: "notify", threshold: "1m" },
