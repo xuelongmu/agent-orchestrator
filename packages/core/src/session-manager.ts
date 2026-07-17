@@ -2742,9 +2742,15 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     return projectId ? sessions.filter((session) => session.projectId === projectId) : sessions;
   }
 
-  async function get(sessionId: SessionId): Promise<Session | null> {
-    // Try to find the session in any project's sessions directory
-    for (const [projectId, project] of Object.entries(config.projects)) {
+  async function get(sessionId: SessionId, scopeProjectId?: string): Promise<Session | null> {
+    // Try to find the session in any project's sessions directory — or only in
+    // `scopeProjectId` when the caller already knows which project owns it, since
+    // the same session id can exist in two projects and the unscoped scan returns
+    // whichever matches first (#13 review).
+    const candidates = scopeProjectId
+      ? Object.entries(config.projects).filter(([projectId]) => projectId === scopeProjectId)
+      : Object.entries(config.projects);
+    for (const [projectId, project] of candidates) {
       const sessionsDir = getProjectSessionsDir(projectId);
       const raw = readMetadataRaw(sessionsDir, sessionId);
       if (!raw) continue;

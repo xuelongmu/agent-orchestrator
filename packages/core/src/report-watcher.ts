@@ -12,13 +12,39 @@
 import type { Session, SessionStatus } from "./types.js";
 import { isAgentReportFresh, readAgentReport, type AgentReport } from "./agent-report.js";
 
+/** Reported states that park a session on a human decision. */
+const DECISION_REPORT_STATES: readonly string[] = ["needs_input", "needs_decision"];
+
+/** True when a report is one that parks the session on a human decision. */
+export function isDecisionReport(report: AgentReport | null): boolean {
+  return !!report && DECISION_REPORT_STATES.includes(report.state);
+}
+
 /**
- * Whether a `needs_decision` report is an ACTIVE block (#12). Active while EITHER
- * the session is currently parked in needs_input, OR the report is still fresh —
- * so a fresh decision request stays active even when PR-enrichment ordering leaves
- * the derived state as pr_open/mergeable, while a decision resolved by inference
- * (agent resumed working, report gone stale) is no longer active and stops being
- * exempted from stale-report handling.
+ * Whether a decision report (`needs_input` or `needs_decision`) is an ACTIVE
+ * block (#12). Active while EITHER the session is currently parked in
+ * needs_input, OR the report is still fresh — so a fresh decision request stays
+ * active even when PR-enrichment ordering leaves the derived state as
+ * pr_open/mergeable, while a decision resolved by inference (agent resumed
+ * working, report gone stale) is no longer active and stops being exempted from
+ * stale-report handling.
+ *
+ * This is the single activity rule for decision reports: the notify-callback
+ * decision instance (#13) binds its identity to it, so an identity exists only
+ * while the decision that minted it is still live.
+ */
+export function isDecisionReportActive(
+  session: Session,
+  report: AgentReport | null,
+  now: Date = new Date(),
+): boolean {
+  if (!isDecisionReport(report) || !report) return false;
+  return session.lifecycle?.session.state === "needs_input" || isAgentReportFresh(report, now);
+}
+
+/**
+ * Whether a `needs_decision` report specifically is an active block (#12) — the
+ * decision-only narrowing of {@link isDecisionReportActive}.
  */
 export function isNeedsDecisionActive(
   session: Session,
@@ -26,7 +52,7 @@ export function isNeedsDecisionActive(
   now: Date = new Date(),
 ): boolean {
   if (report?.state !== "needs_decision") return false;
-  return session.lifecycle?.session.state === "needs_input" || isAgentReportFresh(report, now);
+  return isDecisionReportActive(session, report, now);
 }
 
 /**

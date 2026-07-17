@@ -21,15 +21,34 @@ function reportMeta(atIso: string, state = "needs_input"): Record<string, string
 const SECRET = "route-test-secret";
 // Default decision instant: a report-backed needs_input at this timestamp, with
 // the token's nonce bound to it, is the "decision still pending & matching" case.
-const DECISION_AT = "2026-07-07T00:00:00.000Z";
+// Kept FRESH: a decision identity exists only while the decision is an active
+// block, so a fixed past timestamp would read as an already-spent decision.
+const DECISION_AT = new Date().toISOString();
 
 // Record activity events without touching the real SQLite layer.
 const recordActivityEvent = vi.fn();
+
+// Stand in for the durable, metadata-backed decision store with an equivalent
+// in-memory one, so the route's consume/release wiring is exercised without
+// touching a real project's session metadata on disk. The store deliberately
+// OUTLIVES each request — that is what makes the double-tap assertions meaningful.
+const consumedDecisions = new Set<string>();
+const consumeKey = (projectId: string, sessionId: string, decisionId: string) =>
+  `${projectId}:${sessionId}:${decisionId}`;
 vi.mock("@aoagents/ao-core", async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
   return {
     ...actual,
     recordActivityEvent: (event: unknown) => recordActivityEvent(event),
+    consumeDecision: (projectId: string, sessionId: string, decisionId: string) => {
+      const key = consumeKey(projectId, sessionId, decisionId);
+      if (consumedDecisions.has(key)) return false;
+      consumedDecisions.add(key);
+      return true;
+    },
+    releaseDecision: (projectId: string, sessionId: string, decisionId: string) => {
+      consumedDecisions.delete(consumeKey(projectId, sessionId, decisionId));
+    },
   };
 });
 
@@ -69,7 +88,12 @@ function makeLifecycle(sessionState: string): Session["lifecycle"] {
 
 const send = vi.fn(async () => {});
 const kill = vi.fn(async () => {});
-const get = vi.fn(async () => makeSession());
+// Mirrors the real project-scoped lookup: a session is only visible to the
+// project that owns it, so a token for project B cannot resolve project A's
+// same-id session.
+const get = vi.fn(async (sessionId: string, projectId?: string) =>
+  projectId !== undefined && projectId !== "ao" ? null : makeSession(),
+);
 const mockSessionManager = { send, kill, get } as unknown as SessionManager;
 
 vi.mock("@/lib/services", () => ({
@@ -80,7 +104,6 @@ vi.mock("@/lib/services", () => ({
 }));
 
 import { GET } from "@/app/api/notify-callback/[token]/route";
-import { __resetResolvedDecisions } from "@/lib/notify-callback-dedup";
 
 function makeRequest(): Request {
   return new Request("http://localhost:3000/api/notify-callback/x");
@@ -99,7 +122,7 @@ async function callGet(tok: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  __resetResolvedDecisions();
+  consumedDecisions.clear();
   process.env.AO_NOTIFY_CALLBACK_SECRET = SECRET;
 });
 
@@ -201,7 +224,7 @@ describe("GET /api/notify-callback/[token]", () => {
   it("rejects when the decision nonce no longer matches the session (409)", async () => {
     // Token minted for the decision reported at A; session has since reported a
     // newer decision at B.
-    get.mockResolvedValueOnce(makeSession({ metadata: reportMeta("2026-07-08T00:00:00.000Z") }));
+    get.mockResolvedValueOnce(makeSession({ metadata: reportMeta(new Date().toISOString()) }));
     const res = await callGet(token("approve", { nonce: "2026-07-07T00:00:00.000Z" }));
     expect(res.status).toBe(409);
     expect(send).not.toHaveBeenCalled();
@@ -211,8 +234,9 @@ describe("GET /api/notify-callback/[token]", () => {
   });
 
   it("applies when the decision nonce matches the reported decision instant", async () => {
-    get.mockResolvedValueOnce(makeSession({ metadata: reportMeta("2026-07-07T00:00:00.000Z") }));
-    const res = await callGet(token("approve", { nonce: "2026-07-07T00:00:00.000Z" }));
+    const at = new Date().toISOString();
+    get.mockResolvedValueOnce(makeSession({ metadata: reportMeta(at) }));
+    const res = await callGet(token("approve", { nonce: at }));
     expect(res.status).toBe(200);
     expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
   });
@@ -270,6 +294,52 @@ describe("GET /api/notify-callback/[token]", () => {
     const second = await callGet(token("kill"));
     expect(second.status).toBe(409);
     expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("keeps the decision answerable after a nudge (nudge does not consume)", async () => {
+    // Nudge only asks for a status update — the underlying choice is still
+    // outstanding, so Approve must still land afterwards.
+    const nudged = await callGet(token("nudge"));
+    expect(nudged.status).toBe(200);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.nudge);
+
+    const approved = await callGet(token("approve"));
+    expect(approved.status).toBe(200);
+    expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve);
+  });
+
+  it("still refuses a second resolving action after a nudge", async () => {
+    expect((await callGet(token("nudge"))).status).toBe(200);
+    expect((await callGet(token("approve"))).status).toBe(200);
+    expect((await callGet(token("kill"))).status).toBe(409);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("refuses a repeat action after a dashboard restart — consumption is durable", async () => {
+    // The route module is re-imported (fresh module state, as after a restart or
+    // route reload) while the agent is still parked on the same decision. A
+    // process-local marker would be empty here and would re-dispatch.
+    const first = await callGet(token("approve"));
+    expect(first.status).toBe(200);
+
+    vi.resetModules();
+    const { GET: freshGET } = await import("@/app/api/notify-callback/[token]/route");
+    const second = await freshGET(makeRequest(), {
+      params: Promise.resolve({ token: token("kill") }),
+    });
+    expect(second.status).toBe(409);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("resolves the session within the token's project, not the first id match", async () => {
+    // Two projects can hold the same session id; a token signed for one must never
+    // reach the other's session.
+    await callGet(token("approve"));
+    expect(get).toHaveBeenCalledWith("ao-5", "ao");
+
+    const foreign = await callGet(token("approve", { projectId: "other" }));
+    expect(foreign.status).toBe(404);
+    expect(get).toHaveBeenLastCalledWith("ao-5", "other");
   });
 
   it("rejects a blocked (error/stuck) session — not a human prompt (409)", async () => {

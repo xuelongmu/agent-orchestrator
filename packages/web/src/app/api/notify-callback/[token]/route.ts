@@ -1,13 +1,15 @@
 import { type NextRequest } from "next/server";
 import { getServices } from "@/lib/services";
 import { validateIdentifier } from "@/lib/validation";
-import { claimDecision, decisionKeyFor, releaseDecision } from "@/lib/notify-callback-dedup";
 import {
   ACTIVITY_STATE,
   SessionNotFoundError,
+  activeDecisionId,
+  consumeDecision,
   getNotifyCallbackSecret,
+  isResolvingCallbackAction,
   isTerminalSession,
-  readAgentReport,
+  releaseDecision,
   verifyCallbackToken,
   NOTIFY_CALLBACK_MESSAGES,
   recordActivityEvent,
@@ -117,26 +119,15 @@ export async function GET(
     // acting. A signed link stays valid for its TTL, so a human could tap an
     // older notification after they already answered and the agent resumed —
     // applying a stale Approve/Deny/Nudge would inject an unrelated instruction,
-    // and a stale Kill would terminate resumed work. The checks below require the
-    // right project, a still-pending decision, and a matching decision instance.
-    // (#13, review)
-    const session = await sessionManager.get(sessionId);
+    // and a stale Kill would terminate resumed work. Scoping the lookup to the
+    // token's project also makes project ownership structural rather than a
+    // separate guard: `get` can no longer return a same-id session from another
+    // project. (#13, review)
+    const session = await sessionManager.get(sessionId, projectId);
     const resolvedProjectId =
       session?.projectId ?? resolveProjectIdForSessionId(config, sessionId) ?? projectId;
 
     if (!session) {
-      return htmlResponse(
-        404,
-        "Session not found",
-        "That session no longer exists — it may have already finished or been cleaned up.",
-      );
-    }
-
-    // Session lookups scan every project and return the first id match, so a
-    // token minted for project B's session could otherwise act on a same-id
-    // session in project A. Require the resolved session to belong to the
-    // project the token was signed for. (#13, review)
-    if (session.projectId !== projectId) {
       return htmlResponse(
         404,
         "Session not found",
@@ -152,19 +143,17 @@ export async function GET(
       (session.lifecycle?.session.state === "needs_input" ||
         session.activity === ACTIVITY_STATE.WAITING_INPUT);
 
-    // The token is bound to the decision instance it was minted for: the agent
-    // decision report's timestamp. Only a current `needs_input`/`needs_decision`
-    // report is a valid identity, so a resolved/superseded decision (or a bare
-    // detected prompt with a stale non-decision report) no longer matches. Tokens
-    // are always minted with a nonce, so an absent nonce never matches.
-    const report = readAgentReport(session.metadata);
-    const currentIdentity =
-      report?.state === "needs_input" || report?.state === "needs_decision"
-        ? report.timestamp
-        : "";
-    const decisionMatches = payload.nonce !== undefined && payload.nonce === currentIdentity;
+    // Identity comes from the same core chokepoint the token was minted through,
+    // so a token is honoured only against the decision instance it names. A
+    // resolved/superseded decision — or a bare detected prompt, whose spent report
+    // the lifecycle poll retires — yields a different identity or none at all.
+    // Tokens are always minted with a nonce, so an absent nonce never matches.
+    const decisionId = activeDecisionId(session);
+    const decisionMatches = payload.nonce !== undefined && payload.nonce === decisionId;
 
-    if (!decisionPending || !decisionMatches) {
+    // The `decisionId === null` clause is what decisionMatches already implies;
+    // stating it here narrows the identity to a string for the dispatch below.
+    if (!decisionPending || decisionId === null || !decisionMatches) {
       recordApiObservation({
         config,
         method: "GET",
@@ -194,12 +183,17 @@ export async function GET(
       );
     }
 
-    // Claim the decision before dispatching so a concurrent/second tap can't
-    // fire a second action for the same decision (a double-tap, or Approve then
-    // Kill before the agent leaves needs_input). The claim is taken after the
-    // pending/identity checks and is synchronous, so two in-flight requests that
-    // both pass those checks still race here and exactly one wins. (#13, review)
-    if (!claimDecision(decisionKeyFor(payload), payload.exp, startedAt)) {
+    // Consume the decision instance before dispatching, so a double-tap — or an
+    // Approve followed by Kill before the agent leaves needs_input — cannot fire a
+    // second resolving action. The move from pending to consumed happens under the
+    // session metadata's file lock, so it is atomic against a concurrent tap and
+    // durable across a dashboard restart (a process-local marker was neither).
+    //
+    // Nudge is exempt: it only asks the agent for a status update and leaves the
+    // choice outstanding, so consuming on a nudge would strand a still-pending
+    // decision with no way to answer it. (#13, review)
+    const consumes = isResolvingCallbackAction(action);
+    if (consumes && !consumeDecision(projectId, sessionId, decisionId)) {
       recordApiObservation({
         config,
         method: "GET",
@@ -229,7 +223,7 @@ export async function GET(
       );
     }
 
-    // Release the claim only when the dispatch itself failed, so a genuine
+    // Release the instance only when the dispatch itself failed, so a genuine
     // failure stays retryable. Anything after this point (audit bookkeeping) must
     // NOT release it — the action already fired, and re-opening the decision
     // would let a second tap dispatch it twice.
@@ -240,7 +234,7 @@ export async function GET(
         await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action]);
       }
     } catch (err) {
-      releaseDecision(decisionKeyFor(payload));
+      if (consumes) releaseDecision(projectId, sessionId, decisionId);
       throw err;
     }
 

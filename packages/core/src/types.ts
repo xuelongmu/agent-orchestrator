@@ -2192,7 +2192,12 @@ export interface SessionManager {
    */
   unblock(sessionId: SessionId): Promise<Session>;
   list(projectId?: string): Promise<Session[]>;
-  get(sessionId: SessionId): Promise<Session | null>;
+  /**
+   * Look up a session by id. Without `projectId` this scans every configured
+   * project and returns the first id match, so callers that already know the
+   * project MUST pass it — two projects can hold the same session id.
+   */
+  get(sessionId: SessionId, projectId?: string): Promise<Session | null>;
   kill(sessionId: SessionId, options?: KillOptions): Promise<KillResult>;
   cleanup(
     projectId?: string,

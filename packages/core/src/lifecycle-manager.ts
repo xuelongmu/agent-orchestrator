@@ -71,7 +71,6 @@ import {
   isWeakActivityEvidence,
 } from "./activity-signal.js";
 import {
-  AGENT_REPORT_METADATA_KEYS,
   isAgentReportFresh,
   mapAgentReportToLifecycle,
   readAgentReport,
@@ -88,6 +87,8 @@ import { evaluateBudgetBreach, resolveBudget } from "./budget.js";
 import {
   auditAgentReports,
   getReactionKeyForTrigger,
+  isDecisionReport,
+  isDecisionReportActive,
   isNeedsDecisionActive,
   REPORT_WATCHER_METADATA_KEYS,
 } from "./report-watcher.js";
@@ -100,6 +101,7 @@ import {
   isNotifyActionEvent,
   resolveDecisionEventType,
 } from "./notify-callback.js";
+import { activeDecisionId, clearedDecisionMetadata } from "./notify-decision.js";
 import { resolveSessionRole } from "./agent-selection.js";
 import {
   DETECTING_MAX_ATTEMPTS,
@@ -2396,22 +2398,26 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
   /**
    * Resolve an agent decision exactly once (Class A durable store). When a
-   * needs_decision report is no longer ACTIVE (isNeedsDecisionActive false — the
-   * agent left needs_input AND the report went stale), clear the WHOLE record —
-   * reported state, timestamp, question, confidence — so every stale/blocked check
-   * sees a consistent, resolved report and a later re-entry can't reuse it. A fresh
-   * decision (even on a pr_open/mergeable session) stays active and is untouched
-   * (#12 review).
+   * decision report is no longer ACTIVE (isDecisionReportActive false — the agent
+   * left needs_input AND the report went stale), clear the WHOLE record —
+   * reported state, timestamp, question, confidence, and any notify-callback
+   * consumption marker — so every stale/blocked check sees a consistent, resolved
+   * report and a later re-entry can't reuse it. A fresh decision (even on a
+   * pr_open/mergeable session) stays active and is untouched (#12 review).
+   *
+   * This covers `needs_input` as well as `needs_decision` (#13 review). A plain
+   * needs_input report is otherwise never invalidated: checkBlockedAgent gates
+   * only needs_decision on activity, so a spent report lingers, and when the agent
+   * later stops at an unrelated bare prompt the session is `needs_input` again and
+   * the old report's timestamp would be served as the current decision identity —
+   * revalidating an unused callback token from the earlier decision against the
+   * new prompt. Retiring the spent report here is what makes a decision identity
+   * belong to the transition that activated it.
    */
   function clearStaleDecisionContext(session: Session): void {
     const report = readAgentReport(session.metadata);
-    if (report?.state !== "needs_decision" || isNeedsDecisionActive(session, report)) return;
-    updateSessionMetadata(session, {
-      [AGENT_REPORT_METADATA_KEYS.STATE]: "",
-      [AGENT_REPORT_METADATA_KEYS.AT]: "",
-      [AGENT_REPORT_METADATA_KEYS.QUESTION]: "",
-      [AGENT_REPORT_METADATA_KEYS.CONFIDENCE]: "",
-    });
+    if (!isDecisionReport(report) || isDecisionReportActive(session, report)) return;
+    updateSessionMetadata(session, clearedDecisionMetadata());
   }
 
   function makeFingerprint(ids: string[]): string {
@@ -3612,7 +3618,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // as the session-manager spawn path (see resolveStackedChildBase).
     let parent: Session | null;
     try {
-      parent = await sessionManager.get(parentSessionId);
+      // A stacked child's parent always lives in the child's own project; scope the
+      // lookup so a same-id session in another project can't be mistaken for it
+      // (same unscoped-`get` hazard as the callback mint site) (#13 review).
+      parent = await sessionManager.get(parentSessionId, child.projectId);
     } catch {
       parent = null;
     }
@@ -4023,23 +4032,24 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     // Build notification actions for decision events when a shared callback
     // secret is configured (opt-in via env). Mutating Approve/Deny/Nudge/Kill
-    // buttons are emitted only for a needs_input that is backed by an agent
-    // decision report (`needs_input`/`needs_decision`); the report's timestamp is
-    // a stable per-decision identity bound into each token so a link can't answer
-    // a later, different decision. The report is written by `ao report` before
-    // this notification fires (unlike the report-watcher trigger, which a later
-    // audit pass stamps), so a fresh callback is never mis-rejected. review/merge
-    // decisions get a View PR link; non-decision events fall back to plain
-    // notify. (#13)
+    // buttons are emitted only for a needs_input backed by an ACTIVE agent
+    // decision instance; `activeDecisionId` is the one place that identity is
+    // derived, and the callback route validates against the same function, so a
+    // link can only ever answer the decision it was minted for. The session is
+    // resolved within the EVENT'S project: `get` otherwise scans every project and
+    // returns the first id match, so with a duplicate session id across projects
+    // this would mint from the wrong project's report — signing the wrong nonce or
+    // none at all, and leaving the real project's callbacks unusable (#13 review).
+    // review/merge decisions get a View PR link; non-decision events fall back to
+    // plain notify. (#13)
     const callbackSecret = getNotifyCallbackSecret();
     let actions: NotifyAction[] = [];
     if (callbackSecret && isNotifyActionEvent(resolveDecisionEventType(eventWithPriority))) {
-      const subject = await sessionManager.get(eventWithPriority.sessionId);
-      const report = readAgentReport(subject?.metadata);
-      const nonce =
-        report?.state === "needs_input" || report?.state === "needs_decision"
-          ? report.timestamp
-          : undefined;
+      const subject = await sessionManager.get(
+        eventWithPriority.sessionId,
+        eventWithPriority.projectId,
+      );
+      const nonce = subject ? (activeDecisionId(subject) ?? undefined) : undefined;
       actions = buildNotifyActions(eventWithPriority, { secret: callbackSecret, nonce });
     }
 

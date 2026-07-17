@@ -133,6 +133,8 @@ export {
   checkBlockedAgent,
   shouldAuditSession,
   getReactionKeyForTrigger,
+  isDecisionReport,
+  isDecisionReportActive,
   DEFAULT_REPORT_WATCHER_CONFIG,
   REPORT_WATCHER_METADATA_KEYS,
 } from "./report-watcher.js";
@@ -349,6 +351,15 @@ export type {
   NotifyCallbackAction,
   NotifyCallbackPayload,
 } from "./notify-callback.js";
+export {
+  NOTIFY_DECISION_METADATA_KEYS,
+  RESOLVING_CALLBACK_ACTIONS,
+  activeDecisionId,
+  clearedDecisionMetadata,
+  consumeDecision,
+  isResolvingCallbackAction,
+  releaseDecision,
+} from "./notify-decision.js";
 export {
   recordNotificationDelivery,
   sanitizeNotificationDeliveryReason,
