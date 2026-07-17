@@ -4995,27 +4995,40 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       await executeReaction(session, reactionKey, reactionConfig);
     }
 
-    // Same-state needs_decision (#12 review): when an agent clarifies an EXISTING
-    // block with a new question/confidence, there is no status transition (so the
-    // built-in agent-needs-input notify never fires). Directly notify the human so
-    // the refined decision is not silently dropped. Skipped on the FIRST block
-    // (prior trigger was not already needs-input — the status transition handled
-    // that), and ONLY when NO report-needs-input reaction is configured — a
-    // configured reaction (even auto:false) owns this ping, so we respect its
-    // opt-out (#12 review) rather than notifying anyway.
+    // Same-state decision re-notify (#12, #13 review): a SECOND needs_input or
+    // needs_decision report while the session is already parked changes
+    // `activeDecisionId` (invalidating the previous notification's buttons with
+    // 409) but produces no status transition, and with stock config there is no
+    // report-needs-input reaction to fire. Emit a replacement actionable
+    // notification exactly once per new activation, so the human is never left
+    // holding only invalidated controls. Skipped on the FIRST block (prior trigger
+    // was not already needs-input — the status transition handled that), gated on
+    // `isNewTrigger` (no per-poll duplicate), and skipped when a report-needs-input
+    // reaction owns the ping (respect its opt-out).
+    const decisionReportState = auditResult.report?.state;
     if (
       isNewTrigger &&
       !reactionConfig &&
-      auditResult.report?.state === "needs_decision" &&
+      (decisionReportState === "needs_input" || decisionReportState === "needs_decision") &&
       priorActiveTrigger.startsWith("agent_needs_input")
     ) {
-      const decision = getActiveDecision(session);
-      if (decision) {
+      // needs_decision carries an explicit question/confidence; a plain needs_input
+      // uses the audit finding's generic message. A needs_decision with no active
+      // decision context stays silent (unchanged behavior).
+      const decision =
+        decisionReportState === "needs_decision" ? getActiveDecision(session) : null;
+      const message =
+        decisionReportState === "needs_decision"
+          ? decision
+            ? formatNeedsDecisionMessage(decision)
+            : null
+          : auditResult.message;
+      if (message !== null) {
         const context = buildEventContext(session, prEnrichmentCache);
         const event = createEvent("reaction.triggered", {
           sessionId: session.id,
           projectId: session.projectId,
-          message: formatNeedsDecisionMessage(decision),
+          message,
           data: buildReactionNotificationData({
             eventType: "reaction.triggered",
             sessionId: session.id,

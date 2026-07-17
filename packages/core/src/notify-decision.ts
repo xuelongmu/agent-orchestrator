@@ -3,7 +3,7 @@ import { mutateMetadata } from "./metadata.js";
 import { getProjectSessionsDir } from "./paths.js";
 import { isDecisionReportActive, isDecisionReportState } from "./report-watcher.js";
 import { NOTIFY_CALLBACK_ACTIONS, type NotifyCallbackAction } from "./notify-callback.js";
-import type { Session, SessionId } from "./types.js";
+import { ACTIVITY_STATE, type Session, type SessionId } from "./types.js";
 
 /**
  * The decision instance behind an actionable notification (#13).
@@ -149,6 +149,15 @@ export function isNudgeBlocked(
  * for: B is a new episode, so A's token no longer matches.
  */
 export function activeDecisionId(session: Session): string | null {
+  // A decision is answerable only while it is live in BOTH durable identity and
+  // current live activity. Live "active" activity means the agent has RESUMED
+  // work, which is authoritative even when the persisted canonical state still
+  // lags at needs_input — so a destructive Approve/Deny/Kill cannot land on
+  // already-resumed work before the next lifecycle poll persists the transition.
+  // Parked/ready/idle activities keep a legitimately-waiting decision answerable.
+  // At mint the session is parked (waiting_input is why it is a needs_input
+  // decision), so this never suppresses a genuine control. (#13 review)
+  if (session.activity === ACTIVITY_STATE.ACTIVE) return null;
   const report = readAgentReport(session.metadata);
   if (!isDecisionReportActive(session, report) || !report) return null;
   const episodeAt = session.metadata?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT] ?? "";
@@ -226,6 +235,27 @@ export function consumeDecision(
     return { ...existing, [NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID]: decisionId };
   });
   return claimed;
+}
+
+/**
+ * Reopen a consumed decision so a legitimate retry can re-claim and re-dispatch.
+ *
+ * Only used for a PROVABLY pre-delivery dispatch failure (see
+ * {@link import("./types.js").SessionSendNotDeliveredError}), never after the
+ * runtime delivery boundary is crossed — reopening an already-delivered decision
+ * would break at-most-once. Clears the marker only if it still names `decisionId`,
+ * so it can never reopen a different decision claimed in the meantime.
+ */
+export function releaseDecision(
+  projectId: string,
+  sessionId: SessionId,
+  decisionId: string,
+): void {
+  mutateMetadata(getProjectSessionsDir(projectId), sessionId, (existing) =>
+    existing[NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID] === decisionId
+      ? { ...existing, [NOTIFY_DECISION_METADATA_KEYS.CONSUMED_ID]: "" }
+      : existing,
+  );
 }
 
 /**

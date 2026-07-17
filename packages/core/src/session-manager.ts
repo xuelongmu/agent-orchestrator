@@ -24,6 +24,7 @@ import {
   NON_RESTORABLE_STATUSES,
   SessionNotFoundError,
   SessionNotRestorableError,
+  SessionSendNotDeliveredError,
   WorkspaceMissingError,
   type OpenCodeSessionManager,
   type Session,
@@ -3421,6 +3422,13 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       return normalized;
     };
 
+    // The delivery boundary (#13 review). Set to true the instant before the
+    // runtime send is attempted. Everything that throws while this is false is
+    // PROVABLY pre-delivery (preparation, restore, readiness, missing handle);
+    // anything after is at-or-after the attempt and ambiguous. This flag, not the
+    // error text, is how the failure class is reported to the caller.
+    let deliveryAttempted = false;
+
     const sendWithConfirmation = async (session: Session): Promise<void> => {
       const handle = session.runtimeHandle;
       if (!handle) {
@@ -3431,6 +3439,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       const baselineActivity = detectActivityFromOutput(baselineOutput) ?? session.activity;
       const baselineUpdatedAt = await getOpenCodeSessionUpdatedAt();
 
+      deliveryAttempted = true;
       await runtimePlugin.sendMessage(handle, message);
 
       // DELIVERY HAS CROSSED THE BOUNDARY. Everything below is best-effort
@@ -3518,9 +3527,18 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         summary: `send failed: ${sessionId}`,
         data: {
           stage,
+          delivered: deliveryAttempted,
           reason: err instanceof Error ? err.message : String(err),
         },
       });
+      // Report the failure class honestly at the delivery boundary. A proven
+      // pre-delivery failure becomes SessionSendNotDeliveredError so an
+      // at-most-once caller may reopen its claim; SessionNotFoundError is itself an
+      // unambiguous pre-delivery signal and is left intact for callers that map it
+      // to 404. Anything after the attempt propagates as-is (ambiguous → closed).
+      if (!deliveryAttempted && !(err instanceof SessionNotFoundError)) {
+        throw new SessionSendNotDeliveredError(sessionId, { cause: err });
+      }
       throw err;
     }
   }

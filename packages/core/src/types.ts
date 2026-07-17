@@ -2364,6 +2364,25 @@ export class SessionNotFoundError extends Error {
   }
 }
 
+/**
+ * Thrown by `SessionManager.send` for a failure PROVABLY before the runtime
+ * delivery boundary (preparation, restore, readiness, or a missing handle) — the
+ * message never reached `runtimePlugin.sendMessage`. Callers relying on
+ * at-most-once semantics (the notify-callback route) may safely reopen a consumed
+ * claim ONLY for this typed failure; any failure at or after the delivery attempt
+ * is ambiguous and must keep the claim closed. The boundary is encoded here in the
+ * delivery API, never inferred from error message text. (#13 review)
+ */
+export class SessionSendNotDeliveredError extends Error {
+  constructor(
+    public readonly sessionId: string,
+    options?: { cause?: unknown },
+  ) {
+    super(`Message not delivered to session ${sessionId} (failed before delivery)`, options);
+    this.name = "SessionSendNotDeliveredError";
+  }
+}
+
 /** Thrown when no agent-orchestrator.yaml config file can be found. */
 export class ConfigNotFoundError extends Error {
   constructor(message?: string) {

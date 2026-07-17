@@ -68,18 +68,20 @@ function makeSession(overrides: {
   state?: string;
   lifecycleState?: string;
   episodeAt?: string | null;
+  activity?: string;
 }): Session {
   const {
     at = new Date().toISOString(),
     state = "needs_input",
     lifecycleState,
     episodeAt = EPISODE_AT,
+    activity = "waiting_input",
   } = overrides;
   return {
     id: SESSION_ID,
     projectId: PROJECT_ID,
     status: "working",
-    activity: "waiting_input",
+    activity,
     metadata: {
       [AGENT_REPORT_METADATA_KEYS.STATE]: state,
       [AGENT_REPORT_METADATA_KEYS.AT]: at,
@@ -120,6 +122,22 @@ describe("activeDecisionId", () => {
   it("is available for a fresh decision not yet reflected in lifecycle", () => {
     const at = new Date().toISOString();
     expect(activeDecisionId(makeSession({ at }))).toBe(`${at}:${EPISODE_AT}`);
+  });
+
+  it("is null when live activity is active — work resumed before the poll persisted it", () => {
+    // Stale canonical still says needs_input and the nonce still matches, but the
+    // agent has resumed (activity active), so no destructive callback may land.
+    const at = new Date().toISOString();
+    expect(
+      activeDecisionId(makeSession({ at, lifecycleState: "needs_input", activity: "active" })),
+    ).toBeNull();
+  });
+
+  it("stays answerable for parked/ready/idle activity", () => {
+    const at = new Date().toISOString();
+    for (const activity of ["waiting_input", "ready", "idle"]) {
+      expect(activeDecisionId(makeSession({ at, activity }))).toBe(`${at}:${EPISODE_AT}`);
+    }
   });
 
   it("is null once the decision is spent — agent resumed and the report went stale", () => {

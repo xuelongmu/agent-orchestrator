@@ -1,5 +1,7 @@
 import {
   getNotificationDataV3,
+  normalizeCallbackBaseUrl,
+  resolveCallbackUrl,
   type PluginModule,
   type Notifier,
   type OrchestratorEvent,
@@ -194,10 +196,8 @@ function buildText(event: OrchestratorEvent, data: NotificationDataV3 | null): s
 function actionToButton(action: NotifyAction, callbackBaseUrl: string | null): TelegramButton | null {
   const text = truncate(action.label, 64);
   if (action.url) return { text, url: action.url };
-  if (action.callbackEndpoint && callbackBaseUrl) {
-    return { text, url: `${callbackBaseUrl}${action.callbackEndpoint}` };
-  }
-  return null;
+  const resolved = resolveCallbackUrl(callbackBaseUrl, action.callbackEndpoint);
+  return resolved ? { text, url: resolved } : null;
 }
 
 function buildReplyMarkup(
@@ -242,12 +242,6 @@ async function sendMessage(
   }
 }
 
-/** Trim a trailing slash so `${base}${endpoint}` never doubles up. */
-function normalizeBaseUrl(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim().replace(/\/+$/, "");
-  return trimmed.length > 0 ? trimmed : null;
-}
 
 export function create(config?: Record<string, unknown>): Notifier {
   const botToken =
@@ -256,12 +250,24 @@ export function create(config?: Record<string, unknown>): Notifier {
     config?.chatId !== undefined && config?.chatId !== null
       ? String(config.chatId)
       : (process.env.TELEGRAM_CHAT_ID ?? undefined);
-  const callbackBaseUrl = normalizeBaseUrl(config?.callbackBaseUrl);
+  // Accept only an absolute http(s) base. A malformed value (e.g. `localhost:3000`)
+  // is treated exactly like an unset one, so callback buttons are omitted and the
+  // plain alert still sends — an invalid button URL would make Telegram reject the
+  // whole sendMessage and lose the notification. (#13 review)
+  const rawCallbackBase =
+    typeof config?.callbackBaseUrl === "string" ? config.callbackBaseUrl.trim() : "";
+  const callbackBaseUrl = normalizeCallbackBaseUrl(config?.callbackBaseUrl);
 
   if (!botToken || !chatId) {
     console.warn(
       "[notifier-telegram] Missing botToken or chatId — notifications will be no-ops. " +
         "Set notifiers.telegram.botToken (or TELEGRAM_BOT_TOKEN) and notifiers.telegram.chatId.",
+    );
+  } else if (rawCallbackBase.length > 0 && !callbackBaseUrl) {
+    console.warn(
+      "[notifier-telegram] callbackBaseUrl is not a valid absolute http(s) URL — action " +
+        "buttons that call back into AO will be omitted. Set notifiers.telegram.callbackBaseUrl " +
+        "to your dashboard's public URL (e.g. https://host or https://host/ao).",
     );
   } else if (!callbackBaseUrl) {
     console.warn(

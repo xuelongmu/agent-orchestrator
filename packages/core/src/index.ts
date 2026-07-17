@@ -344,6 +344,8 @@ export {
   getNotifyCallbackSecret,
   isNotifyActionEvent,
   isNotifyCallbackAction,
+  normalizeCallbackBaseUrl,
+  resolveCallbackUrl,
   resolveDecisionEventType,
   signCallbackToken,
   verifyCallbackToken,
@@ -364,6 +366,7 @@ export {
   isNudgeBlocked,
   isParkedOnDecision,
   isResolvingCallbackAction,
+  releaseDecision,
   storedDecisionId,
 } from "./notify-decision.js";
 export {

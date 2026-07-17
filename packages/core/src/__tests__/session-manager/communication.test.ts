@@ -6,6 +6,7 @@ import {
 import { join } from "node:path";
 import { createSessionManager } from "../../session-manager.js";
 import { getProjectSessionsDir } from "../../paths.js";
+import { SessionSendNotDeliveredError } from "../../types.js";
 import {
   writeMetadata,
   readMetadataRaw,
@@ -175,9 +176,9 @@ describe("send", () => {
 
       const sm = createSessionManager({ config, registry: mockRegistry });
       const sendPromise = sm.send("app-1", "hello");
-      const rejection = expect(sendPromise).rejects.toThrow(
-        "Cannot send to session app-1: session is not running",
-      );
+      // Restore/readiness failed BEFORE the delivery boundary, so send reports the
+      // typed pre-delivery failure and never attempted sendMessage. (#13 review)
+      const rejection = expect(sendPromise).rejects.toBeInstanceOf(SessionSendNotDeliveredError);
 
       await vi.runAllTimersAsync();
       await rejection;
@@ -185,6 +186,25 @@ describe("send", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("does NOT report pre-delivery when the runtime send itself throws (ambiguous)", async () => {
+    // sendMessage was reached (delivery attempted) and then rejected — an ambiguous
+    // outcome. send must propagate the original error, NOT the pre-delivery type, so
+    // an at-most-once caller keeps its claim closed. (#13 review)
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp",
+      branch: "main",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: makeHandle("rt-1"),
+    });
+    vi.mocked(mockRuntime.getOutput).mockResolvedValue("");
+    vi.mocked(mockRuntime.sendMessage).mockRejectedValueOnce(new Error("ipc write then timeout"));
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await expect(sm.send("app-1", "hello")).rejects.not.toBeInstanceOf(SessionSendNotDeliveredError);
+    expect(mockRuntime.sendMessage).toHaveBeenCalled();
   });
 
   it("waits for spawning sessions to become interactive before considering restore", async () => {

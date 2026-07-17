@@ -21,7 +21,7 @@ vi.mock("node:os", () => ({
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
-import { manifest, create, escapeAppleScript } from "./index.js";
+import { manifest, create, escapeAppleScript, nativeActionPayloads } from "./index.js";
 
 const mockExecFile = execFile as unknown as Mock;
 const mockExecFileSync = execFileSync as unknown as Mock;
@@ -80,6 +80,33 @@ describe("notifier-desktop", () => {
       expect(manifest.name).toBe("desktop");
       expect(manifest.slot).toBe("notifier");
       expect(manifest.version).toBe("0.1.0");
+    });
+  });
+
+  describe("nativeActionPayloads budget", () => {
+    const fiveActions = [
+      { label: "Approve", callbackEndpoint: "/api/notify-callback/a" },
+      { label: "Deny", callbackEndpoint: "/api/notify-callback/d" },
+      { label: "Nudge", callbackEndpoint: "/api/notify-callback/n" },
+      { label: "Kill", callbackEndpoint: "/api/notify-callback/k" },
+      { label: "View PR", url: "https://github.com/acme/x/pull/7" },
+    ];
+
+    it("keeps the read-only View PR within the four-action limit", () => {
+      const payloads = nativeActionPayloads(fiveActions, "https://host/ao");
+      expect(payloads).toHaveLength(4);
+      const labels = payloads.map((p) => p.label);
+      expect(labels).toContain("View PR");
+      // Mutating controls fill the remaining budget in priority order; the
+      // destructive Kill is shed first.
+      expect(labels).toEqual(["Approve", "Deny", "Nudge", "View PR"]);
+      // Reverse-proxy path prefix preserved in the resolved callback URL.
+      expect(payloads[0].callbackEndpoint).toBe("https://host/ao/api/notify-callback/a");
+    });
+
+    it("passes through when within the limit", () => {
+      const payloads = nativeActionPayloads(fiveActions.slice(0, 3), "https://host");
+      expect(payloads.map((p) => p.label)).toEqual(["Approve", "Deny", "Nudge"]);
     });
   });
 

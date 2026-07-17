@@ -10,6 +10,8 @@ import {
   isNudgeBlocked,
   isResolvingCallbackAction,
   isTerminalSession,
+  releaseDecision,
+  SessionSendNotDeliveredError,
   verifyCallbackToken,
   NOTIFY_CALLBACK_LABELS,
   NOTIFY_CALLBACK_MESSAGES,
@@ -406,17 +408,29 @@ export async function POST(
       // session id they could act on a different project's session than the one
       // just validated. (#13, review)
       //
-      // Once the dispatch call is ATTEMPTED the consumed claim stays closed, even if
-      // it rejects: `sessionManager.send` can write the message to the runtime and
-      // then reject (an IPC timeout, or a post-delivery confirmation error), so a
-      // rejection is only SUSPECTED non-delivery, never known. Reopening the claim
-      // would let a retry deliver the same Approve/Deny/Kill a second time. At-most-
-      // once wins over retryability here; a genuinely undelivered action is recovered
-      // by the agent re-reporting needs_input, which mints a fresh decision. (#13 rev)
-      if (action === "kill") {
-        await sessionManager.kill(sessionId, { projectId });
-      } else {
-        await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action], projectId);
+      // The consumed claim stays closed once the runtime DELIVERY BOUNDARY is
+      // crossed, even on rejection: an at-or-after-delivery failure is only
+      // SUSPECTED non-delivery (an IPC timeout, a post-delivery confirmation error),
+      // so reopening would let a retry deliver the same action twice. The claim is
+      // reopened ONLY for a PROVABLY pre-delivery failure, which `send` reports via
+      // the typed SessionSendNotDeliveredError (or SessionNotFoundError) — never
+      // inferred from message text — so a restore/readiness failure before dispatch
+      // stays retryable. `kill` never reopens (it has no such typed pre-delivery
+      // signal and is destructive). (#13 review)
+      try {
+        if (action === "kill") {
+          await sessionManager.kill(sessionId, { projectId });
+        } else {
+          await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action], projectId);
+        }
+      } catch (dispatchErr) {
+        if (
+          dispatchErr instanceof SessionSendNotDeliveredError ||
+          dispatchErr instanceof SessionNotFoundError
+        ) {
+          releaseDecision(projectId, sessionId, decisionId);
+        }
+        throw dispatchErr;
       }
 
       recordApiObservation({

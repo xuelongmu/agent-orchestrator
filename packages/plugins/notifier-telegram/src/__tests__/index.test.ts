@@ -261,6 +261,49 @@ describe("notifier-telegram", () => {
     expect(markup.inline_keyboard.flat()[0].url).toBe(`${BASE_URL}/api/notify-callback/tok`);
   });
 
+  it("treats a malformed callbackBaseUrl like unset — omits callbacks, still sends the alert", async () => {
+    // `localhost:3000` (no scheme) would otherwise build invalid button URLs and
+    // Telegram would reject the whole sendMessage, losing the alert. (#13 review)
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const notifier = create({
+      botToken: BOT_TOKEN,
+      chatId: CHAT_ID,
+      callbackBaseUrl: "localhost:3000",
+    });
+    await notifier.notifyWithActions!(makeEvent(), CALLBACK_ACTIONS);
+
+    expect(fetchMock).toHaveBeenCalledOnce(); // the alert still went out
+    const markup = lastBody(fetchMock).reply_markup as {
+      inline_keyboard: { text: string; url: string }[][];
+    };
+    // Only the read-only URL action survives; no invalid callback buttons.
+    expect(markup.inline_keyboard.flat()).toEqual([
+      { text: "View PR", url: "https://github.com/acme/x/pull/7" },
+    ]);
+  });
+
+  it("preserves a reverse-proxy path prefix in callback button URLs", async () => {
+    const fetchMock = okFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const notifier = create({
+      botToken: BOT_TOKEN,
+      chatId: CHAT_ID,
+      callbackBaseUrl: "https://host/ao",
+    });
+    await notifier.notifyWithActions!(makeEvent(), [
+      { label: "Approve", callbackEndpoint: "/api/notify-callback/tok" },
+    ]);
+
+    const markup = lastBody(fetchMock).reply_markup as {
+      inline_keyboard: { text: string; url: string }[][];
+    };
+    expect(markup.inline_keyboard.flat()[0].url).toBe("https://host/ao/api/notify-callback/tok");
+  });
+
   it("throws on a non-ok Telegram response", async () => {
     const fetchMock = vi
       .fn()

@@ -4,6 +4,8 @@ import {
   NOTIFY_CALLBACK_ACTIONS,
   NOTIFY_CALLBACK_SECRET_ENV,
   actionsForNotifier,
+  normalizeCallbackBaseUrl,
+  resolveCallbackUrl,
   buildNotifyActions,
   getNotifyCallbackSecret,
   isNotifyActionEvent,
@@ -376,5 +378,49 @@ describe("actionsForNotifier", () => {
 
   it("returns nothing when a non-resolving notifier has only relative callbacks", () => {
     expect(actionsForNotifier([approve, deny], false)).toEqual([]);
+  });
+});
+
+describe("normalizeCallbackBaseUrl", () => {
+  it("accepts absolute http(s) bases and strips trailing slashes", () => {
+    expect(normalizeCallbackBaseUrl("https://host")).toBe("https://host");
+    expect(normalizeCallbackBaseUrl("https://host/")).toBe("https://host");
+    expect(normalizeCallbackBaseUrl("https://host/ao//")).toBe("https://host/ao");
+    expect(normalizeCallbackBaseUrl("  http://host/ao  ")).toBe("http://host/ao");
+  });
+
+  it("rejects malformed, non-http(s), or empty values (treated as unset)", () => {
+    expect(normalizeCallbackBaseUrl("localhost:3000")).toBeNull();
+    expect(normalizeCallbackBaseUrl("ftp://host")).toBeNull();
+    expect(normalizeCallbackBaseUrl("not a url")).toBeNull();
+    expect(normalizeCallbackBaseUrl("")).toBeNull();
+    expect(normalizeCallbackBaseUrl("   ")).toBeNull();
+    expect(normalizeCallbackBaseUrl(undefined)).toBeNull();
+    expect(normalizeCallbackBaseUrl(42)).toBeNull();
+  });
+});
+
+describe("resolveCallbackUrl", () => {
+  const endpoint = "/api/notify-callback/tok";
+
+  it("preserves a reverse-proxy path prefix", () => {
+    // The core of the desktop/telegram bug: new URL(rel, base) would drop `/ao`.
+    expect(resolveCallbackUrl("https://host/ao", endpoint)).toBe("https://host/ao/api/notify-callback/tok");
+    expect(resolveCallbackUrl("https://host/ao/", endpoint)).toBe("https://host/ao/api/notify-callback/tok");
+  });
+
+  it("resolves against a root base", () => {
+    expect(resolveCallbackUrl("https://host", endpoint)).toBe("https://host/api/notify-callback/tok");
+  });
+
+  it("returns an already-absolute endpoint unchanged", () => {
+    expect(resolveCallbackUrl("https://host/ao", "https://other/x")).toBe("https://other/x");
+  });
+
+  it("returns null for an invalid base or unsafe endpoint", () => {
+    expect(resolveCallbackUrl("localhost:3000", endpoint)).toBeNull();
+    expect(resolveCallbackUrl(null, endpoint)).toBeNull();
+    expect(resolveCallbackUrl("https://host", "not-root-relative")).toBeNull();
+    expect(resolveCallbackUrl("https://host", undefined)).toBeNull();
   });
 });

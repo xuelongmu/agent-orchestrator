@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   signCallbackToken,
   SessionNotFoundError,
+  SessionSendNotDeliveredError,
   NOTIFY_CALLBACK_MESSAGES,
   AGENT_REPORT_METADATA_KEYS,
   NOTIFY_DECISION_METADATA_KEYS,
@@ -55,6 +56,11 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
       if (consumedDecisions.has(key)) return false;
       consumedDecisions.add(key);
       return true;
+    },
+    // Reopen a consumed claim — the route calls this only for a proven pre-delivery
+    // dispatch failure.
+    releaseDecision: (projectId: string, sessionId: string, decisionId: string) => {
+      consumedDecisions.delete(consumeKey(projectId, sessionId, decisionId));
     },
     // Route wiring only: block a nudge once the decision is consumed. The
     // stored-identity-superseded branch is exercised against real metadata in
@@ -280,6 +286,21 @@ describe("POST /api/notify-callback/[token]", () => {
     expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve, "ao");
   });
 
+  it("rejects every callback once live activity is active, even with stale needs_input (409)", async () => {
+    // The agent resumed before the poll persisted the transition: canonical still
+    // says needs_input and the nonce still matches, but live activity is active, so
+    // no Approve/Deny/Kill may land on resumed work. (#13 review)
+    for (const action of ["approve", "deny", "kill"] as const) {
+      get.mockResolvedValueOnce(
+        makeSession({ activity: "active", lifecycle: makeLifecycle("needs_input") }),
+      );
+      const res = await callGet(token(action));
+      expect(res.status).toBe(409);
+    }
+    expect(send).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
   it("rejects when the decision nonce no longer matches the session (409)", async () => {
     // Token minted for the decision reported at A; session has since reported a
     // newer decision at B.
@@ -367,6 +388,27 @@ describe("POST /api/notify-callback/[token]", () => {
     // Same token, retried after the ambiguous failure: refused, no second delivery.
     const retry = await callGet(token("approve"));
     expect(retry.status).toBe(409);
+    expect(delivered).toBe(1);
+  });
+
+  it("reopens the claim for a PROVABLY pre-delivery send failure so a retry succeeds", async () => {
+    // send reports (via the typed error) that it failed before crossing the
+    // delivery boundary — restore/readiness failed, nothing was delivered — so the
+    // claim reopens and a retry can deliver exactly once. (#13 review)
+    let delivered = 0;
+    send.mockImplementationOnce(async () => {
+      throw new SessionSendNotDeliveredError("ao-5");
+    });
+    send.mockImplementationOnce(async () => {
+      delivered += 1;
+    });
+
+    const first = await callGet(token("approve"));
+    expect(first.status).toBe(500);
+    expect(delivered).toBe(0);
+
+    const retry = await callGet(token("approve"));
+    expect(retry.status).toBe(200);
     expect(delivered).toBe(1);
   });
 

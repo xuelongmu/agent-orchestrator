@@ -2393,6 +2393,101 @@ describe("reactions", () => {
     }
   });
 
+  describe("decision re-notify when a new report changes the nonce (no reaction configured)", () => {
+    const runAudit = async (
+      reportState: "needs_input" | "needs_decision",
+      newReportAt: string,
+      priorTriggerAt: string,
+      extraMeta: Record<string, string> = {},
+    ) => {
+      const notifier = createMockNotifier();
+      const registryWithNotifier = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const priorState = reportState === "needs_decision" ? "needs_decision" : "needs_input";
+      const session = makeSession({
+        id: "app-1",
+        status: "needs_input",
+        activity: "waiting_input",
+        createdAt: new Date("2025-01-01T11:40:00.000Z"),
+        metadata: {
+          createdAt: "2025-01-01T11:40:00.000Z",
+          agentReportedState: reportState,
+          agentReportedAt: newReportAt,
+          agentAcknowledgedAt: priorTriggerAt,
+          reportWatcherActiveTrigger: `agent_needs_input:${priorState}:${priorTriggerAt}`,
+          reportWatcherTriggerActivatedAt: priorTriggerAt,
+          reportWatcherTriggerCount: "1",
+          notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
+          ...extraMeta,
+        },
+      });
+      config.reactions = {}; // no report-needs-input reaction: the fallback owns the ping
+      vi.mocked(mockSessionManager.list).mockResolvedValue([session]);
+      vi.mocked(mockSessionManager.get).mockResolvedValue(session);
+
+      const lm = createLifecycleManager({
+        config,
+        registry: registryWithNotifier,
+        sessionManager: mockSessionManager,
+      });
+      vi.setSystemTime(new Date("2025-01-01T12:00:00.000Z"));
+      lm.start(60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(60_000);
+      lm.stop();
+
+      return vi.mocked(notifier.notify).mock.calls.filter((call) => {
+        const event = call[0] as { type?: string; data?: { semanticType?: string } };
+        return (
+          event?.type === "reaction.triggered" &&
+          event?.data?.semanticType === "report.needs_input"
+        );
+      });
+    };
+
+    let previousSecret: string | undefined;
+    beforeEach(() => {
+      vi.useFakeTimers();
+      previousSecret = process.env.AO_NOTIFY_CALLBACK_SECRET;
+      process.env.AO_NOTIFY_CALLBACK_SECRET = "re-notify-secret";
+    });
+    afterEach(() => {
+      if (previousSecret === undefined) delete process.env.AO_NOTIFY_CALLBACK_SECRET;
+      else process.env.AO_NOTIFY_CALLBACK_SECRET = previousSecret;
+      vi.useRealTimers();
+    });
+
+    it("re-notifies for a SECOND needs_input report (new nonce)", async () => {
+      const notifies = await runAudit(
+        "needs_input",
+        "2025-01-01T11:55:00.000Z", // new report
+        "2025-01-01T11:50:00.000Z", // prior activation
+      );
+      expect(notifies.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("does not re-fire for the SAME needs_input report", async () => {
+      const sameTs = "2025-01-01T11:50:00.000Z";
+      const notifies = await runAudit("needs_input", sameTs, sameTs);
+      expect(notifies).toHaveLength(0);
+    });
+
+    it("still re-notifies for a second needs_decision report (behavior intact)", async () => {
+      const notifies = await runAudit(
+        "needs_decision",
+        "2025-01-01T11:55:00.000Z",
+        "2025-01-01T11:50:00.000Z",
+        { agentReportedQuestion: "Ship it?", agentReportedConfidence: "0.6" },
+      );
+      expect(notifies.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
   it("triggers send-to-agent reaction on CI failure", async () => {
     config.reactions = {
       "ci-failed": {

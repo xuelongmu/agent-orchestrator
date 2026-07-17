@@ -289,3 +289,46 @@ export function actionsForNotifier(
   if (resolvesActionCallbacks) return actions;
   return actions.filter((action) => action.url || isAbsoluteHttpCallback(action.callbackEndpoint));
 }
+
+/**
+ * A configured public base URL an action-capable notifier prepends to relative
+ * callback endpoints, normalized (trailing slashes stripped), or `null` when the
+ * value is missing or not a valid absolute http(s) URL. A malformed base (e.g.
+ * `localhost:3000`) must be treated exactly like an unset one: notifiers then omit
+ * callback actions and still deliver the plain human alert, rather than building
+ * an invalid button URL that the transport rejects wholesale. (#13 review)
+ */
+export function normalizeCallbackBaseUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  return trimmed.replace(/\/+$/, "");
+}
+
+/**
+ * Resolve a relative callback endpoint into a final absolute URL through the
+ * configured public base, PRESERVING the base's path so a reverse-proxy prefix
+ * (`https://host/ao`) survives (`https://host/ao/api/...`) — `new URL(rel, base)`
+ * would discard it. Returns the endpoint unchanged if it is already absolute
+ * http(s), or `null` when the base is invalid or the endpoint is not a safe
+ * root-relative path. Shared by every actionable notifier so the base-URL rule
+ * cannot diverge. (#13 review)
+ */
+export function resolveCallbackUrl(
+  base: string | null | undefined,
+  endpoint: string | undefined,
+): string | null {
+  if (!endpoint) return null;
+  if (isAbsoluteHttpCallback(endpoint)) return endpoint;
+  if (!endpoint.startsWith("/")) return null;
+  const normalizedBase = normalizeCallbackBaseUrl(base);
+  if (!normalizedBase) return null;
+  return `${normalizedBase}${endpoint}`;
+}

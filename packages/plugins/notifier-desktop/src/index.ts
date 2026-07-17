@@ -6,6 +6,7 @@ import {
   escapeAppleScript,
   getNotificationDataV3,
   isMac,
+  resolveCallbackUrl,
   type PluginModule,
   type Notifier,
   type OrchestratorEvent,
@@ -296,30 +297,15 @@ function firstUrlAction(actions: NotifyAction[] | undefined): string | undefined
   return actions?.find((action) => typeof action.url === "string")?.url;
 }
 
-function isAbsoluteHttpUrl(value: string | undefined): value is string {
-  if (!value) return false;
-  try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
 function resolveCallbackEndpoint(
   callbackEndpoint: string | undefined,
   dashboardUrl: string | undefined,
 ): string | undefined {
-  if (isAbsoluteHttpUrl(callbackEndpoint)) return callbackEndpoint;
-  if (!callbackEndpoint || !dashboardUrl) return undefined;
-  try {
-    const resolved = new URL(callbackEndpoint, dashboardUrl);
-    return resolved.protocol === "http:" || resolved.protocol === "https:"
-      ? resolved.toString()
-      : undefined;
-  } catch {
-    return undefined;
-  }
+  // Preserve a reverse-proxy path prefix: `new URL("/api/...", "https://host/ao")`
+  // discards `/ao`, so AO Notifier.app would POST outside the proxy mapping. The
+  // shared resolver appends the endpoint to the normalized base path instead, and
+  // validates the base is absolute http(s). (#13 review)
+  return resolveCallbackUrl(dashboardUrl, callbackEndpoint) ?? undefined;
 }
 
 function nativeActionPayload(
@@ -344,14 +330,27 @@ function nativeActionIndexes(
   return indexes;
 }
 
-function nativeActionPayloads(
+/** AO Notifier.app renders at most this many action buttons. */
+const NATIVE_ACTION_LIMIT = 4;
+
+export function nativeActionPayloads(
   actions: NotifyAction[] | undefined,
   dashboardUrl: string | undefined,
 ): NativeActionPayload[] {
-  return (actions ?? [])
+  const payloads = (actions ?? [])
     .map((action) => nativeActionPayload(action, dashboardUrl))
-    .filter((action): action is NativeActionPayload => Boolean(action))
-    .slice(0, 4);
+    .filter((action): action is NativeActionPayload => Boolean(action));
+  if (payloads.length <= NATIVE_ACTION_LIMIT) return payloads;
+
+  // Budget for the four-button limit so the read-only View PR link is never the
+  // one dropped: read-only URL actions are always kept, and the remaining budget
+  // is filled with mutating (callback) actions in their minted priority order
+  // (Approve, Deny, Nudge, Kill) — dropping from the tail, which sheds the
+  // destructive Kill first. (#13 review)
+  const readOnly = payloads.filter((p) => p.url);
+  const mutating = payloads.filter((p) => !p.url);
+  const room = Math.max(0, NATIVE_ACTION_LIMIT - readOnly.length);
+  return [...mutating.slice(0, room), ...readOnly];
 }
 
 function firstActionTarget(
