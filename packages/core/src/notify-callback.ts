@@ -309,7 +309,12 @@ export function normalizeCallbackBaseUrl(value: unknown): string | null {
     return null;
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-  return trimmed.replace(/\/+$/, "");
+  // Credentials, a query, or a fragment would corrupt the appended callback path
+  // (e.g. `https://host/ao?x=1` + `/api` → `https://host/ao?x=1/api`). Reject them.
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+  // Canonicalize to origin + pathname (drops default ports etc.), trailing slash
+  // stripped so `${base}${endpoint}` never doubles up.
+  return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, "");
 }
 
 /**

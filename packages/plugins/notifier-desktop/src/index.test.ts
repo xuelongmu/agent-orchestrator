@@ -108,6 +108,14 @@ describe("notifier-desktop", () => {
       const payloads = nativeActionPayloads(fiveActions.slice(0, 3), "https://host");
       expect(payloads.map((p) => p.label)).toEqual(["Approve", "Deny", "Nudge"]);
     });
+
+    it("never exceeds the limit even with more than four read-only actions", () => {
+      const sixReadOnly = Array.from({ length: 6 }, (_, i) => ({
+        label: `Link ${i}`,
+        url: `https://example.com/${i}`,
+      }));
+      expect(nativeActionPayloads(sixReadOnly, "https://host")).toHaveLength(4);
+    });
   });
 
   describe("resolvesActionCallbacks capability", () => {

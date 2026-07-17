@@ -398,6 +398,13 @@ describe("normalizeCallbackBaseUrl", () => {
     expect(normalizeCallbackBaseUrl(undefined)).toBeNull();
     expect(normalizeCallbackBaseUrl(42)).toBeNull();
   });
+
+  it("rejects a base carrying credentials, a query, or a fragment", () => {
+    // These would corrupt the appended callback path (…/ao?x=1 + /api → …/ao?x=1/api).
+    expect(normalizeCallbackBaseUrl("https://host/ao?x=1")).toBeNull();
+    expect(normalizeCallbackBaseUrl("https://host/ao#frag")).toBeNull();
+    expect(normalizeCallbackBaseUrl("https://user:pass@host/ao")).toBeNull();
+  });
 });
 
 describe("resolveCallbackUrl", () => {

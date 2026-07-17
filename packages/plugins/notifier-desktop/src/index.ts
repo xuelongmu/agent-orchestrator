@@ -343,11 +343,11 @@ export function nativeActionPayloads(
   if (payloads.length <= NATIVE_ACTION_LIMIT) return payloads;
 
   // Budget for the four-button limit so the read-only View PR link is never the
-  // one dropped: read-only URL actions are always kept, and the remaining budget
-  // is filled with mutating (callback) actions in their minted priority order
-  // (Approve, Deny, Nudge, Kill) — dropping from the tail, which sheds the
-  // destructive Kill first. (#13 review)
-  const readOnly = payloads.filter((p) => p.url);
+  // one dropped: read-only URL actions are kept first (capped at the limit so the
+  // total can never exceed it), and the remaining budget is filled with mutating
+  // (callback) actions in their minted priority order (Approve, Deny, Nudge, Kill)
+  // — dropping from the tail, which sheds the destructive Kill first. (#13 review)
+  const readOnly = payloads.filter((p) => p.url).slice(0, NATIVE_ACTION_LIMIT);
   const mutating = payloads.filter((p) => !p.url);
   const room = Math.max(0, NATIVE_ACTION_LIMIT - readOnly.length);
   return [...mutating.slice(0, room), ...readOnly];

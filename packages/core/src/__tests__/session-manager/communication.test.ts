@@ -6,16 +6,16 @@ import {
 import { join } from "node:path";
 import { createSessionManager } from "../../session-manager.js";
 import { getProjectSessionsDir } from "../../paths.js";
-import { SessionSendNotDeliveredError } from "../../types.js";
 import {
   writeMetadata,
   readMetadataRaw,
 } from "../../metadata.js";
-import type {
-  OrchestratorConfig,
-  PluginRegistry,
-  Runtime,
-  Agent,
+import {
+  SessionSendNotDeliveredError,
+  type OrchestratorConfig,
+  type PluginRegistry,
+  type Runtime,
+  type Agent,
 } from "../../types.js";
 import { setupTestContext, teardownTestContext, makeHandle, type TestContext } from "../test-utils.js";
 import { installMockOpencode, installMockOpencodeSequence, PATH_SEP } from "./opencode-helpers.js";

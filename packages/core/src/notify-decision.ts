@@ -168,22 +168,6 @@ export function activeDecisionId(session: Session): string | null {
 }
 
 /**
- * The decision identity as recorded in a raw metadata record — the same value
- * {@link activeDecisionId} derives, computed from stored fields alone.
- *
- * This is what makes the identity checkable INSIDE the metadata lock, where only
- * the stored record is in hand. It intentionally omits the liveness half of
- * {@link isDecisionReportActive} (which needs the enriched lifecycle): the episode
- * marker is itself cleared when the session leaves needs_input, so its presence
- * already implies the decision is live.
- *
- * The timestamp is normalized with the SAME rule `readAgentReport` applies
- * (`Date.parse` → `toISOString`). `activeDecisionId` derives the nonce from the
- * report `readAgentReport` returns, so a stored `at` that is valid but not already
- * in `toISOString` form (e.g. `2026-07-17T12:34:56Z`) would otherwise produce a
- * different string here than the signed nonce and reject every action with 409.
- */
-/**
  * Canonicalize a stored report timestamp with the SAME rule `readAgentReport`
  * applies (`Date.parse` → `toISOString`), or `null` when unparseable. Every
  * identity comparison must go through this so a valid but non-canonical spelling
@@ -196,6 +180,21 @@ export function normalizeReportTimestamp(at: string | undefined): string | null 
   return new Date(parsed).toISOString();
 }
 
+/**
+ * The decision identity as recorded in a raw metadata record — the same value
+ * {@link activeDecisionId} derives, computed from stored fields alone.
+ *
+ * This is what makes the identity checkable INSIDE the metadata lock, where only
+ * the stored record is in hand. It intentionally omits the liveness half of
+ * {@link isDecisionReportActive} (which needs the enriched lifecycle): the episode
+ * marker is itself cleared when the session leaves needs_input, so its presence
+ * already implies the decision is live.
+ *
+ * The timestamp is normalized via {@link normalizeReportTimestamp}, so a stored
+ * `at` that is valid but not already in `toISOString` form still equals the signed
+ * nonce (which `activeDecisionId` derives from the report `readAgentReport`
+ * returns) instead of rejecting every action with 409.
+ */
 export function storedDecisionId(raw: Record<string, string>): string | null {
   const state = raw[AGENT_REPORT_METADATA_KEYS.STATE];
   const at = normalizeReportTimestamp(raw[AGENT_REPORT_METADATA_KEYS.AT]);
