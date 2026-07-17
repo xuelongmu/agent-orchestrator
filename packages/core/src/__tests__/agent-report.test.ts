@@ -247,6 +247,21 @@ describe("applyAgentReport", () => {
     });
   });
 
+  it("stamps a durable acknowledgement marker on first report and never overwrites it", () => {
+    const first = new Date("2025-01-01T12:00:00.000Z");
+    applyAgentReport(dataDir, sessionId, { state: "needs_input", now: first });
+    const afterFirst = readMetadataRaw(dataDir, sessionId)!;
+    expect(afterFirst[AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]).toBe(first.toISOString());
+
+    // A later report must NOT move the acknowledgement instant.
+    const second = new Date("2025-01-01T12:30:00.000Z");
+    applyAgentReport(dataDir, sessionId, { state: "working", now: second });
+    const afterSecond = readMetadataRaw(dataDir, sessionId)!;
+    expect(afterSecond[AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]).toBe(first.toISOString());
+    // The current report tracks the latest state/timestamp separately.
+    expect(afterSecond[AGENT_REPORT_METADATA_KEYS.AT]).toBe(second.toISOString());
+  });
+
   it("records needs_decision with confidence + question and parks needs_input", () => {
     const now = new Date("2025-01-01T13:00:00.000Z");
     const result = applyAgentReport(dataDir, sessionId, {

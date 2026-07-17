@@ -402,6 +402,48 @@ describe("POST /api/notify-callback/[token]", () => {
     expect(kill).not.toHaveBeenCalled();
   });
 
+  it("serializes a concurrent resolving action behind an in-flight nudge", async () => {
+    // The race: a Nudge passes its not-consumed check and pauses at dispatch; a
+    // concurrent Deny must not consume and answer the decision while the Nudge is
+    // mid-flight, or the Nudge would land after resolution. Per-decision
+    // serialization holds the Deny until the Nudge completes. (#13 review)
+    const events: string[] = [];
+    let releaseNudge!: () => void;
+    const nudgeGate = new Promise<void>((r) => (releaseNudge = r));
+    let signalNudgeAtSend!: () => void;
+    const nudgeAtSend = new Promise<void>((r) => (signalNudgeAtSend = r));
+
+    try {
+      send.mockImplementation((async (_id: string, msg: string) => {
+        if (msg === NOTIFY_CALLBACK_MESSAGES.nudge) {
+          events.push("nudge-send");
+          signalNudgeAtSend();
+          await nudgeGate; // hold the decision mid-dispatch
+        } else {
+          events.push("resolve-send");
+        }
+      }) as unknown as () => Promise<void>);
+
+      const nudgeP = callGet(token("nudge"));
+      await nudgeAtSend; // nudge is now holding the decision at dispatch
+
+      const denyP = callGet(token("deny"));
+      // Drain microtasks: with serialization the Deny is queued behind the Nudge
+      // and cannot consume/dispatch; without it, "resolve-send" would appear here.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(events).toEqual(["nudge-send"]);
+
+      releaseNudge();
+      const [nudgeRes, denyRes] = await Promise.all([nudgeP, denyP]);
+      expect(nudgeRes.status).toBe(200);
+      expect(denyRes.status).toBe(200);
+      // Nudge fully completed before Deny consumed and dispatched.
+      expect(events).toEqual(["nudge-send", "resolve-send"]);
+    } finally {
+      send.mockImplementation((async () => {}) as unknown as () => Promise<void>);
+    }
+  });
+
   it("refuses a repeat action after a dashboard restart — consumption is durable", async () => {
     // The route module is re-imported (fresh module state, as after a restart or
     // route reload) while the agent is still parked on the same decision. A

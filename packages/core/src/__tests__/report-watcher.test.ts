@@ -12,7 +12,7 @@ import {
 } from "../report-watcher.js";
 import { createInitialCanonicalLifecycle } from "../lifecycle-state.js";
 import type { Session, SessionStatus } from "../types.js";
-import type { AgentReport } from "../agent-report.js";
+import { AGENT_REPORT_METADATA_KEYS, type AgentReport } from "../agent-report.js";
 
 function createMockSession(overrides: Partial<Session> = {}): Session {
   const lifecycle = createInitialCanonicalLifecycle("worker");
@@ -104,6 +104,26 @@ describe("checkAcknowledgeTimeout", () => {
     expect(result).not.toBeNull();
     expect(result?.trigger).toBe("no_acknowledge");
     expect(result?.timeSinceSpawnMs).toBeGreaterThan(config.acknowledgeTimeoutMs);
+  });
+
+  it("stays quiet past the timeout when a durable acknowledgement survives report retirement", () => {
+    // The agent reported (acknowledged) and later left needs_input via inference;
+    // the decision report was retired, so `report` is null here. The durable
+    // ACKNOWLEDGED_AT marker must suppress the false no_acknowledge. (#13 review)
+    const now = new Date();
+    const spawnTime = new Date(now.getTime() - 15 * 60 * 1000);
+    const session = createMockSession({
+      createdAt: spawnTime,
+      metadata: {
+        createdAt: spawnTime.toISOString(),
+        [AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]: new Date(
+          now.getTime() - 12 * 60 * 1000,
+        ).toISOString(),
+      },
+    });
+
+    const result = checkAcknowledgeTimeout(session, null, now, config);
+    expect(result).toBeNull();
   });
 
   it("respects checkAcknowledge config flag", () => {

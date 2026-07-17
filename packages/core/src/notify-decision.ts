@@ -174,15 +174,26 @@ export function activeDecisionId(session: Session): string | null {
  * in `toISOString` form (e.g. `2026-07-17T12:34:56Z`) would otherwise produce a
  * different string here than the signed nonce and reject every action with 409.
  */
+/**
+ * Canonicalize a stored report timestamp with the SAME rule `readAgentReport`
+ * applies (`Date.parse` → `toISOString`), or `null` when unparseable. Every
+ * identity comparison must go through this so a valid but non-canonical spelling
+ * (e.g. `2026-07-17T12:34:56Z`) matches the value the live report derives.
+ */
+export function normalizeReportTimestamp(at: string | undefined): string | null {
+  if (!at) return null;
+  const parsed = Date.parse(at);
+  if (Number.isNaN(parsed)) return null;
+  return new Date(parsed).toISOString();
+}
+
 export function storedDecisionId(raw: Record<string, string>): string | null {
   const state = raw[AGENT_REPORT_METADATA_KEYS.STATE];
-  const at = raw[AGENT_REPORT_METADATA_KEYS.AT];
+  const at = normalizeReportTimestamp(raw[AGENT_REPORT_METADATA_KEYS.AT]);
   const episodeAt = raw[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT];
   if (!state || !at || !episodeAt) return null;
   if (!isDecisionReportState(state)) return null;
-  const parsed = Date.parse(at);
-  if (Number.isNaN(parsed)) return null;
-  return `${new Date(parsed).toISOString()}:${episodeAt}`;
+  return `${at}:${episodeAt}`;
 }
 
 /**
@@ -273,9 +284,13 @@ export function clearSpentDecision(
       };
       return { ...existing, ...applied };
     }
+    // Compare NORMALIZED timestamps: `observed.at` came from `readAgentReport`
+    // (already canonical), but the stored value may be a valid non-canonical
+    // spelling. A raw comparison would never match those, so retirement would
+    // no-op and a later bare prompt could revalidate the stale token. (#13 review)
     if (
       storedState !== observed.state ||
-      existing[AGENT_REPORT_METADATA_KEYS.AT] !== observed.at
+      normalizeReportTimestamp(existing[AGENT_REPORT_METADATA_KEYS.AT]) !== observed.at
     ) {
       applied = null;
       return existing;

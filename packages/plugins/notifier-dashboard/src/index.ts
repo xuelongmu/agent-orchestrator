@@ -40,9 +40,11 @@ export function create(config?: Record<string, unknown>): Notifier {
   return {
     name: "dashboard",
 
-    // The AO web app serves /api/notify-callback at the same origin it renders
-    // these notifications in, so a relative callback endpoint resolves there.
-    resolvesActionCallbacks: true,
+    // Not advertised as callback-capable: although the endpoints are same-origin,
+    // DashboardNotificationButton only renders `action.url`, so mutating callback
+    // actions would be silently dropped and the user would see no controls. Until
+    // the UI renders safe same-origin callback endpoints, the dashboard receives
+    // only URL actions (View PR). (#13 review)
 
     async notify(event: OrchestratorEvent): Promise<void> {
       persist(event);

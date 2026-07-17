@@ -229,6 +229,31 @@ describe("buildNotifyActions", () => {
     ]);
   });
 
+  it("builds the View PR link with no secret configured (secretless opt-out)", () => {
+    // Read-only URL actions need no callback token, so the default secretless
+    // configuration must still surface View PR. (#13 review)
+    const event = makeEvent({
+      type: "merge.ready",
+      data: {
+        schemaVersion: NOTIFICATION_DATA_SCHEMA_VERSION,
+        subject: {
+          session: { id: "my-app-1", projectId: "my-app" },
+          pr: { number: 7, url: "https://github.com/acme/x/pull/7" },
+        },
+      },
+    });
+    expect(buildNotifyActions(event, {})).toEqual([
+      { label: "View PR", url: "https://github.com/acme/x/pull/7" },
+    ]);
+  });
+
+  it("builds no mutating buttons without a secret, even with a nonce", () => {
+    // A needs_input with an identity but no secret cannot sign tokens; it must not
+    // emit Approve/Deny/Nudge/Kill.
+    const actions = buildNotifyActions(makeEvent(), { nonce: NONCE });
+    expect(actions).toEqual([]);
+  });
+
   it("appends a View PR link after the action buttons for needs_input with a PR", () => {
     const event = makeEvent({
       data: {

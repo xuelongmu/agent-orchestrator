@@ -83,6 +83,41 @@ describe("notifier-desktop", () => {
     });
   });
 
+  describe("resolvesActionCallbacks capability", () => {
+    const appInstalled = () =>
+      mockExistsSync.mockImplementation((path: string) =>
+        path.endsWith("AO Notifier.app/Contents/MacOS/ao-notifier"),
+      );
+
+    it("is true only when the actionable AO Notifier.app backend is selected", () => {
+      // auto + app installed → resolves to ao-app (renders real buttons).
+      appInstalled();
+      expect(create({ backend: "auto" }).resolvesActionCallbacks).toBe(true);
+      expect(create({ backend: "ao-app" }).resolvesActionCallbacks).toBe(true);
+    });
+
+    it("is falsy when the app is not installed", () => {
+      mockExistsSync.mockReturnValue(false); // no AO Notifier.app
+      expect(create({ backend: "auto" }).resolvesActionCallbacks).toBeFalsy();
+      // Explicit ao-app without the app installed rejects at notify time.
+      expect(create({ backend: "ao-app" }).resolvesActionCallbacks).toBeFalsy();
+    });
+
+    it("is falsy for non-actionable backends even when the app is installed", () => {
+      appInstalled();
+      expect(create({ backend: "terminal-notifier" }).resolvesActionCallbacks).toBeFalsy();
+      expect(create({ backend: "osascript" }).resolvesActionCallbacks).toBeFalsy();
+    });
+
+    it("is falsy off macOS (notify-send / WinRT never render actions)", () => {
+      appInstalled();
+      setProcessPlatform("linux");
+      expect(create({ backend: "auto" }).resolvesActionCallbacks).toBeFalsy();
+      setProcessPlatform("win32");
+      expect(create({ backend: "ao-app" }).resolvesActionCallbacks).toBeFalsy();
+    });
+  });
+
   describe("escapeAppleScript", () => {
     it("escapes double quotes", () => {
       expect(escapeAppleScript('hello "world"')).toBe('hello \\"world\\"');

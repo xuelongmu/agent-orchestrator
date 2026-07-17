@@ -546,6 +546,16 @@ export function create(config?: Record<string, unknown>): Notifier {
     appPath,
     useTerminalNotifier: hasTerminalNotifier,
   };
+  // Only AO Notifier.app renders real action buttons. notify-send (Linux), WinRT
+  // (Windows), osascript and terminal-notifier all ignore `options.actions` and
+  // show inert fallback text, so advertising callback capability there would offer
+  // controls the user cannot invoke. The macOS notify path selects ao-app when it
+  // is installed AND the backend is "auto" or "ao-app" (not an explicit
+  // terminal-notifier/osascript). Mirror that exactly so the capability is honest.
+  // (#13 review)
+  const aoNotifierAppReady = isMac() && detectAoNotifierApp(appPath);
+  const resolvesActionCallbacks =
+    aoNotifierAppReady && (backend === "auto" || backend === "ao-app");
   const nextNativeNotificationId = (event: OrchestratorEvent): string => {
     nativeNotificationSequence += 1;
     return nativeNotificationId(event, nativeNotificationSequence);
@@ -554,9 +564,8 @@ export function create(config?: Record<string, unknown>): Notifier {
   return {
     name: "desktop",
 
-    // Resolves relative callback endpoints against the configured dashboard URL
-    // (and drops the control when unset), so it may receive callback actions.
-    resolvesActionCallbacks: true,
+    // True only when the actionable AO Notifier.app backend is selected (see above).
+    resolvesActionCallbacks,
 
     async notify(event: OrchestratorEvent): Promise<void> {
       const content = formatContent(event);

@@ -10,7 +10,12 @@
  */
 
 import type { Session, SessionStatus } from "./types.js";
-import { isAgentReportFresh, readAgentReport, type AgentReport } from "./agent-report.js";
+import {
+  AGENT_REPORT_METADATA_KEYS,
+  isAgentReportFresh,
+  readAgentReport,
+  type AgentReport,
+} from "./agent-report.js";
 
 /** Reported states that park a session on a human decision. */
 const DECISION_REPORT_STATES: readonly string[] = ["needs_input", "needs_decision"];
@@ -155,6 +160,12 @@ export function checkAcknowledgeTimeout(
 
   // If we have any report (acknowledge or otherwise), the agent responded
   if (report) return null;
+
+  // The agent may have responded earlier and had its report retired (e.g. a
+  // resolved decision whose callback identity was cleared). The durable
+  // acknowledgement marker survives that retirement, so a session that once
+  // reported is never treated as never-acknowledged. (#13 review)
+  if (session.metadata[AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]) return null;
 
   // Check time since spawn
   const createdAt = session.createdAt ?? session.metadata["createdAt"];

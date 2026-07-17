@@ -42,6 +42,33 @@ import {
  * POST re-verifies the token from scratch — it trusts nothing from the GET.
  */
 
+/**
+ * Per-decision in-process serialization. AO's web dashboard is a single
+ * long-running process (the same assumption the durable claim relies on), so
+ * chaining the authorize-and-dispatch section by decision id prevents a Nudge
+ * from passing its "not yet consumed" check, releasing the metadata lock, and
+ * then dispatching AFTER a concurrent resolving action has consumed and answered
+ * the same decision — a contradictory post-resolution nudge. Requests for
+ * DIFFERENT decisions never contend. (#13 review)
+ */
+const decisionChains = new Map<string, Promise<unknown>>();
+function serializeByDecision<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = decisionChains.get(key) ?? Promise.resolve();
+  const result = prev.then(fn, fn);
+  // Tail never rejects, so one request's failure can't break the chain; it also
+  // evicts the map entry once nothing is queued behind it, bounding growth.
+  const chain: Promise<void> = result.then(
+    () => {
+      if (decisionChains.get(key) === chain) decisionChains.delete(key);
+    },
+    () => {
+      if (decisionChains.get(key) === chain) decisionChains.delete(key);
+    },
+  );
+  decisionChains.set(key, chain);
+  return result;
+}
+
 function escapeHtml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -308,112 +335,117 @@ export async function POST(
     // superseded between the get() above and now. The check is a locked read at
     // the central helper, so it authorizes against the stored identity at dispatch
     // time — the same boundary the resolving path uses.
-    const consumes = isResolvingCallbackAction(action);
-    if (!consumes && isNudgeBlocked(projectId, sessionId, decisionId)) {
+    // Serialize the authorize-and-dispatch section per decision so a Nudge
+    // cannot slip in after a concurrent resolving action has consumed it.
+    const decisionKey = `${projectId}:${sessionId}:${decisionId}`;
+    return await serializeByDecision(decisionKey, async (): Promise<Response> => {
+      const consumes = isResolvingCallbackAction(action);
+      if (!consumes && isNudgeBlocked(projectId, sessionId, decisionId)) {
+        recordApiObservation({
+          config,
+          method: "POST",
+          path: "/api/notify-callback/[token]",
+          correlationId,
+          startedAt,
+          outcome: "failure",
+          statusCode: 409,
+          projectId: resolvedProjectId,
+          sessionId,
+          reason: "decision already resolved or superseded",
+          data: { action },
+        });
+        recordActivityEvent({
+          projectId: resolvedProjectId,
+          sessionId,
+          source: "api",
+          kind: "api.notify_callback.duplicate",
+          level: "warn",
+          summary: `notification action "${action}" ignored — decision already resolved or superseded for session ${sessionId}`,
+          data: { action },
+        });
+        return htmlResponse(
+          409,
+          "Already handled",
+          "This decision was already answered or has moved on, so no further action was taken.",
+        );
+      }
+
+      if (consumes && !consumeDecision(projectId, sessionId, decisionId)) {
+        recordApiObservation({
+          config,
+          method: "POST",
+          path: "/api/notify-callback/[token]",
+          correlationId,
+          startedAt,
+          outcome: "failure",
+          statusCode: 409,
+          projectId: resolvedProjectId,
+          sessionId,
+          reason: "duplicate callback action",
+          data: { action },
+        });
+        recordActivityEvent({
+          projectId: resolvedProjectId,
+          sessionId,
+          source: "api",
+          kind: "api.notify_callback.duplicate",
+          level: "warn",
+          summary: `notification action "${action}" ignored as already resolved for session ${sessionId}`,
+          data: { action },
+        });
+        return htmlResponse(
+          409,
+          "Already handled",
+          "This decision was already answered from another tap, so no further action was taken.",
+        );
+      }
+
+      // Dispatch inside the SIGNED project. Validating the session against the
+      // token's project is not enough on its own: unscoped, `send`/`kill` resolve
+      // the session by scanning projects in config order, so with a duplicate
+      // session id they could act on a different project's session than the one
+      // just validated. (#13, review)
+      //
+      // Once the dispatch call is ATTEMPTED the consumed claim stays closed, even if
+      // it rejects: `sessionManager.send` can write the message to the runtime and
+      // then reject (an IPC timeout, or a post-delivery confirmation error), so a
+      // rejection is only SUSPECTED non-delivery, never known. Reopening the claim
+      // would let a retry deliver the same Approve/Deny/Kill a second time. At-most-
+      // once wins over retryability here; a genuinely undelivered action is recovered
+      // by the agent re-reporting needs_input, which mints a fresh decision. (#13 rev)
+      if (action === "kill") {
+        await sessionManager.kill(sessionId, { projectId });
+      } else {
+        await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action], projectId);
+      }
+
       recordApiObservation({
         config,
         method: "POST",
         path: "/api/notify-callback/[token]",
         correlationId,
         startedAt,
-        outcome: "failure",
-        statusCode: 409,
+        outcome: "success",
+        statusCode: 200,
         projectId: resolvedProjectId,
         sessionId,
-        reason: "decision already resolved or superseded",
         data: { action },
       });
       recordActivityEvent({
         projectId: resolvedProjectId,
         sessionId,
         source: "api",
-        kind: "api.notify_callback.duplicate",
-        level: "warn",
-        summary: `notification action "${action}" ignored — decision already resolved or superseded for session ${sessionId}`,
-        data: { action },
+        kind: `api.notify_callback.${action}`,
+        summary: `notification action "${action}" resolved for session ${sessionId}`,
+        data: { action, source: "notify-callback" },
       });
+
       return htmlResponse(
-        409,
-        "Already handled",
-        "This decision was already answered or has moved on, so no further action was taken.",
+        200,
+        ACTION_HEADING[action],
+        `Session ${sessionId} received your "${action}" decision. You can close this page.`,
       );
-    }
-
-    if (consumes && !consumeDecision(projectId, sessionId, decisionId)) {
-      recordApiObservation({
-        config,
-        method: "POST",
-        path: "/api/notify-callback/[token]",
-        correlationId,
-        startedAt,
-        outcome: "failure",
-        statusCode: 409,
-        projectId: resolvedProjectId,
-        sessionId,
-        reason: "duplicate callback action",
-        data: { action },
-      });
-      recordActivityEvent({
-        projectId: resolvedProjectId,
-        sessionId,
-        source: "api",
-        kind: "api.notify_callback.duplicate",
-        level: "warn",
-        summary: `notification action "${action}" ignored as already resolved for session ${sessionId}`,
-        data: { action },
-      });
-      return htmlResponse(
-        409,
-        "Already handled",
-        "This decision was already answered from another tap, so no further action was taken.",
-      );
-    }
-
-    // Dispatch inside the SIGNED project. Validating the session against the
-    // token's project is not enough on its own: unscoped, `send`/`kill` resolve
-    // the session by scanning projects in config order, so with a duplicate
-    // session id they could act on a different project's session than the one
-    // just validated. (#13, review)
-    //
-    // Once the dispatch call is ATTEMPTED the consumed claim stays closed, even if
-    // it rejects: `sessionManager.send` can write the message to the runtime and
-    // then reject (an IPC timeout, or a post-delivery confirmation error), so a
-    // rejection is only SUSPECTED non-delivery, never known. Reopening the claim
-    // would let a retry deliver the same Approve/Deny/Kill a second time. At-most-
-    // once wins over retryability here; a genuinely undelivered action is recovered
-    // by the agent re-reporting needs_input, which mints a fresh decision. (#13 rev)
-    if (action === "kill") {
-      await sessionManager.kill(sessionId, { projectId });
-    } else {
-      await sessionManager.send(sessionId, NOTIFY_CALLBACK_MESSAGES[action], projectId);
-    }
-
-    recordApiObservation({
-      config,
-      method: "POST",
-      path: "/api/notify-callback/[token]",
-      correlationId,
-      startedAt,
-      outcome: "success",
-      statusCode: 200,
-      projectId: resolvedProjectId,
-      sessionId,
-      data: { action },
     });
-    recordActivityEvent({
-      projectId: resolvedProjectId,
-      sessionId,
-      source: "api",
-      kind: `api.notify_callback.${action}`,
-      summary: `notification action "${action}" resolved for session ${sessionId}`,
-      data: { action, source: "notify-callback" },
-    });
-
-    return htmlResponse(
-      200,
-      ACTION_HEADING[action],
-      `Session ${sessionId} received your "${action}" decision. You can close this page.`,
-    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const notFound = err instanceof SessionNotFoundError;

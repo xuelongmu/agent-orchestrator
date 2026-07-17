@@ -195,8 +195,12 @@ export function verifyCallbackToken(
 }
 
 export interface BuildNotifyActionsOptions {
-  /** Shared HMAC secret. Required — without it no callback actions are built. */
-  secret: string;
+  /**
+   * Shared HMAC secret. Without it, no mutating callback actions are built — but
+   * URL-only actions (View PR) still are, so a read-only link survives the default
+   * secretless opt-out configuration. (#13 review)
+   */
+  secret?: string;
   /**
    * Decision-instance identity to bind the tokens to (the session's current
    * ACTIVE_TRIGGER). Persisted into each token as its {@link NotifyCallbackPayload.nonce}.
@@ -238,7 +242,11 @@ export function buildNotifyActions(
 
   const actions: NotifyAction[] = [];
 
-  if (NEEDS_INPUT_DECISION_TYPES.includes(decisionType) && options.nonce !== undefined) {
+  if (
+    options.secret &&
+    NEEDS_INPUT_DECISION_TYPES.includes(decisionType) &&
+    options.nonce !== undefined
+  ) {
     for (const action of NOTIFY_CALLBACK_ACTIONS) {
       const token = signCallbackToken(
         { sessionId: event.sessionId, projectId: event.projectId, action, exp, nonce: options.nonce },

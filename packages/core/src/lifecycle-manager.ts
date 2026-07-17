@@ -4113,20 +4113,29 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // plain notify. (#13)
     const callbackSecret = getNotifyCallbackSecret();
     let actions: NotifyAction[] = [];
-    if (callbackSecret && isNotifyActionEvent(resolveDecisionEventType(eventWithPriority))) {
-      // Buttons are an ENHANCEMENT of the alert, never a precondition for it.
-      // `get` runs live enrichment and can reject (e.g. an OpenCode session with
-      // no persisted mapping awaits session-list discovery), and this runs outside
-      // the per-notifier delivery try blocks — so an unguarded throw here would
-      // lose the human alert entirely rather than just its buttons. Degrade to a
-      // plain notification instead. (#13 review)
+    if (isNotifyActionEvent(resolveDecisionEventType(eventWithPriority))) {
+      // Build actions for every decision event, secret or not. The read-only View
+      // PR link needs no token, so `review.changes_requested`/`merge.ready` must
+      // keep it even in the default secretless opt-out (#13 review). The MUTATING
+      // buttons are an ENHANCEMENT of the alert, never a precondition: the nonce
+      // lookup runs `get` (live enrichment that can reject — e.g. an OpenCode
+      // session awaiting discovery) outside the per-notifier delivery try blocks,
+      // so an unguarded throw would lose the human alert entirely rather than just
+      // its buttons. It only runs when a secret is set (mutating buttons possible),
+      // and degrades to a plain notification on failure. (#13 review)
       try {
-        const subject = await sessionManager.get(
-          eventWithPriority.sessionId,
-          eventWithPriority.projectId,
-        );
-        const nonce = subject ? (activeDecisionId(subject) ?? undefined) : undefined;
-        actions = buildNotifyActions(eventWithPriority, { secret: callbackSecret, nonce });
+        let nonce: string | undefined;
+        if (callbackSecret) {
+          const subject = await sessionManager.get(
+            eventWithPriority.sessionId,
+            eventWithPriority.projectId,
+          );
+          nonce = subject ? (activeDecisionId(subject) ?? undefined) : undefined;
+        }
+        actions = buildNotifyActions(eventWithPriority, {
+          secret: callbackSecret ?? undefined,
+          nonce,
+        });
       } catch (err) {
         actions = [];
         observer.recordOperation({

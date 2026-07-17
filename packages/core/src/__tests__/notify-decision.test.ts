@@ -445,6 +445,24 @@ describe("clearSpentDecision", () => {
     expect(raw?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]).toBeFalsy();
   });
 
+  it("clears a valid but non-canonical stored timestamp (normalized comparison)", () => {
+    // The stored `at` is valid but not in toISOString() form; observed.at came
+    // from readAgentReport (canonical). A raw compare would never match, so
+    // retirement would no-op and a later prompt could revalidate the stale token.
+    const nonCanonical = "2026-07-17T08:00:00Z"; // no milliseconds
+    const canonical = "2026-07-17T08:00:00.000Z";
+    seedSessionMetadata(sessionsDir, { at: nonCanonical });
+
+    const applied = clearSpentDecision(PROJECT_ID, SESSION_ID, {
+      state: "needs_input",
+      at: canonical,
+    });
+    expect(applied).not.toBeNull();
+    const raw = readMetadataRaw(sessionsDir, SESSION_ID);
+    expect(raw?.[AGENT_REPORT_METADATA_KEYS.STATE]).toBeFalsy();
+    expect(raw?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]).toBeFalsy();
+  });
+
   it("never deletes a fresher report written after the poll's snapshot", () => {
     // The race: the poll loaded the session, judged the decision spent, and only
     // then did the agent write a new `ao report`. Clearing on the stale snapshot
