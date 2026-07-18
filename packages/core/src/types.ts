@@ -937,8 +937,12 @@ export interface SCM {
     deletions: number;
   }>;
 
-  /** Merge a PR */
-  mergePR(pr: PRInfo, method?: MergeMethod): Promise<void>;
+  /**
+   * Merge a PR. Autonomous callers pass `expectedHeadSha` so the SCM rejects
+   * the merge if the reviewed head moved between validation and execution.
+   * Manual callers may omit it.
+   */
+  mergePR(pr: PRInfo, method?: MergeMethod, expectedHeadSha?: string): Promise<void>;
 
   /** Close a PR without merging */
   closePR(pr: PRInfo): Promise<void>;

@@ -538,10 +538,15 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
       };
     },
 
-    async mergePR(pr: PRInfo, method: MergeMethod = "squash"): Promise<void> {
+    async mergePR(
+      pr: PRInfo,
+      method: MergeMethod = "squash",
+      expectedHeadSha?: string,
+    ): Promise<void> {
       const args = ["mr", "merge", String(pr.number), "--repo", repoFlag(pr)];
       if (method === "squash") args.push("--squash");
       else if (method === "rebase") args.push("--rebase");
+      if (expectedHeadSha) args.push("--sha", expectedHeadSha);
       args.push("-d", "-y");
       await glab(args, resolveHostname(pr));
     },

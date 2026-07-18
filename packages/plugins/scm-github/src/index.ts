@@ -869,10 +869,16 @@ function createGitHubSCM(): SCM {
       });
     },
 
-    async mergePR(pr: PRInfo, method: MergeMethod = "squash"): Promise<void> {
+    async mergePR(
+      pr: PRInfo,
+      method: MergeMethod = "squash",
+      expectedHeadSha?: string,
+    ): Promise<void> {
       const flag = method === "rebase" ? "--rebase" : method === "merge" ? "--merge" : "--squash";
-
-      await gh(["pr", "merge", String(pr.number), "--repo", repoFlag(pr), flag, "--delete-branch"]);
+      const args = ["pr", "merge", String(pr.number), "--repo", repoFlag(pr), flag];
+      if (expectedHeadSha) args.push("--match-head-commit", expectedHeadSha);
+      args.push("--delete-branch");
+      await gh(args);
       invalidatePRCache(pr);
     },
 

@@ -576,6 +576,29 @@ describe("scm-github plugin", () => {
         expect.any(Object),
       );
     });
+
+    it("pins an autonomous merge to the expected head", async () => {
+      ghMock.mockRejectedValueOnce(new Error("head commit changed"));
+
+      await expect(scm.mergePR(pr, undefined, "abc123")).rejects.toThrow(
+        "head commit changed",
+      );
+      expect(ghMock).toHaveBeenCalledWith(
+        expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
+        [
+          "pr",
+          "merge",
+          "42",
+          "--repo",
+          "acme/repo",
+          "--squash",
+          "--match-head-commit",
+          "abc123",
+          "--delete-branch",
+        ],
+        expect.any(Object),
+      );
+    });
   });
 
   // ---- closePR -----------------------------------------------------------
