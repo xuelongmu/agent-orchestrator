@@ -602,12 +602,143 @@ func TestSCMObservationUsesPRHeadWhenCIHeadMissing(t *testing.T) {
 func TestPRObservation_MergeConflictNudgesAgent(t *testing.T) {
 	m, st, msg := newManager()
 	st.sessions["mer-1"] = working("mer-1")
-	o := ports.PRObservation{Fetched: true, URL: "pr1", Mergeability: domain.MergeConflicting}
+	o := ports.PRObservation{
+		Fetched: true, URL: "pr1", Number: 7, Title: "sync\x1b[2Jme",
+		HeadSHA: "head-1\x1b[31m", SourceBranch: "feature/sync", TargetBranch: "release/1.0\x1b[2J",
+		Mergeability: domain.MergeConflicting,
+	}
 	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
 		t.Fatal(err)
 	}
 	if len(msg.msgs) != 1 || !strings.Contains(msg.msgs[0], "merge conflicts") {
 		t.Fatalf("want merge-conflict nudge, got %v", msg.msgs)
+	}
+	for _, want := range []string{"PR #7", "head-1[31m", "release/1.0[2J", "PR: pr1"} {
+		if !strings.Contains(msg.msgs[0], want) {
+			t.Fatalf("merge-conflict nudge missing %q: %q", want, msg.msgs[0])
+		}
+	}
+	if strings.Contains(msg.msgs[0], "\x1b") {
+		t.Fatalf("merge-conflict nudge contains terminal escape bytes: %q", msg.msgs[0])
+	}
+}
+
+func TestPRObservation_MergeConflictRequiresExactHead(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	if err := m.ApplyPRObservation(ctx, "mer-1", ports.PRObservation{
+		Fetched: true, URL: "pr1", Mergeability: domain.MergeConflicting,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 || st.signatures["pr1"] != "" {
+		t.Fatalf("headless conflict must fail closed: messages=%v signature=%q", msg.msgs, st.signatures["pr1"])
+	}
+}
+
+func TestPRObservation_MergeConflictDedupsPerHeadAcrossRestart(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	o := ports.PRObservation{
+		Fetched: true, URL: "pr1", HeadSHA: "head-1", TargetBranch: "main",
+		Mergeability: domain.MergeConflicting,
+	}
+	first := &fakeMessenger{}
+	if err := New(st, first).ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(st, first).ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.msgs) != 1 {
+		t.Fatalf("same exact head re-dispatched across restart: %v", first.msgs)
+	}
+
+	o.HeadSHA = "head-2"
+	if err := New(st, first).ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.msgs) != 2 {
+		t.Fatalf("new conflicting head did not get one fresh dispatch: %v", first.msgs)
+	}
+}
+
+func TestPRObservation_MergeConflictRecoveryResetsSameHead(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	o := ports.PRObservation{
+		Fetched: true, URL: "pr1", HeadSHA: "head-1", TargetBranch: "main",
+		Mergeability: domain.MergeConflicting,
+	}
+	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	// UNKNOWN is a transient provider recompute, not proof that conflicts
+	// recovered, so it must not reopen the same exact-head dispatch budget.
+	o.Mergeability = domain.MergeUnknown
+	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	o.Mergeability = domain.MergeConflicting
+	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("transient unknown mergeability reopened conflict episode: %v", msg.msgs)
+	}
+	o.Mergeability = domain.MergeMergeable
+	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	m = New(st, msg) // recovery reset must survive a daemon restart
+	o.Mergeability = domain.MergeConflicting
+	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 2 {
+		t.Fatalf("same head must dispatch again after a confirmed recovery: %v", msg.msgs)
+	}
+}
+
+func TestSCMObservation_MergeConflictCarriesExactPRHead(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	o := ports.SCMObservation{
+		Fetched: true,
+		PR: ports.SCMPRObservation{
+			URL: "pr1", Number: 9, HeadSHA: "provider-head", TargetBranch: "develop",
+		},
+		Mergeability: ports.SCMMergeabilityObservation{State: string(domain.MergeConflicting)},
+	}
+	if err := m.ApplySCMObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 || !strings.Contains(msg.msgs[0], "Exact head: provider-head") {
+		t.Fatalf("SCM conflict dispatch was not bound to provider head: %v", msg.msgs)
+	}
+}
+
+func TestPRObservation_MergeConflictWaitsForWorkableSession(t *testing.T) {
+	m, st, msg := newManager()
+	rec := working("mer-1")
+	rec.Activity.State = domain.ActivityWaitingInput
+	st.sessions["mer-1"] = rec
+	o := ports.PRObservation{
+		Fetched: true, URL: "pr1", HeadSHA: "head-1", TargetBranch: "main",
+		Mergeability: domain.MergeConflicting,
+	}
+	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 || st.signatures["pr1"] != "" {
+		t.Fatalf("waiting-input session consumed conflict dispatch: messages=%v signature=%q", msg.msgs, st.signatures["pr1"])
+	}
+	st.sessions["mer-1"] = working("mer-1")
+	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("conflict did not dispatch after session became workable: %v", msg.msgs)
 	}
 }
 
@@ -813,7 +944,7 @@ func TestPRObservation_StackedChildConflictSuppressed(t *testing.T) {
 		{URL: "parent", SourceBranch: "ao/x", TargetBranch: "main"},
 		{URL: "child", SourceBranch: "ao/x/auth", TargetBranch: "ao/x"},
 	}
-	o := ports.PRObservation{Fetched: true, URL: "child", Mergeability: domain.MergeConflicting}
+	o := ports.PRObservation{Fetched: true, URL: "child", HeadSHA: "child-head", Mergeability: domain.MergeConflicting}
 	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
 		t.Fatal(err)
 	}
@@ -831,7 +962,7 @@ func TestPRObservation_BottomOfStackConflictNudges(t *testing.T) {
 		{URL: "parent", SourceBranch: "ao/x", TargetBranch: "main"},
 		{URL: "child", SourceBranch: "ao/x/auth", TargetBranch: "ao/x"},
 	}
-	o := ports.PRObservation{Fetched: true, URL: "parent", Mergeability: domain.MergeConflicting}
+	o := ports.PRObservation{Fetched: true, URL: "parent", HeadSHA: "parent-head", TargetBranch: "main", Mergeability: domain.MergeConflicting}
 	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
 		t.Fatal(err)
 	}
@@ -1275,7 +1406,7 @@ func TestApplyTrackerFacts_TerminatedSessionDoesNotRefireOrNudge(t *testing.T) {
 func TestPRObservation_RetriesAfterMessengerFailure(t *testing.T) {
 	m, st, msg := newManager()
 	st.sessions["mer-1"] = working("mer-1")
-	o := ports.PRObservation{Fetched: true, URL: "pr1", Mergeability: domain.MergeConflicting}
+	o := ports.PRObservation{Fetched: true, URL: "pr1", HeadSHA: "head-1", TargetBranch: "main", Mergeability: domain.MergeConflicting}
 	msg.err = errors.New("temporary send failure")
 	if err := m.ApplyPRObservation(ctx, "mer-1", o); err == nil {
 		t.Fatal("want send error")

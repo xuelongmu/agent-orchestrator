@@ -27,6 +27,9 @@ type PRObservation struct {
 	Title        string
 	SourceBranch string
 	TargetBranch string
+	// HeadSHA binds lifecycle reactions to the exact provider-observed PR head.
+	// Empty means the observation is not safe for head-specific dispatch.
+	HeadSHA      string
 	Draft        bool
 	Merged       bool
 	Closed       bool
