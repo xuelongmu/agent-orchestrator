@@ -59,11 +59,12 @@ type Projects interface {
 
 // Deps wires the engine.
 type Deps struct {
-	Store    Store
-	Sessions Sessions
-	PRs      PRs
-	Projects Projects
-	Launcher Launcher
+	Store           Store
+	Sessions        Sessions
+	PRs             PRs
+	Projects        Projects
+	Launcher        Launcher
+	RoundCapHandoff RoundCapHandoff
 
 	// Clock and NewID are injectable for deterministic tests.
 	Clock func() time.Time
@@ -72,13 +73,14 @@ type Deps struct {
 
 // Engine is the core code-review engine.
 type Engine struct {
-	store    Store
-	sessions Sessions
-	prs      PRs
-	projects Projects
-	launcher Launcher
-	clock    func() time.Time
-	newID    func() string
+	store           Store
+	sessions        Sessions
+	prs             PRs
+	projects        Projects
+	launcher        Launcher
+	roundCapHandoff RoundCapHandoff
+	clock           func() time.Time
+	newID           func() string
 
 	// triggerMu guards triggerLocks; triggerLocks holds one mutex per worker
 	// session so concurrent Trigger calls for the same worker serialise (see
@@ -98,14 +100,15 @@ func New(d Deps) *Engine {
 		newID = uuid.NewString
 	}
 	return &Engine{
-		store:        d.Store,
-		sessions:     d.Sessions,
-		prs:          d.PRs,
-		projects:     d.Projects,
-		launcher:     d.Launcher,
-		clock:        clock,
-		newID:        newID,
-		triggerLocks: make(map[domain.SessionID]*sync.Mutex),
+		store:           d.Store,
+		sessions:        d.Sessions,
+		prs:             d.PRs,
+		projects:        d.Projects,
+		launcher:        d.Launcher,
+		roundCapHandoff: d.RoundCapHandoff,
+		clock:           clock,
+		newID:           newID,
+		triggerLocks:    make(map[domain.SessionID]*sync.Mutex),
 	}
 }
 

@@ -14,6 +14,13 @@ import (
 // review/fix loop. Manual review remains available after the coordinator stops.
 const MaxAutomaticReviewRounds = 6
 
+// RoundCapHandoff owns the human notification and needs-input latch after the
+// automatic review budget is exhausted. Returning an error keeps the current
+// SCM snapshot unacknowledged so delivery is retried.
+type RoundCapHandoff interface {
+	ApplyReviewRoundCapHandoff(ctx stdctx.Context, workerID domain.SessionID, obs ports.SCMObservation, round int) error
+}
+
 // Automatic reviewer launch failures are retried from durable review_run
 // timestamps. The exponential delay prevents a broken harness from being
 // relaunched every SCM poll, while the cap guarantees eventual retry cadence.
@@ -79,6 +86,11 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 		}
 	}
 	if round >= MaxAutomaticReviewRounds {
+		if e.roundCapHandoff != nil {
+			if err := e.roundCapHandoff.ApplyReviewRoundCapHandoff(ctx, workerID, obs, round); err != nil {
+				return CoordinateResult{}, err
+			}
+		}
 		return CoordinateResult{Outcome: CoordinateExhausted, Round: round}, nil
 	}
 
