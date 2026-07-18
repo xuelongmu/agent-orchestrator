@@ -1818,6 +1818,162 @@ func TestSCMObservation_PendingSubmitHandsOffOnceWithoutSpendingNudgeBudget(t *t
 	}
 }
 
+func TestPRObservation_IdleReviewSendFailureHandsOffOnceAcrossRestart(t *testing.T) {
+	st := newFakeStore()
+	sink := &fakeNotificationSink{}
+	msg := &fakeMessenger{err: errors.New("pane unavailable")}
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	rec := working("mer-1")
+	rec.DisplayName = "review worker"
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	st.sessions[rec.ID] = rec
+	o := ports.PRObservation{
+		Fetched: true,
+		URL:     "https://github.com/o/r/pull/1",
+		Number:  1,
+		Title:   "fix review feedback",
+		Review:  domain.ReviewChangesRequest,
+		Comments: []ports.PRCommentObservation{{
+			ID: "c1", ThreadID: "t1", Author: "reviewer", Body: "fix this",
+		}},
+	}
+
+	m := New(st, msg, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	if err := m.ApplyPRObservation(ctx, rec.ID, o); err == nil {
+		t.Fatal("first review send error = nil, want failed agent delivery")
+	}
+	// Restart while the same agent delivery is still failing. The durable human
+	// handoff must suppress duplicate notifications without turning the failed
+	// send into delivery proof.
+	m = New(st, msg, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now.Add(time.Minute) }
+	if err := m.ApplyPRObservation(ctx, rec.ID, o); err == nil {
+		t.Fatal("replayed review send error = nil, want failed agent delivery")
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("human handoff intents = %d, want exactly 1: %+v", len(sink.intents), sink.intents)
+	}
+	if got := sink.intents[0]; got.Type != domain.NotificationNeedsInput || got.PRURL != o.URL {
+		t.Fatalf("handoff = %+v, want needs-input notification for %s", got, o.URL)
+	}
+	var payload reactionPayload
+	if err := json.Unmarshal([]byte(st.signatures[o.URL]), &payload); err != nil {
+		t.Fatalf("decode reaction payload: %v", err)
+	}
+	if got := payload.Seen["review:"+o.URL]; got != "" {
+		t.Fatalf("failed review send recorded as delivered: %q", got)
+	}
+	if len(payload.Handoffs) != 1 {
+		t.Fatalf("durable handoffs = %+v, want one send-failure handoff", payload.Handoffs)
+	}
+	for _, handoff := range payload.Handoffs {
+		if handoff.Outcome != humanHandoffNotified || handoff.Reason != reviewNudgeSendFailed {
+			t.Fatalf("handoff = %+v, want notified/%s", handoff, reviewNudgeSendFailed)
+		}
+	}
+}
+
+func TestSCMReviewFetchFailureHandsOffObservedOverlayWithoutMutatingDeliveryProof(t *testing.T) {
+	st := newFakeStore()
+	sink := &fakeNotificationSink{}
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	st.sessions[rec.ID] = rec
+	prURL := "https://github.com/o/r/pull/1"
+	obs := ports.SCMObservation{
+		Fetched:  true,
+		Provider: "github",
+		Repo:     "o/r",
+		PR:       ports.SCMPRObservation{URL: prURL, Number: 1, Title: "review overlay"},
+		Review:   ports.SCMReviewObservation{Decision: string(domain.ReviewChangesRequest)},
+	}
+
+	// A durable escalation/handoff with no Seen review signature is explicitly
+	// undelivered. It must not become agent-delivery proof after restart, but the
+	// observed idle review overlay still needs its own human fetch-failure fallback.
+	undelivered := reactionPayload{Handoffs: map[string]humanHandoffOutcome{
+		"review-handoff:" + prURL + ":round-cap": {Outcome: humanHandoffNotified, Reason: reviewRoundCapNotificationFailed},
+	}}
+	raw, err := json.Marshal(undelivered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.signatures[prURL] = string(raw)
+	m := New(st, nil, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	if err := m.ApplySCMReviewFetchFailure(ctx, rec.ID, obs); err != nil {
+		t.Fatalf("undelivered fetch fallback: %v", err)
+	}
+	m = New(st, nil, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now.Add(time.Minute) }
+	if err := m.ApplySCMReviewFetchFailure(ctx, rec.ID, obs); err != nil {
+		t.Fatalf("replayed undelivered fetch fallback: %v", err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("observed-overlay fetch fallback intents = %d, want exactly 1: %+v", len(sink.intents), sink.intents)
+	}
+	var afterUndelivered reactionPayload
+	if err := json.Unmarshal([]byte(st.signatures[prURL]), &afterUndelivered); err != nil {
+		t.Fatalf("decode undelivered fallback: %v", err)
+	}
+	if got := afterUndelivered.Seen["review:"+prURL]; got != "" {
+		t.Fatalf("escalated-undelivered state became agent delivery proof: %q", got)
+	}
+
+	// Once a real review delivery signature is present, the same observed overlay
+	// is already covered by the durable fetch-failure handoff and must not notify
+	// again or rewrite that delivery proof.
+	delivered := reactionPayload{
+		Seen:     map[string]string{"review:" + prURL: "thread-c1"},
+		Handoffs: afterUndelivered.Handoffs,
+	}
+	raw, err = json.Marshal(delivered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.signatures[prURL] = string(raw)
+	m = New(st, nil, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	if err := m.ApplySCMReviewFetchFailure(ctx, rec.ID, obs); err != nil {
+		t.Fatalf("delivered fetch fallback: %v", err)
+	}
+	m = New(st, nil, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now.Add(time.Minute) }
+	if err := m.ApplySCMReviewFetchFailure(ctx, rec.ID, obs); err != nil {
+		t.Fatalf("replayed delivered fetch fallback: %v", err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("fetch-failure handoff intents = %d, want still exactly 1: %+v", len(sink.intents), sink.intents)
+	}
+	var persisted reactionPayload
+	if err := json.Unmarshal([]byte(st.signatures[prURL]), &persisted); err != nil {
+		t.Fatalf("decode persisted handoff: %v", err)
+	}
+	if got := persisted.Seen["review:"+prURL]; got != "thread-c1" {
+		t.Fatalf("fetch fallback mutated agent delivery proof: %q", got)
+	}
+
+	// A genuinely clean current pipeline must not be re-alerted from that stale
+	// Seen value. Current/local overlay state, not historical delivery, owns the
+	// fetch-failure fallback decision.
+	clean := obs
+	clean.PR.HeadSHA = "sha-clean"
+	clean.Review.HeadSHA = "sha-clean"
+	clean.Review.Decision = string(domain.ReviewNone)
+	clean.Mergeability.State = string(domain.MergeUnknown)
+	clean.CI.Summary = string(domain.CIPassing)
+	m = New(st, nil, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now.Add(2 * time.Minute) }
+	if err := m.ApplySCMReviewFetchFailure(ctx, rec.ID, clean); err != nil {
+		t.Fatalf("clean pipeline fetch failure: %v", err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("stale Seen re-alerted a clean current pipeline: %+v", sink.intents)
+	}
+}
+
 func TestPRObservation_NudgesSuppressedWhileBlocked(t *testing.T) {
 	// A blocked session must not receive automated CI/review nudges: injected
 	// text could interact with the pending permission dialog.

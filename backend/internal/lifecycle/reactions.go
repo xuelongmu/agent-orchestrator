@@ -23,6 +23,8 @@ const mergeConflictMaxNudge = 1
 
 const reviewRoundCapNotificationFailed = "review-round-cap-notification-failed"
 const suppressedNudgeNotificationFailed = "suppressed-nudge-notification-failed"
+const reviewNudgeSendFailed = "review-nudge-send-failed"
+const reviewFetchFailed = "review-fetch-failed"
 
 type humanHandoffOutcomeKind string
 
@@ -404,6 +406,52 @@ func (m *Manager) resetMergeConflictNudges(ctx context.Context, prURL, keepKey s
 		return nil
 	}
 	return m.persistPRSignaturesLocked(ctx, prURL)
+}
+
+// ApplySCMReviewFetchFailure handles the one SCM failure that can otherwise
+// leave an idle PR overlay silent forever. The handoff identity comes from the
+// observed head/review pipeline state, not agent-delivery proof: a fetch failure
+// itself needs a human fallback even when the prior review reaction escalated
+// without reaching the agent. Handoffs and agent-delivery signatures remain
+// separate facts so a daemon restart cannot reinterpret that escalation as work
+// the agent received.
+func (m *Manager) ApplySCMReviewFetchFailure(ctx context.Context, id domain.SessionID, o ports.SCMObservation) error {
+	prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
+	if prURL == "" || o.PR.Merged || o.PR.Closed {
+		return nil
+	}
+	m.react.mu.Lock()
+	defer m.react.mu.Unlock()
+	if !m.react.loaded[prURL] {
+		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+			return err
+		}
+		m.react.loaded[prURL] = true
+	}
+	failureSig := reviewFetchFailureSignature(o)
+	if failureSig == "" {
+		return nil
+	}
+	rec, eligible, err := m.idleReviewFailureSession(ctx, id)
+	if err != nil || !eligible {
+		return err
+	}
+	return m.deliverReviewFailureHandoffLocked(ctx, rec, o, "review:"+prURL, failureSig, reviewFetchFailed)
+}
+
+// reviewFetchFailureSignature is the durable identity of an idle PR overlay
+// whose review threads could not be refreshed. It deliberately excludes Seen:
+// notification dedup must not promote an escalation hash into agent-delivery
+// proof. A changed head or pipeline decision opens a new failure episode.
+func reviewFetchFailureSignature(o ports.SCMObservation) string {
+	head := firstSCMNonEmpty(o.Review.HeadSHA, o.PR.HeadSHA)
+	decision := domain.ReviewDecision(o.Review.Decision)
+	overlay := decision == domain.ReviewChangesRequest || decision == domain.ReviewRequired || decision == domain.ReviewApproved ||
+		domain.Mergeability(o.Mergeability.State) == domain.MergeMergeable || domain.CIState(o.CI.Summary) == domain.CIFailing
+	if !overlay {
+		return ""
+	}
+	return strings.Join([]string{head, string(decision), o.Mergeability.State, o.CI.Summary}, "\x00")
 }
 
 // cleanupMergedSession runs the resource-owning session manager before the
@@ -1019,6 +1067,20 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 		if outcome != sessionguard.Sent {
 			return sendOnceSuppressed, err
 		}
+		// A review nudge for an idle PR overlay has no separate stuck-state
+		// transition to alert the user. Surface a durable, one-time fallback while
+		// leaving the failed send unaccounted so the agent delivery may retry.
+		if key == "review:"+prURL {
+			rec, eligible, readErr := m.idleReviewFailureSession(ctx, id)
+			if readErr != nil {
+				return sendOnceAccounted, errors.Join(err, readErr)
+			}
+			if eligible {
+				obs := ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: prURL}}
+				handoffErr := m.deliverReviewFailureHandoffLocked(ctx, rec, obs, key, sig, reviewNudgeSendFailed)
+				return sendOnceAccounted, errors.Join(err, handoffErr)
+			}
+		}
 		return sendOnceAccounted, err
 	}
 	if outcome != sessionguard.Sent {
@@ -1043,6 +1105,49 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 		}
 	}
 	return sendOnceAccounted, nil
+}
+
+// idleReviewFailureSession is the shared eligibility gate for broken review
+// nudge/fetch paths. PR pipeline status overlays activity in the UI, so only an
+// idle agent beyond the normal recent-activity window needs this additional
+// fallback. Active, terminated, and already-user-owned sessions keep their
+// existing behavior.
+func (m *Manager) idleReviewFailureSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return rec, false, err
+	}
+	if rec.IsTerminated || rec.Activity.State != domain.ActivityIdle {
+		return rec, false, nil
+	}
+	return rec, m.clock().Sub(rec.Activity.LastActivityAt) >= m.window, nil
+}
+
+func (m *Manager) deliverReviewFailureHandoffLocked(ctx context.Context, rec domain.SessionRecord, o ports.SCMObservation, key, sig, reason string) error {
+	prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
+	sum := sha256.Sum256([]byte(reason + "\x00" + key + "\x00" + sig))
+	handoffKey := fmt.Sprintf("review-failure:%s:%x", prURL, sum)
+	body := "Pull request review feedback could not be delivered to the idle agent. Open the pull request and review the outstanding feedback."
+	if reason == reviewFetchFailed {
+		body = "Pull request review feedback could not be refreshed while the agent is idle. Open the pull request and verify the outstanding review threads."
+	}
+	intent := ports.NotificationIntent{
+		Type:               domain.NotificationNeedsInput,
+		SessionID:          rec.ID,
+		ProjectID:          rec.ProjectID,
+		PRURL:              prURL,
+		CreatedAt:          m.clock(),
+		TitleOverride:      "PR review feedback needs attention",
+		BodyOverride:       body,
+		SessionDisplayName: rec.DisplayName,
+		PRNumber:           o.PR.Number,
+		PRTitle:            o.PR.Title,
+		PRSourceBranch:     o.PR.SourceBranch,
+		PRTargetBranch:     o.PR.TargetBranch,
+		Provider:           o.Provider,
+		Repo:               o.Repo,
+	}
+	return m.deliverHumanHandoffLocked(ctx, prURL, handoffKey, reason, intent, nil)
 }
 
 // handoffSuppressedPendingNudgeLocked surfaces a PR condition that could not

@@ -285,9 +285,10 @@ func (p *fakeProvider) RerunFailedCheck(_ context.Context, _ ports.SCMRepo, _ po
 }
 
 type fakeLifecycle struct {
-	observed []ports.SCMObservation
-	retried  []domain.SessionID
-	err      error
+	observed            []ports.SCMObservation
+	reviewFetchFailures []ports.SCMObservation
+	retried             []domain.SessionID
+	err                 error
 }
 
 type fakeReviewCoordinator struct {
@@ -305,6 +306,14 @@ func (l *fakeLifecycle) ApplySCMObservation(_ context.Context, _ domain.SessionI
 		return l.err
 	}
 	l.observed = append(l.observed, obs)
+	return nil
+}
+
+func (l *fakeLifecycle) ApplySCMReviewFetchFailure(_ context.Context, _ domain.SessionID, obs ports.SCMObservation) error {
+	if l.err != nil {
+		return l.err
+	}
+	l.reviewFetchFailures = append(l.reviewFetchFailures, obs)
 	return nil
 }
 
@@ -1773,6 +1782,9 @@ func TestPoll_ReviewFetchFailureDoesNotUpdateReviewDecision(t *testing.T) {
 	}
 	if len(store.writes) != 0 || len(lc.observed) != 0 {
 		t.Fatalf("review fetch failure should not persist/notify stale review data: writes=%#v lifecycle=%#v", store.writes, lc.observed)
+	}
+	if len(lc.reviewFetchFailures) != 1 || lc.reviewFetchFailures[0].PR.URL != local.URL {
+		t.Fatalf("review fetch failure fallback = %#v, want one lifecycle signal for %s", lc.reviewFetchFailures, local.URL)
 	}
 	if !obs.Cache.ReviewRefreshFailed[prKey(testRepo, 1)] {
 		t.Fatalf("review fetch failure was not marked for retry")

@@ -68,6 +68,7 @@ type Store interface {
 // Lifecycle is the provider-neutral lifecycle notification sink.
 type Lifecycle interface {
 	ApplySCMObservation(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
+	ApplySCMReviewFetchFailure(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
 	RetryMergedCleanup(ctx context.Context, sessionID domain.SessionID) error
 }
 
@@ -1096,6 +1097,23 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		if err != nil {
 			o.logger.Error("scm observer: review refresh failed", "pr", s.known.URL, "err", err)
 			o.cacheSetBool(o.Cache.ReviewRefreshFailed, &o.Cache.reviewFailedOrder, pkey, true)
+			failureObs := obs
+			if !hasObs {
+				failureObs = observationFromLocal(s.repo, s.known, nil)
+			}
+			// A fast PR snapshot may omit review fields precisely because the
+			// slower thread refresh failed. Carry the last durable decision/head
+			// into the failure signal so lifecycle can identify the idle overlay
+			// without treating stale threads as a successful refresh.
+			failureObs.PR.HeadSHA = firstNonEmpty(failureObs.PR.HeadSHA, s.known.HeadSHA)
+			failureObs.Review.HeadSHA = firstNonEmpty(failureObs.Review.HeadSHA, failureObs.PR.HeadSHA)
+			failureObs.Review.Decision = firstNonEmpty(failureObs.Review.Decision, string(s.known.Review))
+			failureObs.ObservedAt = now
+			if o.lifecycle != nil {
+				if fallbackErr := o.lifecycle.ApplySCMReviewFetchFailure(ctx, s.session.ID, failureObs); fallbackErr != nil {
+					o.logger.Error("scm observer: review refresh fallback failed", "session", s.session.ID, "pr", s.known.URL, "err", fallbackErr)
+				}
+			}
 			if hasObs {
 				obs.Review.Decision = string(s.known.Review)
 				obs.Review.Threads = nil
