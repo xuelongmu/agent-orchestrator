@@ -91,13 +91,25 @@ type TrackerIntakeConfig struct {
 	// Assignee narrows eligible issues to one assignee. Provider-specific values
 	// such as "*" are passed through unchanged.
 	Assignee string `json:"assignee,omitempty"`
+	// MaxConcurrent caps non-terminated worker sessions per project. Zero uses
+	// the safe default of three; intake never spawns beyond available slots.
+	MaxConcurrent int `json:"maxConcurrent,omitempty"`
 }
+
+// DefaultTrackerIntakeMaxConcurrent bounds autonomous issue intake unless a
+// project explicitly chooses another positive limit.
+const DefaultTrackerIntakeMaxConcurrent = 3
 
 // WithDefaults fills the provider only when intake is enabled. Disabled intake
 // leaves the zero value untouched so empty project configs still store as NULL.
 func (c TrackerIntakeConfig) WithDefaults() TrackerIntakeConfig {
-	if c.Enabled && c.Provider == "" {
-		c.Provider = TrackerProviderGitHub
+	if c.Enabled {
+		if c.Provider == "" {
+			c.Provider = TrackerProviderGitHub
+		}
+		if c.MaxConcurrent == 0 {
+			c.MaxConcurrent = DefaultTrackerIntakeMaxConcurrent
+		}
 	}
 	return c
 }
@@ -119,6 +131,9 @@ func (c TrackerIntakeConfig) Validate() error {
 	}
 	if strings.TrimSpace(c.Assignee) == "" {
 		return fmt.Errorf("trackerIntake: assignee is required when enabled")
+	}
+	if c.MaxConcurrent <= 0 {
+		return fmt.Errorf("trackerIntake.maxConcurrent: must be greater than zero")
 	}
 	return nil
 }
