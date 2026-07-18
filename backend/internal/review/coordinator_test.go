@@ -148,6 +148,54 @@ func TestCoordinateStopsOnCurrentHeadHumanApproval(t *testing.T) {
 	}
 }
 
+func TestCoordinateRetriesFailedOrCancelledLaunchAfterDurableBackoff(t *testing.T) {
+	for _, status := range []domain.ReviewRunStatus{domain.ReviewRunFailed, domain.ReviewRunCancelled} {
+		t.Run(string(status), func(t *testing.T) {
+			failedAt := time.Unix(100, 0).UTC()
+			store := &fakeStore{runs: []domain.ReviewRun{
+				reviewRun("run-1", "sha1", status, domain.VerdictNone, "reviewer launch stopped"),
+			}}
+			store.runs[0].CreatedAt = failedAt
+			launcher := &fakeLauncher{handle: "review-mer-1"}
+			now := failedAt.Add(AutomaticReviewRetryBaseDelay - time.Second)
+			newEngine := func() *Engine {
+				ids := 0
+				return New(Deps{
+					Store: store, Sessions: fakeSessions{rec: liveWorker(), ok: true}, PRs: prAt("sha1"),
+					Projects: fakeProjects{}, Launcher: launcher,
+					Clock: func() time.Time { return now },
+					NewID: func() string { ids++; return fmt.Sprintf("retry-%d", ids) },
+				})
+			}
+
+			got, err := newEngine().Coordinate(context.Background(), "mer-1", reviewObservation("sha1"))
+			if err != nil {
+				t.Fatalf("Coordinate before retry window: %v", err)
+			}
+			if got.Outcome != CoordinateWaiting || got.Round != 1 || launcher.spawnCount != 0 || len(store.runs) != 1 {
+				t.Fatalf("before retry window = %+v launcher=%+v runs=%+v", got, launcher, store.runs)
+			}
+
+			// The failed run's timestamp is the durable retry cursor. A fresh engine
+			// over the same store retries once the window has elapsed.
+			now = failedAt.Add(AutomaticReviewRetryBaseDelay)
+			got, err = newEngine().Coordinate(context.Background(), "mer-1", reviewObservation("sha1"))
+			if err != nil {
+				t.Fatalf("Coordinate after retry window: %v", err)
+			}
+			if got.Outcome != CoordinateStarted || got.Round != 1 || launcher.spawnCount != 1 || len(store.runs) != 2 {
+				t.Fatalf("after retry window = %+v launcher=%+v runs=%+v", got, launcher, store.runs)
+			}
+		})
+	}
+}
+
+func TestAutomaticReviewRetryBackoffIsBounded(t *testing.T) {
+	if got := automaticReviewRetryDelay(100); got != AutomaticReviewRetryMaxDelay {
+		t.Fatalf("retry delay = %s, want bounded maximum %s", got, AutomaticReviewRetryMaxDelay)
+	}
+}
+
 func TestCoordinateDoesNotTrustStaleApprovalOrReviewSnapshot(t *testing.T) {
 	t.Run("stale approval does not stop current head review", func(t *testing.T) {
 		store := &fakeStore{}

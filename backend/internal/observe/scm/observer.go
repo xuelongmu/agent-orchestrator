@@ -1018,7 +1018,11 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		if hasObs {
 			currentHeadSHA = obs.PR.HeadSHA
 		}
-		if !fastObservationNeedsReviewSnapshot(obs) &&
+		needsFastSnapshot := fastObservationNeedsReviewSnapshot(obs)
+		if o.reviewCoordinator != nil {
+			needsFastSnapshot = needsFastSnapshot || coordinationObservationNeedsReviewSnapshot(obs)
+		}
+		if !needsFastSnapshot &&
 			!o.needsReviewRefresh(pkey, s.known, decision, currentHeadSHA, hasObs, now) {
 			continue
 		}
@@ -1072,6 +1076,13 @@ func (o *Observer) needsReviewRefresh(key string, local domain.PullRequest, deci
 	if hasObs && currentHeadSHA != "" && local.HeadSHA != "" && currentHeadSHA != local.HeadSHA {
 		return true
 	}
+	if o.reviewCoordinator != nil && !hasObs && local.CI == domain.CIPassing && local.HeadSHA != "" &&
+		!local.Draft && !local.Merged && !local.Closed {
+		last := o.Cache.LastReviewPollAt[key]
+		if last.IsZero() || now.Sub(last) >= o.reviewInterval {
+			return true
+		}
+	}
 	if decision == string(domain.ReviewChangesRequest) {
 		last := o.Cache.LastReviewPollAt[key]
 		return last.IsZero() || now.Sub(last) >= o.reviewInterval
@@ -1096,6 +1107,12 @@ func fastObservationNeedsReviewSnapshot(obs ports.SCMObservation) bool {
 	}
 	review := domain.ReviewDecision(obs.Review.Decision)
 	return review != domain.ReviewChangesRequest && review != domain.ReviewRequired
+}
+
+func coordinationObservationNeedsReviewSnapshot(obs ports.SCMObservation) bool {
+	return !obs.PR.Merged && !obs.PR.Closed && !obs.PR.Draft &&
+		obs.PR.HeadSHA != "" && obs.CI.HeadSHA == obs.PR.HeadSHA &&
+		domain.CIState(obs.CI.Summary) == domain.CIPassing
 }
 
 func (o *Observer) prepareForPersistence(obs ports.SCMObservation, local domain.PullRequest, opts persistenceOptions, now time.Time) ports.SCMObservation {
