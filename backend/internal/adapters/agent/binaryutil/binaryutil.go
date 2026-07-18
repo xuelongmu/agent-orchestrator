@@ -8,11 +8,11 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/hookutil"
+	"github.com/aoagents/agent-orchestrator/backend/internal/pathenv"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -107,7 +107,7 @@ func ResolveBinary(ctx context.Context, spec BinarySpec) (string, error) {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		if path, err := exec.LookPath(name); err == nil && path != "" {
+		if path, err := pathenv.LookPath(name); err == nil && path != "" {
 			return path, nil
 		}
 	}

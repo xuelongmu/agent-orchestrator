@@ -3086,6 +3086,22 @@ func pathPinManager(executable func() (string, error)) (*Manager, *fakeStore, *f
 	return m, st, rt, logBuf
 }
 
+func TestNewDefaultLookPathUsesSystemPathWhenPATHUnset(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX default system PATH")
+	}
+	t.Setenv("PATH", "")
+	m := New(Deps{})
+
+	got, err := m.lookPath("sh")
+	if err != nil {
+		t.Fatalf("default manager lookup with PATH unset: %v", err)
+	}
+	if got != "/usr/bin/sh" && got != "/bin/sh" {
+		t.Fatalf("default manager lookup = %q, want sh from /usr/bin or /bin", got)
+	}
+}
+
 // TestSpawnAndRestore_PinHookPATHToDaemonBinary covers the activity-tracking
 // fix: the spawned session's PATH must put the daemon executable's directory
 // first, so the bare `ao` in the workspace hook commands resolves to the

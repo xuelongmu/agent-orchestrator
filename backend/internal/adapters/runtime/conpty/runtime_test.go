@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -156,6 +157,32 @@ func TestCreate_RegistersSession(t *testing.T) {
 	}
 
 	hosts["sess-abc"].cleanup(t)
+}
+
+func TestCreatePreservesAbsoluteExecutableArgvAcrossWindowsShellSettings(t *testing.T) {
+	for _, shell := range []string{"powershell.exe", "cmd.exe"} {
+		t.Run(shell, func(t *testing.T) {
+			isolateRegistry(t)
+			t.Setenv("AO_SHELL", shell)
+			var got []string
+			rt := New(Options{Spawner: func(_ context.Context, _, _ string, argv []string, _ map[string]string) (string, int, error) {
+				got = append([]string(nil), argv...)
+				return "127.0.0.1:1", livePID(), nil
+			}})
+			want := []string{`C:\Program Files\Claude\claude.exe`, "--model", "opus"}
+			_, err := rt.Create(context.Background(), ports.RuntimeConfig{
+				SessionID:     domain.SessionID("sess-shell"),
+				WorkspacePath: `C:\work tree`,
+				Argv:          want,
+			})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("spawner argv = %#v, want %#v", got, want)
+			}
+		})
+	}
 }
 
 // TestCreate_DuplicateErrors verifies a second Create for the same session id fails.
