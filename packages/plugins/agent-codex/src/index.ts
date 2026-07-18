@@ -663,6 +663,21 @@ function createCodexAgent(): Agent {
       return "active";
     },
 
+    isInputPending(terminalOutput: string): boolean {
+      // Codex collapses a large multiline paste into placeholders while it
+      // remains in the editor. Compare positions so a historical placeholder
+      // does not hide newer, definitive active/queued turn UI.
+      const pastedAt = terminalOutput.lastIndexOf("[Pasted Content");
+      if (pastedAt < 0) return false;
+
+      const turnEvidenceAt = Math.max(
+        terminalOutput.lastIndexOf("Press up to edit queued messages"),
+        terminalOutput.lastIndexOf("esc to interrupt"),
+        terminalOutput.lastIndexOf("Working"),
+      );
+      return pastedAt > turnEvidenceAt;
+    },
+
     async getActivityState(
       session: Session,
       readyThresholdMs?: number,

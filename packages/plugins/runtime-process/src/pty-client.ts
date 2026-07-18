@@ -99,6 +99,10 @@ export function connectPtyHost(pipePath: string, timeoutMs = 3000): Promise<Sock
 const PTY_INPUT_CHUNK_CHARS = 512;
 const PTY_INPUT_CHUNK_DELAY_MS = 15;
 const PTY_INPUT_ENTER_DELAY_MS = 300;
+// Codex needs a longer quiet period to finish coalescing a multi-frame paste
+// before ConPTY delivers Enter as a distinct key event. A fixed 300 ms delay
+// proved insufficient for roughly 7 KB multiline prompts on live Windows.
+const PTY_LARGE_INPUT_ENTER_DELAY_MS = 1_000;
 
 function writeFrame(sock: Socket, frame: Buffer): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -152,7 +156,11 @@ export async function ptyHostSendMessage(pipePath: string, message: string): Pro
         }
         // Brief pause before Enter so the terminal processes the pasted text
         // as input rather than consuming \r as part of the paste itself.
-        await delay(PTY_INPUT_ENTER_DELAY_MS);
+        await delay(
+          message.length > PTY_INPUT_CHUNK_CHARS
+            ? PTY_LARGE_INPUT_ENTER_DELAY_MS
+            : PTY_INPUT_ENTER_DELAY_MS,
+        );
         await writeFrame(sock, encodeMessage(MSG_TERMINAL_INPUT, "\r"));
         finish();
       } catch (err) {

@@ -36,6 +36,7 @@ import {
   type ClaimPRResult,
   type KillOptions,
   type KillResult,
+  type SessionSendResult,
   type LifecycleKillReason,
   type OrchestratorConfig,
   type ProjectConfig,
@@ -3190,7 +3191,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     sessionId: SessionId,
     message: string,
     scopeProjectId?: string,
-  ): Promise<void> {
+  ): Promise<void | SessionSendResult> {
     const { raw, sessionsDir, project, projectId } = requireSessionRecord(sessionId, scopeProjectId);
 
     // ALL setup below is PRE-DELIVERY: agent selection, OpenCode discovery, and
@@ -3257,6 +3258,15 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         return agentPlugin.detectActivity(output);
       } catch {
         return null;
+      }
+    };
+
+    const hasPendingInput = (output: string): boolean => {
+      if (!output || !agentPlugin.isInputPending) return false;
+      try {
+        return agentPlugin.isInputPending(output);
+      } catch {
+        return false;
       }
     };
 
@@ -3450,7 +3460,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     // error text, is how the failure class is reported to the caller.
     let deliveryAttempted = false;
 
-    const sendWithConfirmation = async (session: Session): Promise<void> => {
+    const sendWithConfirmation = async (session: Session): Promise<void | SessionSendResult> => {
       const handle = session.runtimeHandle;
       if (!handle) {
         throw new Error(`Session ${sessionId} has no runtime handle`);
@@ -3459,6 +3469,8 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       const baselineOutput = await captureOutput(handle);
       const baselineActivity = detectActivityFromOutput(baselineOutput) ?? session.activity;
       const baselineUpdatedAt = await getOpenCodeSessionUpdatedAt();
+      let inputRecoveryAttempted = false;
+      let inputStillPending = false;
 
       deliveryAttempted = true;
       await runtimePlugin.sendMessage(handle, message);
@@ -3481,11 +3493,35 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           const output = await captureOutput(handle);
           const activity = detectActivityFromOutput(output) ?? session.activity;
           const updatedAt = await getOpenCodeSessionUpdatedAt();
+          const nativeDeliveryConfirmed =
+            baselineUpdatedAt !== undefined &&
+            updatedAt !== undefined &&
+            updatedAt > baselineUpdatedAt;
+          if (nativeDeliveryConfirmed) {
+            return;
+          }
+
+          // A Codex paste redraw is not a turn. Press Enter once without
+          // resending text, then require a later poll to show real progress.
+          if (hasPendingInput(output)) {
+            inputStillPending = true;
+            if (!inputRecoveryAttempted && runtimePlugin.submitInput) {
+              inputRecoveryAttempted = true;
+              try {
+                await runtimePlugin.submitInput(handle);
+              } catch {
+                // Confirmation remains best-effort after the delivery boundary.
+              }
+            }
+            continue;
+          }
+          inputStillPending = false;
+
+          if (hasQueuedMessage(output)) {
+            return;
+          }
+
           const delivered =
-            (baselineUpdatedAt !== undefined &&
-              updatedAt !== undefined &&
-              updatedAt > baselineUpdatedAt) ||
-            hasQueuedMessage(output) ||
             (output.length > 0 && output !== baselineOutput) ||
             (baselineActivity !== "active" && activity === "active") ||
             (baselineActivity !== "waiting_input" && activity === "waiting_input");
@@ -3496,6 +3532,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         }
       } catch {
         // Confirmation failed after delivery — fall through to soft success.
+      }
+
+      if (inputStillPending) {
+        return { status: "input_pending", recoveryAttempted: inputRecoveryAttempted };
       }
 
       // Message was already sent via runtimePlugin.sendMessage above — if we
@@ -3510,12 +3550,13 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     // retry-with-restore, etc.) emits a single `session.send_failed` event
     // (B16 — failure-only). Stage tag distinguishes which branch failed.
     let stage: "prepare" | "initial" | "restore_retry" = "prepare";
+    let sendResult: SessionSendResult | void = undefined;
     try {
       let prepared = await prepareSession();
 
       try {
         stage = "initial";
-        await sendWithConfirmation(prepared);
+        sendResult = await sendWithConfirmation(prepared);
       } catch (err) {
         const shouldRetryWithRestore =
           prepared.restoredAt === undefined && isRestorable(prepared);
@@ -3530,7 +3571,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         stage = "restore_retry";
         prepared = await prepareSession(true);
         try {
-          await sendWithConfirmation(prepared);
+          sendResult = await sendWithConfirmation(prepared);
         } catch (retryErr) {
           if (retryErr instanceof Error) {
             throw retryErr;
@@ -3562,6 +3603,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       }
       throw err;
     }
+    return sendResult;
   }
 
   async function claimPR(

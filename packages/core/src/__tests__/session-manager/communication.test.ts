@@ -55,6 +55,57 @@ describe("send", () => {
     expect(mockRuntime.sendMessage).toHaveBeenCalledWith(makeHandle("rt-1"), "Fix the CI failures");
   });
 
+  it("submits pasted Codex input without resending the message before confirming", async () => {
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp",
+      branch: "main",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: makeHandle("rt-1"),
+    });
+    vi.mocked(mockRuntime.getOutput)
+      .mockResolvedValueOnce("› ")
+      .mockResolvedValueOnce("› [Pasted Content 4534 chars][Pasted Content 2562 chars]")
+      .mockResolvedValueOnce("Working (esc to interrupt)");
+    mockAgent.isInputPending = vi.fn(
+      (output) => output.includes("[Pasted Content") && !output.includes("esc to interrupt"),
+    );
+    vi.mocked(mockAgent.detectActivity).mockReturnValue("active");
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await sm.send("app-1", "large multiline review context");
+
+    expect(mockRuntime.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mockRuntime.sendMessage).toHaveBeenCalledWith(
+      makeHandle("rt-1"),
+      "large multiline review context",
+    );
+    expect(mockRuntime.submitInput).toHaveBeenCalledTimes(1);
+    expect(mockRuntime.submitInput).toHaveBeenCalledWith(makeHandle("rt-1"));
+    expect(mockRuntime.getOutput).toHaveBeenCalledTimes(3);
+  });
+
+  it("reports input still pending without resending after Enter recovery", async () => {
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp",
+      branch: "main",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: makeHandle("rt-1"),
+    });
+    vi.mocked(mockRuntime.getOutput)
+      .mockResolvedValueOnce("› ")
+      .mockResolvedValue("› [Pasted Content 7096 chars]");
+    mockAgent.isInputPending = vi.fn((output) => output.includes("[Pasted Content"));
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    const result = await sm.send("app-1", "large multiline review context");
+
+    expect(result).toEqual({ status: "input_pending", recoveryAttempted: true });
+    expect(mockRuntime.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mockRuntime.submitInput).toHaveBeenCalledTimes(1);
+  });
+
   it("scopes every nested lookup and restore to the token's project, not the first id match", async () => {
     // Two projects hold the same session id. `other` is FIRST in config and alive;
     // the scoped target (`my-app`) is dead and needs a restore. A send scoped to

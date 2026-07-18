@@ -649,6 +649,25 @@ describe("detectActivity", () => {
   });
 });
 
+describe("isInputPending", () => {
+  const agent = create();
+
+  it("detects one or more pasted-content placeholders still at the prompt", () => {
+    expect(agent.isInputPending?.("› [Pasted Content 4534 chars][Pasted Content 2562 chars]")).toBe(
+      true,
+    );
+  });
+
+  it("does not treat newer active or queued turn UI as pending input", () => {
+    expect(
+      agent.isInputPending?.("› [Pasted Content 7096 chars]\nWorking (esc to interrupt)"),
+    ).toBe(false);
+    expect(
+      agent.isInputPending?.("› [Pasted Content 7096 chars]\nPress up to edit queued messages"),
+    ).toBe(false);
+  });
+});
+
 // =========================================================================
 // getActivityState
 // =========================================================================
