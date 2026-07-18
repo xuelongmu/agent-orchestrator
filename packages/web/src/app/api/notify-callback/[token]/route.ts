@@ -1,9 +1,9 @@
 import { type NextRequest } from "next/server";
 import { getServices } from "@/lib/services";
-import { validateIdentifier } from "@/lib/validation";
 import {
   ACTIVITY_STATE,
   SessionNotFoundError,
+  isValidSessionIdComponent,
   activeDecisionId,
   consumeDecision,
   getNotifyCallbackSecret,
@@ -198,8 +198,12 @@ function verifyRequest(
   }
 
   // The session id came from a token we signed, but validate its shape anyway
-  // before it reaches a shell-based runtime (defense in depth).
-  if (validateIdentifier(payload.sessionId, "sessionId")) {
+  // before it reaches a shell-based runtime (defense in depth). Validate against
+  // core's own session-ID contract — the same character set core enforces at
+  // creation, and length-unbounded — so a valid ID built from a long
+  // sessionPrefix is never rejected here (a generic 128-char identifier cap
+  // would 400 a session core can legitimately create). (#13 review)
+  if (!isValidSessionIdComponent(payload.sessionId)) {
     return {
       ok: false,
       response: htmlResponse(
@@ -341,6 +345,52 @@ export async function POST(
     // cannot slip in after a concurrent resolving action has consumed it.
     const decisionKey = `${projectId}:${sessionId}:${decisionId}`;
     return await serializeByDecision(decisionKey, async (): Promise<Response> => {
+      // Re-fetch and revalidate INSIDE the serialized section. The pending +
+      // identity checks above ran on a snapshot taken before this callback may
+      // have waited its turn behind another action for the same decision (a
+      // queued Approve/Kill behind an in-flight Nudge). While it waited the agent
+      // could have resumed (activity → active) or a newer report could have
+      // superseded the decision — so consume/isNudgeBlocked/send/kill must
+      // authorize against the CURRENT project-scoped session, not the stale
+      // snapshot, or a resolving action lands on already-resumed work. (#13 review)
+      const fresh = await sessionManager.get(sessionId, projectId);
+      const freshPending =
+        !!fresh &&
+        fresh.projectId === projectId &&
+        !isTerminalSession(fresh) &&
+        (fresh.lifecycle?.session.state === "needs_input" ||
+          fresh.activity === ACTIVITY_STATE.WAITING_INPUT);
+      const freshDecisionId = fresh ? activeDecisionId(fresh) : null;
+      if (!freshPending || freshDecisionId === null || freshDecisionId !== decisionId) {
+        recordApiObservation({
+          config,
+          method: "POST",
+          path: "/api/notify-callback/[token]",
+          correlationId,
+          startedAt,
+          outcome: "failure",
+          statusCode: 409,
+          projectId: resolvedProjectId,
+          sessionId,
+          reason: "decision no longer pending at dispatch",
+          data: { action },
+        });
+        recordActivityEvent({
+          projectId: resolvedProjectId,
+          sessionId,
+          source: "api",
+          kind: "api.notify_callback.stale",
+          level: "warn",
+          summary: `notification action "${action}" ignored — decision resolved or agent resumed before dispatch for session ${sessionId}`,
+          data: { action },
+        });
+        return htmlResponse(
+          409,
+          "Action no longer applies",
+          "This decision is no longer pending — it was already answered, or the session has finished or moved on, so no action was taken.",
+        );
+      }
+
       const consumes = isResolvingCallbackAction(action);
       if (!consumes && isNudgeBlocked(projectId, sessionId, decisionId)) {
         recordApiObservation({

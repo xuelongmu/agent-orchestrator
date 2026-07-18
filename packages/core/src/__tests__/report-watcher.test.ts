@@ -358,15 +358,15 @@ describe("reportActivationIdentity", () => {
     ({ state, timestamp }) as unknown as AgentReport;
 
   it("folds state and timestamp into the identity for a needs_input report", () => {
-    expect(reportActivationIdentity("agent_needs_input", report("needs_input", "T1"))).toBe(
-      "agent_needs_input:needs_input:T1",
+    expect(reportActivationIdentity("agent_needs_input", report("needs_input", "T1"), true)).toBe(
+      "agent_needs_input:needs_input:T1:answerable",
     );
   });
 
   it("folds state and timestamp into the identity for a needs_decision report", () => {
-    expect(reportActivationIdentity("agent_needs_input", report("needs_decision", "T1"))).toBe(
-      "agent_needs_input:needs_decision:T1",
-    );
+    expect(
+      reportActivationIdentity("agent_needs_input", report("needs_decision", "T1"), true),
+    ).toBe("agent_needs_input:needs_decision:T1:answerable");
   });
 
   it("changes when a SECOND needs_input report is written — the fix for dead buttons", () => {
@@ -374,19 +374,42 @@ describe("reportActivationIdentity", () => {
     // lifecycle manager treats the second as a new activation and re-fires the
     // notification. Sharing the bare trigger (the bug) would suppress the re-fire
     // and leave the human holding the buttons the second report's nonce invalidated.
-    const first = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"));
-    const second = reportActivationIdentity("agent_needs_input", report("needs_input", "T2"));
+    const first = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"), true);
+    const second = reportActivationIdentity("agent_needs_input", report("needs_input", "T2"), true);
     expect(first).not.toBe(second);
   });
 
+  it("changes when the SAME report becomes answerable — one actionable replacement", () => {
+    // The same report (same state + timestamp) transitioning from unanswerable
+    // (native still active, no controls) to answerable (waiting_input) must yield
+    // a DIFFERENT identity so the lifecycle manager re-fires exactly once with the
+    // now-valid buttons; staying answerable keeps the identity stable (no dup).
+    const unanswerable = reportActivationIdentity(
+      "agent_needs_input",
+      report("needs_input", "T1"),
+      false,
+    );
+    const answerable = reportActivationIdentity(
+      "agent_needs_input",
+      report("needs_input", "T1"),
+      true,
+    );
+    expect(unanswerable).not.toBe(answerable);
+    expect(answerable).toBe(
+      reportActivationIdentity("agent_needs_input", report("needs_input", "T1"), true),
+    );
+  });
+
   it("is stable across polls for the same report — no per-poll re-fire", () => {
-    const a = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"));
-    const b = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"));
+    const a = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"), true);
+    const b = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"), true);
     expect(a).toBe(b);
   });
 
   it("uses the bare trigger for a non-decision or absent report", () => {
-    expect(reportActivationIdentity("no_acknowledge", null)).toBe("no_acknowledge");
-    expect(reportActivationIdentity("stale_report", report("working", "T1"))).toBe("stale_report");
+    expect(reportActivationIdentity("no_acknowledge", null, false)).toBe("no_acknowledge");
+    expect(reportActivationIdentity("stale_report", report("working", "T1"), false)).toBe(
+      "stale_report",
+    );
   });
 });

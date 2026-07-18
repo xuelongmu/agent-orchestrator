@@ -1,5 +1,6 @@
 ---
 "@aoagents/ao-plugin-notifier-telegram": minor
+"@aoagents/ao-plugin-notifier-desktop": minor
 "@aoagents/ao-core": minor
 "@aoagents/ao-cli": minor
 "@aoagents/ao-web": minor

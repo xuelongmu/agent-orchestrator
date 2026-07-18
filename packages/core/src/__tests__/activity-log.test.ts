@@ -308,10 +308,48 @@ describe("recordTerminalActivity", () => {
     expect(lines).toHaveLength(1);
   });
 
-  it("always writes actionable states even if same", async () => {
+  it("appends an actionable state when the prompt trigger changes", async () => {
     const detect = () => "waiting_input" as ActivityState;
     await recordTerminalActivity(tmpDir, "prompt1", detect);
     await recordTerminalActivity(tmpDir, "prompt2", detect);
+
+    const { readFile: rf } = await import("node:fs/promises");
+    const content = await rf(getActivityLogPath(tmpDir), "utf-8");
+    const lines = content.trim().split("\n").filter(Boolean);
+    expect(lines).toHaveLength(2);
+  });
+
+  it("dedupes a repeated actionable observation of the SAME prompt", async () => {
+    // Same waiting_input state AND the same trigger text across polls is a
+    // repeated observation of one live prompt, not a new one — re-appending
+    // would advance the entry ts and retire a live decision (#13 review).
+    const detect = () => "waiting_input" as ActivityState;
+    await recordTerminalActivity(tmpDir, "line1\nline2\nApprove this? (y/n)", detect);
+    await recordTerminalActivity(tmpDir, "line1\nline2\nApprove this? (y/n)", detect);
+    await recordTerminalActivity(tmpDir, "line1\nline2\nApprove this? (y/n)", detect);
+
+    const { readFile: rf } = await import("node:fs/promises");
+    const content = await rf(getActivityLogPath(tmpDir), "utf-8");
+    const lines = content.trim().split("\n").filter(Boolean);
+    expect(lines).toHaveLength(1);
+  });
+
+  it("preserves the first observation's ts when the same prompt repeats", async () => {
+    const detect = () => "waiting_input" as ActivityState;
+    await recordTerminalActivity(tmpDir, "same prompt?", detect);
+    const first = await readLastActivityEntry(tmpDir);
+    // A later poll of the identical prompt must not move the boundary.
+    await recordTerminalActivity(tmpDir, "same prompt?", detect);
+    const second = await readLastActivityEntry(tmpDir);
+    expect(second!.entry.ts).toBe(first!.entry.ts);
+  });
+
+  it("appends when the actionable state changes even if it later returns", async () => {
+    let state: ActivityState = "waiting_input";
+    const detect = () => state;
+    await recordTerminalActivity(tmpDir, "prompt?", detect);
+    state = "blocked";
+    await recordTerminalActivity(tmpDir, "prompt?", detect);
 
     const { readFile: rf } = await import("node:fs/promises");
     const content = await rf(getActivityLogPath(tmpDir), "utf-8");

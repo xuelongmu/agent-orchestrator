@@ -256,7 +256,9 @@ async function sendMessage(
     }
   } catch (err) {
     if (controller.signal.aborted) {
-      throw new Error(`Telegram sendMessage timed out after ${TELEGRAM_REQUEST_TIMEOUT_MS}ms`);
+      throw new Error(`Telegram sendMessage timed out after ${TELEGRAM_REQUEST_TIMEOUT_MS}ms`, {
+        cause: err,
+      });
     }
     throw err;
   } finally {

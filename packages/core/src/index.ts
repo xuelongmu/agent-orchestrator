@@ -275,6 +275,11 @@ export {
 } from "./scm-webhook-utils.js";
 export { asValidOpenCodeSessionId } from "./opencode-session-id.js";
 export {
+  SESSION_ID_COMPONENT_PATTERN,
+  isValidSessionIdComponent,
+  assertValidSessionIdComponent,
+} from "./utils/session-id.js";
+export {
   OPENCODE_SESSION_LIST_CACHE_TTL_MS,
   getOpenCodeTmpDir,
   ensureOpenCodeTmpDir,

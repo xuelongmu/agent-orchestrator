@@ -559,4 +559,69 @@ describe("POST /api/notify-callback/[token]", () => {
     expect(res.status).toBe(400);
     expect(send).not.toHaveBeenCalled();
   });
+
+  it("rejects a queued resolving action when the agent resumed while a nudge held the decision (409)", async () => {
+    // A Nudge holds the decision at dispatch; an Approve queues behind it for the
+    // same decision. While the Approve waits, the agent resolves the prompt and
+    // resumes work. The post-wait re-fetch inside the serialized section must
+    // reject the Approve — activeDecisionId is null on resumed work — so a
+    // resolving action queued behind the nudge cannot land on already-resumed
+    // work. Its pending/identity snapshot, taken before the wait, is stale. (#13 review)
+    let agentResumed = false;
+    let releaseNudge!: () => void;
+    const nudgeGate = new Promise<void>((r) => (releaseNudge = r));
+    let signalNudgeAtSend!: () => void;
+    const nudgeAtSend = new Promise<void>((r) => (signalNudgeAtSend = r));
+
+    get.mockImplementation((async (_id: string, projectId?: string) => {
+      if (projectId !== undefined && projectId !== "ao") return null;
+      return agentResumed
+        ? makeSession({ activity: "active", lifecycle: makeLifecycle("needs_input") })
+        : makeSession();
+    }) as unknown as typeof get);
+
+    try {
+      send.mockImplementation((async (_id: string, msg: string) => {
+        if (msg === NOTIFY_CALLBACK_MESSAGES.nudge) {
+          signalNudgeAtSend();
+          await nudgeGate; // hold the decision mid-dispatch
+        }
+      }) as unknown as () => Promise<void>);
+
+      const nudgeP = callGet(token("nudge"));
+      await nudgeAtSend; // nudge is now holding the decision at dispatch
+
+      // Approve takes its pending snapshot now (agent still parked), then queues.
+      const approveP = callGet(token("approve"));
+      await new Promise((r) => setTimeout(r, 0)); // approve is queued behind the nudge
+
+      agentResumed = true; // agent resolves + resumes while the approve waits
+      releaseNudge();
+
+      const [nudgeRes, approveRes] = await Promise.all([nudgeP, approveP]);
+      expect(nudgeRes.status).toBe(200);
+      expect(approveRes.status).toBe(409);
+      expect(send).not.toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve, "ao");
+    } finally {
+      send.mockImplementation((async () => {}) as unknown as () => Promise<void>);
+      get.mockImplementation((async (_id: string, projectId?: string) =>
+        projectId !== undefined && projectId !== "ao" ? null : makeSession()) as unknown as typeof get);
+    }
+  });
+
+  it("renders the confirmation page for a session id longer than a generic 128-char cap", async () => {
+    // A long sessionPrefix yields a >128-char session id that core can legitimately
+    // create; the callback validates against core's contract, so GET must not 400 it.
+    const longId = `${"x".repeat(150)}-42`; // 153 valid chars
+    const res = await callRawGet(token("approve", { sessionId: longId }));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('method="POST"');
+  });
+
+  it("dispatches for a session id longer than a generic 128-char cap (aligned with core)", async () => {
+    const longId = `${"x".repeat(150)}-42`;
+    const res = await callGet(token("approve", { sessionId: longId }));
+    expect(res.status).toBe(200);
+    expect(send).toHaveBeenCalledWith(longId, NOTIFY_CALLBACK_MESSAGES.approve, "ao");
+  });
 });

@@ -2252,11 +2252,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         // question + confidence so the human keeps the decision context instead of
         // a generic "needs input" ping (#12). Scoped to the needs-input reactions
         // so unrelated notifications (agent-exited, etc.) are never relabeled.
-        const decision =
+        const isDecisionReaction =
           (reactionKey === "agent-needs-input" || reactionKey === "report-needs-input") &&
-          "lifecycle" in session
-            ? getActiveDecision(session)
-            : null;
+          "lifecycle" in session;
+        const decision = isDecisionReaction ? getActiveDecision(session) : null;
         const notifyMessage = decision
           ? formatNeedsDecisionMessage(decision)
           : (reactionConfig.message ?? `Reaction '${reactionKey}' triggered notification`);
@@ -2274,7 +2273,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             enrichment: getPREnrichmentForSession(session),
           }),
         });
-        await notifyHuman(event, reactionConfig.priority ?? "info");
+        // Bind the mutating buttons to the decision this reaction's content was
+        // built from, exactly as the transition/fallback callers do: a report that
+        // supersedes it while notifyHuman's async get() runs must not repoint the
+        // buttons at the newer decision. Only the needs-input reactions mint buttons;
+        // other reactions pass undefined and skip the check. (#13 review)
+        const expectedDecisionId = isDecisionReaction ? activeDecisionId(session) : undefined;
+        await notifyHuman(event, reactionConfig.priority ?? "info", expectedDecisionId);
         recordActivityEvent({
           projectId,
           sessionId,
@@ -4980,7 +4985,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // while still parked re-fires the notification with fresh, valid buttons
     // instead of leaving the human holding the ones the new nonce just
     // invalidated. See reportActivationIdentity (#12, #13 review).
-    const activationIdentity = reportActivationIdentity(auditResult.trigger, auditResult.report);
+    const activationIdentity = reportActivationIdentity(
+      auditResult.trigger,
+      auditResult.report,
+      activeDecisionId(session) !== null,
+    );
     const priorActiveTrigger = session.metadata[REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER] ?? "";
     const isNewTrigger = priorActiveTrigger !== activationIdentity;
 

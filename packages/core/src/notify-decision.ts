@@ -196,8 +196,12 @@ export function activeDecisionId(session: Session): string | null {
   // already-resumed work before the next lifecycle poll persists the transition.
   // Parked/ready/idle activities keep a legitimately-waiting decision answerable.
   // At mint the session is parked (waiting_input is why it is a needs_input
-  // decision), so this never suppresses a genuine control. (#13 review)
-  if (session.activity === ACTIVITY_STATE.ACTIVE) return null;
+  // decision), so this never suppresses a genuine control. Prefer the CURRENT
+  // poll's activitySignal over the persisted session.activity, which can lag a
+  // poll behind — a report can map canonical lifecycle to needs_input while the
+  // fresh native signal still reads active. (#13 review)
+  const liveActivity = session.activitySignal?.activity ?? session.activity;
+  if (liveActivity === ACTIVITY_STATE.ACTIVE) return null;
   const report = readAgentReport(session.metadata);
   if (!isDecisionReportActive(session, report) || !report) return null;
   const episodeAt = session.metadata?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT] ?? "";

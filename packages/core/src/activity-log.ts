@@ -212,9 +212,18 @@ export function classifyTerminalActivity(
 /**
  * Shared `recordActivity` implementation for all agents.
  *
- * Classifies terminal output, deduplicates writes (skips when the state
- * hasn't changed and the last entry is recent), and appends to the JSONL.
- * Actionable states (waiting_input/blocked) always write immediately.
+ * Classifies terminal output, deduplicates writes, and appends to the JSONL.
+ *
+ * Two dedup rules, keyed on whether the state is actionable:
+ *  - Non-actionable (active/ready/idle/exited): skip when the state hasn't
+ *    changed and the last entry is recent (<20s) — pure I/O reduction.
+ *  - Actionable (waiting_input/blocked): skip when the state AND the stable
+ *    prompt trigger are both unchanged. A repeated observation of the SAME
+ *    live prompt every poll must NOT re-append, because the entry `ts` is what
+ *    the durable episode boundary reads (via `getActivityState`): advancing it
+ *    each poll makes a genuinely-blocked decision look like a fresh re-park and
+ *    retires a live decision (#13 review). A new prompt (changed trigger) or a
+ *    state change still appends, so a genuinely new boundary is recorded.
  */
 export async function recordTerminalActivity(
   workspacePath: string,
@@ -222,12 +231,16 @@ export async function recordTerminalActivity(
   detectActivity: (output: string) => ActivityState,
 ): Promise<void> {
   const { state, trigger } = classifyTerminalActivity(terminalOutput, detectActivity);
+  const isActionable = state === "waiting_input" || state === "blocked";
 
-  // Deduplicate writes to reduce I/O. Skip when the state hasn't changed
-  // and the last entry is recent (<20s). Actionable states always write.
-  if (state !== "waiting_input" && state !== "blocked") {
-    const lastEntry = await readLastActivityEntry(workspacePath);
-    if (lastEntry && lastEntry.entry.state === state) {
+  const lastEntry = await readLastActivityEntry(workspacePath);
+  if (lastEntry && lastEntry.entry.state === state) {
+    if (isActionable) {
+      // Same actionable state on the same prompt = a repeated observation, not a
+      // new boundary. `trigger` is the stable last-3-lines of the prompt; a
+      // resolved-then-reparked prompt reads different lines and appends anew.
+      if ((lastEntry.entry.trigger ?? undefined) === (trigger ?? undefined)) return;
+    } else {
       const entryAgeMs = Date.now() - lastEntry.modifiedAt.getTime();
       if (entryAgeMs < 20_000) return;
     }

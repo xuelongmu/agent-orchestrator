@@ -327,9 +327,14 @@ export function auditAgentReports(
 export function reportActivationIdentity(
   trigger: ReportWatcherTrigger,
   report: AgentReport | null,
+  answerable: boolean,
 ): string {
   if (report && isDecisionReportState(report.state)) {
-    return `${trigger}:${report.state}:${report.timestamp}`;
+    // Fold in answerability so the SAME report becoming answerable (native
+    // active → waiting_input) is a NEW activation that emits exactly one
+    // actionable replacement, then no duplicate while it stays answerable.
+    // (#13 review)
+    return `${trigger}:${report.state}:${report.timestamp}:${answerable ? "answerable" : "unanswerable"}`;
   }
   return trigger;
 }
