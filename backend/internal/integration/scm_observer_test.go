@@ -47,6 +47,16 @@ type scmCapturedNudge struct {
 	body    string
 }
 
+type scmMergedCleaner struct {
+	lcm   *lifecycle.Manager
+	calls []domain.SessionID
+}
+
+func (c *scmMergedCleaner) CleanupMergedSession(ctx context.Context, id domain.SessionID) error {
+	c.calls = append(c.calls, id)
+	return c.lcm.MarkTerminated(ctx, id)
+}
+
 func (s *scmMessengerSpy) Send(_ context.Context, id domain.SessionID, msg string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -158,6 +168,7 @@ type scmFixture struct {
 	spy      *scmMessengerSpy
 	provider *cannedSCMProvider
 	observer *scmobserve.Observer
+	cleaner  *scmMergedCleaner
 	session  domain.SessionRecord
 	now      time.Time
 }
@@ -195,6 +206,8 @@ func newSCMFixture(t *testing.T, branch string) *scmFixture {
 
 	spy := &scmMessengerSpy{}
 	lcm := lifecycle.New(store, spy)
+	cleaner := &scmMergedCleaner{lcm: lcm}
+	lcm.SetMergedSessionCleaner(cleaner)
 	provider := newCannedSCMProvider()
 	observer := scmobserve.New(provider, store, lcm, scmobserve.Config{
 		Tick:   time.Hour,
@@ -207,6 +220,7 @@ func newSCMFixture(t *testing.T, branch string) *scmFixture {
 		spy:      spy,
 		provider: provider,
 		observer: observer,
+		cleaner:  cleaner,
 		session:  sess,
 		now:      now,
 	}
@@ -266,6 +280,15 @@ func mergedSCMObservation(prURL string, num int, headSHA string) ports.SCMObserv
 		Review:       ports.SCMReviewObservation{Decision: string(domain.ReviewApproved)},
 		Mergeability: ports.SCMMergeabilityObservation{State: string(domain.MergeMergeable), Mergeable: true},
 	}
+}
+
+func closedSCMObservation(prURL string, num int, headSHA string) ports.SCMObservation {
+	o := mergedSCMObservation(prURL, num, headSHA)
+	o.PR.State = string(domain.PRStateClosed)
+	o.PR.Merged = false
+	o.PR.Closed = true
+	o.PR.Title = "Closed without merge"
+	return o
 }
 
 // TestSCMObserverEndToEnd is the wiring regression guard for issue #109. It
@@ -385,6 +408,45 @@ func TestSCMObserverEndToEnd(t *testing.T) {
 			URL: prURL, Number: 77, SourceBranch: "feat/x", HeadRepo: scmTestRepo.Repo, TargetBranch: "main", HeadSHA: headSHA, Merged: true,
 		}
 		f.provider.observations[77] = mergedSCMObservation(prURL, 77, headSHA)
+		rec, ok, err := f.store.GetSession(ctx, f.session.ID)
+		if err != nil || !ok {
+			t.Fatalf("GetSession before Poll: ok=%v err=%v", ok, err)
+		}
+		rec.Activity = domain.Activity{State: domain.ActivityWaitingInput, LastActivityAt: f.now}
+		if err := f.store.UpdateSession(ctx, rec); err != nil {
+			t.Fatalf("seed waiting_input: %v", err)
+		}
+
+		if err := f.observer.Poll(ctx); err != nil {
+			t.Fatalf("Poll: %v", err)
+		}
+
+		rec, ok, err = f.store.GetSession(ctx, f.session.ID)
+		if err != nil || !ok {
+			t.Fatalf("GetSession: ok=%v err=%v", ok, err)
+		}
+		if !rec.IsTerminated {
+			t.Fatalf("merged observation should MarkTerminated the session: %+v", rec)
+		}
+		if len(f.cleaner.calls) != 1 || f.cleaner.calls[0] != f.session.ID {
+			t.Fatalf("merged waiting_input cleanup calls = %v, want [%s]", f.cleaner.calls, f.session.ID)
+		}
+		if got := f.spy.count(); got != 0 {
+			t.Fatalf("merged observation must not nudge, got %d msgs: %+v", got, f.spy.snapshot())
+		}
+	})
+
+	t.Run("Closed-unmerged observation does not clean up the session", func(t *testing.T) {
+		ctx := context.Background()
+		f := newSCMFixture(t, "feat/x")
+		const (
+			prURL   = "https://github.com/octocat/hello/pull/78"
+			headSHA = "feedface"
+		)
+		f.provider.detected["feat/x"] = ports.SCMPRObservation{
+			URL: prURL, Number: 78, SourceBranch: "feat/x", HeadRepo: scmTestRepo.Repo, TargetBranch: "main", HeadSHA: headSHA,
+		}
+		f.provider.observations[78] = closedSCMObservation(prURL, 78, headSHA)
 
 		if err := f.observer.Poll(ctx); err != nil {
 			t.Fatalf("Poll: %v", err)
@@ -394,11 +456,11 @@ func TestSCMObserverEndToEnd(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("GetSession: ok=%v err=%v", ok, err)
 		}
-		if !rec.IsTerminated {
-			t.Fatalf("merged observation should MarkTerminated the session: %+v", rec)
+		if rec.IsTerminated {
+			t.Fatalf("closed-unmerged observation must leave session live: %+v", rec)
 		}
-		if got := f.spy.count(); got != 0 {
-			t.Fatalf("merged observation must not nudge, got %d msgs: %+v", got, f.spy.snapshot())
+		if len(f.cleaner.calls) != 0 {
+			t.Fatalf("closed-unmerged cleanup calls = %v, want none", f.cleaner.calls)
 		}
 	})
 

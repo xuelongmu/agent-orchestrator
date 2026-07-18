@@ -192,6 +192,8 @@ type Session struct {
 	PreviewRevision                int64
 	PendingSubmitFingerprint       string
 	PendingSubmitRecoveryAttempted bool
+	MergedCleanupPending           bool
+	MergedCleanupPRURL             string
 }
 
 type SessionWorktree struct {

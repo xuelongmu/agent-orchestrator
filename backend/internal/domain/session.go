@@ -45,6 +45,16 @@ type SessionMetadata struct {
 	// recovery attempt so daemon restarts cannot repeat it.
 	PendingSubmitFingerprint       string `json:"pendingSubmitFingerprint,omitempty"`
 	PendingSubmitRecoveryAttempted bool   `json:"pendingSubmitRecoveryAttempted,omitempty"`
+	// MergedCleanupPending is a durable internal retry latch. Lifecycle sets it
+	// before delegating merge-complete resource teardown. Ordinary terminal
+	// observations preserve it; only successful teardown clears it. The SCM
+	// poller retries latched sessions across polls/restarts, including sessions
+	// whose runtime exited while cleanup was pending.
+	MergedCleanupPending bool `json:"-"`
+	// MergedCleanupPRURL identifies the terminal PR observation whose lifecycle
+	// notification must resume after a transient teardown failure. The PR row
+	// holds the remaining enrichment fields.
+	MergedCleanupPRURL string `json:"-"`
 }
 
 // SessionRecord is the persistence shape. It intentionally stores only durable

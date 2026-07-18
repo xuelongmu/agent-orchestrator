@@ -286,6 +286,7 @@ func (p *fakeProvider) RerunFailedCheck(_ context.Context, _ ports.SCMRepo, _ po
 
 type fakeLifecycle struct {
 	observed []ports.SCMObservation
+	retried  []domain.SessionID
 	err      error
 }
 
@@ -305,6 +306,11 @@ func (l *fakeLifecycle) ApplySCMObservation(_ context.Context, _ domain.SessionI
 	}
 	l.observed = append(l.observed, obs)
 	return nil
+}
+
+func (l *fakeLifecycle) RetryMergedCleanup(_ context.Context, id domain.SessionID) error {
+	l.retried = append(l.retried, id)
+	return l.err
 }
 
 func newTestObserver(store *fakeStore, provider *fakeProvider, lc Lifecycle, now time.Time) *Observer {
@@ -341,6 +347,48 @@ func TestStartUsesProviderRecommendedPollDelay(t *testing.T) {
 	}
 	if got := store.getListCalls(); got < 2 {
 		t.Fatalf("poll did not resume after provider backoff: calls = %d", got)
+	}
+}
+
+func TestPollRetriesDurableMergedCleanupBeforeProviderRefresh(t *testing.T) {
+	store := testStoreWithSession()
+	store.sessions[0].Metadata.MergedCleanupPending = true
+	provider := &fakeProvider{}
+	lifecycle := &fakeLifecycle{}
+	observer := newTestObserver(store, provider, lifecycle, time.Now())
+
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if len(lifecycle.retried) != 1 || lifecycle.retried[0] != "p-1" {
+		t.Fatalf("merged cleanup retries = %v, want [p-1]", lifecycle.retried)
+	}
+	if provider.repoGuardCalls != 0 || provider.listCalls != 0 || len(provider.fetchBatches) != 0 {
+		t.Fatalf("provider calls during cleanup retry = guards:%d lists:%d fetches:%d", provider.repoGuardCalls, provider.listCalls, len(provider.fetchBatches))
+	}
+}
+
+func TestPollRetriesDurableMergedCleanupWhenObserverDisabled(t *testing.T) {
+	store := testStoreWithSession()
+	provider := &fakeProvider{credentialGate: true, credentialOK: false}
+	lifecycle := &fakeLifecycle{}
+	observer := newTestObserver(store, provider, lifecycle, time.Now())
+
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatalf("first Poll: %v", err)
+	}
+	if !observer.disabled {
+		t.Fatal("credential gate did not disable observer")
+	}
+	store.sessions[0].Metadata.MergedCleanupPending = true
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatalf("disabled Poll: %v", err)
+	}
+	if len(lifecycle.retried) != 1 {
+		t.Fatalf("cleanup retries = %v, want one after disable", lifecycle.retried)
+	}
+	if provider.credentialChecks != 1 || provider.repoGuardCalls != 0 || provider.listCalls != 0 || len(provider.fetchBatches) != 0 {
+		t.Fatalf("provider use while disabled: credentials=%d guards=%d lists=%d fetches=%d", provider.credentialChecks, provider.repoGuardCalls, provider.listCalls, len(provider.fetchBatches))
 	}
 }
 

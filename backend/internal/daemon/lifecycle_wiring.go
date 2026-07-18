@@ -111,6 +111,10 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 		DataDir:   cfg.DataDir,
 		Logger:    log,
 	})
+	// Lifecycle decides when a session's PR set is complete; Session Manager
+	// owns the runtime/worktree/agent teardown that follows. Wire the late-bound
+	// edge here before daemon startup launches the SCM observer's first poll.
+	lcm.SetMergedSessionCleaner(mgr)
 	scmProvider, err := newGitHubSCMProvider(log)
 	if err != nil {
 		logSCMProviderDisabled(log, err)

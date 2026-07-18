@@ -68,6 +68,7 @@ type Store interface {
 // Lifecycle is the provider-neutral lifecycle notification sink.
 type Lifecycle interface {
 	ApplySCMObservation(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
+	RetryMergedCleanup(ctx context.Context, sessionID domain.SessionID) error
 }
 
 // ReviewCoordinator receives every authoritative PR snapshot after any changed
@@ -297,6 +298,12 @@ func (o *Observer) Poll(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Merged-session cleanup is a local durable replay lane. Run it before every
+	// provider credential/disable gate so runtime and worktree teardown never
+	// depends on GitHub availability.
+	if err := o.retryMergedCleanups(ctx); err != nil {
+		return err
+	}
 	if o.disabled {
 		return nil
 	}
@@ -495,6 +502,25 @@ func (o *Observer) Poll(ctx context.Context) error {
 	return nil
 }
 
+func (o *Observer) retryMergedCleanups(ctx context.Context) error {
+	if o.lifecycle == nil {
+		return nil
+	}
+	sessions, err := o.store.ListAllSessions(ctx)
+	if err != nil {
+		return err
+	}
+	for _, sess := range sessions {
+		if !sess.Metadata.MergedCleanupPending {
+			continue
+		}
+		if err := o.lifecycle.RetryMergedCleanup(ctx, sess.ID); err != nil {
+			o.logger.Error("scm observer: merged session cleanup retry failed", "session", sess.ID, "err", err)
+		}
+	}
+	return nil
+}
+
 func (o *Observer) coordinateReview(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) bool {
 	if o.reviewCoordinator == nil {
 		return true
@@ -555,6 +581,11 @@ func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, [
 	var sessionRepos []sessionRepo
 	for _, sess := range sessions {
 		if sess.IsTerminated {
+			continue
+		}
+		if sess.Metadata.MergedCleanupPending {
+			// The local retry sweep already attempted this session. A failure stays
+			// latched for the next poll and must not trigger provider refreshes.
 			continue
 		}
 		branch := strings.TrimSpace(sess.Metadata.Branch)

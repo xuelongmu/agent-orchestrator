@@ -266,7 +266,7 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 			return err
 		}
 		if done {
-			return m.MarkTerminated(ctx, id)
+			return m.cleanupMergedSession(ctx, id, o.URL)
 		}
 		return nil
 	}
@@ -340,6 +340,93 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 		}
 	}
 	return nil
+}
+
+// cleanupMergedSession runs the resource-owning session manager before the
+// terminal lifecycle write. Tests and minimal embedders that do not wire a
+// cleaner retain the reducer-only behavior and simply mark the row terminal.
+func (m *Manager) cleanupMergedSession(ctx context.Context, id domain.SessionID, prURL string) error {
+	shouldClean := false
+	if err := m.mutate(ctx, id, func(cur domain.SessionRecord, _ time.Time) (domain.SessionRecord, bool) {
+		if cur.IsTerminated || cur.Metadata.MergedCleanupPending {
+			return cur, false
+		}
+		shouldClean = true
+		cur.Metadata.MergedCleanupPending = true
+		cur.Metadata.MergedCleanupPRURL = prURL
+		return cur, true
+	}); err != nil {
+		return err
+	}
+	if !shouldClean {
+		return nil
+	}
+	return m.runMergedCleanup(ctx, id)
+}
+
+func (m *Manager) runMergedCleanup(ctx context.Context, id domain.SessionID) error {
+	m.mu.Lock()
+	cleaner := m.mergedCleaner
+	m.mu.Unlock()
+	if cleaner != nil {
+		if err := cleaner.CleanupMergedSession(ctx, id); err != nil {
+			return err
+		}
+	}
+	return m.markMergedCleanupComplete(ctx, id)
+}
+
+// RetryMergedCleanup replays a durable cleanup latch discovered by the SCM
+// poller. It is intentionally independent of a fresh PR observation: terminal
+// PRs drop out of provider open-PR lists, while teardown failures must remain
+// retryable across polls and daemon restarts.
+func (m *Manager) RetryMergedCleanup(ctx context.Context, id domain.SessionID) error {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok || !rec.Metadata.MergedCleanupPending {
+		return err
+	}
+	intent, err := m.mergedCleanupNotificationIntent(ctx, rec)
+	if err != nil {
+		return err
+	}
+	if err := m.runMergedCleanup(ctx, id); err != nil {
+		return err
+	}
+	m.emitNotification(ctx, intent)
+	return nil
+}
+
+func (m *Manager) mergedCleanupNotificationIntent(ctx context.Context, rec domain.SessionRecord) (*ports.NotificationIntent, error) {
+	prs, err := m.store.ListPRsBySession(ctx, rec.ID)
+	if err != nil {
+		return nil, err
+	}
+	var trigger *domain.PullRequest
+	for i := range prs {
+		if prs[i].URL == rec.Metadata.MergedCleanupPRURL {
+			trigger = &prs[i]
+			break
+		}
+	}
+	if trigger == nil {
+		return nil, nil
+	}
+	o := ports.SCMObservation{
+		ObservedAt: trigger.ObservedAt,
+		Provider:   trigger.Provider,
+		Repo:       trigger.Repo,
+		PR: ports.SCMPRObservation{
+			URL:          trigger.URL,
+			HTMLURL:      trigger.HTMLURL,
+			Number:       trigger.Number,
+			Title:        trigger.Title,
+			SourceBranch: trigger.SourceBranch,
+			TargetBranch: trigger.TargetBranch,
+			Merged:       trigger.Merged,
+			Closed:       trigger.Closed,
+		},
+	}
+	return m.notificationIntentForSCM(rec, o), nil
 }
 
 // ApplyReviewResult reacts to a completed AO-internal review pass after the
