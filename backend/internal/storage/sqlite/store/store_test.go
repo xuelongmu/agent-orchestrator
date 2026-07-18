@@ -305,6 +305,80 @@ func TestSessionFirstSignalRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSessionPendingSubmitLatchRoundTripAndAtomicClaim(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	r, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fingerprint := "sha256-prompt"
+	stamp := r.UpdatedAt.Add(time.Second)
+	if ok, err := s.SetPendingSubmit(ctx, r.ID, fingerprint, stamp); err != nil || !ok {
+		t.Fatalf("SetPendingSubmit = %v, %v; want true, nil", ok, err)
+	}
+	got, _, _ := s.GetSession(ctx, r.ID)
+	if got.Metadata.PendingSubmitFingerprint != fingerprint || got.Metadata.PendingSubmitRecoveryAttempted {
+		t.Fatalf("latched metadata = %+v", got.Metadata)
+	}
+
+	if ok, err := s.ClaimPendingSubmitRecovery(ctx, r.ID, fingerprint, stamp.Add(time.Second)); err != nil || !ok {
+		t.Fatalf("first ClaimPendingSubmitRecovery = %v, %v; want true, nil", ok, err)
+	}
+	if ok, err := s.ClaimPendingSubmitRecovery(ctx, r.ID, fingerprint, stamp.Add(2*time.Second)); err != nil || ok {
+		t.Fatalf("second ClaimPendingSubmitRecovery = %v, %v; want false, nil", ok, err)
+	}
+	got, _, _ = s.GetSession(ctx, r.ID)
+	if !got.Metadata.PendingSubmitRecoveryAttempted {
+		t.Fatal("recovery claim was not persisted")
+	}
+
+	// A stale confirmation cannot clear a different prompt's newer latch.
+	if ok, err := s.ClearPendingSubmit(ctx, r.ID, "wrong", stamp.Add(3*time.Second)); err != nil || ok {
+		t.Fatalf("stale ClearPendingSubmit = %v, %v; want false, nil", ok, err)
+	}
+	if ok, err := s.ClearPendingSubmit(ctx, r.ID, fingerprint, stamp.Add(4*time.Second)); err != nil || !ok {
+		t.Fatalf("ClearPendingSubmit = %v, %v; want true, nil", ok, err)
+	}
+	got, _, _ = s.GetSession(ctx, r.ID)
+	if got.Metadata.PendingSubmitFingerprint != "" || got.Metadata.PendingSubmitRecoveryAttempted {
+		t.Fatalf("cleared metadata = %+v", got.Metadata)
+	}
+}
+
+func TestSessionTerminalOrBlockedUpdateClearsPendingSubmitLatch(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		activity   domain.ActivityState
+		terminated bool
+	}{
+		{name: "blocked", activity: domain.ActivityBlocked},
+		{name: "terminated", activity: domain.ActivityExited, terminated: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			ctx := context.Background()
+			seedProject(t, s, "mer")
+			r, _ := s.CreateSession(ctx, sampleRecord("mer"))
+			_, _ = s.SetPendingSubmit(ctx, r.ID, "sha256-prompt", r.UpdatedAt.Add(time.Second))
+
+			got, _, _ := s.GetSession(ctx, r.ID)
+			got.Activity.State = tc.activity
+			got.IsTerminated = tc.terminated
+			got.UpdatedAt = got.UpdatedAt.Add(2 * time.Second)
+			if err := s.UpdateSession(ctx, got); err != nil {
+				t.Fatal(err)
+			}
+			got, _, _ = s.GetSession(ctx, r.ID)
+			if got.Metadata.PendingSubmitFingerprint != "" || got.Metadata.PendingSubmitRecoveryAttempted {
+				t.Fatalf("terminal metadata = %+v, want latch cleared", got.Metadata)
+			}
+		})
+	}
+}
+
 func TestPRCRUD(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

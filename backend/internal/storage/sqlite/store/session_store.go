@@ -74,6 +74,56 @@ func (s *Store) SetSessionPreviewURL(ctx context.Context, id domain.SessionID, p
 	return rows > 0, nil
 }
 
+// SetPendingSubmit latches a delivered prompt fingerprint before any
+// Enter-only recovery is attempted. It returns ok=false for a missing or
+// already-terminated session.
+func (s *Store) SetPendingSubmit(ctx context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.SetPendingSubmit(ctx, gen.SetPendingSubmitParams{
+		PendingSubmitFingerprint: fingerprint,
+		UpdatedAt:                updatedAt,
+		ID:                       id,
+	})
+	if err != nil {
+		return false, fmt.Errorf("set pending submit for session %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// ClaimPendingSubmitRecovery atomically records the one permitted Enter-only
+// recovery before the pane write. A concurrent caller, daemon restart, or a
+// decision/termination transition therefore cannot claim the same recovery.
+func (s *Store) ClaimPendingSubmitRecovery(ctx context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.ClaimPendingSubmitRecovery(ctx, gen.ClaimPendingSubmitRecoveryParams{
+		UpdatedAt:                updatedAt,
+		ID:                       id,
+		PendingSubmitFingerprint: fingerprint,
+	})
+	if err != nil {
+		return false, fmt.Errorf("claim pending submit recovery for session %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// ClearPendingSubmit consumes only the matching latch, so delayed confirmation
+// from an older send cannot clear a newer prompt's delivery boundary.
+func (s *Store) ClearPendingSubmit(ctx context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.ClearPendingSubmit(ctx, gen.ClearPendingSubmitParams{
+		UpdatedAt:                updatedAt,
+		ID:                       id,
+		PendingSubmitFingerprint: fingerprint,
+	})
+	if err != nil {
+		return false, fmt.Errorf("clear pending submit for session %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
 // DeleteSession removes a session row, but only if it is still in seed state
 // (no workspace, no runtime handle, no agent session id, no prompt, and not
 // already terminated). Rows that have observable spawn output are immutable
@@ -201,13 +251,15 @@ func rowToRecord(row gen.Session) domain.SessionRecord {
 		FirstSignalAt: nullTimeToTime(row.FirstSignalAt),
 		IsTerminated:  row.IsTerminated,
 		Metadata: domain.SessionMetadata{
-			Branch:          row.Branch,
-			WorkspacePath:   row.WorkspacePath,
-			RuntimeHandleID: row.RuntimeHandleID,
-			AgentSessionID:  row.AgentSessionID,
-			Prompt:          row.Prompt,
-			PreviewURL:      row.PreviewURL,
-			PreviewRevision: row.PreviewRevision,
+			Branch:                         row.Branch,
+			WorkspacePath:                  row.WorkspacePath,
+			RuntimeHandleID:                row.RuntimeHandleID,
+			AgentSessionID:                 row.AgentSessionID,
+			Prompt:                         row.Prompt,
+			PreviewURL:                     row.PreviewURL,
+			PreviewRevision:                row.PreviewRevision,
+			PendingSubmitFingerprint:       row.PendingSubmitFingerprint,
+			PendingSubmitRecoveryAttempted: row.PendingSubmitRecoveryAttempted,
 		},
 		CreatedAt: row.CreatedAt,
 		UpdatedAt: row.UpdatedAt,
@@ -216,51 +268,67 @@ func rowToRecord(row gen.Session) domain.SessionRecord {
 
 func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams {
 	activity := normalActivity(rec.Activity, rec.CreatedAt)
+	pendingFingerprint, pendingAttempted := pendingSubmitFields(rec, activity.State)
 	return gen.InsertSessionParams{
-		ID:              rec.ID,
-		ProjectID:       rec.ProjectID,
-		Num:             num,
-		IssueID:         rec.IssueID,
-		Kind:            rec.Kind,
-		Harness:         rec.Harness,
-		DisplayName:     rec.DisplayName,
-		ActivityState:   activity.State,
-		ActivityLastAt:  activity.LastActivityAt,
-		FirstSignalAt:   timeToNullTime(rec.FirstSignalAt),
-		IsTerminated:    rec.IsTerminated,
-		Branch:          rec.Metadata.Branch,
-		WorkspacePath:   rec.Metadata.WorkspacePath,
-		RuntimeHandleID: rec.Metadata.RuntimeHandleID,
-		AgentSessionID:  rec.Metadata.AgentSessionID,
-		Prompt:          rec.Metadata.Prompt,
-		PreviewURL:      rec.Metadata.PreviewURL,
-		PreviewRevision: rec.Metadata.PreviewRevision,
-		CreatedAt:       rec.CreatedAt,
-		UpdatedAt:       rec.UpdatedAt,
+		ID:                             rec.ID,
+		ProjectID:                      rec.ProjectID,
+		Num:                            num,
+		IssueID:                        rec.IssueID,
+		Kind:                           rec.Kind,
+		Harness:                        rec.Harness,
+		DisplayName:                    rec.DisplayName,
+		ActivityState:                  activity.State,
+		ActivityLastAt:                 activity.LastActivityAt,
+		FirstSignalAt:                  timeToNullTime(rec.FirstSignalAt),
+		IsTerminated:                   rec.IsTerminated,
+		Branch:                         rec.Metadata.Branch,
+		WorkspacePath:                  rec.Metadata.WorkspacePath,
+		RuntimeHandleID:                rec.Metadata.RuntimeHandleID,
+		AgentSessionID:                 rec.Metadata.AgentSessionID,
+		Prompt:                         rec.Metadata.Prompt,
+		PreviewURL:                     rec.Metadata.PreviewURL,
+		PreviewRevision:                rec.Metadata.PreviewRevision,
+		PendingSubmitFingerprint:       pendingFingerprint,
+		PendingSubmitRecoveryAttempted: pendingAttempted,
+		CreatedAt:                      rec.CreatedAt,
+		UpdatedAt:                      rec.UpdatedAt,
 	}
 }
 
 func recordToUpdate(rec domain.SessionRecord) gen.UpdateSessionParams {
 	activity := normalActivity(rec.Activity, rec.UpdatedAt)
+	pendingFingerprint, pendingAttempted := pendingSubmitFields(rec, activity.State)
 	return gen.UpdateSessionParams{
-		ID:              rec.ID,
-		IssueID:         rec.IssueID,
-		Kind:            rec.Kind,
-		Harness:         rec.Harness,
-		DisplayName:     rec.DisplayName,
-		ActivityState:   activity.State,
-		ActivityLastAt:  activity.LastActivityAt,
-		FirstSignalAt:   timeToNullTime(rec.FirstSignalAt),
-		IsTerminated:    rec.IsTerminated,
-		Branch:          rec.Metadata.Branch,
-		WorkspacePath:   rec.Metadata.WorkspacePath,
-		RuntimeHandleID: rec.Metadata.RuntimeHandleID,
-		AgentSessionID:  rec.Metadata.AgentSessionID,
-		Prompt:          rec.Metadata.Prompt,
-		PreviewURL:      rec.Metadata.PreviewURL,
-		PreviewRevision: rec.Metadata.PreviewRevision,
-		UpdatedAt:       rec.UpdatedAt,
+		ID:                             rec.ID,
+		IssueID:                        rec.IssueID,
+		Kind:                           rec.Kind,
+		Harness:                        rec.Harness,
+		DisplayName:                    rec.DisplayName,
+		ActivityState:                  activity.State,
+		ActivityLastAt:                 activity.LastActivityAt,
+		FirstSignalAt:                  timeToNullTime(rec.FirstSignalAt),
+		IsTerminated:                   rec.IsTerminated,
+		Branch:                         rec.Metadata.Branch,
+		WorkspacePath:                  rec.Metadata.WorkspacePath,
+		RuntimeHandleID:                rec.Metadata.RuntimeHandleID,
+		AgentSessionID:                 rec.Metadata.AgentSessionID,
+		Prompt:                         rec.Metadata.Prompt,
+		PreviewURL:                     rec.Metadata.PreviewURL,
+		PreviewRevision:                rec.Metadata.PreviewRevision,
+		PendingSubmitFingerprint:       pendingFingerprint,
+		PendingSubmitRecoveryAttempted: pendingAttempted,
+		UpdatedAt:                      rec.UpdatedAt,
 	}
+}
+
+// A terminal or blocked session is definitive evidence that an editor draft
+// can no longer be safely submitted. Clear the latch on every full-row write
+// of either fact, regardless of which lifecycle path produced it.
+func pendingSubmitFields(rec domain.SessionRecord, activity domain.ActivityState) (string, bool) {
+	if rec.IsTerminated || activity == domain.ActivityBlocked {
+		return "", false
+	}
+	return rec.Metadata.PendingSubmitFingerprint, rec.Metadata.PendingSubmitRecoveryAttempted
 }
 
 // nullTimeToTime / timeToNullTime bridge the nullable first_signal_at column

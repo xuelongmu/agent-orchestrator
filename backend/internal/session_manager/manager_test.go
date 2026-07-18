@@ -61,6 +61,38 @@ func (f *fakeStore) UpdateSession(_ context.Context, rec domain.SessionRecord) e
 	f.sessions[rec.ID] = rec
 	return nil
 }
+func (f *fakeStore) SetPendingSubmit(_ context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok || rec.IsTerminated {
+		return false, nil
+	}
+	rec.Metadata.PendingSubmitFingerprint = fingerprint
+	rec.Metadata.PendingSubmitRecoveryAttempted = false
+	rec.UpdatedAt = updatedAt
+	f.sessions[id] = rec
+	return true, nil
+}
+func (f *fakeStore) ClaimPendingSubmitRecovery(_ context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok || rec.IsTerminated || rec.Metadata.PendingSubmitFingerprint != fingerprint || rec.Metadata.PendingSubmitRecoveryAttempted {
+		return false, nil
+	}
+	rec.Metadata.PendingSubmitRecoveryAttempted = true
+	rec.UpdatedAt = updatedAt
+	f.sessions[id] = rec
+	return true, nil
+}
+func (f *fakeStore) ClearPendingSubmit(_ context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok || rec.Metadata.PendingSubmitFingerprint != fingerprint {
+		return false, nil
+	}
+	rec.Metadata.PendingSubmitFingerprint = ""
+	rec.Metadata.PendingSubmitRecoveryAttempted = false
+	rec.UpdatedAt = updatedAt
+	f.sessions[id] = rec
+	return true, nil
+}
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
 	r, ok := f.sessions[id]
 	return r, ok, nil
@@ -4615,6 +4647,99 @@ func TestSend_CodexPendingInputReturnsTypedErrorWithoutDuplicatingText(t *testin
 	}
 	if !reflect.DeepEqual(msg.msgs, []string{"large multiline review context", ""}) {
 		t.Fatalf("messages = %#v, want no duplicate full-text send", msg.msgs)
+	}
+}
+
+func TestSend_CodexDiscardedPendingErrorDoesNotResendPrompt(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = domain.SessionRecord{
+		ID: "s1", Harness: domain.HarnessCodex,
+		Metadata: domain.SessionMetadata{RuntimeHandleID: "h1"},
+	}
+	rt := &fakeRuntime{outputs: []string{"› [Pasted Content 7096 chars]"}}
+	msg := &fakeMessenger{}
+	m := New(Deps{
+		Runtime: rt, Agents: singleAgent{pendingInputAgent{}}, Store: st,
+		Messenger: msg, Logger: slog.Default(),
+	})
+	m.sendConfirm = sendConfirmConfig{pollInterval: time.Millisecond, maxAttempts: 2}
+
+	// Simulate an HTTP caller that discarded the first typed error and retried.
+	_ = m.Send(context.Background(), "s1", "large multiline review context")
+	err := m.Send(context.Background(), "s1", "large multiline review context")
+	if !errors.Is(err, ErrInputPending) {
+		t.Fatalf("retry error = %v, want ErrInputPending", err)
+	}
+	if !reflect.DeepEqual(msg.msgs, []string{"large multiline review context", ""}) {
+		t.Fatalf("messages = %#v, want full text and Enter each delivered exactly once", msg.msgs)
+	}
+	got := st.sessions["s1"].Metadata
+	if got.PendingSubmitFingerprint == "" || !got.PendingSubmitRecoveryAttempted {
+		t.Fatalf("pending-submit latch = %+v, want durable attempted latch", got)
+	}
+}
+
+func TestReconcile_CodexRecoversPendingSubmitAfterRestart(t *testing.T) {
+	st := newFakeStore()
+	fingerprint := pendingSubmitFingerprint("large multiline review context")
+	st.sessions["s1"] = domain.SessionRecord{
+		ID: "s1", Harness: domain.HarnessCodex,
+		Metadata: domain.SessionMetadata{
+			RuntimeHandleID:                "h1",
+			PendingSubmitFingerprint:       fingerprint,
+			PendingSubmitRecoveryAttempted: false,
+		},
+	}
+	rt := &fakeRuntime{
+		aliveByHandle: map[string]bool{"h1": true},
+		outputs:       []string{"› [Pasted Content 7096 chars]"},
+	}
+	msg := &fakeMessenger{}
+	m := New(Deps{
+		Runtime: rt, Agents: singleAgent{pendingInputAgent{}}, Store: st,
+		Messenger: msg, Logger: slog.Default(),
+	})
+	m.sendConfirm = sendConfirmConfig{pollInterval: time.Millisecond, maxAttempts: 1}
+
+	if err := m.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !reflect.DeepEqual(msg.msgs, []string{""}) {
+		t.Fatalf("messages = %#v, want one Enter-only restart recovery", msg.msgs)
+	}
+	got := st.sessions["s1"].Metadata
+	if got.PendingSubmitFingerprint != fingerprint || !got.PendingSubmitRecoveryAttempted {
+		t.Fatalf("pending-submit latch = %+v, want fingerprint retained and attempt recorded", got)
+	}
+}
+
+func TestSend_CodexConfirmedLatchedPromptRetryIsNoOp(t *testing.T) {
+	st := newFakeStore()
+	message := "large multiline review context"
+	st.sessions["s1"] = domain.SessionRecord{
+		ID: "s1", Harness: domain.HarnessCodex,
+		Metadata: domain.SessionMetadata{
+			RuntimeHandleID:                "h1",
+			PendingSubmitFingerprint:       pendingSubmitFingerprint(message),
+			PendingSubmitRecoveryAttempted: true,
+		},
+	}
+	rt := &fakeRuntime{outputs: []string{"Working (esc to interrupt)"}}
+	msg := &fakeMessenger{}
+	m := New(Deps{
+		Runtime: rt, Agents: singleAgent{pendingInputAgent{}}, Store: st,
+		Messenger: msg, Logger: slog.Default(),
+	})
+	m.sendConfirm = sendConfirmConfig{pollInterval: time.Millisecond, maxAttempts: 1}
+
+	if err := m.Send(context.Background(), "s1", message); err != nil {
+		t.Fatalf("Send retry: %v", err)
+	}
+	if len(msg.msgs) != 0 {
+		t.Fatalf("messages = %#v, want confirmed retry to write nothing", msg.msgs)
+	}
+	if got := st.sessions["s1"].Metadata.PendingSubmitFingerprint; got != "" {
+		t.Fatalf("PendingSubmitFingerprint = %q, want cleared", got)
 	}
 }
 
