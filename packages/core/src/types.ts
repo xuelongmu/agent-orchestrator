@@ -939,7 +939,10 @@ export interface SCM {
   /** Assign a PR to the currently authenticated user, if supported. */
   assignPRToCurrentUser?(pr: PRInfo): Promise<void>;
 
-  /** Check out the PR branch into a workspace. Returns true if branch changed. */
+  /**
+   * Check out the PR branch into a workspace. Returns true if branch changed.
+   * Must reject unless the workspace is confirmed to be on `pr.branch`.
+   */
   checkoutPR?(pr: PRInfo, workspacePath: string): Promise<boolean>;
 
   /** Get current PR state */

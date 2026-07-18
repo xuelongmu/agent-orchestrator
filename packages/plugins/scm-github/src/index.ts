@@ -814,6 +814,13 @@ function createGitHubSCM(): SCM {
       }
 
       await ghInDir(["pr", "checkout", String(pr.number), "--repo", repoFlag(pr)], workspacePath);
+      const checkedOutBranch = await git(["branch", "--show-current"], workspacePath);
+      if (checkedOutBranch !== pr.branch) {
+        const actual = checkedOutBranch ? `"${checkedOutBranch}"` : "detached HEAD";
+        throw new Error(
+          `Failed to check out PR #${pr.number} branch "${pr.branch}": workspace remained on ${actual}. The branch may be checked out in another worktree.`,
+        );
+      }
       return true;
     },
 
