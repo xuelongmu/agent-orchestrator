@@ -37,16 +37,18 @@ export async function appendActivityEntry(
   state: ActivityState,
   source: "terminal" | "native" | "hook",
   trigger?: string,
+  fingerprint?: string,
 ): Promise<void> {
   const logPath = getActivityLogPath(workspacePath);
   await mkdir(dirname(logPath), { recursive: true });
 
+  const isActionable = state === "waiting_input" || state === "blocked";
   const entry: ActivityLogEntry = {
     ts: new Date().toISOString(),
     state,
     source,
-    ...(trigger !== undefined &&
-      (state === "waiting_input" || state === "blocked") && { trigger }),
+    ...(trigger !== undefined && isActionable && { trigger }),
+    ...(fingerprint !== undefined && isActionable && { fingerprint }),
   };
 
   await appendFile(logPath, JSON.stringify(entry) + "\n", "utf-8");
@@ -114,6 +116,7 @@ export async function readLastActivityEntry(
         state: record.state as ActivityLogEntry["state"],
         source: record.source as ActivityLogEntry["source"],
         ...(typeof record.trigger === "string" && { trigger: record.trigger }),
+        ...(typeof record.fingerprint === "string" && { fingerprint: record.fingerprint }),
       };
       return { entry, modifiedAt: fileStat.mtime };
     } finally {
@@ -200,13 +203,35 @@ export function getActivityFallbackState(
 export function classifyTerminalActivity(
   terminalOutput: string,
   detectActivity: (output: string) => ActivityState,
-): { state: ActivityState; trigger: string | undefined } {
+): { state: ActivityState; trigger: string | undefined; fingerprint: string | undefined } {
   const state = detectActivity(terminalOutput);
-  const trigger =
-    state === "waiting_input" || state === "blocked"
-      ? terminalOutput.trim().split("\n").slice(-3).join("\n")
-      : undefined;
-  return { state, trigger };
+  const isActionable = state === "waiting_input" || state === "blocked";
+  const trigger = isActionable
+    ? terminalOutput.trim().split("\n").slice(-3).join("\n")
+    : undefined;
+  // Fingerprint the FULL terminal context, not just the prompt's last lines. Two
+  // text-identical prompts share a `trigger`, so trigger alone can never tell a
+  // repeated observation of one live prompt from an identical prompt reached after
+  // intervening work. The wider context differs once the agent has produced output
+  // between them, so the fingerprint advances the boundary for the genuinely new
+  // prompt while staying stable for a static blocked screen. (round 18 review)
+  const fingerprint = isActionable ? fingerprintTerminalContext(terminalOutput) : undefined;
+  return { state, trigger, fingerprint };
+}
+
+/**
+ * Deterministic FNV-1a hash of the trimmed terminal context, as a compact hex
+ * string. Pure (no Date/random), so the same screen always fingerprints
+ * identically across polls.
+ */
+function fingerprintTerminalContext(terminalOutput: string): string {
+  const s = terminalOutput.trim();
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
 }
 
 /**
@@ -217,34 +242,46 @@ export function classifyTerminalActivity(
  * Two dedup rules, keyed on whether the state is actionable:
  *  - Non-actionable (active/ready/idle/exited): skip when the state hasn't
  *    changed and the last entry is recent (<20s) — pure I/O reduction.
- *  - Actionable (waiting_input/blocked): skip when the state AND the stable
- *    prompt trigger are both unchanged. A repeated observation of the SAME
+ *  - Actionable (waiting_input/blocked): skip when the state AND the terminal-
+ *    context fingerprint are both unchanged. A repeated observation of the SAME
  *    live prompt every poll must NOT re-append, because the entry `ts` is what
  *    the durable episode boundary reads (via `getActivityState`): advancing it
  *    each poll makes a genuinely-blocked decision look like a fresh re-park and
- *    retires a live decision (#13 review). A new prompt (changed trigger) or a
- *    state change still appends, so a genuinely new boundary is recorded.
+ *    retires a live decision (#13 review). The fingerprint hashes the broader
+ *    terminal context, so a text-identical prompt reached after intervening work
+ *    fingerprints differently and DOES append — giving the genuinely new prompt
+ *    its own boundary — while a static blocked screen stays stable. A state change
+ *    always appends. (round 18 review)
  */
 export async function recordTerminalActivity(
   workspacePath: string,
   terminalOutput: string,
   detectActivity: (output: string) => ActivityState,
 ): Promise<void> {
-  const { state, trigger } = classifyTerminalActivity(terminalOutput, detectActivity);
+  const { state, trigger, fingerprint } = classifyTerminalActivity(terminalOutput, detectActivity);
   const isActionable = state === "waiting_input" || state === "blocked";
 
   const lastEntry = await readLastActivityEntry(workspacePath);
   if (lastEntry && lastEntry.entry.state === state) {
     if (isActionable) {
-      // Same actionable state on the same prompt = a repeated observation, not a
-      // new boundary. `trigger` is the stable last-3-lines of the prompt; a
-      // resolved-then-reparked prompt reads different lines and appends anew.
-      if ((lastEntry.entry.trigger ?? undefined) === (trigger ?? undefined)) return;
+      // Same actionable state on the same terminal context = a repeated
+      // observation, not a new boundary. The fingerprint covers the whole screen,
+      // so a resolved-then-reparked (or intervening-work-then-identical) prompt
+      // hashes differently and appends anew. When the last entry predates
+      // fingerprints (legacy, trigger-only) fall back to comparing triggers, so an
+      // upgrade doesn't spuriously append and retire a still-live decision.
+      const lastKey =
+        lastEntry.entry.fingerprint !== undefined
+          ? lastEntry.entry.fingerprint
+          : (lastEntry.entry.trigger ?? undefined);
+      const currentKey =
+        lastEntry.entry.fingerprint !== undefined ? fingerprint : (trigger ?? undefined);
+      if (lastKey === currentKey) return;
     } else {
       const entryAgeMs = Date.now() - lastEntry.modifiedAt.getTime();
       if (entryAgeMs < 20_000) return;
     }
   }
 
-  await appendActivityEntry(workspacePath, state, "terminal", trigger);
+  await appendActivityEntry(workspacePath, state, "terminal", trigger, fingerprint);
 }

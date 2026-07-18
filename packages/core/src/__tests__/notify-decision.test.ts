@@ -14,10 +14,12 @@ vi.mock("../paths.js", async (importOriginal) => {
 
 import {
   activeDecisionId,
+  classifyCurrentActivity,
   clearSpentDecision,
   clearedDecisionMetadata,
   consumeDecision,
   decisionEpisodeTransition,
+  isDecisionCallbackAnswerable,
   isNudgeBlocked,
   isResolvingCallbackAction,
   storedDecisionId,
@@ -25,7 +27,7 @@ import {
 } from "../notify-decision.js";
 import { AGENT_REPORT_METADATA_KEYS } from "../agent-report.js";
 import { mutateMetadata, readMetadataRaw } from "../metadata.js";
-import type { Session } from "../types.js";
+import type { ActivitySignal, ActivitySignalState, ActivityState, Session } from "../types.js";
 
 const SESSION_ID = "ao-5";
 const PROJECT_ID = "ao";
@@ -69,6 +71,7 @@ function makeSession(overrides: {
   lifecycleState?: string;
   episodeAt?: string | null;
   activity?: string;
+  activitySignal?: ActivitySignal;
 }): Session {
   const {
     at = new Date().toISOString(),
@@ -76,12 +79,14 @@ function makeSession(overrides: {
     lifecycleState,
     episodeAt = EPISODE_AT,
     activity = "waiting_input",
+    activitySignal,
   } = overrides;
   return {
     id: SESSION_ID,
     projectId: PROJECT_ID,
     status: "working",
     activity,
+    ...(activitySignal ? { activitySignal } : {}),
     metadata: {
       [AGENT_REPORT_METADATA_KEYS.STATE]: state,
       [AGENT_REPORT_METADATA_KEYS.AT]: at,
@@ -97,6 +102,11 @@ function makeSession(overrides: {
         }
       : {}),
   } as unknown as Session;
+}
+
+/** A structured activity signal for tests. */
+function signal(state: ActivitySignalState, activity: ActivityState | null): ActivitySignal {
+  return { state, activity, source: "native" };
 }
 
 /** Comfortably outside AGENT_REPORT_FRESHNESS_MS (5 min). */
@@ -138,6 +148,40 @@ describe("activeDecisionId", () => {
     for (const activity of ["waiting_input", "ready", "idle"]) {
       expect(activeDecisionId(makeSession({ at, activity }))).toBe(`${at}:${EPISODE_AT}`);
     }
+  });
+
+  it("suppresses only for a VALID active signal — a stale active signal keeps controls", () => {
+    // Finding #1 (round 18): a valid activitySignal saying "active" is authoritative
+    // (agent demonstrably resumed) and strips controls. A STALE active signal is
+    // weak evidence and must NOT strip controls from a fresh decision report.
+    const at = new Date().toISOString();
+    expect(
+      activeDecisionId(makeSession({ at, activitySignal: signal("valid", "active") })),
+    ).toBeNull();
+    expect(
+      activeDecisionId(makeSession({ at, activitySignal: signal("stale", "active") })),
+    ).toBe(`${at}:${EPISODE_AT}`);
+  });
+
+  it("prefers the current valid signal over a stale persisted active activity", () => {
+    // Persisted session.activity lags at "active", but the fresh signal says the
+    // agent is parked at the prompt — the decision stays answerable.
+    const at = new Date().toISOString();
+    expect(
+      activeDecisionId(
+        makeSession({ at, activity: "active", activitySignal: signal("valid", "waiting_input") }),
+      ),
+    ).toBe(`${at}:${EPISODE_AT}`);
+  });
+
+  it("falls back to persisted activity when there is no structured signal", () => {
+    // No activitySignal at all (e.g. a metadata-only reconstruction): the safe
+    // pre-signal behaviour — persisted active suppresses, persisted waiting keeps.
+    const at = new Date().toISOString();
+    expect(activeDecisionId(makeSession({ at, activity: "active" }))).toBeNull();
+    expect(activeDecisionId(makeSession({ at, activity: "waiting_input" }))).toBe(
+      `${at}:${EPISODE_AT}`,
+    );
   });
 
   it("is null once the decision is spent — agent resumed and the report went stale", () => {
@@ -271,6 +315,40 @@ describe("decisionEpisodeTransition", () => {
     expect(decisionEpisodeTransition(session, "not-a-date", "2026-07-17T10:00:00.000Z")).toBeNull();
   });
 
+  it("restamps (does NOT retire) when a FRESH successor report B already replaced A", () => {
+    // Finding #4 (round 18): the boundary advanced past A's marker, but the metadata
+    // already holds a fresh successor decision report B — written after A's episode
+    // and by the time the agent re-parked. B is a new decision; retiring it would
+    // lose it and its callback identity. Restamp the episode to the advanced
+    // boundary so B keeps a live identity.
+    const boundaryB = new Date(Date.parse(EPISODE_AT) + 5 * 60_000).toISOString();
+    const reportB = new Date(Date.parse(EPISODE_AT) + 4 * 60_000).toISOString();
+    const session = makeSession({
+      lifecycleState: "needs_input",
+      episodeAt: EPISODE_AT,
+      at: reportB,
+    });
+    expect(decisionEpisodeTransition(session, boundaryB, "2026-07-17T10:00:00.000Z")).toEqual({
+      kind: "stamp",
+      patch: { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: boundaryB },
+    });
+  });
+
+  it("still retires when the boundary advances over a bare prompt with only A's spent report", () => {
+    // A's own report was written at/before A parked (here, long before the marker),
+    // so it is not a successor: a bare prompt B carrying only A's spent report must
+    // retire, exactly as before. (round 18)
+    const boundaryB = new Date(Date.parse(EPISODE_AT) + 5 * 60_000).toISOString();
+    const session = makeSession({
+      lifecycleState: "needs_input",
+      episodeAt: EPISODE_AT,
+      at: LONG_AGO,
+    });
+    expect(decisionEpisodeTransition(session, boundaryB, "2026-07-17T10:00:00.000Z")).toEqual({
+      kind: "retire",
+    });
+  });
+
   it("clears the marker once the session leaves needs_input", () => {
     const session = makeSession({ lifecycleState: "working" });
     // Retiring is not a patch: the clear must go through the locked compare.
@@ -282,6 +360,50 @@ describe("decisionEpisodeTransition", () => {
   it("is a no-op when unparked and already unmarked", () => {
     const session = makeSession({ lifecycleState: "working", episodeAt: null });
     expect(decisionEpisodeTransition(session, null, "2026-07-17T10:00:00.000Z")).toBeNull();
+  });
+});
+
+describe("classifyCurrentActivity / isDecisionCallbackAnswerable", () => {
+  // The dispatch-time gate for mutating callbacks (findings #2 & #5): only a
+  // positively-verified answerable activity authorizes; everything else fails
+  // CLOSED.
+  it("is answerable only for a VALID parked/idle/ready signal", () => {
+    for (const activity of ["waiting_input", "idle", "ready"] as const) {
+      const session = makeSession({ activitySignal: signal("valid", activity) });
+      expect(classifyCurrentActivity(session)).toBe("answerable");
+      expect(isDecisionCallbackAnswerable(session)).toBe(true);
+    }
+  });
+
+  it("rejects a verified active (resumed) agent", () => {
+    const session = makeSession({ activitySignal: signal("valid", "active") });
+    expect(classifyCurrentActivity(session)).toBe("resumed");
+    expect(isDecisionCallbackAnswerable(session)).toBe(false);
+  });
+
+  it("rejects a verified blocked (error/stuck) agent", () => {
+    const session = makeSession({ activitySignal: signal("valid", "blocked") });
+    expect(classifyCurrentActivity(session)).toBe("blocked");
+    expect(isDecisionCallbackAnswerable(session)).toBe(false);
+  });
+
+  it("fails closed when current activity could not be verified/refreshed", () => {
+    // Stale/unavailable/null/probe-failure signals, an exited process, and a
+    // metadata-only session with no structured signal all fail closed.
+    for (const s of [
+      signal("stale", "waiting_input"),
+      signal("unavailable", null),
+      signal("null", null),
+      signal("probe_failure", null),
+      signal("valid", "exited"),
+    ]) {
+      const session = makeSession({ activitySignal: s });
+      expect(classifyCurrentActivity(session)).toBe("unverifiable");
+      expect(isDecisionCallbackAnswerable(session)).toBe(false);
+    }
+    const noSignal = makeSession({ activity: "waiting_input" });
+    expect(classifyCurrentActivity(noSignal)).toBe("unverifiable");
+    expect(isDecisionCallbackAnswerable(noSignal)).toBe(false);
   });
 });
 

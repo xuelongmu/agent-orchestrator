@@ -83,12 +83,17 @@ const mockConfig: OrchestratorConfig = {
 
 function makeSession(overrides: Partial<Session> = {}): Session {
   // Minimal shape the route + isTerminalSession read. A waiting_input,
-  // non-terminal session is the "decision still pending" default.
+  // non-terminal session is the "decision still pending" default. The dispatch
+  // gate reads the freshly-probed activitySignal, so default a VALID signal that
+  // matches `activity` (get() enriches from a live probe); tests override
+  // `activitySignal` to model stale/unavailable/blocked probes.
+  const activity = overrides.activity ?? "waiting_input";
   return {
     id: "ao-5",
     projectId: "ao",
     status: "working",
-    activity: "waiting_input",
+    activity,
+    activitySignal: { state: "valid", activity, source: "native" },
     metadata: reportMeta(DECISION_AT),
     ...overrides,
   } as unknown as Session;
@@ -544,6 +549,46 @@ describe("POST /api/notify-callback/[token]", () => {
     const res = await callGet(token("approve"));
     expect(res.status).toBe(409);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for ALL actions when the under-lock re-fetch shows a blocked agent (409)", async () => {
+    // Finding #5 (round 18): the outer read is answerable, but by dispatch the fresh
+    // probe says the agent hit an error. The nonce still matches (blocked doesn't
+    // clear the report), so ONLY the verified-activity gate rejects here — stale
+    // canonical needs_input must not authorize a mutating action, especially Kill,
+    // into an error/stuck state.
+    for (const action of ["approve", "deny", "nudge", "kill"] as const) {
+      get
+        .mockResolvedValueOnce(makeSession())
+        .mockResolvedValueOnce(
+          makeSession({ activity: "blocked", lifecycle: makeLifecycle("needs_input") }),
+        );
+      const res = await callGet(token(action));
+      expect(res.status).toBe(409);
+    }
+    expect(send).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("fails closed (esp. Kill) when the under-lock re-fetch cannot verify activity (409)", async () => {
+    // Finding #2 (round 18): the fresh probe could not confirm current activity — an
+    // external/unregistered agent plugin, or an unavailable/stale signal. metadata-
+    // only needs_input must not authorize a mutating action; Kill especially must
+    // never proceed on unverified state.
+    for (const action of ["approve", "deny", "nudge", "kill"] as const) {
+      get
+        .mockResolvedValueOnce(makeSession())
+        .mockResolvedValueOnce(
+          makeSession({
+            lifecycle: makeLifecycle("needs_input"),
+            activitySignal: { state: "unavailable", activity: null, source: "none" },
+          } as Partial<Session>),
+        );
+      const res = await callGet(token(action));
+      expect(res.status).toBe(409);
+    }
+    expect(send).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
   });
 
   it("rejects a cross-project session id collision (404)", async () => {

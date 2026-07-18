@@ -5,6 +5,8 @@ import {
   SessionNotFoundError,
   isValidSessionIdComponent,
   activeDecisionId,
+  classifyCurrentActivity,
+  isDecisionCallbackAnswerable,
   consumeDecision,
   getNotifyCallbackSecret,
   isNudgeBlocked,
@@ -361,7 +363,23 @@ export async function POST(
         (fresh.lifecycle?.session.state === "needs_input" ||
           fresh.activity === ACTIVITY_STATE.WAITING_INPUT);
       const freshDecisionId = fresh ? activeDecisionId(fresh) : null;
-      if (!freshPending || freshDecisionId === null || freshDecisionId !== decisionId) {
+      // Every action reaching this route mutates the session (Approve/Deny/Nudge/
+      // Kill), so gate ALL of them on VERIFIED current answerability, failing
+      // CLOSED. The canonical needs_input above is metadata-only evidence; it must
+      // not by itself authorize a dispatch when the freshly-probed activity says the
+      // agent resumed (active), hit an error (blocked), or could not be verified at
+      // all (external/unregistered agent plugin, stale/unavailable/null/probe-failure
+      // signal). In particular Kill must never land on already-resumed work, an
+      // error/stuck session, or a session whose current state we could not refresh.
+      // (round 18 review, findings #2 & #5)
+      const activityVerdict = fresh ? classifyCurrentActivity(fresh) : "unverifiable";
+      const answerable = !!fresh && isDecisionCallbackAnswerable(fresh);
+      if (
+        !freshPending ||
+        !answerable ||
+        freshDecisionId === null ||
+        freshDecisionId !== decisionId
+      ) {
         recordApiObservation({
           config,
           method: "POST",
@@ -373,7 +391,7 @@ export async function POST(
           projectId: resolvedProjectId,
           sessionId,
           reason: "decision no longer pending at dispatch",
-          data: { action },
+          data: { action, activityVerdict },
         });
         recordActivityEvent({
           projectId: resolvedProjectId,
@@ -381,8 +399,8 @@ export async function POST(
           source: "api",
           kind: "api.notify_callback.stale",
           level: "warn",
-          summary: `notification action "${action}" ignored — decision resolved or agent resumed before dispatch for session ${sessionId}`,
-          data: { action },
+          summary: `notification action "${action}" ignored — decision resolved, agent resumed, or current activity unverified (${activityVerdict}) before dispatch for session ${sessionId}`,
+          data: { action, activityVerdict },
         });
         return htmlResponse(
           409,

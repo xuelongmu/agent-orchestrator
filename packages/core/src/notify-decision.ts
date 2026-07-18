@@ -105,12 +105,34 @@ export type DecisionEpisodeTransition =
  * Strictly-after comparison on two ISO instants, `false` if either is absent or
  * unparseable — so a missing/garbled boundary can never trigger a retirement.
  */
-function isBoundaryAfter(candidate: string | null, stamped: string): boolean {
+function isBoundaryAfter(candidate: string | null, stamped: string | null): boolean {
   if (!candidate || !stamped) return false;
   const a = Date.parse(candidate);
   const b = Date.parse(stamped);
   if (Number.isNaN(a) || Number.isNaN(b)) return false;
   return a > b;
+}
+
+/**
+ * Whether the session's current metadata holds a FRESH successor decision report B
+ * — one reported after A's episode began (`> stamped`) and no later than the agent's
+ * advanced re-park boundary (`<= episodeBoundary`, since the agent writes B just
+ * before blocking on it). A's own report was written at or before A parked
+ * (`<= stamped`), so it never qualifies, and a spurious far-future timestamp
+ * (`> episodeBoundary`) is not a genuine re-park report either. Used to keep B live
+ * when the boundary advances past A instead of retiring it with A. (round 18 review)
+ */
+function hasFreshSuccessorReport(
+  session: Session,
+  stamped: string,
+  episodeBoundary: string | null,
+): boolean {
+  const report = readAgentReport(session.metadata);
+  if (!report || !isDecisionReportState(report.state)) return false;
+  return (
+    isBoundaryAfter(report.timestamp, stamped) &&
+    !isBoundaryAfter(report.timestamp, episodeBoundary)
+  );
 }
 
 export function decisionEpisodeTransition(
@@ -132,7 +154,21 @@ export function decisionEpisodeTransition(
     }
     // Already parked and stamped: the only reason to touch the record is the agent
     // demonstrably moving past the marked prompt (see BETWEEN-POLLS RE-PARK above).
-    if (isBoundaryAfter(episodeBoundary, stamped)) return { kind: "retire" };
+    if (isBoundaryAfter(episodeBoundary, stamped)) {
+      // The agent left A's marked prompt. If the metadata already carries a FRESH
+      // successor decision report B (written after A's episode, by the time the
+      // agent re-parked), this is a new decision — restamp the episode to the
+      // advanced boundary so B keeps its own live identity instead of being retired
+      // with A. Only when the sole report is A's spent one (a bare prompt B with no
+      // new report) do we retire. (round 18 review)
+      if (hasFreshSuccessorReport(session, stamped, episodeBoundary)) {
+        return {
+          kind: "stamp",
+          patch: { [NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT]: episodeBoundary ?? nowIso },
+        };
+      }
+      return { kind: "retire" };
+    }
     return null;
   }
   if (stamped) return { kind: "retire" };
@@ -196,12 +232,18 @@ export function activeDecisionId(session: Session): string | null {
   // already-resumed work before the next lifecycle poll persists the transition.
   // Parked/ready/idle activities keep a legitimately-waiting decision answerable.
   // At mint the session is parked (waiting_input is why it is a needs_input
-  // decision), so this never suppresses a genuine control. Prefer the CURRENT
-  // poll's activitySignal over the persisted session.activity, which can lag a
-  // poll behind — a report can map canonical lifecycle to needs_input while the
-  // fresh native signal still reads active. (#13 review)
-  const liveActivity = session.activitySignal?.activity ?? session.activity;
-  if (liveActivity === ACTIVITY_STATE.ACTIVE) return null;
+  // decision), so this never suppresses a genuine control. Suppress for CURRENT
+  // active activity ONLY when that reading is trustworthy: a *valid* activitySignal
+  // saying "active" means the agent demonstrably resumed work, authoritative even
+  // when the persisted canonical state still lags at needs_input. A STALE active
+  // signal is weak evidence and must NOT strip controls from a fresh decision
+  // report; when there is no structured signal at all, fall back to the persisted
+  // session.activity (the safe pre-signal behaviour). (round 18 review)
+  const signal = session.activitySignal;
+  const currentlyActive = signal
+    ? signal.state === "valid" && signal.activity === ACTIVITY_STATE.ACTIVE
+    : session.activity === ACTIVITY_STATE.ACTIVE;
+  if (currentlyActive) return null;
   const report = readAgentReport(session.metadata);
   if (!isDecisionReportActive(session, report) || !report) return null;
   const episodeAt = session.metadata?.[NOTIFY_DECISION_METADATA_KEYS.EPISODE_AT] ?? "";
@@ -209,6 +251,56 @@ export function activeDecisionId(session: Session): string | null {
   // answer, so there is nothing to bind a mutating action to.
   if (!episodeAt) return null;
   return `${report.timestamp}:${episodeAt}`;
+}
+
+/**
+ * Verdict on a session's CURRENT (freshly probed) activity, used to gate mutating
+ * decision callbacks. Read from the structured `activitySignal` — the per-poll /
+ * enrichment probe — never the persisted `session.activity`, which lags a poll
+ * behind:
+ *
+ *  - "answerable":   a VALID signal shows the agent parked/idle/ready — a human
+ *                    control may act on the pending decision.
+ *  - "resumed":      a VALID signal shows the agent went active again.
+ *  - "blocked":      a VALID signal shows the agent hit an unrecoverable error.
+ *  - "unverifiable": no current/valid signal (stale, unavailable, null, probe
+ *                    failure, `exited`, or an external/unregistered agent plugin
+ *                    that cannot be probed) — current activity could not be
+ *                    confirmed.
+ *
+ * (round 18 review)
+ */
+export type CurrentActivityVerdict = "answerable" | "resumed" | "blocked" | "unverifiable";
+
+export function classifyCurrentActivity(session: Session): CurrentActivityVerdict {
+  const signal = session.activitySignal;
+  if (!signal || signal.state !== "valid" || signal.activity === null) return "unverifiable";
+  switch (signal.activity) {
+    case ACTIVITY_STATE.ACTIVE:
+      return "resumed";
+    case ACTIVITY_STATE.BLOCKED:
+      return "blocked";
+    case ACTIVITY_STATE.WAITING_INPUT:
+    case ACTIVITY_STATE.IDLE:
+    case ACTIVITY_STATE.READY:
+      return "answerable";
+    default:
+      // `exited` or anything else: not a live, answerable prompt.
+      return "unverifiable";
+  }
+}
+
+/**
+ * Whether a mutating decision callback (Approve/Deny/Nudge/Kill) may act on the
+ * session's CURRENT activity. Fails CLOSED: only a positively-verified answerable
+ * activity authorizes a dispatch. A resumed or blocked agent, or any activity that
+ * could not be verified/refreshed (external/unregistered agent, stale/unavailable
+ * signal), rejects — so a destructive action (especially Kill) never lands on
+ * already-resumed work, an errored/stuck session, or metadata-only needs_input
+ * evidence. (round 18 review)
+ */
+export function isDecisionCallbackAnswerable(session: Session): boolean {
+  return classifyCurrentActivity(session) === "answerable";
 }
 
 /**

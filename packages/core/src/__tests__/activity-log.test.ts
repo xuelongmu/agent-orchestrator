@@ -50,6 +50,36 @@ describe("classifyTerminalActivity", () => {
     expect(result.state).toBe("blocked");
     expect(result.trigger).toBeDefined();
   });
+
+  it("has no fingerprint for a non-actionable state", () => {
+    const detect = () => "active" as ActivityState;
+    expect(classifyTerminalActivity("some output", detect).fingerprint).toBeUndefined();
+  });
+
+  it("fingerprints the full context, so an identical prompt after different work differs", () => {
+    // Last three lines are identical (same trigger), but the broader context — the
+    // intervening work above the prompt — differs. The fingerprint must diverge so
+    // the second prompt is recognized as a genuinely new boundary. (round 18 review)
+    const detect = () => "waiting_input" as ActivityState;
+    const promptA = classifyTerminalActivity(
+      "ran task A\ncontext line 1\ncontext line 2\nApprove this? (y/n)",
+      detect,
+    );
+    const promptB = classifyTerminalActivity(
+      "ran task B instead\ncontext line 1\ncontext line 2\nApprove this? (y/n)",
+      detect,
+    );
+    expect(promptA.trigger).toBe(promptB.trigger); // same last 3 lines
+    expect(promptA.fingerprint).toBeDefined();
+    expect(promptA.fingerprint).not.toBe(promptB.fingerprint);
+  });
+
+  it("fingerprints a byte-identical screen stably across observations", () => {
+    const detect = () => "waiting_input" as ActivityState;
+    const first = classifyTerminalActivity("work\nApprove this? (y/n)", detect);
+    const second = classifyTerminalActivity("work\nApprove this? (y/n)", detect);
+    expect(first.fingerprint).toBe(second.fingerprint);
+  });
 });
 
 describe("checkActivityLogState", () => {
@@ -355,5 +385,49 @@ describe("recordTerminalActivity", () => {
     const content = await rf(getActivityLogPath(tmpDir), "utf-8");
     const lines = content.trim().split("\n").filter(Boolean);
     expect(lines).toHaveLength(2);
+  });
+
+  it("appends a text-identical prompt that follows intervening work (new boundary)", async () => {
+    // A resolves; the agent works, then reaches prompt B whose LAST LINES are
+    // text-identical to A entirely between polls. Same state + same last-3-lines
+    // trigger, but the broader terminal context differs (the intervening work), so
+    // the fingerprint diverges and B must append a fresh entry with a new ts — a
+    // trigger-only dedup would wrongly collapse them and freeze A's boundary onto
+    // B, retiring a live decision. (round 18 review, finding #3)
+    const detect = () => "waiting_input" as ActivityState;
+    await recordTerminalActivity(
+      tmpDir,
+      "ran task A\ncontext line 1\ncontext line 2\nApprove this? (y/n)",
+      detect,
+    );
+    const first = await readLastActivityEntry(tmpDir);
+
+    await recordTerminalActivity(
+      tmpDir,
+      "ran task B instead\ncontext line 1\ncontext line 2\nApprove this? (y/n)",
+      detect,
+    );
+    const second = await readLastActivityEntry(tmpDir);
+
+    const { readFile: rf } = await import("node:fs/promises");
+    const content = await rf(getActivityLogPath(tmpDir), "utf-8");
+    const lines = content.trim().split("\n").filter(Boolean);
+    expect(lines).toHaveLength(2);
+    // Same last 3 lines (trigger), but a new durable boundary was recorded.
+    expect(second!.entry.trigger).toBe(first!.entry.trigger);
+    expect(second!.entry.ts).not.toBe(first!.entry.ts);
+  });
+
+  it("persists the fingerprint on actionable entries and dedupes on it", async () => {
+    const detect = () => "waiting_input" as ActivityState;
+    await recordTerminalActivity(tmpDir, "work\nApprove this? (y/n)", detect);
+    const entry = await readLastActivityEntry(tmpDir);
+    expect(entry!.entry.fingerprint).toBeDefined();
+
+    // A byte-identical re-observation dedupes (no new line, boundary frozen).
+    await recordTerminalActivity(tmpDir, "work\nApprove this? (y/n)", detect);
+    const { readFile: rf } = await import("node:fs/promises");
+    const content = await rf(getActivityLogPath(tmpDir), "utf-8");
+    expect(content.trim().split("\n").filter(Boolean)).toHaveLength(1);
   });
 });

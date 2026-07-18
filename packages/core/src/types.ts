@@ -195,6 +195,14 @@ export interface ActivityLogEntry {
   source: "terminal" | "native" | "hook";
   /** Raw terminal snippet, hook event name, or other context that caused waiting_input/blocked (for debugging) */
   trigger?: string;
+  /**
+   * Compact fingerprint of the broader terminal context for an actionable
+   * (waiting_input/blocked) observation. Stable while the agent stays blocked at
+   * the exact same screen (repeated observations dedupe), but changes when
+   * intervening work precedes a text-identical prompt — so a genuinely new prompt
+   * gets a new durable boundary even when its last lines match the previous one.
+   */
+  fingerprint?: string;
 }
 
 /** Default threshold (ms) before a "ready" session becomes "idle". */

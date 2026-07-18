@@ -364,15 +364,18 @@ export {
   NOTIFY_DECISION_METADATA_KEYS,
   RESOLVING_CALLBACK_ACTIONS,
   activeDecisionId,
+  classifyCurrentActivity,
   clearSpentDecision,
   clearedDecisionMetadata,
   consumeDecision,
   decisionEpisodeTransition,
+  isDecisionCallbackAnswerable,
   isNudgeBlocked,
   isParkedOnDecision,
   isResolvingCallbackAction,
   releaseDecision,
   storedDecisionId,
+  type CurrentActivityVerdict,
 } from "./notify-decision.js";
 export {
   recordNotificationDelivery,

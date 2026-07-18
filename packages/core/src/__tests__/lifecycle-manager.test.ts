@@ -2913,6 +2913,47 @@ describe("reactions", () => {
       expect(meta?.["notifyDecisionEpisodeAt"]).toBe(episodeAt);
       expect(meta?.["agentReportedState"]).toBe("needs_input");
     });
+
+    it("restamps the episode and KEEPS a fresh successor report B instead of retiring it", async () => {
+      // Finding #4 (round 18): the agent resolved A, worked, and re-parked on a NEW
+      // decision B — writing a fresh report — entirely between polls. The activity
+      // boundary advanced past A's marker, but B's report (written after A's episode,
+      // by the time the agent re-parked) is already in metadata. The poll must
+      // restamp the episode to the advanced boundary and KEEP B, not retire it with A.
+      const oldEpisode = new Date(Date.now() - 90_000).toISOString(); // A's stamp
+      const boundaryB = new Date(); // agent's advanced activity boundary (past A)
+      const reportBAt = new Date(Date.now() - 30_000).toISOString(); // after A's episode, before re-park
+      const metaB = () => ({
+        agent: "mock-agent",
+        createdAt: CREATED_AT.toISOString(),
+        agentReportedState: "needs_input",
+        agentReportedAt: reportBAt,
+        notifyDecisionEpisodeAt: oldEpisode,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({
+        state: "waiting_input",
+        timestamp: boundaryB,
+      });
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "needs_input",
+          activity: "waiting_input",
+          createdAt: CREATED_AT,
+          metadata: metaB(),
+        }),
+        metaOverrides: metaB(),
+      });
+      updateMetadata(env.sessionsDir, "app-1", metaB());
+
+      await lm.check("app-1");
+
+      const meta = readMetadataRaw(env.sessionsDir, "app-1");
+      // Episode restamped to the advanced boundary — not cleared, not the old marker.
+      expect(meta?.["notifyDecisionEpisodeAt"]).toBe(boundaryB.toISOString());
+      // B's report survived (would have been cleared by a retire).
+      expect(meta?.["agentReportedState"]).toBe("needs_input");
+      expect(meta?.["agentReportedAt"]).toBe(reportBAt);
+    });
   });
 
   it("triggers send-to-agent reaction on CI failure", async () => {
