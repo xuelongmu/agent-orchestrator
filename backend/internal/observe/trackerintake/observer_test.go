@@ -59,6 +59,65 @@ func TestPollSpawnsWorkerForEligibleIssue(t *testing.T) {
 	}
 }
 
+func TestPollRespectsPerProjectConcurrencyLimit(t *testing.T) {
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{{
+			ID:            "demo",
+			RepoOriginURL: "https://github.com/acme/demo.git",
+			Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+				Enabled:       true,
+				Assignee:      "alice",
+				MaxConcurrent: 3,
+			}},
+		}},
+		sessions: []domain.SessionRecord{
+			{ID: "demo-1", ProjectID: "demo", Kind: domain.KindWorker},
+			{ID: "demo-2", ProjectID: "demo", Kind: domain.KindWorker},
+			{ID: "demo-orch", ProjectID: "demo", Kind: domain.KindOrchestrator},
+			{ID: "demo-old", ProjectID: "demo", Kind: domain.KindWorker, IsTerminated: true},
+			{ID: "other-1", ProjectID: "other", Kind: domain.KindWorker},
+		},
+	}
+	tracker := &fakeTracker{issues: []domain.Issue{
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#1"}, State: domain.IssueOpen, Assignees: []string{"alice"}},
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#2"}, State: domain.IssueOpen, Assignees: []string{"alice"}},
+	}}
+	spawner := &fakeSpawner{}
+
+	if err := New(singleResolver(tracker), store, spawner, Config{Logger: discardLogger()}).Poll(context.Background()); err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+	if len(spawner.calls) != 1 {
+		t.Fatalf("spawn calls = %d, want 1 available slot", len(spawner.calls))
+	}
+	if len(tracker.filters) != 1 {
+		t.Fatalf("tracker filters = %+v, want one query", tracker.filters)
+	}
+}
+
+func TestPollSkipsTrackerWhenProjectAtConcurrencyLimit(t *testing.T) {
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{{
+			ID:            "demo",
+			RepoOriginURL: "https://github.com/acme/demo.git",
+			Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+				Enabled:       true,
+				Assignee:      "alice",
+				MaxConcurrent: 1,
+			}},
+		}},
+		sessions: []domain.SessionRecord{{ID: "demo-1", ProjectID: "demo", Kind: domain.KindWorker}},
+	}
+	tracker := &fakeTracker{}
+
+	if err := New(singleResolver(tracker), store, &fakeSpawner{}, Config{Logger: discardLogger()}).Poll(context.Background()); err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+	if len(tracker.repos) != 0 {
+		t.Fatalf("tracker calls = %d, want 0 at capacity", len(tracker.repos))
+	}
+}
+
 func TestPollSkipsExistingIssueSessionsAfterRestart(t *testing.T) {
 	store := &fakeStore{
 		projects: []domain.ProjectRecord{{

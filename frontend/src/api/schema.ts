@@ -1158,6 +1158,7 @@ export interface components {
         TrackerIntakeConfig: {
             assignee?: string;
             enabled?: boolean;
+            maxConcurrent?: number;
             /** @enum {string} */
             provider?: "github";
             repo?: string;

@@ -142,6 +142,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 		return err
 	}
 	seen := seenIssueIDs(sessions)
+	activeWorkers := activeWorkerCounts(sessions)
 	for _, project := range enabledProjects {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -150,7 +151,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 			o.logger.Debug("tracker intake: project in failure backoff", "project", project.ID, "until", until)
 			continue
 		}
-		if failed := o.pollProject(ctx, project, seen); failed {
+		if failed := o.pollProject(ctx, project, seen, activeWorkers[domain.ProjectID(project.ID)]); failed {
 			o.backoffUntil[project.ID] = now.Add(o.failureBackoff)
 		} else {
 			delete(o.backoffUntil, project.ID)
@@ -161,7 +162,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 
 // pollProject returns failed=true for conditions that should be retried after a
 // backoff window rather than logged on every poll.
-func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord, seen map[domain.IssueID]bool) (failed bool) {
+func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord, seen map[domain.IssueID]bool, activeWorkers int) (failed bool) {
 	cfg := project.Config.TrackerIntake.WithDefaults()
 	if !cfg.Enabled {
 		return false
@@ -169,6 +170,11 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 	if err := cfg.Validate(); err != nil {
 		o.logger.Warn("tracker intake: skipping project with invalid config", "project", project.ID, "err", err)
 		return true
+	}
+	available := cfg.MaxConcurrent - activeWorkers
+	if available <= 0 {
+		o.logger.Debug("tracker intake: project at concurrency limit", "project", project.ID, "active", activeWorkers, "limit", cfg.MaxConcurrent)
+		return false
 	}
 	repo, ok := trackerRepo(project, cfg)
 	if !ok {
@@ -189,7 +195,11 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 		return true
 	}
 	var spawnFailed bool
+	spawned := 0
 	for _, issue := range issues {
+		if spawned >= available {
+			break
+		}
 		if ctx.Err() != nil {
 			return true
 		}
@@ -214,8 +224,19 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 			continue
 		}
 		seen[issueID] = true
+		spawned++
 	}
 	return spawnFailed
+}
+
+func activeWorkerCounts(sessions []domain.SessionRecord) map[domain.ProjectID]int {
+	counts := make(map[domain.ProjectID]int)
+	for _, sess := range sessions {
+		if sess.Kind == domain.KindWorker && !sess.IsTerminated {
+			counts[sess.ProjectID]++
+		}
+	}
+	return counts
 }
 
 func issueMatchesConfig(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool {
