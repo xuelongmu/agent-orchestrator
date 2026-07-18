@@ -4390,8 +4390,28 @@ describe("reactions", () => {
     };
 
     const batchMock = mockBatchEnrichment({ reviewDecision: "changes_requested" });
+    let changesRequested = true;
     const mockSCM = createMockSCM({
       enrichSessionsPRBatch: batchMock,
+      getReviewDecision: vi.fn().mockImplementation(async () =>
+        changesRequested ? "changes_requested" : "none",
+      ),
+      getReviewThreads: vi.fn().mockImplementation(async () => ({
+        threads: [],
+        reviews: changesRequested
+          ? [
+              {
+                author: "reviewer",
+                state: "CHANGES_REQUESTED",
+                body: "Required changes",
+                submittedAt: new Date(),
+                commitSha: "sha-head",
+              },
+            ]
+          : [],
+        headSha: "sha-head",
+        threadsTruncated: false,
+      })),
     });
     const registry = createMockRegistry({
       runtime: plugins.runtime,
@@ -4413,12 +4433,14 @@ describe("reactions", () => {
     vi.mocked(mockSessionManager.send).mockClear();
 
     // Transition away — tracker clears (non-persistent key)
+    changesRequested = false;
     vi.mocked(mockSCM.enrichSessionsPRBatch!).mockImplementation(
       mockBatchEnrichment({ ciStatus: "passing", reviewDecision: "none" }),
     );
     await lm.check("app-1");
 
     // Transition back — fresh tracker (attempt 1 again, NOT 2)
+    changesRequested = true;
     vi.mocked(mockSCM.enrichSessionsPRBatch!).mockImplementation(
       mockBatchEnrichment({ reviewDecision: "changes_requested" }),
     );
@@ -4426,12 +4448,14 @@ describe("reactions", () => {
     expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
 
     // Transition away and back again — still attempt 1, not escalating
+    changesRequested = false;
     vi.mocked(mockSCM.enrichSessionsPRBatch!).mockImplementation(
       mockBatchEnrichment({ ciStatus: "passing", reviewDecision: "none" }),
     );
     await lm.check("app-1");
     vi.mocked(mockSessionManager.send).mockClear();
 
+    changesRequested = true;
     vi.mocked(mockSCM.enrichSessionsPRBatch!).mockImplementation(
       mockBatchEnrichment({ reviewDecision: "changes_requested" }),
     );
