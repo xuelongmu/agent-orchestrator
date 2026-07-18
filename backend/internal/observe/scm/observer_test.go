@@ -1134,6 +1134,60 @@ func TestPoll_CIPassingForcesExactHeadReviewRefreshBeforeReady(t *testing.T) {
 	}
 }
 
+func TestPoll_CoordinationRefreshesPassingBlockedHeadWithCachedReviewHashAfterRestart(t *testing.T) {
+	store := testStoreWithSession()
+	review := ports.SCMReviewObservation{
+		Decision: string(domain.ReviewRequired),
+		HeadSHA:  "sha1",
+	}
+	local := knownPR(1)
+	local.CI = domain.CIPassing
+	local.Review = domain.ReviewRequired
+	local.Mergeability = domain.MergeBlocked
+	local.ReviewHash = reviewSemanticHash(review)
+	store.prs["p-1"] = []domain.PullRequest{local}
+
+	provider := &fakeProvider{
+		repoGuards: map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "repo", NotModified: true}},
+		reviews:    map[string]ports.SCMReviewObservation{prKey(testRepo, 1): review},
+	}
+	coordinator := &fakeReviewCoordinator{}
+	obs := New(provider, store, &fakeLifecycle{}, Config{
+		Clock: func() time.Time { return time.Unix(200, 0).UTC() }, Tick: time.Hour,
+		Logger: quietSlog(), CacheMax: 128, ReviewCoordinator: coordinator,
+	})
+
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.reviewCalls != 1 {
+		t.Fatalf("review calls = %d, want exact-head refresh despite cached hash", provider.reviewCalls)
+	}
+	if len(coordinator.observed) != 1 {
+		t.Fatalf("coordinator observations = %#v, want one complete snapshot", coordinator.observed)
+	}
+	if len(store.writes) != 0 {
+		t.Fatalf("unchanged cached snapshot wrote durable facts again: %#v", store.writes)
+	}
+	got := coordinator.observed[0]
+	if got.Review.HeadSHA != got.PR.HeadSHA || got.Review.HeadSHA != "sha1" || got.Review.Partial {
+		t.Fatalf("coordinator snapshot = %#v, want complete exact-head review facts", got)
+	}
+}
+
+func TestCoordinationObservationNeedsReviewSnapshotWhileProviderBlocksOnReview(t *testing.T) {
+	obs := testObs(1)
+	obs.Review.Decision = string(domain.ReviewRequired)
+	obs.Mergeability = ports.SCMMergeabilityObservation{State: string(domain.MergeBlocked)}
+	if !coordinationObservationNeedsReviewSnapshot(obs) {
+		t.Fatal("passing exact head must fetch review facts even when provider mergeability is review-blocked")
+	}
+	obs.CI.Summary = string(domain.CIFailing)
+	if coordinationObservationNeedsReviewSnapshot(obs) {
+		t.Fatal("failing head must not trigger automatic-review snapshot fetch")
+	}
+}
+
 func TestPoll_UnchangedHashesDoNotWriteOrNotify(t *testing.T) {
 	store := testStoreWithSession()
 	obsValue := testObs(1)

@@ -37,3 +37,18 @@ func TestReviewTextsIncludesMultiPRQueue(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewTextsKeepsLowPriorityFindingsOutOfBlockingInlineThreads(t *testing.T) {
+	prompt, systemPrompt := reviewTexts(launchSpec())
+	for _, want := range []string{
+		"Create inline comments only for P0/P1 findings",
+		"Keep P2/P3 suggestions in the review summary body only",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if !strings.Contains(systemPrompt, "Do not post P2/P3 findings as inline comments") {
+		t.Fatalf("system prompt does not keep low-priority findings non-blocking:\n%s", systemPrompt)
+	}
+}

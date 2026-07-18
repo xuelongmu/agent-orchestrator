@@ -3,6 +3,7 @@ package review
 import (
 	stdctx "context"
 	"strings"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -12,6 +13,14 @@ import (
 // MaxAutomaticReviewRounds is the durable budget for one PR's automatic
 // review/fix loop. Manual review remains available after the coordinator stops.
 const MaxAutomaticReviewRounds = 6
+
+// Automatic reviewer launch failures are retried from durable review_run
+// timestamps. The exponential delay prevents a broken harness from being
+// relaunched every SCM poll, while the cap guarantees eventual retry cadence.
+const (
+	AutomaticReviewRetryBaseDelay = 30 * time.Second
+	AutomaticReviewRetryMaxDelay  = 15 * time.Minute
+)
 
 // CoordinateOutcome describes what the automatic review coordinator decided
 // for one authoritative PR observation.
@@ -54,13 +63,20 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 		return CoordinateResult{Outcome: CoordinateSatisfied, Round: round, Run: current}, nil
 	}
 	if hasCurrent {
-		outcome := CoordinateWaiting
-		if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictApproved && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
-			outcome = CoordinateSatisfied
-		} else if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictChangesRequested && !reviewBodyHasBlockingFindings(current.Body) && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
-			outcome = CoordinateSatisfied
+		if current.Status == domain.ReviewRunFailed || current.Status == domain.ReviewRunCancelled {
+			retryDelay := automaticReviewRetryDelay(coordinateRetryAttempts(runs, prURL, head))
+			if e.clock().Before(current.CreatedAt.Add(retryDelay)) {
+				return CoordinateResult{Outcome: CoordinateWaiting, Round: round, Run: current}, nil
+			}
+		} else {
+			outcome := CoordinateWaiting
+			if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictApproved && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
+				outcome = CoordinateSatisfied
+			} else if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictChangesRequested && !reviewBodyHasBlockingFindings(current.Body) && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
+				outcome = CoordinateSatisfied
+			}
+			return CoordinateResult{Outcome: outcome, Round: round, Run: current}, nil
 		}
-		return CoordinateResult{Outcome: outcome, Round: round, Run: current}, nil
 	}
 	if round >= MaxAutomaticReviewRounds {
 		return CoordinateResult{Outcome: CoordinateExhausted, Round: round}, nil
@@ -74,12 +90,15 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 		// A concurrent coordinator may have won the per-worker trigger lock after
 		// our initial ledger read. Reflect its durable current-head round rather
 		// than returning the stale pre-lock count.
-		if triggered.Run.PRURL == prURL && triggered.Run.TargetSHA == head {
+		if !hasCurrent && triggered.Run.PRURL == prURL && triggered.Run.TargetSHA == head {
 			round++
 		}
 		return CoordinateResult{Outcome: CoordinateWaiting, Round: round, Run: triggered.Run}, nil
 	}
-	return CoordinateResult{Outcome: CoordinateStarted, Round: round + 1, Run: triggered.Run}, nil
+	if !hasCurrent {
+		round++
+	}
+	return CoordinateResult{Outcome: CoordinateStarted, Round: round, Run: triggered.Run}, nil
 }
 
 func coordinateEligible(obs ports.SCMObservation) bool {
@@ -111,6 +130,28 @@ func coordinateRunState(runs []domain.ReviewRun, prURL, currentHead string) (dom
 		}
 	}
 	return current, hasCurrent, len(distinctHeads)
+}
+
+func coordinateRetryAttempts(runs []domain.ReviewRun, prURL, head string) int {
+	attempts := 0
+	for _, run := range runs {
+		if run.PRURL == prURL && run.TargetSHA == head &&
+			(run.Status == domain.ReviewRunFailed || run.Status == domain.ReviewRunCancelled) {
+			attempts++
+		}
+	}
+	return attempts
+}
+
+func automaticReviewRetryDelay(attempts int) time.Duration {
+	delay := AutomaticReviewRetryBaseDelay
+	for attempt := 1; attempt < attempts && delay < AutomaticReviewRetryMaxDelay; attempt++ {
+		delay *= 2
+		if delay > AutomaticReviewRetryMaxDelay {
+			return AutomaticReviewRetryMaxDelay
+		}
+	}
+	return delay
 }
 
 // A changes-requested result from an older reviewer may predate the priority
