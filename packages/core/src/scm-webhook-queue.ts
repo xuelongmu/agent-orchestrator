@@ -10,6 +10,7 @@ const WEBHOOK_QUEUE_VERSION = 1;
 const DEFAULT_RETRY_BASE_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 60_000;
 const DEFAULT_LEASE_MS = 10 * 60_000;
+const COMPLETED_DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
 interface WebhookDeliveryRecord {
   provider: string;
@@ -122,6 +123,23 @@ function makeDeliveryKey(provider: string, deliveryId: string | undefined): stri
   return deliveryId ? `${provider}:${deliveryId}` : `${provider}:unkeyed:${randomUUID()}`;
 }
 
+function pruneCompletedDeliveries(store: WebhookQueueStore, now: number): boolean {
+  const cutoff = now - COMPLETED_DELIVERY_RETENTION_MS;
+  const pendingDeliveryKeys = new Set(store.jobs.map((job) => job.deliveryKey));
+  let changed = false;
+  for (const [deliveryKey, delivery] of Object.entries(store.deliveries)) {
+    if (
+      delivery.completedAt !== undefined &&
+      delivery.completedAt < cutoff &&
+      !pendingDeliveryKeys.has(deliveryKey)
+    ) {
+      delete store.deliveries[deliveryKey];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 /**
  * Persist lifecycle work before acknowledging a verified webhook delivery.
  * A delivery ID is recorded before any handler runs, so GitHub redeliveries do
@@ -136,7 +154,9 @@ export function enqueueSCMWebhookDelivery(
   const deliveryKey = makeDeliveryKey(input.provider, input.deliveryId);
 
   return withWebhookQueue(path, (store) => {
+    const pruned = pruneCompletedDeliveries(store, now);
     if (input.deliveryId && store.deliveries[deliveryKey]) {
+      if (pruned) writeWebhookQueue(path, store);
       return { deliveryKey, duplicate: true, enqueuedJobs: 0 };
     }
 

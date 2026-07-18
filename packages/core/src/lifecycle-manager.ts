@@ -584,6 +584,10 @@ export interface LifecycleManagerDeps {
   projectId?: string;
 }
 
+function webhookSessionKey(projectId: string, sessionId: SessionId): string {
+  return JSON.stringify([projectId, sessionId]);
+}
+
 /** Track attempt counts for reactions per session. */
 interface ReactionTracker {
   attempts: number;
@@ -602,6 +606,15 @@ interface ReactionTracker {
 export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleManager {
   const { config, registry, sessionManager, projectId: scopedProjectId } = deps;
   const observer = createProjectObserver(config, "lifecycle-manager");
+  const projectUsesGithubSCM = (projectId: string): boolean => {
+    const pluginName = config.projects[projectId]?.scm?.plugin;
+    if (!pluginName) return false;
+    const scm = registry.get<SCM>("scm", pluginName);
+    return pluginName.toLowerCase() === "github" || scm?.name.toLowerCase() === "github";
+  };
+  const githubBackoffEnabled = scopedProjectId
+    ? projectUsesGithubSCM(scopedProjectId)
+    : Object.keys(config.projects).some(projectUsesGithubSCM);
 
   const states = new Map<SessionId, SessionStatus>();
   const activityStateCache = new Map<string, ActivityState>(); // sessionId → last observed activity
@@ -5288,9 +5301,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // poll completed successfully. This preserves lifecycle's ownership of
       // transitions while letting a web-process crash/failure retry durably on
       // the next CLI poll without an extra duplicate GitHub enrichment pass.
-      const sessionsById = new Map(sessions.map((session) => [session.id, session]));
-      const checkResultsById = new Map(
-        sessionsToCheck.map((session, index) => [session.id, sessionCheckResults[index]]),
+      const sessionsByProjectAndId = new Map(
+        sessions.map((session) => [webhookSessionKey(session.projectId, session.id), session]),
+      );
+      const checkResultsByProjectAndId = new Map(
+        sessionsToCheck.map((session, index) => [
+          webhookSessionKey(session.projectId, session.id),
+          sessionCheckResults[index],
+        ]),
       );
       const queueProjectIds = scopedProjectId
         ? [scopedProjectId]
@@ -5299,10 +5317,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         await processSCMWebhookQueue(
           queueProjectId,
           async (job) => {
-            const session = sessionsById.get(job.sessionId);
+            const sessionKey = webhookSessionKey(job.projectId, job.sessionId);
+            const session = sessionsByProjectAndId.get(sessionKey);
             if (!session || TERMINAL_STATUSES.has(session.status)) return;
 
-            const result = checkResultsById.get(job.sessionId);
+            const result = checkResultsByProjectAndId.get(sessionKey);
             if (!result) {
               throw new Error(`Session ${job.sessionId} was not checked in this poll`);
             }
@@ -5467,7 +5486,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       const runPollLoop = async (): Promise<void> => {
         await pollAll();
         if (!pollingStarted || generation !== pollGeneration) return;
-        const nextIntervalMs = getAdaptiveGithubPollInterval(intervalMs);
+        const nextIntervalMs = githubBackoffEnabled
+          ? getAdaptiveGithubPollInterval(intervalMs)
+          : intervalMs;
         pollTimer = setTimeout(() => {
           pollTimer = null;
           void runPollLoop();
@@ -5509,3 +5530,5 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     },
   };
 }
+
+export const _testUtils = { webhookSessionKey };

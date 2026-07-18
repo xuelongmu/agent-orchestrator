@@ -165,6 +165,24 @@ describe("getAdaptiveGithubPollInterval", () => {
     expect(getAdaptiveGithubPollInterval(30_000, observedAt)).toBe(30_000);
   });
 
+  it("keeps the lower quota when concurrent responses finish out of order", () => {
+    const reset = observedAt / 1_000 + 3_600;
+    observe({
+      rateLimitLimit: 5_000,
+      rateLimitRemaining: 20,
+      rateLimitReset: reset,
+      rateLimitResource: "core",
+    });
+    observe({
+      rateLimitLimit: 5_000,
+      rateLimitRemaining: 4_000,
+      rateLimitReset: reset,
+      rateLimitResource: "core",
+    });
+
+    expect(getAdaptiveGithubPollInterval(30_000, observedAt)).toBe(240_000);
+  });
+
   it("uses quota percentage for resources with smaller limits", () => {
     observe({
       rateLimitLimit: 30,

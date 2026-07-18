@@ -6,9 +6,18 @@ import { enqueueSCMWebhookDelivery, processSCMWebhookQueue } from "../scm-webhoo
 import type { SessionId } from "../types.js";
 
 describe("durable SCM webhook queue", () => {
+  type PersistedQueue = {
+    deliveries: Record<string, { completedAt?: number }>;
+    jobs: Array<{ deliveryKey: string; attemptCount: number; availableAt: number }>;
+  };
+  const DAY_MS = 24 * 60 * 60_000;
   let tempDir: string;
   let queuePath: string;
   let now: number;
+
+  function readQueue(): PersistedQueue {
+    return JSON.parse(readFileSync(queuePath, "utf-8")) as PersistedQueue;
+  }
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "ao-webhook-queue-"));
@@ -75,9 +84,7 @@ describe("durable SCM webhook queue", () => {
     expect(failed.failures).toHaveLength(1);
     expect(processor).toHaveBeenCalledTimes(1);
 
-    const persistedAfterFailure = JSON.parse(readFileSync(queuePath, "utf-8")) as {
-      jobs: Array<{ attemptCount: number; availableAt: number }>;
-    };
+    const persistedAfterFailure = readQueue();
     expect(persistedAfterFailure.jobs).toEqual([
       expect.objectContaining({ attemptCount: 1, availableAt: 2_000 }),
     ]);
@@ -126,5 +133,83 @@ describe("durable SCM webhook queue", () => {
       enqueuedBefore: now + 1,
     });
     expect(processor).toHaveBeenCalledTimes(1);
+  });
+
+  it("prunes completed delivery IDs after the dedupe retention window", async () => {
+    enqueueSCMWebhookDelivery(
+      {
+        provider: "github",
+        deliveryId: "delivery-old",
+        projectId: "my-app",
+        sessionIds: ["app-old" as SessionId],
+      },
+      { queuePath, now: () => now },
+    );
+    await processSCMWebhookQueue("my-app", async () => {}, {
+      queuePath,
+      now: () => now,
+    });
+
+    now += 8 * DAY_MS;
+    enqueueSCMWebhookDelivery(
+      {
+        provider: "github",
+        deliveryId: "delivery-new",
+        projectId: "my-app",
+        sessionIds: ["app-new" as SessionId],
+      },
+      { queuePath, now: () => now },
+    );
+
+    expect(readQueue().deliveries).not.toHaveProperty("github:delivery-old");
+    expect(readQueue().deliveries).toHaveProperty("github:delivery-new");
+  });
+
+  it("retains and deduplicates recently completed deliveries", async () => {
+    const input = {
+      provider: "github",
+      deliveryId: "delivery-recent",
+      projectId: "my-app",
+      sessionIds: ["app-recent" as SessionId],
+    };
+    enqueueSCMWebhookDelivery(input, { queuePath, now: () => now });
+    await processSCMWebhookQueue("my-app", async () => {}, {
+      queuePath,
+      now: () => now,
+    });
+
+    now += 6 * DAY_MS;
+    expect(enqueueSCMWebhookDelivery(input, { queuePath, now: () => now }).duplicate).toBe(true);
+    expect(readQueue().deliveries).toHaveProperty("github:delivery-recent");
+  });
+
+  it("never prunes pending deliveries or their jobs", () => {
+    enqueueSCMWebhookDelivery(
+      {
+        provider: "github",
+        deliveryId: "delivery-pending",
+        projectId: "my-app",
+        sessionIds: ["app-pending" as SessionId],
+      },
+      { queuePath, now: () => now },
+    );
+
+    now += 8 * DAY_MS;
+    enqueueSCMWebhookDelivery(
+      {
+        provider: "github",
+        deliveryId: "delivery-later",
+        projectId: "my-app",
+        sessionIds: ["app-later" as SessionId],
+      },
+      { queuePath, now: () => now },
+    );
+
+    const store = readQueue();
+    expect(store.deliveries).toHaveProperty("github:delivery-pending");
+    expect(store.jobs).toEqual([
+      expect.objectContaining({ deliveryKey: "github:delivery-pending" }),
+      expect.objectContaining({ deliveryKey: "github:delivery-later" }),
+    ]);
   });
 });

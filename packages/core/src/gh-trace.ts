@@ -139,11 +139,36 @@ function observeGithubRateLimit(entry: GhTraceEntry, observedAt = Date.now()): v
   const resource = entry.rateLimitResource ??
     (entry.graphqlRemaining !== undefined ? "graphql" : "core");
 
-  githubRateLimits.set(resource, {
+  const next: GithubRateLimitSnapshot = {
     limit: entry.rateLimitLimit,
     remaining,
     resetAt,
     observedAt,
+  };
+  const previous = githubRateLimits.get(resource);
+  if (!previous) {
+    githubRateLimits.set(resource, next);
+    return;
+  }
+
+  // Concurrent gh calls can complete out of order. Within the same reset
+  // window, retain the lowest observed quota so a stale higher response cannot
+  // cancel backoff. A later reset window is a genuine quota refresh; an older
+  // reset window is stale and must not replace the current snapshot.
+  if (
+    previous.resetAt !== undefined &&
+    next.resetAt !== undefined &&
+    next.resetAt !== previous.resetAt
+  ) {
+    if (next.resetAt > previous.resetAt) githubRateLimits.set(resource, next);
+    return;
+  }
+
+  githubRateLimits.set(resource, {
+    limit: next.limit ?? previous.limit,
+    remaining: Math.min(previous.remaining, next.remaining),
+    resetAt: next.resetAt ?? previous.resetAt,
+    observedAt: Math.max(previous.observedAt, next.observedAt),
   });
 }
 
