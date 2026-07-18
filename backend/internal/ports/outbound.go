@@ -22,6 +22,7 @@ type PRWriter interface {
 // review-thread/comment rows.
 type ReviewWriteMode int
 
+// Actionable PR checkout failure kinds.
 const (
 	// ReviewWritePreserve leaves stored review rows untouched. Metadata/CI-only
 	// refreshes and failed review fetches use this mode.
@@ -44,7 +45,10 @@ type SCMWriter interface {
 // PRClaimer atomically moves (or creates) a PR row for a target session and
 // persists the live SCM facts observed for that PR in the same transaction.
 type PRClaimer interface {
-	ClaimPR(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ReviewWriteMode, allowActiveTakeover bool) (ClaimOutcome, error)
+	// CheckPRClaim performs the same active-owner guard as ClaimPR without
+	// changing ownership. Callers use it before mutating a claimant workspace.
+	CheckPRClaim(ctx context.Context, prURL string, claimant domain.SessionID, allowActiveTakeover bool) (ClaimOutcome, error)
+	ClaimPR(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ReviewWriteMode, allowActiveTakeover bool, workspaceBranch string) (ClaimOutcome, error)
 }
 
 // ErrPRClaimedByActiveSession is returned by PRClaimer.ClaimPR when takeover is
@@ -67,6 +71,50 @@ type ClaimOutcome struct {
 	PreviousOwner   domain.SessionID
 	OwnerTerminated bool
 }
+
+// PRCheckoutErrorKind identifies a claim checkout failure that the caller can
+// correct or retry. These errors are intentionally typed so the HTTP boundary
+// does not turn local Git state into an opaque 500 response.
+type PRCheckoutErrorKind string
+
+const (
+	// PRCheckoutWorkspaceDirty means local changes prevent a safe checkout.
+	PRCheckoutWorkspaceDirty PRCheckoutErrorKind = "workspace_dirty"
+	// PRCheckoutFailed means Git or GitHub CLI could not prepare the branch.
+	PRCheckoutFailed PRCheckoutErrorKind = "checkout_failed"
+	// PRCheckoutHeadMismatch means checkout succeeded at a stale or unexpected commit.
+	PRCheckoutHeadMismatch PRCheckoutErrorKind = "head_mismatch"
+	// PRCheckoutBranchDiverged means the private claim branch has local commits to preserve.
+	PRCheckoutBranchDiverged PRCheckoutErrorKind = "branch_diverged"
+)
+
+// PRCheckoutError carries user-actionable checkout context without coupling
+// SCM adapters to HTTP response types.
+type PRCheckoutError struct {
+	Kind         PRCheckoutErrorKind
+	Branch       string
+	ExpectedHead string
+	ActualHead   string
+	Err          error
+}
+
+func (e PRCheckoutError) Error() string {
+	switch e.Kind {
+	case PRCheckoutWorkspaceDirty:
+		return fmt.Sprintf("claim workspace has uncommitted changes; cannot switch to branch %q safely", e.Branch)
+	case PRCheckoutHeadMismatch:
+		return fmt.Sprintf("claim workspace HEAD %s does not match PR head %s", e.ActualHead, e.ExpectedHead)
+	case PRCheckoutBranchDiverged:
+		return fmt.Sprintf("claim branch %q is at %s, not PR head %s; refusing to discard local commits", e.Branch, e.ActualHead, e.ExpectedHead)
+	default:
+		if e.Err != nil {
+			return fmt.Sprintf("claim checkout failed: %v", e.Err)
+		}
+		return "claim checkout failed"
+	}
+}
+
+func (e PRCheckoutError) Unwrap() error { return e.Err }
 
 // AgentMessenger injects a message into a running agent. An empty message
 // sends only the submit keystroke (Enter) — callers use it to nudge a pasted

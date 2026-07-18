@@ -280,15 +280,24 @@ func TestClaimPR_CreatesMovesAndGuardsActiveOwner(t *testing.T) {
 	seedProject(t, s, "mer")
 	first, _ := s.CreateSession(ctx, sampleRecord("mer"))
 	second, _ := s.CreateSession(ctx, sampleRecord("mer"))
+	if err := s.UpsertSessionWorktree(ctx, domain.SessionWorktreeRecord{SessionID: first.ID, RepoName: domain.RootWorkspaceRepoName, Branch: "ao/old", BaseSHA: "base", WorktreePath: "/ws/first"}); err != nil {
+		t.Fatal(err)
+	}
 	url := "https://github.com/acme/repo/pull/42"
 	pr := domain.PullRequest{URL: url, SessionID: first.ID, Number: 42, CI: domain.CIPassing, Mergeability: domain.MergeMergeable, UpdatedAt: time.Now().UTC()}
 
-	out, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, true)
+	out, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "ao/claim/"+string(first.ID)+"/pr-42/root")
 	if err != nil {
 		t.Fatalf("initial claim: %v", err)
 	}
 	if out.PreviousOwner != "" {
 		t.Fatalf("new claim previous owner = %q", out.PreviousOwner)
+	}
+	claimedBranch := "ao/claim/" + string(first.ID) + "/pr-42/root"
+	claimedSession, _, _ := s.GetSession(ctx, first.ID)
+	claimedWorktree, _, _ := s.GetSessionWorktree(ctx, first.ID, domain.RootWorkspaceRepoName)
+	if claimedSession.Metadata.Branch != claimedBranch || claimedWorktree.Branch != claimedBranch {
+		t.Fatalf("claim branches session=%q worktree=%q want=%q", claimedSession.Metadata.Branch, claimedWorktree.Branch, claimedBranch)
 	}
 	got, ok, err := s.GetPR(ctx, url)
 	if err != nil || !ok || got.SessionID != first.ID || got.Number != 42 {
@@ -296,7 +305,11 @@ func TestClaimPR_CreatesMovesAndGuardsActiveOwner(t *testing.T) {
 	}
 
 	pr.SessionID = second.ID
-	if _, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, false); !errors.Is(err, ports.ErrPRClaimedByActiveSession) {
+	preflight, err := s.CheckPRClaim(ctx, url, second.ID, false)
+	if !errors.Is(err, ports.ErrPRClaimedByActiveSession) || preflight.PreviousOwner != first.ID {
+		t.Fatalf("claim preflight = %+v, %v", preflight, err)
+	}
+	if _, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, false, "ao/claim/"+string(second.ID)+"/pr-42/root"); !errors.Is(err, ports.ErrPRClaimedByActiveSession) {
 		t.Fatalf("no-takeover err = %v, want ErrPRClaimedByActiveSession", err)
 	}
 	got, _, _ = s.GetPR(ctx, url)
@@ -304,7 +317,7 @@ func TestClaimPR_CreatesMovesAndGuardsActiveOwner(t *testing.T) {
 		t.Fatalf("active-owner refusal moved row to %s", got.SessionID)
 	}
 
-	out, err = s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, true)
+	out, err = s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "ao/claim/"+string(second.ID)+"/pr-42/root")
 	if err != nil {
 		t.Fatalf("takeover: %v", err)
 	}
@@ -333,7 +346,7 @@ func TestClaimPRCreatedCDCUsesClaimReviewDecision(t *testing.T) {
 		Review:    domain.ReviewChangesRequest,
 		UpdatedAt: time.Now().UTC(),
 	}
-	if _, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, true); err != nil {
+	if _, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, true, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -361,7 +374,7 @@ func TestClaimPR_TakesOverTerminatedOwnerAndEmitsSessionChangedCDC(t *testing.T)
 	second, _ := s.CreateSession(ctx, sampleRecord("mer"))
 	url := "https://github.com/acme/repo/pull/99"
 	pr := domain.PullRequest{URL: url, SessionID: first.ID, Number: 99, CI: domain.CIPassing, UpdatedAt: time.Now().UTC()}
-	if _, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, true); err != nil {
+	if _, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, true, ""); err != nil {
 		t.Fatal(err)
 	}
 	first.IsTerminated = true
@@ -371,7 +384,7 @@ func TestClaimPR_TakesOverTerminatedOwnerAndEmitsSessionChangedCDC(t *testing.T)
 	}
 
 	pr.SessionID = second.ID
-	out, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, false)
+	out, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, false, "")
 	if err != nil {
 		t.Fatalf("terminated takeover: %v", err)
 	}

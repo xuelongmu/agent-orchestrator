@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -92,11 +93,17 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	if s.scm == nil || s.prClaimer == nil {
 		return ClaimPRResult{}, ErrSCMUnavailable
 	}
+	claimLock := s.prClaimLock(prURL)
+	claimLock.Lock()
+	defer claimLock.Unlock()
 	repo, err := scmRepoForClaim(s.scm, project.RepoOriginURL, prURL)
 	if err != nil {
 		return ClaimPRResult{}, err
 	}
 	refSpec := ports.SCMPRRef{Repo: repo, Number: number, URL: prURL}
+	if _, err := s.prClaimer.CheckPRClaim(ctx, prURL, id, opts.AllowTakeover); err != nil {
+		return ClaimPRResult{}, err
+	}
 	obs, err := s.fetchClaimObservation(ctx, refSpec)
 	if err != nil {
 		return ClaimPRResult{}, err
@@ -114,13 +121,14 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	if err != nil {
 		return ClaimPRResult{}, err
 	}
-	branchChanged, err := s.scm.CheckoutPullRequest(ctx, refSpec, obs.PR, rec.Metadata.WorkspacePath)
+	workspaceBranch := fmt.Sprintf("ao/claim/%s/pr-%d/root", id, number)
+	branchChanged, err := s.scm.CheckoutPullRequest(ctx, refSpec, obs.PR, rec.Metadata.WorkspacePath, workspaceBranch)
 	if err != nil {
 		return ClaimPRResult{}, fmt.Errorf("checkout PR #%d: %w", number, err)
 	}
 	now := s.clock().UTC()
 	pr, checks, reviews, threads, comments := claimRowsFromSCM(id, obs, now)
-	outcome, err := s.prClaimer.ClaimPR(ctx, pr, checks, reviews, threads, comments, reviewMode, opts.AllowTakeover)
+	outcome, err := s.prClaimer.ClaimPR(ctx, pr, checks, reviews, threads, comments, reviewMode, opts.AllowTakeover, workspaceBranch)
 	if err != nil {
 		return ClaimPRResult{}, err
 	}
@@ -134,6 +142,18 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 		res.TakenOverFrom = []domain.SessionID{outcome.PreviousOwner}
 	}
 	return res, nil
+}
+
+func (s *Service) prClaimLock(prURL string) *sync.Mutex {
+	s.prClaimLocksMu.Lock()
+	defer s.prClaimLocksMu.Unlock()
+	if s.prClaimLocks == nil {
+		s.prClaimLocks = make(map[string]*sync.Mutex)
+	}
+	if s.prClaimLocks[prURL] == nil {
+		s.prClaimLocks[prURL] = &sync.Mutex{}
+	}
+	return s.prClaimLocks[prURL]
 }
 
 func (s *Service) fetchClaimObservation(ctx context.Context, ref ports.SCMPRRef) (ports.SCMObservation, error) {

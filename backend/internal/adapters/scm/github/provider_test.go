@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,24 +57,24 @@ func TestCheckoutPullRequestVerifiesBranchAndExactHead(t *testing.T) {
 	}{
 		{
 			name:        "checks out and verifies exact head",
-			outputs:     []string{"ao/mer-1\n", "old-sha\n", "", "", "fix/exact-head\n", "abc123\n"},
+			outputs:     []string{"ao/mer-1\n", "old-sha\n", "", "", "", "ao/claim/mer-1/pr-7/root\n", "abc123\n"},
 			wantChanged: true,
 			wantGH:      true,
 		},
 		{
 			name:    "rejects successful checkout at wrong head",
-			outputs: []string{"ao/mer-1\n", "old-sha\n", "", "", "fix/exact-head\n", "deadbeef\n"},
+			outputs: []string{"ao/mer-1\n", "old-sha\n", "", "", "", "ao/claim/mer-1/pr-7/root\n", "deadbeef\n"},
 			wantErr: "workspace HEAD deadbeef does not match PR head abc123",
 			wantGH:  true,
 		},
 		{
-			name:        "already on exact branch and head",
-			outputs:     []string{"fix/exact-head\n", "abc123\n"},
+			name:        "already on exact private branch and head",
+			outputs:     []string{"ao/claim/mer-1/pr-7/root\n", "abc123\n"},
 			wantChanged: false,
 		},
 		{
 			name:    "refuses dirty workspace",
-			outputs: []string{"ao/mer-1\n", "old-sha\n", " M work.go\n"},
+			outputs: []string{"ao/mer-1\n", "old-sha\n", "", " M work.go\n"},
 			wantErr: "uncommitted changes",
 		},
 	}
@@ -82,9 +83,11 @@ func TestCheckoutPullRequestVerifiesBranchAndExactHead(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
 			ghCalled := false
-			p := &Provider{runCheckout: func(_ context.Context, _ string, name string, _ ...string) (string, error) {
+			var ghArgs []string
+			p := &Provider{runCheckout: func(_ context.Context, _ string, name string, args ...string) (string, error) {
 				if name == "gh" {
 					ghCalled = true
+					ghArgs = append([]string(nil), args...)
 				}
 				if calls >= len(tc.outputs) {
 					t.Fatalf("unexpected command %s", name)
@@ -95,7 +98,7 @@ func TestCheckoutPullRequestVerifiesBranchAndExactHead(t *testing.T) {
 			}}
 			changed, err := p.CheckoutPullRequest(context.Background(), ports.SCMPRRef{
 				Repo: ports.SCMRepo{Owner: "acme", Name: "repo", Repo: "acme/repo"}, Number: 7,
-			}, ports.SCMPRObservation{Number: 7, SourceBranch: "fix/exact-head", HeadSHA: "abc123"}, "/ws")
+			}, ports.SCMPRObservation{Number: 7, SourceBranch: "fix/exact-head", HeadSHA: "abc123"}, "/ws", "ao/claim/mer-1/pr-7/root")
 			if tc.wantErr == "" && err != nil {
 				t.Fatal(err)
 			}
@@ -107,6 +110,50 @@ func TestCheckoutPullRequestVerifiesBranchAndExactHead(t *testing.T) {
 			}
 			if ghCalled != tc.wantGH {
 				t.Fatalf("gh called = %v, want %v", ghCalled, tc.wantGH)
+			}
+			if ghCalled && !slices.Equal(ghArgs, []string{"pr", "checkout", "7", "--repo", "acme/repo", "--branch", "ao/claim/mer-1/pr-7/root", "--force"}) {
+				t.Fatalf("gh args = %v", ghArgs)
+			}
+		})
+	}
+}
+
+func TestCheckoutPullRequestReturnsTypedActionableErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		outputs  []string
+		errors   []error
+		want     ports.PRCheckoutErrorKind
+		wantNoGH bool
+	}{
+		{name: "dirty", outputs: []string{"ao/mer-1\n", "old\n", "", " M work.go\n"}, want: ports.PRCheckoutWorkspaceDirty},
+		{name: "checkout", outputs: []string{"ao/mer-1\n", "old\n", "", "", ""}, errors: []error{nil, nil, nil, nil, errors.New("branch is already checked out")}, want: ports.PRCheckoutFailed},
+		{name: "head mismatch", outputs: []string{"ao/mer-1\n", "old\n", "", "", "", "ao/claim/mer-1/pr-7/root\n", "wrong\n"}, want: ports.PRCheckoutHeadMismatch},
+		{name: "local commits", outputs: []string{"ao/claim/mer-1/pr-7/root\n", "local-head\n", "local-head\n"}, want: ports.PRCheckoutBranchDiverged, wantNoGH: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			ghCalled := false
+			p := &Provider{runCheckout: func(_ context.Context, _ string, name string, _ ...string) (string, error) {
+				if name == "gh" {
+					ghCalled = true
+				}
+				out := tc.outputs[calls]
+				var err error
+				if calls < len(tc.errors) {
+					err = tc.errors[calls]
+				}
+				calls++
+				return out, err
+			}}
+			_, err := p.CheckoutPullRequest(context.Background(), ports.SCMPRRef{Repo: ports.SCMRepo{Repo: "acme/repo"}, Number: 7}, ports.SCMPRObservation{SourceBranch: "fix/exact-head", HeadSHA: "abc123"}, "/ws", "ao/claim/mer-1/pr-7/root")
+			var checkoutErr ports.PRCheckoutError
+			if !errors.As(err, &checkoutErr) || checkoutErr.Kind != tc.want {
+				t.Fatalf("err = %#v, want PRCheckoutError kind %q", err, tc.want)
+			}
+			if tc.wantNoGH && ghCalled {
+				t.Fatal("gh checkout called for diverged private branch")
 			}
 		})
 	}

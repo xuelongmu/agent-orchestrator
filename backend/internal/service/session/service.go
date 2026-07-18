@@ -77,7 +77,7 @@ type scmProvider interface {
 	ParseRepository(remote string) (ports.SCMRepo, bool)
 	FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
 	FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error)
-	CheckoutPullRequest(ctx context.Context, ref ports.SCMPRRef, pr ports.SCMPRObservation, workspacePath string) (bool, error)
+	CheckoutPullRequest(ctx context.Context, ref ports.SCMPRRef, pr ports.SCMPRObservation, workspacePath, workspaceBranch string) (bool, error)
 }
 
 // Service is the controller-facing session service. It delegates command-side
@@ -93,6 +93,8 @@ type Service struct {
 	telemetry           ports.EventSink
 	orchestratorLocksMu sync.Mutex
 	orchestratorLocks   map[domain.ProjectID]*sync.Mutex
+	prClaimLocksMu      sync.Mutex
+	prClaimLocks        map[string]*sync.Mutex
 	// signalCapable reports whether a harness has a hook pipeline that can
 	// deliver activity signals at all. Only capable harnesses are eligible for
 	// the no_signal downgrade: a hook-less harness staying silent forever is

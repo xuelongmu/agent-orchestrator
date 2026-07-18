@@ -89,17 +89,23 @@ func NewProvider(opts ProviderOptions) (*Provider, error) {
 	return &Provider{client: c, logger: logger, runCheckout: runCheckoutCommand}, nil
 }
 
-// CheckoutPullRequest switches workspacePath to the PR's source branch and
-// confirms that Git checked out the exact head commit observed from GitHub.
-// The caller persists claim ownership only after this method succeeds.
-func (p *Provider) CheckoutPullRequest(ctx context.Context, ref ports.SCMPRRef, pr ports.SCMPRObservation, workspacePath string) (bool, error) {
-	branch := strings.TrimSpace(pr.SourceBranch)
+// CheckoutPullRequest switches workspacePath to a session-private local branch
+// that tracks the PR source branch, then confirms that Git checked out the
+// exact head commit observed from GitHub. The private local name avoids Git's
+// one-worktree-per-branch restriction during takeover. The caller persists
+// claim ownership only after this method succeeds.
+func (p *Provider) CheckoutPullRequest(ctx context.Context, ref ports.SCMPRRef, pr ports.SCMPRObservation, workspacePath, workspaceBranch string) (bool, error) {
+	sourceBranch := strings.TrimSpace(pr.SourceBranch)
+	branch := strings.TrimSpace(workspaceBranch)
 	expectedHead := strings.TrimSpace(pr.HeadSHA)
+	if sourceBranch == "" {
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Branch: branch, Err: errors.New("github scm: PR source branch is empty")}
+	}
 	if branch == "" {
-		return false, errors.New("github scm: PR source branch is empty")
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Err: errors.New("github scm: claim workspace branch is empty")}
 	}
 	if expectedHead == "" {
-		return false, errors.New("github scm: PR head SHA is empty")
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Branch: branch, Err: errors.New("github scm: PR head SHA is empty")}
 	}
 	run := p.runCheckout
 	if run == nil {
@@ -107,32 +113,40 @@ func (p *Provider) CheckoutPullRequest(ctx context.Context, ref ports.SCMPRRef, 
 	}
 	currentBranch, err := run(ctx, workspacePath, "git", "branch", "--show-current")
 	if err != nil {
-		return false, fmt.Errorf("github scm: inspect workspace branch: %w", err)
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Branch: branch, Err: fmt.Errorf("github scm: inspect workspace branch: %w", err)}
 	}
 	currentHead, err := run(ctx, workspacePath, "git", "rev-parse", "--verify", "HEAD")
 	if err != nil {
-		return false, fmt.Errorf("github scm: inspect workspace HEAD: %w", err)
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Branch: branch, Err: fmt.Errorf("github scm: inspect workspace HEAD: %w", err)}
 	}
 	if strings.TrimSpace(currentBranch) == branch && strings.EqualFold(strings.TrimSpace(currentHead), expectedHead) {
 		return false, nil
 	}
+	targetHead, err := run(ctx, workspacePath, "git", "for-each-ref", "--format=%(objectname)", "refs/heads/"+branch)
+	if err != nil {
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Branch: branch, Err: fmt.Errorf("github scm: inspect claim branch: %w", err)}
+	}
+	targetHead = strings.TrimSpace(targetHead)
+	if targetHead != "" && !strings.EqualFold(targetHead, expectedHead) {
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutBranchDiverged, Branch: branch, ExpectedHead: expectedHead, ActualHead: targetHead}
+	}
 	dirty, err := run(ctx, workspacePath, "git", "status", "--porcelain")
 	if err != nil {
-		return false, fmt.Errorf("github scm: inspect workspace status: %w", err)
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Branch: branch, Err: fmt.Errorf("github scm: inspect workspace status: %w", err)}
 	}
 	if strings.TrimSpace(dirty) != "" {
-		return false, fmt.Errorf("github scm: workspace has uncommitted changes; cannot switch to PR branch %q safely", branch)
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutWorkspaceDirty, Branch: branch}
 	}
 	repo := strings.TrimSpace(ref.Repo.Repo)
 	if repo == "" {
 		repo = strings.Trim(strings.TrimSpace(ref.Repo.Owner)+"/"+strings.TrimSpace(ref.Repo.Name), "/")
 	}
-	if _, err := run(ctx, workspacePath, "gh", "pr", "checkout", strconv.Itoa(ref.Number), "--repo", repo); err != nil {
-		return false, fmt.Errorf("github scm: check out PR #%d: %w", ref.Number, err)
+	if _, err := run(ctx, workspacePath, "gh", "pr", "checkout", strconv.Itoa(ref.Number), "--repo", repo, "--branch", branch, "--force"); err != nil {
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Branch: branch, Err: fmt.Errorf("github scm: check out PR #%d: %w", ref.Number, err)}
 	}
 	checkedOutBranch, err := run(ctx, workspacePath, "git", "branch", "--show-current")
 	if err != nil {
-		return false, fmt.Errorf("github scm: verify workspace branch: %w", err)
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Branch: branch, Err: fmt.Errorf("github scm: verify workspace branch: %w", err)}
 	}
 	checkedOutBranch = strings.TrimSpace(checkedOutBranch)
 	if checkedOutBranch != branch {
@@ -140,15 +154,15 @@ func (p *Provider) CheckoutPullRequest(ctx context.Context, ref ports.SCMPRRef, 
 		if checkedOutBranch == "" {
 			actual = "detached HEAD"
 		}
-		return false, fmt.Errorf("github scm: checked out PR #%d branch %q, but workspace is on %s", ref.Number, branch, actual)
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Branch: branch, Err: fmt.Errorf("github scm: checked out PR #%d branch %q, but workspace is on %s", ref.Number, branch, actual)}
 	}
 	checkedOutHead, err := run(ctx, workspacePath, "git", "rev-parse", "--verify", "HEAD")
 	if err != nil {
-		return false, fmt.Errorf("github scm: verify workspace HEAD: %w", err)
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutFailed, Branch: branch, Err: fmt.Errorf("github scm: verify workspace HEAD: %w", err)}
 	}
 	checkedOutHead = strings.TrimSpace(checkedOutHead)
 	if !strings.EqualFold(checkedOutHead, expectedHead) {
-		return false, fmt.Errorf("github scm: workspace HEAD %s does not match PR head %s", checkedOutHead, expectedHead)
+		return false, ports.PRCheckoutError{Kind: ports.PRCheckoutHeadMismatch, Branch: branch, ExpectedHead: expectedHead, ActualHead: checkedOutHead}
 	}
 	return true, nil
 }

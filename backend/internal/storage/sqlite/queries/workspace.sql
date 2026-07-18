@@ -38,3 +38,8 @@ ORDER BY CASE WHEN repo_name = '__root__' THEN 0 ELSE 1 END, repo_name;
 
 -- name: DeleteSessionWorktrees :exec
 DELETE FROM session_worktrees WHERE session_id = ?;
+
+-- name: SetClaimedPRRootWorktreeBranch :exec
+UPDATE session_worktrees
+SET branch = ?
+WHERE session_id = ? AND repo_name = '__root__';
