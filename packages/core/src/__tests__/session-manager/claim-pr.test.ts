@@ -110,6 +110,36 @@ describe("claimPR", () => {
     expect(raw!["prAutoDetect"]).toBeUndefined();
   });
 
+  it("leaves claim metadata unchanged when the PR branch checkout is not confirmed", async () => {
+    const mockSCM = makeSCM({
+      checkoutPR: vi.fn().mockRejectedValue(
+        new Error(
+          'Failed to check out PR #42 branch "feat/existing-pr": workspace remained on "session/app-2"',
+        ),
+      ),
+    });
+
+    writeMetadata(sessionsDir, "app-2", {
+      worktree: "/tmp/ws-app-2",
+      branch: "session/app-2",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: makeHandle("rt-2"),
+    });
+
+    const sm = createSessionManager({ config, registry: registryWithSCM(mockSCM) });
+
+    await expect(sm.claimPR("app-2", "42")).rejects.toThrow(
+      'workspace remained on "session/app-2"',
+    );
+
+    expect(readMetadataRaw(sessionsDir, "app-2")).toMatchObject({
+      branch: "session/app-2",
+      status: "working",
+    });
+    expect(readMetadataRaw(sessionsDir, "app-2")!["pr"]).toBeUndefined();
+  });
+
   it("consolidates ownership by disabling PR auto-detect on the previous session", async () => {
     const mockSCM = makeSCM();
 

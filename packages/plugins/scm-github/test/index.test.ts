@@ -514,9 +514,21 @@ describe("scm-github plugin", () => {
       ghMock.mockResolvedValueOnce({ stdout: "main\n" });
       ghMock.mockResolvedValueOnce({ stdout: "" });
       ghMock.mockResolvedValueOnce({ stdout: "" });
+      ghMock.mockResolvedValueOnce({ stdout: "feat/my-feature\n" });
 
       const changed = await scm.checkoutPR?.(pr, "/tmp/repo");
       expect(changed).toBe(true);
+    });
+
+    it("fails when gh reports success without checking out the PR branch", async () => {
+      ghMock.mockResolvedValueOnce({ stdout: "session/test-2\n" });
+      ghMock.mockResolvedValueOnce({ stdout: "" });
+      ghMock.mockResolvedValueOnce({ stdout: "" });
+      ghMock.mockResolvedValueOnce({ stdout: "session/test-2\n" });
+
+      await expect(scm.checkoutPR?.(pr, "/tmp/repo")).rejects.toThrow(
+        'Failed to check out PR #42 branch "feat/my-feature": workspace remained on "session/test-2". The branch may be checked out in another worktree.',
+      );
     });
   });
 
