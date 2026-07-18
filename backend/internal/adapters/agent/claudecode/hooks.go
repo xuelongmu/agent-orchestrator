@@ -22,7 +22,7 @@ var claudeStartupMatcher = "startup"
 // claudeManagedHooks is the source of truth for the hooks AO installs:
 // SessionStart (under the "startup" matcher), UserPromptSubmit, the tool-use
 // trio (PreToolUse, PostToolUse, PostToolUseFailure), PermissionRequest,
-// Stop, Notification, and SessionEnd. They report normalized session metadata
+// Stop, StopFailure, Notification, and SessionEnd. They report normalized session metadata
 // and activity-state signals back into AO's store (see DeriveActivityState).
 // Notification and SessionEnd carry no matcher: each installs once and fires
 // for every sub-type, and the handler filters on the payload's
@@ -42,6 +42,7 @@ var claudeManagedHooks = []hooksjson.HookSpec{
 	{Event: "PostToolUseFailure", Command: claudeHookCommandPrefix + "post-tool-use-failure"},
 	{Event: "PermissionRequest", Command: claudeHookCommandPrefix + "permission-request"},
 	{Event: "Stop", Command: claudeHookCommandPrefix + "stop"},
+	{Event: "StopFailure", Command: claudeHookCommandPrefix + "stop-failure"},
 	{Event: "Notification", Command: claudeHookCommandPrefix + "notification"},
 	{Event: "SessionEnd", Command: claudeHookCommandPrefix + "session-end"},
 }

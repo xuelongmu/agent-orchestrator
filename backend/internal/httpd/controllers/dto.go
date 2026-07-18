@@ -458,6 +458,7 @@ type SetActivityRequest struct {
 	Event          string `json:"event,omitempty" description:"AO hook sub-command that produced this state (e.g. post-tool-use)."`
 	ToolName       string `json:"toolName,omitempty" description:"Native tool name, for tool-use hook events."`
 	ToolUseID      string `json:"toolUseId,omitempty" description:"Native tool-use id, for tool-use hook events."`
+	ErrorType      string `json:"errorType,omitempty" description:"Native structured hook error category, when supplied by the harness."`
 	AgentSessionID string `json:"agentSessionId,omitempty" description:"Native agent session identifier used to resume its transcript."`
 }
 

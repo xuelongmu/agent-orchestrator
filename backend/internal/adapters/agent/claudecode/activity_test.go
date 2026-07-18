@@ -21,6 +21,7 @@ func TestDeriveActivityState(t *testing.T) {
 		{"post-tool-use -> active", "post-tool-use", `{"tool_name":"Bash","tool_use_id":"toolu_1"}`, domain.ActivityActive, true},
 		{"post-tool-use-failure -> active", "post-tool-use-failure", `{"tool_name":"Bash","tool_use_id":"toolu_1"}`, domain.ActivityActive, true},
 		{"permission-request -> blocked", "permission-request", `{"tool_name":"Bash"}`, domain.ActivityBlocked, true},
+		{"stop-failure -> idle", "stop-failure", `{"error":"rate_limit"}`, domain.ActivityIdle, true},
 		{"stop -> idle", "stop", `{}`, domain.ActivityIdle, true},
 		{"notification idle_prompt -> idle", "notification", `{"notification_type":"idle_prompt"}`, domain.ActivityIdle, true},
 		{"notification permission_prompt -> blocked", "notification", `{"notification_type":"permission_prompt"}`, domain.ActivityBlocked, true},

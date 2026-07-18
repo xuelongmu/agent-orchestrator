@@ -132,6 +132,7 @@ var schemaNames = map[string]string{
 	"DomainSessionID":           "SessionID",
 	"DomainIssueID":             "IssueID",
 	"DomainSession":             "Session",
+	"DomainLifecycleDiagnostic": "LifecycleDiagnostic",
 	"DomainProjectConfig":       "ProjectConfig",
 	"DomainTrackerIntakeConfig": "TrackerIntakeConfig",
 	"DomainAgentConfig":         "AgentConfig",

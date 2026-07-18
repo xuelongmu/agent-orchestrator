@@ -518,6 +518,7 @@ func (c *SessionsController) activity(w http.ResponseWriter, r *http.Request) {
 		Event:          capActivityMeta(domain.SanitizeControlChars(in.Event)),
 		ToolName:       capActivityMeta(domain.SanitizeControlChars(in.ToolName)),
 		ToolUseID:      capActivityMeta(domain.SanitizeControlChars(in.ToolUseID)),
+		ErrorType:      capActivityMeta(domain.SanitizeControlChars(in.ErrorType)),
 		AgentSessionID: agentSessionID,
 	}
 	if err := c.Activity.ApplyActivitySignal(r.Context(), sessionID(r), sig); err != nil {

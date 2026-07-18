@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"sort"
 	"strings"
@@ -40,17 +41,25 @@ type sessionRenameRequest struct {
 }
 
 type sessionDTO struct {
-	ID           string          `json:"id"`
-	ProjectID    string          `json:"projectId"`
-	IssueID      string          `json:"issueId,omitempty"`
-	Kind         string          `json:"kind"`
-	Harness      string          `json:"harness,omitempty"`
-	DisplayName  string          `json:"displayName,omitempty"`
-	Activity     sessionActivity `json:"activity"`
-	IsTerminated bool            `json:"isTerminated"`
-	CreatedAt    time.Time       `json:"createdAt"`
-	UpdatedAt    time.Time       `json:"updatedAt"`
-	Status       string          `json:"status"`
+	ID           string             `json:"id"`
+	ProjectID    string             `json:"projectId"`
+	IssueID      string             `json:"issueId,omitempty"`
+	Kind         string             `json:"kind"`
+	Harness      string             `json:"harness,omitempty"`
+	DisplayName  string             `json:"displayName,omitempty"`
+	Activity     sessionActivity    `json:"activity"`
+	IsTerminated bool               `json:"isTerminated"`
+	CreatedAt    time.Time          `json:"createdAt"`
+	UpdatedAt    time.Time          `json:"updatedAt"`
+	Status       string             `json:"status"`
+	Diagnostic   *sessionDiagnostic `json:"diagnostic,omitempty"`
+}
+
+type sessionDiagnostic struct {
+	Trigger       string    `json:"trigger"`
+	TerminalTail  string    `json:"terminalTail,omitempty"`
+	HookErrorType string    `json:"hookErrorType,omitempty"`
+	CapturedAt    time.Time `json:"capturedAt"`
 }
 
 type sessionActivity struct {
@@ -116,16 +125,17 @@ type claimPRResponse struct {
 }
 
 type sessionListEntry struct {
-	ID             string     `json:"id"`
-	ProjectID      string     `json:"projectId"`
-	Role           string     `json:"role"`
-	Status         string     `json:"status,omitempty"`
-	IssueID        string     `json:"issueId,omitempty"`
-	Harness        string     `json:"harness,omitempty"`
-	IsTerminated   bool       `json:"isTerminated"`
-	LastActivityAt *time.Time `json:"lastActivityAt,omitempty"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	UpdatedAt      time.Time  `json:"updatedAt"`
+	ID             string             `json:"id"`
+	ProjectID      string             `json:"projectId"`
+	Role           string             `json:"role"`
+	Status         string             `json:"status,omitempty"`
+	IssueID        string             `json:"issueId,omitempty"`
+	Harness        string             `json:"harness,omitempty"`
+	IsTerminated   bool               `json:"isTerminated"`
+	LastActivityAt *time.Time         `json:"lastActivityAt,omitempty"`
+	CreatedAt      time.Time          `json:"createdAt"`
+	UpdatedAt      time.Time          `json:"updatedAt"`
+	Diagnostic     *sessionDiagnostic `json:"diagnostic,omitempty"`
 }
 
 type sessionListOutput struct {
@@ -620,6 +630,7 @@ func sessionListEntries(sessions []sessionDTO) []sessionListEntry {
 			LastActivityAt: last,
 			CreatedAt:      sess.CreatedAt,
 			UpdatedAt:      sess.UpdatedAt,
+			Diagnostic:     sess.Diagnostic,
 		})
 	}
 	return entries
@@ -680,6 +691,11 @@ func writeSessionList(cmd *cobra.Command, sessions []sessionDTO, hiddenTerminate
 			if _, err := fmt.Fprintln(out); err != nil {
 				return err
 			}
+			if sess.Diagnostic != nil {
+				if err := writeDiagnostic(out, sess.Diagnostic, "    "); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	if hiddenTerminatedCount > 0 {
@@ -734,6 +750,34 @@ func writeSessionDetails(cmd *cobra.Command, sess sessionDTO) error {
 	}
 	if !sess.UpdatedAt.IsZero() {
 		if _, err := fmt.Fprintf(out, "updated: %s\n", sess.UpdatedAt.Format(time.RFC3339)); err != nil {
+			return err
+		}
+	}
+	if sess.Diagnostic != nil {
+		if err := writeDiagnostic(out, sess.Diagnostic, ""); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeDiagnostic(out io.Writer, diagnostic *sessionDiagnostic, indent string) error {
+	if diagnostic == nil {
+		return nil
+	}
+	if _, err := fmt.Fprintf(out, "%sdiagnostic: %s\n", indent, diagnostic.Trigger); err != nil {
+		return err
+	}
+	if diagnostic.HookErrorType != "" {
+		if _, err := fmt.Fprintf(out, "%shook error: %s\n", indent, diagnostic.HookErrorType); err != nil {
+			return err
+		}
+	}
+	for _, line := range strings.Split(diagnostic.TerminalTail, "\n") {
+		if line == "" {
+			continue
+		}
+		if _, err := fmt.Fprintf(out, "%s  | %s\n", indent, line); err != nil {
 			return err
 		}
 	}

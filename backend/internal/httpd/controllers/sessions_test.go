@@ -267,6 +267,7 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	svc := newFakeSessionService()
 	s := svc.sessions["ao-1"]
 	s.Metadata = domain.SessionMetadata{Branch: "qa/modal-worker", WorkspacePath: "/tmp/private-worktree", RuntimeHandleID: "runtime-1", Prompt: "private prompt"}
+	s.Diagnostic = &domain.LifecycleDiagnostic{Trigger: domain.DiagnosticRuntimeProbeFailed, TerminalTail: "probe timed out", CapturedAt: time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)}
 	svc.sessions["ao-1"] = s
 	srv := newSessionTestServer(t, svc)
 
@@ -283,6 +284,9 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	}
 	if list.Sessions[0].Branch != "qa/modal-worker" {
 		t.Fatalf("branch = %q, want qa/modal-worker", list.Sessions[0].Branch)
+	}
+	if list.Sessions[0].Diagnostic == nil || list.Sessions[0].Diagnostic.TerminalTail != "probe timed out" {
+		t.Fatalf("diagnostic = %#v, want persisted terminal tail", list.Sessions[0].Diagnostic)
 	}
 	var rawList struct {
 		Sessions []map[string]any `json:"sessions"`
@@ -923,15 +927,16 @@ func TestSessionsAPI_CleanupWithoutProjectFilter(t *testing.T) {
 }
 
 type sessionBody struct {
-	ID               string `json:"id"`
-	ProjectID        string `json:"projectId"`
-	IssueID          string `json:"issueId"`
-	Kind             string `json:"kind"`
-	Harness          string `json:"harness"`
-	DisplayName      string `json:"displayName"`
-	Branch           string `json:"branch"`
-	Status           string `json:"status"`
-	TerminalHandleID string `json:"terminalHandleId"`
+	ID               string                      `json:"id"`
+	ProjectID        string                      `json:"projectId"`
+	IssueID          string                      `json:"issueId"`
+	Kind             string                      `json:"kind"`
+	Harness          string                      `json:"harness"`
+	DisplayName      string                      `json:"displayName"`
+	Branch           string                      `json:"branch"`
+	Status           string                      `json:"status"`
+	TerminalHandleID string                      `json:"terminalHandleId"`
+	Diagnostic       *domain.LifecycleDiagnostic `json:"diagnostic"`
 }
 
 func TestSessionsAPI_PRRoutes(t *testing.T) {

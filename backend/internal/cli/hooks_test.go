@@ -130,6 +130,40 @@ func TestHooks_StopReportsIdle(t *testing.T) {
 	}
 }
 
+func TestHooks_StopFailureReportsStructuredErrorType(t *testing.T) {
+	t.Setenv("AO_SESSION_ID", "ao-7")
+	cfg := setConfigEnv(t)
+	srv, capture := activityServer(t, http.StatusOK, `{"ok":true}`)
+	writeRunFileFor(t, cfg, srv)
+
+	_, _, err := executeCLI(t, Deps{
+		In:           strings.NewReader(`{"error":"rate_limit"}`),
+		ProcessAlive: func(int) bool { return true },
+	}, "hooks", "claude-code", "stop-failure")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var req setActivityAPIRequest
+	if err := json.Unmarshal([]byte(capture.body), &req); err != nil {
+		t.Fatalf("decode body: %v\nbody=%s", err, capture.body)
+	}
+	want := setActivityAPIRequest{State: "idle", Event: "stop-failure", ErrorType: "rate_limit"}
+	if req != want {
+		t.Fatalf("body = %+v, want %+v", req, want)
+	}
+}
+
+func TestActivityMeta_StopFailureErrorFieldPrecedenceAndLegacyFallback(t *testing.T) {
+	_, _, got := activityMeta([]byte(`{"error":"rate_limit","error_type":"legacy_error"}`))
+	if got != "rate_limit" {
+		t.Fatalf("documented error field = %q, want rate_limit", got)
+	}
+	_, _, got = activityMeta([]byte(`{"error_type":"legacy_error"}`))
+	if got != "legacy_error" {
+		t.Fatalf("legacy error_type fallback = %q, want legacy_error", got)
+	}
+}
+
 func TestHooks_SessionStartReportsNativeSessionIDWithoutActivity(t *testing.T) {
 	t.Setenv("AO_SESSION_ID", "ao-7")
 	cfg := setConfigEnv(t)

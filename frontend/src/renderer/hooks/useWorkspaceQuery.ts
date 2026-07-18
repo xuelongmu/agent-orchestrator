@@ -62,6 +62,7 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 				createdAt: session.createdAt,
 				updatedAt: session.updatedAt,
 				activity: toSessionActivity(session.activity),
+				diagnostic: session.diagnostic,
 				previewUrl: session.previewUrl,
 				previewRevision: session.previewRevision,
 				prs: (session.prs ?? []).map(toPullRequestFacts),

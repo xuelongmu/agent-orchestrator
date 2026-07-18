@@ -45,6 +45,7 @@ type setActivityAPIRequest struct {
 	Event          string `json:"event,omitempty"`
 	ToolName       string `json:"toolName,omitempty"`
 	ToolUseID      string `json:"toolUseId,omitempty"`
+	ErrorType      string `json:"errorType,omitempty"`
 	AgentSessionID string `json:"agentSessionId,omitempty"`
 }
 
@@ -59,19 +60,28 @@ const maxActivityMetaLen = 256
 // them (claude-code's PreToolUse/PostToolUse/PostToolUseFailure and
 // PermissionRequest payloads); adapters whose payloads lack them yield empty
 // strings and the signal degrades to today's state-only form.
-func activityMeta(payload []byte) (toolName, toolUseID string) {
+func activityMeta(payload []byte) (toolName, toolUseID, errorType string) {
 	var p struct {
-		ToolName  string `json:"tool_name"`
-		ToolUseID string `json:"tool_use_id"`
+		ToolName        string `json:"tool_name"`
+		ToolUseID       string `json:"tool_use_id"`
+		Error           string `json:"error"`
+		LegacyErrorType string `json:"error_type"`
 	}
 	_ = json.Unmarshal(payload, &p)
+	errorType = strings.TrimSpace(p.Error)
+	if errorType == "" {
+		errorType = strings.TrimSpace(p.LegacyErrorType)
+	}
 	if len(p.ToolName) > maxActivityMetaLen {
 		p.ToolName = ""
 	}
 	if len(p.ToolUseID) > maxActivityMetaLen {
 		p.ToolUseID = ""
 	}
-	return p.ToolName, p.ToolUseID
+	if len(errorType) > maxActivityMetaLen {
+		errorType = ""
+	}
+	return p.ToolName, p.ToolUseID, errorType
 }
 
 // hookAgentSessionID extracts the native resume handle shared by Agy, Copilot,
@@ -159,12 +169,13 @@ func (c *commandContext) runHook(ctx context.Context, agent, event string) error
 		return nil
 	}
 
-	toolName, toolUseID := activityMeta(payload)
+	toolName, toolUseID, errorType := activityMeta(payload)
 	path := "sessions/" + url.PathEscape(sessionID) + "/activity"
 	req := setActivityAPIRequest{
 		Event:          event,
 		ToolName:       toolName,
 		ToolUseID:      toolUseID,
+		ErrorType:      errorType,
 		AgentSessionID: agentSessionID,
 	}
 	if hasActivity {

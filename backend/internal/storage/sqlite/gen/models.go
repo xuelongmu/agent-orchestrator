@@ -194,6 +194,10 @@ type Session struct {
 	PendingSubmitRecoveryAttempted bool
 	MergedCleanupPending           bool
 	MergedCleanupPRURL             string
+	DiagnosticTrigger              string
+	DiagnosticTerminalTail         string
+	DiagnosticHookErrorType        string
+	DiagnosticCapturedAt           sql.NullTime
 }
 
 type SessionWorktree struct {

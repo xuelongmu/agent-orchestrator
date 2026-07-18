@@ -189,6 +189,56 @@ func TestSessionCreateAssignsPerProjectID(t *testing.T) {
 	}
 }
 
+func TestSessionDiagnosticSurvivesStoreRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	s, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	seedProject(t, s, "mer")
+	rec := sampleRecord("mer")
+	created, err := s.CreateSession(ctx, rec)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	created.Diagnostic = &domain.LifecycleDiagnostic{
+		Trigger:       domain.DiagnosticStopFailure,
+		TerminalTail:  "agent stopped after validation failed",
+		HookErrorType: "validation_failed",
+		CapturedAt:    now,
+	}
+	created.UpdatedAt = now.Add(time.Second)
+	if err := s.UpdateSession(ctx, created); err != nil {
+		t.Fatalf("persist diagnostic: %v", err)
+	}
+	events, err := s.EventsAfter(ctx, 0, 10)
+	if err != nil {
+		t.Fatalf("read diagnostic CDC: %v", err)
+	}
+	if len(events) != 2 || string(events[1].Type) != "session_updated" {
+		t.Fatalf("diagnostic CDC events = %#v, want create then session_updated", events)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	got, ok, err := reopened.GetSession(ctx, created.ID)
+	if err != nil || !ok {
+		t.Fatalf("get after restart: ok=%v err=%v", ok, err)
+	}
+	if !reflect.DeepEqual(got.Diagnostic, created.Diagnostic) {
+		t.Fatalf("diagnostic after restart = %#v, want %#v", got.Diagnostic, created.Diagnostic)
+	}
+}
+
 // TestDeleteSessionOnlyRemovesSeedRows covers Bug 4's storage-layer guarantee:
 // DeleteSession removes a session row only when the row is still in seed state
 // (no workspace, no runtime handle, no agent session id, no prompt, not

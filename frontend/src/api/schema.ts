@@ -737,6 +737,7 @@ export interface components {
             branch?: string;
             /** Format: date-time */
             createdAt: string;
+            diagnostic?: components["schemas"]["LifecycleDiagnostic"];
             displayName?: string;
             harness?: string;
             id: string;
@@ -792,6 +793,13 @@ export interface components {
             freed?: boolean;
             ok: boolean;
             sessionId: string;
+        };
+        LifecycleDiagnostic: {
+            /** Format: date-time */
+            capturedAt: string;
+            hookErrorType?: string;
+            terminalTail?: string;
+            trigger: string;
         };
         ListAgentsResponse: {
             /** @description Compatibility list of installed agents whose local auth probe recently returned authorized. Advisory and stale-prone; spawn may still fail. */
@@ -1100,6 +1108,8 @@ export interface components {
         SetActivityRequest: {
             /** @description Native agent session identifier used to resume its transcript. */
             agentSessionId?: string;
+            /** @description Native structured hook error category, when supplied by the harness. */
+            errorType?: string;
             /** @description AO hook sub-command that produced this state (e.g. post-tool-use). */
             event?: string;
             /**
