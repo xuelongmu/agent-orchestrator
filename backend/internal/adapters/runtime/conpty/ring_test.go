@@ -7,7 +7,7 @@ import (
 )
 
 // TestRingAppendPartialThenComplete verifies partial-line accumulation and
-// that Snapshot/Tail reflect only completed lines.
+// that Snapshot excludes while Tail includes the current partial line.
 func TestRingAppendPartialThenComplete(t *testing.T) {
 	r := NewRing()
 	r.Append([]byte("hel"))
@@ -19,8 +19,8 @@ func TestRingAppendPartialThenComplete(t *testing.T) {
 	}
 
 	tail := r.Tail(10)
-	if tail != "hello\n" {
-		t.Errorf("Tail(10) = %q, want %q", tail, "hello\n")
+	if tail != "hello\nwor" {
+		t.Errorf("Tail(10) = %q, want %q", tail, "hello\nwor")
 	}
 
 	// Flush the partial "wor"
@@ -28,6 +28,18 @@ func TestRingAppendPartialThenComplete(t *testing.T) {
 	snap = string(r.Snapshot())
 	if snap != "hello\nwor" {
 		t.Errorf("after FlushPartial Snapshot = %q, want %q", snap, "hello\nwor")
+	}
+}
+
+func TestRingTailCountsPartialAsLatestLine(t *testing.T) {
+	r := NewRing()
+	r.Append([]byte("first\nsecond\n[Pasted Content 7096 chars]"))
+
+	if got := r.Tail(1); got != "[Pasted Content 7096 chars]" {
+		t.Errorf("Tail(1) = %q, want current partial line", got)
+	}
+	if got := r.Tail(2); got != "second\n[Pasted Content 7096 chars]" {
+		t.Errorf("Tail(2) = %q, want last completed line plus partial", got)
 	}
 }
 

@@ -268,6 +268,26 @@ func TestSendMessage_DeliversChunkedTextAndEnter(t *testing.T) {
 	}
 }
 
+func TestInputEnterDelayUsesLongSettleForMultiFramePaste(t *testing.T) {
+	tests := []struct {
+		name  string
+		runes int
+		want  time.Duration
+	}{
+		{name: "empty enter-only", runes: 0, want: ptyInputEnterDelay},
+		{name: "short", runes: 1, want: ptyInputEnterDelay},
+		{name: "single frame boundary", runes: ptyInputChunkRunes, want: ptyInputEnterDelay},
+		{name: "multi-frame", runes: ptyInputChunkRunes + 1, want: ptyInputLongEnterDelay},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := inputEnterDelay(tt.runes); got != tt.want {
+				t.Fatalf("inputEnterDelay(%d) = %s, want %s", tt.runes, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestSendMessage_LargeMessageChunked verifies a message > 512 runes is
 // delivered correctly (host receives full text + "\r").
 func TestSendMessage_LargeMessageChunked(t *testing.T) {

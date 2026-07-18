@@ -65,8 +65,10 @@ func (r *Ring) Snapshot() []byte {
 	return []byte(strings.Join(r.lines, ""))
 }
 
-// Tail returns the last n stored lines joined as a string.
-// Mirrors the MSG_GET_OUTPUT_REQ handler: start = max(0, len-lines).
+// Tail returns the last n available lines joined as a string, including the
+// current unterminated line. Terminal UIs frequently redraw their actionable
+// state without a trailing newline, so excluding partialLine hides prompts
+// such as Codex's collapsed "[Pasted Content ...]" editor placeholder.
 // n <= 0 returns "".
 func (r *Ring) Tail(n int) string {
 	r.mu.Lock()
@@ -75,9 +77,15 @@ func (r *Ring) Tail(n int) string {
 	if n <= 0 {
 		return ""
 	}
-	start := len(r.lines) - n
+	available := r.lines
+	if r.partialLine != "" {
+		available = make([]string, 0, len(r.lines)+1)
+		available = append(available, r.lines...)
+		available = append(available, r.partialLine)
+	}
+	start := len(available) - n
 	if start < 0 {
 		start = 0
 	}
-	return strings.Join(r.lines[start:], "")
+	return strings.Join(available[start:], "")
 }

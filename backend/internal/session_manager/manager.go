@@ -54,7 +54,25 @@ var (
 	// would answer it on the user's behalf. The API maps it to a 409; the
 	// caller retries once the user has answered in the terminal.
 	ErrAwaitingDecision = errors.New("session: awaiting a user decision")
+	// ErrInputPending means the full message reached the agent's editor but did
+	// not start a turn. Callers must not resend the text: it remains in the
+	// editor and doing so would duplicate the prompt.
+	ErrInputPending = errors.New("session: input pending in agent editor")
 )
+
+// InputPendingError preserves the at-most-once delivery boundary for callers.
+// RecoveryAttempted reports whether AO sent an Enter-only recovery after it
+// observed the pending editor state.
+type InputPendingError struct {
+	SessionID         domain.SessionID
+	RecoveryAttempted bool
+}
+
+func (e *InputPendingError) Error() string {
+	return fmt.Sprintf("message pasted into session %s, but input remains pending in the agent editor", e.SessionID)
+}
+
+func (e *InputPendingError) Unwrap() error { return ErrInputPending }
 
 // Env vars a spawned process reads to learn who it is.
 const (
@@ -83,6 +101,14 @@ type runtimeController interface {
 	// IsAlive reports whether the handle's runtime session still exists. Used by
 	// Reconcile on boot to adopt crash-surviving sessions and reap leaked ones.
 	IsAlive(ctx context.Context, handle ports.RuntimeHandle) (bool, error)
+}
+
+// inputPendingDetector is an optional agent capability for terminal editors
+// that can definitively identify a paste which has not started a turn. It is
+// intentionally local to the session manager until more than one adapter
+// needs the contract.
+type inputPendingDetector interface {
+	IsInputPending(terminalOutput string) bool
 }
 
 // Store is the persistence surface needed by the internal session Manager.
@@ -168,9 +194,10 @@ type sendConfirmConfig struct {
 // Production sendConfirm bounds: 3 Enters total (1 from Send + 2 re-sends),
 // each given 2s to flip the session active, polled every 300ms.
 const (
-	sendConfirmPollInterval    = 300 * time.Millisecond
-	sendConfirmAttemptDeadline = 2 * time.Second
-	sendConfirmMaxAttempts     = 3
+	sendConfirmPollInterval     = 300 * time.Millisecond
+	sendConfirmAttemptDeadline  = 2 * time.Second
+	sendConfirmMaxAttempts      = 3
+	sendConfirmationOutputLines = 50
 )
 
 // Deps are the collaborators a Session Manager needs; New wires them together.
@@ -1538,8 +1565,76 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string)
 	if !ok {
 		return nil
 	}
+	if m.agents != nil {
+		agent, agentOK := m.agents.Agent(rec.Harness)
+		if agentOK {
+			if detector, supportsPendingDetection := agent.(inputPendingDetector); supportsPendingDetection {
+				if err := m.confirmInputSubmitted(ctx, m.messenger, detector, rec); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	if m.harnessNudgeSafe(rec.Harness) {
 		m.confirmActive(ctx, m.messenger, id)
+	}
+	return nil
+}
+
+// confirmInputSubmitted checks adapters with definitive editor-state
+// detection after the full message has crossed the delivery boundary. When a
+// pending paste is observed, it sends Enter only through the same just-in-time
+// session guard used by confirmActive. If the paste is still pending after the
+// bounded poll budget, the typed error tells callers not to resend the text.
+func (m *Manager) confirmInputSubmitted(ctx context.Context, guard *sessionguard.Guard, detector inputPendingDetector, rec domain.SessionRecord) error {
+	handle := runtimeHandle(rec.Metadata)
+	if handle.ID == "" || m.runtime == nil {
+		return nil
+	}
+
+	pending := false
+	recoveryAttempted := false
+	for attempt := 1; attempt <= m.sendConfirm.maxAttempts; attempt++ {
+		timer := time.NewTimer(m.sendConfirm.pollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+
+		output, err := m.runtime.GetOutput(ctx, handle, sendConfirmationOutputLines)
+		if err != nil {
+			// Delivery has already been attempted. A failed confirmation probe is
+			// ambiguous, so preserve the existing soft-success contract.
+			m.logger.Debug("send: pending-input confirmation unavailable", "sessionID", rec.ID, "error", err)
+			return nil
+		}
+		if !detector.IsInputPending(output) {
+			// Empty output can be a best-effort runtime read failure. It does not
+			// prove an already-observed draft was submitted.
+			if pending && output == "" {
+				continue
+			}
+			return nil
+		}
+
+		pending = true
+		if recoveryAttempted {
+			continue
+		}
+		outcome, recoveryErr := guard.Deliver(ctx, rec.ID, "")
+		recoveryAttempted = outcome == sessionguard.Sent
+		if recoveryErr != nil {
+			m.logger.Warn("send: pending-input Enter recovery failed", "sessionID", rec.ID, "error", recoveryErr)
+		}
+		if outcome != sessionguard.Sent {
+			return &InputPendingError{SessionID: rec.ID, RecoveryAttempted: false}
+		}
+	}
+
+	if pending {
+		return &InputPendingError{SessionID: rec.ID, RecoveryAttempted: recoveryAttempted}
 	}
 	return nil
 }

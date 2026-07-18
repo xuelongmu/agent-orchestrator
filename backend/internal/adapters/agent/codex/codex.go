@@ -47,6 +47,21 @@ func (p *Plugin) EmitsSubmitActivity() bool { return true }
 // ports.ActivitySignaler.
 func (p *Plugin) EmitsBlockedActivity() bool { return false }
 
+// IsInputPending reports whether the newest terminal state shows a collapsed
+// paste still sitting in Codex's editor. Compare positions so a historical
+// placeholder does not hide newer, definitive active or queued-turn UI.
+func (p *Plugin) IsInputPending(terminalOutput string) bool {
+	pastedAt := strings.LastIndex(terminalOutput, "[Pasted Content")
+	if pastedAt < 0 {
+		return false
+	}
+	turnEvidenceAt := max(
+		strings.LastIndex(terminalOutput, "Press up to edit queued messages"),
+		strings.LastIndex(terminalOutput, "esc to interrupt"),
+	)
+	return pastedAt > turnEvidenceAt
+}
+
 var _ adapters.Adapter = (*Plugin)(nil)
 var _ ports.Agent = (*Plugin)(nil)
 var _ ports.AgentAuthChecker = (*Plugin)(nil)
