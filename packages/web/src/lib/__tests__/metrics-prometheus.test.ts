@@ -120,6 +120,47 @@ describe("renderPrometheus", () => {
     );
   });
 
+  it("types sliding-window duration series as gauges when their values decrease", () => {
+    const operation = "GET /api/observability";
+    const before = renderPrometheus(
+      makeSummary({
+        "project-a": makeProject({
+          recentTraces: [makeTrace(operation, 10), makeTrace(operation, 20)],
+        }),
+      }),
+    );
+    const after = renderPrometheus(
+      makeSummary({
+        "project-a": makeProject({ recentTraces: [makeTrace(operation, 5)] }),
+      }),
+    );
+
+    expect(before).toContain(
+      'ao_operation_duration_ms_bucket{project="project-a",operation="GET /api/observability",le="25"} 2',
+    );
+    expect(after).toContain(
+      'ao_operation_duration_ms_bucket{project="project-a",operation="GET /api/observability",le="25"} 1',
+    );
+    expect(before).toContain(
+      'ao_operation_duration_ms_sum{project="project-a",operation="GET /api/observability"} 30',
+    );
+    expect(after).toContain(
+      'ao_operation_duration_ms_sum{project="project-a",operation="GET /api/observability"} 5',
+    );
+    expect(before).toContain(
+      'ao_operation_duration_ms_count{project="project-a",operation="GET /api/observability"} 2',
+    );
+    expect(after).toContain(
+      'ao_operation_duration_ms_count{project="project-a",operation="GET /api/observability"} 1',
+    );
+    for (const body of [before, after]) {
+      expect(body).toContain("# TYPE ao_operation_duration_ms_bucket gauge");
+      expect(body).toContain("# TYPE ao_operation_duration_ms_sum gauge");
+      expect(body).toContain("# TYPE ao_operation_duration_ms_count gauge");
+      expect(body).not.toContain("# TYPE ao_operation_duration_ms histogram");
+    }
+  });
+
   it("maps overall and per-surface health statuses to numeric gauges", () => {
     const body = renderPrometheus(
       makeSummary(
@@ -164,7 +205,9 @@ describe("renderPrometheus", () => {
       "ao_operations_total",
       "ao_overall_status",
       "ao_health_status",
-      "ao_operation_duration_ms",
+      "ao_operation_duration_ms_bucket",
+      "ao_operation_duration_ms_sum",
+      "ao_operation_duration_ms_count",
     ]) {
       expect(body.match(new RegExp(`^# HELP ${family} `, "gm"))).toHaveLength(1);
       expect(body.match(new RegExp(`^# TYPE ${family} `, "gm"))).toHaveLength(1);

@@ -22,8 +22,8 @@ function labels(entries: Array<[string, string]>): string {
 /**
  * Render the current observability snapshot in the Prometheus text exposition format.
  *
- * Duration histograms are derived from each project's capped recent-trace window. They are
- * best-effort sliding-window distributions, not cumulative histograms across scrapes.
+ * Duration gauges are derived from each project's capped recent-trace window. They may decrease
+ * when traces leave the window, so they must not be exposed as histogram counters.
  */
 export function renderPrometheus(summary: ObservabilitySummary): string {
   const lines: string[] = [];
@@ -72,11 +72,9 @@ export function renderPrometheus(summary: ObservabilitySummary): string {
     }
   }
 
-  lines.push(
-    "",
-    "# HELP ao_operation_duration_ms Best-effort AO operation duration distribution in milliseconds over the capped recent-trace window; values are not cumulative across scrapes.",
-    "# TYPE ao_operation_duration_ms histogram",
-  );
+  const durationBuckets: string[] = [];
+  const durationSums: string[] = [];
+  const durationCounts: string[] = [];
   for (const project of projects) {
     const durationsByOperation = new Map<string, number[]>();
     for (const trace of project.recentTraces) {
@@ -101,20 +99,39 @@ export function renderPrometheus(summary: ObservabilitySummary): string {
       ];
       for (const upperBound of DURATION_BUCKETS_MS) {
         const count = durations.filter((duration) => duration <= upperBound).length;
-        lines.push(
+        durationBuckets.push(
           `ao_operation_duration_ms_bucket${labels([
             ...commonLabels,
             ["le", String(upperBound)],
           ])} ${count}`,
         );
       }
-      lines.push(
+      durationBuckets.push(
         `ao_operation_duration_ms_bucket${labels([...commonLabels, ["le", "+Inf"]])} ${durations.length}`,
+      );
+      durationSums.push(
         `ao_operation_duration_ms_sum${labels(commonLabels)} ${durations.reduce((sum, duration) => sum + duration, 0)}`,
+      );
+      durationCounts.push(
         `ao_operation_duration_ms_count${labels(commonLabels)} ${durations.length}`,
       );
     }
   }
+
+  lines.push(
+    "",
+    "# HELP ao_operation_duration_ms_bucket Number of AO operations in the capped recent-trace window at or below the duration bound.",
+    "# TYPE ao_operation_duration_ms_bucket gauge",
+    ...durationBuckets,
+    "",
+    "# HELP ao_operation_duration_ms_sum Sum of AO operation durations in milliseconds in the capped recent-trace window.",
+    "# TYPE ao_operation_duration_ms_sum gauge",
+    ...durationSums,
+    "",
+    "# HELP ao_operation_duration_ms_count Number of AO operations in the capped recent-trace window.",
+    "# TYPE ao_operation_duration_ms_count gauge",
+    ...durationCounts,
+  );
 
   return `${lines.join("\n")}\n`;
 }
