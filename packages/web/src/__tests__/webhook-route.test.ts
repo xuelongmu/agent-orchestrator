@@ -331,6 +331,80 @@ describe("POST /api/webhooks/[...slug] — activity events", () => {
     expect(mockLifecycle.check).not.toHaveBeenCalled();
   });
 
+  it("scopes an immediate check to the queued project when session IDs overlap", async () => {
+    const originalProjects = mockConfig.projects;
+    mockConfig.projects = {
+      ...originalProjects,
+      "other-app": {
+        name: "Other App",
+        repo: "acme/other-app",
+        path: "/tmp/other-app",
+        defaultBranch: "main",
+        sessionPrefix: "my-app",
+        scm: {
+          plugin: "github",
+          webhook: { enabled: true, path: "/api/webhooks/github", maxBodyBytes: 1024 },
+        },
+      },
+    };
+    const sharedSessionId = "shared" as Session["id"];
+    vi.mocked(mockSessionManager.list).mockResolvedValueOnce([
+      makeSession(sharedSessionId),
+      makeSession(sharedSessionId, {
+        projectId: "other-app",
+        pr: {
+          number: 42,
+          url: "u2",
+          title: "t2",
+          owner: "acme",
+          repo: "other-app",
+          branch: "feat/x",
+          baseBranch: "main",
+          isDraft: false,
+        },
+      }),
+    ]);
+    processSCMWebhookQueue.mockImplementationOnce(
+      async (
+        projectId: string,
+        processor: (job: { projectId: string; sessionId: Session["id"] }) => Promise<void>,
+      ) => {
+        const job = {
+          id: "github:delivery-1:shared",
+          deliveryKey: "github:delivery-1",
+          projectId,
+          sessionId: sharedSessionId,
+          attemptCount: 0,
+          availableAt: Date.now(),
+        };
+        await processor(job);
+        return { processed: [job], failures: [] };
+      },
+    );
+
+    try {
+      const res = await webhookPOST(makeWebhookRequest());
+      expect(res.status).toBe(202);
+      expect(enqueueSCMWebhookDelivery).toHaveBeenCalledTimes(1);
+      expect(enqueueSCMWebhookDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({ projectId: "my-app", sessionIds: [sharedSessionId] }),
+      );
+      expect(processSCMWebhookQueue).toHaveBeenCalledTimes(1);
+      expect(processSCMWebhookQueue).toHaveBeenCalledWith(
+        "my-app",
+        expect.any(Function),
+        expect.objectContaining({ deliveryKeys: expect.any(Set) }),
+      );
+      expect(mockLifecycle.check).toHaveBeenCalledTimes(1);
+      expect(mockLifecycle.check).toHaveBeenCalledWith(sharedSessionId, {
+        projectId: "my-app",
+        requireSuccessfulSCMRefresh: true,
+      });
+    } finally {
+      mockConfig.projects = originalProjects;
+    }
+  });
+
   it("reports a failed lifecycle attempt after the delivery was queued", async () => {
     vi.mocked(mockLifecycle.check).mockRejectedValueOnce(new Error("temporary failure"));
 

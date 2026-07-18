@@ -192,7 +192,11 @@ export async function POST(request: Request): Promise<Response> {
     for (const [projectId, deliveryKeys] of queuedDeliveryKeys) {
       const result = await processSCMWebhookQueue(
         projectId,
-        async (job) => services.lifecycleManager.check(job.sessionId),
+        async (job) =>
+          services.lifecycleManager.check(job.sessionId, {
+            projectId: job.projectId,
+            requireSuccessfulSCMRefresh: true,
+          }),
         { deliveryKeys },
       );
       for (const failure of result.failures) {
