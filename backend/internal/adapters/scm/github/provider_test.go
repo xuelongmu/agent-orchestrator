@@ -1284,6 +1284,47 @@ func TestSCMChecksFromGraphQL_StatusContextUsesState(t *testing.T) {
 	}
 }
 
+func TestFetchPullRequestFilesAndRerunFailedCheck(t *testing.T) {
+	f := newFakeGH(t)
+	f.on(http.MethodGet, "/repos/octocat/hello/pulls/42/files", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[
+			{"filename":"backend/internal/lifecycle/reactions.go"},
+			{"filename":"backend/new.go","previous_filename":"frontend/old.test.tsx"}
+		]`)
+	})
+	f.on(http.MethodPost, "/repos/octocat/hello/actions/jobs/101/rerun", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	})
+	p := newProviderForTest(t, f)
+	repo := ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "octocat", Name: "hello", Repo: "octocat/hello"}
+	files, err := p.FetchPullRequestFiles(ctx(), ports.SCMPRRef{Repo: repo, Number: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(files, []string{
+		"backend/internal/lifecycle/reactions.go",
+		"backend/new.go",
+		"frontend/old.test.tsx",
+	}) {
+		t.Fatalf("files = %#v", files)
+	}
+	if err := p.RerunFailedCheck(ctx(), repo, ports.SCMCheckObservation{Name: "test", ProviderID: "101"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.callsTo(http.MethodPost, "/repos/octocat/hello/actions/jobs/101/rerun"); got != 1 {
+		t.Fatalf("rerun calls = %d, want 1", got)
+	}
+}
+
+func TestRerunFailedCheckRejectsNonActionsContext(t *testing.T) {
+	p := &Provider{}
+	err := p.RerunFailedCheck(ctx(), ports.SCMRepo{}, ports.SCMCheckObservation{Name: "legacy status"})
+	if err == nil || !strings.Contains(err.Error(), "invalid Actions job id") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestSCMThreadFromGraphQLMarksThreadBotOnlyWhenAllCommentsAreBots(t *testing.T) {
 	mixed := scmThreadFromGraphQL(map[string]any{
 		"id":         "T-mixed",

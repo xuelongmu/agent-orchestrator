@@ -44,6 +44,8 @@ type Provider interface {
 	CommitChecksGuard(ctx context.Context, repo ports.SCMRepo, headSHA, etag string) (ports.SCMGuardResult, error)
 	FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
 	FetchFailedCheckLogTail(ctx context.Context, repo ports.SCMRepo, check ports.SCMCheckObservation) (string, error)
+	FetchPullRequestFiles(ctx context.Context, ref ports.SCMPRRef) ([]string, error)
+	RerunFailedCheck(ctx context.Context, repo ports.SCMRepo, check ports.SCMCheckObservation) error
 	FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error)
 }
 
@@ -57,6 +59,9 @@ type Store interface {
 	ListSessionWorktrees(ctx context.Context, sessionID domain.SessionID) ([]domain.SessionWorktreeRecord, error)
 	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
 	ListChecks(ctx context.Context, prURL string) ([]domain.PullRequestCheck, error)
+	GetCIRerunAttempt(ctx context.Context, prURL, headSHA, checkName string) (ports.SCMCIRerunAttempt, bool, error)
+	ReserveCIRerunAttempt(ctx context.Context, attempt ports.SCMCIRerunAttempt) (bool, error)
+	UpdateCIRerunAttempt(ctx context.Context, attempt ports.SCMCIRerunAttempt) error
 	WriteSCMObservation(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ports.ReviewWriteMode) error
 }
 
@@ -403,6 +408,18 @@ func (o *Observer) Poll(ctx context.Context) error {
 		}
 		prepared := o.prepareForPersistence(obs, local, opts, now)
 		if !prepared.Changed.Metadata && !prepared.Changed.CI && !prepared.Changed.Review {
+			if o.lifecycle != nil {
+				decision := o.maybeRerunFlakyCI(ctx, subj, prepared)
+				if decision == ciRerunRequested || decision == ciRerunDispatchFailure {
+					lifecycleObservation := prepared
+					lifecycleObservation.CI.RerunRequested = decision == ciRerunRequested
+					if err := o.lifecycle.ApplySCMObservation(ctx, subj.session.ID, lifecycleObservation); err != nil {
+						o.logger.Error("scm observer: lifecycle CI rerun follow-up failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
+						markRepoRefreshFailed(subj.repo)
+						continue
+					}
+				}
+			}
 			if !o.coordinateReview(ctx, subj.session.ID, prepared) {
 				markRepoRefreshFailed(subj.repo)
 				continue
@@ -436,7 +453,10 @@ func (o *Observer) Poll(ctx context.Context) error {
 			continue
 		}
 		if o.lifecycle != nil {
-			if err := o.lifecycle.ApplySCMObservation(ctx, subj.session.ID, prepared); err != nil {
+			lifecycleObservation := prepared
+			decision := o.maybeRerunFlakyCI(ctx, subj, prepared)
+			lifecycleObservation.CI.RerunRequested = decision == ciRerunRequested || decision == ciRerunStillPending
+			if err := o.lifecycle.ApplySCMObservation(ctx, subj.session.ID, lifecycleObservation); err != nil {
 				o.logger.Error("scm observer: lifecycle notification failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
 				markRepoRefreshFailed(subj.repo)
 				continue

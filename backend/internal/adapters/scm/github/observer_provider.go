@@ -156,6 +156,67 @@ func (p *Provider) FetchFailedCheckLogTail(ctx context.Context, repo ports.SCMRe
 	return tailLines(log, ciFailureLogTailLines), nil
 }
 
+// FetchPullRequestFiles returns every changed path for fail-closed CI
+// relevance classification. GitHub caps this endpoint at 3,000 files; reaching
+// that cap returns an error so AO dispatches the normal CI failure instead of
+// guessing from an incomplete diff.
+func (p *Provider) FetchPullRequestFiles(ctx context.Context, ref ports.SCMPRRef) ([]string, error) {
+	const (
+		perPage  = 100
+		maxFiles = 3000
+	)
+	files := make([]string, 0, perPage)
+	providerFileCount := 0
+	for page := 1; ; page++ {
+		q := url.Values{}
+		q.Set("per_page", strconv.Itoa(perPage))
+		q.Set("page", strconv.Itoa(page))
+		resp, err := p.client.doREST(ctx, http.MethodGet, repoPath(ref.Repo.Owner, ref.Repo.Name, "pulls", strconv.Itoa(ref.Number), "files"), q, nil)
+		if err != nil {
+			return nil, err
+		}
+		var batch []struct {
+			Filename         string `json:"filename"`
+			PreviousFilename string `json:"previous_filename"`
+		}
+		if err := json.Unmarshal(resp.Body, &batch); err != nil {
+			return nil, fmt.Errorf("github scm: decode pull request files: %w", err)
+		}
+		for _, file := range batch {
+			if file.Filename != "" {
+				files = append(files, file.Filename)
+			}
+			// A rename changes both path areas for relevance purposes. Dropping
+			// the old path could make a frontend-to-backend move look unrelated
+			// to a failing frontend test and suppress the normal CI dispatch.
+			if file.PreviousFilename != "" && file.PreviousFilename != file.Filename {
+				files = append(files, file.PreviousFilename)
+			}
+		}
+		providerFileCount += len(batch)
+		if len(batch) < perPage {
+			return files, nil
+		}
+		if providerFileCount >= maxFiles {
+			return nil, fmt.Errorf("github scm: pull request file list reached provider cap of %d", maxFiles)
+		}
+	}
+}
+
+// RerunFailedCheck requests a rerun of one GitHub Actions job. Status contexts
+// and providers without a numeric Actions job id are intentionally ineligible.
+func (p *Provider) RerunFailedCheck(ctx context.Context, repo ports.SCMRepo, check ports.SCMCheckObservation) error {
+	jobID, err := strconv.ParseInt(check.ProviderID, 10, 64)
+	if err != nil || jobID <= 0 {
+		return fmt.Errorf("github scm: invalid Actions job id %q", check.ProviderID)
+	}
+	_, err = p.client.doREST(ctx, http.MethodPost, repoPath(repo.Owner, repo.Name, "actions", "jobs", strconv.FormatInt(jobID, 10), "rerun"), nil, nil)
+	if err != nil {
+		return fmt.Errorf("github scm: rerun Actions job %d: %w", jobID, err)
+	}
+	return nil
+}
+
 // FetchReviewThreads fetches review threads separately from the fast PR/CI path.
 func (p *Provider) FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error) {
 	latest, err := p.fetchReviewThreadPage(ctx, ref, "", true)

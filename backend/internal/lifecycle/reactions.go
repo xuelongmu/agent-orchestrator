@@ -519,8 +519,17 @@ func scmToPRObservation(o ports.SCMObservation) ports.PRObservation {
 	if pr.Mergeability == "" {
 		pr.Mergeability = domain.MergeUnknown
 	}
+	if o.CI.RerunRequested {
+		// The observer has already durably bounded and requested a provider
+		// rerun. Keep the session in a non-mergeable CI state without dispatching
+		// an agent to chase the stale failed job.
+		pr.CI = domain.CIPending
+	}
 	checkCommit := firstSCMNonEmpty(o.CI.HeadSHA, o.PR.HeadSHA)
 	for _, ch := range o.CI.FailedChecks {
+		if o.CI.RerunRequested {
+			break
+		}
 		status := domain.PRCheckStatus(ch.Status)
 		if status == "" {
 			status = domain.PRCheckFailed
