@@ -19,6 +19,7 @@ import (
 )
 
 const reviewMaxNudge = 3
+const mergeConflictMaxNudge = 1
 
 const reviewRoundCapNotificationFailed = "review-round-cap-notification-failed"
 const suppressedNudgeNotificationFailed = "suppressed-nudge-notification-failed"
@@ -270,6 +271,14 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 		}
 		return nil
 	}
+	// A provider-confirmed recovery ends the current conflict episode. Clear its
+	// durable one-shot so the same head can be dispatched again if a later base
+	// advance makes it conflicting anew.
+	if o.Mergeability != domain.MergeConflicting && o.Mergeability != domain.MergeUnknown && o.Mergeability != "" {
+		if err := m.resetMergeConflictNudges(ctx, o.URL, ""); err != nil {
+			return err
+		}
+	}
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil || !ok {
 		return err
@@ -315,7 +324,7 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 		}
 		nudges = append(nudges, pendingNudge{key: "review:" + o.URL, sig: sig, msg: msg, maxAttempts: reviewMaxNudge})
 	}
-	if o.Mergeability == domain.MergeConflicting {
+	if o.Mergeability == domain.MergeConflicting && strings.TrimSpace(o.URL) != "" && strings.TrimSpace(o.HeadSHA) != "" {
 		// Only the bottom of a stack is eligible for the rebase nudge. A PR
 		// stacked on an open parent is expected to report conflicts against its
 		// parent branch until the parent merges and it retargets, so nudging the
@@ -326,11 +335,21 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 			return err
 		}
 		if !blocked {
-			msg := "There are merge conflicts on " + ident + ". Rebase onto the base branch and resolve them."
-			if o.URL != "" {
-				msg += "\nPR: " + domain.SanitizeControlChars(o.URL)
+			sig := mergeConflictSignature(o)
+			key := mergeConflictNudgeKey(o.URL, sig)
+			if err := m.resetMergeConflictNudges(ctx, o.URL, key); err != nil {
+				return err
 			}
-			nudges = append(nudges, pendingNudge{key: "merge-conflict:" + o.URL, sig: string(o.Mergeability), msg: msg, maxAttempts: 0})
+			base := domain.SanitizeControlChars(o.TargetBranch)
+			if strings.TrimSpace(base) == "" {
+				base = "the PR base branch"
+			}
+			msg := "The provider reports merge conflicts on " + ident + "."
+			msg += "\nExact head: " + domain.SanitizeControlChars(o.HeadSHA)
+			msg += "\nBase: " + base
+			msg += "\nConfirm the PR still points at this exact head, then update from the base using the repository's normal merge or rebase workflow, resolve the conflicts, run the relevant checks, and push the updated head. AO has not executed Git commands for you."
+			msg += "\nPR: " + domain.SanitizeControlChars(o.URL)
+			nudges = append(nudges, pendingNudge{key: key, sig: sig, msg: msg, maxAttempts: mergeConflictMaxNudge})
 		}
 	}
 
@@ -340,6 +359,51 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 		}
 	}
 	return nil
+}
+
+func mergeConflictSignature(o ports.PRObservation) string {
+	return strings.Join([]string{o.HeadSHA, o.TargetBranch, string(o.Mergeability)}, "\x00")
+}
+
+func mergeConflictNudgeKey(prURL, sig string) string {
+	sum := sha256.Sum256([]byte(sig))
+	return fmt.Sprintf("merge-conflict:%s:%x", prURL, sum)
+}
+
+// resetMergeConflictNudges removes superseded per-head conflict episodes. The
+// current key may be kept for an unchanged conflicting observation; an empty
+// keepKey is a provider-confirmed recovery. Caller-visible persistence makes
+// both paths survive daemon restarts without growing an unbounded key ledger.
+func (m *Manager) resetMergeConflictNudges(ctx context.Context, prURL, keepKey string) error {
+	if strings.TrimSpace(prURL) == "" {
+		return nil
+	}
+	m.react.mu.Lock()
+	defer m.react.mu.Unlock()
+	if !m.react.loaded[prURL] {
+		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+			return err
+		}
+		m.react.loaded[prURL] = true
+	}
+	prefix := "merge-conflict:" + prURL
+	changed := false
+	for key := range m.react.seen {
+		if key != keepKey && (key == prefix || strings.HasPrefix(key, prefix+":")) {
+			delete(m.react.seen, key)
+			changed = true
+		}
+	}
+	for key := range m.react.attempts {
+		if key != keepKey && (key == prefix || strings.HasPrefix(key, prefix+":")) {
+			delete(m.react.attempts, key)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return m.persistPRSignaturesLocked(ctx, prURL)
 }
 
 // cleanupMergedSession runs the resource-owning session manager before the
@@ -590,6 +654,7 @@ func scmToPRObservation(o ports.SCMObservation) ports.PRObservation {
 		Title:        o.PR.Title,
 		SourceBranch: o.PR.SourceBranch,
 		TargetBranch: o.PR.TargetBranch,
+		HeadSHA:      o.PR.HeadSHA,
 		Draft:        o.PR.Draft,
 		Merged:       o.PR.Merged,
 		Closed:       o.PR.Closed,
