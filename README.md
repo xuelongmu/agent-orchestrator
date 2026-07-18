@@ -1,245 +1,193 @@
-<h1 align="center">Agent Orchestrator — The Orchestration Layer for Parallel AI Agents</h1>
-
-<p align="center">
-<a href="https://github.com/ComposioHQ/agent-orchestrator">
-  <img width="800" alt="Agent Orchestrator banner" src="docs/assets/agent_orchestrator_banner.png">
-</a>
-</p>
-
 <div align="center">
+  <img src="ao-logo.svg" alt="Agent Orchestrator" width="160" height="160" />
 
-Spawn parallel AI coding agents, each in its own git worktree. Agents autonomously fix CI failures, address review comments, and open PRs — you supervise from one dashboard.
+# Agent Orchestrator
 
-[![GitHub stars](https://img.shields.io/github/stars/ComposioHQ/agent-orchestrator?style=flat-square)](https://github.com/ComposioHQ/agent-orchestrator/stargazers)
-[![npm version](https://img.shields.io/npm/v/%40aoagents%2Fao?style=flat-square)](https://www.npmjs.com/package/@aoagents/ao)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![PRs merged](https://img.shields.io/badge/PRs_merged-61-brightgreen?style=flat-square)](https://github.com/ComposioHQ/agent-orchestrator/pulls?q=is%3Amerged)
-[![Tests](https://img.shields.io/badge/test_cases-3%2C288-blue?style=flat-square)](https://github.com/ComposioHQ/agent-orchestrator/releases/tag/metrics-v1)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/UZv7JjxbwG)
+**The orchestration layer for parallel AI coding agents**
 
+[![Stars](https://img.shields.io/github/stars/AgentWrapper/agent-orchestrator)](https://github.com/AgentWrapper/agent-orchestrator/stargazers)
+[![Contributors](https://img.shields.io/github/contributors/AgentWrapper/agent-orchestrator)](https://github.com/AgentWrapper/agent-orchestrator/graphs/contributors)
+[![Twitter](https://img.shields.io/badge/Twitter-1DA1F2?logo=twitter&logoColor=white)](https://x.com/aoagents)
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.com/invite/UZv7JjxbwG)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
+An Agentic IDE that supervises parallel AI coding agents in isolated workspaces, with complete control and automatic feedback loops from CI failures, review comments, and merge conflicts.
+
+<img src="docs/assets/readme/dashboard.png" alt="Agent Orchestrator dashboard showing parallel coding agent sessions" width="100%" />
 </div>
 
 ---
 
-Agent Orchestrator manages fleets of AI coding agents working in parallel on your codebase. Each agent gets its own git worktree, its own branch, and its own PR. When CI fails, the agent fixes it. When reviewers leave comments, the agent addresses them. You only get pulled in when human judgment is needed.
+## What is Agent Orchestrator?
 
-**Agent-agnostic** (Claude Code, Codex, Aider) · **Runtime-agnostic** (tmux, ConPTY/process, Docker) · **Tracker-agnostic** (GitHub, Linear)
+Agent Orchestrator is a meta-harness agent IDE for running AI coding agents in parallel. It gives terminal-based agents like Claude Code, Codex, Cursor, Kimi Code, opencode, and others a shared workspace where their sessions, terminals, branches, pull requests, and feedback loops can be supervised from one place.
 
-<div align="center">
-
-## See it in action
-
-<a href="https://x.com/agent_wrapper/status/2026329204405723180">
-  <img src="docs/assets/demo-video-tweet.png" alt="Agent Orchestrator demo — AI agents building their own orchestrator" width="560">
-</a>
-<br><br>
-<a href="https://x.com/agent_wrapper/status/2026329204405723180"><img src="docs/assets/btn-watch-demo.png" alt="Watch the Demo on X" height="48"></a>
-<br><br><br>
-<a href="https://x.com/agent_wrapper/status/2025986105485733945">
-  <img src="docs/assets/article-tweet.png" alt="The Self-Improving AI System That Built Itself" width="560">
-</a>
-<br><br>
-<a href="https://x.com/agent_wrapper/status/2025986105485733945"><img src="docs/assets/btn-read-article.png" alt="Read the Full Article on X" height="48"></a>
-
-</div>
-
-## Quick Start
-
-> **Prerequisites:** [Node.js 20.18.3+](https://nodejs.org), [Git 2.25+](https://git-scm.com), [`gh` CLI](https://cli.github.com), and:
-> - **macOS / Linux:** [tmux](https://github.com/tmux/tmux/wiki/Installing) — install via `brew install tmux` or `sudo apt install tmux`.
-> - **Windows:** PowerShell 7+ recommended. tmux is **not** required — AO uses native ConPTY via the `runtime-process` plugin (the default on Windows). Set `AO_SHELL=bash` if you have Git Bash and prefer it.
-
-### Install
-
-```bash
-npm install -g @aoagents/ao
-```
-
-> **Nightly builds** (latest `main`, daily Fri–Tue): `npm install -g @aoagents/ao@nightly`
-> Back to stable: `npm install -g @aoagents/ao@latest`
-
-<details>
-<summary>Permission denied? Install from source?</summary>
-
-If `npm install -g` fails with EACCES, prefix with `sudo` or [fix your npm permissions](https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally).
-
-To install from source (for contributors):
-
-```bash
-git clone https://github.com/ComposioHQ/agent-orchestrator.git
-cd agent-orchestrator && bash scripts/setup.sh
-```
-</details>
-
-### Zsh Completion
-
-Generate the completion file from the installed CLI:
-
-```bash
-mkdir -p ~/.zsh/completions
-ao completion zsh > ~/.zsh/completions/_ao
-```
-
-Then make sure the directory is on your `fpath` before `compinit` runs:
-
-```zsh
-fpath=(~/.zsh/completions $fpath)
-autoload -Uz compinit
-compinit
-```
-
-For Oh My Zsh, install the same generated file into a custom plugin directory and add `ao` to your plugin list:
-
-```bash
-mkdir -p "${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/ao"
-ao completion zsh > "${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/ao/_ao"
-```
-
-If you are contributing from a source checkout, you can also symlink the repo copy at [`completions/_ao`](completions/_ao).
-
-### Start
-
-Point it at any repo — it clones, configures, and launches the dashboard in one command:
-
-```bash
-ao start https://github.com/your-org/your-repo
-```
-
-Or from inside an existing local repo:
-
-```bash
-cd ~/your-project && ao start
-```
-
-That's it. The dashboard opens at `http://localhost:3000` and the orchestrator agent starts managing your project.
-
-### Add more projects
-
-```bash
-ao start ~/path/to/another-repo
-```
-
-## How It Works
-
-1. **You start** — `ao start` launches the dashboard and an orchestrator agent
-2. **Orchestrator spawns workers** — each issue gets its own agent in an isolated git worktree
-3. **Agents work autonomously** — they read code, write tests, create PRs
-4. **Reactions handle feedback** — CI failures and review comments are automatically routed back to the agent
-5. **You review and merge** — you only get pulled in when human judgment is needed
-
-The orchestrator agent uses the [AO CLI](docs/CLI.md) internally to manage sessions. You don't need to learn or use the CLI — the dashboard and orchestrator handle everything.
-
-## Configuration
-
-`ao start` auto-generates `agent-orchestrator.yaml` with sensible defaults. You can edit it afterwards to customize behavior:
-
-```yaml
-# agent-orchestrator.yaml
-$schema: https://raw.githubusercontent.com/ComposioHQ/agent-orchestrator/main/schema/config.schema.json
-# Runtime data is auto-derived under ~/.agent-orchestrator/{hash}-{projectId}/
-port: 3000
-
-defaults:
-  runtime: tmux       # default on macOS / Linux; on Windows the default is `process` (ConPTY)
-  agent: claude-code
-  workspace: worktree
-  notifiers: [desktop]
-
-projects:
-  my-app:
-    repo: owner/my-app
-    path: ~/my-app
-    defaultBranch: main
-    sessionPrefix: app
-
-reactions:
-  ci-failed:
-    auto: true
-    action: send-to-agent
-    retries: 2
-  changes-requested:
-    auto: true
-    action: send-to-agent
-    escalateAfter: 30m
-  approved-and-green:
-    auto: true
-    action: auto-merge # gated by green CI, review policy, conflicts, and confidence
-    confidenceThreshold: 0.8
-```
-
-CI fails → AO retries classifier-confirmed flakes or sends real failures to the agent. Reviewer requests changes → agent addresses them. Auto-merge runs only after the complete quality gate passes.
-
-Keep the `$schema` line so editors can autocomplete and validate against [`schema/config.schema.json`](schema/config.schema.json).
-
-See [`agent-orchestrator.yaml.example`](agent-orchestrator.yaml.example) for the full reference, or run `ao config-help` for the complete schema.
-
-## Remote Access
-
-AO keeps your Mac awake while running, so you can access the dashboard remotely (e.g., via Tailscale from your phone) without the machine going to sleep.
-
-**How it works:** On macOS, AO automatically holds an idle-sleep prevention assertion using `caffeinate`. When AO exits, the assertion is released.
-
-```yaml
-# agent-orchestrator.yaml
-$schema: https://raw.githubusercontent.com/ComposioHQ/agent-orchestrator/main/schema/config.schema.json
-power:
-  preventIdleSleep: true  # Default on macOS; no-op on Linux and Windows
-```
-
-Set to `false` if you want to allow idle sleep while AO runs.
-
-**Lid-close limitation:** macOS enforces lid-close sleep at the hardware level — no userspace assertion can override it. If you need remote access while traveling with the lid closed, use [clamshell mode](https://support.apple.com/en-us/102505) (external power + display + input device).
-
-**Linux / Windows:** AO does not currently hold a wake assertion on these platforms. On Linux, idle-sleep behaviour is governed by your desktop environment / `systemd-logind`; configure that directly. On Windows, set the OS power plan if remote access matters while idle.
-
-## Plugin Architecture
-
-Seven plugin slots. Lifecycle stays in core.
-
-| Slot      | Default     | Alternatives             |
-| --------- | ----------- | ------------------------ |
-| Runtime   | tmux (macOS/Linux) / process (Windows) | process, docker |
-| Agent     | claude-code | codex, aider, cursor, opencode, kimicode |
-| Workspace | worktree    | clone                    |
-| Tracker   | github      | linear, gitlab           |
-| SCM       | github      | gitlab                   |
-| Notifier  | desktop     | slack, discord, composio, webhook, openclaw |
-| Terminal  | iterm2      | web                      |
-
-All interfaces defined in [`packages/core/src/types.ts`](packages/core/src/types.ts). A plugin implements one interface and exports a `PluginModule`. That's it.
+The agents still do the coding. AO provides the harness around them: isolated workspaces, live terminal access, session state, PR awareness, and automatic loops that send CI failures, review comments, and merge conflicts back to the right agent. Instead of manually coordinating a pile of agent terminals, AO turns parallel agent work into a managed workflow.
 
 ## Why Agent Orchestrator?
 
-Running one AI agent in a terminal is easy. Running 30 across different issues, branches, and PRs is a coordination problem.
+AI coding agents become much more useful when they can work in parallel, but parallel work gets messy quickly. Branches overlap, terminals get lost, CI failures need follow-up, review comments need replies, and merge conflicts have to reach the right worker.
 
-**Without orchestration**, you manually: create branches, start agents, check if they're stuck, read CI failures, forward review comments, track which PRs are ready to merge, clean up when done.
+Agent Orchestrator is built to keep that loop visible and manageable. It helps you:
 
-**With Agent Orchestrator**, you: `ao start` and walk away. The system handles isolation, feedback routing, and status tracking. You review PRs and make decisions — the rest is automated.
+- Start multiple agents from the same project without mixing their work
+- Keep every session in a separate git worktree
+- See which agents are working, waiting, finished, or blocked
+- Route CI failures, review comments, and merge conflicts back to the right session
+- Use different agent CLIs through one common supervisor
+
+## How it works
+
+At a high level, Agent Orchestrator follows a simple loop:
+
+1. Add a project you want agents to work on.
+2. Start one or more sessions from the desktop app or CLI.
+3. AO creates an isolated git worktree for each session.
+4. AO launches the selected coding agent in that session's terminal runtime.
+5. The local daemon watches session state, terminal activity, pull requests, CI, and review feedback.
+6. The desktop app and CLI show the current state and let you send follow-up instructions to the right session.
+
+The result is a local control layer for agentic coding: agents still do the coding, while Agent Orchestrator keeps their workspaces, status, terminals, and feedback loops organized.
+
+## Features
+
+The desktop app is the main control surface: projects on the left, active sessions in the center, and the selected session's terminal, pull request state, review runs, and browser preview in the inspector.
+
+<table>
+  <tr>
+    <td width="36%">
+      <h3>Parallel agent sessions</h3>
+      <p>Start multiple coding agents from the same project without mixing files, branches, terminals, or pull request state.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/dashboard.png" alt="Agent Orchestrator board with multiple parallel sessions" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%">
+      <h3>Live terminal control</h3>
+      <p>Open any session and attach to the worker terminal while keeping session summary, PR state, and follow-up actions in view.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/session-terminal.png" alt="Session terminal inside Agent Orchestrator" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%">
+      <h3>Review feedback loop</h3>
+      <p>Run reviewer agents, inspect review status, and route requested changes back to the right worker session.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/reviews-tab.png" alt="Reviews tab showing reviewer runs and actions" />
+    </td>
+  </tr>
+  <tr>
+    <td width="36%">
+      <h3>In-app browser preview</h3>
+      <p>Preview a session's local app beside the terminal so UI work, browser state, and agent output stay together.</p>
+    </td>
+    <td width="64%">
+      <img src="docs/assets/readme/browser-preview.png" alt="Browser preview tab showing a local app preview" />
+    </td>
+  </tr>
+</table>
+
+## Supported Agents
+
+AO ships adapters for 23 worker agent harnesses:
+
+<p>
+  <a href="https://ao-agents.com/docs/plugins/agents/claude-code"><img src="frontend/src/landing/public/docs/logos/claude-code.svg" alt="" width="16" height="16" valign="middle" /> <code>claude-code</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents/codex"><img src="frontend/src/landing/public/docs/logos/codex.svg" alt="" width="16" height="16" valign="middle" /> <code>codex</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents/aider"><img src="frontend/src/landing/public/docs/logos/aider.png" alt="" width="16" height="16" valign="middle" /> <code>aider</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents/opencode"><img src="frontend/src/landing/public/docs/logos/opencode.svg" alt="" width="16" height="16" valign="middle" /> <code>opencode</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/grok.png" alt="" width="16" height="16" valign="middle" /> <code>grok</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/droid.png" alt="" width="16" height="16" valign="middle" /> <code>droid</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><code>amp</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><code>agy</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/crush.png" alt="" width="16" height="16" valign="middle" /> <code>crush</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents/cursor"><img src="frontend/src/landing/public/docs/logos/cursor.svg" alt="" width="16" height="16" valign="middle" /> <code>cursor</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/qwen.png" alt="" width="16" height="16" valign="middle" /> <code>qwen</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/copilot.png" alt="" width="16" height="16" valign="middle" /> <code>copilot</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/goose.png" alt="" width="16" height="16" valign="middle" /> <code>goose</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><code>auggie</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/continue.png" alt="" width="16" height="16" valign="middle" /> <code>continue</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/devin.png" alt="" width="16" height="16" valign="middle" /> <code>devin</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><code>cline</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/kimi.png" alt="" width="16" height="16" valign="middle" /> <code>kimi</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/kiro.png" alt="" width="16" height="16" valign="middle" /> <code>kiro</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/kilocode.png" alt="" width="16" height="16" valign="middle" /> <code>kilocode</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/vibe.png" alt="" width="16" height="16" valign="middle" /> <code>vibe</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><img src="frontend/src/landing/public/docs/logos/pi.png" alt="" width="16" height="16" valign="middle" /> <code>pi</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents"><code>autohand</code></a>
+</p>
+
+Reviewer agents are configured separately. The current reviewer harnesses are:
+
+<p>
+  <a href="https://ao-agents.com/docs/plugins/agents/claude-code"><img src="frontend/src/landing/public/docs/logos/claude-code.svg" alt="" width="16" height="16" valign="middle" /> <code>claude-code</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents/codex"><img src="frontend/src/landing/public/docs/logos/codex.svg" alt="" width="16" height="16" valign="middle" /> <code>codex</code></a> ·
+  <a href="https://ao-agents.com/docs/plugins/agents/opencode"><img src="frontend/src/landing/public/docs/logos/opencode.svg" alt="" width="16" height="16" valign="middle" /> <code>opencode</code></a>
+</p>
+
+**If it runs in a terminal, it runs on Agent Orchestrator.**
+
+## Install
+
+Download the latest desktop build for your platform:
+
+| Platform              | Download                                                                                                                      |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| macOS (Apple silicon) | [Download](https://github.com/AgentWrapper/agent-orchestrator/releases/latest/download/agent-orchestrator-darwin-arm64.zip)   |
+| macOS (Intel)         | [Download](https://github.com/AgentWrapper/agent-orchestrator/releases/latest/download/agent-orchestrator-darwin-x64.zip)     |
+| Windows               | [Download](https://github.com/AgentWrapper/agent-orchestrator/releases/latest/download/agent-orchestrator-win32-x64.exe)      |
+| Linux                 | [Download](https://github.com/AgentWrapper/agent-orchestrator/releases/latest/download/agent-orchestrator-linux-x64.AppImage) |
+
+After installing, open Agent Orchestrator and point it at the repository you want AO to manage. The desktop app runs the daemon for you, so no CLI is required. See the [installation guide](https://ao-agents.com/docs/installation) for agent CLI setup and troubleshooting.
+
+<details>
+<summary>Install via npm (legacy CLI, no longer recommended)</summary>
+
+npm still works but is no longer recommended. `0.10.0` is the final version published to npm, and the `@aoagents/ao` package is frozen and will not receive further updates. It stays available for existing users who have the `ao` CLI on their PATH; `ao start` fetches and opens the same desktop build linked above. For any new setup, prefer the desktop download.
+
+```bash
+npm install -g @aoagents/ao
+ao start
+```
+
+</details>
+
+## Witness AO's Journey on X
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="https://x.com/agent_wrapper/status/2026329204405723180">
+        <img src="screenshots/tweet2.png" height="330" alt="Agent Orchestrator journey screenshot one" />
+      </a>
+    </td>
+    <td width="50%" align="center">
+      <a href="https://x.com/agent_wrapper/status/2025986105485733945">
+        <img src="screenshots/tweet1.png" height="330" alt="Agent Orchestrator journey screenshot two" />
+      </a>
+    </td>
+  </tr>
+</table>
 
 ## Documentation
 
-| Doc                                      | What it covers                                               |
-| ---------------------------------------- | ------------------------------------------------------------ |
-| [Setup Guide](SETUP.md)                  | Detailed installation, configuration, and troubleshooting    |
-| [CLI Reference](docs/CLI.md)             | All `ao` commands (mostly used by the orchestrator agent)    |
-| [Examples](examples/)                    | Config templates (GitHub, Linear, multi-project, auto-merge) |
-| [Development Guide](docs/DEVELOPMENT.md) | Architecture, conventions, plugin pattern                    |
-| [Contributing](CONTRIBUTING.md)          | How to contribute, build plugins, PR process                 |
+| Document                                                         | Start here when you need                                                                     |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| [docs/architecture.md](docs/architecture.md)                     | Backend mental model, lifecycle, persistence, CDC, status derivation, and daemon boundaries. |
+| [docs/backend-code-structure.md](docs/backend-code-structure.md) | Package ownership and where each backend concern belongs.                                    |
+| [docs/cli/README.md](docs/cli/README.md)                         | CLI behavior and daemon route mapping.                                                       |
+| [docs/STATUS.md](docs/STATUS.md)                                 | What currently ships on `main` and what remains in flight.                                   |
+| [docs/stack.md](docs/stack.md)                                   | Library, runtime, and dependency decisions.                                                  |
 
-## Development
+## Telemetry
 
-```bash
-pnpm install && pnpm build    # Install and build all packages
-pnpm test                      # Run tests (3,288 test cases)
-pnpm dev                       # Start web dashboard dev server
-```
-
-See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for code conventions and architecture details.
-
-## Contributing
-
-Contributions welcome. The plugin system makes it straightforward to add support for new agents, runtimes, trackers, and notification channels. Every plugin is an implementation of a TypeScript interface — see [CONTRIBUTING.md](CONTRIBUTING.md) and the [Development Guide](docs/DEVELOPMENT.md) for the pattern.
+Agent Orchestrator's Electron renderer sends anonymous usage events to PostHog for reliability and product understanding, and PostHog session recording is enabled with local paths and local URLs redacted before transmission. Set `VITE_AO_POSTHOG_KEY` to an empty string before building to disable transmission. See [docs/telemetry.md](docs/telemetry.md).
 
 ## License
 
-MIT
+Apache License 2.0. See [LICENSE](LICENSE).

@@ -1,0 +1,264 @@
+// Package vibe implements the Mistral Vibe agent adapter: launching interactive
+// Vibe sessions and resuming sessions when a native Vibe session id is known.
+//
+// Mistral Vibe (binary "vibe", https://github.com/mistralai/mistral-vibe) is a
+// Python CLI installed via `uv tool install mistral-vibe`, pip, or its install
+// script. AO drives Vibe in interactive mode by passing the task as the
+// positional initial prompt. `--trust` skips the working-directory trust prompt
+// for AO-managed worktrees while preserving Vibe's normal TUI.
+//
+// Permission modes map onto Vibe's builtin agent profiles via `--agent`:
+// accept-edits ("auto-approves file edits only") and auto-approve
+// ("auto-approves all tool executions"). PermissionModeDefault emits no flag so
+// Vibe resolves its starting agent from the user's `default_agent` config.
+//
+// Vibe has no usable lifecycle-hook surface for AO activity: its only hook type
+// is an experimental, off-by-default POST_AGENT_TURN hook with no
+// session-start/user-prompt-submit/stop/permission-request taxonomy, and it is
+// not Claude-Code compatible. Hook installation and SessionInfo are therefore
+// intentionally no-ops (Tier C).
+//
+// Restore uses `--resume <session id>` (Vibe matches by partial/short id) when
+// a native session id is available in metadata.
+package vibe
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/binaryutil"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/hookutil"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+)
+
+const adapterID = "vibe"
+
+// Plugin is the Mistral Vibe agent adapter. It is safe for concurrent use; the
+// binary path is resolved once and cached under binaryMu.
+type Plugin struct {
+	agentbase.Base
+	binaryMu       sync.Mutex
+	resolvedBinary string
+}
+
+// New returns a ready-to-register Mistral Vibe adapter.
+func New() *Plugin {
+	return &Plugin{}
+}
+
+var _ adapters.Adapter = (*Plugin)(nil)
+var _ ports.Agent = (*Plugin)(nil)
+
+// Manifest returns the adapter's static self-description.
+func (p *Plugin) Manifest() adapters.Manifest {
+	return adapters.Manifest{
+		ID:          adapterID,
+		Name:        "Mistral Vibe",
+		Description: "Run Mistral Vibe worker sessions.",
+		Version:     "0.0.1",
+		Capabilities: []adapters.Capability{
+			adapters.CapabilityAgent,
+		},
+	}
+}
+
+// GetLaunchCommand builds the argv to start a new interactive Vibe session:
+//
+//	vibe --trust [--workdir <path>] [--agent <profile-or-ao-agent>] [--auto-approve] [-- <prompt>]
+//
+// When present, the prompt is delivered as Vibe's positional initial prompt, so
+// AO uses in-command delivery. Empty prompts intentionally launch an interactive
+// Vibe TUI with no positional prompt: the session manager uses promptless
+// launches for orchestrators and restore fallback. `--trust` skips the trust
+// prompt for automation and avoiding `-p` keeps Vibe in its Textual TUI instead
+// of programmatic output mode. `--workdir` is passed explicitly because Vibe
+// validates its own working directory in addition to the process cwd AO sets
+// through the runtime. Vibe exposes no CLI system-prompt flag (system prompts
+// are config-driven), so SystemPrompt is not forwarded.
+func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (cmd []string, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	binary, err := p.vibeBinary(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	agentName, addDir, err := vibeAgentFlag(cfg.Permissions, cfg.SystemPrompt, cfg.SystemPromptFile)
+	if err != nil {
+		return nil, err
+	}
+	cmd = make([]string, 0, 6)
+	cmd = append(cmd, binary, "--trust")
+	appendWorkdirFlag(&cmd, cfg.WorkspacePath)
+	if addDir != "" {
+		cmd = append(cmd, "--add-dir", addDir)
+	}
+	if agentName != "" {
+		cmd = append(cmd, "--agent", agentName)
+		appendCustomAgentApprovalFlags(&cmd, cfg.Permissions)
+	} else {
+		appendAgentFlags(&cmd, cfg.Permissions)
+	}
+	if strings.TrimSpace(cfg.Prompt) != "" {
+		cmd = append(cmd, "--", cfg.Prompt)
+	}
+	return cmd, nil
+}
+
+// GetRestoreCommand rebuilds the argv that continues an existing Vibe session
+// when a native session id is available in metadata. Without it, ok is false
+// and callers fall back to fresh launch behavior.
+func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig) (cmd []string, ok bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	agentSessionID := strings.TrimSpace(cfg.Session.Metadata[ports.MetadataKeyAgentSessionID])
+	if agentSessionID == "" {
+		return nil, false, nil
+	}
+
+	binary, err := p.vibeBinary(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	agentName, addDir, err := vibeAgentFlag(cfg.Permissions, cfg.SystemPrompt, cfg.SystemPromptFile)
+	if err != nil {
+		return nil, false, err
+	}
+	cmd = []string{binary, "--trust"}
+	appendWorkdirFlag(&cmd, cfg.Session.WorkspacePath)
+	if addDir != "" {
+		cmd = append(cmd, "--add-dir", addDir)
+	}
+	if agentName != "" {
+		cmd = append(cmd, "--agent", agentName)
+		appendCustomAgentApprovalFlags(&cmd, cfg.Permissions)
+	} else {
+		appendAgentFlags(&cmd, cfg.Permissions)
+	}
+	cmd = append(cmd, "--resume", agentSessionID)
+	return cmd, true, nil
+}
+
+// appendWorkdirFlag adds Vibe's explicit `--workdir` flag. Vibe validates its
+// own working directory in addition to the process cwd AO sets.
+func appendWorkdirFlag(cmd *[]string, workspacePath string) {
+	if workspacePath != "" {
+		*cmd = append(*cmd, "--workdir", workspacePath)
+	}
+}
+
+// appendAgentFlags maps AO permission modes onto Vibe's builtin `--agent`
+// profiles. PermissionModeDefault (and the empty mode) emit no flag so Vibe
+// resolves its starting agent from the user's `default_agent` config.
+func appendAgentFlags(cmd *[]string, mode ports.PermissionMode) {
+	switch mode {
+	case ports.PermissionModeAcceptEdits:
+		*cmd = append(*cmd, "--agent", "accept-edits")
+	case ports.PermissionModeAuto:
+		*cmd = append(*cmd, "--agent", "auto-approve")
+	case ports.PermissionModeBypassPermissions:
+		*cmd = append(*cmd, "--agent", "auto-approve")
+	}
+}
+
+func appendCustomAgentApprovalFlags(cmd *[]string, mode ports.PermissionMode) {
+	switch ports.NormalizePermissionMode(mode) {
+	case ports.PermissionModeAuto, ports.PermissionModeBypassPermissions:
+		*cmd = append(*cmd, "--auto-approve")
+	}
+}
+
+const vibePromptAgentName = "ao-system-prompt"
+
+func vibeAgentFlag(mode ports.PermissionMode, inlinePrompt, promptFile string) (string, string, error) {
+	if inlinePrompt == "" && promptFile == "" {
+		return "", "", nil
+	}
+	if strings.TrimSpace(promptFile) == "" {
+		return "", "", fmt.Errorf("vibe: system prompt file required to build agent config")
+	}
+	vibeRoot := filepath.Join(filepath.Dir(promptFile), "vibe")
+	promptsDir := filepath.Join(vibeRoot, ".vibe", "prompts")
+	agentsDir := filepath.Join(vibeRoot, ".vibe", "agents")
+	promptText := inlinePrompt
+	if promptText == "" {
+		data, err := os.ReadFile(promptFile) //nolint:gosec // path is AO-owned launch config
+		if err != nil {
+			return "", "", err
+		}
+		promptText = string(data)
+	}
+	if err := os.MkdirAll(promptsDir, 0o700); err != nil {
+		return "", "", fmt.Errorf("vibe: create prompts dir: %w", err)
+	}
+	if err := os.MkdirAll(agentsDir, 0o700); err != nil {
+		return "", "", fmt.Errorf("vibe: create agents dir: %w", err)
+	}
+	if err := hookutil.AtomicWriteFile(filepath.Join(promptsDir, vibePromptAgentName+".md"), []byte(strings.TrimRight(promptText, "\n")+"\n"), 0o600); err != nil {
+		return "", "", fmt.Errorf("vibe: write prompt: %w", err)
+	}
+	agentConfig := vibeAgentTOML(vibePromptAgentName, mode)
+	if err := hookutil.AtomicWriteFile(filepath.Join(agentsDir, vibePromptAgentName+".toml"), []byte(agentConfig), 0o600); err != nil {
+		return "", "", fmt.Errorf("vibe: write agent config: %w", err)
+	}
+	return vibePromptAgentName, vibeRoot, nil
+}
+
+func vibeAgentTOML(agentName string, mode ports.PermissionMode) string {
+	var b strings.Builder
+	b.WriteString(`agent_type = "agent"` + "\n")
+	b.WriteString(`display_name = "AO Session"` + "\n")
+	b.WriteString(`description = "AO session standing instructions."` + "\n")
+	b.WriteString(`safety = "neutral"` + "\n")
+	b.WriteString("system_prompt_id = ")
+	b.WriteString(strconv.Quote(agentName))
+	b.WriteString("\n")
+	if ports.NormalizePermissionMode(mode) == ports.PermissionModeAcceptEdits {
+		b.WriteString("\n[tools.write_file]\npermission = \"always\"\n")
+		b.WriteString("\n[tools.search_replace]\npermission = \"always\"\n")
+	}
+	return b.String()
+}
+
+var vibeBinarySpec = binaryutil.BinarySpec{
+	Label:         "vibe",
+	Names:         []string{"vibe"},
+	WinNames:      []string{"vibe.exe", "vibe.cmd", "vibe"},
+	UnixPaths:     []string{"/usr/local/bin/vibe", "/opt/homebrew/bin/vibe"},
+	UnixHomePaths: [][]string{{".local", "bin", "vibe"}, {".local", "share", "uv", "tools", "mistral-vibe", "bin", "vibe"}},
+	WinPaths: []binaryutil.WinPath{
+		{Base: binaryutil.WinAppData, Parts: []string{"Python", "Scripts", "vibe.exe"}},
+		{Base: binaryutil.WinLocalAppData, Parts: []string{"uv", "tools", "mistral-vibe", "Scripts", "vibe.exe"}},
+	},
+}
+
+// ResolveVibeBinary finds the `vibe` binary, searching PATH then common install
+// locations. It returns a wrapped ports.ErrAgentBinaryNotFound when Vibe is absent.
+func ResolveVibeBinary(ctx context.Context) (string, error) {
+	return binaryutil.ResolveBinary(ctx, vibeBinarySpec)
+}
+
+func (p *Plugin) vibeBinary(ctx context.Context) (string, error) {
+	p.binaryMu.Lock()
+	defer p.binaryMu.Unlock()
+
+	if p.resolvedBinary != "" {
+		return p.resolvedBinary, nil
+	}
+
+	binary, err := ResolveVibeBinary(ctx)
+	if err != nil {
+		return "", err
+	}
+	p.resolvedBinary = binary
+	return binary, nil
+}
