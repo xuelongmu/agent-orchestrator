@@ -19,6 +19,10 @@ const (
 	ptyInputChunkDelay = 15 * time.Millisecond
 	// ptyInputEnterDelay is the pause before sending Enter. Mirrors PTY_INPUT_ENTER_DELAY_MS.
 	ptyInputEnterDelay = 300 * time.Millisecond
+	// ptyInputLongEnterDelay gives a multi-frame paste longer to settle in the
+	// terminal editor before Enter is submitted. Without this, Codex can leave
+	// the collapsed "[Pasted Content ...]" draft unsubmitted.
+	ptyInputLongEnterDelay = time.Second
 
 	dialTimeout      = 3 * time.Second
 	getOutputTimeout = 3 * time.Second
@@ -31,7 +35,8 @@ func dialHost(addr string, timeout time.Duration) (net.Conn, error) {
 }
 
 // clientSendMessage chunks message by 512 runes and sends each as a
-// MsgTerminalInput frame with 15ms gaps, then pauses 300ms and sends "\r".
+// MsgTerminalInput frame with 15ms gaps, then pauses long enough for the paste
+// to settle (1s for payloads over 512 runes, 300ms otherwise) and sends "\r".
 // Mirrors ptyHostSendMessage from pty-client.ts.
 func clientSendMessage(addr, message string) error {
 	conn, err := dialHost(addr, dialTimeout)
@@ -65,7 +70,7 @@ func clientSendMessage(addr, message string) error {
 	// settle, and the pause would only widen the guard-read→Enter window
 	// (mirrors the tmux runtime's enterDelay contract).
 	if len(runes) > 0 {
-		time.Sleep(ptyInputEnterDelay)
+		time.Sleep(inputEnterDelay(len(runes)))
 	}
 	frame, err := EncodeMessage(MsgTerminalInput, []byte("\r"))
 	if err != nil {
@@ -73,6 +78,13 @@ func clientSendMessage(addr, message string) error {
 	}
 	_, err = conn.Write(frame)
 	return err
+}
+
+func inputEnterDelay(runes int) time.Duration {
+	if runes > ptyInputChunkRunes {
+		return ptyInputLongEnterDelay
+	}
+	return ptyInputEnterDelay
 }
 
 func clientSendInput(addr, input string) error {

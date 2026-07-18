@@ -90,6 +90,28 @@ func TestGetLaunchCommandWithoutWorkspaceOmitsTrustFlag(t *testing.T) {
 	}
 }
 
+func TestIsInputPending(t *testing.T) {
+	p := New()
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "collapsed paste", output: "› [Pasted Content 4534 chars][Pasted Content 2562 chars]", want: true},
+		{name: "newer active turn", output: "› [Pasted Content 7096 chars]\nWorking (esc to interrupt)", want: false},
+		{name: "newer queued turn", output: "› [Pasted Content 7096 chars]\nPress up to edit queued messages", want: false},
+		{name: "newer paste after historical turn", output: "[Pasted Content 10 chars]\nesc to interrupt\n› [Pasted Content 20 chars]", want: true},
+		{name: "ordinary output", output: "Working tree changes must be committed before finishing", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := p.IsInputPending(tt.output); got != tt.want {
+				t.Fatalf("IsInputPending(%q) = %v, want %v", tt.output, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveCodexBinaryFindsNVMInstallWhenPathIsSparse(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("NVM install discovery is Unix-specific")

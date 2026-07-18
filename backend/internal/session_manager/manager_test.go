@@ -4504,6 +4504,16 @@ type submitOnlyAgent struct{ fakeAgent }
 func (submitOnlyAgent) EmitsSubmitActivity() bool  { return true }
 func (submitOnlyAgent) EmitsBlockedActivity() bool { return false }
 
+type pendingInputAgent struct{ fakeAgent }
+
+func (pendingInputAgent) IsInputPending(output string) bool {
+	pastedAt := strings.LastIndex(output, "[Pasted Content")
+	if pastedAt < 0 {
+		return false
+	}
+	return pastedAt > strings.LastIndex(output, "esc to interrupt")
+}
+
 // newSendTestManager builds a Manager wired for Send confirmation tests with
 // fast (millisecond) confirmation timings so no test waits real seconds. The
 // returned messenger records every Send; the store is mutable so a test can
@@ -4547,6 +4557,91 @@ func TestSend_SkipsConfirmForHooklessHarness(t *testing.T) {
 	// Hookless path returns within milliseconds (no 2s+ confirmation wait).
 	if dt := time.Since(start); dt > 250*time.Millisecond {
 		t.Fatalf("Send took %s for a hookless harness; confirmActive should have been skipped", dt)
+	}
+}
+
+func TestSend_CodexPendingInputRecoversWithEnterOnly(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = domain.SessionRecord{
+		ID: "s1", Harness: domain.HarnessCodex,
+		Metadata: domain.SessionMetadata{RuntimeHandleID: "h1"},
+	}
+	rt := &fakeRuntime{outputs: []string{
+		"› [Pasted Content 7096 chars]",
+		"Working (esc to interrupt)",
+	}}
+	msg := &fakeMessenger{}
+	m := New(Deps{
+		Runtime: rt, Agents: singleAgent{pendingInputAgent{}}, Store: st,
+		Messenger: msg, Logger: slog.Default(),
+	})
+	m.sendConfirm = sendConfirmConfig{pollInterval: time.Millisecond, maxAttempts: 3}
+
+	if err := m.Send(context.Background(), "s1", "large multiline review context"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !reflect.DeepEqual(msg.msgs, []string{"large multiline review context", ""}) {
+		t.Fatalf("messages = %#v, want full text once followed by Enter-only recovery", msg.msgs)
+	}
+	if rt.outputCalls != 2 {
+		t.Fatalf("GetOutput calls = %d, want 2", rt.outputCalls)
+	}
+}
+
+func TestSend_CodexPendingInputReturnsTypedErrorWithoutDuplicatingText(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = domain.SessionRecord{
+		ID: "s1", Harness: domain.HarnessCodex,
+		Metadata: domain.SessionMetadata{RuntimeHandleID: "h1"},
+	}
+	rt := &fakeRuntime{outputs: []string{"› [Pasted Content 7096 chars]"}}
+	msg := &fakeMessenger{}
+	m := New(Deps{
+		Runtime: rt, Agents: singleAgent{pendingInputAgent{}}, Store: st,
+		Messenger: msg, Logger: slog.Default(),
+	})
+	m.sendConfirm = sendConfirmConfig{pollInterval: time.Millisecond, maxAttempts: 3}
+
+	err := m.Send(context.Background(), "s1", "large multiline review context")
+	if !errors.Is(err, ErrInputPending) {
+		t.Fatalf("Send error = %v, want ErrInputPending", err)
+	}
+	var pendingErr *InputPendingError
+	if !errors.As(err, &pendingErr) {
+		t.Fatalf("Send error type = %T, want *InputPendingError", err)
+	}
+	if pendingErr.SessionID != "s1" || !pendingErr.RecoveryAttempted {
+		t.Fatalf("InputPendingError = %+v, want session s1 with recovery attempted", pendingErr)
+	}
+	if !reflect.DeepEqual(msg.msgs, []string{"large multiline review context", ""}) {
+		t.Fatalf("messages = %#v, want no duplicate full-text send", msg.msgs)
+	}
+}
+
+func TestSend_CodexPendingRecoveryStillHonorsDecisionGuard(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = domain.SessionRecord{
+		ID: "s1", Harness: domain.HarnessCodex,
+		Metadata: domain.SessionMetadata{RuntimeHandleID: "h1"},
+	}
+	rt := &fakeRuntime{outputs: []string{"› [Pasted Content 7096 chars]"}}
+	msg := &blockOnSendMessenger{sessionID: "s1", store: st}
+	m := New(Deps{
+		Runtime: rt, Agents: singleAgent{pendingInputAgent{}}, Store: st,
+		Messenger: msg, Logger: slog.Default(),
+	})
+	m.sendConfirm = sendConfirmConfig{pollInterval: time.Millisecond, maxAttempts: 3}
+
+	err := m.Send(context.Background(), "s1", "large multiline review context")
+	var pendingErr *InputPendingError
+	if !errors.As(err, &pendingErr) {
+		t.Fatalf("Send error = %v, want *InputPendingError", err)
+	}
+	if pendingErr.RecoveryAttempted {
+		t.Fatal("RecoveryAttempted = true, want false when decision guard suppressed Enter")
+	}
+	if !reflect.DeepEqual(msg.msgs, []string{"large multiline review context"}) {
+		t.Fatalf("messages = %#v, want guarded Enter recovery suppressed", msg.msgs)
 	}
 }
 
