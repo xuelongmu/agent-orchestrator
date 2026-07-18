@@ -30,7 +30,7 @@ type RuntimeFacts struct {
 // SessionStart, allowing lifecycle to persist the native resume handle without
 // inventing an activity transition.
 //
-// Event/ToolName/ToolUseID are optional correlation facts: the AO hook
+// Event/ToolName/ToolUseID/ErrorType are optional correlation facts: the AO hook
 // sub-command that produced the state and, for tool-use hooks, the native
 // tool call it concerns. Lifecycle uses them to clear a stale blocked state
 // only when the specific approved tool finishes. A signal without an Event
@@ -43,5 +43,6 @@ type ActivitySignal struct {
 	Event          string
 	ToolName       string
 	ToolUseID      string
+	ErrorType      string
 	AgentSessionID string
 }

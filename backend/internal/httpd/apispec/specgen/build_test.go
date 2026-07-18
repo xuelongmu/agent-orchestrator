@@ -41,3 +41,16 @@ func TestBuild_Deterministic(t *testing.T) {
 		t.Fatal("Build() is not deterministic across calls")
 	}
 }
+
+func TestBuild_UsesStableLifecycleDiagnosticSchemaName(t *testing.T) {
+	got, err := specgen.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if bytes.Contains(got, []byte("DomainLifecycleDiagnostic")) {
+		t.Fatal("generated API contract leaked the Go package name for LifecycleDiagnostic")
+	}
+	if !bytes.Contains(got, []byte("LifecycleDiagnostic:")) {
+		t.Fatal("generated API contract is missing the stable LifecycleDiagnostic schema")
+	}
+}

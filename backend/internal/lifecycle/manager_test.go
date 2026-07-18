@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,20 @@ func (c *retryMergedCleaner) CleanupMergedSession(ctx context.Context, id domain
 		return c.err
 	}
 	return c.lcm.MarkTerminated(ctx, id)
+}
+
+type fakeDiagnosticRuntime struct {
+	output string
+	err    error
+	calls  int
+}
+
+func (r *fakeDiagnosticRuntime) GetOutput(_ context.Context, _ ports.RuntimeHandle, lines int) (string, error) {
+	r.calls++
+	if lines != diagnosticTailLines {
+		return "", fmt.Errorf("lines = %d, want %d", lines, diagnosticTailLines)
+	}
+	return r.output, r.err
 }
 
 type telemetrySink struct {
@@ -180,6 +195,158 @@ func TestActivityExitedPreservesMergedCleanupForRetry(t *testing.T) {
 	got := st.sessions[rec.ID]
 	if !got.IsTerminated || got.Metadata.MergedCleanupPending || cleaner.calls != 1 {
 		t.Fatalf("retry must clean exited session: rec=%+v calls=%d", got, cleaner.calls)
+	}
+}
+
+func TestRuntimeObservation_FailedProbeCapturesSafeDiagnosticWithoutChangingLifecycle(t *testing.T) {
+	st := newFakeStore()
+	rt := &fakeDiagnosticRuntime{output: "\x1b[31mprobe failed\x1b[0m\nGITHUB_TOKEN=ghp_supersecret\nretrying"}
+	m := New(st, nil, WithDiagnosticRuntime(rt))
+	rec := working("mer-1")
+	rec.Metadata.RuntimeHandleID = "runtime-1"
+	st.sessions[rec.ID] = rec
+
+	if err := m.ApplyRuntimeObservation(ctx, rec.ID, ports.RuntimeFacts{Probe: ports.ProbeFailed}); err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions[rec.ID]
+	if got.IsTerminated || got.Activity != rec.Activity {
+		t.Fatalf("probe diagnostic changed lifecycle: got %+v, want activity %+v", got, rec.Activity)
+	}
+	if got.Diagnostic == nil || got.Diagnostic.Trigger != domain.DiagnosticRuntimeProbeFailed {
+		t.Fatalf("diagnostic = %#v, want runtime probe failure", got.Diagnostic)
+	}
+	if strings.Contains(got.Diagnostic.TerminalTail, "\x1b") || strings.Contains(got.Diagnostic.TerminalTail, "supersecret") {
+		t.Fatalf("diagnostic was not scrubbed: %q", got.Diagnostic.TerminalTail)
+	}
+	if !strings.Contains(got.Diagnostic.TerminalTail, "GITHUB_TOKEN=[REDACTED]") {
+		t.Fatalf("diagnostic did not preserve useful redacted context: %q", got.Diagnostic.TerminalTail)
+	}
+}
+
+func TestRuntimeObservation_DiagnosticCaptureFailureDoesNotBlockTerminalTransition(t *testing.T) {
+	st := newFakeStore()
+	rt := &fakeDiagnosticRuntime{err: errors.New("runtime output unavailable")}
+	m := New(st, nil, WithDiagnosticRuntime(rt))
+	rec := working("mer-1")
+	rec.Activity.LastActivityAt = time.Now().Add(-2 * time.Minute)
+	rec.Metadata.RuntimeHandleID = "runtime-1"
+	st.sessions[rec.ID] = rec
+
+	if err := m.ApplyRuntimeObservation(ctx, rec.ID, ports.RuntimeFacts{Probe: ports.ProbeDead}); err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions[rec.ID]
+	if !got.IsTerminated || got.Activity.State != domain.ActivityExited {
+		t.Fatalf("capture failure blocked terminal transition: %+v", got)
+	}
+	if got.Diagnostic != nil {
+		t.Fatalf("failed capture persisted a fabricated diagnostic: %#v", got.Diagnostic)
+	}
+}
+
+func TestRuntimeObservation_EmptyDiagnosticCaptureDoesNotPersist(t *testing.T) {
+	st := newFakeStore()
+	rt := &fakeDiagnosticRuntime{output: "\x1b[31m\x1b[0m"}
+	m := New(st, nil, WithDiagnosticRuntime(rt))
+	rec := working("mer-1")
+	rec.Metadata.RuntimeHandleID = "runtime-1"
+	st.sessions[rec.ID] = rec
+
+	if err := m.ApplyRuntimeObservation(ctx, rec.ID, ports.RuntimeFacts{Probe: ports.ProbeFailed}); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.sessions[rec.ID].Diagnostic; got != nil {
+		t.Fatalf("empty capture persisted a diagnostic: %#v", got)
+	}
+}
+
+func TestActivity_StopFailureCapturesHookErrorAndTerminalTail(t *testing.T) {
+	st := newFakeStore()
+	rt := &fakeDiagnosticRuntime{output: "Hook stopped: validation failed"}
+	m := New(st, nil, WithDiagnosticRuntime(rt))
+	rec := working("mer-1")
+	rec.Metadata.RuntimeHandleID = "runtime-1"
+	st.sessions[rec.ID] = rec
+
+	if err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{
+		Valid: true, State: domain.ActivityIdle, Event: "stop-failure", ErrorType: "validation_failed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions[rec.ID]
+	if got.Activity.State != domain.ActivityIdle {
+		t.Fatalf("activity = %q, want idle", got.Activity.State)
+	}
+	if got.Diagnostic == nil || got.Diagnostic.Trigger != domain.DiagnosticStopFailure || got.Diagnostic.HookErrorType != "validation_failed" {
+		t.Fatalf("diagnostic = %#v", got.Diagnostic)
+	}
+	if got.Diagnostic.TerminalTail != "Hook stopped: validation failed" {
+		t.Fatalf("terminal tail = %q", got.Diagnostic.TerminalTail)
+	}
+}
+
+func TestActivity_AuthoritativeRecoveryClearsOnlyTransientDiagnostics(t *testing.T) {
+	tests := []struct {
+		name        string
+		trigger     domain.DiagnosticTrigger
+		wantCleared bool
+	}{
+		{name: "blocked", trigger: domain.DiagnosticBlocked, wantCleared: true},
+		{name: "stop failure", trigger: domain.DiagnosticStopFailure, wantCleared: true},
+		{name: "runtime probe failure", trigger: domain.DiagnosticRuntimeProbeFailed, wantCleared: true},
+		{name: "runtime dead during grace", trigger: domain.DiagnosticRuntimeDead, wantCleared: true},
+		{name: "agent exited", trigger: domain.DiagnosticAgentExited, wantCleared: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, st, _ := newManager()
+			rec := working("mer-1")
+			rec.Activity.State = domain.ActivityBlocked
+			rec.FirstSignalAt = time.Now().Add(-time.Minute)
+			rec.Diagnostic = &domain.LifecycleDiagnostic{Trigger: tt.trigger, TerminalTail: "evidence", CapturedAt: time.Now()}
+			st.sessions[rec.ID] = rec
+
+			if err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityIdle, Event: "stop"}); err != nil {
+				t.Fatal(err)
+			}
+			got := st.sessions[rec.ID]
+			if got.Activity.State != domain.ActivityIdle {
+				t.Fatalf("activity = %q, want idle", got.Activity.State)
+			}
+			if tt.wantCleared && got.Diagnostic != nil {
+				t.Fatalf("transient diagnostic survived recovery: %#v", got.Diagnostic)
+			}
+			if !tt.wantCleared && got.Diagnostic == nil {
+				t.Fatal("non-transient diagnostic was cleared")
+			}
+		})
+	}
+}
+
+func TestRuntimeObservation_AliveClearsRecoverableDiagnostics(t *testing.T) {
+	for _, trigger := range []domain.DiagnosticTrigger{
+		domain.DiagnosticRuntimeProbeFailed,
+		domain.DiagnosticRuntimeDead,
+	} {
+		t.Run(string(trigger), func(t *testing.T) {
+			m, st, _ := newManager()
+			rec := working("mer-1")
+			rec.Diagnostic = &domain.LifecycleDiagnostic{Trigger: trigger, TerminalTail: "old evidence", CapturedAt: time.Now()}
+			st.sessions[rec.ID] = rec
+
+			if err := m.ApplyRuntimeObservation(ctx, rec.ID, ports.RuntimeFacts{Probe: ports.ProbeAlive}); err != nil {
+				t.Fatal(err)
+			}
+			got := st.sessions[rec.ID]
+			if got.Diagnostic != nil {
+				t.Fatalf("recoverable diagnostic survived an alive probe: %#v", got.Diagnostic)
+			}
+			if got.Activity != rec.Activity || got.IsTerminated {
+				t.Fatalf("alive probe changed lifecycle: got %+v, want activity %+v", got, rec.Activity)
+			}
+		})
 	}
 }
 

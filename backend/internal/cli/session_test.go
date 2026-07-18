@@ -104,7 +104,7 @@ func sessionCommandServer(t *testing.T) (*httptest.Server, *sessionRequestLog) {
 }
 
 func sessionJSON(id, project, kind, status string, terminated bool) string {
-	b, _ := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"id":           id,
 		"projectId":    project,
 		"kind":         kind,
@@ -115,7 +115,13 @@ func sessionJSON(id, project, kind, status string, terminated bool) string {
 		"createdAt":    "2026-06-02T11:00:00Z",
 		"updatedAt":    "2026-06-02T12:00:00Z",
 		"status":       status,
-	})
+	}
+	if id == "demo-1" {
+		payload["diagnostic"] = map[string]any{
+			"trigger": "runtime_probe_failed", "terminalTail": "probe timed out\nretrying", "capturedAt": "2026-06-02T12:00:00Z",
+		}
+	}
+	b, _ := json.Marshal(payload)
 	return string(b)
 }
 
@@ -137,6 +143,9 @@ func TestSessionList_ProjectFilterAndDefaultFiltering(t *testing.T) {
 	}
 	if !strings.Contains(out, "demo:") || !strings.Contains(out, "demo-1") {
 		t.Fatalf("output missing worker session:\n%s", out)
+	}
+	if !strings.Contains(out, "    diagnostic: runtime_probe_failed") || !strings.Contains(out, "      | probe timed out") {
+		t.Fatalf("output missing stuck diagnostic:\n%s", out)
 	}
 	if strings.Contains(out, "demo-2") {
 		t.Fatalf("orchestrator session should be hidden without --all:\n%s", out)
@@ -192,6 +201,9 @@ func TestSessionGet_SuccessWithProjectScope(t *testing.T) {
 	}
 	if !strings.Contains(out, "id: demo-1") || !strings.Contains(out, "project: demo") {
 		t.Fatalf("unexpected get output:\n%s", out)
+	}
+	if !strings.Contains(out, "diagnostic: runtime_probe_failed") || !strings.Contains(out, "  | probe timed out") || !strings.Contains(out, "  | retrying") {
+		t.Fatalf("session diagnostic missing from get output:\n%s", out)
 	}
 	want := []string{"GET /api/v1/sessions/demo-1"}
 	if got := log.all(); !reflect.DeepEqual(got, want) {

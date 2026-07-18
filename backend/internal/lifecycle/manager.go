@@ -45,6 +45,18 @@ type MergedSessionCleaner interface {
 	CleanupMergedSession(ctx context.Context, id domain.SessionID) error
 }
 
+// diagnosticRuntime is the read-only runtime surface lifecycle needs to attach
+// terminal evidence to abnormal transitions. It is optional so pure reducer
+// tests and embeddings can run without a runtime.
+type diagnosticRuntime interface {
+	GetOutput(ctx context.Context, handle ports.RuntimeHandle, lines int) (string, error)
+}
+
+const (
+	diagnosticTailLines      = 40
+	diagnosticCaptureTimeout = 750 * time.Millisecond
+)
+
 // Option customizes a Manager.
 type Option func(*Manager)
 
@@ -58,6 +70,13 @@ func WithTelemetry(sink ports.EventSink) Option {
 	return func(m *Manager) { m.telemetry = sink }
 }
 
+// WithDiagnosticRuntime enables best-effort terminal-tail capture at abnormal
+// lifecycle boundaries. Capture errors are intentionally ignored by the state
+// reducer: observability must never change a lifecycle decision.
+func WithDiagnosticRuntime(runtime diagnosticRuntime) Option {
+	return func(m *Manager) { m.diagnosticRuntime = runtime }
+}
+
 // Manager reduces runtime, activity, spawn, and termination observations into durable session facts.
 // It also owns agent nudges caused by PR observations, including merge-conflict, CI-failure, and review-feedback prompts.
 type Manager struct {
@@ -65,9 +84,10 @@ type Manager struct {
 	// guard is the shared pane-write primitive every reaction nudge goes
 	// through (see sessionguard). Nil when no messenger was wired: reaction
 	// nudges become no-ops but the reducer still runs.
-	guard         *sessionguard.Guard
-	notifications notificationSink
-	mergedCleaner MergedSessionCleaner
+	guard             *sessionguard.Guard
+	notifications     notificationSink
+	mergedCleaner     MergedSessionCleaner
+	diagnosticRuntime diagnosticRuntime
 
 	mu        sync.Mutex
 	window    time.Duration
@@ -126,16 +146,48 @@ func (m *Manager) mutate(ctx context.Context, id domain.SessionID, fn func(domai
 	return nil
 }
 
-// ApplyRuntimeObservation only writes when runtime liveness is unambiguous. A
-// failed probe or liveness disagreement is ignored; no transient lifecycle state is stored.
+// ApplyRuntimeObservation only changes lifecycle state when runtime liveness
+// is unambiguous. Failed/dead probes may still persist best-effort diagnostics,
+// and a later alive probe clears those transient runtime diagnostics.
 func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.SessionID, f ports.RuntimeFacts) error {
+	var diagnostic *domain.LifecycleDiagnostic
+	switch f.Probe {
+	case ports.ProbeFailed:
+		diagnostic = m.captureDiagnostic(ctx, id, domain.DiagnosticRuntimeProbeFailed, "")
+	case ports.ProbeDead:
+		diagnostic = m.captureDiagnostic(ctx, id, domain.DiagnosticRuntimeDead, "")
+	}
 	return m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
-		if cur.IsTerminated || !runtimeClearlyDead(f, cur.Activity, now, m.window) {
+		if cur.IsTerminated {
+			return cur, false
+		}
+		if f.Probe == ports.ProbeFailed {
+			if diagnostic == nil || sameDiagnosticContent(cur.Diagnostic, diagnostic) {
+				return cur, false
+			}
+			cur.Diagnostic = diagnostic
+			return cur, true
+		}
+		if f.Probe == ports.ProbeAlive && isRuntimeDiagnostic(cur.Diagnostic) {
+			cur.Diagnostic = nil
+			return cur, true
+		}
+		if !runtimeClearlyDead(f, cur.Activity, now, m.window) {
+			// A recent activity signal delays the terminal conclusion, but the
+			// first readable dead-runtime screen may disappear before the grace
+			// window closes. Preserve that evidence now without changing state.
+			if f.Probe == ports.ProbeDead && diagnostic != nil && !sameDiagnosticContent(cur.Diagnostic, diagnostic) {
+				cur.Diagnostic = diagnostic
+				return cur, true
+			}
 			return cur, false
 		}
 		next := cur
 		next.IsTerminated = true
 		next.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: timeOr(f.ObservedAt, now)}
+		if diagnostic != nil {
+			next.Diagnostic = diagnostic
+		}
 		// Reaper-driven death (crash/SIGKILL) never fires a session-end hook,
 		// so this is the last chance to release the session's tool-flight
 		// state; a leaked entry would otherwise persist for the daemon's life
@@ -154,6 +206,7 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	if !s.Valid && s.AgentSessionID == "" {
 		return nil
 	}
+	diagnostic := m.captureSignalDiagnostic(ctx, id, s)
 	var intent *ports.NotificationIntent
 	m.mu.Lock()
 	rec, ok, err := m.store.GetSession(ctx, id)
@@ -180,6 +233,13 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	if s.Valid {
 		s = m.applyToolPrecedenceLocked(id, rec.Activity.State, s)
 	}
+	// Accepted active/idle signals prove a non-terminal anomaly recovered. Do
+	// not leave stale "Stuck diagnostic" evidence attached to a healthy
+	// session. Terminal diagnostics remain as last-known evidence.
+	diagnosticCleared := diagnostic == nil && s.Valid && (s.State == domain.ActivityActive || s.State == domain.ActivityIdle) && isRecoverableDiagnostic(rec.Diagnostic)
+	if diagnosticCleared {
+		rec.Diagnostic = nil
+	}
 	// Any authoritative non-waiting signal proves an editor-pending prompt is
 	// no longer waiting to be submitted. Clear that delivery latch before the
 	// same-state fast path below: activity persistence may otherwise be a no-op,
@@ -194,6 +254,7 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 		m.mu.Unlock()
 		return nil
 	}
+	diagnosticChanged := diagnostic != nil && !sameDiagnosticContent(rec.Diagnostic, diagnostic)
 	if !s.Valid {
 		rec.Metadata.AgentSessionID = s.AgentSessionID
 		rec.UpdatedAt = now
@@ -216,7 +277,10 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	// first to ARRIVE may match the seeded state — e.g. a turn's "active"
 	// POST is lost and its Stop hook lands idle on the idle-seeded row.
 	if sameState && !rec.FirstSignalAt.IsZero() {
-		if metadataChanged || pendingSubmitCleared {
+		if metadataChanged || pendingSubmitCleared || diagnosticChanged || diagnosticCleared {
+			if diagnosticChanged {
+				rec.Diagnostic = diagnostic
+			}
 			rec.UpdatedAt = now
 			err := m.store.UpdateSession(ctx, rec)
 			m.mu.Unlock()
@@ -227,6 +291,9 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	}
 	next := rec
 	next.Activity = act
+	if diagnosticChanged {
+		next.Diagnostic = diagnostic
+	}
 	if next.FirstSignalAt.IsZero() {
 		next.FirstSignalAt = timeOr(s.Timestamp, now)
 	}
@@ -487,6 +554,7 @@ func (m *Manager) MarkSpawned(ctx context.Context, id domain.SessionID, metadata
 	// a relaunch with broken hooks degrades to no_signal instead of inheriting
 	// a stale "signals worked once" fact.
 	rec.FirstSignalAt = time.Time{}
+	rec.Diagnostic = nil
 	rec.Metadata = mergeMetadata(rec.Metadata, metadata)
 	rec.UpdatedAt = now
 	return m.store.UpdateSession(ctx, rec)
@@ -494,12 +562,16 @@ func (m *Manager) MarkSpawned(ctx context.Context, id domain.SessionID, metadata
 
 // MarkTerminated marks a session terminated without tearing down external resources.
 func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error {
+	diagnostic := m.captureDiagnostic(ctx, id, domain.DiagnosticTerminated, "")
 	return m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
 		if cur.IsTerminated {
 			return cur, false
 		}
 		cur.IsTerminated = true
 		cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
+		if diagnostic != nil {
+			cur.Diagnostic = diagnostic
+		}
 		delete(m.flights, id) // runs under m.mu (mutate holds it)
 		return cur, true
 	})
@@ -521,6 +593,99 @@ func (m *Manager) markMergedCleanupComplete(ctx context.Context, id domain.Sessi
 		delete(m.flights, id)
 		return cur, true
 	})
+}
+
+func (m *Manager) captureSignalDiagnostic(ctx context.Context, id domain.SessionID, s ports.ActivitySignal) *domain.LifecycleDiagnostic {
+	if !s.Valid {
+		return nil
+	}
+	trigger := domain.DiagnosticTrigger("")
+	switch {
+	case s.Event == "stop-failure":
+		trigger = domain.DiagnosticStopFailure
+	case s.State == domain.ActivityBlocked:
+		trigger = domain.DiagnosticBlocked
+	case s.State == domain.ActivityExited:
+		trigger = domain.DiagnosticAgentExited
+	}
+	if trigger == "" {
+		return nil
+	}
+	return m.captureDiagnostic(ctx, id, trigger, s.ErrorType)
+}
+
+func (m *Manager) captureDiagnostic(ctx context.Context, id domain.SessionID, trigger domain.DiagnosticTrigger, hookErrorType string) *domain.LifecycleDiagnostic {
+	errorType := strings.TrimSpace(domain.SanitizeDiagnosticTail(hookErrorType))
+	if len([]rune(errorType)) > 256 {
+		errorType = ""
+	}
+	var tail string
+	captured := false
+	if m.diagnosticRuntime != nil {
+		rec, ok, err := m.store.GetSession(ctx, id)
+		if err == nil && ok && rec.Metadata.RuntimeHandleID != "" {
+			output, outputErr := m.readDiagnosticOutput(ctx, ports.RuntimeHandle{ID: rec.Metadata.RuntimeHandleID})
+			if outputErr == nil {
+				tail = domain.SanitizeDiagnosticTail(output)
+				captured = tail != ""
+			}
+		}
+	}
+	if !captured && errorType == "" {
+		return nil
+	}
+	return &domain.LifecycleDiagnostic{
+		Trigger:       trigger,
+		TerminalTail:  tail,
+		HookErrorType: errorType,
+		CapturedAt:    m.clock().UTC(),
+	}
+}
+
+func (m *Manager) readDiagnosticOutput(ctx context.Context, handle ports.RuntimeHandle) (string, error) {
+	captureCtx, cancel := context.WithTimeout(ctx, diagnosticCaptureTimeout)
+	defer cancel()
+	type result struct {
+		output string
+		err    error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		output, err := m.diagnosticRuntime.GetOutput(captureCtx, handle, diagnosticTailLines)
+		resultCh <- result{output: output, err: err}
+	}()
+	select {
+	case got := <-resultCh:
+		return got.output, got.err
+	case <-captureCtx.Done():
+		return "", captureCtx.Err()
+	}
+}
+
+func sameDiagnosticContent(a, b *domain.LifecycleDiagnostic) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Trigger == b.Trigger && a.TerminalTail == b.TerminalTail && a.HookErrorType == b.HookErrorType
+}
+
+func isRecoverableDiagnostic(diagnostic *domain.LifecycleDiagnostic) bool {
+	if diagnostic == nil {
+		return false
+	}
+	switch diagnostic.Trigger {
+	case domain.DiagnosticBlocked, domain.DiagnosticStopFailure, domain.DiagnosticRuntimeProbeFailed, domain.DiagnosticRuntimeDead:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRuntimeDiagnostic(diagnostic *domain.LifecycleDiagnostic) bool {
+	if diagnostic == nil {
+		return false
+	}
+	return diagnostic.Trigger == domain.DiagnosticRuntimeProbeFailed || diagnostic.Trigger == domain.DiagnosticRuntimeDead
 }
 
 // sameActivity reports whether two activity signals describe the same state.

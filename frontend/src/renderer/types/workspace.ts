@@ -46,6 +46,13 @@ export type SessionActivity = {
 	lastActivityAt: string;
 };
 
+export type SessionDiagnostic = {
+	trigger: string;
+	terminalTail?: string;
+	hookErrorType?: string;
+	capturedAt: string;
+};
+
 export function toSessionActivity(
 	activity?: { state?: string; lastActivityAt?: string } | null,
 ): SessionActivity | undefined {
@@ -132,6 +139,8 @@ export type WorkspaceSession = {
 	updatedAt: string;
 	/** Raw agent lifecycle activity from the daemon. */
 	activity?: SessionActivity;
+	/** Last privacy-scrubbed terminal evidence captured at a stuck/terminal boundary. */
+	diagnostic?: SessionDiagnostic;
 	/**
 	 * Live preview target set by the daemon (via `ao preview`) and streamed over
 	 * CDC. When non-empty, the browser panel opens and navigates here.

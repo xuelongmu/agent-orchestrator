@@ -257,6 +257,8 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 				<ActivityTimeline session={session} />
 			</Section>
 
+			{session.diagnostic ? <SessionDiagnostic diagnostic={session.diagnostic} /> : null}
+
 			<Section className="border-t border-border pt-5" title="Overview">
 				<dl className="flex flex-col gap-1">
 					<Row k="Agent" v={session.provider} mono />
@@ -267,6 +269,35 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 				</dl>
 			</Section>
 		</div>
+	);
+}
+
+function SessionDiagnostic({ diagnostic }: { diagnostic: NonNullable<WorkspaceSession["diagnostic"]> }) {
+	const trigger = diagnostic.trigger.replaceAll("_", " ");
+	return (
+		<Section title="Stuck diagnostic">
+			<div className="rounded-md border border-warning/35 bg-warning/8 p-3">
+				<div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-muted-foreground">
+					<span className="capitalize">{trigger}</span>
+					{diagnostic.hookErrorType ? (
+						<code className="rounded bg-raised px-1.5 py-0.5 font-mono text-2xs text-warning">
+							{diagnostic.hookErrorType}
+						</code>
+					) : null}
+					{diagnostic.capturedAt ? <span>{formatTimeCompact(diagnostic.capturedAt)}</span> : null}
+				</div>
+				{diagnostic.terminalTail ? (
+					<pre
+						className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-background p-2 font-mono text-2xs leading-relaxed text-foreground"
+						data-testid="session-diagnostic-tail"
+					>
+						{diagnostic.terminalTail}
+					</pre>
+				) : (
+					<p className="mt-2 text-xs text-muted-foreground">No terminal output was available.</p>
+				)}
+			</div>
+		</Section>
 	);
 }
 

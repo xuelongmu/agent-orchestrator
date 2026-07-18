@@ -237,6 +237,7 @@ func mapSessionRows(rows []gen.Session) []domain.SessionRecord {
 }
 
 func rowToRecord(row gen.Session) domain.SessionRecord {
+	diagnostic := rowDiagnostic(row.DiagnosticTrigger, row.DiagnosticTerminalTail, row.DiagnosticHookErrorType, row.DiagnosticCapturedAt)
 	return domain.SessionRecord{
 		ID:          row.ID,
 		ProjectID:   row.ProjectID,
@@ -250,6 +251,7 @@ func rowToRecord(row gen.Session) domain.SessionRecord {
 		},
 		FirstSignalAt: nullTimeToTime(row.FirstSignalAt),
 		IsTerminated:  row.IsTerminated,
+		Diagnostic:    diagnostic,
 		Metadata: domain.SessionMetadata{
 			Branch:                         row.Branch,
 			WorkspacePath:                  row.WorkspacePath,
@@ -271,6 +273,7 @@ func rowToRecord(row gen.Session) domain.SessionRecord {
 func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams {
 	activity := normalActivity(rec.Activity, rec.CreatedAt)
 	pendingFingerprint, pendingAttempted := pendingSubmitFields(rec, activity.State)
+	diagnosticTrigger, diagnosticTail, diagnosticErrorType, diagnosticAt := diagnosticFields(rec.Diagnostic)
 	return gen.InsertSessionParams{
 		ID:                             rec.ID,
 		ProjectID:                      rec.ProjectID,
@@ -294,6 +297,10 @@ func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams
 		PendingSubmitRecoveryAttempted: pendingAttempted,
 		MergedCleanupPending:           rec.Metadata.MergedCleanupPending,
 		MergedCleanupPRURL:             rec.Metadata.MergedCleanupPRURL,
+		DiagnosticTrigger:              diagnosticTrigger,
+		DiagnosticTerminalTail:         diagnosticTail,
+		DiagnosticHookErrorType:        diagnosticErrorType,
+		DiagnosticCapturedAt:           diagnosticAt,
 		CreatedAt:                      rec.CreatedAt,
 		UpdatedAt:                      rec.UpdatedAt,
 	}
@@ -302,6 +309,7 @@ func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams
 func recordToUpdate(rec domain.SessionRecord) gen.UpdateSessionParams {
 	activity := normalActivity(rec.Activity, rec.UpdatedAt)
 	pendingFingerprint, pendingAttempted := pendingSubmitFields(rec, activity.State)
+	diagnosticTrigger, diagnosticTail, diagnosticErrorType, diagnosticAt := diagnosticFields(rec.Diagnostic)
 	return gen.UpdateSessionParams{
 		ID:                             rec.ID,
 		IssueID:                        rec.IssueID,
@@ -323,8 +331,31 @@ func recordToUpdate(rec domain.SessionRecord) gen.UpdateSessionParams {
 		PendingSubmitRecoveryAttempted: pendingAttempted,
 		MergedCleanupPending:           rec.Metadata.MergedCleanupPending,
 		MergedCleanupPRURL:             rec.Metadata.MergedCleanupPRURL,
+		DiagnosticTrigger:              diagnosticTrigger,
+		DiagnosticTerminalTail:         diagnosticTail,
+		DiagnosticHookErrorType:        diagnosticErrorType,
+		DiagnosticCapturedAt:           diagnosticAt,
 		UpdatedAt:                      rec.UpdatedAt,
 	}
+}
+
+func rowDiagnostic(trigger, tail, errorType string, capturedAt sql.NullTime) *domain.LifecycleDiagnostic {
+	if trigger == "" || !capturedAt.Valid {
+		return nil
+	}
+	return &domain.LifecycleDiagnostic{
+		Trigger:       domain.DiagnosticTrigger(trigger),
+		TerminalTail:  tail,
+		HookErrorType: errorType,
+		CapturedAt:    capturedAt.Time,
+	}
+}
+
+func diagnosticFields(diagnostic *domain.LifecycleDiagnostic) (string, string, string, sql.NullTime) {
+	if diagnostic == nil || diagnostic.Trigger == "" || diagnostic.CapturedAt.IsZero() {
+		return "", "", "", sql.NullTime{}
+	}
+	return string(diagnostic.Trigger), diagnostic.TerminalTail, diagnostic.HookErrorType, timeToNullTime(diagnostic.CapturedAt)
 }
 
 // A terminal or blocked session is definitive evidence that an editor draft

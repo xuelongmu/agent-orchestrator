@@ -73,11 +73,15 @@ type SessionRecord struct {
 	// activity state. Zero means no hook has ever reported, which deriveStatus
 	// surfaces as StatusNoSignal after a grace period. Internal fact, not part
 	// of the API read model.
-	FirstSignalAt time.Time       `json:"-"`
-	IsTerminated  bool            `json:"isTerminated"`
-	Metadata      SessionMetadata `json:"-"`
-	CreatedAt     time.Time       `json:"createdAt"`
-	UpdatedAt     time.Time       `json:"updatedAt"`
+	FirstSignalAt time.Time `json:"-"`
+	IsTerminated  bool      `json:"isTerminated"`
+	// Diagnostic is the latest bounded, privacy-scrubbed evidence captured at
+	// an abnormal or terminal lifecycle boundary. Nil means no capture has
+	// succeeded; capture failure never fabricates evidence.
+	Diagnostic *LifecycleDiagnostic `json:"diagnostic,omitempty"`
+	Metadata   SessionMetadata      `json:"-"`
+	CreatedAt  time.Time            `json:"createdAt"`
+	UpdatedAt  time.Time            `json:"updatedAt"`
 }
 
 // Session is the read-model returned across the API boundary: a SessionRecord

@@ -398,6 +398,32 @@ describe("SessionInspector Activity section", () => {
 	});
 });
 
+describe("SessionInspector diagnostics", () => {
+	it("renders the persisted terminal tail and structured hook error", () => {
+		renderWithQuery(
+			<SessionInspector
+				session={session([], {
+					status: "needs_input",
+					diagnostic: {
+						trigger: "stop_failure",
+						terminalTail: "Claude could not stop cleanly\nValidation failed",
+						hookErrorType: "validation_failed",
+						capturedAt: "2026-06-15T10:00:00Z",
+					},
+				})}
+			/>,
+		);
+
+		const section = within(
+			screen.getByText("Stuck diagnostic").closest("[data-testid='inspector-section']") as HTMLElement,
+		);
+		expect(section.getByText("validation_failed")).toBeInTheDocument();
+		expect(section.getByTestId("session-diagnostic-tail")).toHaveTextContent(
+			"Claude could not stop cleanly Validation failed",
+		);
+	});
+});
+
 describe("SessionInspector tabs", () => {
 	it("exposes Summary, Reviews, Browser, and Files as inspector tabs", () => {
 		renderWithQuery(<SessionInspector session={session([pr(1, "open")])} />);

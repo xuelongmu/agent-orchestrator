@@ -36,6 +36,12 @@ func DeriveActivityState(event string, payload []byte) (domain.ActivityState, bo
 		// Notification(permission_prompt): the payload names the blocking
 		// tool, which lifecycle snapshots for the correlated clear above.
 		return domain.ActivityBlocked, true
+	case "stop-failure":
+		// Claude ended the turn because an API error prevented a normal Stop.
+		// StopFailure has no decision control: the session is idle and remains
+		// sendable, while the documented payload error is retained separately
+		// as structured diagnostic evidence.
+		return domain.ActivityIdle, true
 	case "stop":
 		// End of a turn (including a user interrupt): the agent is idle but
 		// alive (not exited). A following Notification(idle_prompt) also maps to
