@@ -4073,11 +4073,16 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     };
 
     if (plugins.agent.getRestoreCommand) {
-      const restoreCmd = await plugins.agent.getRestoreCommand(
-        session,
-        projectConfigForLaunch,
-        executablePath,
-      );
+      // Keep the legacy two-argument call for plugins that do not resolve an
+      // executable; some external plugins may inspect arguments.length.
+      const restoreCmd =
+        executablePath === undefined
+          ? await plugins.agent.getRestoreCommand(session, projectConfigForLaunch)
+          : await plugins.agent.getRestoreCommand(
+              session,
+              projectConfigForLaunch,
+              executablePath,
+            );
       if (restoreCmd) {
         launchCommand = restoreCmd;
         updateMetadata(sessionsDir, sessionId, { restoreFallbackReason: "" });
