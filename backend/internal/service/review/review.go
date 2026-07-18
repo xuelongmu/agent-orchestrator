@@ -88,6 +88,20 @@ func (s *Service) Trigger(ctx context.Context, workerID domain.SessionID) (revie
 	return s.engine.Trigger(ctx, workerID)
 }
 
+// Coordinate advances the automatic, head-bound review loop for one durable
+// SCM observation. It is daemon-internal and intentionally not part of the
+// HTTP Manager contract.
+func (s *Service) Coordinate(ctx context.Context, workerID domain.SessionID, obs ports.SCMObservation) (reviewcore.CoordinateResult, error) {
+	return s.engine.Coordinate(ctx, workerID, obs)
+}
+
+// CoordinateReview implements the SCM observer's restart-safe coordination
+// hook while keeping the richer result internal to this service.
+func (s *Service) CoordinateReview(ctx context.Context, workerID domain.SessionID, obs ports.SCMObservation) error {
+	_, err := s.Coordinate(ctx, workerID, obs)
+	return err
+}
+
 // Cancel stops the live reviewer pane and marks running review passes as failed.
 func (s *Service) Cancel(ctx context.Context, workerID domain.SessionID) (reviewcore.CancelResult, error) {
 	return s.engine.Cancel(ctx, workerID)

@@ -4,10 +4,9 @@
 package scmready
 
 import (
-	"strings"
-
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/reviewpolicy"
 )
 
 // IsReadyToMerge reports whether a complete SCM observation proves that the
@@ -34,47 +33,11 @@ func IsReadyToMerge(o ports.SCMObservation) bool {
 	reviewDecision := domain.ReviewDecision(o.Review.Decision)
 	if reviewDecision == domain.ReviewChangesRequest ||
 		reviewDecision == domain.ReviewRequired ||
-		hasUnresolvedRequiredComments(o.Review.Threads) {
+		reviewpolicy.HasUnresolvedRequiredComments(o.Review.Threads) {
 		return false
 	}
-	if reviewDecision == domain.ReviewApproved && !hasCurrentHeadApproval(o.Review.Reviews, o.PR.HeadSHA) {
+	if reviewDecision == domain.ReviewApproved && !reviewpolicy.HasCurrentHeadHumanApproval(o.Review.Reviews, o.PR.HeadSHA) {
 		return false
 	}
 	return domain.Mergeability(o.Mergeability.State) == domain.MergeMergeable
-}
-
-func hasCurrentHeadApproval(reviews []ports.SCMReviewSummaryObservation, headSHA string) bool {
-	for _, review := range reviews {
-		if !review.IsBot && domain.ReviewDecision(review.State) == domain.ReviewApproved && review.CommitSHA == headSHA {
-			return true
-		}
-	}
-	return false
-}
-
-func hasUnresolvedRequiredComments(threads []ports.SCMReviewThreadObservation) bool {
-	for _, thread := range threads {
-		if thread.Resolved {
-			continue
-		}
-		for _, comment := range thread.Comments {
-			if !comment.IsBot {
-				return true
-			}
-			if isCodexReviewBot(comment.Author) && isP0OrP1Finding(comment.Body) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isCodexReviewBot(author string) bool {
-	author = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(author)), "[bot]")
-	return author == "chatgpt-codex-connector" || author == "codex"
-}
-
-func isP0OrP1Finding(body string) bool {
-	body = strings.ToLower(body)
-	return strings.Contains(body, "[p0]") || strings.Contains(body, "[p1]")
 }

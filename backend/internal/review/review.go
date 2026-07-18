@@ -159,6 +159,13 @@ type CancelResult struct {
 // It reuses running/up-to-date runs, retries failed/current changes-requested
 // heads, and uses one reviewer pane for every new run in the batch.
 func (e *Engine) Trigger(ctx stdctx.Context, workerID domain.SessionID) (TriggerResult, error) {
+	return e.trigger(ctx, workerID, "")
+}
+
+// trigger starts review work for every eligible PR, or only prURL when the
+// automatic coordinator supplies one. The PR-scoped form prevents observing
+// one PR from accidentally spending another stacked PR's review budget.
+func (e *Engine) trigger(ctx stdctx.Context, workerID domain.SessionID, prURL string) (TriggerResult, error) {
 	if workerID == "" {
 		return TriggerResult{}, fmt.Errorf("%w: worker session id is required", ErrInvalid)
 	}
@@ -196,6 +203,18 @@ func (e *Engine) Trigger(ctx stdctx.Context, workerID domain.SessionID) (Trigger
 		return TriggerResult{}, err
 	}
 	reviews := Plan(prs, runs)
+	if prURL != "" {
+		filtered := make([]PRReviewState, 0, 1)
+		for _, reviewState := range reviews {
+			if reviewState.PRURL == prURL {
+				filtered = append(filtered, reviewState)
+			}
+		}
+		reviews = filtered
+		if len(reviews) == 0 {
+			return TriggerResult{}, fmt.Errorf("%w: pull request %q does not belong to worker %q", ErrNotFound, prURL, workerID)
+		}
+	}
 
 	reviewRow, hasReview, err := e.store.GetReviewBySession(ctx, workerID)
 	if err != nil {

@@ -20,6 +20,9 @@ func reviewTexts(spec LaunchSpec) (prompt, systemPrompt string) {
 You are an AO code reviewer. You review the requested pull request changes in the current checkout — do not start unrelated work. Inspect what each PR changed by diffing the checkout against the PR's base branch, and review for correctness bugs, missing error handling, security issues, test coverage, and clear deviations from the surrounding code's conventions. Prefer a few high-confidence findings over nitpicks.
 
 Post your review as a comment on the pull request, stating clearly whether it needs changes or is ready, with inline comments for specific findings. Do not push commits, edit files, or modify the branch — review only.`
+	systemPrompt += `
+
+Prefix every finding with exactly one priority tag: [P0] for release-blocking or destructive issues, [P1] for correctness/security issues that must be fixed before merge, [P2] for worthwhile non-blocking improvements, or [P3] for minor suggestions. Report changes_requested only when at least one P0 or P1 finding remains. If there are no P0/P1 findings, report approved even when you include P2/P3 suggestions.`
 
 	queueText := reviewQueueText(spec)
 	prompt = fmt.Sprintf(`Review the requested pull request(s) for worker session %s.
