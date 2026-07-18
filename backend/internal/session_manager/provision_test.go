@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/pathenv"
 )
 
 func TestSpawnEnvProjectVarsCannotOverrideInternal(t *testing.T) {
@@ -32,6 +33,11 @@ func TestHookPATH(t *testing.T) {
 	daemonExe := filepath.Join("/opt", "aod", "ao")
 	daemonDir := filepath.Dir(daemonExe)
 	exeOK := func() (string, error) { return daemonExe, nil }
+	defaultBase := pathenv.Effective(func(string) string { return "" })
+	emptyBaseWant := daemonDir
+	if defaultBase != "" {
+		emptyBaseWant += sep + defaultBase
+	}
 
 	cases := []struct {
 		name       string
@@ -55,9 +61,9 @@ func TestHookPATH(t *testing.T) {
 			want:       daemonDir + sep + "/proj/bin",
 		},
 		{
-			name:       "empty base PATH yields the daemon dir alone",
+			name:       "empty base PATH uses the platform default",
 			executable: exeOK,
-			want:       daemonDir,
+			want:       emptyBaseWant,
 		},
 		{
 			name:       "unresolvable executable fails",
