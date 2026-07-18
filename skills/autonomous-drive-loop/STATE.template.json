@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "updatedAt": "<ISO timestamp — set from command output, e.g. date -u>",
+  "note": "Machine-written volatile state for a drive loop. Policy lives in the versioned policy file / SKILL.md. Update only from command output or VERBATIM human input (quote the human's words with a timestamp) — never from the agent's own paraphrased recollection. Derivable facts (CI status, HEAD sha, review lists) are NOT stored here — derive them fresh each cycle. All arrays below start EMPTY in a live bootstrap; field shapes are documented in _shapes, which is reference-only and must never be read as data.",
+  "_shapes": {
+    "userDecisions[]": {
+      "at": "<ISO>",
+      "decision": "<verbatim-ish record of an explicit human decision>"
+    },
+    "findingLedger.<pr>.classes[]": {
+      "tag": "<class-tag>",
+      "occurrences": 0,
+      "note": ""
+    },
+    "findingLedger.<pr>.openFindings[]": {
+      "id": 0,
+      "round": 0,
+      "loc": "<file:line>",
+      "classTag": "<tag>",
+      "fixCommit": null,
+      "disposition": "<dispatched|deferred-to-issue-N|absorbed-by-invariant|fixed> — NEVER delete entries; update disposition/fixCommit so per-round class history survives for the >=3-recurrence trigger"
+    },
+    "dispatchLog[]": {
+      "at": "<ISO>",
+      "to": "<session>",
+      "file": "<message file>",
+      "what": "<summary>"
+    }
+  },
+  "mission": {
+    "epicIssue": null,
+    "remainingRoadmap": [],
+    "merged": []
+  },
+  "current": {
+    "issue": null,
+    "pr": null,
+    "session": null,
+    "worktree": null,
+    "branch": null,
+    "phase": "<human-readable: what was last done, what is awaited>"
+  },
+  "userDecisions": [],
+  "findingLedger": {},
+  "dispatchLog": [],
+  "cleanupPending": []
+}

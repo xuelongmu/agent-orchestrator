@@ -49,6 +49,18 @@ Agents working on this repo should use these checked-in skills:
 
 **Always pull latest main before triaging.** Stale code = bad triage. No exceptions.
 
+### Autonomous Drive Loop (`skills/autonomous-drive-loop/`)
+
+**When to use:** Driving one or more PRs through a bot-review→fix→merge cycle autonomously over hours/days (self-scheduled orchestration loops).
+
+**What it covers:**
+- Three-store state discipline (policy file / machine-written STATE.json / derive-fresh) — never keep loop state in prompts
+- Cycle checklist: health → derive fresh (PR state first) → act → update state → deliver → reschedule
+- Reviewer-bot signal handling (dual-channel verdicts, head-bound approval verification, quota exhaustion, re-triggering)
+- Merge gate and anti-treadmill review policy (finding-class ledger, simplification rounds, sibling-path sweep)
+
+**How to load:** Read `skills/autonomous-drive-loop/SKILL.md`; bootstrap loop state from `STATE.template.json`.
+
 ## Key Files
 
 - `packages/core/src/types.ts` — All plugin interfaces (Agent, Runtime, Workspace, etc.)
