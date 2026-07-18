@@ -2273,6 +2273,13 @@ export interface CleanupResult {
   errors: Array<{ sessionId: string; error: string }>;
 }
 
+export interface LifecycleCheckOptions {
+  /** Restrict lookup to one project when session IDs may overlap. */
+  projectId?: string;
+  /** Reject when the check could not refresh SCM state successfully. */
+  requireSuccessfulSCMRefresh?: boolean;
+}
+
 /** Lifecycle manager — state machine + reaction engine */
 export interface LifecycleManager {
   /** Start the lifecycle polling loop */
@@ -2284,8 +2291,8 @@ export interface LifecycleManager {
   /** Get current state for all sessions */
   getStates(): Map<SessionId, SessionStatus>;
 
-  /** Force-check a specific session now */
-  check(sessionId: SessionId): Promise<void>;
+  /** Force-check a specific session now. */
+  check(sessionId: SessionId, options?: LifecycleCheckOptions): Promise<void>;
 }
 
 /** Plugin registry — discovery + loading */

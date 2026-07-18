@@ -1,5 +1,9 @@
-import { describe, it, expect } from "vitest";
-import { _testUtils } from "../gh-trace.js";
+import { afterEach, beforeEach, describe, it, expect } from "vitest";
+import {
+  _testUtils,
+  getAdaptiveGithubPollInterval,
+  type GhTraceEntry,
+} from "../gh-trace.js";
 
 const { extractOperation, redactArgs, parseIncludedHttpResponse } = _testUtils;
 
@@ -96,5 +100,97 @@ describe("parseIncludedHttpResponse", () => {
     const result = parseIncludedHttpResponse(output);
     expect(result.statusLine).toBe("HTTP/1.1 200 OK");
     expect(result.headers["etag"]).toBe("W/\"final\"");
+  });
+});
+
+describe("getAdaptiveGithubPollInterval", () => {
+  const observedAt = Date.parse("2026-01-01T00:00:00.000Z");
+
+  function observe(overrides: Partial<GhTraceEntry>): void {
+    _testUtils.observeGithubRateLimit(
+      {
+        timestamp: new Date(observedAt).toISOString(),
+        component: "test",
+        operation: "gh.api.graphql",
+        args: [],
+        ok: true,
+        durationMs: 1,
+        stdoutBytes: 0,
+        stderrBytes: 0,
+        ...overrides,
+      },
+      observedAt,
+    );
+  }
+
+  beforeEach(() => _testUtils.resetGithubRateLimits());
+  afterEach(() => _testUtils.resetGithubRateLimits());
+
+  it("widens polling as the remaining quota approaches exhaustion", () => {
+    observe({
+      rateLimitLimit: 5_000,
+      rateLimitRemaining: 250,
+      rateLimitReset: observedAt / 1_000 + 3_600,
+      rateLimitResource: "graphql",
+    });
+
+    expect(getAdaptiveGithubPollInterval(30_000, observedAt)).toBe(120_000);
+  });
+
+  it("waits for reset instead of polling an exhausted quota", () => {
+    observe({
+      rateLimitLimit: 5_000,
+      rateLimitRemaining: 0,
+      rateLimitReset: observedAt / 1_000 + 60,
+      rateLimitResource: "core",
+    });
+
+    expect(getAdaptiveGithubPollInterval(30_000, observedAt)).toBe(61_000);
+  });
+
+  it("returns to the base interval after a refreshed healthy quota", () => {
+    observe({
+      rateLimitLimit: 5_000,
+      rateLimitRemaining: 20,
+      rateLimitReset: observedAt / 1_000 + 3_600,
+      rateLimitResource: "core",
+    });
+    observe({
+      rateLimitLimit: 5_000,
+      rateLimitRemaining: 4_900,
+      rateLimitReset: observedAt / 1_000 + 7_200,
+      rateLimitResource: "core",
+    });
+
+    expect(getAdaptiveGithubPollInterval(30_000, observedAt)).toBe(30_000);
+  });
+
+  it("keeps the lower quota when concurrent responses finish out of order", () => {
+    const reset = observedAt / 1_000 + 3_600;
+    observe({
+      rateLimitLimit: 5_000,
+      rateLimitRemaining: 20,
+      rateLimitReset: reset,
+      rateLimitResource: "core",
+    });
+    observe({
+      rateLimitLimit: 5_000,
+      rateLimitRemaining: 4_000,
+      rateLimitReset: reset,
+      rateLimitResource: "core",
+    });
+
+    expect(getAdaptiveGithubPollInterval(30_000, observedAt)).toBe(240_000);
+  });
+
+  it("uses quota percentage for resources with smaller limits", () => {
+    observe({
+      rateLimitLimit: 30,
+      rateLimitRemaining: 29,
+      rateLimitReset: observedAt / 1_000 + 60,
+      rateLimitResource: "search",
+    });
+
+    expect(getAdaptiveGithubPollInterval(30_000, observedAt)).toBe(30_000);
   });
 });

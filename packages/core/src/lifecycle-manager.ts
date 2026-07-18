@@ -19,6 +19,7 @@ import {
   SESSION_STATUS,
   TERMINAL_STATUSES,
   type ActivityState,
+  type LifecycleCheckOptions,
   type LifecycleManager,
   type OpenCodeSessionManager,
   type SessionId,
@@ -110,6 +111,8 @@ import {
   decisionEpisodeTransition,
 } from "./notify-decision.js";
 import { resolveSessionRole } from "./agent-selection.js";
+import { getAdaptiveGithubPollInterval } from "./gh-trace.js";
+import { processSCMWebhookQueue } from "./scm-webhook-queue.js";
 import {
   DETECTING_MAX_ATTEMPTS,
   createDetectingDecision,
@@ -582,6 +585,50 @@ export interface LifecycleManagerDeps {
   projectId?: string;
 }
 
+function webhookSessionKey(projectId: string, sessionId: SessionId): string {
+  return JSON.stringify([projectId, sessionId]);
+}
+
+type SCMRefreshOutcome = { status: "succeeded" } | { status: "failed"; error: unknown };
+type SCMRefreshOutcomes = Map<string, SCMRefreshOutcome>;
+
+function recordSCMRefreshSuccess(
+  outcomes: SCMRefreshOutcomes,
+  sessionKeys: Iterable<string>,
+): void {
+  for (const sessionKey of sessionKeys) {
+    if (outcomes.get(sessionKey)?.status !== "failed") {
+      outcomes.set(sessionKey, { status: "succeeded" });
+    }
+  }
+}
+
+function recordSCMRefreshFailure(
+  outcomes: SCMRefreshOutcomes,
+  sessionKeys: Iterable<string>,
+  error: unknown,
+): void {
+  for (const sessionKey of sessionKeys) {
+    outcomes.set(sessionKey, { status: "failed", error });
+  }
+}
+
+function requireSuccessfulSCMRefresh(
+  outcomes: SCMRefreshOutcomes,
+  session: Session,
+): void {
+  const outcome = outcomes.get(webhookSessionKey(session.projectId, session.id));
+  if (outcome?.status === "succeeded") return;
+
+  const detail =
+    outcome?.status === "failed"
+      ? outcome.error instanceof Error
+        ? outcome.error.message
+        : String(outcome.error)
+      : "no SCM refresh completed";
+  throw new Error(`SCM refresh failed for ${session.projectId}/${session.id}: ${detail}`);
+}
+
 /** Track attempt counts for reactions per session. */
 interface ReactionTracker {
   attempts: number;
@@ -600,11 +647,22 @@ interface ReactionTracker {
 export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleManager {
   const { config, registry, sessionManager, projectId: scopedProjectId } = deps;
   const observer = createProjectObserver(config, "lifecycle-manager");
+  const projectUsesGithubSCM = (projectId: string): boolean => {
+    const pluginName = config.projects[projectId]?.scm?.plugin;
+    if (!pluginName) return false;
+    const scm = registry.get<SCM>("scm", pluginName);
+    return pluginName.toLowerCase() === "github" || scm?.name.toLowerCase() === "github";
+  };
+  const githubBackoffEnabled = scopedProjectId
+    ? projectUsesGithubSCM(scopedProjectId)
+    : Object.keys(config.projects).some(projectUsesGithubSCM);
 
   const states = new Map<SessionId, SessionStatus>();
   const activityStateCache = new Map<string, ActivityState>(); // sessionId → last observed activity
   const reactionTrackers = new Map<string, ReactionTracker>(); // "sessionId:reactionKey"
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  let pollingStarted = false;
+  let pollGeneration = 0;
   let polling = false; // re-entrancy guard
   let allCompleteEmitted = false; // guard against repeated all_complete
   const branchAdoptionReservations = new Map<string, SessionId>();
@@ -681,7 +739,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * Populate the PR enrichment cache using batch GraphQL queries.
    * This is called once per poll cycle to fetch data for all PRs efficiently.
    */
-  async function populatePREnrichmentCache(sessions: Session[]): Promise<void> {
+  async function populatePREnrichmentCache(
+    sessions: Session[],
+    scmRefreshOutcomes: SCMRefreshOutcomes,
+  ): Promise<void> {
     // Clear previous cache
     prEnrichmentCache.clear();
     prListUnchangedRepos = new Set();
@@ -691,6 +752,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // for every active repo — enabling detectPR gating even when no PRs exist yet.
     const prsByPlugin = new Map<string, Array<NonNullable<Session["pr"]>>>();
     const reposByPlugin = new Map<string, Set<string>>();
+    const sessionKeysByPlugin = new Map<string, Set<string>>();
     const seenPRKeys = new Set<string>();
     for (const session of sessions) {
       const project = config.projects[session.projectId];
@@ -703,6 +765,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       if (!reposByPlugin.has(pluginKey)) {
         reposByPlugin.set(pluginKey, new Set());
       }
+      if (!sessionKeysByPlugin.has(pluginKey)) {
+        sessionKeysByPlugin.set(pluginKey, new Set());
+      }
+      sessionKeysByPlugin
+        .get(pluginKey)
+        ?.add(webhookSessionKey(session.projectId, session.id));
       reposByPlugin.get(pluginKey)!.add(project.repo);
       const sessionPRs = normalizeSessionPRs(session);
       if (sessionPRs.length === 0) continue;
@@ -794,6 +862,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         for (const [key, data] of enrichmentData) {
           prEnrichmentCache.set(key, data);
         }
+        recordSCMRefreshSuccess(
+          scmRefreshOutcomes,
+          sessionKeysByPlugin.get(pluginKey) ?? [],
+        );
       } catch (err) {
         // Batch fetch failed - individual calls will still work
         const errorMsg = err instanceof Error ? err.message : String(err);
@@ -823,6 +895,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             errorMessage: errorMsg,
           },
         });
+        recordSCMRefreshFailure(
+          scmRefreshOutcomes,
+          sessionKeysByPlugin.get(pluginKey) ?? [],
+          err,
+        );
       }
     }
 
@@ -866,6 +943,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
       try {
         const detectedPR = await scm.detectPR(session, project);
+        recordSCMRefreshSuccess(scmRefreshOutcomes, [
+          webhookSessionKey(session.projectId, session.id),
+        ]);
         if (detectedPR) {
           // Track by owner/repo/number — allows multiple PRs on the same repo
           // in the same session (e.g. agent opens PR #10 and PR #11 both on acme/main-app).
@@ -917,6 +997,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           });
         }
       } catch (error) {
+        recordSCMRefreshFailure(
+          scmRefreshOutcomes,
+          [webhookSessionKey(session.projectId, session.id)],
+          error,
+        );
         const errorMsg = error instanceof Error ? error.message : String(error);
         observer?.recordOperation?.({
           metric: "lifecycle_poll",
@@ -1142,7 +1227,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   /** Determine current status for a session by polling plugins. */
-  async function determineStatus(session: Session): Promise<DeterminedStatus> {
+  async function determineStatus(
+    session: Session,
+    scmRefreshOutcomes: SCMRefreshOutcomes,
+  ): Promise<DeterminedStatus> {
     const project = config.projects[session.projectId];
     if (!project) {
       return {
@@ -1508,8 +1596,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         if (!escalatedEnrichment && scm.getPRState) {
           try {
             const liveState = await scm.getPRState(session.pr);
+            recordSCMRefreshSuccess(scmRefreshOutcomes, [
+              webhookSessionKey(session.projectId, session.id),
+            ]);
             prIsTerminal = liveState === "merged" || liveState === "closed";
-          } catch {
+          } catch (error) {
+            recordSCMRefreshFailure(
+              scmRefreshOutcomes,
+              [webhookSessionKey(session.projectId, session.id)],
+              error,
+            );
             // Couldn't confirm — keep holding the latch until the next poll.
           }
         }
@@ -1614,6 +1710,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           if (session.prs.length > 1) {
             // Multi-PR: only terminate when ALL PRs are in a terminal state.
             const states = await Promise.all(session.prs.map((p) => scm.getPRState(p)));
+            recordSCMRefreshSuccess(scmRefreshOutcomes, [
+              webhookSessionKey(session.projectId, session.id),
+            ]);
             if (states.every((s) => s === "merged" || s === "closed")) {
               const prState = states.every((s) => s === "merged") ? "merged" : "closed";
               return commit(
@@ -1630,6 +1729,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             }
           } else {
             const prState = await scm.getPRState(session.pr);
+            recordSCMRefreshSuccess(scmRefreshOutcomes, [
+              webhookSessionKey(session.projectId, session.id),
+            ]);
             if (prState === "merged" || prState === "closed") {
               return commit(
                 resolvePRLiveDecision({
@@ -1645,6 +1747,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             }
           }
         } catch (err) {
+          recordSCMRefreshFailure(
+            scmRefreshOutcomes,
+            [webhookSessionKey(session.projectId, session.id)],
+            err,
+          );
           // Best-effort — batch will retry next cycle. Record AE evidence so
           // RCA can answer "why didn't AO transition to merged/closed in time?"
           recordActivityEvent({
@@ -4438,7 +4545,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   /** Poll a single session and handle state transitions. */
-  async function checkSession(session: Session, projectCostUsd?: number): Promise<void> {
+  async function checkSession(
+    session: Session,
+    projectCostUsd: number | undefined,
+    scmRefreshOutcomes: SCMRefreshOutcomes,
+  ): Promise<void> {
     // Use tracked state if available; otherwise use the persisted metadata status
     // (not session.status, which list() may have already overwritten for dead runtimes).
     // This ensures transitions are detected after a lifecycle manager restart.
@@ -4447,7 +4558,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       tracked ?? ((session.metadata?.["status"] as SessionStatus | undefined) || session.status);
     const previousLifecycle = cloneLifecycle(session.lifecycle);
     const previousPRState = session.lifecycle.pr.state;
-    const assessment = await determineStatus(session);
+    const assessment = await determineStatus(session, scmRefreshOutcomes);
     if (assessment.skipMetadataWrite) {
       states.set(session.id, oldStatus);
       return;
@@ -5262,7 +5373,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
       // Prime the per-poll PR enrichment cache before session checks so
       // downstream status/reaction logic can reuse batch GraphQL data.
-      await populatePREnrichmentCache(sessionsToCheck);
+      const scmRefreshOutcomes: SCMRefreshOutcomes = new Map();
+      await populatePREnrichmentCache(sessionsToCheck, scmRefreshOutcomes);
 
       // Sum each project's estimated cost across all (enriched) sessions so the
       // per-project budget cap can be evaluated per session below.
@@ -5272,13 +5384,50 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // undefined) — NOT `?? 0` — so checkSession can tell "no cost observed"
       // (transient enrichment failure) apart from a real $0 aggregate and keep
       // a budget pause latched through the failure window.
-      await Promise.allSettled(
-        sessionsToCheck.map((s) => checkSession(s, projectCostUsd.get(s.projectId))),
+      const sessionCheckResults = await Promise.allSettled(
+        sessionsToCheck.map((s) =>
+          checkSession(s, projectCostUsd.get(s.projectId), scmRefreshOutcomes),
+        ),
       );
 
       // Persist batch enrichment data to session metadata files so the
       // web dashboard can read it without calling GitHub API.
       persistPREnrichmentToMetadata(sessionsToCheck);
+
+      // A webhook job is acknowledged only after the same session check and
+      // its SCM refresh completed successfully. This preserves lifecycle's
+      // ownership of transitions while retaining work when best-effort polling
+      // swallows an SCM failure.
+      const sessionsByProjectAndId = new Map(
+        sessions.map((session) => [webhookSessionKey(session.projectId, session.id), session]),
+      );
+      const checkResultsByProjectAndId = new Map(
+        sessionsToCheck.map((session, index) => [
+          webhookSessionKey(session.projectId, session.id),
+          sessionCheckResults[index],
+        ]),
+      );
+      const queueProjectIds = scopedProjectId
+        ? [scopedProjectId]
+        : Object.keys(config.projects);
+      for (const queueProjectId of queueProjectIds) {
+        await processSCMWebhookQueue(
+          queueProjectId,
+          async (job) => {
+            const sessionKey = webhookSessionKey(job.projectId, job.sessionId);
+            const session = sessionsByProjectAndId.get(sessionKey);
+            if (!session || TERMINAL_STATUSES.has(session.status)) return;
+
+            const result = checkResultsByProjectAndId.get(sessionKey);
+            if (!result) {
+              throw new Error(`Session ${job.sessionId} was not checked in this poll`);
+            }
+            if (result.status === "rejected") throw result.reason;
+            requireSuccessfulSCMRefresh(scmRefreshOutcomes, session);
+          },
+          { enqueuedBefore: startedAt },
+        );
+      }
 
       // Dependency scheduler (#10): unblock and launch held sessions whose
       // prerequisites just merged. Runs after checkSession so newly-merged
@@ -5428,15 +5577,32 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
   return {
     start(intervalMs = 30_000): void {
-      if (pollTimer) return; // Already running
-      pollTimer = setInterval(() => void pollAll(), intervalMs);
-      // Run immediately on start
-      void pollAll();
+      if (pollingStarted) return;
+      pollingStarted = true;
+      const generation = ++pollGeneration;
+
+      const runPollLoop = async (): Promise<void> => {
+        await pollAll();
+        if (!pollingStarted || generation !== pollGeneration) return;
+        const nextIntervalMs = githubBackoffEnabled
+          ? getAdaptiveGithubPollInterval(intervalMs)
+          : intervalMs;
+        pollTimer = setTimeout(() => {
+          pollTimer = null;
+          void runPollLoop();
+        }, nextIntervalMs);
+      };
+
+      // Run immediately on start, then schedule each subsequent poll using the
+      // latest GitHub quota observed during the completed cycle.
+      void runPollLoop();
     },
 
     stop(): void {
+      pollingStarted = false;
+      pollGeneration += 1;
       if (pollTimer) {
-        clearInterval(pollTimer);
+        clearTimeout(pollTimer);
         pollTimer = null;
       }
     },
@@ -5445,20 +5611,32 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       return new Map(states);
     },
 
-    async check(sessionId: SessionId): Promise<void> {
-      const session = await sessionManager.get(sessionId);
+    async check(sessionId: SessionId, options: LifecycleCheckOptions = {}): Promise<void> {
+      const session = options.projectId
+        ? await sessionManager.get(sessionId, options.projectId)
+        : await sessionManager.get(sessionId);
       if (!session) throw new Error(`Session ${sessionId} not found`);
       await refreshTrackedBranch(session);
       // Populate batch enrichment cache for this session's PR so
       // checkSession can read from cache (no individual REST fallback).
-      await populatePREnrichmentCache([session]);
+      const scmRefreshOutcomes: SCMRefreshOutcomes = new Map();
+      await populatePREnrichmentCache([session], scmRefreshOutcomes);
       // Sum the project's spend across all its sessions so the per-project
       // budget cap is evaluated correctly for direct (e.g. webhook) checks,
       // not just the polling loop.
       const projectCostUsd = sumProjectCost(await sessionManager.list(session.projectId));
       // Pass the raw lookup (possibly undefined) — see the pollAll call site for
       // why missing cost must not be coalesced to 0.
-      await checkSession(session, projectCostUsd.get(session.projectId));
+      await checkSession(
+        session,
+        projectCostUsd.get(session.projectId),
+        scmRefreshOutcomes,
+      );
+      if (options.requireSuccessfulSCMRefresh) {
+        requireSuccessfulSCMRefresh(scmRefreshOutcomes, session);
+      }
     },
   };
 }
+
+export const _testUtils = { webhookSessionKey };

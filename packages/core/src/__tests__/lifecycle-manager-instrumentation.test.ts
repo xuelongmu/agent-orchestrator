@@ -15,6 +15,8 @@
  * because it needs real observability snapshots in addition to activity events.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type * as ActivityEventsModule from "../activity-events.js";
 
 vi.mock("../activity-events.js", async (importOriginal) => {
@@ -28,6 +30,7 @@ vi.mock("../activity-events.js", async (importOriginal) => {
 import { recordActivityEvent } from "../activity-events.js";
 import { createLifecycleManager } from "../lifecycle-manager.js";
 import { writeMetadata } from "../metadata.js";
+import { enqueueSCMWebhookDelivery, processSCMWebhookQueue } from "../scm-webhook-queue.js";
 import type {
   OpenCodeSessionManager,
   OrchestratorConfig,
@@ -221,6 +224,94 @@ describe("scm.batch_enrich_failed", () => {
       prCount: 1,
       errorMessage: "rate limited",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Durable webhook SCM refresh acknowledgement
+// ---------------------------------------------------------------------------
+
+describe("durable webhook SCM refresh acknowledgement", () => {
+  function readQueuedJobs(queuePath: string): unknown[] {
+    const store = JSON.parse(readFileSync(queuePath, "utf-8")) as { jobs: unknown[] };
+    return store.jobs;
+  }
+
+  async function processWebhookCheck(
+    mockSCM: ReturnType<typeof createMockSCM>,
+    deliveryId: string,
+  ) {
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier: createMockNotifier(),
+    });
+    const session = makeSession({ status: "pr_open", pr: makeMatchingPR() });
+    persistSession("app-1", session);
+    const lm = buildLM(registry);
+    const queuePath = join(env.tmpDir, `${deliveryId}.json`);
+    enqueueSCMWebhookDelivery(
+      {
+        provider: "github",
+        deliveryId,
+        projectId: session.projectId,
+        sessionIds: [session.id],
+      },
+      { queuePath, now: () => 1_000 },
+    );
+    const result = await processSCMWebhookQueue(
+      session.projectId,
+      async (job) =>
+        lm.check(job.sessionId, {
+          projectId: job.projectId,
+          requireSuccessfulSCMRefresh: true,
+        }),
+      { queuePath, now: () => 1_000 },
+    );
+    return { queuePath, result };
+  }
+
+  it("preserves the job when batch enrichment fails but the lifecycle check continues", async () => {
+    const mockSCM = createMockSCM({
+      enrichSessionsPRBatch: vi.fn().mockRejectedValue(new Error("rate limited")),
+    });
+
+    const { queuePath, result } = await processWebhookCheck(mockSCM, "batch-failure");
+
+    expect(result.processed).toHaveLength(0);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]?.error).toEqual(
+      expect.objectContaining({ message: expect.stringContaining("rate limited") }),
+    );
+    expect(readQueuedJobs(queuePath)).toHaveLength(1);
+  });
+
+  it("preserves the job when the live PR fallback failure is swallowed", async () => {
+    const mockSCM = createMockSCM({
+      enrichSessionsPRBatch: vi.fn().mockResolvedValue(new Map()),
+      getPRState: vi.fn().mockRejectedValue(new Error("GitHub unavailable")),
+    });
+
+    const { queuePath, result } = await processWebhookCheck(mockSCM, "live-failure");
+
+    expect(result.processed).toHaveLength(0);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]?.error).toEqual(
+      expect.objectContaining({ message: expect.stringContaining("GitHub unavailable") }),
+    );
+    expect(readQueuedJobs(queuePath)).toHaveLength(1);
+  });
+
+  it("completes the job after a successful project-scoped SCM refresh", async () => {
+    const mockSCM = createMockSCM();
+
+    const { queuePath, result } = await processWebhookCheck(mockSCM, "refresh-success");
+
+    expect(result.failures).toHaveLength(0);
+    expect(result.processed).toHaveLength(1);
+    expect(mockSessionManager.get).toHaveBeenCalledWith("app-1", "my-app");
+    expect(readQueuedJobs(queuePath)).toHaveLength(0);
   });
 });
 

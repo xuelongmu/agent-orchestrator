@@ -13,10 +13,14 @@ import {
 // Activity event recording is mocked so we can assert what fires without
 // touching the real SQLite layer.
 const recordActivityEvent = vi.fn();
+const enqueueSCMWebhookDelivery = vi.fn();
+const processSCMWebhookQueue = vi.fn();
 vi.mock("@aoagents/ao-core", async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
   return {
     ...actual,
+    enqueueSCMWebhookDelivery: (...args: unknown[]) => enqueueSCMWebhookDelivery(...args),
+    processSCMWebhookQueue: (...args: unknown[]) => processSCMWebhookQueue(...args),
     recordActivityEvent: (event: unknown) => recordActivityEvent(event),
   };
 });
@@ -155,12 +159,36 @@ function makeWebhookRequest(opts?: {
 beforeEach(() => {
   vi.clearAllMocks();
   recordActivityEvent.mockClear();
-  verifyWebhook.mockResolvedValue({ ok: true });
+  enqueueSCMWebhookDelivery.mockReturnValue({
+    deliveryKey: "github:delivery-1",
+    duplicate: false,
+    enqueuedJobs: 1,
+  });
+  processSCMWebhookQueue.mockImplementation(
+    async (projectId: string, processor: (job: { sessionId: Session["id"] }) => Promise<void>) => {
+      const job = {
+        id: "github:delivery-1:s1",
+        deliveryKey: "github:delivery-1",
+        projectId,
+        sessionId: "s1" as Session["id"],
+        attemptCount: 0,
+        availableAt: Date.now(),
+      };
+      try {
+        await processor(job);
+        return { processed: [job], failures: [] };
+      } catch (error) {
+        return { processed: [], failures: [{ job, error }] };
+      }
+    },
+  );
+  verifyWebhook.mockResolvedValue({ ok: true, deliveryId: "delivery-1" });
   parseWebhook.mockResolvedValue({
     provider: "github",
     kind: "pull_request",
     action: "synchronize",
     rawEventType: "pull_request",
+    deliveryId: "delivery-1",
     repository: { owner: "acme", name: "my-app" },
     prNumber: 42,
     branch: "feat/x",
@@ -287,6 +315,108 @@ describe("POST /api/webhooks/[...slug] — activity events", () => {
     expect(received).toBeDefined();
     expect((received![0] as { level: string }).level).toBe("warn");
     expect((received![0] as { data: Record<string, unknown> }).data["parseErrorCount"]).toBe(1);
+  });
+
+  it("does not process a duplicate delivery again", async () => {
+    enqueueSCMWebhookDelivery.mockReturnValueOnce({
+      deliveryKey: "github:delivery-1",
+      duplicate: true,
+      enqueuedJobs: 0,
+    });
+
+    const res = await webhookPOST(makeWebhookRequest());
+    expect(res.status).toBe(202);
+    await expect(res.json()).resolves.toMatchObject({ duplicateDeliveries: 1 });
+    expect(processSCMWebhookQueue).not.toHaveBeenCalled();
+    expect(mockLifecycle.check).not.toHaveBeenCalled();
+  });
+
+  it("scopes an immediate check to the queued project when session IDs overlap", async () => {
+    const originalProjects = mockConfig.projects;
+    mockConfig.projects = {
+      ...originalProjects,
+      "other-app": {
+        name: "Other App",
+        repo: "acme/other-app",
+        path: "/tmp/other-app",
+        defaultBranch: "main",
+        sessionPrefix: "my-app",
+        scm: {
+          plugin: "github",
+          webhook: { enabled: true, path: "/api/webhooks/github", maxBodyBytes: 1024 },
+        },
+      },
+    };
+    const sharedSessionId = "shared" as Session["id"];
+    vi.mocked(mockSessionManager.list).mockResolvedValueOnce([
+      makeSession(sharedSessionId),
+      makeSession(sharedSessionId, {
+        projectId: "other-app",
+        pr: {
+          number: 42,
+          url: "u2",
+          title: "t2",
+          owner: "acme",
+          repo: "other-app",
+          branch: "feat/x",
+          baseBranch: "main",
+          isDraft: false,
+        },
+      }),
+    ]);
+    processSCMWebhookQueue.mockImplementationOnce(
+      async (
+        projectId: string,
+        processor: (job: { projectId: string; sessionId: Session["id"] }) => Promise<void>,
+      ) => {
+        const job = {
+          id: "github:delivery-1:shared",
+          deliveryKey: "github:delivery-1",
+          projectId,
+          sessionId: sharedSessionId,
+          attemptCount: 0,
+          availableAt: Date.now(),
+        };
+        await processor(job);
+        return { processed: [job], failures: [] };
+      },
+    );
+
+    try {
+      const res = await webhookPOST(makeWebhookRequest());
+      expect(res.status).toBe(202);
+      expect(enqueueSCMWebhookDelivery).toHaveBeenCalledTimes(1);
+      expect(enqueueSCMWebhookDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({ projectId: "my-app", sessionIds: [sharedSessionId] }),
+      );
+      expect(processSCMWebhookQueue).toHaveBeenCalledTimes(1);
+      expect(processSCMWebhookQueue).toHaveBeenCalledWith(
+        "my-app",
+        expect.any(Function),
+        expect.objectContaining({ deliveryKeys: expect.any(Set) }),
+      );
+      expect(mockLifecycle.check).toHaveBeenCalledTimes(1);
+      expect(mockLifecycle.check).toHaveBeenCalledWith(sharedSessionId, {
+        projectId: "my-app",
+        requireSuccessfulSCMRefresh: true,
+      });
+    } finally {
+      mockConfig.projects = originalProjects;
+    }
+  });
+
+  it("reports a failed lifecycle attempt after the delivery was queued", async () => {
+    vi.mocked(mockLifecycle.check).mockRejectedValueOnce(new Error("temporary failure"));
+
+    const res = await webhookPOST(makeWebhookRequest());
+    expect(res.status).toBe(202);
+    await expect(res.json()).resolves.toMatchObject({
+      queuedDeliveries: 1,
+      lifecycleErrors: ["session s1: temporary failure"],
+    });
+    expect(enqueueSCMWebhookDelivery.mock.invocationCallOrder[0]).toBeLessThan(
+      processSCMWebhookQueue.mock.invocationCallOrder[0]!,
+    );
   });
 
   it("emits api.webhook_failed on 500 outer crash", async () => {

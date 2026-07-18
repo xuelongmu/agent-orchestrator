@@ -273,6 +273,17 @@ export {
   parseWebhookTimestamp,
   parseWebhookBranchRef,
 } from "./scm-webhook-utils.js";
+export {
+  enqueueSCMWebhookDelivery,
+  processSCMWebhookQueue,
+} from "./scm-webhook-queue.js";
+export type {
+  EnqueueSCMWebhookDeliveryInput,
+  EnqueueSCMWebhookDeliveryResult,
+  ProcessSCMWebhookQueueFailure,
+  ProcessSCMWebhookQueueResult,
+  SCMWebhookQueueJob,
+} from "./scm-webhook-queue.js";
 export { asValidOpenCodeSessionId } from "./opencode-session-id.js";
 export {
   SESSION_ID_COMPONENT_PATTERN,
@@ -335,7 +346,11 @@ export {
   createProjectObserver,
   readObservabilitySummary,
 } from "./observability.js";
-export { execGhObserved, getGhTraceFilePath } from "./gh-trace.js";
+export {
+  execGhObserved,
+  getAdaptiveGithubPollInterval,
+  getGhTraceFilePath,
+} from "./gh-trace.js";
 export { resolveNotifierTarget } from "./notifier-resolution.js";
 export {
   NEEDS_INPUT_DECISION_TYPES,

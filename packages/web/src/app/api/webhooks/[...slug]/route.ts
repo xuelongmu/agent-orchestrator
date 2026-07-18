@@ -1,5 +1,9 @@
 import { NextResponse } from "next/server";
-import { recordActivityEvent } from "@aoagents/ao-core";
+import {
+  enqueueSCMWebhookDelivery,
+  processSCMWebhookQueue,
+  recordActivityEvent,
+} from "@aoagents/ao-core";
 import { getServices } from "@/lib/services";
 import {
   buildWebhookRequest,
@@ -93,6 +97,9 @@ export async function POST(request: Request): Promise<Response> {
     const errors: string[] = [];
     const parseErrors: string[] = [];
     const lifecycleErrors: string[] = [];
+    const queuedDeliveryKeys = new Map<string, Set<string>>();
+    let queuedDeliveryCount = 0;
+    let duplicateDeliveryCount = 0;
 
     for (const candidate of candidates) {
       if (!candidate.scm.verifyWebhook) {
@@ -127,15 +134,23 @@ export async function POST(request: Request): Promise<Response> {
         continue;
       }
 
-      const lifecycle = services.lifecycleManager;
       for (const session of affectedSessions) {
         sessionIds.add(session.id);
-        try {
-          await lifecycle.check(session.id);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : "Lifecycle check failed";
-          lifecycleErrors.push(`session ${session.id}: ${message}`);
-        }
+      }
+
+      const enqueued = enqueueSCMWebhookDelivery({
+        provider: event.provider,
+        deliveryId: verification.deliveryId ?? event.deliveryId,
+        projectId: candidate.projectId,
+        sessionIds: affectedSessions.map((session) => session.id),
+      });
+      if (enqueued.duplicate) {
+        duplicateDeliveryCount += 1;
+      } else {
+        queuedDeliveryCount += 1;
+        const keys = queuedDeliveryKeys.get(candidate.projectId) ?? new Set<string>();
+        keys.add(enqueued.deliveryKey);
+        queuedDeliveryKeys.set(candidate.projectId, keys);
       }
     }
 
@@ -171,6 +186,26 @@ export async function POST(request: Request): Promise<Response> {
       );
     }
 
+    // Only the process that durably enqueued a delivery handles it immediately.
+    // Redeliveries do not re-run lifecycle work; failed jobs remain queued for
+    // the CLI lifecycle worker to retry on a subsequent poll.
+    for (const [projectId, deliveryKeys] of queuedDeliveryKeys) {
+      const result = await processSCMWebhookQueue(
+        projectId,
+        async (job) =>
+          services.lifecycleManager.check(job.sessionId, {
+            projectId: job.projectId,
+            requireSuccessfulSCMRefresh: true,
+          }),
+        { deliveryKeys },
+      );
+      for (const failure of result.failures) {
+        const message =
+          failure.error instanceof Error ? failure.error.message : "Lifecycle check failed";
+        lifecycleErrors.push(`session ${failure.job.sessionId}: ${message}`);
+      }
+    }
+
     recordActivityEvent({
       source: "api",
       kind: "api.webhook_received",
@@ -181,6 +216,8 @@ export async function POST(request: Request): Promise<Response> {
         remoteAddr,
         projectIds: [...projectIds],
         matchedSessions: sessionIds.size,
+        queuedDeliveryCount,
+        duplicateDeliveryCount,
         parseErrorCount: parseErrors.length,
         lifecycleErrorCount: lifecycleErrors.length,
       },
@@ -192,6 +229,8 @@ export async function POST(request: Request): Promise<Response> {
         projectIds: [...projectIds],
         sessionIds: [...sessionIds],
         matchedSessions: sessionIds.size,
+        queuedDeliveries: queuedDeliveryCount,
+        duplicateDeliveries: duplicateDeliveryCount,
         parseErrors,
         lifecycleErrors,
       },
