@@ -221,6 +221,14 @@ const PERSISTENT_REACTION_KEYS = new Set(["ci-failed"]);
  *  and is awaiting a per-poll retry (Class B chokepoint, #12). */
 const CONFIDENCE_HOLD_PENDING_KEY = "confidenceHoldPending";
 
+/** Metadata key: activation identity of a same-state decision notification whose
+ *  delivery failed and is awaiting the shared per-poll human-outcome retry. */
+const DECISION_NOTIFICATION_PENDING_KEY = "decisionNotificationPending";
+
+/** Explicit confidence-gate outcome. In particular, `held-delivered` means only
+ *  the human received the payload; it must never be counted as an agent action. */
+type ConfidenceHoldOutcome = "proceed" | "held-delivered" | "held-pending";
+
 /** Number of consecutive CI-passing polls required before the ci-failed tracker
  *  (including its escalated flag) is cleared, allowing a fresh budget for the
  *  next real CI failure incident. */
@@ -2064,15 +2072,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   /**
    * The SINGLE confidence-hold chokepoint (Class B). Every gated autonomous send
    * routes through here, so a hold reaches EXACTLY ONE terminal outcome:
-   *   • proceed   — `{ withhold: false }`: confidence is sufficient (or the reaction
-   *                 isn't gated). Any pending hold is released; the caller acts.
-   *   • escalated — `{ withhold: true, delivered: true }`: a human received the
-   *                 question (+ detail). The tracker is latched and pending cleared.
-   *                 Re-entry while latched short-circuits here (no re-notify).
-   *   • pending   — `{ withhold: true, delivered: false }`: held but the escalation
-   *                 could not be delivered. Persisted so retryPendingConfidenceHold
-   *                 re-attempts every poll; NEVER latched and NEVER marked delivered,
-   *                 so held sends are never stamped as handled without proof.
+   *   • proceed        — confidence is sufficient (or the reaction isn't gated).
+   *                      Any pending hold is released; the caller acts.
+   *   • held-delivered — a human received the question (+ detail). The tracker is
+   *                      latched and pending cleared. Re-entry while latched
+   *                      short-circuits here (no re-notify).
+   *   • held-pending   — held but the escalation could not be delivered. Persisted
+   *                      so retryPendingConfidenceHold re-attempts every poll;
+   *                      NEVER latched or marked delivered, so a held send is never
+   *                      stamped as handled without proof.
    */
   async function withholdForConfidence(
     session: Session,
@@ -2080,17 +2088,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     action: string,
     reactionConfig: ReactionConfig,
     detail?: string,
-  ): Promise<{ withhold: boolean; delivered: boolean }> {
+  ): Promise<ConfidenceHoldOutcome> {
     const trackerKey = `${session.id}:${reactionKey}`;
     const existing = reactionTrackers.get(trackerKey);
     if (existing?.escalated && existing.heldForConfidence) {
       clearPendingConfidenceHold(session, reactionKey);
-      return { withhold: true, delivered: true };
+      return "held-delivered";
     }
     const evaluated = evaluateConfidenceHold(session, action, reactionConfig);
     if (!evaluated) {
       clearPendingConfidenceHold(session, reactionKey);
-      return { withhold: false, delivered: false };
+      return "proceed";
     }
     const delivered = await notifyConfidenceEscalation(
       session,
@@ -2110,7 +2118,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     } else {
       setPendingConfidenceHold(session, reactionKey);
     }
-    return { withhold: true, delivered };
+    return delivered ? "held-delivered" : "held-pending";
   }
 
   /**
@@ -2119,16 +2127,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * latch. Unlike withholdForConfidence it ALWAYS re-delivers the detail (the caller
    * dedups via its own dispatch hash), so a generic transition/retry escalation that
    * already latched never suppresses the detailed one (#12 review). Returns
-   * `{ withhold, delivered }`; stamp the dispatch hash only when delivered.
+   * the explicit outcome; stamp the dispatch hash only when the human received it.
    */
   async function withholdDispatchForConfidence(
     session: Session,
     reactionKey: string,
     reactionConfig: ReactionConfig,
     detail: string,
-  ): Promise<{ withhold: boolean; delivered: boolean }> {
+  ): Promise<ConfidenceHoldOutcome> {
     const evaluated = evaluateConfidenceHold(session, "send-to-agent", reactionConfig);
-    if (!evaluated) return { withhold: false, delivered: false };
+    if (!evaluated) return "proceed";
     const delivered = await notifyConfidenceEscalation(
       session,
       reactionKey,
@@ -2149,7 +2157,57 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       reactionTrackers.set(trackerKey, tracker);
       clearPendingConfidenceHold(session, reactionKey);
     }
-    return { withhold: true, delivered };
+    return delivered ? "held-delivered" : "held-pending";
+  }
+
+  /** Deliver the standard human-facing form of a notify reaction. Kept separate
+   * from executeReaction so pending human outcomes can retry delivery without
+   * ever re-entering a disabled autonomous action. */
+  async function deliverNotifyReaction(
+    session: Session | ReactionSessionContext,
+    reactionKey: string,
+    reactionConfig: ReactionConfig,
+  ): Promise<boolean> {
+    const { id: sessionId, projectId } = session;
+    const context = buildEventContext(session, prEnrichmentCache);
+    const lifecycleSession = "lifecycle" in session ? session : null;
+    const isDecisionReaction =
+      !!lifecycleSession &&
+      (reactionKey === "agent-needs-input" || reactionKey === "report-needs-input");
+    const decision =
+      lifecycleSession && isDecisionReaction ? getActiveDecision(lifecycleSession) : null;
+    const notifyMessage = decision
+      ? formatNeedsDecisionMessage(decision)
+      : (reactionConfig.message ?? `Reaction '${reactionKey}' triggered notification`);
+    const event = createEvent("reaction.triggered", {
+      sessionId,
+      projectId,
+      message: notifyMessage,
+      data: buildReactionNotificationData({
+        eventType: "reaction.triggered",
+        sessionId,
+        projectId,
+        context,
+        reactionKey,
+        action: "notify",
+        enrichment: getPREnrichmentForSession(session),
+      }),
+    });
+    const expectedDecisionId =
+      lifecycleSession && isDecisionReaction ? activeDecisionId(lifecycleSession) : undefined;
+    return notifyHuman(event, reactionConfig.priority ?? "info", expectedDecisionId);
+  }
+
+  function setPendingDecisionNotification(session: Session, activationIdentity: string): void {
+    if (session.metadata[DECISION_NOTIFICATION_PENDING_KEY] === activationIdentity) return;
+    updateSessionMetadata(session, {
+      [DECISION_NOTIFICATION_PENDING_KEY]: activationIdentity,
+    });
+  }
+
+  function clearPendingDecisionNotification(session: Session, activationIdentity: string): void {
+    if (session.metadata[DECISION_NOTIFICATION_PENDING_KEY] !== activationIdentity) return;
+    updateSessionMetadata(session, { [DECISION_NOTIFICATION_PENDING_KEY]: "" });
   }
 
   /**
@@ -2169,7 +2227,71 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       clearPendingConfidenceHold(session, reactionKey);
       return;
     }
+    // The operator may disable autonomy after the hold was persisted (or before a
+    // restart). Keep retrying the human outcome, but never re-enter the autonomous
+    // action: route through the notify-only delivery path instead.
+    if (reactionConfig.auto === false && reactionConfig.action !== "notify") {
+      const delivered = await deliverNotifyReaction(session, reactionKey, {
+        ...reactionConfig,
+        action: "notify",
+        priority: reactionConfig.priority ?? "urgent",
+      });
+      if (delivered) clearPendingConfidenceHold(session, reactionKey);
+      return;
+    }
     await executeReaction(session, reactionKey, reactionConfig);
+  }
+
+  /** Retry a failed same-state decision fallback while its exact activation is
+   * still current. A successor report is a new activation and owns its own alert. */
+  async function retryPendingDecisionNotification(session: Session): Promise<void> {
+    const pendingIdentity = session.metadata[DECISION_NOTIFICATION_PENDING_KEY];
+    if (!pendingIdentity) return;
+
+    const auditResult = auditAgentReports(session);
+    const reportState = auditResult?.report?.state;
+    if (
+      !auditResult?.trigger ||
+      (reportState !== "needs_input" && reportState !== "needs_decision")
+    ) {
+      clearPendingDecisionNotification(session, pendingIdentity);
+      return;
+    }
+
+    const activationIdentity = reportActivationIdentity(
+      auditResult.trigger,
+      auditResult.report,
+      activeDecisionId(session) !== null,
+    );
+    if (activationIdentity !== pendingIdentity) {
+      clearPendingDecisionNotification(session, pendingIdentity);
+      return;
+    }
+
+    const decision = reportState === "needs_decision" ? getActiveDecision(session) : null;
+    const message =
+      reportState === "needs_decision"
+        ? decision
+          ? formatNeedsDecisionMessage(decision)
+          : null
+        : auditResult.message;
+    if (message === null) {
+      clearPendingDecisionNotification(session, pendingIdentity);
+      return;
+    }
+
+    const delivered = await deliverNotifyReaction(
+      session,
+      getReactionKeyForTrigger(auditResult.trigger),
+      { auto: true, action: "notify", priority: "urgent", message },
+    );
+    if (delivered) clearPendingDecisionNotification(session, pendingIdentity);
+  }
+
+  /** The single per-poll retry chokepoint for undelivered human outcomes. */
+  async function retryPendingHumanOutcomes(session: Session): Promise<void> {
+    await retryPendingConfidenceHold(session);
+    await retryPendingDecisionNotification(session);
   }
 
   /** Execute a reaction for a session. */
@@ -2333,7 +2455,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         action,
         effectiveReactionConfig,
       );
-      if (hold.withhold) {
+      if (hold !== "proceed") {
         return {
           reactionType: reactionKey,
           success: true,
@@ -2391,40 +2513,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       }
 
       case "notify": {
-        const context = buildEventContext(session, prEnrichmentCache);
         // A `needs_decision` report parks the session in needs_input, which fires
-        // the needs-input notify reaction here. Surface the agent's explicit
-        // question + confidence so the human keeps the decision context instead of
-        // a generic "needs input" ping (#12). Scoped to the needs-input reactions
-        // so unrelated notifications (agent-exited, etc.) are never relabeled.
-        const isDecisionReaction =
-          (reactionKey === "agent-needs-input" || reactionKey === "report-needs-input") &&
-          "lifecycle" in session;
-        const decision = isDecisionReaction ? getActiveDecision(session) : null;
-        const notifyMessage = decision
-          ? formatNeedsDecisionMessage(decision)
-          : (reactionConfig.message ?? `Reaction '${reactionKey}' triggered notification`);
-        const event = createEvent("reaction.triggered", {
-          sessionId,
-          projectId,
-          message: notifyMessage,
-          data: buildReactionNotificationData({
-            eventType: "reaction.triggered",
-            sessionId,
-            projectId,
-            context,
-            reactionKey,
-            action: "notify",
-            enrichment: getPREnrichmentForSession(session),
-          }),
-        });
-        // Bind the mutating buttons to the decision this reaction's content was
-        // built from, exactly as the transition/fallback callers do: a report that
-        // supersedes it while notifyHuman's async get() runs must not repoint the
-        // buttons at the newer decision. Only the needs-input reactions mint buttons;
-        // other reactions pass undefined and skip the check. (#13 review)
-        const expectedDecisionId = isDecisionReaction ? activeDecisionId(session) : undefined;
-        await notifyHuman(event, reactionConfig.priority ?? "info", expectedDecisionId);
+        // the needs-input notify reaction here. deliverNotifyReaction surfaces the
+        // explicit question/confidence and binds controls to this report snapshot.
+        await deliverNotifyReaction(session, reactionKey, reactionConfig);
         recordActivityEvent({
           projectId,
           sessionId,
@@ -2563,10 +2655,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // explicit autonomous action override enables `auto` here too (a per-project
     // `approved-and-green: { action: auto-merge, confidenceThreshold }` must not
     // inherit the global default's auto:false and stay dead) (#12 review).
-    const reactionConfig =
-      projectReaction && globalReaction
-        ? mergeReactionOverride(globalReaction, projectReaction as Partial<ReactionConfig>)
-        : (projectReaction ?? globalReaction);
+    const reactionConfig = projectReaction
+      ? mergeReactionOverride(
+          globalReaction ?? { auto: true, action: "notify" },
+          projectReaction as Partial<ReactionConfig>,
+        )
+      : globalReaction;
     return reactionConfig ? (reactionConfig as ReactionConfig) : null;
   }
 
@@ -3275,11 +3369,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
                   reactionConfig,
                   enrichedMessage,
                 )
-              : { withhold: false, delivered: false };
+              : "proceed";
 
           let success = false;
-          if (hold.withhold) {
-            success = hold.delivered;
+          if (hold !== "proceed") {
+            success = hold === "held-delivered";
           } else if (
             // When the transition handler already called executeReaction for this
             // key, send the enriched payload directly to avoid double-billing the
@@ -3400,9 +3494,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             );
 
             // Dispatch-site confidence gate (Class B chokepoint): a low-confidence
-            // hold sends ONE escalation (question + comments) to the human;
-            // stamp/count the round only on delivery so an undelivered hold retries
-            // next poll (#12).
+            // hold sends ONE escalation (question + comments) to the human. Stamp
+            // human or agent delivery for dedup, but count a round ONLY when the
+            // payload actually reaches the agent.
             const hold =
               reactionConfig.action === "send-to-agent"
                 ? await withholdDispatchForConfidence(
@@ -3411,11 +3505,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
                     reactionConfig,
                     enrichedMessage,
                   )
-                : { withhold: false, delivered: false };
+                : "proceed";
 
             let success = false;
-            if (hold.withhold) {
-              success = hold.delivered;
+            let deliveredToAgent = false;
+            if (hold !== "proceed") {
+              success = hold === "held-delivered";
             } else if (
               // Direct-send bypass when the transition already called executeReaction;
               // NOT when it escalated (exhausted retries) — route back so the
@@ -3427,6 +3522,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
               try {
                 await sessionManager.send(session.id, enrichedMessage);
                 success = true;
+                deliveredToAgent = true;
               } catch {
                 // Send failed — will retry on next unthrottled poll
               }
@@ -3436,16 +3532,20 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
               // Retry/duration escalation stamps (human handoff, #5 invariant); a
               // normal send stamps on success. Confidence holds handled above.
               success = result.success;
+              deliveredToAgent = result.success && result.action === "send-to-agent";
             }
             if (success) {
-              updateSessionMetadata(session, {
+              const dispatchUpdates: Record<string, string> = {
                 lastAutomatedReviewDispatchHash: automatedFingerprint,
                 lastAutomatedReviewDispatchAt: new Date().toISOString(),
-                reviewRoundCount: String(reviewRounds + 1),
-                reviewRoundCountTotal: String(
+              };
+              if (deliveredToAgent) {
+                dispatchUpdates.reviewRoundCount = String(reviewRounds + 1);
+                dispatchUpdates.reviewRoundCountTotal = String(
                   parseAttemptCount(session.metadata["reviewRoundCountTotal"]) + 1,
-                ),
-              });
+                );
+              }
+              updateSessionMetadata(session, dispatchUpdates);
             }
           }
         }
@@ -4860,8 +4960,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           reactionConfig,
           detailedMessage,
         );
-        if (hold.withhold) {
-          if (hold.delivered) {
+        if (hold !== "proceed") {
+          if (hold === "held-delivered") {
             updateSessionMetadata(session, {
               lastCIFailureDispatchHash: ciFingerprint,
               lastCIFailureDispatchAt: new Date().toISOString(),
@@ -5897,9 +5997,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // Drop a resolved needs_decision's sticky question/confidence if the session
     // has since left needs_input (before reading any report below) (#12 review).
     clearStaleDecisionContext(session);
-    // Retry an undelivered confidence hold — the single guaranteed retry for
-    // transition-only gated actions (auto-merge) with no per-poll dispatcher (#12).
-    await retryPendingConfidenceHold(session);
+    // Retry every undelivered human outcome through one per-poll chokepoint:
+    // confidence holds and same-state decision notifications.
+    await retryPendingHumanOutcomes(session);
     const auditResult = auditAgentReports(session);
     const now = new Date().toISOString();
 
@@ -6030,24 +6130,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             : null
           : auditResult.message;
       if (message !== null) {
-        const context = buildEventContext(session, prEnrichmentCache);
-        const event = createEvent("reaction.triggered", {
-          sessionId: session.id,
-          projectId: session.projectId,
+        const delivered = await deliverNotifyReaction(session, reactionKey, {
+          auto: true,
+          action: "notify",
+          priority: "urgent",
           message,
-          data: buildReactionNotificationData({
-            eventType: "reaction.triggered",
-            sessionId: session.id,
-            projectId: session.projectId,
-            context,
-            reactionKey,
-            action: "notify",
-            enrichment: getPREnrichmentForSession(session),
-          }),
         });
-        // Bind the controls to the identity this message was built for, so a report
-        // superseding it during delivery cannot repoint the buttons (#13 review).
-        await notifyHuman(event, "urgent", activeDecisionId(session));
+        if (delivered) {
+          clearPendingDecisionNotification(session, activationIdentity);
+        } else {
+          setPendingDecisionNotification(session, activationIdentity);
+        }
       }
     }
   }

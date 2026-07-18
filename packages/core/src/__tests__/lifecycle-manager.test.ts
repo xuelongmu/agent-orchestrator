@@ -2611,6 +2611,59 @@ describe("reactions", () => {
       expect(notifies.length).toBeGreaterThanOrEqual(1);
     });
 
+    it("retries a same-state needs_decision notification that no notifier accepted", async () => {
+      const notifier = createMockNotifier();
+      vi.mocked(notifier.notify)
+        .mockRejectedValueOnce(new Error("desktop unavailable"))
+        .mockResolvedValue(undefined);
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const reportAt = "2025-01-01T11:55:00.000Z";
+      const priorAt = "2025-01-01T11:50:00.000Z";
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "needs_input",
+          activity: "waiting_input",
+          metadata: {
+            agent: "mock-agent",
+            agentReportedState: "needs_decision",
+            agentReportedAt: reportAt,
+            agentReportedQuestion: "Ship it?",
+            agentReportedConfidence: "0.6",
+            reportWatcherActiveTrigger: `agent_needs_input:needs_decision:${priorAt}:answerable`,
+            reportWatcherTriggerActivatedAt: priorAt,
+            reportWatcherTriggerCount: "1",
+            notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
+          },
+        }),
+        registry,
+        configOverride: {
+          ...config,
+          reactions: {},
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+        },
+      });
+
+      await lm.check("app-1");
+      await lm.check("app-1");
+
+      const decisionNotifications = vi.mocked(notifier.notify).mock.calls.filter((call) => {
+        const event = call[0] as { type?: string; data?: { semanticType?: string } };
+        return (
+          event?.type === "reaction.triggered" && event?.data?.semanticType === "report.needs_input"
+        );
+      });
+      expect(decisionNotifications).toHaveLength(2);
+      expect(
+        readMetadataRaw(env.sessionsDir, "app-1")?.["decisionNotificationPending"],
+      ).toBeFalsy();
+    });
+
     it("re-notifies for the FIRST report that lands after a bare-prompt transition", async () => {
       // The session is already parked (a prior poll's bare-prompt transition) with
       // NO active trigger yet; the first report arrives with no transition this
@@ -2790,6 +2843,45 @@ describe("reactions", () => {
         },
       },
       notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+    });
+
+    it("merges a project-only report reaction over notify defaults", async () => {
+      const notifier = createMockNotifier();
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const lm = setupCheck("app-1", {
+        session: decisionSession("2025-01-01T11:55:00.000Z", "2025-01-01T11:50:00.000Z"),
+        registry,
+        configOverride: {
+          ...config,
+          reactions: {},
+          projects: {
+            ...config.projects,
+            "my-app": {
+              ...config.projects["my-app"],
+              reactions: {
+                // Runtime project reaction shape is partial, like root overrides.
+                "report-needs-input": { priority: "urgent" },
+              },
+            },
+          },
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+        },
+      });
+
+      await lm.check("app-1");
+
+      expect(notifier.notify).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "reaction.triggered",
+          data: expect.objectContaining({ semanticType: "report.needs_input" }),
+        }),
+      );
     });
 
     it("executeReaction omits buttons when a superseding report changes the identity during delivery (B→C)", async () => {
@@ -3014,6 +3106,47 @@ describe("reactions", () => {
 
     await lm.check("app-1");
     expect(mockSessionManager.send).not.toHaveBeenCalled();
+  });
+
+  it("routes a pending confidence hold to notify-only when auto becomes false", async () => {
+    const notifier = createMockNotifier();
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      notifier,
+    });
+    config.reactions = {
+      "agent-idle": {
+        auto: false,
+        action: "send-to-agent",
+        message: "Agent idle action was disabled.",
+        confidenceThreshold: 0.9,
+      },
+    };
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+
+    const session = makeSession({
+      status: "working",
+      activity: "active",
+      metadata: { agent: "mock-agent", confidenceHoldPending: "agent-idle" },
+    });
+    const lm = setupCheck("app-1", {
+      session,
+      registry,
+      metaOverrides: { confidenceHoldPending: "agent-idle" },
+    });
+    updateMetadata(env.sessionsDir, "app-1", { confidenceHoldPending: "agent-idle" });
+
+    await lm.check("app-1");
+
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(notifier.notify).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "reaction.triggered",
+        message: "Agent idle action was disabled.",
+      }),
+    );
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["confidenceHoldPending"]).toBeFalsy();
   });
 
   it("suppresses immediate notification when send-to-agent reaction handles the event", async () => {
@@ -6858,6 +6991,7 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
         confidenceThreshold: 0.9,
       },
     };
+    updateMetadata(env.sessionsDir, "app-1", { reviewRoundCountTotal: "5" });
 
     await lm.check("app-1");
     // Held from the agent, but surfaced to the human as ONE actionable escalation:
@@ -6873,6 +7007,10 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(escalation).toBeDefined();
     // The enriched bot comment travels with the escalation.
     expect(String((escalation![0] as { message?: string }).message)).toContain("Potential issue");
+    // A human-only confidence escalation is not an agent review→fix round.
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["reviewRoundCount"]).toBeFalsy();
+    expect(meta?.["reviewRoundCountTotal"]).toBe("5");
   });
 
   // Round-7 finding (id 3521898192): the agent-stuck notify is no longer deferred,
