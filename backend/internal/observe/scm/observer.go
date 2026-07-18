@@ -54,6 +54,7 @@ type Store interface {
 	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
 	UpsertProject(ctx context.Context, row domain.ProjectRecord) error
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
+	ListSessionWorktrees(ctx context.Context, sessionID domain.SessionID) ([]domain.SessionWorktreeRecord, error)
 	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
 	ListChecks(ctx context.Context, prURL string) ([]domain.PullRequestCheck, error)
 	WriteSCMObservation(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ports.ReviewWriteMode) error
@@ -643,6 +644,16 @@ func (o *Observer) workspaceSCMSessionRepos(ctx context.Context, proj domain.Pro
 	if err != nil {
 		return nil, err
 	}
+	worktrees, err := o.store.ListSessionWorktrees(ctx, sess.ID)
+	if err != nil {
+		return nil, err
+	}
+	branches := make(map[string]string, len(worktrees))
+	for _, worktree := range worktrees {
+		if worktreeBranch := strings.TrimSpace(worktree.Branch); worktreeBranch != "" {
+			branches[worktree.RepoName] = worktreeBranch
+		}
+	}
 	repos := make([]sessionRepo, 0, len(childRepos))
 	seen := map[string]bool{}
 	for _, child := range childRepos {
@@ -654,6 +665,10 @@ func (o *Observer) workspaceSCMSessionRepos(ctx context.Context, proj domain.Pro
 			o.logger.Debug("scm observer: unsupported SCM origin", "project", proj.ID, "repo", child.Name, "origin", child.RepoOriginURL)
 			continue
 		}
+		childBranch := branch
+		if worktreeBranch := branches[child.Name]; worktreeBranch != "" {
+			childBranch = worktreeBranch
+		}
 		childPath := filepath.Join(proj.Path, filepath.FromSlash(child.RelativePath))
 		for _, scanRepo := range o.resolveScanRepos(domain.ProjectRecord{Path: childPath}, repo) {
 			key := prKey(scanRepo, 0)
@@ -661,7 +676,7 @@ func (o *Observer) workspaceSCMSessionRepos(ctx context.Context, proj domain.Pro
 				continue
 			}
 			seen[key] = true
-			repos = append(repos, sessionRepo{session: sess, repo: scanRepo, headRepo: repo, branch: branch})
+			repos = append(repos, sessionRepo{session: sess, repo: scanRepo, headRepo: repo, branch: childBranch})
 		}
 	}
 	return repos, nil

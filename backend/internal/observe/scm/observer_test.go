@@ -30,12 +30,13 @@ var (
 type fakeStore struct {
 	mu sync.Mutex
 
-	sessions       []domain.SessionRecord
-	projects       map[string]domain.ProjectRecord
-	workspaceRepos map[string][]domain.WorkspaceRepoRecord
-	prs            map[domain.SessionID][]domain.PullRequest
-	checks         map[string][]domain.PullRequestCheck
-	writeErr       error
+	sessions         []domain.SessionRecord
+	projects         map[string]domain.ProjectRecord
+	workspaceRepos   map[string][]domain.WorkspaceRepoRecord
+	sessionWorktrees map[domain.SessionID][]domain.SessionWorktreeRecord
+	prs              map[domain.SessionID][]domain.PullRequest
+	checks           map[string][]domain.PullRequestCheck
+	writeErr         error
 
 	writes []fakeWrite
 
@@ -100,6 +101,12 @@ func (s *fakeStore) ListWorkspaceRepos(_ context.Context, projectID string) ([]d
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]domain.WorkspaceRepoRecord(nil), s.workspaceRepos[projectID]...), nil
+}
+
+func (s *fakeStore) ListSessionWorktrees(_ context.Context, sessionID domain.SessionID) ([]domain.SessionWorktreeRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]domain.SessionWorktreeRecord(nil), s.sessionWorktrees[sessionID]...), nil
 }
 
 func (s *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]domain.PullRequest, error) {
@@ -711,6 +718,54 @@ func TestPoll_DiscoversWorkspaceChildRepoPR(t *testing.T) {
 	}
 	if len(lc.observed) != 1 {
 		t.Fatalf("lifecycle observations = %d, want 1", len(lc.observed))
+	}
+}
+
+func TestPoll_RootPRClaimPreservesChildRepoBranchAttribution(t *testing.T) {
+	store := testStoreWithSession()
+	store.sessions[0].Metadata.Branch = "ao/claim/p-1/pr-42/root"
+	store.projects["p"] = domain.ProjectRecord{
+		ID:            "p",
+		RepoOriginURL: "https://github.com/o/r.git",
+		Kind:          domain.ProjectKindWorkspace,
+	}
+	store.workspaceRepos = map[string][]domain.WorkspaceRepoRecord{
+		"p": {{ProjectID: "p", Name: "api", RelativePath: "api", RepoOriginURL: "https://github.com/o/api.git"}},
+	}
+	store.sessionWorktrees = map[domain.SessionID][]domain.SessionWorktreeRecord{
+		"p-1": {
+			{SessionID: "p-1", RepoName: domain.RootWorkspaceRepoName, Branch: "ao/claim/p-1/pr-42/root"},
+			{SessionID: "p-1", RepoName: "api", Branch: "ao/p-1/api-billing"},
+		},
+	}
+	prObs := testObs(12)
+	prObs.Repo = "o/api"
+	prObs.PR.URL = "https://github.com/o/api/pull/12"
+	prObs.PR.HTMLURL = prObs.PR.URL
+	prObs.PR.Number = 12
+	prObs.PR.SourceBranch = "ao/p-1/api-billing"
+	prObs.PR.HeadRepo = "o/api"
+	prObs.PR.HeadSHA = "api-sha"
+	prObs.CI.HeadSHA = "api-sha"
+	provider := &fakeProvider{
+		repoGuards: map[string]ports.SCMGuardResult{
+			prKey(testRepo, 0):    {ETag: "root-v2"},
+			prKey(testAPIRepo, 0): {ETag: "api-v2"},
+		},
+		openPRs: map[string][]ports.SCMPRObservation{
+			prKey(testAPIRepo, 0): {{URL: prObs.PR.URL, Number: 12, SourceBranch: "ao/p-1/api-billing", HeadRepo: "o/api", TargetBranch: "main", HeadSHA: "api-sha"}},
+		},
+		observations: map[string]ports.SCMObservation{prKey(testAPIRepo, 12): prObs},
+	}
+	obs := newTestObserver(store, provider, &fakeLifecycle{}, time.Unix(1, 0).UTC())
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.fetchBatches) != 1 || len(provider.fetchBatches[0]) != 1 {
+		t.Fatalf("child repo PR not attributed after root claim: %#v", provider.fetchBatches)
+	}
+	if got := provider.fetchBatches[0][0]; got.Repo.Repo != "o/api" || got.Number != 12 {
+		t.Fatalf("fetched ref = %#v, want o/api#12", got)
 	}
 }
 
