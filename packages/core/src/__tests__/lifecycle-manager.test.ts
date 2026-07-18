@@ -2867,7 +2867,7 @@ describe("reactions", () => {
               reactions: {
                 // Runtime project reaction shape is partial, like root overrides.
                 "report-needs-input": { priority: "urgent" },
-              } as OrchestratorConfig["reactions"],
+              },
             },
           },
           notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
