@@ -126,18 +126,17 @@ function makeDeliveryKey(provider: string, deliveryId: string | undefined): stri
 function pruneCompletedDeliveries(store: WebhookQueueStore, now: number): boolean {
   const cutoff = now - COMPLETED_DELIVERY_RETENTION_MS;
   const pendingDeliveryKeys = new Set(store.jobs.map((job) => job.deliveryKey));
-  let changed = false;
-  for (const [deliveryKey, delivery] of Object.entries(store.deliveries)) {
-    if (
-      delivery.completedAt !== undefined &&
-      delivery.completedAt < cutoff &&
-      !pendingDeliveryKeys.has(deliveryKey)
-    ) {
-      delete store.deliveries[deliveryKey];
-      changed = true;
-    }
-  }
-  return changed;
+  const deliveries = Object.entries(store.deliveries);
+  const retainedDeliveries = deliveries.filter(
+    ([deliveryKey, delivery]) =>
+      delivery.completedAt === undefined ||
+      delivery.completedAt >= cutoff ||
+      pendingDeliveryKeys.has(deliveryKey),
+  );
+  if (retainedDeliveries.length === deliveries.length) return false;
+
+  store.deliveries = Object.fromEntries(retainedDeliveries);
+  return true;
 }
 
 /**
