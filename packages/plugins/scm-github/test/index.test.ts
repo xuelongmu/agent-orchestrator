@@ -1210,6 +1210,68 @@ describe("scm-github plugin", () => {
   // ---- getReviewThreads --------------------------------------------------
 
   describe("getReviewThreads", () => {
+    it("classifies a bot-opened thread as human feedback when a human replies", async () => {
+      mockGh({
+        data: {
+          repository: {
+            pullRequest: {
+              headRefOid: "sha-head",
+              commits: { nodes: [{ commit: { pushedDate: "2026-07-18T00:10:00Z" } }] },
+              reviewThreads: {
+                totalCount: 1,
+                nodes: [
+                  {
+                    id: "thread-1",
+                    isResolved: false,
+                    comments: {
+                      totalCount: 2,
+                      nodes: [
+                        {
+                          id: "bot-comment",
+                          author: { login: "coderabbitai[bot]" },
+                          body: "Optional bot suggestion",
+                          path: "src/example.ts",
+                          line: 10,
+                          url: "https://github.com/acme/repo/pull/42#discussion-bot",
+                          createdAt: "2026-07-18T00:11:00Z",
+                        },
+                        {
+                          id: "human-reply",
+                          author: { login: "alice" },
+                          body: "Please address this before merge",
+                          path: "src/example.ts",
+                          line: 10,
+                          url: "https://github.com/acme/repo/pull/42#discussion-human",
+                          createdAt: "2026-07-18T00:12:00Z",
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+              reviews: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [],
+              },
+              reactions: { nodes: [] },
+            },
+          },
+        },
+      });
+
+      const result = await scm.getReviewThreads?.(pr, { forceFresh: true });
+
+      expect(result?.threads).toEqual([
+        expect.objectContaining({
+          id: "human-reply",
+          threadId: "thread-1",
+          author: "alice",
+          isBot: false,
+        }),
+      ]);
+      expect(ghMock.mock.calls[0]?.[1]).toContain("comments(first: 100)");
+    });
+
     it("pages all review submissions so an older current-head approval remains visible", async () => {
       const newerReviews = Array.from({ length: 100 }, (_, index) => ({
         author: { login: `reviewer-${index}` },

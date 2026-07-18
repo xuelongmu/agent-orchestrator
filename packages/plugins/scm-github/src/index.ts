@@ -1188,7 +1188,7 @@ function createGitHubSCM(): SCM {
                   nodes {
                     id
                     isResolved
-                    comments(first: 1) {
+                    comments(first: 100) {
                       nodes {
                         id
                         author { login }
@@ -1234,17 +1234,14 @@ function createGitHubSCM(): SCM {
 
           const threads = data.data.repository.pullRequest.reviewThreads.nodes;
 
-          return threads
-            .filter((t) => {
-              if (t.isResolved) return false; // only pending (unresolved) threads
-              const c = t.comments.nodes[0];
-              if (!c) return false; // skip threads with no comments
-              const author = c.author?.login ?? "";
-              return !isBotAuthor(author);
-            })
-            .map((t) => {
-              const c = t.comments.nodes[0];
-              return {
+          return threads.flatMap((t) => {
+            if (t.isResolved) return []; // only pending (unresolved) threads
+            const c = t.comments.nodes.find(
+              (comment) => !isBotAuthor(comment.author?.login ?? ""),
+            );
+            if (!c) return [];
+            return [
+              {
                 id: c.id,
                 threadId: t.id,
                 author: c.author?.login ?? "unknown",
@@ -1254,8 +1251,9 @@ function createGitHubSCM(): SCM {
                 isResolved: t.isResolved,
                 createdAt: parseDate(c.createdAt),
                 url: c.url,
-              };
-            });
+              },
+            ];
+          });
         } catch (err) {
           throw new Error("Failed to fetch pending comments", { cause: err });
         }
@@ -1312,7 +1310,8 @@ function createGitHubSCM(): SCM {
                   nodes {
                     id
                     isResolved
-                    comments(first: 1) {
+                    comments(first: 100) {
+                      totalCount
                       nodes {
                         id
                         author { login }
@@ -1376,6 +1375,7 @@ function createGitHubSCM(): SCM {
                     id: string;
                     isResolved: boolean;
                     comments: {
+                      totalCount?: number;
                       nodes: Array<{
                         id: string;
                         author: { login: string } | null;
@@ -1449,19 +1449,35 @@ function createGitHubSCM(): SCM {
         const headSha = pullRequest.headRefOid ?? undefined;
         const headPushedAtRaw = pullRequest.commits?.nodes[0]?.commit.pushedDate;
         const headPushedAt = headPushedAtRaw ? parseDate(headPushedAtRaw) : undefined;
-        // We fetch the 100 most-recent threads; if the PR has more, an older
-        // unresolved thread may be outside the window. Flag truncation so callers
-        // don't treat an empty set as authoritatively clean.
-        const threadsTruncated = pullRequest.reviewThreads.totalCount > threadNodes.length;
+        // We fetch up to 100 threads and 100 comments per thread. Flag either
+        // connection as truncated so callers never treat an unseen thread or
+        // participant as authoritatively clean.
+        const threadsTruncated =
+          pullRequest.reviewThreads.totalCount > threadNodes.length ||
+          threadNodes.some(
+            (thread) =>
+              !thread.isResolved &&
+              typeof thread.comments.totalCount === "number" &&
+              thread.comments.totalCount > thread.comments.nodes.length,
+          );
 
         const threads: ReviewComment[] = threadNodes
           .filter((t) => {
             if (t.isResolved) return false;
-            const c = t.comments.nodes[0];
+            const c =
+              t.comments.nodes.find(
+                (comment) => !isBotAuthor(comment.author?.login ?? ""),
+              ) ?? t.comments.nodes[0];
             return !!c;
           })
           .map((t) => {
-            const c = t.comments.nodes[0];
+            // Human participation makes the unresolved thread required even
+            // when a fractional-weight bot opened it. Prefer the human reply as
+            // the representative comment so core applies human policy.
+            const c =
+              t.comments.nodes.find(
+                (comment) => !isBotAuthor(comment.author?.login ?? ""),
+              ) ?? t.comments.nodes[0]!;
             const author = c.author?.login ?? "unknown";
             return {
               id: c.id,

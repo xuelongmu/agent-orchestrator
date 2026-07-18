@@ -221,4 +221,17 @@ describe("per-bot review policy (#15)", () => {
     expect(result.deprioritized.map((comment) => comment.id)).toEqual(["rabbit"]);
     expect(result.ignored.map((comment) => comment.id)).toEqual(["copilot"]);
   });
+
+  it("ignores unmatched bots when an explicit policy omits the wildcard", () => {
+    const result = partitionAutomatedComments(
+      [
+        makeComment({ id: "codex", botName: "chatgpt-codex-connector[bot]" }),
+        makeComment({ id: "unknown", botName: "unknown-reviewer[bot]" }),
+      ],
+      { "chatgpt-codex-connector[bot]": { weight: 1 } },
+    );
+
+    expect(result.actionable.map((comment) => comment.id)).toEqual(["codex"]);
+    expect(result.ignored.map((comment) => comment.id)).toEqual(["unknown"]);
+  });
 });

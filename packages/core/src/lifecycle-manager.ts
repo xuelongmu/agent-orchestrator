@@ -3913,6 +3913,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // satisfies approval even though GitHub still says "Review required".
       if (/^CI is /i.test(blocker) || /^Required checks are failing$/i.test(blocker)) return false;
       if (/^Review required$/i.test(blocker)) return false;
+      if (/^Approval required$/i.test(blocker)) return false;
       if (/^Changes requested in review$/i.test(blocker)) return false;
       // Conflicts and draft state retain their explicit stable blocker names.
       if (/conflict/i.test(blocker) || /draft/i.test(blocker)) return false;
@@ -4088,6 +4089,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         if (
           changesRequested.complete &&
           changesRequested.required.length === 0 &&
+          unresolvedRequiredThreads === 0 &&
           !approvalSignal
         ) {
           missingApprovalTargets.push({ pr, headSha: reviewData.headSha });
@@ -4556,7 +4558,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   }
 
   function makeCIFailureFingerprint(failedChecks: CICheck[]): string {
-    return makeFingerprint(failedChecks.map((c) => `${c.name}:${c.status}:${c.conclusion ?? ""}`));
+    return makeFingerprint(
+      failedChecks.map((c) => {
+        const runIdentity =
+          c.url ?? `${c.startedAt?.getTime() ?? ""}:${c.completedAt?.getTime() ?? ""}`;
+        return `${c.name}:${c.status}:${c.conclusion ?? ""}:${runIdentity}`;
+      }),
+    );
   }
 
   /**
