@@ -235,6 +235,16 @@ type fakeLifecycle struct {
 	err      error
 }
 
+type fakeReviewCoordinator struct {
+	observed []ports.SCMObservation
+	err      error
+}
+
+func (c *fakeReviewCoordinator) CoordinateReview(_ context.Context, _ domain.SessionID, obs ports.SCMObservation) error {
+	c.observed = append(c.observed, obs)
+	return c.err
+}
+
 func (l *fakeLifecycle) ApplySCMObservation(_ context.Context, _ domain.SessionID, obs ports.SCMObservation) error {
 	if l.err != nil {
 		return l.err
@@ -1134,12 +1144,19 @@ func TestPoll_UnchangedHashesDoNotWriteOrNotify(t *testing.T) {
 	store.prs["p-1"] = []domain.PullRequest{local}
 	provider := &fakeProvider{repoGuards: map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "repo"}}, observations: map[string]ports.SCMObservation{prKey(testRepo, 1): obsValue}}
 	lc := &fakeLifecycle{}
-	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
+	coordinator := &fakeReviewCoordinator{}
+	obs := New(provider, store, lc, Config{
+		Clock: func() time.Time { return time.Unix(1, 0).UTC() }, Tick: time.Hour,
+		Logger: quietSlog(), CacheMax: 128, ReviewCoordinator: coordinator,
+	})
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.writes) != 0 || len(lc.observed) != 0 {
 		t.Fatalf("unchanged hashes wrote/notified: writes=%d observed=%d", len(store.writes), len(lc.observed))
+	}
+	if len(coordinator.observed) != 1 || coordinator.observed[0].PR.HeadSHA != obsValue.PR.HeadSHA {
+		t.Fatalf("unchanged durable snapshot was not coordinated: %#v", coordinator.observed)
 	}
 }
 

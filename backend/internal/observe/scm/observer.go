@@ -64,6 +64,14 @@ type Lifecycle interface {
 	ApplySCMObservation(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
 }
 
+// ReviewCoordinator receives every authoritative PR snapshot after any changed
+// facts are durable. Unlike lifecycle reactions, it also receives semantically
+// unchanged snapshots so a daemon restart can resume automatic coordination
+// from review_run without waiting for the provider state to change.
+type ReviewCoordinator interface {
+	CoordinateReview(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
+}
+
 type credentialChecker interface {
 	SCMCredentialsAvailable(ctx context.Context) (bool, error)
 }
@@ -82,6 +90,8 @@ type Config struct {
 	Clock func() time.Time
 	// Logger receives operational diagnostics for provider/store/lifecycle failures.
 	Logger *slog.Logger
+	// ReviewCoordinator optionally advances the durable automatic review loop.
+	ReviewCoordinator ReviewCoordinator
 	// CacheMax bounds each in-memory ETag/review cache. Zero uses DefaultCacheMax.
 	CacheMax int
 }
@@ -132,6 +142,8 @@ type Observer struct {
 	store Store
 	// lifecycle is notified after successful persistence of meaningful changes.
 	lifecycle Lifecycle
+	// reviewCoordinator receives durable snapshots, including unchanged ones.
+	reviewCoordinator ReviewCoordinator
 	// tick is the active PR/CI polling cadence.
 	tick time.Duration
 	// reviewInterval is the minimum duration between review-thread fetches per PR.
@@ -151,7 +163,7 @@ type Observer struct {
 // New constructs an Observer with default cadence/cache settings for zero
 // values in cfg.
 func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Observer {
-	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, Cache: newCache(cfg.CacheMax)}
+	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, reviewCoordinator: cfg.ReviewCoordinator, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, Cache: newCache(cfg.CacheMax)}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
@@ -390,6 +402,10 @@ func (o *Observer) Poll(ctx context.Context) error {
 		}
 		prepared := o.prepareForPersistence(obs, local, opts, now)
 		if !prepared.Changed.Metadata && !prepared.Changed.CI && !prepared.Changed.Review {
+			if !o.coordinateReview(ctx, subj.session.ID, prepared) {
+				markRepoRefreshFailed(subj.repo)
+				continue
+			}
 			prRefreshOK[key] = true
 			continue
 		}
@@ -430,6 +446,10 @@ func (o *Observer) Poll(ctx context.Context) error {
 				continue
 			}
 		}
+		if !o.coordinateReview(ctx, subj.session.ID, prepared) {
+			markRepoRefreshFailed(subj.repo)
+			continue
+		}
 		prRefreshOK[key] = true
 	}
 	for key, ok := range prRefreshOK {
@@ -452,6 +472,17 @@ func (o *Observer) Poll(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (o *Observer) coordinateReview(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) bool {
+	if o.reviewCoordinator == nil {
+		return true
+	}
+	if err := o.reviewCoordinator.CoordinateReview(ctx, sessionID, obs); err != nil {
+		o.logger.Error("scm observer: automatic review coordination failed", "session", sessionID, "pr", firstNonEmpty(obs.PR.URL, obs.PR.HTMLURL), "err", err)
+		return false
+	}
+	return true
 }
 
 // dispatchOrder returns observation keys in a deterministic order so lifecycle

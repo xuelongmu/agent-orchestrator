@@ -118,7 +118,6 @@ func Run() error {
 	// lifecycle write path live (reducer write -> store -> DB trigger ->
 	// change_log -> poller -> broadcaster) and gives startSession the shared LCM.
 	lcStack := startLifecycle(ctx, store, runtimeAdapter, messenger, notificationWriter, telemetrySink, log)
-	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, log)
 
 	// Wire the controller-facing session service over the same store + LCM, the
 	// selected runtime, a gitworktree workspace, the per-session agent resolver
@@ -133,6 +132,10 @@ func Run() error {
 		}
 		return fmt.Errorf("wire session service: %w", err)
 	}
+	// Start SCM polling only after the review engine exists. The observer can
+	// then hand each durable, lifecycle-applied head observation to
+	// the automatic review coordinator during its immediate first poll.
+	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, reviewSvc, log)
 	lcStack.trackerDone = startTrackerIntake(ctx, store, sessionSvc, log)
 	previewDone := preview.NewPoller(store, sessionSvc, "http://"+cfg.Addr(), preview.PollerConfig{Logger: log}).Start(ctx)
 	agentSvc := agentsvc.New()
