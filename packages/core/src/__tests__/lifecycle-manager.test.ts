@@ -1419,6 +1419,7 @@ describe("check (single session)", () => {
     expect(mockSCM.detectPR).toHaveBeenCalledOnce();
     const meta = readMetadataRaw(env.sessionsDir, "app-1");
     expect(meta?.["pr"]).toBe(makePR().url);
+    expect(meta?.["prBaseBranch"]).toBe(makePR().baseBranch);
     expect(lm.getStates().get("app-1")).toBe("stuck");
   });
 
@@ -8494,7 +8495,7 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
       project: "my-app",
       agent: "mock-agent",
       parentSessionId: "app-1",
-      baseRef: "feat/parent",
+      ...(child.metadata["baseRef"] ? { baseRef: child.metadata["baseRef"] } : {}),
       ...(child.metadata["stackRetargetedAt"]
         ? { stackRetargetedAt: child.metadata["stackRetargetedAt"] }
         : {}),
@@ -8527,6 +8528,30 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
     const meta = readMetadataRaw(env.sessionsDir, "app-2");
     expect(meta?.["stackRetargetedAt"]).toBeTruthy();
     expect(meta?.["baseRef"]).toBe("feat/grandparent");
+    expect(meta?.["prBaseBranch"]).toBe("feat/grandparent");
+  });
+
+  it("uses the parent's persisted actual PR base after metadata reload (#66)", async () => {
+    const retargetPR = vi.fn().mockResolvedValue("retargeted");
+    const parent = makeSession({
+      id: "app-1",
+      status: "merged",
+      branch: "feat/parent",
+      pr: makeMatchingPR({ number: 100, baseBranch: "" }),
+      metadata: {
+        agent: "mock-agent",
+        baseRef: "feat/stale-grandparent",
+        prBaseBranch: "release/actual-base",
+      },
+    });
+    const lm = wire({ parent, scm: createMockSCM({ retargetPR }) });
+
+    await lm.check("app-2");
+
+    expect(retargetPR).toHaveBeenCalledWith(childPr, "release/actual-base", "feat/parent");
+    expect(readMetadataRaw(env.sessionsDir, "app-2")?.["baseRef"]).toBe(
+      "release/actual-base",
+    );
   });
 
   it("waits (no-op) while the parent PR is still open", async () => {
@@ -8560,6 +8585,31 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
     expect(readMetadataRaw(env.sessionsDir, "app-2")?.["stackRetargetedAt"]).toBeFalsy();
   });
 
+  it("does not fabricate an old base for a child spawned after the parent merged (#66)", async () => {
+    const retargetPR = vi.fn().mockResolvedValue("retargeted");
+    const parent = makeSession({
+      id: "app-1",
+      status: "merged",
+      branch: "feat/parent",
+      pr: makeMatchingPR({ number: 100, baseBranch: "main" }),
+    });
+    const child = makeSession({
+      id: "app-2",
+      status: "working",
+      branch: "feat/child",
+      pr: { ...childPr, baseBranch: "main" },
+      parentSessionId: "app-1",
+      metadata: { agent: "mock-agent" },
+    });
+    const lm = wire({ parent, child, scm: createMockSCM({ retargetPR }) });
+
+    await lm.check("app-2");
+
+    expect(retargetPR).not.toHaveBeenCalled();
+    expect(rebaseMessage()).toBeUndefined();
+    expect(readMetadataRaw(env.sessionsDir, "app-2")?.["stackRetargetedAt"]).toBeTruthy();
+  });
+
   it("targets the default branch when the parent has been merged and cleaned up", async () => {
     const retargetPR = vi.fn().mockResolvedValue("retargeted");
     // parent: null → archived (merged + auto-cleaned).
@@ -8591,6 +8641,25 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
     const meta = readMetadataRaw(env.sessionsDir, "app-2");
     expect(meta?.["stackRetargetedAt"]).toBeTruthy(); // latched (surfaced once, no nag)
     expect(meta?.["baseRef"]).toBe("feat/parent"); // unchanged
+  });
+
+  it("does not latch or hand off a rebase when the child PR is not found (#66)", async () => {
+    const retargetPR = vi.fn().mockResolvedValue("not_found");
+    const parent = makeSession({
+      id: "app-1",
+      status: "merged",
+      branch: "feat/parent",
+      pr: makeMatchingPR({ number: 100, baseBranch: "feat/grandparent" }),
+    });
+    const lm = wire({ parent, scm: createMockSCM({ retargetPR }) });
+
+    await lm.check("app-2");
+
+    expect(retargetPR).toHaveBeenCalled();
+    expect(rebaseMessage()).toBeUndefined();
+    const meta = readMetadataRaw(env.sessionsDir, "app-2");
+    expect(meta?.["stackRetargetedAt"]).toBeFalsy();
+    expect(meta?.["baseRef"]).toBe("feat/parent");
   });
 
   it("notifies a stacked child that has not opened its PR yet", async () => {

@@ -792,6 +792,7 @@ const PR_FIELDS = `
   mergeStateStatus
   reviewDecision
   headRefName
+  baseRefName
   headRefOid
   commits(last: 1) {
     nodes {
@@ -1109,6 +1110,7 @@ function extractPREnrichment(
   const additions = typeof pr["additions"] === "number" ? pr["additions"] : 0;
   const deletions = typeof pr["deletions"] === "number" ? pr["deletions"] : 0;
   const isDraft = pr["isDraft"] === true;
+  const baseBranch = typeof pr["baseRefName"] === "string" ? pr["baseRefName"] : undefined;
 
   // Extract head SHA for ETag Guard 2
   const headSha =
@@ -1182,6 +1184,7 @@ function extractPREnrichment(
     isDraft,
     hasConflicts,
     isBehind,
+    baseBranch,
     blockers,
     ...(ciChecks !== undefined ? { ciChecks } : {}),
   };

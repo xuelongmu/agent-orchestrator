@@ -70,7 +70,12 @@ export function sessionFromMetadata(
 
   // Build a PRInfo object from a single URL string.
   // isDraft defaults to false for secondary PRs — only the primary PR carries the flag.
-  const buildPRInfo = (url: string, isDraft = false, lifecyclePrNumber?: number | null): PRInfo => {
+  const buildPRInfo = (
+    url: string,
+    isDraft = false,
+    lifecyclePrNumber?: number | null,
+    baseBranch = "",
+  ): PRInfo => {
     const parsed = parsePrFromUrl(url);
     return {
       number: parsed?.number || lifecyclePrNumber || 0,
@@ -79,7 +84,7 @@ export function sessionFromMetadata(
       owner: parsed?.owner ?? "",
       repo: parsed?.repo ?? "",
       branch: meta["branch"] ?? "",
-      baseBranch: "",
+      baseBranch,
       isDraft,
     };
   };
@@ -93,11 +98,16 @@ export function sessionFromMetadata(
     ? prsRaw
         .split(",")
         .map((u, i) =>
-          buildPRInfo(u.trim(), i === 0 ? prIsDraft : false, i === 0 ? lifecyclePrNumber : null),
+          buildPRInfo(
+            u.trim(),
+            i === 0 ? prIsDraft : false,
+            i === 0 ? lifecyclePrNumber : null,
+            i === 0 ? (meta["prBaseBranch"] ?? "") : "",
+          ),
         )
         .filter((p) => Boolean(p.url))
     : prUrl
-      ? [buildPRInfo(prUrl, prIsDraft, lifecyclePrNumber)]
+      ? [buildPRInfo(prUrl, prIsDraft, lifecyclePrNumber, meta["prBaseBranch"] ?? "")]
       : [];
   const prs = dedupePrInfos(parsedPrs);
 

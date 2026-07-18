@@ -786,6 +786,12 @@ export interface WorkspaceCreateConfig {
    * workspace resolves `origin/<baseRef>` / `refs/heads/<baseRef>` as needed.
    */
   baseRef?: string;
+  /**
+   * Local repository that owns `baseRef`. Clone workspaces use the parent
+   * session's clone here because its branch may not exist in the project source
+   * checkout or on the remote yet.
+   */
+  baseRepoPath?: string;
 }
 
 export interface WorkspaceInfo {
@@ -1078,6 +1084,8 @@ export interface PREnrichmentData {
   hasConflicts?: boolean;
   /** Whether PR is behind base branch */
   isBehind?: boolean;
+  /** Current base branch reported by the SCM. */
+  baseBranch?: string;
   /** List of blockers preventing merge */
   blockers?: string[];
 }
@@ -1336,6 +1344,8 @@ export interface PREnrichmentData {
   hasConflicts?: boolean;
   /** Whether PR is behind base branch */
   isBehind?: boolean;
+  /** Current base branch reported by the SCM. */
+  baseBranch?: string;
   /** List of blockers preventing merge */
   blockers?: string[];
   /** Individual CI check results (populated from batch enrichment when available) */
@@ -2210,6 +2220,8 @@ export interface SessionMetadata {
    * which branch to retarget its children onto.
    */
   baseRef?: string;
+  /** Current base branch of the primary PR, persisted across metadata reloads. */
+  prBaseBranch?: string;
   /**
    * Human-readable display name for the session.
    *
