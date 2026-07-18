@@ -184,6 +184,9 @@ type SCMCheckObservation struct {
 type SCMReviewObservation struct {
 	// Decision is AO's normalized review decision.
 	Decision string
+	// HeadSHA is the PR head commit the review snapshot was fetched for.
+	// Merge-readiness consumers must match it to SCMPRObservation.HeadSHA.
+	HeadSHA string
 	// Reviews contains submitted review summaries fetched on the slower review cadence.
 	Reviews []SCMReviewSummaryObservation
 	// Threads contains normalized review threads fetched on the slower review cadence.
@@ -202,6 +205,8 @@ type SCMReviewSummaryObservation struct {
 	Author string
 	// State is AO's normalized review decision for this review.
 	State string
+	// CommitSHA is the head commit the provider attached this review to.
+	CommitSHA string
 	// URL is a provider link to the submitted review summary.
 	URL string
 	// IsBot is true when the provider identifies the reviewer as a bot.

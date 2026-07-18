@@ -383,6 +383,13 @@ func scmObservationIsReadyToMerge(o ports.SCMObservation) bool {
 	if o.PR.Merged || o.PR.Closed || o.PR.Draft {
 		return false
 	}
+	if o.PR.HeadSHA == "" ||
+		o.CI.HeadSHA != o.PR.HeadSHA ||
+		o.Review.HeadSHA == "" ||
+		o.Review.HeadSHA != o.PR.HeadSHA ||
+		o.Review.Partial {
+		return false
+	}
 	ci := domain.CIState(o.CI.Summary)
 	if ci == "" {
 		ci = domain.CIUnknown
@@ -391,24 +398,52 @@ func scmObservationIsReadyToMerge(o ports.SCMObservation) bool {
 	case domain.CIFailing, domain.CIPending, domain.CIUnknown:
 		return false
 	}
-	if domain.ReviewDecision(o.Review.Decision) == domain.ReviewChangesRequest || hasUnresolvedSCMComments(o.Review.Threads) {
+	reviewDecision := domain.ReviewDecision(o.Review.Decision)
+	if reviewDecision == domain.ReviewChangesRequest ||
+		reviewDecision == domain.ReviewRequired ||
+		hasUnresolvedRequiredSCMComments(o.Review.Threads) {
+		return false
+	}
+	if reviewDecision == domain.ReviewApproved && !hasCurrentHeadApproval(o.Review.Reviews, o.PR.HeadSHA) {
 		return false
 	}
 	return domain.Mergeability(o.Mergeability.State) == domain.MergeMergeable
 }
 
-func hasUnresolvedSCMComments(threads []ports.SCMReviewThreadObservation) bool {
+func hasCurrentHeadApproval(reviews []ports.SCMReviewSummaryObservation, headSHA string) bool {
+	for _, review := range reviews {
+		if !review.IsBot && domain.ReviewDecision(review.State) == domain.ReviewApproved && review.CommitSHA == headSHA {
+			return true
+		}
+	}
+	return false
+}
+
+func hasUnresolvedRequiredSCMComments(threads []ports.SCMReviewThreadObservation) bool {
 	for _, th := range threads {
-		if th.Resolved || th.IsBot {
+		if th.Resolved {
 			continue
 		}
 		for _, c := range th.Comments {
 			if !c.IsBot {
 				return true
 			}
+			if isCodexReviewBot(c.Author) && isP0OrP1Finding(c.Body) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+func isCodexReviewBot(author string) bool {
+	author = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(author)), "[bot]")
+	return author == "chatgpt-codex-connector" || author == "codex"
+}
+
+func isP0OrP1Finding(body string) bool {
+	body = strings.ToLower(body)
+	return strings.Contains(body, "[p0]") || strings.Contains(body, "[p1]")
 }
 
 func scmToPRObservation(o ports.SCMObservation) ports.PRObservation {

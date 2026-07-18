@@ -1447,6 +1447,9 @@ func TestFetchReviewThreadsUsesLatestWindowWithoutFallbackWhenOldestResolved(t *
 		if !strings.Contains(string(body), "reviews(last:20, states:[APPROVED,CHANGES_REQUESTED])") {
 			t.Fatalf("review query should fetch decisive review summaries, body=%s", body)
 		}
+		if !strings.Contains(string(body), "headRefOid") || !strings.Contains(string(body), "commit{ oid }") {
+			t.Fatalf("review query should bind summaries to the current head, body=%s", body)
+		}
 		if !strings.Contains(string(body), "comments(first:5)") {
 			t.Fatalf("review query should cap comments per thread, body=%s", body)
 		}
@@ -1454,10 +1457,12 @@ func TestFetchReviewThreadsUsesLatestWindowWithoutFallbackWhenOldestResolved(t *
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"data": map[string]any{"repo": map[string]any{"pullRequest": map[string]any{
 				"reviewDecision": "CHANGES_REQUESTED",
+				"headRefOid":     "head-2",
 				"reviewSummaries": map[string]any{"nodes": []any{map[string]any{
 					"id":          "review-1",
 					"state":       "CHANGES_REQUESTED",
 					"url":         "https://github.com/o/r/pull/1#pullrequestreview-1",
+					"commit":      map[string]any{"oid": "head-2"},
 					"submittedAt": "2026-06-15T00:00:00Z",
 					"author":      map[string]any{"login": "alice", "__typename": "User"},
 				}}},
@@ -1481,11 +1486,17 @@ func TestFetchReviewThreadsUsesLatestWindowWithoutFallbackWhenOldestResolved(t *
 	if !review.Partial {
 		t.Fatalf("review Partial = false, want true because older pages exist")
 	}
+	if review.HeadSHA != "head-2" {
+		t.Fatalf("review HeadSHA = %q, want head-2", review.HeadSHA)
+	}
 	if len(review.Threads) != 1 || review.Threads[0].ID != "latest-resolved" {
 		t.Fatalf("threads = %#v", review.Threads)
 	}
 	if len(review.Reviews) != 1 || review.Reviews[0].Author != "alice" || review.Reviews[0].URL != "https://github.com/o/r/pull/1#pullrequestreview-1" {
 		t.Fatalf("reviews = %#v", review.Reviews)
+	}
+	if review.Reviews[0].CommitSHA != "head-2" {
+		t.Fatalf("review binding = %#v", review.Reviews[0])
 	}
 	if len(review.Threads[0].Comments) != 1 || review.Threads[0].Comments[0].URL != "https://github.com/o/r/pull/1#discussion_r1" {
 		t.Fatalf("thread comments = %#v", review.Threads[0].Comments)

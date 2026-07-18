@@ -158,41 +158,41 @@ func (p *Provider) FetchFailedCheckLogTail(ctx context.Context, repo ports.SCMRe
 
 // FetchReviewThreads fetches review threads separately from the fast PR/CI path.
 func (p *Provider) FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error) {
-	latest, reviews, decision, pi, err := p.fetchReviewThreadPage(ctx, ref, "", true)
+	latest, err := p.fetchReviewThreadPage(ctx, ref, "", true)
 	if err != nil {
 		return ports.SCMReviewObservation{}, err
 	}
-	if !boolv(pi["hasPreviousPage"]) {
-		return ports.SCMReviewObservation{Decision: decision, Reviews: reviews, Threads: latest}, nil
+	if !boolv(latest.pageInfo["hasPreviousPage"]) {
+		return ports.SCMReviewObservation{Decision: latest.decision, HeadSHA: latest.headSHA, Reviews: latest.reviews, Threads: latest.threads}, nil
 	}
-	out := latest
-	startCursor := str(pi["startCursor"])
+	out := latest.threads
+	startCursor := str(latest.pageInfo["startCursor"])
 	// GitHub returns nodes in connection order even when selecting last:N, so
 	// latest[0] is the oldest thread in the latest window. If that boundary
 	// thread is still unresolved, fetch one older window to avoid hiding older
 	// active review feedback behind the normal 50-thread cost cap.
-	oldestLatestUnresolved := len(latest) == 0 || !latest[0].Resolved
+	oldestLatestUnresolved := len(latest.threads) == 0 || !latest.threads[0].Resolved
 	if oldestLatestUnresolved {
 		if startCursor == "" {
 			p.logger.Warn("github scm: review thread page is partial but missing start cursor",
 				"repo", repoFullName(ref.Repo), "pr", ref.Number)
 		} else {
-			older, _, _, olderPI, err := p.fetchReviewThreadPage(ctx, ref, startCursor, false)
+			older, err := p.fetchReviewThreadPage(ctx, ref, startCursor, false)
 			if err != nil {
 				return ports.SCMReviewObservation{}, err
 			}
-			combined := make([]ports.SCMReviewThreadObservation, 0, len(older)+len(latest))
-			combined = append(combined, older...)
-			combined = append(combined, latest...)
+			combined := make([]ports.SCMReviewThreadObservation, 0, len(older.threads)+len(latest.threads))
+			combined = append(combined, older.threads...)
+			combined = append(combined, latest.threads...)
 			out = combined
-			if boolv(olderPI["hasPreviousPage"]) {
+			if boolv(older.pageInfo["hasPreviousPage"]) {
 				p.logger.Warn("github scm: review thread page limit reached",
 					"repo", repoFullName(ref.Repo), "pr", ref.Number,
 					"max_pages", githubReviewThreadMaxPages)
 			}
 		}
 	}
-	return ports.SCMReviewObservation{Decision: decision, Reviews: reviews, Threads: out, Partial: true}, nil
+	return ports.SCMReviewObservation{Decision: latest.decision, HeadSHA: latest.headSHA, Reviews: latest.reviews, Threads: out, Partial: true}, nil
 }
 
 type restListPull struct {
@@ -520,18 +520,27 @@ func mergeabilityObservation(providerMergeable, providerMergeState, ci, review s
 	return out
 }
 
-func (p *Provider) fetchReviewThreadPage(ctx context.Context, ref ports.SCMPRRef, beforeCursor string, includeReviews bool) ([]ports.SCMReviewThreadObservation, []ports.SCMReviewSummaryObservation, string, map[string]any, error) {
+type reviewThreadPage struct {
+	threads  []ports.SCMReviewThreadObservation
+	reviews  []ports.SCMReviewSummaryObservation
+	decision string
+	headSHA  string
+	pageInfo map[string]any
+}
+
+func (p *Provider) fetchReviewThreadPage(ctx context.Context, ref ports.SCMPRRef, beforeCursor string, includeReviews bool) (reviewThreadPage, error) {
 	query := buildReviewThreadsQuery(ref, beforeCursor, includeReviews)
 	data, err := p.client.doGraphQL(ctx, query, nil)
 	if err != nil {
-		return nil, nil, "", nil, err
+		return reviewThreadPage{}, err
 	}
 	repoData, _ := data["repo"].(map[string]any)
 	pr, _ := repoData["pullRequest"].(map[string]any)
 	if pr == nil {
-		return nil, nil, "", nil, fmt.Errorf("%w: pull request not found in review response", ErrNotFound)
+		return reviewThreadPage{}, fmt.Errorf("%w: pull request not found in review response", ErrNotFound)
 	}
 	decision := string(reviewDecisionFromGraphQL(pr))
+	headSHA := str(pr["headRefOid"])
 	reviewSummaries, _ := pr["reviewSummaries"].(map[string]any)
 	reviews := make([]ports.SCMReviewSummaryObservation, 0, len(nodes(reviewSummaries["nodes"])))
 	for _, review := range nodes(reviewSummaries["nodes"]) {
@@ -547,7 +556,7 @@ func (p *Provider) fetchReviewThreadPage(ctx context.Context, ref ports.SCMPRRef
 		out = append(out, scmThreadFromGraphQL(th))
 	}
 	pi, _ := threads["pageInfo"].(map[string]any)
-	return out, reviews, decision, pi, nil
+	return reviewThreadPage{threads: out, reviews: reviews, decision: decision, headSHA: headSHA, pageInfo: pi}, nil
 }
 
 func buildReviewThreadsQuery(ref ports.SCMPRRef, beforeCursor string, includeReviews bool) string {
@@ -557,10 +566,10 @@ func buildReviewThreadsQuery(ref ports.SCMPRRef, beforeCursor string, includeRev
 	}
 	reviewSelection := ""
 	if includeReviews {
-		reviewSelection = fmt.Sprintf(" reviewSummaries: reviews(last:%d, states:[APPROVED,CHANGES_REQUESTED]){ nodes{ id state url submittedAt author{ login __typename } } }", githubReviewSummaryLimit)
+		reviewSelection = fmt.Sprintf(" reviewSummaries: reviews(last:%d, states:[APPROVED,CHANGES_REQUESTED]){ nodes{ id state url submittedAt commit{ oid } author{ login __typename } } }", githubReviewSummaryLimit)
 	}
 	return fmt.Sprintf(`query{
-repo: repository(owner:%s,name:%s){ pullRequest(number:%d){ reviewDecision%s reviewThreads(last:%d, before:%s){ nodes{
+repo: repository(owner:%s,name:%s){ pullRequest(number:%d){ headRefOid reviewDecision%s reviewThreads(last:%d, before:%s){ nodes{
   id isResolved path line
   comments(first:%d){ nodes{ id body url author{ login __typename } } }
 } pageInfo{ hasPreviousPage startCursor } } } }
@@ -569,10 +578,12 @@ repo: repository(owner:%s,name:%s){ pullRequest(number:%d){ reviewDecision%s rev
 
 func scmReviewSummaryFromGraphQL(review map[string]any) ports.SCMReviewSummaryObservation {
 	author, _ := review["author"].(map[string]any)
+	commit, _ := review["commit"].(map[string]any)
 	return ports.SCMReviewSummaryObservation{
 		ID:          str(review["id"]),
 		Author:      str(author["login"]),
 		State:       string(reviewStateFromGraphQL(review["state"])),
+		CommitSHA:   str(commit["oid"]),
 		URL:         str(review["url"]),
 		IsBot:       isBotAuthor(author),
 		SubmittedAt: parseGitHubTime(str(review["submittedAt"])),
