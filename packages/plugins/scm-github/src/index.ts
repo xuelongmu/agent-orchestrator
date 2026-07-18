@@ -1280,7 +1280,7 @@ function createGitHubSCM(): SCM {
               pullRequest(number: $number) {
                 headRefOid
                 commits(last: 1) {
-                  nodes { commit { committedDate } }
+                  nodes { commit { pushedDate } }
                 }
                 reviewThreads(last: 100) {
                   totalCount
@@ -1300,7 +1300,8 @@ function createGitHubSCM(): SCM {
                     }
                   }
                 }
-                reviews(last: 20) {
+                reviews(first: 100) {
+                  pageInfo { hasNextPage endCursor }
                   nodes {
                     author { login }
                     state
@@ -1324,13 +1325,25 @@ function createGitHubSCM(): SCM {
         // Strip HTTP headers from -i response to get JSON body
         const raw = rawWithHeaders.replace(/^[\s\S]*?\r?\n\r?\n/, "");
 
+        type ReviewNode = {
+          author: { login: string } | null;
+          state: string;
+          body: string;
+          submittedAt: string;
+          commit: { oid: string } | null;
+        };
+        type ReviewConnection = {
+          pageInfo: { hasNextPage: boolean; endCursor: string | null };
+          nodes: ReviewNode[];
+        };
+
         const data: {
           data: {
             repository: {
               pullRequest: {
                 headRefOid: string | null;
                 commits?: {
-                  nodes: Array<{ commit: { committedDate: string } }>;
+                  nodes: Array<{ commit: { pushedDate: string | null } }>;
                 };
                 reviewThreads: {
                   totalCount: number;
@@ -1350,15 +1363,7 @@ function createGitHubSCM(): SCM {
                     };
                   }>;
                 };
-                reviews: {
-                  nodes: Array<{
-                    author: { login: string } | null;
-                    state: string;
-                    body: string;
-                    submittedAt: string;
-                    commit: { oid: string } | null;
-                  }>;
-                };
+                reviews: ReviewConnection;
                 reactions?: {
                   nodes: Array<{
                     content: string;
@@ -1373,10 +1378,52 @@ function createGitHubSCM(): SCM {
 
         const pullRequest = data.data.repository.pullRequest;
         const threadNodes = pullRequest.reviewThreads.nodes;
-        const reviewNodes = pullRequest.reviews.nodes;
+        const reviewNodes = [...pullRequest.reviews.nodes];
+        let reviewPageInfo = pullRequest.reviews.pageInfo;
+        while (reviewPageInfo.hasNextPage) {
+          if (!reviewPageInfo.endCursor) {
+            throw new Error("GitHub returned a truncated review page without a cursor");
+          }
+          const reviewPageRaw = await gh([
+            "api",
+            "graphql",
+            "-f",
+            `owner=${pr.owner}`,
+            "-f",
+            `name=${pr.repo}`,
+            "-F",
+            `number=${pr.number}`,
+            "-f",
+            `reviewsCursor=${reviewPageInfo.endCursor}`,
+            "-f",
+            `query=query($owner: String!, $name: String!, $number: Int!, $reviewsCursor: String!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) {
+                  reviews(first: 100, after: $reviewsCursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      author { login }
+                      state
+                      body
+                      submittedAt
+                      commit { oid }
+                    }
+                  }
+                }
+              }
+              rateLimit { cost remaining resetAt }
+            }`,
+          ]);
+          const reviewPageData: {
+            data: { repository: { pullRequest: { reviews: ReviewConnection } } };
+          } = JSON.parse(reviewPageRaw);
+          const nextReviews = reviewPageData.data.repository.pullRequest.reviews;
+          reviewNodes.push(...nextReviews.nodes);
+          reviewPageInfo = nextReviews.pageInfo;
+        }
         const headSha = pullRequest.headRefOid ?? undefined;
-        const headCommittedAtRaw = pullRequest.commits?.nodes[0]?.commit.committedDate;
-        const headCommittedAt = headCommittedAtRaw ? parseDate(headCommittedAtRaw) : undefined;
+        const headPushedAtRaw = pullRequest.commits?.nodes[0]?.commit.pushedDate;
+        const headPushedAt = headPushedAtRaw ? parseDate(headPushedAtRaw) : undefined;
         // We fetch the 100 most-recent threads; if the PR has more, an older
         // unresolved thread may be outside the window. Flag truncation so callers
         // don't treat an empty set as authoritatively clean.
@@ -1452,7 +1499,7 @@ function createGitHubSCM(): SCM {
           reviews,
           reactions,
           headSha,
-          headCommittedAt,
+          headPushedAt,
           threadsTruncated,
         };
         reviewThreadsCache.set(cacheKey, result);
@@ -1494,6 +1541,7 @@ function createGitHubSCM(): SCM {
             ciPassing: true,
             approved: true,
             noConflicts: true,
+            isDraft: false,
             blockers: [],
           };
         }
@@ -1559,6 +1607,7 @@ function createGitHubSCM(): SCM {
           ciPassing,
           approved,
           noConflicts,
+          isDraft: data.isDraft,
           blockers,
         };
       });

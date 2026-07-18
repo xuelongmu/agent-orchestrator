@@ -90,18 +90,36 @@ export function classifyCIFailure(
   failedChecks: CICheck[],
   summary?: CIFailureSummary | null,
 ): CIFailureClassification {
+  if (failedChecks.length === 0) {
+    return { kind: "real", reason: "no failed checks to classify" };
+  }
+
+  const flakyReasons: string[] = [];
+  const unmatchedJobs = [...(summary?.failedJobs ?? [])];
   for (const check of failedChecks) {
     const conclusion = check.conclusion?.toUpperCase();
     if (conclusion && FLAKY_CI_CONCLUSIONS.has(conclusion)) {
-      return { kind: "flaky", reason: `check conclusion ${conclusion}` };
+      flakyReasons.push(`${check.name}: check conclusion ${conclusion}`);
+      continue;
     }
+
+    const jobIndex = unmatchedJobs.findIndex(
+      (candidate) =>
+        (!!check.url && candidate.runUrl === check.url) || candidate.name === check.name,
+    );
+    const job = jobIndex >= 0 ? unmatchedJobs.splice(jobIndex, 1)[0] : undefined;
+    if (!job) {
+      return { kind: "real", reason: `${check.name}: no check-specific flaky evidence` };
+    }
+    const evidence = [job.failedStep, job.logTail].filter(Boolean).join("\n");
+    const signal = FLAKY_CI_LOG_PATTERNS.find(({ pattern }) => pattern.test(evidence));
+    if (!signal) {
+      return { kind: "real", reason: `${check.name}: no flaky infrastructure signal` };
+    }
+    flakyReasons.push(`${check.name}: ${signal.reason}`);
   }
 
-  const logs = summary?.failedJobs.map((job) => job.logTail ?? "").join("\n") ?? "";
-  for (const signal of FLAKY_CI_LOG_PATTERNS) {
-    if (signal.pattern.test(logs)) return { kind: "flaky", reason: signal.reason };
-  }
-  return { kind: "real", reason: "no flaky infrastructure signal" };
+  return { kind: "flaky", reason: flakyReasons.join("; ") };
 }
 
 type ProbeState = "alive" | "dead" | "unknown";

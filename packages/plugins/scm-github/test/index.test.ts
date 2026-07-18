@@ -1154,6 +1154,65 @@ describe("scm-github plugin", () => {
     });
   });
 
+  // ---- getReviewThreads --------------------------------------------------
+
+  describe("getReviewThreads", () => {
+    it("pages all review submissions so an older current-head approval remains visible", async () => {
+      const newerReviews = Array.from({ length: 100 }, (_, index) => ({
+        author: { login: `reviewer-${index}` },
+        state: "COMMENTED",
+        body: `Follow-up ${index}`,
+        submittedAt: "2026-07-18T00:20:00Z",
+        commit: { oid: "sha-head" },
+      }));
+      mockGh({
+        data: {
+          repository: {
+            pullRequest: {
+              headRefOid: "sha-head",
+              commits: { nodes: [{ commit: { pushedDate: "2026-07-18T00:10:00Z" } }] },
+              reviewThreads: { totalCount: 0, nodes: [] },
+              reviews: {
+                pageInfo: { hasNextPage: true, endCursor: "page-2" },
+                nodes: newerReviews,
+              },
+              reactions: { nodes: [] },
+            },
+          },
+        },
+      });
+      mockGh({
+        data: {
+          repository: {
+            pullRequest: {
+              reviews: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    author: { login: "alice" },
+                    state: "APPROVED",
+                    body: "",
+                    submittedAt: "2026-07-18T00:05:00Z",
+                    commit: { oid: "sha-head" },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      });
+
+      const result = await scm.getReviewThreads?.(pr, { forceFresh: true });
+
+      expect(result?.reviews).toContainEqual(
+        expect.objectContaining({ author: "alice", state: "APPROVED", commitSha: "sha-head" }),
+      );
+      expect(result?.headPushedAt).toEqual(new Date("2026-07-18T00:10:00Z"));
+      expect(ghMock).toHaveBeenCalledTimes(2);
+      expect(ghMock.mock.calls[1]?.[1]).toContain("reviewsCursor=page-2");
+    });
+  });
+
   // ---- getMergeability ---------------------------------------------------
 
   describe("getMergeability", () => {
@@ -1167,6 +1226,7 @@ describe("scm-github plugin", () => {
         ciPassing: true,
         approved: true,
         noConflicts: true,
+        isDraft: false,
         blockers: [],
       });
       // Should only call gh once (for getPRState), not for mergeable/CI
@@ -1211,6 +1271,7 @@ describe("scm-github plugin", () => {
         ciPassing: true,
         approved: true,
         noConflicts: true,
+        isDraft: false,
         blockers: [],
       });
     });

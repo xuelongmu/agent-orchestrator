@@ -3657,6 +3657,48 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     );
   }
 
+  function approvalReactionObservationMetadataKeys(pr: PRInfo): {
+    headSha: string;
+    observedAt: string;
+  } {
+    const suffix = `${pr.owner}/${pr.repo}#${pr.number}`;
+    return {
+      headSha: `approvalReactionHeadSha:${suffix}`,
+      observedAt: `approvalReactionObservedAt:${suffix}`,
+    };
+  }
+
+  /**
+   * Return the earliest reaction time that can approve this head. GitHub's
+   * pushedDate is authoritative when present. Because it is often null, keep a
+   * durable per-PR observation boundary as the safe fallback: the first poll of
+   * a head records the boundary and rejects all reactions, while later polls may
+   * accept only reactions created after it.
+   */
+  function approvalReactionBoundary(
+    session: Session,
+    pr: PRInfo,
+    headSha: string | undefined,
+    headPushedAt: Date | undefined,
+  ): Date | null {
+    if (headPushedAt && Number.isFinite(headPushedAt.getTime())) return headPushedAt;
+    if (!headSha) return null;
+
+    const keys = approvalReactionObservationMetadataKeys(pr);
+    const observedAtRaw = session.metadata[keys.observedAt];
+    const observedAtMs = Date.parse(observedAtRaw ?? "");
+    if (session.metadata[keys.headSha] !== headSha || !Number.isFinite(observedAtMs)) {
+      const observedAt = new Date().toISOString();
+      updateSessionMetadata(session, {
+        [keys.headSha]: headSha,
+        [keys.observedAt]: observedAt,
+      });
+      return null;
+    }
+
+    return new Date(observedAtMs);
+  }
+
   /** Gather fresh SCM facts and evaluate the complete auto-merge DoD. */
   async function evaluateMergeDefinitionOfDone(
     session: Session,
@@ -3722,24 +3764,30 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             review.commitSha === reviewData.headSha
           );
         });
-        const botReactionApproved = (reviewData.reactions ?? []).some((reaction) => {
-          const botName = reaction.botName ?? (reaction.isBot ? reaction.author : undefined);
-          if (!botName || reviewBotWeight(session, botName, false) < 1) return false;
-          const policy = resolveReviewBotPolicy(botName, getReviewBotPolicies(session));
-          if (
-            !policy?.approvalReactions?.some(
-              (content) => content.toUpperCase() === reaction.content.toUpperCase(),
-            )
-          ) {
-            return false;
-          }
-          // Reactions persist across pushes. Accept only reactions created after
-          // the current head commit; fail closed when the SCM lacks either time.
-          return (
-            !!reviewData.headCommittedAt &&
-            reaction.createdAt.getTime() >= reviewData.headCommittedAt.getTime()
-          );
-        });
+        const reactionBoundary = approvalReactionBoundary(
+          session,
+          pr,
+          reviewData.headSha,
+          reviewData.headPushedAt,
+        );
+        const botReactionApproved =
+          !!reactionBoundary &&
+          (reviewData.reactions ?? []).some((reaction) => {
+            const botName = reaction.botName ?? (reaction.isBot ? reaction.author : undefined);
+            if (!botName || reviewBotWeight(session, botName, false) < 1) return false;
+            const policy = resolveReviewBotPolicy(botName, getReviewBotPolicies(session));
+            if (
+              !policy?.approvalReactions?.some(
+                (content) => content.toUpperCase() === reaction.content.toUpperCase(),
+              )
+            ) {
+              return false;
+            }
+            // Reactions persist across pushes. Bind approval to the authoritative
+            // push time or, when GitHub omits it, the durable first-observation
+            // boundary for this exact PR/head.
+            return reaction.createdAt.getTime() >= reactionBoundary.getTime();
+          });
         const approvalSatisfied =
           reviewDecision !== "changes_requested" &&
           (humanReviewApproved || botReviewApproved || botReactionApproved);
@@ -3750,7 +3798,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
         const mergeabilityBlockers = liveMergeabilityBlockers(mergeability);
         const liveDraft =
-          pr.isDraft || mergeability.blockers.some((blocker) => /draft/i.test(blocker));
+          mergeability.isDraft ?? mergeability.blockers.some((blocker) => /draft/i.test(blocker));
 
         const decision = resolveMergeDefinitionOfDone({
           ciGreen: ciStatus === "passing" || ciStatus === "none",

@@ -88,7 +88,52 @@ describe("flaky CI classifier (#15)", () => {
           },
         ],
       }),
-    ).toEqual({ kind: "real", reason: "no flaky infrastructure signal" });
+    ).toEqual({ kind: "real", reason: "windows: no check-specific flaky evidence" });
+  });
+
+  it("keeps a mixed flaky and real failure set on the agent-fix path", () => {
+    expect(
+      classifyCIFailure(
+        [
+          { name: "startup", status: "failed", conclusion: "STARTUP_FAILURE" },
+          { name: "unit", status: "failed", conclusion: "FAILURE" },
+        ],
+        {
+          failedJobs: [
+            {
+              name: "unit",
+              runUrl: "https://example.test/run/unit",
+              logTail: "AssertionError: expected 1 to equal 2",
+            },
+          ],
+        },
+      ),
+    ).toMatchObject({ kind: "real" });
+  });
+
+  it("retries only when every failed check has its own flaky evidence", () => {
+    expect(
+      classifyCIFailure(
+        [
+          { name: "startup", status: "failed", conclusion: "STARTUP_FAILURE" },
+          {
+            name: "windows",
+            status: "failed",
+            conclusion: "FAILURE",
+            url: "https://example.test/run/windows",
+          },
+        ],
+        {
+          failedJobs: [
+            {
+              name: "windows",
+              runUrl: "https://example.test/run/windows",
+              logTail: "The hosted runner was lost. ECONNRESET",
+            },
+          ],
+        },
+      ),
+    ).toMatchObject({ kind: "flaky" });
   });
 });
 

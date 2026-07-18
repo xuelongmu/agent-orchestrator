@@ -1264,8 +1264,8 @@ export interface ReviewThreadsResult {
   reactions?: ReviewReaction[];
   /** Current head commit SHA of the PR, when the SCM can provide it. */
   headSha?: string;
-  /** Commit time of `headSha`, used to reject approval reactions from an older head. */
-  headCommittedAt?: Date;
+  /** Push time of `headSha`, used to reject approval reactions from an older pushed head. */
+  headPushedAt?: Date;
   /**
    * True when the returned `threads` may be incomplete (the PR has more review
    * threads than the plugin fetched in one page). Callers must fail closed —
@@ -1302,6 +1302,8 @@ export interface MergeReadiness {
   ciPassing: boolean;
   approved: boolean;
   noConflicts: boolean;
+  /** Fresh draft state when the SCM exposes it as part of mergeability. */
+  isDraft?: boolean;
   blockers: string[];
 }
 
