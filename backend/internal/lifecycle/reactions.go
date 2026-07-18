@@ -949,15 +949,27 @@ func unresolvedReviewComments(comments []ports.PRCommentObservation) []ports.PRC
 func reviewCommentsSignature(comments []ports.PRCommentObservation) string {
 	parts := make([]string, 0, len(comments))
 	for _, c := range comments {
-		id := strings.TrimSpace(c.ID)
-		threadID := strings.TrimSpace(c.ThreadID)
-		if id == "" && threadID == "" {
-			continue
-		}
-		parts = append(parts, threadID+"\x00"+id)
+		// Count and provider IDs alone are not enough: a reviewer may replace
+		// one unresolved thread with another at the same count, or edit an
+		// existing comment in place. Hash the provider-neutral actionable
+		// content while retaining stable IDs when available. Links are omitted
+		// because providers may refresh them without changing the feedback.
+		semantic := strings.Join([]string{
+			strings.TrimSpace(c.ThreadID),
+			strings.TrimSpace(c.ID),
+			strings.TrimSpace(c.Author),
+			c.File,
+			fmt.Sprint(c.Line),
+			c.Body,
+		}, "\x00")
+		sum := sha256.Sum256([]byte(semantic))
+		parts = append(parts, fmt.Sprintf("%x", sum))
+	}
+	if len(parts) == 0 {
+		return ""
 	}
 	sort.Strings(parts)
-	return strings.Join(parts, "\x01")
+	return "v2:" + strings.Join(parts, "\x01")
 }
 
 func formatReviewCommentsMessage(comments []ports.PRCommentObservation) string {
