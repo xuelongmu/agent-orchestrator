@@ -513,6 +513,8 @@ export {
   isLinux,
   getDefaultRuntime,
   getNodePtyPrebuildsSubdir,
+  resolveExecutable,
+  prependExecutableDirectoryToPath,
   getShell,
   killProcessTree,
   findPidByPort,

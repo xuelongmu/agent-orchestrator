@@ -23,6 +23,8 @@ const {
   mockChmod,
   mockExistsSync,
   mockIsWindows,
+  mockResolveExecutable,
+  mockPrependExecutableDirectoryToPath,
 } = vi.hoisted(() => ({
   mockExecFileAsync: vi.fn(),
   mockReaddir: vi.fn(),
@@ -35,6 +37,10 @@ const {
   mockChmod: vi.fn().mockResolvedValue(undefined),
   mockExistsSync: vi.fn().mockReturnValue(false),
   mockIsWindows: vi.fn(() => false),
+  mockResolveExecutable: vi.fn((): string | null => "/home/dev/.local/bin/claude"),
+  mockPrependExecutableDirectoryToPath: vi.fn(
+    (_executablePath: string) => "/home/dev/.local/bin:/usr/bin",
+  ),
 }));
 
 vi.mock("node:child_process", () => {
@@ -67,6 +73,8 @@ vi.mock("@aoagents/ao-core", async (importOriginal) => {
   return {
     ...actual,
     isWindows: mockIsWindows,
+    resolveExecutable: mockResolveExecutable,
+    prependExecutableDirectoryToPath: mockPrependExecutableDirectoryToPath,
   };
 });
 
@@ -166,6 +174,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   resetPsCache();
   mockHomedir.mockReturnValue("/mock/home");
+  mockResolveExecutable.mockReturnValue("/home/dev/.local/bin/claude");
+  mockPrependExecutableDirectoryToPath.mockReturnValue("/home/dev/.local/bin:/usr/bin");
   // Default: non-Windows so existing tests are unaffected
   mockIsWindows.mockReturnValue(false);
 });
@@ -241,6 +251,21 @@ describe("getLaunchCommand", () => {
     // Must not contain shell operators (execFile-safe)
     expect(cmd).not.toContain("&&");
     expect(cmd).not.toContain("unset");
+  });
+
+  it("launches the resolved executable by absolute path", () => {
+    const cmd = agent.getLaunchCommand(
+      makeLaunchConfig({ executablePath: "/home/dev/.local/bin/claude" }),
+    );
+    expect(cmd).toBe("'/home/dev/.local/bin/claude'");
+  });
+
+  it("uses the PowerShell call operator for a resolved Windows executable", () => {
+    mockIsWindows.mockReturnValueOnce(true);
+    const cmd = agent.getLaunchCommand(
+      makeLaunchConfig({ executablePath: "C:\\Users\\dev\\.local\\bin\\claude.exe" }),
+    );
+    expect(cmd).toBe("& 'C:\\Users\\dev\\.local\\bin\\claude.exe'");
   });
 
   it("includes --dangerously-skip-permissions when permissions=permissionless", () => {
@@ -351,6 +376,32 @@ describe("getEnvironment", () => {
   it("does not set AO_ISSUE_ID when not provided", () => {
     const env = agent.getEnvironment(makeLaunchConfig());
     expect(env["AO_ISSUE_ID"]).toBeUndefined();
+  });
+
+  it("prepends the resolved executable directory to PATH", () => {
+    const executablePath = "/home/dev/.local/bin/claude";
+    const env = agent.getEnvironment(makeLaunchConfig({ executablePath }));
+    expect(mockPrependExecutableDirectoryToPath).toHaveBeenCalledWith(executablePath);
+    expect(env["PATH"]).toBe("/home/dev/.local/bin:/usr/bin");
+  });
+});
+
+// =========================================================================
+// resolveExecutablePath
+// =========================================================================
+describe("resolveExecutablePath", () => {
+  it("returns the resolved absolute Claude binary path", async () => {
+    const agent = create();
+    await expect(agent.resolveExecutablePath!()).resolves.toBe("/home/dev/.local/bin/claude");
+    expect(mockResolveExecutable).toHaveBeenCalledWith("claude");
+  });
+
+  it("fails loudly when the Claude binary cannot be found", async () => {
+    mockResolveExecutable.mockReturnValueOnce(null);
+    const agent = create();
+    await expect(agent.resolveExecutablePath!()).rejects.toThrow(
+      "agent binary `claude` not found on PATH",
+    );
   });
 });
 
@@ -679,6 +730,28 @@ describe("getSessionInfo", () => {
 
       expect(command).toBe("claude --resume 'persisted-uuid'");
       expect(mockReaddir).not.toHaveBeenCalled();
+    });
+
+    it("uses the resolved executable path when restoring", async () => {
+      const agent = create();
+      const session = makeSession({
+        workspacePath: "/workspace/test-project",
+        metadata: { claudeSessionUuid: "persisted-uuid" },
+      });
+
+      const command = await agent.getRestoreCommand!(
+        session,
+        {
+          name: "test-project",
+          repo: "owner/repo",
+          path: "/workspace/test-project",
+          defaultBranch: "main",
+          sessionPrefix: "test",
+        },
+        "/home/dev/.local/bin/claude",
+      );
+
+      expect(command).toBe("'/home/dev/.local/bin/claude' --resume 'persisted-uuid'");
     });
   });
 

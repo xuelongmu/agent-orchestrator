@@ -1581,6 +1581,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         return blockedSession;
       }
 
+      // Resolve launch binaries before creating a workspace/runtime. Agent
+      // plugins that opt in must return an absolute path or fail loudly.
+      const executablePath = await plugins.agent.resolveExecutablePath?.();
+
       // Create workspace (if workspace plugin is available)
       let workspacePath = project.path;
       if (plugins.workspace) {
@@ -1679,6 +1683,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
 
       const agentLaunchConfig = {
         sessionId,
+        ...(executablePath ? { executablePath } : {}),
         projectConfig: {
           ...project,
           agentConfig: {
@@ -2037,6 +2042,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       throw new Error(`Agent plugin '${selection.agentName}' not found`);
     }
 
+    // Validate the agent binary before reserving an identity or creating the
+    // orchestrator worktree. This prevents a doomed runtime from being born.
+    const executablePath = await plugins.agent.resolveExecutablePath?.();
+
     // Get the sessions directory for this project
     const sessionsDir = getProjectSessionsDir(orchestratorConfig.projectId);
 
@@ -2246,6 +2255,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     // Orchestrator ALWAYS gets permissionless mode — it must run ao CLI commands autonomously.
     const agentLaunchConfig = {
       sessionId,
+      ...(executablePath ? { executablePath } : {}),
       projectConfig: {
         ...project,
         agentConfig: {
@@ -3910,6 +3920,8 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       throw new Error(`Agent plugin '${selection.agentName}' not found`);
     }
 
+    const executablePath = await plugins.agent.resolveExecutablePath?.();
+
     // 5. Check workspace
     const workspacePath = raw["worktree"] || project.path;
     const workspaceExists = plugins.workspace?.exists
@@ -4050,6 +4062,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
 
     const agentLaunchConfig = {
       sessionId,
+      ...(executablePath ? { executablePath } : {}),
       projectConfig: projectConfigForLaunch,
       workspacePath,
       issueId: session.issueId ?? undefined,
@@ -4060,7 +4073,16 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     };
 
     if (plugins.agent.getRestoreCommand) {
-      const restoreCmd = await plugins.agent.getRestoreCommand(session, projectConfigForLaunch);
+      // Keep the legacy two-argument call for plugins that do not resolve an
+      // executable; some external plugins may inspect arguments.length.
+      const restoreCmd =
+        executablePath === undefined
+          ? await plugins.agent.getRestoreCommand(session, projectConfigForLaunch)
+          : await plugins.agent.getRestoreCommand(
+              session,
+              projectConfigForLaunch,
+              executablePath,
+            );
       if (restoreCmd) {
         launchCommand = restoreCmd;
         updateMetadata(sessionsDir, sessionId, { restoreFallbackReason: "" });

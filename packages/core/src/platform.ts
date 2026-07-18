@@ -2,6 +2,7 @@ import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import { homedir, userInfo } from "node:os";
 import { existsSync } from "node:fs";
+import { posix, win32 } from "node:path";
 
 const execFileAsync = promisify(execFileCb);
 
@@ -30,6 +31,87 @@ export function getDefaultRuntime(): "tmux" | "process" {
 
 export function getNodePtyPrebuildsSubdir(): string {
   return `${process.platform}-${process.arch}`;
+}
+
+// -- Executable resolution --
+
+function getPlatformPath(): typeof posix | typeof win32 {
+  return isWindows() ? win32 : posix;
+}
+
+function executableNames(binaryName: string): string[] {
+  if (!isWindows() || win32.extname(binaryName)) return [binaryName];
+
+  const extensions = (process.env["PATHEXT"] ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((extension) => extension.trim())
+    .filter(Boolean);
+  const names = extensions.map((extension) => `${binaryName}${extension}`);
+  // PowerShell can also invoke extensionless executables on Windows.
+  names.push(binaryName);
+  return [...new Set(names)];
+}
+
+/**
+ * Resolve an executable to an absolute path without relying on a child shell.
+ *
+ * In addition to PATH, search common user-local install directories. Headless
+ * daemons often inherit a reduced PATH that omits ~/.local/bin even though
+ * native agent installers place their binaries there.
+ */
+export function resolveExecutable(
+  binaryName: string,
+  pathValue = process.env["PATH"],
+): string | null {
+  const pathApi = getPlatformPath();
+  const delimiter = isWindows() ? ";" : ":";
+  const hasPathSeparator = binaryName.includes("/") || binaryName.includes("\\");
+
+  const directories = hasPathSeparator
+    ? [""]
+    : [
+        ...(pathValue ?? "")
+          .split(delimiter)
+          .map((entry) => entry.trim().replace(/^"(.*)"$/, "$1"))
+          .filter(Boolean),
+        pathApi.join(homedir(), ".local", "bin"),
+        ...(isWindows() && process.env["APPDATA"]
+          ? [pathApi.join(process.env["APPDATA"], "npm")]
+          : []),
+        ...(!isWindows() ? ["/usr/local/bin", "/opt/homebrew/bin"] : []),
+      ];
+
+  const seen = new Set<string>();
+  for (const directory of directories) {
+    for (const name of executableNames(binaryName)) {
+      const candidate = pathApi.resolve(directory, name);
+      const compareKey = isWindows() ? candidate.toLowerCase() : candidate;
+      if (seen.has(compareKey)) continue;
+      seen.add(compareKey);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+
+  return null;
+}
+
+/** Prepend an executable's install directory to PATH, without duplicates. */
+export function prependExecutableDirectoryToPath(
+  executablePath: string,
+  pathValue = process.env["PATH"] ?? "",
+): string {
+  const pathApi = getPlatformPath();
+  const delimiter = isWindows() ? ";" : ":";
+  const executableDirectory = pathApi.dirname(executablePath);
+  const compare = (value: string): string => (isWindows() ? value.toLowerCase() : value);
+  const pathKey = (value: string): string =>
+    compare(pathApi.resolve(value.replace(/^"(.*)"$/, "$1")));
+  const directoryKey = pathKey(executableDirectory);
+  const inherited = pathValue
+    .split(delimiter)
+    .filter(Boolean)
+    .filter((entry) => pathKey(entry) !== directoryKey);
+  return [executableDirectory, ...inherited].join(delimiter);
 }
 
 // -- Shell resolution --

@@ -562,10 +562,55 @@ describe("restore", () => {
     const sm = createSessionManager({ config, registry: registryWithAgentRestore });
     await sm.restore("app-1");
 
-    expect(mockAgentWithRestore.getRestoreCommand).toHaveBeenCalled();
+    expect(mockAgentWithRestore.getRestoreCommand).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.any(Object),
+    );
+    expect(
+      (mockAgentWithRestore.getRestoreCommand as ReturnType<typeof vi.fn>).mock.calls[0],
+    ).toHaveLength(2);
     // Verify runtime.create was called with the restore command
     const createCall = (mockRuntime.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(createCall.launchCommand).toBe("claude --resume abc123");
+  });
+
+  it("passes a resolved executable to getRestoreCommand", async () => {
+    const wsPath = join(tmpDir, "ws-app-restore-executable");
+    mkdirSync(wsPath, { recursive: true });
+    const executablePath = join(tmpDir, "bin", "claude");
+
+    const mockAgentWithExecutable: Agent = {
+      ...mockAgent,
+      resolveExecutablePath: vi.fn().mockResolvedValue(executablePath),
+      getRestoreCommand: vi.fn().mockResolvedValue(`${executablePath} --resume abc123`),
+    };
+
+    const registryWithExecutable: PluginRegistry = {
+      ...mockRegistry,
+      get: vi.fn().mockImplementation((slot: string) => {
+        if (slot === "runtime") return mockRuntime;
+        if (slot === "agent") return mockAgentWithExecutable;
+        if (slot === "workspace") return mockWorkspace;
+        return null;
+      }),
+    };
+
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: wsPath,
+      branch: "feat/TEST-1",
+      status: "errored",
+      project: "my-app",
+      runtimeHandle: makeHandle("rt-old"),
+    });
+
+    const sm = createSessionManager({ config, registry: registryWithExecutable });
+    await sm.restore("app-1");
+
+    expect(mockAgentWithExecutable.getRestoreCommand).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.any(Object),
+      executablePath,
+    );
   });
 
   it("falls back to getLaunchCommand when getRestoreCommand returns null", async () => {

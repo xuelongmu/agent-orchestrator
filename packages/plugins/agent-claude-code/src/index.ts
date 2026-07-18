@@ -2,6 +2,8 @@ import {
   shellEscape,
   normalizeAgentPermissionMode,
   isWindows,
+  prependExecutableDirectoryToPath,
+  resolveExecutable,
   type Agent,
   type AgentSessionInfo,
   type AgentLaunchConfig,
@@ -1049,10 +1051,21 @@ function createClaudeCodeAgent(): Agent {
   return {
     name: "claude-code",
     processName: "claude",
+
+    async resolveExecutablePath(): Promise<string> {
+      const executablePath = resolveExecutable("claude");
+      if (!executablePath) {
+        throw new Error("agent binary `claude` not found on PATH");
+      }
+      return executablePath;
+    },
+
     getLaunchCommand(config: AgentLaunchConfig): string {
       // Note: CLAUDECODE is unset via getEnvironment() (set to ""), not here.
       // This command must be safe for both shell and execFile contexts.
-      const parts: string[] = ["claude"];
+      const parts: string[] = [
+        config.executablePath ? shellEscape(config.executablePath) : "claude",
+      ];
 
       const permissionMode = normalizeAgentPermissionMode(config.permissions);
       if (permissionMode === "permissionless" || permissionMode === "auto-edit") {
@@ -1086,7 +1099,10 @@ function createClaudeCodeAgent(): Agent {
         parts.push("--", shellEscape(config.prompt));
       }
 
-      return parts.join(" ");
+      const command = parts.join(" ");
+      // PowerShell parses a leading quoted path as a string expression unless
+      // the call operator is present.
+      return isWindows() && config.executablePath ? `& ${command}` : command;
     },
 
     getEnvironment(config: AgentLaunchConfig): Record<string, string> {
@@ -1106,6 +1122,10 @@ function createClaudeCodeAgent(): Agent {
 
       if (config.issueId) {
         env["AO_ISSUE_ID"] = config.issueId;
+      }
+
+      if (config.executablePath) {
+        env["PATH"] = prependExecutableDirectoryToPath(config.executablePath);
       }
 
       return env;
@@ -1176,7 +1196,11 @@ function createClaudeCodeAgent(): Agent {
       };
     },
 
-    async getRestoreCommand(session: Session, project: ProjectConfig): Promise<string | null> {
+    async getRestoreCommand(
+      session: Session,
+      project: ProjectConfig,
+      executablePath?: string,
+    ): Promise<string | null> {
       let sessionUuid = session.metadata?.["claudeSessionUuid"]?.trim();
       if (!sessionUuid) {
         if (!session.workspacePath) return null;
@@ -1195,7 +1219,11 @@ function createClaudeCodeAgent(): Agent {
       if (!sessionUuid) return null;
 
       // Build resume command
-      const parts: string[] = ["claude", "--resume", shellEscape(sessionUuid)];
+      const parts: string[] = [
+        executablePath ? shellEscape(executablePath) : "claude",
+        "--resume",
+        shellEscape(sessionUuid),
+      ];
 
       const permissionMode = normalizeAgentPermissionMode(project.agentConfig?.permissions);
       if (permissionMode === "permissionless" || permissionMode === "auto-edit") {
@@ -1206,7 +1234,8 @@ function createClaudeCodeAgent(): Agent {
         parts.push("--model", shellEscape(project.agentConfig.model as string));
       }
 
-      return parts.join(" ");
+      const command = parts.join(" ");
+      return isWindows() && executablePath ? `& ${command}` : command;
     },
 
     async setupWorkspaceHooks(workspacePath: string, _config: WorkspaceHooksConfig): Promise<void> {
@@ -1218,6 +1247,7 @@ function createClaudeCodeAgent(): Agent {
     async postLaunchSetup(_session: Session): Promise<void> {
       // Hooks are installed pre-launch via setupWorkspaceHooks so that
       // PostToolUse hooks exist before the agent's first tool call.
+      // Binary resolution also happens pre-launch via resolveExecutablePath.
     },
   };
 }

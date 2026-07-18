@@ -69,6 +69,7 @@ function setPlatform(p: string): void {
 beforeEach(() => {
   vi.clearAllMocks();
   setPlatform(originalPlatform);
+  mockHomedir.mockReturnValue("/mock/home");
   // Default: absolute powershell path doesn't exist (let probe-based tests run).
   // Specific tests override this when exercising the absolute-path branch.
   mockExistsSync.mockReturnValue(false);
@@ -452,6 +453,89 @@ describe("findPidByPort", () => {
     const pid = await mod.findPidByPort(3000);
 
     expect(pid).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// executable resolution / PATH construction
+// ---------------------------------------------------------------------------
+
+describe("resolveExecutable", () => {
+  it("resolves a Windows executable from PATH using PATHEXT", async () => {
+    setPlatform("win32");
+    const savedPathExt = process.env["PATHEXT"];
+    process.env["PATHEXT"] = ".EXE;.CMD";
+    mockExistsSync.mockImplementation(
+      (candidate: unknown) => String(candidate) === "C:\\tools\\claude.EXE",
+    );
+
+    try {
+      const mod = await import("../platform.js");
+      expect(mod.resolveExecutable("claude", "C:\\tools")).toBe("C:\\tools\\claude.EXE");
+    } finally {
+      if (savedPathExt !== undefined) process.env["PATHEXT"] = savedPathExt;
+      else delete process.env["PATHEXT"];
+    }
+  });
+
+  it("finds Claude in the Windows user-local bin when daemon PATH omits it", async () => {
+    setPlatform("win32");
+    const savedPathExt = process.env["PATHEXT"];
+    process.env["PATHEXT"] = ".EXE;.CMD";
+    mockHomedir.mockReturnValue("C:\\Users\\dev");
+    mockExistsSync.mockImplementation(
+      (candidate: unknown) => String(candidate) === "C:\\Users\\dev\\.local\\bin\\claude.EXE",
+    );
+
+    try {
+      const mod = await import("../platform.js");
+      expect(mod.resolveExecutable("claude", "C:\\Windows\\System32")).toBe(
+        "C:\\Users\\dev\\.local\\bin\\claude.EXE",
+      );
+    } finally {
+      if (savedPathExt !== undefined) process.env["PATHEXT"] = savedPathExt;
+      else delete process.env["PATHEXT"];
+    }
+  });
+
+  it("finds an executable in the POSIX user-local bin", async () => {
+    setPlatform("linux");
+    mockHomedir.mockReturnValue("/home/dev");
+    mockExistsSync.mockImplementation(
+      (candidate: unknown) => String(candidate) === "/home/dev/.local/bin/claude",
+    );
+
+    const mod = await import("../platform.js");
+    expect(mod.resolveExecutable("claude", "/usr/bin:/bin")).toBe("/home/dev/.local/bin/claude");
+  });
+
+  it("returns null when the executable cannot be found", async () => {
+    setPlatform("linux");
+    mockExistsSync.mockReturnValue(false);
+
+    const mod = await import("../platform.js");
+    expect(mod.resolveExecutable("missing-agent", "/usr/bin:/bin")).toBeNull();
+  });
+});
+
+describe("prependExecutableDirectoryToPath", () => {
+  it("uses Windows separators and deduplicates case-insensitively", async () => {
+    setPlatform("win32");
+    const mod = await import("../platform.js");
+    expect(
+      mod.prependExecutableDirectoryToPath(
+        "C:\\Users\\dev\\.local\\bin\\claude.exe",
+        "C:\\Windows;C:\\USERS\\DEV\\.LOCAL\\BIN",
+      ),
+    ).toBe("C:\\Users\\dev\\.local\\bin;C:\\Windows");
+  });
+
+  it("uses POSIX separators and preserves other PATH entries", async () => {
+    setPlatform("linux");
+    const mod = await import("../platform.js");
+    expect(
+      mod.prependExecutableDirectoryToPath("/home/dev/.local/bin/claude", "/usr/bin:/bin"),
+    ).toBe("/home/dev/.local/bin:/usr/bin:/bin");
   });
 });
 
