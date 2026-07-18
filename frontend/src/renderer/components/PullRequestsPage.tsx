@@ -103,6 +103,7 @@ function PRRowView({ row, onOpen }: { row: PRRow; onOpen: () => void }) {
 		mutationFn: async () => {
 			const { data, error } = await apiClient.POST("/api/v1/prs/{id}/merge", {
 				params: { path: { id: String(row.pr.number) } },
+				body: { prUrl: row.pr.url, expectedHeadSha: row.pr.headSha },
 			});
 			if (error) throw new Error(apiErrorMessage(error));
 			return data;

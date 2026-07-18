@@ -37,6 +37,7 @@ func (s *Store) ListPRFactsForSession(ctx context.Context, id domain.SessionID) 
 		out = append(out, domain.PRFacts{
 			URL:            r.URL,
 			Number:         int(r.Number),
+			HeadSHA:        r.HeadSha,
 			Draft:          r.PRState == domain.PRStateDraft,
 			Merged:         r.PRState == domain.PRStateMerged,
 			Closed:         r.PRState == domain.PRStateClosed,
@@ -57,6 +58,7 @@ func prFactsFromGen(r gen.GetDisplayPRFactsBySessionRow) domain.PRFacts {
 	return domain.PRFacts{
 		URL:            r.URL,
 		Number:         int(r.Number),
+		HeadSHA:        r.HeadSha,
 		Draft:          state == domain.PRStateDraft,
 		Merged:         state == domain.PRStateMerged,
 		Closed:         state == domain.PRStateClosed,

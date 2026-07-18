@@ -82,6 +82,7 @@ UPDATE pr SET last_nudge_signature = ? WHERE url = ?;
 SELECT
     pr.url,
     pr.number,
+    pr.head_sha,
     pr.pr_state,
     pr.review_decision,
     pr.ci_state,
@@ -108,6 +109,7 @@ LIMIT 1;
 SELECT
     pr.url,
     pr.number,
+    pr.head_sha,
     pr.pr_state,
     pr.review_decision,
     pr.ci_state,

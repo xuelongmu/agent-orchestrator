@@ -766,7 +766,7 @@ func sessionViews(sessions []domain.Session) []SessionView {
 func sessionPRFacts(prs []domain.PRFacts) []SessionPRFacts {
 	out := make([]SessionPRFacts, 0, len(prs))
 	for _, pr := range prs {
-		out = append(out, SessionPRFacts{URL: pr.URL, Number: pr.Number, State: prState(pr), CI: pr.CI, Review: pr.Review, Mergeability: pr.Mergeability, ReviewComments: pr.ReviewComments, UpdatedAt: pr.UpdatedAt})
+		out = append(out, SessionPRFacts{URL: pr.URL, Number: pr.Number, HeadSHA: pr.HeadSHA, State: prState(pr), CI: pr.CI, Review: pr.Review, Mergeability: pr.Mergeability, ReviewComments: pr.ReviewComments, UpdatedAt: pr.UpdatedAt})
 	}
 	return out
 }

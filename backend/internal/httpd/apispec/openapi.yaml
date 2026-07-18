@@ -765,6 +765,12 @@ paths:
         schema:
           description: PR number.
           type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergePRRequest'
+        required: true
       responses:
         "200":
           content:
@@ -772,6 +778,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/MergePRResponse'
           description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
         "404":
           content:
             application/json:
@@ -2204,6 +2216,18 @@ components:
       required:
       - status
       type: object
+    MergePRRequest:
+      properties:
+        expectedHeadSha:
+          pattern: ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$
+          type: string
+        prUrl:
+          minLength: 1
+          type: string
+      required:
+      - prUrl
+      - expectedHeadSha
+      type: object
     MergePRResponse:
       properties:
         method:
@@ -2661,6 +2685,8 @@ components:
           - passing
           - failing
           type: string
+        headSha:
+          type: string
         mergeability:
           enum:
           - unknown
@@ -2695,6 +2721,7 @@ components:
       required:
       - url
       - number
+      - headSha
       - state
       - ci
       - review

@@ -9,6 +9,7 @@ import "time"
 type PRFacts struct {
 	URL            string
 	Number         int
+	HeadSHA        string
 	Draft          bool
 	Merged         bool
 	Closed         bool

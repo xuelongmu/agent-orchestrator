@@ -32,7 +32,7 @@ func TestListPRFactsForSessionProjectsAllPRsNewestFirst(t *testing.T) {
 			t.Fatalf("write %s: %v", pr.URL, err)
 		}
 	}
-	write(domain.PullRequest{URL: "root", SessionID: r.ID, Number: 1, CI: domain.CIPassing, SourceBranch: "feat/x", TargetBranch: "main", UpdatedAt: now, ObservedAt: now})
+	write(domain.PullRequest{URL: "root", SessionID: r.ID, Number: 1, HeadSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", CI: domain.CIPassing, SourceBranch: "feat/x", TargetBranch: "main", UpdatedAt: now, ObservedAt: now})
 	write(domain.PullRequest{URL: "child", SessionID: r.ID, Number: 2, Draft: true, SourceBranch: "feat/x/child", TargetBranch: "feat/x", UpdatedAt: now.Add(time.Second), ObservedAt: now})
 	write(domain.PullRequest{URL: "old", SessionID: r.ID, Number: 3, Merged: true, SourceBranch: "feat/old", TargetBranch: "main", UpdatedAt: now.Add(2 * time.Second), ObservedAt: now})
 
@@ -67,6 +67,9 @@ func TestListPRFactsForSessionProjectsAllPRsNewestFirst(t *testing.T) {
 	}
 	if byURL["root"].CI != domain.CIPassing {
 		t.Fatalf("root CI = %q, want passing", byURL["root"].CI)
+	}
+	if byURL["root"].HeadSHA != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("root head SHA = %q, want exact observed head", byURL["root"].HeadSHA)
 	}
 
 	// A session with no PRs returns an empty (non-nil) slice, never an error.

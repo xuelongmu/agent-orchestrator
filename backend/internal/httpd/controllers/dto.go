@@ -282,6 +282,7 @@ type SendSessionMessageResponse struct {
 type SessionPRFacts struct {
 	URL            string                `json:"url"`
 	Number         int                   `json:"number"`
+	HeadSHA        string                `json:"headSha"`
 	State          string                `json:"state" enum:"draft,open,merged,closed"`
 	CI             domain.CIState        `json:"ci" enum:"unknown,pending,passing,failing"`
 	Review         domain.ReviewDecision `json:"review" enum:"none,approved,changes_requested,review_required"`
@@ -575,6 +576,14 @@ type ImportRunResponse struct {
 // PRIDParam is the {id} path parameter shared by the /prs/{id} routes.
 type PRIDParam struct {
 	ID string `path:"id" description:"PR number."`
+}
+
+// MergePRRequest is the body of POST /api/v1/prs/{id}/merge. PRURL makes the
+// globally-numbered route unambiguous across repositories; ExpectedHeadSHA
+// pins every caller to the exact head it displayed.
+type MergePRRequest struct {
+	PRURL           string `json:"prUrl" minLength:"1"`
+	ExpectedHeadSHA string `json:"expectedHeadSha" pattern:"^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$"`
 }
 
 // MergePRResponse is the body of POST /api/v1/prs/{id}/merge (200).
