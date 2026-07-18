@@ -3285,12 +3285,15 @@ describe("reactions", () => {
       scm: mockSCM,
     });
 
-    let editorPending = true;
+    let editorPending = false;
     vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
       state: editorPending ? "waiting_input" : "active",
     }));
     vi.mocked(mockSessionManager.send)
-      .mockRejectedValueOnce(new SessionInputPendingError("app-1", true))
+      .mockImplementationOnce(async () => {
+        editorPending = true;
+        throw new SessionInputPendingError("app-1", true);
+      })
       .mockResolvedValue(undefined);
 
     let now = Date.now();
@@ -3462,7 +3465,15 @@ describe("reactions", () => {
       editorPending = false;
       now += 121_000;
       await lm.check("app-1");
-      expect(mockSessionManager.send).toHaveBeenCalledTimes(3);
+      // Returning from needs_input to changes_requested is a real transition:
+      // resume with the configured generic reaction, then the enriched details.
+      expect(mockSessionManager.send).toHaveBeenCalledTimes(4);
+      expect(vi.mocked(mockSessionManager.send).mock.calls[2]?.[1]).toBe(
+        "Handle requested changes.",
+      );
+      const enrichedRetry = vi.mocked(mockSessionManager.send).mock.calls[3]?.[1] as string;
+      expect(enrichedRetry).toContain("src/route.ts:44");
+      expect(enrichedRetry).toContain("Please add validation");
       expect(readMetadataRaw(env.sessionsDir, "app-1")?.["lastPendingReviewDispatchHash"]).toBe(
         "c1",
       );
