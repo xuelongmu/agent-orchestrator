@@ -2488,7 +2488,7 @@ describe("reactions", () => {
             agentReportedState: reportState,
             agentReportedAt: newReportAt,
             agentAcknowledgedAt: priorTriggerAt,
-            reportWatcherActiveTrigger: `agent_needs_input:${priorState}:${priorTriggerAt}`,
+            reportWatcherActiveTrigger: `agent_needs_input:${priorState}:${priorTriggerAt}:answerable`,
             reportWatcherTriggerActivatedAt: priorTriggerAt,
             reportWatcherTriggerCount: "1",
             notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
@@ -2870,7 +2870,7 @@ describe("reactions", () => {
         state: "waiting_input",
         timestamp: activityTimestamp,
       });
-      return setupCheck("app-1", {
+      const lm = setupCheck("app-1", {
         session: makeSession({
           status: "needs_input",
           activity: "waiting_input",
@@ -2879,6 +2879,12 @@ describe("reactions", () => {
         }),
         metaOverrides: decisionMeta(),
       });
+      // setupCheck's initial write uses the typed SessionMetadata serializer,
+      // which intentionally ignores extension keys. Seed the durable decision
+      // fields explicitly so this integration test exercises the locked retire
+      // path instead of asserting against metadata that was never persisted.
+      updateMetadata(env.sessionsDir, "app-1", decisionMeta());
+      return lm;
     };
 
     it("retires the spent report+episode when the agent activity boundary advances while still parked", async () => {
