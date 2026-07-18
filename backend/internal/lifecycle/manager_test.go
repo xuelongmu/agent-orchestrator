@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -1153,6 +1154,115 @@ func TestMarkSpawnedClearsFirstSignal(t *testing.T) {
 type fakeNotificationSink struct {
 	intents []ports.NotificationIntent
 	err     error
+}
+
+func reviewRoundCapObservation() ports.SCMObservation {
+	return ports.SCMObservation{
+		Fetched:  true,
+		Provider: "github",
+		Repo:     "o/r",
+		PR: ports.SCMPRObservation{
+			URL:          "https://github.com/o/r/pull/1",
+			Number:       1,
+			Title:        "still blocked",
+			SourceBranch: "fix/review",
+			TargetBranch: "main",
+			HeadSHA:      "sha7",
+		},
+	}
+}
+
+func reviewHandoffState(t *testing.T, raw, key string) reviewBacklogOutcome {
+	t.Helper()
+	var payload reactionPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("decode reaction payload: %v", err)
+	}
+	return payload.Handoffs[key]
+}
+
+func TestReviewRoundCapHandoffRequiresConfirmedNotification(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		sink *fakeNotificationSink
+	}{
+		{name: "no notification sink"},
+		{name: "notification delivery fails", sink: &fakeNotificationSink{err: errors.New("push unavailable")}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newFakeStore()
+			m := New(st, nil)
+			if tt.sink != nil {
+				m = New(st, nil, WithNotificationSink(tt.sink))
+			}
+			st.sessions["mer-1"] = working("mer-1")
+			obs := reviewRoundCapObservation()
+
+			if err := m.ApplyReviewRoundCapHandoff(ctx, "mer-1", obs, 6); err == nil {
+				t.Fatal("handoff error = nil, want undelivered fallback")
+			}
+			if got := st.sessions["mer-1"].Activity.State; got != domain.ActivityActive {
+				t.Fatalf("activity = %q, want active until notification is confirmed", got)
+			}
+			key := reviewRoundCapHandoffKey(obs.PR.URL)
+			got := reviewHandoffState(t, st.signatures[obs.PR.URL], key)
+			if got.Outcome != reviewBacklogBlocked || got.Reason != reviewRoundCapNotificationFailed {
+				t.Fatalf("handoff = %+v, want blocked/%s", got, reviewRoundCapNotificationFailed)
+			}
+		})
+	}
+}
+
+func TestReviewRoundCapHandoffRetriesBlockedOutcomeAndParksAfterDelivery(t *testing.T) {
+	st := newFakeStore()
+	sink := &fakeNotificationSink{err: errors.New("push unavailable")}
+	m := New(st, nil, WithNotificationSink(sink))
+	st.sessions["mer-1"] = working("mer-1")
+	obs := reviewRoundCapObservation()
+
+	if err := m.ApplyReviewRoundCapHandoff(ctx, "mer-1", obs, 6); err == nil {
+		t.Fatal("first handoff error = nil, want failed delivery")
+	}
+	// Retry immediately. A normal review-fetch cadence must not overwrite or
+	// defer a previously blocked, undelivered handoff.
+	sink.err = nil
+	if err := m.ApplyReviewRoundCapHandoff(ctx, "mer-1", obs, 6); err != nil {
+		t.Fatalf("retry handoff: %v", err)
+	}
+	if len(sink.intents) != 2 {
+		t.Fatalf("notification attempts = %d, want failed attempt plus immediate retry", len(sink.intents))
+	}
+	if got := st.sessions["mer-1"].Activity.State; got != domain.ActivityWaitingInput {
+		t.Fatalf("activity = %q, want waiting_input after confirmed fallback", got)
+	}
+	key := reviewRoundCapHandoffKey(obs.PR.URL)
+	got := reviewHandoffState(t, st.signatures[obs.PR.URL], key)
+	if got.Outcome != reviewBacklogNotified || got.Reason != reviewRoundCapNotificationFailed {
+		t.Fatalf("handoff = %+v, want notified/%s", got, reviewRoundCapNotificationFailed)
+	}
+
+	if err := m.ApplyReviewRoundCapHandoff(ctx, "mer-1", obs, 6); err != nil {
+		t.Fatalf("latched handoff repeat: %v", err)
+	}
+	if len(sink.intents) != 2 {
+		t.Fatalf("latched handoff re-notified: %+v", sink.intents)
+	}
+}
+
+func TestReviewRoundCapHandoffPreservesPendingInputSuppression(t *testing.T) {
+	st := newFakeStore()
+	sink := &fakeNotificationSink{}
+	m := New(st, nil, WithNotificationSink(sink))
+	rec := working("mer-1")
+	rec.Activity.State = domain.ActivityBlocked
+	st.sessions["mer-1"] = rec
+
+	if err := m.ApplyReviewRoundCapHandoff(ctx, "mer-1", reviewRoundCapObservation(), 6); err != nil {
+		t.Fatalf("pending-input handoff: %v", err)
+	}
+	if len(sink.intents) != 0 || len(st.signatures) != 0 {
+		t.Fatalf("pending-input session emitted handoff: intents=%+v signatures=%+v", sink.intents, st.signatures)
+	}
 }
 
 func (f *fakeNotificationSink) Notify(_ context.Context, intent ports.NotificationIntent) error {

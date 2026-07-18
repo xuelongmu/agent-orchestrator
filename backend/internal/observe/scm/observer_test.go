@@ -1230,6 +1230,44 @@ func TestPoll_CoordinationRefreshesPassingBlockedHeadWithCachedReviewHashAfterRe
 	}
 }
 
+func TestPoll_CoordinationHandoffFailureDoesNotThrottleRetry(t *testing.T) {
+	store := testStoreWithSession()
+	review := ports.SCMReviewObservation{
+		Decision: string(domain.ReviewRequired),
+		HeadSHA:  "sha1",
+	}
+	local := knownPR(1)
+	local.CI = domain.CIPassing
+	local.Review = domain.ReviewRequired
+	local.Mergeability = domain.MergeBlocked
+	local.ReviewHash = reviewSemanticHash(review)
+	store.prs["p-1"] = []domain.PullRequest{local}
+	provider := &fakeProvider{
+		repoGuards: map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "repo", NotModified: true}},
+		reviews:    map[string]ports.SCMReviewObservation{prKey(testRepo, 1): review},
+	}
+	coordinator := &fakeReviewCoordinator{err: errors.New("handoff undelivered")}
+	now := time.Unix(200, 0).UTC()
+	obs := New(provider, store, &fakeLifecycle{}, Config{
+		Clock: func() time.Time { return now }, Tick: time.Hour,
+		Logger: quietSlog(), CacheMax: 128, ReviewCoordinator: coordinator,
+	})
+
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	key := prKey(testRepo, 1)
+	if provider.reviewCalls != 2 || len(coordinator.observed) != 2 {
+		t.Fatalf("undelivered handoff was throttled: review calls=%d coordinator=%d", provider.reviewCalls, len(coordinator.observed))
+	}
+	if _, ok := obs.Cache.LastReviewPollAt[key]; ok {
+		t.Fatalf("undelivered handoff advanced review throttle: %#v", obs.Cache.LastReviewPollAt)
+	}
+}
+
 func TestCoordinationObservationNeedsReviewSnapshotWhileProviderBlocksOnReview(t *testing.T) {
 	obs := testObs(1)
 	obs.Review.Decision = string(domain.ReviewRequired)

@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -17,6 +18,23 @@ import (
 )
 
 const reviewMaxNudge = 3
+
+const reviewRoundCapNotificationFailed = "review-round-cap-notification-failed"
+
+type reviewBacklogOutcomeKind string
+
+const (
+	reviewBacklogBlocked  reviewBacklogOutcomeKind = "blocked"
+	reviewBacklogNotified reviewBacklogOutcomeKind = "notified"
+)
+
+// reviewBacklogOutcome is the durable terminal result of a human handoff.
+// A failed delivery remains blocked and retryable; only a notification sink
+// that returns success may advance it to notified.
+type reviewBacklogOutcome struct {
+	Outcome reviewBacklogOutcomeKind `json:"outcome"`
+	Reason  string                   `json:"reason"`
+}
 
 // ReviewDeliveryOutcome reports what ApplyReviewResult did with a completed
 // AO-internal review pass.
@@ -107,6 +125,7 @@ type reactionState struct {
 	mu       sync.Mutex
 	seen     map[string]string
 	attempts map[string]int
+	handoffs map[string]reviewBacklogOutcome
 	// loaded tracks PR URLs whose persisted dedup payload has been merged into
 	// seen/attempts during this process. Lazy: we only pay the DB read on the
 	// first reaction touching each PR after startup.
@@ -114,15 +133,96 @@ type reactionState struct {
 }
 
 func newReactionState() reactionState {
-	return reactionState{seen: map[string]string{}, attempts: map[string]int{}, loaded: map[string]bool{}}
+	return reactionState{seen: map[string]string{}, attempts: map[string]int{}, handoffs: map[string]reviewBacklogOutcome{}, loaded: map[string]bool{}}
 }
 
 // reactionPayload is the JSON document persisted in pr.last_nudge_signature.
 // Keeping the schema explicit (and stable) lets the daemon restart and resume
 // the existing dedup state without re-nudging an agent.
 type reactionPayload struct {
-	Seen     map[string]string `json:"seen,omitempty"`
-	Attempts map[string]int    `json:"attempts,omitempty"`
+	Seen     map[string]string               `json:"seen,omitempty"`
+	Attempts map[string]int                  `json:"attempts,omitempty"`
+	Handoffs map[string]reviewBacklogOutcome `json:"handoffs,omitempty"`
+}
+
+func reviewRoundCapHandoffKey(prURL string) string {
+	return "review-handoff:" + prURL + ":round-cap"
+}
+
+// ApplyReviewRoundCapHandoff is the single outcome chokepoint for an exhausted
+// automatic review loop. Notification delivery comes first; only confirmed
+// delivery latches the handoff and parks the worker in waiting_input. A failed
+// or missing sink records blocked and returns an error so the SCM observer does
+// not acknowledge/throttle the snapshot and retries on its next poll.
+func (m *Manager) ApplyReviewRoundCapHandoff(ctx context.Context, id domain.SessionID, obs ports.SCMObservation, round int) error {
+	prURL := firstSCMNonEmpty(obs.PR.URL, obs.PR.HTMLURL)
+	if prURL == "" {
+		return nil
+	}
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return err
+	}
+	// Preserve the pending-input suppression invariant: another user decision
+	// already owns this session, so do not stack a review-cap handoff on it.
+	if rec.IsTerminated || rec.Activity.State.NeedsInput() {
+		return nil
+	}
+
+	key := reviewRoundCapHandoffKey(prURL)
+	m.react.mu.Lock()
+	defer m.react.mu.Unlock()
+	if !m.react.loaded[prURL] {
+		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+			return err
+		}
+		m.react.loaded[prURL] = true
+	}
+	if prior := m.react.handoffs[key]; prior.Outcome == reviewBacklogNotified {
+		return nil
+	}
+
+	blocked := reviewBacklogOutcome{Outcome: reviewBacklogBlocked, Reason: reviewRoundCapNotificationFailed}
+	record := func(outcome reviewBacklogOutcome) error {
+		m.react.handoffs[key] = outcome
+		return m.persistPRSignaturesLocked(ctx, prURL)
+	}
+	if m.notifications == nil {
+		persistErr := record(blocked)
+		return errors.Join(errors.New("lifecycle: review round-cap notification sink is unavailable"), persistErr)
+	}
+	intent := ports.NotificationIntent{
+		Type:               domain.NotificationNeedsInput,
+		SessionID:          rec.ID,
+		ProjectID:          rec.ProjectID,
+		PRURL:              prURL,
+		CreatedAt:          m.clock(),
+		SessionDisplayName: rec.DisplayName,
+		PRNumber:           obs.PR.Number,
+		PRTitle:            obs.PR.Title,
+		PRSourceBranch:     obs.PR.SourceBranch,
+		PRTargetBranch:     obs.PR.TargetBranch,
+		Provider:           obs.Provider,
+		Repo:               obs.Repo,
+	}
+	if err := m.notifications.Notify(ctx, intent); err != nil {
+		persistErr := record(blocked)
+		return errors.Join(fmt.Errorf("lifecycle: review round-cap notification: %w", err), persistErr)
+	}
+	if err := m.parkReviewRoundCapSession(ctx, id); err != nil {
+		return err
+	}
+	return record(reviewBacklogOutcome{Outcome: reviewBacklogNotified, Reason: reviewRoundCapNotificationFailed})
+}
+
+func (m *Manager) parkReviewRoundCapSession(ctx context.Context, id domain.SessionID) error {
+	return m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
+		if cur.IsTerminated || cur.Activity.State.NeedsInput() {
+			return cur, false
+		}
+		cur.Activity = domain.Activity{State: domain.ActivityWaitingInput, LastActivityAt: now}
+		return cur, true
+	})
 }
 
 // pendingNudge is one actionable PR nudge queued by ApplyPRObservation. Queuing
@@ -792,6 +892,11 @@ func (m *Manager) loadPRSignaturesLocked(ctx context.Context, prURL string) erro
 			m.react.attempts[k] = v
 		}
 	}
+	for k, v := range p.Handoffs {
+		if _, ok := m.react.handoffs[k]; !ok {
+			m.react.handoffs[k] = v
+		}
+	}
 	return nil
 }
 
@@ -800,7 +905,7 @@ func (m *Manager) loadPRSignaturesLocked(ctx context.Context, prURL string) erro
 // hold m.react.mu. A failed persist surfaces upward so the in-memory mutation
 // (which the messenger already acted on) is not silently divergent from disk.
 func (m *Manager) persistPRSignaturesLocked(ctx context.Context, prURL string) error {
-	payload := reactionPayload{Seen: map[string]string{}, Attempts: map[string]int{}}
+	payload := reactionPayload{Seen: map[string]string{}, Attempts: map[string]int{}, Handoffs: map[string]reviewBacklogOutcome{}}
 	for k, v := range m.react.seen {
 		if reactionKeyTargetsPR(k, prURL) {
 			payload.Seen[k] = v
@@ -809,6 +914,11 @@ func (m *Manager) persistPRSignaturesLocked(ctx context.Context, prURL string) e
 	for k, v := range m.react.attempts {
 		if reactionKeyTargetsPR(k, prURL) {
 			payload.Attempts[k] = v
+		}
+	}
+	for k, v := range m.react.handoffs {
+		if reactionKeyTargetsPR(k, prURL) {
+			payload.Handoffs[k] = v
 		}
 	}
 	raw, err := json.Marshal(payload)

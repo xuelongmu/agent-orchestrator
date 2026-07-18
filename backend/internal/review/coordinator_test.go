@@ -2,6 +2,7 @@ package review
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -9,6 +10,22 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
+
+type fakeRoundCapHandoff struct {
+	calls int
+	err   error
+	id    domain.SessionID
+	obs   ports.SCMObservation
+	round int
+}
+
+func (f *fakeRoundCapHandoff) ApplyReviewRoundCapHandoff(_ context.Context, id domain.SessionID, obs ports.SCMObservation, round int) error {
+	f.calls++
+	f.id = id
+	f.obs = obs
+	f.round = round
+	return f.err
+}
 
 func reviewObservation(head string) ports.SCMObservation {
 	return ports.SCMObservation{
@@ -289,6 +306,31 @@ func TestCoordinateStopsAfterSixDistinctHeadRounds(t *testing.T) {
 	}
 	if got.Outcome != CoordinateExhausted || got.Round != MaxAutomaticReviewRounds || launcher.spawnCount != 0 || len(store.runs) != MaxAutomaticReviewRounds {
 		t.Fatalf("coordinate = %+v launcher=%+v runs=%+v", got, launcher, store.runs)
+	}
+}
+
+func TestCoordinateRoundCapHandoffFailureRemainsRetryable(t *testing.T) {
+	runs := make([]domain.ReviewRun, 0, MaxAutomaticReviewRounds)
+	for i := 1; i <= MaxAutomaticReviewRounds; i++ {
+		runs = append(runs, reviewRun(
+			fmt.Sprintf("run-%d", i), fmt.Sprintf("sha%d", i),
+			domain.ReviewRunDelivered, domain.VerdictChangesRequested, "[P1] still broken",
+		))
+	}
+	store := &fakeStore{runs: runs}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha7"), fakeProjects{}, &fakeLauncher{})
+	handoff := &fakeRoundCapHandoff{err: errors.New("notification unavailable")}
+	eng.roundCapHandoff = handoff
+	obs := reviewObservation("sha7")
+
+	if _, err := eng.Coordinate(context.Background(), "mer-1", obs); !errors.Is(err, handoff.err) {
+		t.Fatalf("Coordinate error = %v, want handoff failure", err)
+	}
+	if _, err := eng.Coordinate(context.Background(), "mer-1", obs); !errors.Is(err, handoff.err) {
+		t.Fatalf("Coordinate retry error = %v, want handoff failure", err)
+	}
+	if handoff.calls != 2 || handoff.id != "mer-1" || handoff.obs.PR.HeadSHA != "sha7" || handoff.round != MaxAutomaticReviewRounds {
+		t.Fatalf("handoff calls = %+v, want two exact-head attempts", handoff)
 	}
 }
 
