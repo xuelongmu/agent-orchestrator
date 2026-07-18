@@ -70,6 +70,9 @@ UPDATE sessions SET display_name = ?, updated_at = ? WHERE id = ?;
 -- trigger and the desktop browser panel re-navigates / refreshes.
 UPDATE sessions SET preview_url = ?, preview_revision = preview_revision + 1, updated_at = ? WHERE id = ?;
 
+-- name: SetClaimedPRBranch :exec
+UPDATE sessions SET branch = ?, updated_at = ? WHERE id = ?;
+
 -- name: SessionIsSeed :one
 -- SessionIsSeed reports whether the session id matches a row still in seed
 -- state (see DeleteSeedSession for the conditions). Callers probe with this

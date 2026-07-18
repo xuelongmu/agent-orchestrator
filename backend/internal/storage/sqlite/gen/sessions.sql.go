@@ -319,6 +319,21 @@ func (q *Queries) SessionIsSeed(ctx context.Context, id domain.SessionID) (bool,
 	return is_seed, err
 }
 
+const setClaimedPRBranch = `-- name: SetClaimedPRBranch :exec
+UPDATE sessions SET branch = ?, updated_at = ? WHERE id = ?
+`
+
+type SetClaimedPRBranchParams struct {
+	Branch    string
+	UpdatedAt time.Time
+	ID        domain.SessionID
+}
+
+func (q *Queries) SetClaimedPRBranch(ctx context.Context, arg SetClaimedPRBranchParams) error {
+	_, err := q.db.ExecContext(ctx, setClaimedPRBranch, arg.Branch, arg.UpdatedAt, arg.ID)
+	return err
+}
+
 const setPendingSubmit = `-- name: SetPendingSubmit :execrows
 UPDATE sessions SET
     pending_submit_fingerprint = ?, pending_submit_recovery_attempted = FALSE,

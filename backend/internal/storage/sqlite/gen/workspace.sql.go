@@ -130,6 +130,22 @@ func (q *Queries) ListWorkspaceRepos(ctx context.Context, projectID domain.Proje
 	return items, nil
 }
 
+const setClaimedPRRootWorktreeBranch = `-- name: SetClaimedPRRootWorktreeBranch :exec
+UPDATE session_worktrees
+SET branch = ?
+WHERE session_id = ? AND repo_name = '__root__'
+`
+
+type SetClaimedPRRootWorktreeBranchParams struct {
+	Branch    string
+	SessionID domain.SessionID
+}
+
+func (q *Queries) SetClaimedPRRootWorktreeBranch(ctx context.Context, arg SetClaimedPRRootWorktreeBranchParams) error {
+	_, err := q.db.ExecContext(ctx, setClaimedPRRootWorktreeBranch, arg.Branch, arg.SessionID)
+	return err
+}
+
 const upsertSessionWorktree = `-- name: UpsertSessionWorktree :exec
 INSERT INTO session_worktrees (session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state)
 VALUES (?, ?, ?, ?, ?, ?, ?)

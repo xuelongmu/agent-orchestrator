@@ -952,18 +952,31 @@ func TestSpawnOrchestratorVerifiesReplacementHarness(t *testing.T) {
 }
 
 type fakePRClaimer struct {
-	out    errorFreeClaimOutcome
-	err    error
-	called *bool
+	out             errorFreeClaimOutcome
+	preflightErr    error
+	err             error
+	preflightCalled *bool
+	called          *bool
+	workspaceBranch *string
 }
 
 type errorFreeClaimOutcome struct {
 	ports.ClaimOutcome
 }
 
-func (f fakePRClaimer) ClaimPR(context.Context, domain.PullRequest, []domain.PullRequestCheck, []domain.PullRequestReview, []domain.PullRequestReviewThread, []domain.PullRequestComment, ports.ReviewWriteMode, bool) (ports.ClaimOutcome, error) {
+func (f fakePRClaimer) CheckPRClaim(context.Context, string, domain.SessionID, bool) (ports.ClaimOutcome, error) {
+	if f.preflightCalled != nil {
+		*f.preflightCalled = true
+	}
+	return f.out.ClaimOutcome, f.preflightErr
+}
+
+func (f fakePRClaimer) ClaimPR(_ context.Context, _ domain.PullRequest, _ []domain.PullRequestCheck, _ []domain.PullRequestReview, _ []domain.PullRequestReviewThread, _ []domain.PullRequestComment, _ ports.ReviewWriteMode, _ bool, workspaceBranch string) (ports.ClaimOutcome, error) {
 	if f.called != nil {
 		*f.called = true
+	}
+	if f.workspaceBranch != nil {
+		*f.workspaceBranch = workspaceBranch
 	}
 	return f.out.ClaimOutcome, f.err
 }
@@ -975,6 +988,8 @@ type fakeSCM struct {
 	reviewErr       error
 	checkoutChanged bool
 	checkoutErr     error
+	checkoutCalled  *bool
+	checkoutBranch  *string
 }
 
 func (f fakeSCM) ParseRepository(remote string) (ports.SCMRepo, bool) {
@@ -999,8 +1014,37 @@ func (f fakeSCM) FetchReviewThreads(context.Context, ports.SCMPRRef) (ports.SCMR
 	return f.review, f.reviewErr
 }
 
-func (f fakeSCM) CheckoutPullRequest(context.Context, ports.SCMPRRef, ports.SCMPRObservation, string) (bool, error) {
+func (f fakeSCM) CheckoutPullRequest(_ context.Context, _ ports.SCMPRRef, _ ports.SCMPRObservation, _ string, workspaceBranch string) (bool, error) {
+	if f.checkoutCalled != nil {
+		*f.checkoutCalled = true
+	}
+	if f.checkoutBranch != nil {
+		*f.checkoutBranch = workspaceBranch
+	}
 	return f.checkoutChanged, f.checkoutErr
+}
+
+func TestClaimPRPreflightsActiveOwnerBeforeCheckout(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws"}}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+	preflightCalled, checkoutCalled := false, false
+	svc := NewWithDeps(Deps{
+		Store:     st,
+		PRClaimer: fakePRClaimer{preflightCalled: &preflightCalled, preflightErr: ports.PRClaimedByActiveSessionError{Owner: "mer-2"}},
+		SCM: fakeSCM{
+			obs:            ports.SCMObservation{Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/repo", PR: ports.SCMPRObservation{URL: "https://github.com/acme/repo/pull/7", Number: 7, SourceBranch: "fix/exact-head", HeadSHA: "abc123"}},
+			checkoutCalled: &checkoutCalled,
+		},
+	})
+
+	_, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: false})
+	if !errors.Is(err, ports.ErrPRClaimedByActiveSession) {
+		t.Fatalf("err = %v, want active owner conflict", err)
+	}
+	if !preflightCalled || checkoutCalled {
+		t.Fatalf("preflight called = %v, checkout called = %v", preflightCalled, checkoutCalled)
+	}
 }
 
 func TestClaimPRChecksOutExactHeadBeforePersistingClaim(t *testing.T) {
@@ -1026,6 +1070,29 @@ func TestClaimPRChecksOutExactHeadBeforePersistingClaim(t *testing.T) {
 	}
 	if claimCalled {
 		t.Fatal("PR claim was persisted after checkout verification failed")
+	}
+}
+
+func TestClaimPRUsesAndPersistsSessionPrivateBranch(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws"}}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+	var checkoutBranch, persistedBranch string
+	svc := NewWithDeps(Deps{
+		Store:     st,
+		PRClaimer: fakePRClaimer{workspaceBranch: &persistedBranch},
+		SCM: fakeSCM{
+			obs:             ports.SCMObservation{Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/repo", PR: ports.SCMPRObservation{URL: "https://github.com/acme/repo/pull/7", Number: 7, SourceBranch: "fix/exact-head", HeadSHA: "abc123"}},
+			checkoutChanged: true,
+			checkoutBranch:  &checkoutBranch,
+		},
+	})
+
+	if _, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true}); err != nil {
+		t.Fatal(err)
+	}
+	if checkoutBranch != "ao/claim/mer-1/pr-7/root" || persistedBranch != checkoutBranch {
+		t.Fatalf("checkout branch = %q, persisted branch = %q", checkoutBranch, persistedBranch)
 	}
 }
 

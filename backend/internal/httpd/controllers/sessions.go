@@ -632,6 +632,7 @@ func parseSessionListFilter(r *http.Request) (sessionsvc.ListFilter, error) {
 
 func writeSessionPRError(w http.ResponseWriter, r *http.Request, err error) {
 	var claimed ports.PRClaimedByActiveSessionError
+	var checkout ports.PRCheckoutError
 	switch {
 	case errors.Is(err, sessionsvc.ErrInvalidPRRef):
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_PR_REF", "PR reference must be a github.com PR URL or a number", nil)
@@ -641,6 +642,14 @@ func writeSessionPRError(w http.ResponseWriter, r *http.Request, err error) {
 		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PR_NOT_OPEN", "PR is not open", nil)
 	case errors.As(err, &claimed):
 		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PR_CLAIMED_BY_ACTIVE_SESSION", "PR is already claimed by active session "+string(claimed.Owner)+" (omit --no-takeover to steal)", map[string]any{"ownerSessionId": string(claimed.Owner)})
+	case errors.As(err, &checkout) && checkout.Kind == ports.PRCheckoutWorkspaceDirty:
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PR_CLAIM_WORKSPACE_DIRTY", "Session workspace has uncommitted changes; commit, stash, or discard them before claiming this PR", map[string]any{"workspaceBranch": checkout.Branch})
+	case errors.As(err, &checkout) && checkout.Kind == ports.PRCheckoutHeadMismatch:
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PR_CLAIM_HEAD_MISMATCH", "PR head changed during checkout; retry the claim", map[string]any{"expectedHead": checkout.ExpectedHead, "actualHead": checkout.ActualHead})
+	case errors.As(err, &checkout) && checkout.Kind == ports.PRCheckoutBranchDiverged:
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PR_CLAIM_LOCAL_COMMITS", "Claim branch has local commits that would be discarded; push or preserve them before retrying", map[string]any{"workspaceBranch": checkout.Branch, "expectedHead": checkout.ExpectedHead, "actualHead": checkout.ActualHead})
+	case errors.As(err, &checkout):
+		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "PR_CLAIM_CHECKOUT_FAILED", "Could not prepare the session workspace for this PR; verify GitHub CLI access and retry", map[string]any{"workspaceBranch": checkout.Branch})
 	case errors.Is(err, sessionsvc.ErrSessionNotClaimable):
 		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "SESSION_NOT_CLAIMABLE", "Session cannot claim PRs", nil)
 	case errors.Is(err, sessionsvc.ErrSessionNoWorkspace):

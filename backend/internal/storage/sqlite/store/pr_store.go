@@ -48,24 +48,25 @@ func (s *Store) WriteSCMObservation(ctx context.Context, pr domain.PullRequest, 
 	return s.writePR(ctx, pr, checks, reviews, threads, comments, reviewMode, false)
 }
 
+// CheckPRClaim applies the active-owner guard without changing PR ownership.
+func (s *Store) CheckPRClaim(ctx context.Context, prURL string, claimant domain.SessionID, allowActiveTakeover bool) (ports.ClaimOutcome, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return checkPRClaim(ctx, s.qr, prURL, claimant, allowActiveTakeover)
+}
+
 // ClaimPR moves (or creates) a PR row to pr.SessionID and applies the live SCM
-// observation in the same transaction. The session_id update is what fires the
-// pr_session_changed CDC trigger added in migration 0005.
-func (s *Store) ClaimPR(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ports.ReviewWriteMode, allowActiveTakeover bool) (ports.ClaimOutcome, error) {
+// observation and claimant branch metadata in the same transaction. The
+// session_id update fires the pr_session_changed CDC trigger from migration 0005.
+func (s *Store) ClaimPR(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ports.ReviewWriteMode, allowActiveTakeover bool, workspaceBranch string) (ports.ClaimOutcome, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	var outcome ports.ClaimOutcome
 	err := s.inTx(ctx, "claim pr", func(q *gen.Queries) error {
-		owner, err := q.GetPRClaimAndOwner(ctx, pr.URL)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		var err error
+		outcome, err = checkPRClaim(ctx, q, pr.URL, pr.SessionID, allowActiveTakeover)
+		if err != nil {
 			return err
-		}
-		if err == nil {
-			outcome.PreviousOwner = owner.SessionID
-			outcome.OwnerTerminated = owner.IsTerminated
-			if owner.SessionID != pr.SessionID && !owner.IsTerminated && !allowActiveTakeover {
-				return ports.PRClaimedByActiveSessionError{Owner: owner.SessionID}
-			}
 		}
 		if err := q.ClaimPRForSession(ctx, gen.ClaimPRForSessionParams{
 			URL: pr.URL, SessionID: pr.SessionID, Number: int64(pr.Number), PRState: prState(pr),
@@ -73,9 +74,35 @@ func (s *Store) ClaimPR(ctx context.Context, pr domain.PullRequest, checks []dom
 		}); err != nil {
 			return err
 		}
-		return writePRRows(ctx, q, pr, checks, reviews, threads, comments, reviewMode, false, false)
+		if err := writePRRows(ctx, q, pr, checks, reviews, threads, comments, reviewMode, false, false); err != nil {
+			return err
+		}
+		if workspaceBranch != "" {
+			if err := q.SetClaimedPRBranch(ctx, gen.SetClaimedPRBranchParams{Branch: workspaceBranch, UpdatedAt: pr.UpdatedAt, ID: pr.SessionID}); err != nil {
+				return err
+			}
+			if err := q.SetClaimedPRRootWorktreeBranch(ctx, gen.SetClaimedPRRootWorktreeBranchParams{Branch: workspaceBranch, SessionID: pr.SessionID}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	return outcome, err
+}
+
+func checkPRClaim(ctx context.Context, q *gen.Queries, prURL string, claimant domain.SessionID, allowActiveTakeover bool) (ports.ClaimOutcome, error) {
+	owner, err := q.GetPRClaimAndOwner(ctx, prURL)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ports.ClaimOutcome{}, nil
+	}
+	if err != nil {
+		return ports.ClaimOutcome{}, err
+	}
+	outcome := ports.ClaimOutcome{PreviousOwner: owner.SessionID, OwnerTerminated: owner.IsTerminated}
+	if owner.SessionID != claimant && !owner.IsTerminated && !allowActiveTakeover {
+		return outcome, ports.PRClaimedByActiveSessionError{Owner: owner.SessionID}
+	}
+	return outcome, nil
 }
 
 func (s *Store) writePR(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ports.ReviewWriteMode, replaceLegacyComments bool) error {
