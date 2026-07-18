@@ -315,7 +315,8 @@ describe("POST /api/notify-callback/[token]", () => {
 
   it("applies when the decision nonce matches the reported decision instant", async () => {
     const at = new Date().toISOString();
-    get.mockResolvedValueOnce(makeSession({ metadata: reportMeta(at) }));
+    const session = makeSession({ metadata: reportMeta(at) });
+    get.mockResolvedValueOnce(session).mockResolvedValueOnce(session);
     const res = await callGet(token("approve", { nonce: identityFor(at) }));
     expect(res.status).toBe(200);
     expect(send).toHaveBeenCalledWith("ao-5", NOTIFY_CALLBACK_MESSAGES.approve, "ao");

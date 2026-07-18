@@ -2783,13 +2783,13 @@ describe("reactions", () => {
     // path owns the ping. That path must bind the mutating buttons to the SAME
     // snapshot identity, exactly like the transition and fallback callers — a
     // superseding report during notify's async get() must not repoint them.
-    const reportNeedsInputReaction = {
+    const reportNeedsInputReaction = (): OrchestratorConfig => ({
       ...config,
       reactions: {
         "report-needs-input": { action: "notify" as const, auto: true, priority: "urgent" as const },
       },
       notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
-    };
+    });
 
     it("executeReaction omits buttons when a superseding report changes the identity during delivery (B→C)", async () => {
       const cap = capturingNotifier();
@@ -2803,7 +2803,7 @@ describe("reactions", () => {
       const lm = setupCheck("app-1", {
         session: decisionSession("2025-01-01T11:55:00.000Z", "2025-01-01T11:50:00.000Z"),
         registry,
-        configOverride: reportNeedsInputReaction,
+        configOverride: reportNeedsInputReaction(),
       });
 
       const sessionB = (await mockSessionManager.get("app-1"))!;
@@ -2838,7 +2838,7 @@ describe("reactions", () => {
       const lm = setupCheck("app-1", {
         session: sessionB,
         registry,
-        configOverride: reportNeedsInputReaction,
+        configOverride: reportNeedsInputReaction(),
       });
       vi.mocked(mockSessionManager.get).mockResolvedValue(sessionB);
 
