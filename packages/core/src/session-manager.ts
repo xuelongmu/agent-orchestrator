@@ -1460,8 +1460,6 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
             `Cannot stack session on parent "${parentSessionId}": parent not found`,
           );
         }
-        stackBaseRepoPath = parentRecord?.raw["worktree"] || undefined;
-
         if (spawnConfig.baseRef && !options?.reuseIdentity) {
           // Explicit override on a fresh spawn: `SessionSpawnConfig.baseRef` is
           // derived from `parentSessionId` only when omitted, so honor a
@@ -1470,6 +1468,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           // baseRef, not a fresh user choice, so it re-resolves below instead.
           stackBaseBranch = spawnConfig.baseRef;
         } else {
+          // Parent-derived bases may exist only in the parent's workspace until
+          // they are pushed. Explicit overrides, however, retain the historical
+          // project-checkout lookup so a project-local branch still works.
+          stackBaseRepoPath = parentRecord?.raw["worktree"] || undefined;
           // Re-resolve the base from the parent's CURRENT lifecycle — never replay
           // a stale persisted `baseRef`. A held child carries `baseRef` = parent
           // branch, but by the time it unblocks the parent has usually merged;

@@ -105,7 +105,9 @@ describe("spawn", () => {
 
     const createCfg = vi.mocked(mockWorkspace.create).mock.calls[0]![0];
     expect(createCfg.baseRef).toBe("custom/base");
-    expect(createCfg.baseRepoPath).toBe("/tmp/ws");
+    // Explicit bases retain the project-checkout lookup. Only a base derived
+    // from the parent should be probed in the parent's workspace.
+    expect(createCfg.baseRepoPath).toBeUndefined();
   });
 
   it("rejects an unknown parent even when a fresh spawn supplies baseRef (#66)", async () => {

@@ -4624,9 +4624,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         ? {
             lifecycle: parent.lifecycle,
             branch: parent.branch,
-            // Prefer the live PR base, then its durable metadata copy, before the
-            // spawn-time baseRef fallback.
+            // Prefer the current poll's GraphQL base. Metadata is persisted only
+            // after all checks finish, so parent.pr may still contain the prior
+            // poll's value while a child is being retargeted.
             ownBase:
+              (parent.pr
+                ? prEnrichmentCache.get(
+                    `${parent.pr.owner}/${parent.pr.repo}#${parent.pr.number}`,
+                  )?.baseBranch
+                : undefined) ||
               parent.pr?.baseBranch ||
               parent.metadata["prBaseBranch"] ||
               parent.metadata["baseRef"],
@@ -4732,6 +4738,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       updateSessionMetadata(child, { prBaseBranch: targetBase });
       for (const pr of child.prs) {
         pr.baseBranch = targetBase;
+        // pollAll() persists this cache after every check. Keep it aligned with
+        // the verified SCM edit so the stale pre-check enrichment cannot undo
+        // the new base in metadata or in memory during the same poll.
+        const cached = prEnrichmentCache.get(`${pr.owner}/${pr.repo}#${pr.number}`);
+        if (cached) cached.baseBranch = targetBase;
       }
       if (child.pr) child.pr.baseBranch = targetBase;
     }

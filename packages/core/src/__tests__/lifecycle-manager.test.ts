@@ -8554,6 +8554,112 @@ describe("stacked child retarget + rebase on parent merge (#11)", () => {
     );
   });
 
+  it("uses fresh poll bases and does not overwrite a retarget with stale enrichment (#75)", async () => {
+    vi.useFakeTimers();
+    let lm: ReturnType<typeof createLifecycleManager> | undefined;
+    try {
+      const parentPr = makeMatchingPR({
+        number: 100,
+        url: "https://github.com/org/my-app/pull/100",
+        branch: "feat/parent",
+        baseBranch: "feat/stale-grandparent",
+      });
+      const parent = makeSession({
+        id: "app-1",
+        status: "approved",
+        branch: "feat/parent",
+        pr: parentPr,
+        metadata: {
+          agent: "mock-agent",
+          baseRef: "feat/stale-grandparent",
+          prBaseBranch: "feat/stale-grandparent",
+        },
+      });
+      // Keep the parent eligible for this poll while representing a merge that
+      // was already known before the fresh GraphQL enrichment arrived.
+      parent.lifecycle.pr.state = "merged";
+      parent.lifecycle.pr.reason = "merged";
+      const child = makeChild();
+
+      const retargetPR = vi.fn().mockResolvedValue("retargeted");
+      const enrichSessionsPRBatch = vi.fn().mockResolvedValue(
+        new Map([
+          [
+            "org/my-app#100",
+            {
+              state: "merged",
+              ciStatus: "none",
+              reviewDecision: "none",
+              mergeable: false,
+              baseBranch: "release/actual-base",
+            },
+          ],
+          [
+            "org/my-app#200",
+            {
+              state: "open",
+              ciStatus: "passing",
+              reviewDecision: "none",
+              mergeable: false,
+              baseBranch: "feat/parent",
+            },
+          ],
+        ]),
+      );
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        scm: createMockSCM({ enrichSessionsPRBatch, retargetPR }),
+      });
+      vi.mocked(mockSessionManager.list).mockResolvedValue([parent, child]);
+      vi.mocked(mockSessionManager.get).mockImplementation(async (id: string) =>
+        id === parent.id ? parent : id === child.id ? child : null,
+      );
+      writeMetadata(env.sessionsDir, parent.id, {
+        worktree: "/tmp/parent",
+        branch: parent.branch ?? "feat/parent",
+        status: parent.status,
+        lifecycle: parent.lifecycle,
+        project: "my-app",
+        agent: "mock-agent",
+        pr: parentPr.url,
+        baseRef: "feat/stale-grandparent",
+        prBaseBranch: "feat/stale-grandparent",
+      });
+      writeMetadata(env.sessionsDir, child.id, {
+        worktree: "/tmp/child",
+        branch: child.branch ?? "feat/child",
+        status: child.status,
+        lifecycle: child.lifecycle,
+        project: "my-app",
+        agent: "mock-agent",
+        pr: childPr.url,
+        parentSessionId: parent.id,
+        baseRef: "feat/parent",
+      });
+
+      lm = createLifecycleManager({ config, registry, sessionManager: mockSessionManager });
+      lm.start(60_000);
+      await vi.advanceTimersByTimeAsync(0);
+      lm.stop();
+
+      expect(retargetPR).toHaveBeenCalledWith(
+        childPr,
+        "release/actual-base",
+        "feat/parent",
+      );
+      // pollAll persists its pre-check cache after retargeting. The verified new
+      // base must survive that write both durably and in the live session.
+      expect(readMetadataRaw(env.sessionsDir, child.id)?.["prBaseBranch"]).toBe(
+        "release/actual-base",
+      );
+      expect(child.pr?.baseBranch).toBe("release/actual-base");
+    } finally {
+      lm?.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("waits (no-op) while the parent PR is still open", async () => {
     const retargetPR = vi.fn().mockResolvedValue(undefined);
     const parent = makeSession({ id: "app-1", status: "review_pending", branch: "feat/parent" });
