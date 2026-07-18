@@ -20,11 +20,15 @@ import (
 
 const reviewMaxNudge = 3
 const mergeConflictMaxNudge = 1
+const idleReviewMaxNudges = 3
 
 const reviewRoundCapNotificationFailed = "review-round-cap-notification-failed"
 const suppressedNudgeNotificationFailed = "suppressed-nudge-notification-failed"
 const reviewNudgeSendFailed = "review-nudge-send-failed"
 const reviewFetchFailed = "review-fetch-failed"
+const idleReviewUndeliverable = "idle-review-undeliverable"
+const idleReviewNudgeFailed = "idle-review-nudge-failed"
+const idleReviewNudgeExhausted = "idle-review-nudge-exhausted"
 
 type humanHandoffOutcomeKind string
 
@@ -436,7 +440,222 @@ func (m *Manager) ApplySCMReviewFetchFailure(ctx context.Context, id domain.Sess
 	if err != nil || !eligible {
 		return err
 	}
-	return m.deliverReviewFailureHandoffLocked(ctx, rec, o, "review:"+prURL, failureSig, reviewFetchFailed)
+	return m.deliverReviewFailureHandoffLocked(ctx, rec, o, reviewFetchFailed)
+}
+
+// ApplyIdleReviewSnapshot is the single deferral decision for an idle worker
+// with a freshly fetched review backlog. The observer calls it only for a
+// semantically unchanged snapshot: a changed snapshot first belongs to the
+// normal review dispatcher, and the next forced idle refresh can safely decide
+// whether that delivery made progress.
+//
+// A human handoff is deferred only when the worker is positively idle beyond
+// the activity window, the review snapshot is complete, actionable comments
+// are present, the normal review delivery is durably proven, the reminder
+// reaches the worker, and its bounded budget remains. Every uncertainty is a
+// durable one-time handoff for this idle episode.
+func (m *Manager) ApplyIdleReviewSnapshot(ctx context.Context, id domain.SessionID, o ports.SCMObservation) error {
+	prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
+	if !o.Fetched || prURL == "" || o.PR.Merged || o.PR.Closed {
+		return nil
+	}
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return err
+	}
+
+	m.react.mu.Lock()
+	defer m.react.mu.Unlock()
+	if !m.react.loaded[prURL] {
+		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+			return err
+		}
+		m.react.loaded[prURL] = true
+	}
+
+	idleBeyondWindow := !rec.IsTerminated && rec.Activity.State == domain.ActivityIdle &&
+		m.clock().Sub(rec.Activity.LastActivityAt) >= m.window
+	allUnresolved := unresolvedSCMReviewThreads(o.Review.Threads)
+	if !idleBeyondWindow || (!o.Review.Partial && allUnresolved == 0) {
+		return m.clearIdleReviewEpisodeLocked(ctx, prURL)
+	}
+	if rec.IsTerminated || rec.Activity.State.NeedsInput() {
+		return nil
+	}
+
+	episodeKey := idleReviewEpisodeKey(prURL, rec.Activity.LastActivityAt)
+	handoffKey, err := m.canonicalIdleReviewHandoffLocked(ctx, prURL, rec.Activity.LastActivityAt)
+	if err != nil {
+		return err
+	}
+	if prior := m.react.handoffs[handoffKey]; prior.Outcome == humanHandoffNotified {
+		return nil
+	}
+	prObs := scmToPRObservation(o)
+	actionable := unresolvedReviewComments(prObs.Comments)
+	actionableSig := reviewCommentsSignature(actionable)
+	deliveredSig := m.react.seen["review:"+prURL]
+
+	handoff := func(reason string) error {
+		body := "The idle agent could not be safely reminded about its pull request review backlog. Open the pull request and review the outstanding feedback."
+		if reason == idleReviewNudgeExhausted {
+			body = fmt.Sprintf("The agent remains idle with unresolved pull request feedback after %d automated reminder(s). Human review is needed.", idleReviewMaxNudges)
+		}
+		intent := ports.NotificationIntent{
+			Type:               domain.NotificationNeedsInput,
+			SessionID:          rec.ID,
+			ProjectID:          rec.ProjectID,
+			PRURL:              prURL,
+			CreatedAt:          m.clock(),
+			TitleOverride:      "Idle PR review backlog needs attention",
+			BodyOverride:       body,
+			SessionDisplayName: rec.DisplayName,
+			PRNumber:           o.PR.Number,
+			PRTitle:            o.PR.Title,
+			PRSourceBranch:     o.PR.SourceBranch,
+			PRTargetBranch:     o.PR.TargetBranch,
+			Provider:           o.Provider,
+			Repo:               o.Repo,
+		}
+		return m.deliverHumanHandoffLocked(ctx, prURL, handoffKey, reason, intent, nil)
+	}
+
+	// A partial page cannot prove the backlog is complete. Likewise, a backlog
+	// with no sendable human-authored comment, or one lacking proof of a prior
+	// real delivery, cannot justify suppressing the human alert.
+	if rec.FirstSignalAt.IsZero() || o.Review.Partial || allUnresolved == 0 || actionableSig == "" ||
+		!reviewSignatureCovers(deliveredSig, actionableSig) || m.guard == nil {
+		return handoff(idleReviewUndeliverable)
+	}
+
+	attempts := m.react.attempts[episodeKey]
+	if attempts >= idleReviewMaxNudges {
+		return handoff(idleReviewNudgeExhausted)
+	}
+	msg := fmt.Sprintf("You still have %d unresolved review comment(s) on %s and appear to be idle. Address them now, push fixes, and resolve each addressed thread.\n\n%s",
+		len(actionable), prIdentity(prObs), formatReviewCommentsMessage(actionable))
+	outcome, sendErr := m.guard.Nudge(ctx, id, msg)
+	if sendErr != nil || outcome != sessionguard.Sent {
+		handoffErr := handoff(idleReviewNudgeFailed)
+		if sendErr != nil {
+			return errors.Join(sendErr, handoffErr)
+		}
+		return handoffErr
+	}
+	m.react.attempts[episodeKey] = attempts + 1
+	return m.persistPRSignaturesLocked(ctx, prURL)
+}
+
+func unresolvedSCMReviewThreads(threads []ports.SCMReviewThreadObservation) int {
+	n := 0
+	for _, th := range threads {
+		if !th.Resolved {
+			n++
+		}
+	}
+	return n
+}
+
+func reviewSignatureCovers(delivered, current string) bool {
+	if delivered == "" || current == "" {
+		return false
+	}
+	deliveredVersion, delivered := splitReviewSignatureVersion(delivered)
+	currentVersion, current := splitReviewSignatureVersion(current)
+	if deliveredVersion != currentVersion {
+		return false
+	}
+	covered := make(map[string]struct{})
+	for _, part := range strings.Split(delivered, "\x01") {
+		covered[part] = struct{}{}
+	}
+	for _, part := range strings.Split(current, "\x01") {
+		if _, ok := covered[part]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func splitReviewSignatureVersion(sig string) (string, string) {
+	if rest, ok := strings.CutPrefix(sig, "v2:"); ok {
+		return "v2", rest
+	}
+	return "v1", sig
+}
+
+func idleReviewEpisodeKey(prURL string, idleSince time.Time) string {
+	sum := sha256.Sum256([]byte(idleSince.UTC().Format(time.RFC3339Nano)))
+	return fmt.Sprintf("idle-review:%s:%x", prURL, sum)
+}
+
+func idleReviewHandoffKey(prURL string, idleSince time.Time) string {
+	sum := sha256.Sum256([]byte(idleSince.UTC().Format(time.RFC3339Nano)))
+	return fmt.Sprintf("idle-review-handoff:%s:%x", prURL, sum)
+}
+
+func (m *Manager) clearIdleReviewEpisodeLocked(ctx context.Context, prURL string) error {
+	if !m.clearIdleReviewPRStateLocked(prURL) {
+		return nil
+	}
+	return m.persistPRSignaturesLocked(ctx, prURL)
+}
+
+// clearIdleReviewStateForSession is called directly by the authoritative
+// activity reducer on an idle -> non-idle transition. It prevents stale
+// attempt/handoff episode keys from waiting indefinitely for another SCM
+// refresh and bounds the durable ledger for long-lived sessions.
+func (m *Manager) clearIdleReviewStateForSession(ctx context.Context, id domain.SessionID) error {
+	prs, err := m.store.ListPRsBySession(ctx, id)
+	if err != nil {
+		return err
+	}
+	seen := map[string]struct{}{}
+	var errs []error
+	for _, pr := range prs {
+		prURL := strings.TrimSpace(pr.URL)
+		if prURL == "" {
+			continue
+		}
+		if _, ok := seen[prURL]; ok {
+			continue
+		}
+		seen[prURL] = struct{}{}
+		m.react.mu.Lock()
+		if !m.react.loaded[prURL] {
+			if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+				errs = append(errs, err)
+				m.react.mu.Unlock()
+				continue
+			}
+			m.react.loaded[prURL] = true
+		}
+		if m.clearIdleReviewPRStateLocked(prURL) {
+			errs = append(errs, m.persistPRSignaturesLocked(ctx, prURL))
+		}
+		m.react.mu.Unlock()
+	}
+	return errors.Join(errs...)
+}
+
+// clearIdleReviewPRStateLocked removes only idle/stuck-episode state. Normal
+// review/CI/conflict delivery signatures remain intact. Caller holds react.mu.
+func (m *Manager) clearIdleReviewPRStateLocked(prURL string) bool {
+	changed := false
+	for key := range m.react.attempts {
+		if strings.HasPrefix(key, "idle-review:"+prURL+":") {
+			delete(m.react.attempts, key)
+			changed = true
+		}
+	}
+	for key := range m.react.handoffs {
+		if strings.HasPrefix(key, "idle-review-handoff:"+prURL+":") ||
+			strings.HasPrefix(key, "review-failure:"+prURL+":") {
+			delete(m.react.handoffs, key)
+			changed = true
+		}
+	}
+	return changed
 }
 
 // reviewFetchFailureSignature is the durable identity of an idle PR overlay
@@ -1089,7 +1308,7 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 			}
 			if eligible {
 				obs := ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: prURL}}
-				handoffErr := m.deliverReviewFailureHandoffLocked(ctx, rec, obs, key, sig, reviewNudgeSendFailed)
+				handoffErr := m.deliverReviewFailureHandoffLocked(ctx, rec, obs, reviewNudgeSendFailed)
 				return sendOnceAccounted, errors.Join(err, handoffErr)
 			}
 		}
@@ -1135,10 +1354,12 @@ func (m *Manager) idleReviewFailureSession(ctx context.Context, id domain.Sessio
 	return rec, m.clock().Sub(rec.Activity.LastActivityAt) >= m.window, nil
 }
 
-func (m *Manager) deliverReviewFailureHandoffLocked(ctx context.Context, rec domain.SessionRecord, o ports.SCMObservation, key, sig, reason string) error {
+func (m *Manager) deliverReviewFailureHandoffLocked(ctx context.Context, rec domain.SessionRecord, o ports.SCMObservation, reason string) error {
 	prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
-	sum := sha256.Sum256([]byte(reason + "\x00" + key + "\x00" + sig))
-	handoffKey := fmt.Sprintf("review-failure:%s:%x", prURL, sum)
+	handoffKey, err := m.canonicalIdleReviewHandoffLocked(ctx, prURL, rec.Activity.LastActivityAt)
+	if err != nil {
+		return err
+	}
 	body := "Pull request review feedback could not be delivered to the idle agent. Open the pull request and review the outstanding feedback."
 	if reason == reviewFetchFailed {
 		body = "Pull request review feedback could not be refreshed while the agent is idle. Open the pull request and verify the outstanding review threads."
@@ -1160,6 +1381,43 @@ func (m *Manager) deliverReviewFailureHandoffLocked(ctx context.Context, rec dom
 		Repo:               o.Repo,
 	}
 	return m.deliverHumanHandoffLocked(ctx, prURL, handoffKey, reason, intent, nil)
+}
+
+// canonicalIdleReviewHandoffLocked returns the one per-PR + idle-episode latch
+// shared by successful-snapshot decisions and every fetch/send failure path.
+// It also collapses #111's condition-specific durable keys before either path
+// checks dedup, so upgrade order cannot produce a duplicate notification.
+// Caller holds react.mu and has loaded prURL.
+func (m *Manager) canonicalIdleReviewHandoffLocked(ctx context.Context, prURL string, idleSince time.Time) (string, error) {
+	// Every fetch/send/snapshot failure in one positive idle episode shares this
+	// one latch. Reason/head/signature changes are diagnostic metadata, never a
+	// new permission to notify the human again.
+	handoffKey := idleReviewHandoffKey(prURL, idleSince)
+	// #111 persisted condition-specific latches, and an earlier #52 iteration
+	// added idle time while still keeping the condition in the identity. Migrate
+	// every old per-condition shape for this PR onto the canonical episode key
+	// without duplicating delivery. The old schema had no recoverable episode
+	// identity, so preserving its notified latch is the only fail-safe migration.
+	canonical, canonicalExists := m.react.handoffs[handoffKey]
+	migrated := false
+	for oldKey, legacy := range m.react.handoffs {
+		if !strings.HasPrefix(oldKey, "review-failure:"+prURL+":") {
+			continue
+		}
+		delete(m.react.handoffs, oldKey)
+		if !canonicalExists || (canonical.Outcome != humanHandoffNotified && legacy.Outcome == humanHandoffNotified) {
+			canonical = legacy
+			canonicalExists = true
+		}
+		migrated = true
+	}
+	if migrated {
+		m.react.handoffs[handoffKey] = canonical
+		if err := m.persistPRSignaturesLocked(ctx, prURL); err != nil {
+			return "", err
+		}
+	}
+	return handoffKey, nil
 }
 
 // handoffSuppressedPendingNudgeLocked surfaces a PR condition that could not

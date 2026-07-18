@@ -319,11 +319,15 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	}
 	waitingEvents := m.waitingInputEvents(next, prevState, prevAt, now)
 	m.mu.Unlock()
+	var recoveryErr error
+	if prevState == domain.ActivityIdle && next.Activity.State != domain.ActivityIdle {
+		recoveryErr = m.clearIdleReviewStateForSession(ctx, id)
+	}
 	for _, ev := range waitingEvents {
 		m.emitTelemetry(ctx, ev)
 	}
 	m.emitNotification(ctx, intent)
-	return nil
+	return recoveryErr
 }
 
 // toolFlight tracks one session's in-flight tool executions and the pending

@@ -2196,6 +2196,335 @@ func TestSCMReviewFetchFailureHandsOffObservedOverlayWithoutMutatingDeliveryProo
 	if len(sink.intents) != 1 {
 		t.Fatalf("stale Seen re-alerted a clean current pipeline: %+v", sink.intents)
 	}
+
+	// Recovery followed by a later idle episode must rearm the one-time
+	// fallback even when the provider overlay/signature is otherwise identical.
+	recovered := st.sessions[rec.ID]
+	recovered.Activity = domain.Activity{State: domain.ActivityActive, LastActivityAt: now.Add(3 * time.Minute)}
+	st.sessions[rec.ID] = recovered
+	recovered.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(4 * time.Minute)}
+	st.sessions[rec.ID] = recovered
+	m = New(st, nil, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now.Add(6 * time.Minute) }
+	if err := m.ApplySCMReviewFetchFailure(ctx, rec.ID, obs); err != nil {
+		t.Fatalf("new idle episode fetch fallback: %v", err)
+	}
+	if len(sink.intents) != 2 {
+		t.Fatalf("recovered fetch-failure episode did not rearm: %+v", sink.intents)
+	}
+}
+
+func TestIdleReviewHandoffIsCanonicalAcrossFetchAndSnapshotPathsAfterRestart(t *testing.T) {
+	st := newFakeStore()
+	sink := &fakeNotificationSink{}
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	prURL := "https://github.com/o/r/pull/1"
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	rec.FirstSignalAt = now.Add(-2 * time.Minute)
+	st.sessions[rec.ID] = rec
+	failedFetch := ports.SCMObservation{
+		Fetched:  true,
+		Provider: "github",
+		Repo:     "o/r",
+		PR:       ports.SCMPRObservation{URL: prURL, Number: 1, HeadSHA: "sha1"},
+		Review:   ports.SCMReviewObservation{Decision: string(domain.ReviewChangesRequest), HeadSHA: "sha1"},
+	}
+	m := New(st, nil, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	if err := m.ApplySCMReviewFetchFailure(ctx, rec.ID, failedFetch); err != nil {
+		t.Fatalf("fetch-failure handoff: %v", err)
+	}
+
+	// Restart, then successfully fetch a complete actionable backlog for the
+	// same idle episode. With no agent-delivery proof the snapshot path also
+	// wants a handoff, but it must reuse the fetch path's canonical latch.
+	complete := idleReviewSnapshot(prURL, false, ports.SCMReviewThreadObservation{
+		ID: "t1", Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix"}},
+	})
+	m = New(st, &fakeMessenger{}, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now.Add(time.Minute) }
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, complete); err != nil {
+		t.Fatalf("complete-snapshot handoff: %v", err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("same idle episode notified across both paths: %+v", sink.intents)
+	}
+	var payload reactionPayload
+	if err := json.Unmarshal([]byte(st.signatures[prURL]), &payload); err != nil {
+		t.Fatal(err)
+	}
+	key := idleReviewHandoffKey(prURL, rec.Activity.LastActivityAt)
+	if len(payload.Handoffs) != 1 || payload.Handoffs[key].Outcome != humanHandoffNotified {
+		t.Fatalf("handoffs = %+v, want one canonical notified latch at %q", payload.Handoffs, key)
+	}
+}
+
+func TestIdleReviewSnapshotMigratesLegacyFailureLatchBeforeDedup(t *testing.T) {
+	st := newFakeStore()
+	sink := &fakeNotificationSink{}
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	prURL := "https://github.com/o/r/pull/1"
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	rec.FirstSignalAt = now.Add(-2 * time.Minute)
+	st.sessions[rec.ID] = rec
+	legacy := reactionPayload{Handoffs: map[string]humanHandoffOutcome{
+		"review-failure:" + prURL + ":legacy-condition": {Outcome: humanHandoffNotified, Reason: reviewFetchFailed},
+	}}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.signatures[prURL] = string(raw)
+
+	// The first post-upgrade path is a complete snapshot, not another fetch
+	// failure. It must collapse the old #111 key before checking canonical dedup.
+	complete := idleReviewSnapshot(prURL, false, ports.SCMReviewThreadObservation{
+		ID: "t1", Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix"}},
+	})
+	m := New(st, &fakeMessenger{}, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, complete); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 0 {
+		t.Fatalf("legacy notified latch duplicated on snapshot-first upgrade: %+v", sink.intents)
+	}
+	var got reactionPayload
+	if err := json.Unmarshal([]byte(st.signatures[prURL]), &got); err != nil {
+		t.Fatal(err)
+	}
+	key := idleReviewHandoffKey(prURL, rec.Activity.LastActivityAt)
+	if len(got.Handoffs) != 1 || got.Handoffs[key].Outcome != humanHandoffNotified {
+		t.Fatalf("legacy latch was not collapsed to canonical key %q: %+v", key, got.Handoffs)
+	}
+}
+
+func idleReviewSnapshot(prURL string, partial bool, threads ...ports.SCMReviewThreadObservation) ports.SCMObservation {
+	return ports.SCMObservation{
+		Fetched:  true,
+		Provider: "github",
+		Repo:     "o/r",
+		PR: ports.SCMPRObservation{
+			URL:     prURL,
+			Number:  1,
+			Title:   "idle review backlog",
+			HeadSHA: "sha1",
+		},
+		Review: ports.SCMReviewObservation{
+			Decision: string(domain.ReviewChangesRequest),
+			HeadSHA:  "sha1",
+			Threads:  threads,
+			Partial:  partial,
+		},
+	}
+}
+
+func idleReviewDeliverySignature(obs ports.SCMObservation) string {
+	return reviewCommentsSignature(unresolvedReviewComments(scmToPRObservation(obs).Comments))
+}
+
+func TestReviewSignatureCoversV2ShrinkingBacklogOnly(t *testing.T) {
+	delivered := reviewCommentsSignature([]ports.PRCommentObservation{
+		{ID: "c1", ThreadID: "t1", Author: "alice", File: "a.go", Line: 1, Body: "first"},
+		{ID: "c2", ThreadID: "t2", Author: "bob", File: "b.go", Line: 2, Body: "second"},
+	})
+	remaining := reviewCommentsSignature([]ports.PRCommentObservation{
+		{ID: "c2", ThreadID: "t2", Author: "bob", File: "b.go", Line: 2, Body: "second"},
+	})
+	if !reviewSignatureCovers(delivered, remaining) {
+		t.Fatal("v2 delivery proof must cover a shrinking, unchanged backlog")
+	}
+	edited := reviewCommentsSignature([]ports.PRCommentObservation{
+		{ID: "c2", ThreadID: "t2", Author: "bob", File: "b.go", Line: 2, Body: "revised"},
+	})
+	if reviewSignatureCovers(delivered, edited) {
+		t.Fatal("v2 delivery proof must not cover edited actionable content")
+	}
+}
+
+func TestIdleReviewSnapshot_DeliveredNudgesDeferUntilBudgetExhausted(t *testing.T) {
+	st := newFakeStore()
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{}
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	rec.FirstSignalAt = now.Add(-2 * time.Minute)
+	st.sessions[rec.ID] = rec
+	prURL := "https://github.com/o/r/pull/1"
+	obs := idleReviewSnapshot(prURL, false, ports.SCMReviewThreadObservation{
+		ID: "t1", Path: "a.go", Line: 9,
+		Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix this"}},
+	})
+	delivered := reactionPayload{Seen: map[string]string{"review:" + prURL: idleReviewDeliverySignature(obs)}}
+	raw, err := json.Marshal(delivered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.signatures[prURL] = string(raw)
+	m := New(st, msg, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+
+	for i := 0; i < idleReviewMaxNudges; i++ {
+		if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, obs); err != nil {
+			t.Fatalf("nudge %d: %v", i+1, err)
+		}
+		if len(sink.intents) != 0 {
+			t.Fatalf("nudge %d notified before budget exhaustion: %+v", i+1, sink.intents)
+		}
+	}
+	if got := len(msg.msgs); got != idleReviewMaxNudges {
+		t.Fatalf("agent nudges = %d, want %d", got, idleReviewMaxNudges)
+	}
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, obs); err != nil {
+		t.Fatalf("exhaustion handoff: %v", err)
+	}
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, obs); err != nil {
+		t.Fatalf("latched exhaustion handoff: %v", err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("exhaustion notifications = %d, want exactly 1: %+v", len(sink.intents), sink.intents)
+	}
+}
+
+func TestIdleReviewSnapshot_FailsClosedExactlyOnce(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	prURL := "https://github.com/o/r/pull/1"
+	human := ports.SCMReviewThreadObservation{
+		ID: "t1", Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix"}},
+	}
+	bot := ports.SCMReviewThreadObservation{
+		ID: "bot-1", IsBot: true,
+		Comments: []ports.SCMReviewCommentObservation{{ID: "bc1", Author: "review-bot", Body: "context", IsBot: true}},
+	}
+	for _, tc := range []struct {
+		name      string
+		obs       ports.SCMObservation
+		seedProof bool
+		noSignal  bool
+		messenger *fakeMessenger
+	}{
+		{name: "partial snapshot is uncertain", obs: idleReviewSnapshot(prURL, true, bot), seedProof: true, messenger: &fakeMessenger{}},
+		{name: "non-actionable backlog", obs: idleReviewSnapshot(prURL, false, bot), seedProof: true, messenger: &fakeMessenger{}},
+		{name: "no actual delivery proof", obs: idleReviewSnapshot(prURL, false, human), messenger: &fakeMessenger{}},
+		{name: "no positive idle evidence", obs: idleReviewSnapshot(prURL, false, human), seedProof: true, noSignal: true, messenger: &fakeMessenger{}},
+		{name: "send failure", obs: idleReviewSnapshot(prURL, false, human), seedProof: true, messenger: &fakeMessenger{err: errors.New("pane unavailable")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			sink := &fakeNotificationSink{}
+			rec := working("mer-1")
+			rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+			if !tc.noSignal {
+				rec.FirstSignalAt = now.Add(-2 * time.Minute)
+			}
+			st.sessions[rec.ID] = rec
+			if tc.seedProof {
+				proof := reactionPayload{Seen: map[string]string{"review:" + prURL: idleReviewDeliverySignature(tc.obs)}}
+				raw, err := json.Marshal(proof)
+				if err != nil {
+					t.Fatal(err)
+				}
+				st.signatures[prURL] = string(raw)
+			}
+			m := New(st, tc.messenger, WithNotificationSink(sink))
+			m.clock = func() time.Time { return now }
+			_ = m.ApplyIdleReviewSnapshot(ctx, rec.ID, tc.obs)
+			m = New(st, tc.messenger, WithNotificationSink(sink))
+			m.clock = func() time.Time { return now.Add(time.Minute) }
+			_ = m.ApplyIdleReviewSnapshot(ctx, rec.ID, tc.obs)
+			if len(sink.intents) != 1 {
+				t.Fatalf("notifications = %d, want exactly 1: %+v", len(sink.intents), sink.intents)
+			}
+		})
+	}
+}
+
+func TestIdleReviewSnapshot_CleanOrRecoveredDoesNotAlertAndRearms(t *testing.T) {
+	st := newFakeStore()
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{}
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	prURL := "https://github.com/o/r/pull/1"
+	backlog := idleReviewSnapshot(prURL, false, ports.SCMReviewThreadObservation{
+		ID: "t1", Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix"}},
+	})
+	proof := reactionPayload{Seen: map[string]string{"review:" + prURL: idleReviewDeliverySignature(backlog)}}
+	raw, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.signatures[prURL] = string(raw)
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	rec.FirstSignalAt = now.Add(-2 * time.Minute)
+	st.sessions[rec.ID] = rec
+	st.prs[rec.ID] = []domain.PullRequest{{URL: prURL}}
+	m := New(st, msg, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, backlog); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityActive, Timestamp: now.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityIdle, Timestamp: now.Add(2 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	m.clock = func() time.Time { return now.Add(2 * time.Minute) }
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, backlog); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(msg.msgs); got != 2 {
+		t.Fatalf("recovered episode did not rearm: nudges=%d want 2", got)
+	}
+
+	clean := idleReviewSnapshot(prURL, false)
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, clean); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 0 {
+		t.Fatalf("clean PR overlay emitted stuck alert: %+v", sink.intents)
+	}
+}
+
+func TestActivityRecoveryPromptlyClearsDurableIdleReviewState(t *testing.T) {
+	st := newFakeStore()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	prURL := "https://github.com/o/r/pull/1"
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	rec.FirstSignalAt = now.Add(-2 * time.Minute)
+	st.sessions[rec.ID] = rec
+	st.prs[rec.ID] = []domain.PullRequest{{URL: prURL}}
+	payload := reactionPayload{
+		Attempts: map[string]int{idleReviewEpisodeKey(prURL, rec.Activity.LastActivityAt): 2},
+		Handoffs: map[string]humanHandoffOutcome{
+			idleReviewHandoffKey(prURL, rec.Activity.LastActivityAt): {Outcome: humanHandoffNotified, Reason: idleReviewNudgeFailed},
+			"review-failure:" + prURL + ":old":                       {Outcome: humanHandoffNotified, Reason: reviewFetchFailed},
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.signatures[prURL] = string(raw)
+	m := New(st, &fakeMessenger{})
+	m.clock = func() time.Time { return now }
+
+	if err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityActive, Timestamp: now}); err != nil {
+		t.Fatal(err)
+	}
+	var got reactionPayload
+	if err := json.Unmarshal([]byte(st.signatures[prURL]), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Attempts) != 0 || len(got.Handoffs) != 0 {
+		t.Fatalf("recovery left stale idle episode state: attempts=%+v handoffs=%+v", got.Attempts, got.Handoffs)
+	}
 }
 
 func TestPRObservation_NudgesSuppressedWhileBlocked(t *testing.T) {
