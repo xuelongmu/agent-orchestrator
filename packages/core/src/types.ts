@@ -2288,12 +2288,6 @@ export interface KillOptions {
   projectId?: string;
 }
 
-/** A safe, non-throwing send outcome after the runtime delivery boundary. */
-export type SessionSendResult = {
-  status: "input_pending";
-  recoveryAttempted: boolean;
-};
-
 /** Session manager — CRUD for sessions */
 export interface SessionManager {
   spawn(config: SessionSpawnConfig): Promise<Session>;
@@ -2333,11 +2327,7 @@ export interface SessionManager {
    * let a caller message the wrong one. Callers that know the owning project
    * MUST pass it.
    */
-  send(
-    sessionId: SessionId,
-    message: string,
-    projectId?: string,
-  ): Promise<undefined | SessionSendResult>;
+  send(sessionId: SessionId, message: string, projectId?: string): Promise<void>;
   claimPR(sessionId: SessionId, prRef: string, options?: ClaimPROptions): Promise<ClaimPRResult>;
 }
 
@@ -2486,9 +2476,10 @@ export class SessionNotFoundError extends Error {
  * delivery boundary (preparation, restore, readiness, or a missing handle) — the
  * message never reached `runtimePlugin.sendMessage`. Callers relying on
  * at-most-once semantics (the notify-callback route) may safely reopen a consumed
- * claim ONLY for this typed failure; any failure at or after the delivery attempt
- * is ambiguous and must keep the claim closed. The boundary is encoded here in the
- * delivery API, never inferred from error message text. (#13 review)
+ * claim ONLY for this typed failure. Failures at or after the delivery attempt
+ * (whether ambiguous, or definitively pending in the editor) must keep the claim
+ * closed. The boundary is encoded here in the delivery API, never inferred from
+ * error message text. (#13 review)
  */
 export class SessionSendNotDeliveredError extends Error {
   constructor(
@@ -2505,6 +2496,25 @@ export class SessionSendNotDeliveredError extends Error {
         : `Message not delivered to session ${sessionId} (failed before delivery)`;
     super(message, options);
     this.name = "SessionSendNotDeliveredError";
+  }
+}
+
+/**
+ * Thrown when message text reached the agent's editor but did not start or
+ * queue a turn, even after a safe submission-only recovery attempt. This is an
+ * unsuccessful send, but it is beyond the pre-delivery boundary: callers must
+ * not retry blindly or reopen an at-most-once claim because the text remains
+ * present in the editor.
+ */
+export class SessionInputPendingError extends Error {
+  public readonly status = "input_pending" as const;
+
+  constructor(
+    public readonly sessionId: string,
+    public readonly recoveryAttempted: boolean,
+  ) {
+    super(`Message pasted into session ${sessionId}, but input remains pending in the agent editor`);
+    this.name = "SessionInputPendingError";
   }
 }
 

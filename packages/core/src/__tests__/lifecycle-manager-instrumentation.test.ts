@@ -31,12 +31,13 @@ import { recordActivityEvent } from "../activity-events.js";
 import { createLifecycleManager } from "../lifecycle-manager.js";
 import { writeMetadata } from "../metadata.js";
 import { enqueueSCMWebhookDelivery, processSCMWebhookQueue } from "../scm-webhook-queue.js";
-import type {
-  OpenCodeSessionManager,
-  OrchestratorConfig,
-  PRInfo,
-  PluginRegistry,
-  SessionMetadata,
+import {
+  SessionInputPendingError,
+  type OpenCodeSessionManager,
+  type OrchestratorConfig,
+  type PRInfo,
+  type PluginRegistry,
+  type SessionMetadata,
 } from "../types.js";
 import {
   createMockNotifier,
@@ -548,6 +549,40 @@ describe("reaction.send_to_agent_failed", () => {
       reactionKey: "ci-failed",
       errorMessage: "agent unreachable",
     });
+  });
+
+  it("does not record reaction success while session input remains pending", async () => {
+    config.reactions = {
+      "ci-failed": { auto: true, action: "send-to-agent", message: "fix CI", retries: 5 },
+    };
+    vi.mocked(mockSessionManager.send).mockRejectedValue(
+      new SessionInputPendingError("app-1", true),
+    );
+
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: makeCiFailedScm(),
+      notifier: createMockNotifier(),
+    });
+
+    persistSession("app-1", makeSession({ status: "pr_open", pr: makeMatchingPR() }));
+
+    const lm = buildLM(registry);
+    await lm.check("app-1");
+
+    const calls = vi.mocked(recordActivityEvent).mock.calls.map((c) => c[0]);
+    expect(calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "reaction.send_to_agent_failed",
+          sessionId: "app-1",
+        }),
+      ]),
+    );
+    expect(calls).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: "reaction.action_succeeded" })]),
+    );
   });
 });
 

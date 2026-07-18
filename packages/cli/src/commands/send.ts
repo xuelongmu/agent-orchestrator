@@ -195,16 +195,8 @@ export function registerSend(program: Command): void {
 
         if (existingSession && sessionManager) {
           try {
-            const result = await sessionManager.send(session, message);
-            if (result?.status === "input_pending") {
-              console.log(
-                chalk.yellow(
-                  "Message pasted but submission could not be confirmed (text was not resent)",
-                ),
-              );
-            } else {
-              console.log(chalk.green("Message sent and processing"));
-            }
+            await sessionManager.send(session, message);
+            console.log(chalk.green("Message sent and processing"));
           } catch (err) {
             console.error(chalk.red(err instanceof Error ? err.message : String(err)));
             process.exit(1);

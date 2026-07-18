@@ -477,9 +477,9 @@ export async function POST(
       // just validated. (#13, review)
       //
       // The consumed claim stays closed once the runtime DELIVERY BOUNDARY is
-      // crossed, even on rejection: an at-or-after-delivery failure is only
-      // SUSPECTED non-delivery (an IPC timeout, a post-delivery confirmation error),
-      // so reopening would let a retry deliver the same action twice. The claim is
+      // crossed, even on rejection: an at-or-after-delivery failure may be
+      // ambiguous (an IPC timeout) or leave text definitively pending in the editor,
+      // so reopening would let a retry paste the same action twice. The claim is
       // reopened ONLY for a PROVABLY pre-delivery failure, which `send` reports via
       // the typed SessionSendNotDeliveredError (or SessionNotFoundError) — never
       // inferred from message text — so a restore/readiness failure before dispatch

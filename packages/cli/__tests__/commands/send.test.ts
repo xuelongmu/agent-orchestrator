@@ -461,15 +461,16 @@ describe("send command", () => {
         lastActivityAt: new Date(),
         metadata: { agent: "codex" },
       });
-      mockSessionManager.send.mockResolvedValue({
-        status: "input_pending",
-        recoveryAttempted: true,
-      });
+      mockSessionManager.send.mockRejectedValue(
+        new Error("Message pasted, but input remains pending in the agent editor"),
+      );
 
-      await program.parseAsync(["node", "test", "send", "app-1", "large", "review"]);
+      await expect(
+        program.parseAsync(["node", "test", "send", "app-1", "large", "review"]),
+      ).rejects.toThrow("process.exit(1)");
 
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("submission could not be confirmed"),
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("input remains pending"),
       );
       expect(consoleSpy).not.toHaveBeenCalledWith(
         expect.stringContaining("Message sent and processing"),
