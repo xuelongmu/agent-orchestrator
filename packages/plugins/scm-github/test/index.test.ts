@@ -813,6 +813,7 @@ describe("scm-github plugin", () => {
         },
       ];
       mockGhError("run view failed");
+      mockGhError("job logs fallback failed");
 
       await expect(scm.getCIFailureSummary?.(pr, checks)).resolves.toBeNull();
     });
