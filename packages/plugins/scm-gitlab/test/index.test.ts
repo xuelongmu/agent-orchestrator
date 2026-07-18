@@ -514,6 +514,30 @@ describe("scm-gitlab plugin", () => {
       expect(args).not.toContain("--squash");
       expect(args).not.toContain("--rebase");
     });
+
+    it("pins an autonomous merge to the expected head", async () => {
+      glabMock.mockRejectedValueOnce(new Error("head SHA does not match"));
+
+      await expect(scm.mergePR(pr, undefined, "abc123")).rejects.toThrow(
+        "head SHA does not match",
+      );
+      expect(glabMock).toHaveBeenCalledWith(
+        "glab",
+        [
+          "mr",
+          "merge",
+          "42",
+          "--repo",
+          "acme/repo",
+          "--squash",
+          "--sha",
+          "abc123",
+          "-d",
+          "-y",
+        ],
+        expect.any(Object),
+      );
+    });
   });
 
   // ---- closePR -----------------------------------------------------------

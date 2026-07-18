@@ -1966,7 +1966,7 @@ describe("extractPREnrichment ciChecks", () => {
     expect(check?.status).toBe("skipped");
   });
 
-  it("maps COMPLETED+STARTUP_FAILURE to skipped (matches REST mapRawCheckStateToStatus default fallback)", () => {
+  it("maps COMPLETED+STARTUP_FAILURE to failed in both GraphQL and REST", () => {
     const pullRequest = {
       title: "Startup failure check",
       state: "OPEN",
@@ -2002,9 +2002,9 @@ describe("extractPREnrichment ciChecks", () => {
 
     const extracted = extractPREnrichment(pullRequest);
     const check = extracted?.data.ciChecks?.[0];
-    // STARTUP_FAILURE is not in the explicit failure list → falls through to "skipped"
-    // matching mapRawCheckStateToStatus()'s default return "skipped"
-    expect(check?.status).toBe("skipped");
+    // Startup failures are explicit failures so the flaky-CI classifier can
+    // retry the affected run instead of silently treating it as non-actionable.
+    expect(check?.status).toBe("failed");
     expect(check?.conclusion).toBe("STARTUP_FAILURE");
   });
 

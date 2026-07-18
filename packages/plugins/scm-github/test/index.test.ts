@@ -576,6 +576,29 @@ describe("scm-github plugin", () => {
         expect.any(Object),
       );
     });
+
+    it("pins an autonomous merge to the expected head", async () => {
+      ghMock.mockRejectedValueOnce(new Error("head commit changed"));
+
+      await expect(scm.mergePR(pr, undefined, "abc123")).rejects.toThrow(
+        "head commit changed",
+      );
+      expect(ghMock).toHaveBeenCalledWith(
+        expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
+        [
+          "pr",
+          "merge",
+          "42",
+          "--repo",
+          "acme/repo",
+          "--squash",
+          "--match-head-commit",
+          "abc123",
+          "--delete-branch",
+        ],
+        expect.any(Object),
+      );
+    });
   });
 
   // ---- closePR -----------------------------------------------------------
@@ -724,6 +747,71 @@ describe("scm-github plugin", () => {
     });
   });
 
+  describe("retryCI", () => {
+    const failedRuns = [
+      {
+        name: "unit",
+        status: "failed" as const,
+        url: "https://github.com/acme/repo/actions/runs/123/job/1",
+      },
+      {
+        name: "lint",
+        status: "failed" as const,
+        url: "https://github.com/acme/repo/actions/runs/124/job/2",
+      },
+    ];
+
+    it("reruns every distinct failed GitHub Actions run when all requests succeed", async () => {
+      ghMock.mockResolvedValue({ stdout: "" });
+      const retried = await scm.retryCI!(pr, failedRuns);
+
+      expect(retried).toBe(true);
+      expect(ghMock).toHaveBeenCalledTimes(2);
+      expect(ghMock).toHaveBeenCalledWith(
+        expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
+        ["run", "rerun", "123", "--failed", "--repo", "acme/repo"],
+        expect.any(Object),
+      );
+      expect(ghMock).toHaveBeenCalledWith(
+        expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
+        ["run", "rerun", "124", "--failed", "--repo", "acme/repo"],
+        expect.any(Object),
+      );
+    });
+
+    it("returns success when at least one workflow rerun was queued", async () => {
+      ghMock
+        .mockResolvedValueOnce({ stdout: "" })
+        .mockRejectedValueOnce(new Error("run 124 cannot be rerun"));
+
+      await expect(scm.retryCI!(pr, failedRuns)).resolves.toBe(true);
+      expect(ghMock).toHaveBeenCalledTimes(2);
+      expect(recordActivityEventMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "scm.ci_retry_failed",
+          data: expect.objectContaining({ runId: "124" }),
+        }),
+      );
+    });
+
+    it("returns false when every workflow rerun request fails", async () => {
+      ghMock.mockRejectedValue(new Error("rerun unavailable"));
+
+      await expect(scm.retryCI!(pr, failedRuns)).resolves.toBe(false);
+      expect(ghMock).toHaveBeenCalledTimes(2);
+      expect(recordActivityEventMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("declines non-Actions checks that cannot be retried", async () => {
+      expect(
+        await scm.retryCI!(pr, [
+          { name: "external", status: "failed", url: "https://ci.example.test/1" },
+        ]),
+      ).toBe(false);
+      expect(ghMock).not.toHaveBeenCalled();
+    });
+  });
+
   // ---- getCIFailureSummary -----------------------------------------------
 
   describe("getCIFailureSummary", () => {
@@ -778,6 +866,7 @@ describe("scm-github plugin", () => {
         },
       ];
       mockGhError("run view failed");
+      mockGhError("job logs fallback failed");
 
       await expect(scm.getCIFailureSummary?.(pr, checks)).resolves.toBeNull();
     });
@@ -1118,6 +1207,65 @@ describe("scm-github plugin", () => {
     });
   });
 
+  // ---- getReviewThreads --------------------------------------------------
+
+  describe("getReviewThreads", () => {
+    it("pages all review submissions so an older current-head approval remains visible", async () => {
+      const newerReviews = Array.from({ length: 100 }, (_, index) => ({
+        author: { login: `reviewer-${index}` },
+        state: "COMMENTED",
+        body: `Follow-up ${index}`,
+        submittedAt: "2026-07-18T00:20:00Z",
+        commit: { oid: "sha-head" },
+      }));
+      mockGh({
+        data: {
+          repository: {
+            pullRequest: {
+              headRefOid: "sha-head",
+              commits: { nodes: [{ commit: { pushedDate: "2026-07-18T00:10:00Z" } }] },
+              reviewThreads: { totalCount: 0, nodes: [] },
+              reviews: {
+                pageInfo: { hasNextPage: true, endCursor: "page-2" },
+                nodes: newerReviews,
+              },
+              reactions: { nodes: [] },
+            },
+          },
+        },
+      });
+      mockGh({
+        data: {
+          repository: {
+            pullRequest: {
+              reviews: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    author: { login: "alice" },
+                    state: "APPROVED",
+                    body: "",
+                    submittedAt: "2026-07-18T00:05:00Z",
+                    commit: { oid: "sha-head" },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      });
+
+      const result = await scm.getReviewThreads?.(pr, { forceFresh: true });
+
+      expect(result?.reviews).toContainEqual(
+        expect.objectContaining({ author: "alice", state: "APPROVED", commitSha: "sha-head" }),
+      );
+      expect(result?.headPushedAt).toEqual(new Date("2026-07-18T00:10:00Z"));
+      expect(ghMock).toHaveBeenCalledTimes(2);
+      expect(ghMock.mock.calls[1]?.[1]).toContain("reviewsCursor=page-2");
+    });
+  });
+
   // ---- getMergeability ---------------------------------------------------
 
   describe("getMergeability", () => {
@@ -1131,6 +1279,7 @@ describe("scm-github plugin", () => {
         ciPassing: true,
         approved: true,
         noConflicts: true,
+        isDraft: false,
         blockers: [],
       });
       // Should only call gh once (for getPRState), not for mergeable/CI
@@ -1175,6 +1324,7 @@ describe("scm-github plugin", () => {
         ciPassing: true,
         approved: true,
         noConflicts: true,
+        isDraft: false,
         blockers: [],
       });
     });

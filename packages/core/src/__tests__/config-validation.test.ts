@@ -1345,6 +1345,38 @@ describe("Config Validation - Reaction default merging (#12)", () => {
   });
 });
 
+describe("Config Validation - quality policies (#15)", () => {
+  it("defaults to actionable Codex reviews and classifier-first flaky CI retry", () => {
+    const config = validateConfig({ projects: {} });
+    expect(
+      config.reactions["bugbot-comments"].reviewBots?.["chatgpt-codex-connector[bot]"]?.weight,
+    ).toBe(1);
+    expect(
+      config.reactions["bugbot-comments"].reviewBots?.["chatgpt-codex-connector[bot]"]
+        ?.approvalPhrases,
+    ).toEqual(["Didn't find any major issues"]);
+    expect(config.reactions["bugbot-comments"].reviewBots?.["*"]?.weight).toBeLessThan(1);
+    expect(config.reactions["ci-failed"].flakyRetries).toBe(1);
+    expect(config.reactions["approved-and-green"].confidenceThreshold).toBe(0.8);
+  });
+
+  it("deep-merges one bot override without dropping its approval signals", () => {
+    const config = validateConfig({
+      projects: {},
+      reactions: {
+        "bugbot-comments": {
+          reviewBots: {
+            "chatgpt-codex-connector[bot]": { weight: 0.5 },
+          },
+        },
+      },
+    });
+    const codex = config.reactions["bugbot-comments"].reviewBots?.["chatgpt-codex-connector[bot]"];
+    expect(codex?.weight).toBe(0.5);
+    expect(codex?.approvalReactions).toContain("THUMBS_UP");
+  });
+});
+
 describe("Config Validation - Enabling autonomous actions (#12)", () => {
   it("enables auto when an autonomous action is explicitly set over an auto:false default", () => {
     const config = validateConfig({

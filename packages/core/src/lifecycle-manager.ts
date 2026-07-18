@@ -44,7 +44,10 @@ import {
   type CIFailureSummary,
   type PRInfo,
   type PRRetargetOutcome,
+  type MergeReadiness,
   type ReviewComment,
+  type ReviewBotPolicy,
+  type ReviewDecision,
   type ReviewSummary,
   type ProcessProbeResult,
   isProcessProbeIndeterminate,
@@ -71,11 +74,7 @@ import {
   hasPositiveIdleEvidence,
   isWeakActivityEvidence,
 } from "./activity-signal.js";
-import {
-  isAgentReportFresh,
-  mapAgentReportToLifecycle,
-  readAgentReport,
-} from "./agent-report.js";
+import { isAgentReportFresh, mapAgentReportToLifecycle, readAgentReport } from "./agent-report.js";
 import {
   computeConfidence,
   summarizeConfidenceFactors,
@@ -118,6 +117,8 @@ import {
   createDetectingDecision,
   isDetectingTimedOut,
   parseAttemptCount,
+  classifyCIFailure,
+  resolveMergeDefinitionOfDone,
   resolvePREnrichmentDecision,
   resolvePRLiveDecision,
   resolveProbeDecision,
@@ -132,6 +133,12 @@ import {
   buildSessionTransitionNotificationData,
   type NotificationEventContext,
 } from "./notification-data.js";
+import {
+  formatAutomatedCommentsMessage,
+  normalizeReviewBotName,
+  partitionAutomatedComments,
+  resolveReviewBotPolicy,
+} from "./format-automated-comments.js";
 
 /** Parse a duration string like "10m", "30s", "1h" to milliseconds. */
 function parseDuration(str: string): number {
@@ -218,6 +225,9 @@ const CONFIDENCE_HOLD_PENDING_KEY = "confidenceHoldPending";
  *  (including its escalated flag) is cleared, allowing a fresh budget for the
  *  next real CI failure incident. */
 const CI_PASSING_STABLE_THRESHOLD = 2;
+
+/** Auto-merge never runs without an explicit confidence floor. */
+const DEFAULT_AUTO_MERGE_CONFIDENCE_THRESHOLD = 0.8;
 
 type TransitionReaction = {
   key: string;
@@ -613,10 +623,7 @@ function recordSCMRefreshFailure(
   }
 }
 
-function requireSuccessfulSCMRefresh(
-  outcomes: SCMRefreshOutcomes,
-  session: Session,
-): void {
+function requireSuccessfulSCMRefresh(outcomes: SCMRefreshOutcomes, session: Session): void {
   const outcome = outcomes.get(webhookSessionKey(session.projectId, session.id));
   if (outcome?.status === "succeeded") return;
 
@@ -768,9 +775,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       if (!sessionKeysByPlugin.has(pluginKey)) {
         sessionKeysByPlugin.set(pluginKey, new Set());
       }
-      sessionKeysByPlugin
-        .get(pluginKey)
-        ?.add(webhookSessionKey(session.projectId, session.id));
+      sessionKeysByPlugin.get(pluginKey)?.add(webhookSessionKey(session.projectId, session.id));
       reposByPlugin.get(pluginKey)!.add(project.repo);
       const sessionPRs = normalizeSessionPRs(session);
       if (sessionPRs.length === 0) continue;
@@ -862,10 +867,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         for (const [key, data] of enrichmentData) {
           prEnrichmentCache.set(key, data);
         }
-        recordSCMRefreshSuccess(
-          scmRefreshOutcomes,
-          sessionKeysByPlugin.get(pluginKey) ?? [],
-        );
+        recordSCMRefreshSuccess(scmRefreshOutcomes, sessionKeysByPlugin.get(pluginKey) ?? []);
       } catch (err) {
         // Batch fetch failed - individual calls will still work
         const errorMsg = err instanceof Error ? err.message : String(err);
@@ -895,11 +897,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             errorMessage: errorMsg,
           },
         });
-        recordSCMRefreshFailure(
-          scmRefreshOutcomes,
-          sessionKeysByPlugin.get(pluginKey) ?? [],
-          err,
-        );
+        recordSCMRefreshFailure(scmRefreshOutcomes, sessionKeysByPlugin.get(pluginKey) ?? [], err);
       }
     }
 
@@ -955,7 +953,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             (p) =>
               p.owner === detectedPR.owner &&
               p.repo === detectedPR.repo &&
-              p.number === detectedPR.number
+              p.number === detectedPR.number,
           );
           if (!alreadyTracked) {
             // Remove any closed PRs on the same repo before adding the new one.
@@ -968,7 +966,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
                     p.repo === detectedPR.repo &&
                     p.number !== detectedPR.number &&
                     prEnrichmentCache.get(`${p.owner}/${p.repo}#${p.number}`)?.state === "closed"
-                  )
+                  ),
               )
               .concat(detectedPR);
           }
@@ -1656,9 +1654,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
                   : allEnrichments.every((e) => e.ciStatus === "passing" || e.ciStatus === "none")
                     ? "passing"
                     : "pending",
-                reviewDecision: allEnrichments.some(
-                  (e) => e.reviewDecision === "changes_requested",
-                )
+                reviewDecision: allEnrichments.some((e) => e.reviewDecision === "changes_requested")
                   ? "changes_requested"
                   : allEnrichments.every((e) => e.reviewDecision === "approved")
                     ? "approved"
@@ -1963,8 +1959,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         // same severity and shrink the penalty.
         const isRiskier =
           findingRank > currentRank ||
-          (findingRank === currentRank &&
-            (finding.confidence ?? 1) > (maxFindingConfidence ?? 1));
+          (findingRank === currentRank && (finding.confidence ?? 1) > (maxFindingConfidence ?? 1));
         if (isRiskier) {
           maxFindingSeverity = finding.severity;
           maxFindingConfidence = finding.confidence ?? null;
@@ -2145,7 +2140,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     );
     if (delivered) {
       const trackerKey = `${session.id}:${reactionKey}`;
-      const tracker = reactionTrackers.get(trackerKey) ?? { attempts: 0, firstTriggered: new Date() };
+      const tracker = reactionTrackers.get(trackerKey) ?? {
+        attempts: 0,
+        firstTriggered: new Date(),
+      };
       tracker.escalated = true;
       tracker.heldForConfidence = true;
       reactionTrackers.set(trackerKey, tracker);
@@ -2285,6 +2283,41 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     // Execute the reaction action
     const action = reactionConfig.action ?? "notify";
+    const effectiveReactionConfig =
+      action === "auto-merge" && reactionConfig.confidenceThreshold === undefined
+        ? {
+            ...reactionConfig,
+            confidenceThreshold: DEFAULT_AUTO_MERGE_CONFIDENCE_THRESHOLD,
+          }
+        : reactionConfig;
+
+    // Definition-of-done is checked fresh before confidence and before every
+    // merge attempt. A status of `mergeable` is only a hint: Codex uses informal
+    // approval and COMMENTED reviews, so the SCM's coarse mergeable bit cannot
+    // prove the intended reviewer is satisfied or that its threads are resolved.
+    let mergeGate: Awaited<ReturnType<typeof evaluateMergeDefinitionOfDone>> | undefined;
+    if (action === "auto-merge" && "lifecycle" in session) {
+      mergeGate = await evaluateMergeDefinitionOfDone(session, effectiveReactionConfig);
+      const nonConfidenceBlockers = mergeGate.blockers.filter(
+        (blocker) => blocker !== "low_confidence",
+      );
+      if (nonConfidenceBlockers.length > 0) {
+        updateAutoMergeBlockers(session, nonConfidenceBlockers);
+        if (nonConfidenceBlockers.includes("review_approval_missing")) {
+          for (const approvalTarget of mergeGate.missingApprovalTargets) {
+            await maybeRebumpAutomatedReviewer(session, approvalTarget);
+          }
+        }
+        return {
+          reactionType: reactionKey,
+          success: false,
+          action: "auto-merge",
+          message: `Definition of done blocked: ${nonConfidenceBlockers.join(", ")}`,
+          escalated: false,
+        };
+      }
+      updateAutoMergeBlockers(session, []);
+    }
 
     // Confidence gate (#12): withholdForConfidence is the transition chokepoint —
     // it guarantees a (generic) human escalation for a held action and drives the
@@ -2294,7 +2327,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // baseline even if a later detail fetch fails. Synthetic system sessions (no
     // lifecycle) carry nothing to score.
     if ("lifecycle" in session) {
-      const hold = await withholdForConfidence(session, reactionKey, action, reactionConfig);
+      const hold = await withholdForConfidence(
+        session,
+        reactionKey,
+        action,
+        effectiveReactionConfig,
+      );
       if (hold.withhold) {
         return {
           reactionType: reactionKey,
@@ -2404,8 +2442,49 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       }
 
       case "auto-merge": {
-        // Auto-merge is handled by the SCM plugin
-        // For now, just notify
+        if (!("lifecycle" in session) || !mergeGate || mergeGate.mergeTargets.length === 0) break;
+        const project = config.projects[session.projectId];
+        const scm = project?.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
+        if (!scm) break;
+
+        let activeTarget: AutoMergeTarget | undefined;
+        try {
+          for (const target of mergeGate.mergeTargets) {
+            activeTarget = target;
+            await scm.mergePR(target.pr, undefined, target.expectedHeadSha);
+            clearAutoMergeFailure(session, target);
+          }
+          updateSessionMetadata(session, {
+            autoMergeRequestedAt: new Date().toISOString(),
+            autoMergeBlockers: "",
+          });
+        } catch (err) {
+          recordActivityEvent({
+            projectId,
+            sessionId,
+            source: "reaction",
+            kind: "reaction.auto_merge_failed",
+            level: "warn",
+            summary: `auto-merge failed for ${sessionId}`,
+            data: {
+              reactionKey,
+              prNumber: activeTarget?.pr.number,
+              prUrl: activeTarget?.pr.url,
+              expectedHeadSha: activeTarget?.expectedHeadSha,
+              errorMessage: err instanceof Error ? err.message : String(err),
+            },
+          });
+          const escalated = activeTarget
+            ? await notifyAutoMergeFailure(session, activeTarget, err, tracker.attempts)
+            : false;
+          return {
+            reactionType: reactionKey,
+            success: false,
+            action: "auto-merge",
+            escalated,
+          };
+        }
+
         const context = buildEventContext(session, prEnrichmentCache);
         const event = createEvent("reaction.triggered", {
           sessionId,
@@ -2620,6 +2699,145 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return new Set(fingerprint ? fingerprint.split(",") : []);
   }
 
+  function getReviewBotPolicies(session: Session): Record<string, ReviewBotPolicy> | undefined {
+    return getReactionConfigForSession(session, "bugbot-comments")?.reviewBots;
+  }
+
+  function reviewCommentBotName(comment: ReviewComment): string | undefined {
+    return comment.botName ?? (comment.isBot ? comment.author : undefined);
+  }
+
+  function reviewSummaryBotName(review: ReviewSummary): string | undefined {
+    return review.botName ?? (review.isBot ? review.author : undefined);
+  }
+
+  function reviewBotWeight(
+    session: Session,
+    botName: string,
+    legacyActionable = true,
+  ): number {
+    const policies = getReviewBotPolicies(session);
+    const configured = resolveReviewBotPolicy(botName, policies);
+    if (configured) return configured.weight;
+    // A missing policy preserves the pre-#15 behavior for hand-constructed
+    // configs. A configured map without a matching/wildcard entry is fail-safe:
+    // only reviewers explicitly targeted by the installation are actionable.
+    if (!policies) return legacyActionable ? 1 : 0;
+    return 0;
+  }
+
+  interface PolicyAwareChangesRequested {
+    required: ReviewSummary[];
+    contextOnly: ReviewSummary[];
+    complete: boolean;
+  }
+
+  /**
+   * Classify the latest decisive review from each author under the configured
+   * bot policy. Human and weight >= 1 changes requests are required; fractional
+   * bot reviews are context only. The aggregate decision is used solely as an
+   * incompleteness guard: when it says changes were requested but the fresh
+   * summaries cannot identify any such author, callers fail closed rather than
+   * guessing which policy applies.
+   */
+  function classifyPolicyAwareChangesRequested(
+    session: Session,
+    reviews: ReviewSummary[],
+    aggregateDecision: ReviewDecision | undefined,
+    reviewDataComplete: boolean,
+  ): PolicyAwareChangesRequested {
+    const latestDecisiveByAuthor = new Map<string, ReviewSummary>();
+    for (const review of reviews) {
+      const state = review.state.toUpperCase();
+      if (state !== "APPROVED" && state !== "CHANGES_REQUESTED" && state !== "DISMISSED") {
+        continue;
+      }
+      const previous = latestDecisiveByAuthor.get(review.author);
+      if (!previous || review.submittedAt.getTime() >= previous.submittedAt.getTime()) {
+        latestDecisiveByAuthor.set(review.author, review);
+      }
+    }
+
+    const required: ReviewSummary[] = [];
+    const contextOnly: ReviewSummary[] = [];
+    for (const review of latestDecisiveByAuthor.values()) {
+      if (review.state.toUpperCase() !== "CHANGES_REQUESTED") continue;
+      const botName = reviewSummaryBotName(review);
+      if (!botName || reviewBotWeight(session, botName, review.isReviewBot === true) >= 1) {
+        required.push(review);
+      } else {
+        contextOnly.push(review);
+      }
+    }
+
+    const aggregateExplained =
+      aggregateDecision !== "changes_requested" || required.length + contextOnly.length > 0;
+    return {
+      required,
+      contextOnly,
+      complete: reviewDataComplete && aggregateDecision !== undefined && aggregateExplained,
+    };
+  }
+
+  async function fetchPolicyAwareChangesRequested(
+    session: Session,
+  ): Promise<PolicyAwareChangesRequested> {
+    const incomplete = { required: [], contextOnly: [], complete: false };
+    const prs = normalizeSessionPRs(session);
+    if (prs.length === 0) return incomplete;
+    const project = config.projects[session.projectId];
+    const scm = project?.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
+    if (!scm?.getReviewThreads) return incomplete;
+    const getReviewThreads = scm.getReviewThreads;
+    const perPR = await Promise.all(
+      prs.map(async (pr): Promise<PolicyAwareChangesRequested> => {
+        try {
+          const [reviewData, aggregateDecision] = await Promise.all([
+            getReviewThreads(pr, { forceFresh: true }),
+            scm.getReviewDecision(pr),
+          ]);
+          return classifyPolicyAwareChangesRequested(
+            session,
+            reviewData.reviews,
+            aggregateDecision,
+            !(reviewData.threadsTruncated ?? false),
+          );
+        } catch {
+          return incomplete;
+        }
+      }),
+    );
+    return {
+      required: perPR.flatMap((result) => result.required),
+      contextOnly: perPR.flatMap((result) => result.contextOnly),
+      complete: perPR.every((result) => result.complete),
+    };
+  }
+
+  function toAutomatedComment(comment: ReviewComment) {
+    return {
+      id: comment.id,
+      botName: reviewCommentBotName(comment) ?? comment.author,
+      body: comment.body,
+      path: comment.path,
+      line: comment.line,
+      severity: "warning" as const,
+      createdAt: comment.createdAt,
+      url: comment.url,
+      threadId: comment.threadId,
+    };
+  }
+
+  function formatAutomatedReviewComments(
+    session: Session,
+    actionable: ReviewComment[],
+    contextOnly: ReviewComment[] = [],
+  ): string {
+    const comments = actionable.map(toAutomatedComment);
+    const context = contextOnly.map(toAutomatedComment);
+    return formatAutomatedCommentsMessage(comments, session.pr ?? undefined, context);
+  }
+
   /**
    * True when the review reaction for `key` re-delivers comments to the AGENT
    * (an enabled send-to-agent action). Notify-only or auto:false configs surface
@@ -2679,6 +2897,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       clearReactionTracker(session.id, automatedReactionKey);
       lastReviewBacklogCheckAt.delete(session.id);
       updateSessionMetadata(session, {
+        ...scopedReviewRebumpMetadataCleanup(session),
+        ...scopedAutoMergeFailureMetadataCleanup(session),
         lastPendingReviewFingerprint: "",
         lastPendingReviewDispatchHash: "",
         lastPendingReviewDispatchAt: "",
@@ -2694,6 +2914,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         reviewSatisfiedAt: "",
         botReviewObserved: "",
         botReviewObservedSha: "",
+        reviewRebumpHeadSha: "",
+        reviewRebumpCount: "",
+        reviewRebumpAt: "",
+        reviewApprovalEscalatedAt: "",
+        autoMergeRequestedAt: "",
+        autoMergeBlockers: "",
         stuckNudgeCount: "",
         stuckNudgeEscalated: "",
         stuckNudgeFingerprint: "",
@@ -2774,11 +3000,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       stuckNudgeEscalated ||
       nudgeInProgress;
     // Single GraphQL call for all review threads (human + bot) + review summaries.
-    // Split locally by isBot for separate reaction pipelines.
+    // Split locally by botName so the configured reviewer policy, not a generic
+    // isBot boolean, controls the automated review/fix loop.
     let allThreads: ReviewComment[];
     let reviewSummaries: ReviewSummary[] = [];
     let currentHeadSha: string | undefined;
     let primaryThreadsTruncated = false;
+    let reviewSummariesComplete = false;
     try {
       if (scm.getReviewThreads) {
         // Force a fresh fetch when GraphQL-only thread resolution must be seen
@@ -2790,6 +3018,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         reviewSummaries = result.reviews;
         currentHeadSha = result.headSha;
         primaryThreadsTruncated = result.threadsTruncated ?? false;
+        reviewSummariesComplete = !primaryThreadsTruncated;
       } else {
         // Fallback for SCM plugins that don't implement getReviewThreads yet
         allThreads = await scm.getPendingComments(session.pr);
@@ -2822,9 +3051,23 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // we returned above so the next poll can retry without waiting 2 minutes.
     lastReviewBacklogCheckAt.set(session.id, Date.now());
 
+    let aggregateReviewDecision: ReviewDecision | undefined;
+    try {
+      aggregateReviewDecision = await scm.getReviewDecision(session.pr);
+    } catch {
+      // The aggregate is only an incompleteness guard, but without it we cannot
+      // prove that the fresh summaries account for every changes request.
+    }
+    const changesRequested = classifyPolicyAwareChangesRequested(
+      session,
+      reviewSummaries,
+      aggregateReviewDecision,
+      reviewSummariesComplete,
+    );
+
     // Persist review comments + summaries to metadata for dashboard consumption
     {
-      const unresolved = allThreads.filter((c) => !c.isBot);
+      const unresolved = allThreads.filter((c) => !reviewCommentBotName(c));
       const reviewBlob = JSON.stringify({
         unresolvedThreads: unresolved.length,
         unresolvedComments: unresolved.map((c) => ({
@@ -2870,7 +3113,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         } catch {
           continue;
         }
-        const secondaryUnresolved = secondaryThreads.filter((c) => !c.isBot);
+        const secondaryUnresolved = secondaryThreads.filter((c) => !reviewCommentBotName(c));
         const secondaryBlob = JSON.stringify({
           unresolvedThreads: secondaryUnresolved.length,
           unresolvedComments: secondaryUnresolved.map((c) => ({
@@ -2893,8 +3136,19 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       }
     }
 
-    const pendingComments = allThreads.filter((c) => !c.isBot);
-    const automatedComments = allThreads.filter((c) => c.isBot);
+    const pendingComments = allThreads.filter((c) => !reviewCommentBotName(c));
+    const allAutomatedComments = allThreads.filter((c) => !!reviewCommentBotName(c));
+    const automatedById = new Map(allAutomatedComments.map((comment) => [comment.id, comment]));
+    const automatedBuckets = partitionAutomatedComments(
+      allAutomatedComments.map(toAutomatedComment),
+      getReviewBotPolicies(session),
+    );
+    const automatedComments = automatedBuckets.actionable
+      .map((comment) => automatedById.get(comment.id))
+      .filter((comment): comment is ReviewComment => !!comment);
+    const contextOnlyAutomatedComments = automatedBuckets.deprioritized
+      .map((comment) => automatedById.get(comment.id))
+      .filter((comment): comment is ReviewComment => !!comment);
 
     // Snapshot the dispatch hashes BEFORE the human/bot blocks below mutate them,
     // so the stuck-agent nudge can distinguish "already delivered, agent went
@@ -2905,22 +3159,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     // Re-validate a previously-recorded "satisfied" mark. Clear it the moment the
     // session stops being demonstrably clean — a reappearing thread, CI no longer
-    // green, a changes_requested review, a truncated thread page (can't trust the
-    // clean set), or a new head the recorded review no longer covers — so the
+    // green, a policy-required changes request, a truncated thread page (can't
+    // trust the clean set), or a new head the recorded review no longer covers — so the
     // merge gate never acts on a stale signal. Gated on the mark being set so the
     // extra CI/review checks only run when there is something to invalidate.
     if (session.metadata["reviewSatisfiedAt"]) {
       const anyThreadOpen = pendingComments.length > 0 || automatedComments.length > 0;
       const isMultiPR = normalizeSessionPRs(session).length > 1;
       const ciGreen = await primaryPRCIGreen(session, scm);
-      const notChangesRequested = await primaryPRNotChangesRequested(session, scm);
       const headMoved =
         !!currentHeadSha && session.metadata["botReviewObservedSha"] !== currentHeadSha;
       if (
         anyThreadOpen ||
         isMultiPR ||
         !ciGreen ||
-        !notChangesRequested ||
+        !changesRequested.complete ||
+        changesRequested.required.length > 0 ||
         primaryThreadsTruncated ||
         headMoved
       ) {
@@ -2940,9 +3194,22 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     //    used only as the fallback when the SCM cannot report a head SHA.
     const reviewedCurrentHead =
       !!currentHeadSha &&
-      reviewSummaries.some((r) => r.isReviewBot && r.commitSha === currentHeadSha);
+      reviewSummaries.some((review) => {
+        const botName = reviewSummaryBotName(review);
+        return (
+          !!botName &&
+          reviewBotWeight(session, botName, review.isReviewBot === true) >= 1 &&
+          review.commitSha === currentHeadSha
+        );
+      });
     const anyReviewBotEngagement =
-      automatedComments.some((c) => c.isReviewBot) || reviewSummaries.some((r) => r.isReviewBot);
+      automatedComments.length > 0 ||
+      reviewSummaries.some((review) => {
+        const botName = reviewSummaryBotName(review);
+        return (
+          !!botName && reviewBotWeight(session, botName, review.isReviewBot === true) >= 1
+        );
+      });
     const engagementUpdates: Record<string, string> = {};
     if (anyReviewBotEngagement && session.metadata["botReviewObserved"] !== "true") {
       engagementUpdates["botReviewObserved"] = "true";
@@ -3090,6 +3357,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           primaryHumanThreadsClear: pendingComments.length === 0,
           headSha: currentHeadSha,
           threadsTruncated: primaryThreadsTruncated,
+          changesRequested,
         });
         // Reset the round budget + escalation latch ONLY when the loop genuinely
         // ends: the review is satisfied, or a human resolved an escalated loop.
@@ -3122,7 +3390,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             reactionConfig.action &&
             (reactionConfig.auto !== false || reactionConfig.action === "notify")
           ) {
-            const enrichedMessage = formatReviewCommentsMessage(automatedComments, "bot");
+            // Fractional-weight findings stay out of the fingerprint, round
+            // count, and required section. Surface them only as explicitly
+            // non-blocking context alongside a genuinely actionable dispatch.
+            const enrichedMessage = formatAutomatedReviewComments(
+              session,
+              automatedComments,
+              contextOnlyAutomatedComments,
+            );
 
             // Dispatch-site confidence gate (Class B chokepoint): a low-confidence
             // hold sends ONE escalation (question + comments) to the human;
@@ -3392,7 +3667,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       parts.push(formatReviewCommentsMessage(pendingComments, "reviewer", reviewSummaries));
     }
     if (automatedAlreadyDelivered) {
-      parts.push(formatReviewCommentsMessage(automatedComments, "bot"));
+      parts.push(formatAutomatedReviewComments(session, automatedComments));
     }
 
     try {
@@ -3444,38 +3719,479 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const p = session.pr;
     if (!p) return false;
     const cached = prEnrichmentCache.get(`${p.owner}/${p.repo}#${p.number}`);
-    const ci = cached
-      ? cached.ciStatus
-      : await scm.getCISummary(p).catch(() => undefined); // live fallback
+    const ci = cached ? cached.ciStatus : await scm.getCISummary(p).catch(() => undefined); // live fallback
     return ci === "passing" || ci === "none";
   }
 
-  /**
-   * True when the session's PR does NOT have a changes_requested review decision.
-   * Reads the enrichment cache first (authoritative) and falls back to live
-   * getReviewDecision on a cache miss. Fails CLOSED: if the decision cannot be
-   * determined (transient/permission error), returns false so a hidden
-   * changes_requested cannot produce a false clean signal.
-   */
-  async function primaryPRNotChangesRequested(session: Session, scm: SCM): Promise<boolean> {
-    const p = session.pr;
-    if (!p) return false;
-    const cached = prEnrichmentCache.get(`${p.owner}/${p.repo}#${p.number}`);
-    let decision = cached?.reviewDecision;
-    if (!cached) {
-      try {
-        decision = await scm.getReviewDecision(p); // live fallback
-      } catch {
-        return false; // fail closed — can't confirm the PR isn't changes_requested
+  interface AutoMergeTarget {
+    pr: PRInfo;
+    expectedHeadSha: string;
+  }
+
+  interface AutoMergeGateResult {
+    blockers: string[];
+    mergeTargets: AutoMergeTarget[];
+    missingApprovalTargets: Array<{ pr: PRInfo; headSha?: string }>;
+  }
+
+  function autoMergeFailureMetadataKeys(pr: PRInfo): { headSha: string; notifiedAt: string } {
+    const suffix = `${pr.owner}/${pr.repo}#${pr.number}`;
+    return {
+      headSha: `autoMergeFailureHeadSha:${suffix}`,
+      notifiedAt: `autoMergeFailureNotifiedAt:${suffix}`,
+    };
+  }
+
+  function scopedAutoMergeFailureMetadataCleanup(session: Session): Record<string, string> {
+    const updates: Record<string, string> = {};
+    for (const key of Object.keys(session.metadata)) {
+      if (
+        key.startsWith("autoMergeFailureHeadSha:") ||
+        key.startsWith("autoMergeFailureNotifiedAt:")
+      ) {
+        updates[key] = "";
       }
     }
-    return decision !== "changes_requested";
+    return updates;
+  }
+
+  function clearAutoMergeFailure(session: Session, target: AutoMergeTarget): void {
+    const keys = autoMergeFailureMetadataKeys(target.pr);
+    if (!session.metadata[keys.headSha] && !session.metadata[keys.notifiedAt]) return;
+    updateSessionMetadata(session, { [keys.headSha]: "", [keys.notifiedAt]: "" });
+  }
+
+  async function notifyAutoMergeFailure(
+    session: Session,
+    target: AutoMergeTarget,
+    error: unknown,
+    attempts: number,
+  ): Promise<boolean> {
+    const keys = autoMergeFailureMetadataKeys(target.pr);
+    if (session.metadata[keys.headSha] !== target.expectedHeadSha) {
+      updateSessionMetadata(session, {
+        [keys.headSha]: target.expectedHeadSha,
+        [keys.notifiedAt]: "",
+      });
+    }
+    if (session.metadata[keys.notifiedAt]) return true;
+
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const context = buildEventContext(session, prEnrichmentCache);
+    const event = createEvent("reaction.escalated", {
+      sessionId: session.id,
+      projectId: session.projectId,
+      message: `AO could not auto-merge PR #${target.pr.number} at reviewed head ${target.expectedHeadSha}: ${errorMessage}. AO will retry; human intervention may be required.`,
+      data: buildReactionEscalationNotificationData({
+        eventType: "reaction.escalated",
+        sessionId: session.id,
+        projectId: session.projectId,
+        context,
+        reactionKey: "approved-and-green",
+        action: "auto-merge",
+        attempts,
+        cause: "max_attempts",
+        enrichment: getPREnrichmentForSession(session),
+      }),
+    });
+    let delivered = false;
+    try {
+      delivered = await notifyHuman(event, "urgent");
+    } catch {
+      // Delivery failures must not set the latch; retry notification next poll.
+    }
+    if (delivered) {
+      updateSessionMetadata(session, { [keys.notifiedAt]: new Date().toISOString() });
+    }
+    return delivered;
+  }
+
+  function liveMergeabilityBlockers(mergeability: MergeReadiness): string[] {
+    const blockers = mergeability.blockers.filter((blocker) => {
+      // CI and policy-aware review approval are evaluated independently by the
+      // DoD. In particular, Codex's informal clean verdict intentionally
+      // satisfies approval even though GitHub still says "Review required".
+      if (/^CI is /i.test(blocker) || /^Required checks are failing$/i.test(blocker)) return false;
+      if (/^Review required$/i.test(blocker)) return false;
+      if (/^Changes requested in review$/i.test(blocker)) return false;
+      // Conflicts and draft state retain their explicit stable blocker names.
+      if (/conflict/i.test(blocker) || /draft/i.test(blocker)) return false;
+      return true;
+    });
+    if (
+      !mergeability.mergeable &&
+      blockers.length === 0 &&
+      mergeability.blockers.length === 0 &&
+      mergeability.ciPassing &&
+      mergeability.approved &&
+      mergeability.noConflicts
+    ) {
+      blockers.push("SCM reported the PR is not mergeable");
+    }
+    return blockers;
+  }
+
+  function reviewBodyMatchesApproval(body: string, policy: ReviewBotPolicy): boolean {
+    const normalizedBody = body.toLowerCase().replace(/\s+/g, " ");
+    return (policy.approvalPhrases ?? []).some((phrase) =>
+      normalizedBody.includes(phrase.toLowerCase().replace(/\s+/g, " ")),
+    );
+  }
+
+  function approvalReactionObservationMetadataKeys(pr: PRInfo): {
+    headSha: string;
+    observedAt: string;
+  } {
+    const suffix = `${pr.owner}/${pr.repo}#${pr.number}`;
+    return {
+      headSha: `approvalReactionHeadSha:${suffix}`,
+      observedAt: `approvalReactionObservedAt:${suffix}`,
+    };
+  }
+
+  /**
+   * Return the earliest reaction time that can approve this head. GitHub's
+   * pushedDate is authoritative when present. Because it is often null, keep a
+   * durable per-PR observation boundary as the safe fallback: the first poll of
+   * a head records the boundary and rejects all reactions, while later polls may
+   * accept only reactions created after it.
+   */
+  function approvalReactionBoundary(
+    session: Session,
+    pr: PRInfo,
+    headSha: string | undefined,
+    headPushedAt: Date | undefined,
+  ): Date | null {
+    if (headPushedAt && Number.isFinite(headPushedAt.getTime())) return headPushedAt;
+    if (!headSha) return null;
+
+    const keys = approvalReactionObservationMetadataKeys(pr);
+    const observedAtRaw = session.metadata[keys.observedAt];
+    const observedAtMs = Date.parse(observedAtRaw ?? "");
+    if (session.metadata[keys.headSha] !== headSha || !Number.isFinite(observedAtMs)) {
+      const observedAt = new Date().toISOString();
+      updateSessionMetadata(session, {
+        [keys.headSha]: headSha,
+        [keys.observedAt]: observedAt,
+      });
+      return null;
+    }
+
+    return new Date(observedAtMs);
+  }
+
+  /** Gather fresh SCM facts and evaluate the complete auto-merge DoD. */
+  async function evaluateMergeDefinitionOfDone(
+    session: Session,
+    reactionConfig: ReactionConfig,
+  ): Promise<AutoMergeGateResult> {
+    const project = config.projects[session.projectId];
+    const scm = project?.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
+    const prs = normalizeSessionPRs(session);
+    if (!scm || prs.length === 0 || !scm.getReviewThreads) {
+      return { blockers: ["review_data_incomplete"], mergeTargets: [], missingApprovalTargets: [] };
+    }
+
+    const confidence = computeConfidence(gatherConfidenceSignals(session)).score;
+    const confidenceThreshold =
+      reactionConfig.confidenceThreshold ?? DEFAULT_AUTO_MERGE_CONFIDENCE_THRESHOLD;
+    const blockers = new Set<string>();
+    const mergeTargets: AutoMergeTarget[] = [];
+    const missingApprovalTargets: Array<{ pr: PRInfo; headSha?: string }> = [];
+
+    for (const pr of prs) {
+      try {
+        const [prState, ciStatus, mergeability, reviewDecision, reviewData] = await Promise.all([
+          scm.getPRState(pr),
+          scm.getCISummary(pr),
+          scm.getMergeability(pr),
+          scm.getReviewDecision(pr),
+          scm.getReviewThreads(pr, { forceFresh: true }),
+        ]);
+
+        if (prState === "merged") continue;
+        if (prState !== "open") {
+          blockers.add("pr_not_open");
+          continue;
+        }
+        if (!reviewData.headSha) {
+          // Autonomous merge must be atomically pinned to the exact reviewed
+          // head. Without an SCM-provided head SHA there is no safe merge call.
+          blockers.add("review_data_incomplete");
+          continue;
+        }
+        mergeTargets.push({ pr, expectedHeadSha: reviewData.headSha });
+
+        const unresolvedRequiredThreads = reviewData.threads.filter((comment) => {
+          const botName = reviewCommentBotName(comment);
+          return !botName || reviewBotWeight(session, botName) >= 1;
+        }).length;
+
+        const botReviewApproved = reviewData.reviews.some((review) => {
+          const botName = reviewSummaryBotName(review);
+          if (
+            !botName ||
+            reviewBotWeight(session, botName, review.isReviewBot === true) < 1
+          ) {
+            return false;
+          }
+          const policy = resolveReviewBotPolicy(botName, getReviewBotPolicies(session));
+          const currentHeadReview = !!reviewData.headSha && review.commitSha === reviewData.headSha;
+          if (!currentHeadReview) return false;
+          return (
+            review.state.toUpperCase() === "APPROVED" ||
+            (!!policy && reviewBodyMatchesApproval(review.body, policy))
+          );
+        });
+        const humanReviewApproved = reviewData.reviews.some((review) => {
+          if (reviewSummaryBotName(review)) return false;
+          return (
+            review.state.toUpperCase() === "APPROVED" &&
+            !!reviewData.headSha &&
+            review.commitSha === reviewData.headSha
+          );
+        });
+        const reactionBoundary = approvalReactionBoundary(
+          session,
+          pr,
+          reviewData.headSha,
+          reviewData.headPushedAt,
+        );
+        const botReactionApproved =
+          !!reactionBoundary &&
+          (reviewData.reactions ?? []).some((reaction) => {
+            const botName = reaction.botName ?? (reaction.isBot ? reaction.author : undefined);
+            if (!botName || reviewBotWeight(session, botName, false) < 1) return false;
+            const policy = resolveReviewBotPolicy(botName, getReviewBotPolicies(session));
+            if (
+              !policy?.approvalReactions?.some(
+                (content) => content.toUpperCase() === reaction.content.toUpperCase(),
+              )
+            ) {
+              return false;
+            }
+            // Reactions persist across pushes. Bind approval to the authoritative
+            // push time or, when GitHub omits it, the durable first-observation
+            // boundary for this exact PR/head.
+            return reaction.createdAt.getTime() >= reactionBoundary.getTime();
+          });
+        const changesRequested = classifyPolicyAwareChangesRequested(
+          session,
+          reviewData.reviews,
+          reviewDecision,
+          !(reviewData.threadsTruncated ?? false),
+        );
+        const approvalSignal = humanReviewApproved || botReviewApproved || botReactionApproved;
+        const approvalSatisfied =
+          changesRequested.complete && changesRequested.required.length === 0 && approvalSignal;
+
+        if (
+          changesRequested.complete &&
+          changesRequested.required.length === 0 &&
+          !approvalSignal
+        ) {
+          missingApprovalTargets.push({ pr, headSha: reviewData.headSha });
+        }
+
+        const mergeabilityBlockers = liveMergeabilityBlockers(mergeability);
+        const liveDraft =
+          mergeability.isDraft ?? mergeability.blockers.some((blocker) => /draft/i.test(blocker));
+
+        const decision = resolveMergeDefinitionOfDone({
+          ciGreen: ciStatus === "passing" || ciStatus === "none",
+          unresolvedRequiredThreads,
+          approvalSatisfied,
+          noConflicts: mergeability.noConflicts,
+          isDraft: liveDraft,
+          mergeabilityBlockers,
+          confidence,
+          confidenceThreshold,
+          reviewDataComplete: changesRequested.complete,
+        });
+        for (const blocker of decision.blockers) blockers.add(blocker);
+      } catch {
+        // Every SCM read is decision-critical. A transient failure must never be
+        // interpreted as done.
+        blockers.add("review_data_incomplete");
+      }
+    }
+
+    return { blockers: [...blockers], mergeTargets, missingApprovalTargets };
+  }
+
+  function updateAutoMergeBlockers(session: Session, blockers: string[]): void {
+    const next = blockers.join(",");
+    if ((session.metadata["autoMergeBlockers"] ?? "") === next) return;
+    updateSessionMetadata(session, { autoMergeBlockers: next });
+  }
+
+  function actionableRebumpPolicy(
+    session: Session,
+  ): { botName: string; policy: ReviewBotPolicy } | null {
+    const policies = getReviewBotPolicies(session);
+    if (!policies) return null;
+    for (const [botName, policy] of Object.entries(policies)) {
+      if (botName !== "*" && policy.weight >= 1 && policy.rebumpMessage) {
+        return { botName, policy };
+      }
+    }
+    return null;
+  }
+
+  function reviewRebumpMetadataKeys(pr: PRInfo): {
+    headSha: string;
+    count: string;
+    at: string;
+    escalatedAt: string;
+  } {
+    const suffix = `${pr.owner}/${pr.repo}#${pr.number}`;
+    return {
+      headSha: `reviewRebumpHeadSha:${suffix}`,
+      count: `reviewRebumpCount:${suffix}`,
+      at: `reviewRebumpAt:${suffix}`,
+      escalatedAt: `reviewApprovalEscalatedAt:${suffix}`,
+    };
+  }
+
+  function scopedReviewRebumpMetadataCleanup(session: Session): Record<string, string> {
+    const updates: Record<string, string> = {};
+    for (const key of Object.keys(session.metadata)) {
+      if (
+        key.startsWith("reviewRebumpHeadSha:") ||
+        key.startsWith("reviewRebumpCount:") ||
+        key.startsWith("reviewRebumpAt:") ||
+        key.startsWith("reviewApprovalEscalatedAt:")
+      ) {
+        updates[key] = "";
+      }
+    }
+    return updates;
+  }
+
+  async function escalateReviewApprovalFallback(
+    session: Session,
+    pr: PRInfo,
+    target: { botName: string; policy: ReviewBotPolicy },
+    keys: ReturnType<typeof reviewRebumpMetadataKeys>,
+    attempts: number,
+    reason: "max_rebumps" | "posting_unavailable" | "posting_failed",
+  ): Promise<void> {
+    if (session.metadata[keys.escalatedAt]) return;
+    const message =
+      reason === "posting_unavailable"
+        ? `AO cannot request another review from ${target.botName} on PR #${pr.number} because this SCM cannot post PR comments. Human approval can satisfy the merge gate.`
+        : reason === "posting_failed"
+          ? `AO failed to post another review request for ${target.botName} on PR #${pr.number}. Human approval can satisfy the merge gate.`
+          : `${target.botName} did not provide an approval signal after ${attempts} re-bump(s) on PR #${pr.number}. Human approval can satisfy the merge gate.`;
+    const context = buildEventContext(session, prEnrichmentCache);
+    const event = createEvent("reaction.escalated", {
+      sessionId: session.id,
+      projectId: session.projectId,
+      message,
+      data: buildReactionEscalationNotificationData({
+        eventType: "reaction.escalated",
+        sessionId: session.id,
+        projectId: session.projectId,
+        context,
+        reactionKey: "approved-and-green",
+        action: "auto-merge",
+        attempts,
+        cause: "max_attempts",
+        enrichment: getPREnrichmentForSession(session),
+      }),
+    });
+    if (await notifyHuman(event, "action")) {
+      updateSessionMetadata(session, { [keys.escalatedAt]: new Date().toISOString() });
+    }
+  }
+
+  /** Bounded, exponentially backed-off Codex re-bump with human fallback. */
+  async function maybeRebumpAutomatedReviewer(
+    session: Session,
+    approvalTarget: { pr: PRInfo; headSha?: string },
+  ): Promise<void> {
+    const { pr, headSha } = approvalTarget;
+    if (!headSha) return;
+    const target = actionableRebumpPolicy(session);
+    if (!target) return;
+    const keys = reviewRebumpMetadataKeys(pr);
+    if (session.metadata[keys.headSha] !== headSha) {
+      updateSessionMetadata(session, {
+        [keys.headSha]: headSha,
+        [keys.count]: "",
+        [keys.at]: "",
+        [keys.escalatedAt]: "",
+      });
+    }
+    if (session.metadata[keys.escalatedAt]) return;
+
+    const project = config.projects[session.projectId];
+    const scm = project?.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
+    if (!scm?.postPRComment) {
+      await escalateReviewApprovalFallback(session, pr, target, keys, 0, "posting_unavailable");
+      return;
+    }
+
+    const count = parseAttemptCount(session.metadata[keys.count]);
+    const maxRebumps = target.policy.maxRebumps ?? 0;
+    const baseBackoffMs = parseDuration(target.policy.rebumpBackoff ?? "30m");
+    const lastAt = Date.parse(session.metadata[keys.at] ?? "");
+    const backoffMs = baseBackoffMs * 2 ** Math.max(0, count - 1);
+    if (Number.isFinite(lastAt) && Date.now() - lastAt < backoffMs) return;
+
+    if (count < maxRebumps) {
+      try {
+        await scm.postPRComment(pr, target.policy.rebumpMessage!);
+        updateSessionMetadata(session, {
+          [keys.headSha]: headSha,
+          [keys.count]: String(count + 1),
+          [keys.at]: new Date().toISOString(),
+        });
+        recordActivityEvent({
+          projectId: session.projectId,
+          sessionId: session.id,
+          source: "reaction",
+          kind: "review.rebumped",
+          summary: `requested another review from ${normalizeReviewBotName(target.botName)}`,
+          data: {
+            botName: target.botName,
+            attempt: count + 1,
+            maxRebumps,
+            headSha,
+            prNumber: pr.number,
+          },
+        });
+      } catch {
+        await escalateReviewApprovalFallback(session, pr, target, keys, count, "posting_failed");
+      }
+      return;
+    }
+
+    await escalateReviewApprovalFallback(session, pr, target, keys, maxRebumps, "max_rebumps");
+  }
+
+  async function maybeAutoMergeWhenDone(session: Session, newStatus: SessionStatus): Promise<void> {
+    if (!session.pr || session.lifecycle.pr.state !== "open") return;
+    if (session.metadata["autoMergeRequestedAt"]) return;
+    const reactionConfig = getReactionConfigForSession(session, "approved-and-green");
+    if (
+      reactionConfig?.action !== "auto-merge" ||
+      reactionConfig.auto === false ||
+      (newStatus !== "mergeable" &&
+        newStatus !== "approved" &&
+        newStatus !== "review_pending" &&
+        newStatus !== "changes_requested" &&
+        !session.metadata["reviewSatisfiedAt"])
+    ) {
+      return;
+    }
+    await executeReaction(session, "approved-and-green", reactionConfig);
   }
 
   /**
    * Completion detection for the bot review→fix loop: when no unresolved review
-   * threads remain, CI is green, no changes_requested review is open, and the
-   * code reviewer has reviewed the CURRENT head, record that the review is
+   * threads remain, CI is green, no policy-required changes request is open,
+   * and the code reviewer has reviewed the CURRENT head, record that the review is
    * satisfied so the merge gate (#15) can advance the PR. Latches on
    * `reviewSatisfiedAt`; the latch is cleared (above) when a thread reappears, CI
    * regresses, a change is requested, or the head moves.
@@ -3487,7 +4203,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   async function maybeMarkReviewSatisfied(
     session: Session,
     scm: SCM,
-    ctx: { primaryHumanThreadsClear: boolean; headSha: string | undefined; threadsTruncated: boolean },
+    ctx: {
+      primaryHumanThreadsClear: boolean;
+      headSha: string | undefined;
+      threadsTruncated: boolean;
+      changesRequested: PolicyAwareChangesRequested;
+    },
   ): Promise<boolean> {
     if (session.metadata["reviewSatisfiedAt"]) return false; // already marked
     if (normalizeSessionPRs(session).length > 1) return false; // multi-PR deferred to #15
@@ -3503,9 +4224,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // those to the merge gate rather than emit a possibly-stale signal.
     if (!ctx.headSha) return false;
     if (session.metadata["botReviewObservedSha"] !== ctx.headSha) return false;
-    // A top-level changes_requested review (even with no inline threads) blocks
-    // merge-readiness.
-    if (!(await primaryPRNotChangesRequested(session, scm))) return false;
+    // Only policy-required changes requests block. Fractional-weight bot reviews
+    // are optional context, while incomplete fresh review data fails closed.
+    if (!ctx.changesRequested.complete || ctx.changesRequested.required.length > 0) return false;
     if (!(await primaryPRCIGreen(session, scm))) return false;
 
     const satisfiedAt = new Date().toISOString();
@@ -3738,6 +4459,76 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return makeFingerprint(failedChecks.map((c) => `${c.name}:${c.status}:${c.conclusion ?? ""}`));
   }
 
+  /**
+   * Retry classifier-approved flaky CI before the ci-failed reaction is allowed
+   * to consume an agent fix attempt. Returns true while the retry grace window
+   * owns this exact failure fingerprint.
+   */
+  async function maybeRetryFlakyCI(session: Session, newStatus: SessionStatus): Promise<boolean> {
+    if (newStatus !== "ci_failed" || !session.pr) return false;
+    const reactionConfig = getReactionConfigForSession(session, "ci-failed");
+    const maxRetries = reactionConfig?.flakyRetries ?? 0;
+    if (maxRetries <= 0) return false;
+
+    const project = config.projects[session.projectId];
+    const scm = project?.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
+    if (!scm?.retryCI) return false;
+    const failedChecks = await getFailedCIChecks(scm, session.pr, { allowFetch: true });
+    if (!failedChecks) return false;
+
+    const fingerprint = makeCIFailureFingerprint(failedChecks);
+    const lastFingerprint = session.metadata["lastFlakyCIFingerprint"] ?? "";
+    const lastRetryAt = Date.parse(session.metadata["lastFlakyCIRetryAt"] ?? "");
+    const graceMs = parseDuration(reactionConfig?.flakyRetryBackoff ?? "10m");
+    if (
+      fingerprint === lastFingerprint &&
+      Number.isFinite(lastRetryAt) &&
+      Date.now() - lastRetryAt < graceMs
+    ) {
+      return true;
+    }
+
+    const retryCount = parseAttemptCount(session.metadata["flakyCIRetryCount"]);
+    if (retryCount >= maxRetries) return false;
+
+    let summary: CIFailureSummary | null = null;
+    if (scm.getCIFailureSummary) {
+      try {
+        summary = await scm.getCIFailureSummary(session.pr, failedChecks);
+      } catch {
+        // Check conclusions alone may still identify a flaky infrastructure run.
+      }
+    }
+    const classification = classifyCIFailure(failedChecks, summary);
+    if (classification.kind !== "flaky") return false;
+
+    try {
+      if (!(await scm.retryCI(session.pr, failedChecks))) return false;
+    } catch {
+      return false;
+    }
+
+    updateSessionMetadata(session, {
+      lastFlakyCIFingerprint: fingerprint,
+      lastFlakyCIRetryAt: new Date().toISOString(),
+      flakyCIRetryCount: String(retryCount + 1),
+    });
+    recordActivityEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      source: "reaction",
+      kind: "ci.flaky_retry",
+      summary: `retried flaky CI before nudging the agent: ${classification.reason}`,
+      data: {
+        attempt: retryCount + 1,
+        maxRetries,
+        fingerprint,
+        reason: classification.reason,
+      },
+    });
+    return true;
+  }
+
   /** Instructions the child agent follows to rebase its branch onto the new
    *  base after its parent merged. A base-edit alone is not enough under the
    *  default squash merge: the child branch still carries the parent's original
@@ -3951,6 +4742,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     _oldStatus: SessionStatus,
     newStatus: SessionStatus,
     transitionReaction?: TransitionReaction,
+    flakyCIRetryPending = false,
   ): Promise<void> {
     const project = config.projects[session.projectId];
     if (!project || !session.pr) return;
@@ -3959,6 +4751,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     if (!scm) return;
 
     const ciReactionKey = "ci-failed";
+
+    if (flakyCIRetryPending) return;
 
     // The cumulative CI-failure signal is reset ONLY at a TERMINAL PR (merged, or
     // closed-unmerged) — never on CI recovery — so a later auto-action still scores
@@ -3977,6 +4771,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         lastCIFailureDispatchHash: "",
         lastCIFailureDispatchAt: "",
         ciFailureCountTotal: "",
+        lastFlakyCIFingerprint: "",
+        lastFlakyCIRetryAt: "",
+        flakyCIRetryCount: "",
       });
       return;
     }
@@ -4613,9 +5410,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         // every subsequent poll while still over budget. Resetting it each poll
         // would make the dashboard/observability show a perpetually-fresh
         // transition time and churn the persisted lifecycle.
-        const pausedAt = firstPause
-          ? new Date().toISOString()
-          : session.metadata["budgetPausedAt"];
+        const pausedAt = firstPause ? new Date().toISOString() : session.metadata["budgetPausedAt"];
         newStatus = SESSION_STATUS.NEEDS_INPUT;
         session.status = SESSION_STATUS.NEEDS_INPUT;
         session.lifecycle.session.state = "needs_input";
@@ -4675,8 +5470,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           (typeof budget.perSessionUsd === "number" && budget.perSessionUsd > 0) ||
           (typeof budget.perProjectUsd === "number" && budget.perProjectUsd > 0);
         const costObserved =
-          projectCostUsd !== undefined ||
-          session.agentInfo?.cost?.estimatedCostUsd !== undefined;
+          projectCostUsd !== undefined || session.agentInfo?.cost?.estimatedCostUsd !== undefined;
         if (!anyCapActive || costObserved) {
           // Cap removed, or a real cost was observed below it — release.
           updateSessionMetadata(session, {
@@ -4781,7 +5575,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           const stableCount = Number(session.metadata["ciPassingStableCount"] ?? "0") + 1;
           if (stableCount >= CI_PASSING_STABLE_THRESHOLD) {
             clearReactionTracker(session.id, "ci-failed");
-            updateSessionMetadata(session, { ciPassingStableCount: "" });
+            updateSessionMetadata(session, {
+              ciPassingStableCount: "",
+              lastFlakyCIFingerprint: "",
+              lastFlakyCIRetryAt: "",
+              flakyCIRetryCount: "",
+            });
           } else {
             updateSessionMetadata(session, { ciPassingStableCount: String(stableCount) });
           }
@@ -4791,6 +5590,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         }
       }
     }
+
+    // Classify before transition reactions. When this returns true, the SCM retry
+    // owns the incident and neither executeReaction nor the detailed dispatcher
+    // may spend an agent fix round for it.
+    const flakyCIRetryPending = await maybeRetryFlakyCI(session, newStatus);
 
     // Stamp/clear the needs_input episode marker BEFORE anything can notify. The
     // decision identity pairs the report instant with this marker, so it must
@@ -4864,8 +5668,21 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       if (eventType) {
         let reactionHandledNotify = false;
         const reactionKey = eventToReactionKey(eventType);
+        const changesRequested =
+          reactionKey === "changes-requested"
+            ? await fetchPolicyAwareChangesRequested(session)
+            : undefined;
+        const suppressContextOnlyChangesRequested =
+          changesRequested?.complete === true && changesRequested.required.length === 0;
 
-        if (reactionKey) {
+        if (suppressContextOnlyChangesRequested) {
+          // The coarse SCM status cannot identify the author. Fresh summaries
+          // prove that only fractional-weight bots requested changes, so this is
+          // context rather than a required transition/reaction.
+          reactionHandledNotify = true;
+        }
+
+        if (reactionKey && !suppressContextOnlyChangesRequested) {
           let reactionConfig = getReactionConfigForSession(session, reactionKey);
           let messageEnriched = false;
 
@@ -4875,6 +5692,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           // composed message without altering lifecycle state transitions.
           if (
             reactionKey === "ci-failed" &&
+            !flakyCIRetryPending &&
             session.pr &&
             reactionConfig?.action === "send-to-agent"
           ) {
@@ -4895,33 +5713,42 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           if (reactionConfig && reactionConfig.action) {
             // auto: false skips automated agent actions but still allows notifications
             if (reactionConfig.auto !== false || reactionConfig.action === "notify") {
-              const reactionResult = await executeReaction(session, reactionKey, reactionConfig);
-              transitionReaction = { key: reactionKey, result: reactionResult, messageEnriched };
-              observer.recordOperation({
-                metric: "lifecycle_poll",
-                operation: "lifecycle.transition.reaction",
-                outcome: reactionResult.success ? "success" : "failure",
-                correlationId,
-                projectId: session.projectId,
-                sessionId: session.id,
-                reason: primaryLifecycleReason(session.lifecycle),
-                data: buildTransitionObservabilityData(
-                  previousLifecycle,
-                  session.lifecycle,
-                  oldStatus,
-                  newStatus,
-                  assessment.evidence,
-                  assessment.detectingAttempts,
-                  true,
-                  transitionReaction,
-                ),
-                level: reactionResult.success ? "info" : "warn",
-              });
-              // Reaction is handling this event — suppress immediate human notification.
-              // "send-to-agent" retries + escalates on its own; "notify"/"auto-merge"
-              // already call notifyHuman internally. Notifying here would bypass the
-              // delayed escalation behaviour configured via retries/escalateAfter.
-              reactionHandledNotify = true;
+              // Auto-merge is level-triggered after the review/CI dispatchers have
+              // refreshed their facts below. Deferring avoids racing a stale
+              // mergeable transition against a newly-opened review thread.
+              if (reactionKey === "ci-failed" && flakyCIRetryPending) {
+                reactionHandledNotify = true;
+              } else if (reactionConfig.action === "auto-merge") {
+                reactionHandledNotify = true;
+              } else {
+                const reactionResult = await executeReaction(session, reactionKey, reactionConfig);
+                transitionReaction = { key: reactionKey, result: reactionResult, messageEnriched };
+                observer.recordOperation({
+                  metric: "lifecycle_poll",
+                  operation: "lifecycle.transition.reaction",
+                  outcome: reactionResult.success ? "success" : "failure",
+                  correlationId,
+                  projectId: session.projectId,
+                  sessionId: session.id,
+                  reason: primaryLifecycleReason(session.lifecycle),
+                  data: buildTransitionObservabilityData(
+                    previousLifecycle,
+                    session.lifecycle,
+                    oldStatus,
+                    newStatus,
+                    assessment.evidence,
+                    assessment.detectingAttempts,
+                    true,
+                    transitionReaction,
+                  ),
+                  level: reactionResult.success ? "info" : "warn",
+                });
+                // Reaction is handling this event — suppress immediate human notification.
+                // "send-to-agent" retries + escalates on its own; "notify"/"auto-merge"
+                // already call notifyHuman internally. Notifying here would bypass the
+                // delayed escalation behaviour configured via retries/escalateAfter.
+                reactionHandledNotify = true;
+              }
             }
           }
         }
@@ -5032,9 +5859,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     await Promise.allSettled([
       maybeDispatchReviewBacklog(session, oldStatus, newStatus, transitionReaction),
       maybeDispatchMergeConflicts(session, newStatus),
-      maybeDispatchCIFailureDetails(session, oldStatus, newStatus, transitionReaction),
+      maybeDispatchCIFailureDetails(
+        session,
+        oldStatus,
+        newStatus,
+        transitionReaction,
+        flakyCIRetryPending,
+      ),
       maybeRetargetStackedChild(session),
     ]);
+    await maybeAutoMergeWhenDone(session, newStatus);
 
     // Report watcher: audit agent reports for issues (#140). Tell it whether THIS
     // poll transitioned the session into needs_input — if so, the transition
@@ -5188,8 +6022,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // needs_decision carries an explicit question/confidence; a plain needs_input
       // uses the audit finding's generic message. A needs_decision with no active
       // decision context stays silent (unchanged behavior).
-      const decision =
-        decisionReportState === "needs_decision" ? getActiveDecision(session) : null;
+      const decision = decisionReportState === "needs_decision" ? getActiveDecision(session) : null;
       const message =
         decisionReportState === "needs_decision"
           ? decision
@@ -5407,9 +6240,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           sessionCheckResults[index],
         ]),
       );
-      const queueProjectIds = scopedProjectId
-        ? [scopedProjectId]
-        : Object.keys(config.projects);
+      const queueProjectIds = scopedProjectId ? [scopedProjectId] : Object.keys(config.projects);
       for (const queueProjectId of queueProjectIds) {
         await processSCMWebhookQueue(
           queueProjectId,
@@ -5627,11 +6458,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       const projectCostUsd = sumProjectCost(await sessionManager.list(session.projectId));
       // Pass the raw lookup (possibly undefined) — see the pollAll call site for
       // why missing cost must not be coalesced to 0.
-      await checkSession(
-        session,
-        projectCostUsd.get(session.projectId),
-        scmRefreshOutcomes,
-      );
+      await checkSession(session, projectCostUsd.get(session.projectId), scmRefreshOutcomes);
       if (options.requireSuccessfulSCMRefresh) {
         requireSuccessfulSCMRefresh(scmRefreshOutcomes, session);
       }

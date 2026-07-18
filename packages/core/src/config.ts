@@ -151,6 +151,18 @@ function validatePluginConfigFields(
   }
 }
 
+const ReviewBotPolicySchema = z.object({
+  weight: z.number().min(0).max(1).default(1),
+  approvalPhrases: z.array(z.string().min(1)).optional(),
+  approvalReactions: z.array(z.string().min(1)).optional(),
+  rebumpMessage: z.string().min(1).optional(),
+  maxRebumps: z.number().int().nonnegative().optional(),
+  rebumpBackoff: z
+    .string()
+    .regex(/^\d+(s|m|h)$/)
+    .optional(),
+});
+
 const ReactionConfigSchema = z.object({
   auto: z.boolean().default(true),
   action: z.enum(["send-to-agent", "notify", "auto-merge", "spawn-session"]).default("notify"),
@@ -163,6 +175,12 @@ const ReactionConfigSchema = z.object({
   maxRounds: z.number().int().positive().optional(),
   nudgeRetries: z.number().int().positive().optional(),
   confidenceThreshold: z.number().min(0).max(1).optional(),
+  reviewBots: z.record(ReviewBotPolicySchema).optional(),
+  flakyRetries: z.number().int().nonnegative().optional(),
+  flakyRetryBackoff: z
+    .string()
+    .regex(/^\d+(s|m|h)$/)
+    .optional(),
 });
 
 const TrackerConfigSchema = z
@@ -718,6 +736,13 @@ export function mergeReactionOverride(
   override: Partial<ReactionConfig>,
 ): ReactionConfig {
   const merged: ReactionConfig = { ...base, ...override };
+  if (base.reviewBots || override.reviewBots) {
+    const reviewBots = { ...base.reviewBots };
+    for (const [botName, policy] of Object.entries(override.reviewBots ?? {})) {
+      reviewBots[botName] = { ...reviewBots[botName], ...policy };
+    }
+    merged.reviewBots = reviewBots;
+  }
   if (override.action !== undefined && override.auto === undefined && merged.action !== "notify") {
     merged.auto = true;
   }
@@ -748,6 +773,8 @@ function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
       action: "send-to-agent",
       retries: 2,
       escalateAfter: 2,
+      flakyRetries: 1,
+      flakyRetryBackoff: "10m",
     },
     "changes-requested": {
       auto: true,
@@ -762,6 +789,19 @@ function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
       message: "Automated review comments found on your PR. Details will follow shortly.",
       escalateAfter: "30m",
       maxRounds: 5,
+      reviewBots: {
+        "chatgpt-codex-connector[bot]": {
+          weight: 1,
+          approvalPhrases: ["Didn't find any major issues"],
+          approvalReactions: ["THUMBS_UP"],
+          rebumpMessage: "@codex review",
+          maxRebumps: 2,
+          rebumpBackoff: "30m",
+        },
+        // Other bots remain visible as context when Codex has actionable
+        // findings, but do not independently spend a fix round or block merge.
+        "*": { weight: 0.25 },
+      },
     },
     "merge-conflicts": {
       auto: true,
@@ -774,6 +814,9 @@ function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
       action: "notify",
       priority: "action",
       message: "PR is ready to merge",
+      // Inherited when a user changes only `action: auto-merge`, making the
+      // confidence component of the definition-of-done mandatory by default.
+      confidenceThreshold: 0.8,
     },
     "agent-idle": {
       auto: true,

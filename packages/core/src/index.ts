@@ -121,9 +121,22 @@ export type {
 export {
   DETECTING_MAX_ATTEMPTS,
   DETECTING_MAX_DURATION_MS,
+  classifyCIFailure,
   hashEvidence,
   isDetectingTimedOut,
+  resolveMergeDefinitionOfDone,
 } from "./lifecycle-status-decisions.js";
+export type {
+  CIFailureClassification,
+  MergeDefinitionOfDoneDecision,
+  MergeDefinitionOfDoneInput,
+} from "./lifecycle-status-decisions.js";
+export {
+  formatAutomatedCommentsMessage,
+  normalizeReviewBotName,
+  partitionAutomatedComments,
+  resolveReviewBotPolicy,
+} from "./format-automated-comments.js";
 
 // Report watcher — background trigger system for agent reports (#140)
 export {

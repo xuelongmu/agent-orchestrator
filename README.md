@@ -162,11 +162,12 @@ reactions:
     action: send-to-agent
     escalateAfter: 30m
   approved-and-green:
-    auto: false # flip to true for auto-merge
-    action: notify
+    auto: true
+    action: auto-merge # gated by green CI, review policy, conflicts, and confidence
+    confidenceThreshold: 0.8
 ```
 
-CI fails → agent gets the logs and fixes it. Reviewer requests changes → agent addresses them. PR approved with green CI → you get a notification to merge.
+CI fails → AO retries classifier-confirmed flakes or sends real failures to the agent. Reviewer requests changes → agent addresses them. Auto-merge runs only after the complete quality gate passes.
 
 Keep the `$schema` line so editors can autocomplete and validate against [`schema/config.schema.json`](schema/config.schema.json).
 

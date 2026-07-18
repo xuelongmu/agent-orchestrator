@@ -73,6 +73,10 @@ const BOT_AUTHORS = new Set([
  */
 const CODE_REVIEW_BOT_AUTHORS = new Set(["cursor[bot]", "chatgpt-codex-connector[bot]"]);
 
+function isBotAuthor(author: string): boolean {
+  return BOT_AUTHORS.has(author) || author.toLowerCase().endsWith("[bot]");
+}
+
 const CI_FAILURE_LOG_TAIL_LINES = 120;
 const ciSummaryFailClosedEmitted = new Set<string>();
 
@@ -170,7 +174,8 @@ function mapRawCheckStateToStatus(rawState: string | undefined): CICheck["status
     state === "TIMED_OUT" ||
     state === "CANCELLED" ||
     state === "ACTION_REQUIRED" ||
-    state === "ERROR"
+    state === "ERROR" ||
+    state === "STARTUP_FAILURE"
   ) {
     return "failed";
   }
@@ -864,10 +869,16 @@ function createGitHubSCM(): SCM {
       });
     },
 
-    async mergePR(pr: PRInfo, method: MergeMethod = "squash"): Promise<void> {
+    async mergePR(
+      pr: PRInfo,
+      method: MergeMethod = "squash",
+      expectedHeadSha?: string,
+    ): Promise<void> {
       const flag = method === "rebase" ? "--rebase" : method === "merge" ? "--merge" : "--squash";
-
-      await gh(["pr", "merge", String(pr.number), "--repo", repoFlag(pr), flag, "--delete-branch"]);
+      const args = ["pr", "merge", String(pr.number), "--repo", repoFlag(pr), flag];
+      if (expectedHeadSha) args.push("--match-head-commit", expectedHeadSha);
+      args.push("--delete-branch");
+      await gh(args);
       invalidatePRCache(pr);
     },
 
@@ -1054,6 +1065,40 @@ function createGitHubSCM(): SCM {
       return "passing";
     },
 
+    async retryCI(pr: PRInfo, failedChecks: CICheck[]): Promise<boolean> {
+      const runIds = new Set<string>();
+      for (const check of failedChecks) {
+        const reference = extractActionRunReference(check);
+        if (reference) runIds.add(reference.runId);
+      }
+      if (runIds.size === 0) return false;
+
+      let anyRetried = false;
+      for (const runId of runIds) {
+        try {
+          await gh(["run", "rerun", runId, "--failed", "--repo", repoFlag(pr)]);
+          anyRetried = true;
+        } catch (err) {
+          recordActivityEvent({
+            source: "scm",
+            kind: "scm.ci_retry_failed",
+            level: "warn",
+            summary: `Failed to rerun CI workflow run ${runId} for PR #${pr.number}`,
+            data: {
+              plugin: "scm-github",
+              prNumber: pr.number,
+              prOwner: pr.owner,
+              prRepo: pr.repo,
+              runId,
+              errorMessage: err instanceof Error ? err.message : String(err),
+            },
+          });
+        }
+      }
+      if (anyRetried) invalidatePRCache(pr);
+      return anyRetried;
+    },
+
     async getReviews(pr: PRInfo): Promise<Review[]> {
       // 5s TTL — review array. Reviewers are async, so the lifecycle worker
       // sees a new review on its next poll cycle within 5s of the cache expiring.
@@ -1195,7 +1240,7 @@ function createGitHubSCM(): SCM {
               const c = t.comments.nodes[0];
               if (!c) return false; // skip threads with no comments
               const author = c.author?.login ?? "";
-              return !BOT_AUTHORS.has(author);
+              return !isBotAuthor(author);
             })
             .map((t) => {
               const c = t.comments.nodes[0];
@@ -1259,6 +1304,9 @@ function createGitHubSCM(): SCM {
             repository(owner: $owner, name: $name) {
               pullRequest(number: $number) {
                 headRefOid
+                commits(last: 1) {
+                  nodes { commit { pushedDate } }
+                }
                 reviewThreads(last: 100) {
                   totalCount
                   nodes {
@@ -1277,13 +1325,21 @@ function createGitHubSCM(): SCM {
                     }
                   }
                 }
-                reviews(last: 20) {
+                reviews(first: 100) {
+                  pageInfo { hasNextPage endCursor }
                   nodes {
                     author { login }
                     state
                     body
                     submittedAt
                     commit { oid }
+                  }
+                }
+                reactions(last: 100) {
+                  nodes {
+                    content
+                    createdAt
+                    user { login }
                   }
                 }
               }
@@ -1294,11 +1350,26 @@ function createGitHubSCM(): SCM {
         // Strip HTTP headers from -i response to get JSON body
         const raw = rawWithHeaders.replace(/^[\s\S]*?\r?\n\r?\n/, "");
 
+        type ReviewNode = {
+          author: { login: string } | null;
+          state: string;
+          body: string;
+          submittedAt: string;
+          commit: { oid: string } | null;
+        };
+        type ReviewConnection = {
+          pageInfo: { hasNextPage: boolean; endCursor: string | null };
+          nodes: ReviewNode[];
+        };
+
         const data: {
           data: {
             repository: {
               pullRequest: {
                 headRefOid: string | null;
+                commits?: {
+                  nodes: Array<{ commit: { pushedDate: string | null } }>;
+                };
                 reviewThreads: {
                   totalCount: number;
                   nodes: Array<{
@@ -1317,13 +1388,12 @@ function createGitHubSCM(): SCM {
                     };
                   }>;
                 };
-                reviews: {
+                reviews: ReviewConnection;
+                reactions?: {
                   nodes: Array<{
-                    author: { login: string } | null;
-                    state: string;
-                    body: string;
-                    submittedAt: string;
-                    commit: { oid: string } | null;
+                    content: string;
+                    createdAt: string;
+                    user: { login: string } | null;
                   }>;
                 };
               };
@@ -1333,8 +1403,52 @@ function createGitHubSCM(): SCM {
 
         const pullRequest = data.data.repository.pullRequest;
         const threadNodes = pullRequest.reviewThreads.nodes;
-        const reviewNodes = pullRequest.reviews.nodes;
+        const reviewNodes = [...pullRequest.reviews.nodes];
+        let reviewPageInfo = pullRequest.reviews.pageInfo;
+        while (reviewPageInfo.hasNextPage) {
+          if (!reviewPageInfo.endCursor) {
+            throw new Error("GitHub returned a truncated review page without a cursor");
+          }
+          const reviewPageRaw = await gh([
+            "api",
+            "graphql",
+            "-f",
+            `owner=${pr.owner}`,
+            "-f",
+            `name=${pr.repo}`,
+            "-F",
+            `number=${pr.number}`,
+            "-f",
+            `reviewsCursor=${reviewPageInfo.endCursor}`,
+            "-f",
+            `query=query($owner: String!, $name: String!, $number: Int!, $reviewsCursor: String!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) {
+                  reviews(first: 100, after: $reviewsCursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      author { login }
+                      state
+                      body
+                      submittedAt
+                      commit { oid }
+                    }
+                  }
+                }
+              }
+              rateLimit { cost remaining resetAt }
+            }`,
+          ]);
+          const reviewPageData: {
+            data: { repository: { pullRequest: { reviews: ReviewConnection } } };
+          } = JSON.parse(reviewPageRaw);
+          const nextReviews = reviewPageData.data.repository.pullRequest.reviews;
+          reviewNodes.push(...nextReviews.nodes);
+          reviewPageInfo = nextReviews.pageInfo;
+        }
         const headSha = pullRequest.headRefOid ?? undefined;
+        const headPushedAtRaw = pullRequest.commits?.nodes[0]?.commit.pushedDate;
+        const headPushedAt = headPushedAtRaw ? parseDate(headPushedAtRaw) : undefined;
         // We fetch the 100 most-recent threads; if the PR has more, an older
         // unresolved thread may be outside the window. Flag truncation so callers
         // don't treat an empty set as authoritatively clean.
@@ -1359,18 +1473,25 @@ function createGitHubSCM(): SCM {
               isResolved: t.isResolved,
               createdAt: parseDate(c.createdAt),
               url: c.url,
-              isBot: BOT_AUTHORS.has(author),
+              isBot: isBotAuthor(author),
+              botName: isBotAuthor(author) ? author : undefined,
               isReviewBot: CODE_REVIEW_BOT_AUTHORS.has(author),
             };
           });
 
         const reviews: ReviewSummary[] = reviewNodes
-          // Keep non-empty human reviews for display, and ALL bot reviews (even
-          // with an empty body) so completion detection can recognize a clean,
-          // no-inline-comment bot review as a real review-submission signal.
+          // Keep non-empty human reviews for display, decisive human review
+          // states for head-scoped approval checks, and ALL bot reviews so a
+          // clean no-inline-comment bot review remains an engagement signal.
           .filter((r) => {
             const author = r.author?.login ?? "unknown";
-            return (r.body && r.body.trim().length > 0) || BOT_AUTHORS.has(author);
+            const state = r.state.toUpperCase();
+            return (
+              (r.body && r.body.trim().length > 0) ||
+              isBotAuthor(author) ||
+              state === "APPROVED" ||
+              state === "CHANGES_REQUESTED"
+            );
           })
           .map((r) => {
             const author = r.author?.login ?? "unknown";
@@ -1379,13 +1500,33 @@ function createGitHubSCM(): SCM {
               state: r.state,
               body: r.body,
               submittedAt: parseDate(r.submittedAt),
-              isBot: BOT_AUTHORS.has(author),
+              isBot: isBotAuthor(author),
+              botName: isBotAuthor(author) ? author : undefined,
               isReviewBot: CODE_REVIEW_BOT_AUTHORS.has(author),
               commitSha: r.commit?.oid ?? undefined,
             };
           });
 
-        const result: ReviewThreadsResult = { threads, reviews, headSha, threadsTruncated };
+        const reactions = (pullRequest.reactions?.nodes ?? []).map((reaction) => {
+          const author = reaction.user?.login ?? "unknown";
+          const bot = isBotAuthor(author);
+          return {
+            author,
+            content: reaction.content,
+            createdAt: parseDate(reaction.createdAt),
+            isBot: bot,
+            botName: bot ? author : undefined,
+          };
+        });
+
+        const result: ReviewThreadsResult = {
+          threads,
+          reviews,
+          reactions,
+          headSha,
+          headPushedAt,
+          threadsTruncated,
+        };
         reviewThreadsCache.set(cacheKey, result);
         return result;
       } catch (err) {
@@ -1399,6 +1540,11 @@ function createGitHubSCM(): SCM {
         instanceObserver?.log("warn", `[getReviewThreads] Failed for ${cacheKey}: ${errorMsg}`);
         throw new Error("Failed to fetch review threads", { cause: err });
       }
+    },
+
+    async postPRComment(pr: PRInfo, body: string): Promise<void> {
+      await gh(["pr", "comment", String(pr.number), "--repo", repoFlag(pr), "--body", body]);
+      invalidatePRCache(pr);
     },
 
     async getMergeability(pr: PRInfo): Promise<MergeReadiness> {
@@ -1420,6 +1566,7 @@ function createGitHubSCM(): SCM {
             ciPassing: true,
             approved: true,
             noConflicts: true,
+            isDraft: false,
             blockers: [],
           };
         }
@@ -1485,6 +1632,7 @@ function createGitHubSCM(): SCM {
           ciPassing,
           approved,
           noConflicts,
+          isDraft: data.isDraft,
           blockers,
         };
       });
