@@ -85,6 +85,7 @@ export type ActivityEventKind =
   | "reaction.escalated"
   | "reaction.send_to_agent_failed"
   | "reaction.action_succeeded"
+  | "review_backlog.outcome"
   // Budget enforcement
   | "budget.paused"
   | "budget.interrupt_failed"
