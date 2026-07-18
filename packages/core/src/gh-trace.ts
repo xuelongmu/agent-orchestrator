@@ -114,6 +114,82 @@ interface HeaderMap {
   [key: string]: string | undefined;
 }
 
+interface GithubRateLimitSnapshot {
+  limit?: number;
+  remaining: number;
+  resetAt?: number;
+  observedAt: number;
+}
+
+const githubRateLimits = new Map<string, GithubRateLimitSnapshot>();
+const RATE_LIMIT_SNAPSHOT_TTL_MS = 5 * 60_000;
+
+function observeGithubRateLimit(entry: GhTraceEntry, observedAt = Date.now()): void {
+  const remaining = entry.graphqlRemaining ?? entry.rateLimitRemaining;
+  if (remaining === undefined) return;
+
+  const graphqlResetAt = entry.graphqlResetAt
+    ? Date.parse(entry.graphqlResetAt)
+    : undefined;
+  const resetAt = Number.isFinite(graphqlResetAt)
+    ? graphqlResetAt
+    : entry.rateLimitReset !== undefined
+      ? entry.rateLimitReset * 1_000
+      : undefined;
+  const resource = entry.rateLimitResource ??
+    (entry.graphqlRemaining !== undefined ? "graphql" : "core");
+
+  githubRateLimits.set(resource, {
+    limit: entry.rateLimitLimit,
+    remaining,
+    resetAt,
+    observedAt,
+  });
+}
+
+/**
+ * Widen a lifecycle polling interval while the observed GitHub quota is low.
+ * Exhausted quotas wait for reset; approaching quotas use progressively wider
+ * intervals so polling cannot continue hammering the API at its normal rate.
+ */
+export function getAdaptiveGithubPollInterval(
+  baseIntervalMs: number,
+  now = Date.now(),
+): number {
+  let intervalMs = baseIntervalMs;
+
+  for (const [resource, snapshot] of githubRateLimits) {
+    if (
+      (snapshot.resetAt !== undefined && snapshot.resetAt <= now) ||
+      (snapshot.resetAt === undefined && snapshot.observedAt + RATE_LIMIT_SNAPSHOT_TTL_MS <= now)
+    ) {
+      githubRateLimits.delete(resource);
+      continue;
+    }
+
+    if (snapshot.remaining <= 0) {
+      intervalMs = Math.max(
+        intervalMs,
+        snapshot.resetAt !== undefined ? snapshot.resetAt - now + 1_000 : baseIntervalMs * 8,
+      );
+      continue;
+    }
+
+    const ratio = snapshot.limit && snapshot.limit > 0
+      ? snapshot.remaining / snapshot.limit
+      : undefined;
+    if (ratio !== undefined ? ratio <= 0.01 : snapshot.remaining <= 25) {
+      intervalMs = Math.max(intervalMs, baseIntervalMs * 8);
+    } else if (ratio !== undefined ? ratio <= 0.05 : snapshot.remaining <= 100) {
+      intervalMs = Math.max(intervalMs, baseIntervalMs * 4);
+    } else if (ratio !== undefined ? ratio <= 0.1 : snapshot.remaining <= 250) {
+      intervalMs = Math.max(intervalMs, baseIntervalMs * 2);
+    }
+  }
+
+  return intervalMs;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -300,7 +376,7 @@ function buildTraceEntry(
     ? Number.parseInt(statusLine.replace(/^HTTP\/[0-9.]+\s+/, "").split(" ")[0] ?? "", 10)
     : undefined;
 
-  return {
+  const entry: GhTraceEntry = {
     timestamp: nowIso(),
     component: ctx.component,
     operation: ctx.operation ?? extractOperation(args),
@@ -325,6 +401,8 @@ function buildTraceEntry(
     rateLimitResource: headers["x-ratelimit-resource"],
     ...parseGraphQLRateLimit(result.stdout ?? "", args),
   };
+  observeGithubRateLimit(entry);
+  return entry;
 }
 
 /** Extract rateLimit { cost, remaining, resetAt } from GraphQL response body. */
@@ -411,4 +489,6 @@ export const _testUtils = {
   extractOperation,
   redactArgs,
   parseIncludedHttpResponse,
+  observeGithubRateLimit,
+  resetGithubRateLimits: () => githubRateLimits.clear(),
 };

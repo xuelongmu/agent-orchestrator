@@ -110,6 +110,8 @@ import {
   decisionEpisodeTransition,
 } from "./notify-decision.js";
 import { resolveSessionRole } from "./agent-selection.js";
+import { getAdaptiveGithubPollInterval } from "./gh-trace.js";
+import { processSCMWebhookQueue } from "./scm-webhook-queue.js";
 import {
   DETECTING_MAX_ATTEMPTS,
   createDetectingDecision,
@@ -604,7 +606,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   const states = new Map<SessionId, SessionStatus>();
   const activityStateCache = new Map<string, ActivityState>(); // sessionId → last observed activity
   const reactionTrackers = new Map<string, ReactionTracker>(); // "sessionId:reactionKey"
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  let pollingStarted = false;
+  let pollGeneration = 0;
   let polling = false; // re-entrancy guard
   let allCompleteEmitted = false; // guard against repeated all_complete
   const branchAdoptionReservations = new Map<string, SessionId>();
@@ -5272,13 +5276,41 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       // undefined) — NOT `?? 0` — so checkSession can tell "no cost observed"
       // (transient enrichment failure) apart from a real $0 aggregate and keep
       // a budget pause latched through the failure window.
-      await Promise.allSettled(
+      const sessionCheckResults = await Promise.allSettled(
         sessionsToCheck.map((s) => checkSession(s, projectCostUsd.get(s.projectId))),
       );
 
       // Persist batch enrichment data to session metadata files so the
       // web dashboard can read it without calling GitHub API.
       persistPREnrichmentToMetadata(sessionsToCheck);
+
+      // A webhook job is acknowledged only after the same session check this
+      // poll completed successfully. This preserves lifecycle's ownership of
+      // transitions while letting a web-process crash/failure retry durably on
+      // the next CLI poll without an extra duplicate GitHub enrichment pass.
+      const sessionsById = new Map(sessions.map((session) => [session.id, session]));
+      const checkResultsById = new Map(
+        sessionsToCheck.map((session, index) => [session.id, sessionCheckResults[index]]),
+      );
+      const queueProjectIds = scopedProjectId
+        ? [scopedProjectId]
+        : Object.keys(config.projects);
+      for (const queueProjectId of queueProjectIds) {
+        await processSCMWebhookQueue(
+          queueProjectId,
+          async (job) => {
+            const session = sessionsById.get(job.sessionId);
+            if (!session || TERMINAL_STATUSES.has(session.status)) return;
+
+            const result = checkResultsById.get(job.sessionId);
+            if (!result) {
+              throw new Error(`Session ${job.sessionId} was not checked in this poll`);
+            }
+            if (result.status === "rejected") throw result.reason;
+          },
+          { enqueuedBefore: startedAt },
+        );
+      }
 
       // Dependency scheduler (#10): unblock and launch held sessions whose
       // prerequisites just merged. Runs after checkSession so newly-merged
@@ -5428,15 +5460,30 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
   return {
     start(intervalMs = 30_000): void {
-      if (pollTimer) return; // Already running
-      pollTimer = setInterval(() => void pollAll(), intervalMs);
-      // Run immediately on start
-      void pollAll();
+      if (pollingStarted) return;
+      pollingStarted = true;
+      const generation = ++pollGeneration;
+
+      const runPollLoop = async (): Promise<void> => {
+        await pollAll();
+        if (!pollingStarted || generation !== pollGeneration) return;
+        const nextIntervalMs = getAdaptiveGithubPollInterval(intervalMs);
+        pollTimer = setTimeout(() => {
+          pollTimer = null;
+          void runPollLoop();
+        }, nextIntervalMs);
+      };
+
+      // Run immediately on start, then schedule each subsequent poll using the
+      // latest GitHub quota observed during the completed cycle.
+      void runPollLoop();
     },
 
     stop(): void {
+      pollingStarted = false;
+      pollGeneration += 1;
       if (pollTimer) {
-        clearInterval(pollTimer);
+        clearTimeout(pollTimer);
         pollTimer = null;
       }
     },
