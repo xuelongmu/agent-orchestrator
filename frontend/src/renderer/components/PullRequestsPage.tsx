@@ -119,6 +119,7 @@ function PRRowView({ row, onOpen }: { row: PRRow; onOpen: () => void }) {
 		mutationFn: async () => {
 			const { error } = await apiClient.POST("/api/v1/prs/{id}/resolve-comments", {
 				params: { path: { id: String(row.pr.number) } },
+				body: { prUrl: row.pr.url },
 			});
 			if (error) throw new Error(apiErrorMessage(error));
 		},

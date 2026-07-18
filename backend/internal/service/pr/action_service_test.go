@@ -10,13 +10,18 @@ import (
 )
 
 type fakeActionStore struct {
-	pr  domain.PullRequest
-	ok  bool
-	err error
+	pr      domain.PullRequest
+	ok      bool
+	err     error
+	threads []domain.PullRequestReviewThread
 }
 
 func (f *fakeActionStore) GetPR(_ context.Context, _ string) (domain.PullRequest, bool, error) {
 	return f.pr, f.ok, f.err
+}
+
+func (f *fakeActionStore) ListPRReviewThreads(_ context.Context, _ string) ([]domain.PullRequestReviewThread, error) {
+	return append([]domain.PullRequestReviewThread(nil), f.threads...), f.err
 }
 
 type fakeSCMAction struct {
@@ -28,6 +33,14 @@ type fakeSCMAction struct {
 	review       ports.SCMReviewObservation
 	reviewErr    error
 	mergeCalls   int
+	resolveCalls []string
+	resolve      map[string]ports.SCMReviewThreadResolution
+	resolveErr   map[string]error
+}
+
+func (f *fakeSCMAction) ResolveReviewThread(_ context.Context, threadID string) (ports.SCMReviewThreadResolution, error) {
+	f.resolveCalls = append(f.resolveCalls, threadID)
+	return f.resolve[threadID], f.resolveErr[threadID]
 }
 
 func (f *fakeSCMAction) MergePullRequest(_ context.Context, request ports.SCMMergeRequest) (ports.SCMMergeResult, error) {
@@ -200,6 +213,7 @@ func TestMerge_MapsProviderErrors(t *testing.T) {
 		{provider: ports.ErrSCMNotFound, want: ErrPRNotFound},
 		{provider: ports.ErrSCMHeadChanged, want: ErrPRHeadChanged},
 		{provider: ports.ErrSCMNotMergeable, want: ErrPRNotMergeable},
+		{provider: ports.ErrSCMPermissionDenied, want: ErrPRPermissionDenied},
 	}
 	for _, tc := range tests {
 		pr := mergeablePR()
@@ -270,10 +284,121 @@ func TestMerge_FailsClosedWhenFreshDefinitionOfDoneIsUnmet(t *testing.T) {
 	}
 }
 
-func TestResolveComments_ReturnsOK(t *testing.T) {
-	svc := NewActionService(ActionDeps{})
-	_, err := svc.ResolveComments(context.Background(), "1", nil)
+func TestResolveComments_ResolvesSelectedThreadsOnce(t *testing.T) {
+	pr := mergeablePR()
+	store := &fakeActionStore{pr: pr, ok: true, threads: []domain.PullRequestReviewThread{
+		{ThreadID: "PRRT_1"}, {ThreadID: "PRRT_2"},
+	}}
+	scm := &fakeSCMAction{resolve: map[string]ports.SCMReviewThreadResolution{
+		"PRRT_1": {ThreadID: "PRRT_1", Resolved: true},
+		"PRRT_2": {ThreadID: "PRRT_2", Resolved: true},
+	}, resolveErr: map[string]error{}}
+	svc := NewActionService(ActionDeps{Store: store, Resolver: scm})
+
+	got, err := svc.ResolveComments(context.Background(), ResolveRequest{
+		PRID: "42", PRURL: pr.URL, ThreadIDs: []string{"PRRT_1", "PRRT_1", "PRRT_2"},
+	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got.Requested != 2 || got.Resolved != 2 || got.AlreadyResolved != 0 || got.Failed != 0 {
+		t.Fatalf("result = %#v", got)
+	}
+	if len(scm.resolveCalls) != 2 || scm.resolveCalls[0] != "PRRT_1" || scm.resolveCalls[1] != "PRRT_2" {
+		t.Fatalf("resolve calls = %#v", scm.resolveCalls)
+	}
+}
+
+func TestResolveComments_NoIDsResolvesAllUnresolved(t *testing.T) {
+	pr := mergeablePR()
+	store := &fakeActionStore{pr: pr, ok: true, threads: []domain.PullRequestReviewThread{
+		{ThreadID: "PRRT_open"}, {ThreadID: "PRRT_done", Resolved: true},
+	}}
+	scm := &fakeSCMAction{resolve: map[string]ports.SCMReviewThreadResolution{
+		"PRRT_open": {ThreadID: "PRRT_open", Resolved: true},
+	}, resolveErr: map[string]error{}}
+	svc := NewActionService(ActionDeps{Store: store, Resolver: scm})
+	got, err := svc.ResolveComments(context.Background(), ResolveRequest{PRID: "42", PRURL: pr.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Resolved != 1 || len(scm.resolveCalls) != 1 || scm.resolveCalls[0] != "PRRT_open" {
+		t.Fatalf("result=%#v calls=%#v", got, scm.resolveCalls)
+	}
+}
+
+func TestResolveComments_ExplicitResolvedThreadIsIdempotent(t *testing.T) {
+	pr := mergeablePR()
+	store := &fakeActionStore{pr: pr, ok: true, threads: []domain.PullRequestReviewThread{{ThreadID: "PRRT_done", Resolved: true}}}
+	scm := &fakeSCMAction{resolve: map[string]ports.SCMReviewThreadResolution{
+		"PRRT_done": {ThreadID: "PRRT_done", Resolved: true},
+	}, resolveErr: map[string]error{}}
+	svc := NewActionService(ActionDeps{Store: store, Resolver: scm})
+	got, err := svc.ResolveComments(context.Background(), ResolveRequest{PRID: "42", PRURL: pr.URL, ThreadIDs: []string{"PRRT_done"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AlreadyResolved != 1 || got.Resolved != 0 || len(scm.resolveCalls) != 1 {
+		t.Fatalf("result=%#v calls=%#v", got, scm.resolveCalls)
+	}
+}
+
+func TestResolveComments_ReportsPartialFailureWithoutFalseSuccess(t *testing.T) {
+	pr := mergeablePR()
+	store := &fakeActionStore{pr: pr, ok: true, threads: []domain.PullRequestReviewThread{
+		{ThreadID: "PRRT_ok"}, {ThreadID: "PRRT_missing"}, {ThreadID: "PRRT_denied"}, {ThreadID: "PRRT_false"},
+	}}
+	scm := &fakeSCMAction{
+		resolve: map[string]ports.SCMReviewThreadResolution{
+			"PRRT_ok":    {ThreadID: "PRRT_ok", Resolved: true},
+			"PRRT_false": {ThreadID: "PRRT_false", Resolved: false},
+		},
+		resolveErr: map[string]error{
+			"PRRT_missing": ports.ErrSCMNotFound,
+			"PRRT_denied":  ports.ErrSCMPermissionDenied,
+		},
+	}
+	svc := NewActionService(ActionDeps{Store: store, Resolver: scm})
+	got, err := svc.ResolveComments(context.Background(), ResolveRequest{
+		PRID: "42", PRURL: pr.URL, ThreadIDs: []string{"PRRT_ok", "PRRT_missing", "PRRT_denied", "PRRT_false"},
+	})
+	if err == nil || !errors.Is(err, ErrReviewThreadNotFound) || !errors.Is(err, ErrPRPermissionDenied) {
+		t.Fatalf("error = %v", err)
+	}
+	if got.Requested != 4 || got.Resolved != 1 || got.Failed != 3 {
+		t.Fatalf("result = %#v", got)
+	}
+	var partial *ResolveError
+	if !errors.As(err, &partial) || partial.Result != got || len(partial.Failures) != 3 {
+		t.Fatalf("partial error = %#v", partial)
+	}
+}
+
+func TestResolveComments_RejectsInvalidIDsBeforeMutating(t *testing.T) {
+	pr := mergeablePR()
+	store := &fakeActionStore{pr: pr, ok: true, threads: []domain.PullRequestReviewThread{{ThreadID: "PRRT_1"}}}
+	for _, tc := range []ResolveRequest{
+		{PRID: "0", PRURL: pr.URL, ThreadIDs: []string{"PRRT_1"}},
+		{PRID: "42", PRURL: "", ThreadIDs: []string{"PRRT_1"}},
+		{PRID: "42", PRURL: pr.URL, ThreadIDs: []string{""}},
+		{PRID: "42", PRURL: pr.URL, ThreadIDs: []string{"PRRT_unknown"}},
+	} {
+		scm := &fakeSCMAction{resolve: map[string]ports.SCMReviewThreadResolution{}, resolveErr: map[string]error{}}
+		svc := NewActionService(ActionDeps{Store: store, Resolver: scm})
+		_, err := svc.ResolveComments(context.Background(), tc)
+		if err == nil {
+			t.Fatalf("ResolveComments(%#v) succeeded", tc)
+		}
+		if len(scm.resolveCalls) != 0 {
+			t.Fatalf("request %#v mutated threads: %#v", tc, scm.resolveCalls)
+		}
+	}
+}
+
+func TestResolveComments_UnconfiguredStaysDisabled(t *testing.T) {
+	svc := NewActionService(ActionDeps{})
+	_, err := svc.ResolveComments(context.Background(), ResolveRequest{PRID: "1", PRURL: "https://github.com/acme/widgets/pull/1"})
+	if !errors.Is(err, ErrActionNotConfigured) {
+		t.Fatalf("error = %v, want ErrActionNotConfigured", err)
 	}
 }

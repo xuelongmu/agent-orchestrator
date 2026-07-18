@@ -14,11 +14,12 @@ import (
 )
 
 type fakePRService struct {
-	mergeResult   prsvc.MergeResult
-	mergeErr      error
-	mergeRequest  prsvc.MergeRequest
-	resolveResult prsvc.ResolveResult
-	resolveErr    error
+	mergeResult    prsvc.MergeResult
+	mergeErr       error
+	mergeRequest   prsvc.MergeRequest
+	resolveResult  prsvc.ResolveResult
+	resolveErr     error
+	resolveRequest prsvc.ResolveRequest
 }
 
 func (f *fakePRService) Merge(_ context.Context, request prsvc.MergeRequest) (prsvc.MergeResult, error) {
@@ -26,7 +27,8 @@ func (f *fakePRService) Merge(_ context.Context, request prsvc.MergeRequest) (pr
 	return f.mergeResult, f.mergeErr
 }
 
-func (f *fakePRService) ResolveComments(_ context.Context, _ string, _ []string) (prsvc.ResolveResult, error) {
+func (f *fakePRService) ResolveComments(_ context.Context, request prsvc.ResolveRequest) (prsvc.ResolveResult, error) {
+	f.resolveRequest = request
 	return f.resolveResult, f.resolveErr
 }
 
@@ -149,13 +151,21 @@ func TestPRsRoutes_Merge_HeadChangedReturns409(t *testing.T) {
 	assertErrorCode(t, body, status, http.StatusConflict, "PR_HEAD_CHANGED")
 }
 
+func TestPRsRoutes_Merge_PermissionDeniedReturns403(t *testing.T) {
+	svc := &fakePRService{mergeErr: prsvc.ErrPRPermissionDenied}
+	srv := newPRTestServer(t, svc)
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/merge", `{"prUrl":"https://github.com/acme/widgets/pull/1","expectedHeadSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
+	assertJSON(t, headers)
+	assertErrorCode(t, body, status, http.StatusForbidden, "PR_PERMISSION_DENIED")
+}
+
 // ---- ResolveComments: 200 ----
 
 func TestPRsRoutes_ResolveComments_200(t *testing.T) {
 	svc := &fakePRService{resolveResult: prsvc.ResolveResult{Resolved: 3}}
 	srv := newPRTestServer(t, svc)
 
-	body, status, _ := doRequest(t, srv, "POST", "/api/v1/prs/42/resolve-comments", `{"commentIds":["T_1","T_2","T_3"]}`)
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/prs/42/resolve-comments", `{"prUrl":"https://github.com/acme/widgets/pull/42","commentIds":["T_1","T_2","T_3"]}`)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", status, body)
 	}
@@ -167,13 +177,16 @@ func TestPRsRoutes_ResolveComments_200(t *testing.T) {
 	if !resp.OK || resp.Resolved != 3 {
 		t.Errorf("resp = %+v, want {ok:true resolved:3}", resp)
 	}
+	if svc.resolveRequest.PRID != "42" || svc.resolveRequest.PRURL != "https://github.com/acme/widgets/pull/42" || len(svc.resolveRequest.ThreadIDs) != 3 {
+		t.Fatalf("resolve request = %#v", svc.resolveRequest)
+	}
 }
 
-func TestPRsRoutes_ResolveComments_200_NoBody(t *testing.T) {
+func TestPRsRoutes_ResolveComments_200_AllThreads(t *testing.T) {
 	svc := &fakePRService{resolveResult: prsvc.ResolveResult{Resolved: 2}}
 	srv := newPRTestServer(t, svc)
 
-	body, status, _ := doRequest(t, srv, "POST", "/api/v1/prs/42/resolve-comments", "")
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/prs/42/resolve-comments", `{"prUrl":"https://github.com/acme/widgets/pull/42"}`)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", status, body)
 	}
@@ -185,7 +198,7 @@ func TestPRsRoutes_ResolveComments_404(t *testing.T) {
 	svc := &fakePRService{resolveErr: prsvc.ErrPRNotFound}
 	srv := newPRTestServer(t, svc)
 
-	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/99/resolve-comments", "")
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/99/resolve-comments", `{"prUrl":"https://github.com/acme/widgets/pull/99"}`)
 	assertJSON(t, headers)
 	assertErrorCode(t, body, status, http.StatusNotFound, "PR_NOT_FOUND")
 }
@@ -196,7 +209,23 @@ func TestPRsRoutes_ResolveComments_422(t *testing.T) {
 	svc := &fakePRService{resolveErr: prsvc.ErrNothingToResolve}
 	srv := newPRTestServer(t, svc)
 
-	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/resolve-comments", "")
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/resolve-comments", `{"prUrl":"https://github.com/acme/widgets/pull/1"}`)
 	assertJSON(t, headers)
 	assertErrorCode(t, body, status, http.StatusUnprocessableEntity, "NOTHING_TO_RESOLVE")
+}
+
+func TestPRsRoutes_ResolveComments_UnconfiguredReturns501(t *testing.T) {
+	svc := &fakePRService{resolveErr: prsvc.ErrActionNotConfigured}
+	srv := newPRTestServer(t, svc)
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/resolve-comments", `{"prUrl":"https://github.com/acme/widgets/pull/1"}`)
+	assertJSON(t, headers)
+	assertErrorCode(t, body, status, http.StatusNotImplemented, "NOT_IMPLEMENTED")
+}
+
+func TestPRsRoutes_ResolveComments_PermissionDeniedReturns403(t *testing.T) {
+	svc := &fakePRService{resolveErr: prsvc.ErrPRPermissionDenied}
+	srv := newPRTestServer(t, svc)
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/resolve-comments", `{"prUrl":"https://github.com/acme/widgets/pull/1"}`)
+	assertJSON(t, headers)
+	assertErrorCode(t, body, status, http.StatusForbidden, "PR_PERMISSION_DENIED")
 }

@@ -54,6 +54,7 @@ func TestMergePullRequest_MapsGitHubFailures(t *testing.T) {
 	}{
 		{name: "not found", status: http.StatusNotFound, want: ports.ErrSCMNotFound},
 		{name: "head changed", status: http.StatusConflict, want: ports.ErrSCMHeadChanged},
+		{name: "permission denied", status: http.StatusForbidden, want: ports.ErrSCMPermissionDenied},
 		{name: "merge blocked", status: http.StatusMethodNotAllowed, want: ports.ErrSCMNotMergeable},
 		{name: "validation blocked", status: http.StatusUnprocessableEntity, want: ports.ErrSCMNotMergeable},
 	}

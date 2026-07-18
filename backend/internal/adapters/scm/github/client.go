@@ -27,9 +27,10 @@ const (
 // errors.Is; the orchestrator's lifecycle code is intentionally insulated
 // from raw HTTP status codes.
 var (
-	ErrNotFound    = ports.ErrSCMNotFound
-	ErrAuthFailed  = errors.New("github scm: authentication failed")
-	ErrRateLimited = errors.New("github scm: rate limited")
+	ErrNotFound         = ports.ErrSCMNotFound
+	ErrPermissionDenied = ports.ErrSCMPermissionDenied
+	ErrAuthFailed       = errors.New("github scm: authentication failed")
+	ErrRateLimited      = errors.New("github scm: rate limited")
 )
 
 // RateLimitError carries the structured backoff hints from a rate-limit
@@ -333,16 +334,20 @@ func (c *Client) doGraphQL(ctx context.Context, query string, variables map[stri
 		return nil, fmt.Errorf("github scm: decode graphql response: %w", err)
 	}
 	if len(decoded.Errors) > 0 {
-		msg := decoded.Errors[0].Message
+		graphErr := decoded.Errors[0]
+		msg := graphErr.Message
 		low := strings.ToLower(msg)
+		errType := strings.ToUpper(strings.TrimSpace(graphErr.Type))
 		switch {
 		case strings.Contains(low, "rate limit") || strings.Contains(low, "abuse"):
 			return decoded.Data, &RateLimitError{Message: msg}
 		case strings.Contains(low, "bad credentials") || strings.Contains(low, "credentials"):
 			c.invalidateToken()
 			return decoded.Data, fmt.Errorf("%w: %s", ErrAuthFailed, msg)
-		case strings.Contains(low, "could not resolve") || strings.Contains(low, "not found"):
+		case errType == "NOT_FOUND" || strings.Contains(low, "could not resolve") || strings.Contains(low, "not found"):
 			return decoded.Data, fmt.Errorf("%w: %s", ErrNotFound, msg)
+		case errType == "FORBIDDEN" || strings.Contains(low, "resource not accessible") || strings.Contains(low, "permission"):
+			return decoded.Data, fmt.Errorf("%w: %s", ErrPermissionDenied, msg)
 		default:
 			return decoded.Data, fmt.Errorf("github scm: graphql error: %s", msg)
 		}
@@ -598,7 +603,7 @@ func classifyError(resp *http.Response, body []byte) error {
 		if isRateLimited(resp, msg) {
 			return rateLimited(resp, msg)
 		}
-		return fmt.Errorf("%w: %s", ErrAuthFailed, msg)
+		return fmt.Errorf("%w: %s", ErrPermissionDenied, msg)
 	}
 	return fmt.Errorf("github scm: %d %s", resp.StatusCode, msg)
 }

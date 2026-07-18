@@ -14,14 +14,15 @@ import (
 )
 
 var (
-	prNumberPattern = regexp.MustCompile(`^[1-9]\d*$`)
-	gitSHAPattern   = regexp.MustCompile(`^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$`)
+	prNumberPattern       = regexp.MustCompile(`^[1-9]\d*$`)
+	gitSHAPattern         = regexp.MustCompile(`^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$`)
+	reviewThreadIDPattern = regexp.MustCompile(`^[A-Za-z0-9_./+:=-]{1,256}$`)
 )
 
 // ActionManager is the controller-facing contract for /prs/{id} action routes.
 type ActionManager interface {
 	Merge(ctx context.Context, request MergeRequest) (MergeResult, error)
-	ResolveComments(ctx context.Context, prID string, commentIDs []string) (ResolveResult, error)
+	ResolveComments(ctx context.Context, request ResolveRequest) (ResolveResult, error)
 }
 
 // MergeRequest is the service-level input for an exact-head PR merge.
@@ -38,13 +39,51 @@ type MergeResult struct {
 	MergeCommitSHA string
 }
 
+// ResolveRequest identifies one tracked PR and optionally selects review
+// threads. An empty ThreadIDs slice means all locally-known unresolved threads.
+type ResolveRequest struct {
+	PRID      string
+	PRURL     string
+	ThreadIDs []string
+}
+
 // ResolveResult is the successful outcome of a resolve-comments operation.
 type ResolveResult struct {
-	Resolved int
+	Requested       int
+	Resolved        int
+	AlreadyResolved int
+	Failed          int
+}
+
+// ResolveFailure records one provider mutation that failed. Keeping the node
+// ID with the typed cause makes partial completion auditable by callers.
+type ResolveFailure struct {
+	ThreadID string
+	Err      error
+}
+
+// ResolveError reports a partial or total batch failure. Unwrap exposes every
+// typed cause so callers can map not-found/permission failures with errors.Is.
+type ResolveError struct {
+	Result   ResolveResult
+	Failures []ResolveFailure
+}
+
+func (e *ResolveError) Error() string {
+	return fmt.Sprintf("pr: resolve review threads: %d of %d failed", e.Result.Failed, e.Result.Requested)
+}
+
+func (e *ResolveError) Unwrap() []error {
+	out := make([]error, 0, len(e.Failures))
+	for _, failure := range e.Failures {
+		out = append(out, failure.Err)
+	}
+	return out
 }
 
 type actionStore interface {
 	GetPR(ctx context.Context, url string) (domain.PullRequest, bool, error)
+	ListPRReviewThreads(ctx context.Context, prURL string) ([]domain.PullRequestReviewThread, error)
 }
 
 type actionReader interface {
@@ -54,23 +93,25 @@ type actionReader interface {
 
 // ActionDeps are the dependencies needed to execute PR actions.
 type ActionDeps struct {
-	Store  actionStore
-	Merger ports.SCMMerger
-	Reader actionReader
+	Store    actionStore
+	Merger   ports.SCMMerger
+	Reader   actionReader
+	Resolver ports.SCMReviewThreadResolver
 }
 
 // ActionService implements provider-neutral pull-request actions.
 type ActionService struct {
-	store  actionStore
-	merger ports.SCMMerger
-	reader actionReader
+	store    actionStore
+	merger   ports.SCMMerger
+	reader   actionReader
+	resolver ports.SCMReviewThreadResolver
 }
 
 var _ ActionManager = (*ActionService)(nil)
 
 // NewActionService constructs the PR action executor.
 func NewActionService(deps ActionDeps) *ActionService {
-	return &ActionService{store: deps.Store, merger: deps.Merger, reader: deps.Reader}
+	return &ActionService{store: deps.Store, merger: deps.Merger, reader: deps.Reader, resolver: deps.Resolver}
 }
 
 // Merge squash-merges one tracked PR only when fresh SCM facts prove the shared
@@ -141,6 +182,8 @@ func (s *ActionService) Merge(ctx context.Context, request MergeRequest) (MergeR
 			return MergeResult{}, fmt.Errorf("%w: %w", ErrPRHeadChanged, err)
 		case errors.Is(err, ports.ErrSCMNotMergeable):
 			return MergeResult{}, fmt.Errorf("%w: %w", ErrPRNotMergeable, err)
+		case errors.Is(err, ports.ErrSCMPermissionDenied):
+			return MergeResult{}, fmt.Errorf("%w: %w", ErrPRPermissionDenied, err)
 		default:
 			return MergeResult{}, fmt.Errorf("merge pull request: %w", err)
 		}
@@ -198,8 +241,100 @@ func scmRepoForPR(pr domain.PullRequest) (ports.SCMRepo, bool) {
 	return ports.SCMRepo{Provider: provider, Host: host, Owner: parts[0], Name: parts[1], Repo: pr.Repo}, true
 }
 
-// ResolveComments resolves review threads on the PR identified by prID.
-// TODO: implement — resolve review threads via the SCM provider.
-func (s *ActionService) ResolveComments(_ context.Context, _ string, _ []string) (ResolveResult, error) {
-	return ResolveResult{Resolved: 0}, nil
+// ResolveComments ensures selected review threads are resolved, or all locally
+// known unresolved threads when no explicit IDs are supplied. The operation is
+// idempotent and returns an error whenever any provider mutation is unconfirmed.
+func (s *ActionService) ResolveComments(ctx context.Context, request ResolveRequest) (ResolveResult, error) {
+	if s.store == nil || s.resolver == nil {
+		return ResolveResult{}, ErrActionNotConfigured
+	}
+	prNumber, err := parsePRNumber(request.PRID)
+	if err != nil || strings.TrimSpace(request.PRURL) == "" {
+		return ResolveResult{}, fmt.Errorf("%w: invalid pull request identity", ErrInvalidPR)
+	}
+	tracked, ok, err := s.store.GetPR(ctx, request.PRURL)
+	if err != nil {
+		return ResolveResult{}, fmt.Errorf("load pull request: %w", err)
+	}
+	if !ok || tracked.Number != prNumber {
+		return ResolveResult{}, ErrPRNotFound
+	}
+	threads, err := s.store.ListPRReviewThreads(ctx, tracked.URL)
+	if err != nil {
+		return ResolveResult{}, fmt.Errorf("list pull request review threads: %w", err)
+	}
+	byID := make(map[string]domain.PullRequestReviewThread, len(threads))
+	for _, thread := range threads {
+		byID[thread.ThreadID] = thread
+	}
+
+	selected, explicit, err := selectReviewThreads(request.ThreadIDs, threads, byID)
+	if err != nil {
+		return ResolveResult{}, err
+	}
+	if len(selected) == 0 {
+		return ResolveResult{}, ErrNothingToResolve
+	}
+	result := ResolveResult{Requested: len(selected)}
+	failures := make([]ResolveFailure, 0)
+	for _, threadID := range selected {
+		wasResolved := explicit && byID[threadID].Resolved
+		resolved, resolveErr := s.resolver.ResolveReviewThread(ctx, threadID)
+		if resolveErr == nil && (resolved.ThreadID != threadID || !resolved.Resolved) {
+			resolveErr = errors.New("provider did not confirm resolved state")
+		}
+		if resolveErr == nil {
+			if wasResolved {
+				result.AlreadyResolved++
+			} else {
+				result.Resolved++
+			}
+			continue
+		}
+		result.Failed++
+		failures = append(failures, ResolveFailure{ThreadID: threadID, Err: mapResolveError(resolveErr)})
+	}
+	if len(failures) > 0 {
+		return result, &ResolveError{Result: result, Failures: failures}
+	}
+	return result, nil
+}
+
+func selectReviewThreads(requested []string, threads []domain.PullRequestReviewThread, byID map[string]domain.PullRequestReviewThread) ([]string, bool, error) {
+	if len(requested) == 0 {
+		selected := make([]string, 0, len(threads))
+		for _, thread := range threads {
+			if !thread.Resolved {
+				selected = append(selected, thread.ThreadID)
+			}
+		}
+		return selected, false, nil
+	}
+	seen := make(map[string]struct{}, len(requested))
+	selected := make([]string, 0, len(requested))
+	for _, threadID := range requested {
+		if strings.TrimSpace(threadID) != threadID || !reviewThreadIDPattern.MatchString(threadID) {
+			return nil, true, fmt.Errorf("%w: invalid review thread id", ErrInvalidPR)
+		}
+		if _, ok := byID[threadID]; !ok {
+			return nil, true, fmt.Errorf("%w: %s", ErrReviewThreadNotFound, threadID)
+		}
+		if _, duplicate := seen[threadID]; duplicate {
+			continue
+		}
+		seen[threadID] = struct{}{}
+		selected = append(selected, threadID)
+	}
+	return selected, true, nil
+}
+
+func mapResolveError(err error) error {
+	switch {
+	case errors.Is(err, ports.ErrSCMNotFound):
+		return fmt.Errorf("%w: %w", ErrReviewThreadNotFound, err)
+	case errors.Is(err, ports.ErrSCMPermissionDenied):
+		return fmt.Errorf("%w: %w", ErrPRPermissionDenied, err)
+	default:
+		return err
+	}
 }
