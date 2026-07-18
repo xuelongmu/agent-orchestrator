@@ -885,6 +885,9 @@ func TestObserve_PrimaryRateLimit(t *testing.T) {
 	if rle.ResetAt.Unix() != reset {
 		t.Fatalf("ResetAt = %d, want %d", rle.ResetAt.Unix(), reset)
 	}
+	if delay := p.RecommendedPollDelay(time.Now(), time.Second); delay < time.Minute {
+		t.Fatalf("RecommendedPollDelay() = %s, want reset-based backoff", delay)
+	}
 }
 
 func TestObserve_SecondaryRateLimit(t *testing.T) {
@@ -909,6 +912,9 @@ func TestObserve_SecondaryRateLimit(t *testing.T) {
 	}
 	if rle.RetryAfter != 30*time.Second {
 		t.Fatalf("RetryAfter = %v, want 30s", rle.RetryAfter)
+	}
+	if delay := p.RecommendedPollDelay(time.Now(), time.Second); delay < 30*time.Second {
+		t.Fatalf("RecommendedPollDelay() = %s, want Retry-After backoff", delay)
 	}
 }
 

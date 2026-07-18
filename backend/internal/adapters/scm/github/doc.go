@@ -115,6 +115,12 @@
 //
 // The provider-neutral observer owns its own ETag cache and calls explicit
 // provider guard methods that do not mutate the legacy Client cache.
+// The Client also retains bounded, in-memory GitHub quota snapshots from
+// X-RateLimit-* and Retry-After response headers. The observer asks the
+// Provider for a recommended delay after each completed cycle: low quota
+// progressively widens the base cadence, while exhausted and secondary limits
+// wait through GitHub's advertised reset/retry window. Restarting the daemon
+// clears this advisory state and the next response repopulates it.
 //
 // # Out of scope (intentionally — these are different PRs / lanes)
 //

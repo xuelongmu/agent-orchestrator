@@ -68,6 +68,10 @@ type credentialChecker interface {
 	SCMCredentialsAvailable(ctx context.Context) (bool, error)
 }
 
+type pollDelayAdvisor interface {
+	RecommendedPollDelay(now time.Time, base time.Duration) time.Duration
+}
+
 // Config holds optional observer knobs. Zero values use production defaults.
 type Config struct {
 	// Tick is the fast PR/CI polling interval. Zero uses DefaultTickInterval.
@@ -164,7 +168,8 @@ func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Obser
 }
 
 // Start launches the observer loop. The first Poll runs immediately inside the
-// goroutine so daemon startup is not blocked; subsequent polls run on the tick.
+// goroutine so daemon startup is not blocked; subsequent polls use the base
+// tick widened by any optional provider rate-limit guidance.
 //
 // The first invocation of poll inside the supervisor also runs checkCredentials
 // up front. That way the "scm observer disabled: provider credentials
@@ -183,7 +188,41 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 		})
 		return o.Poll(ctx)
 	}
-	return observe.StartPollLoop(ctx, o.tick, poll, o.logger, "scm observer")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			o.logger.Error("scm observer: initial poll failed", "err", err)
+		}
+		for {
+			timer := time.NewTimer(o.nextPollDelay())
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			case <-timer.C:
+				if err := poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					o.logger.Error("scm observer: poll failed", "err", err)
+				}
+			}
+		}
+	}()
+	return done
+}
+
+func (o *Observer) nextPollDelay() time.Duration {
+	delay := o.tick
+	if advisor, ok := o.provider.(pollDelayAdvisor); ok {
+		if recommended := advisor.RecommendedPollDelay(o.clock().UTC(), o.tick); recommended > delay {
+			delay = recommended
+		}
+	}
+	return delay
 }
 
 type subject struct {
