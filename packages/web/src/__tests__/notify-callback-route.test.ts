@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   signCallbackToken,
+  SessionInputPendingError,
   SessionNotFoundError,
   SessionSendNotDeliveredError,
   NOTIFY_CALLBACK_MESSAGES,
@@ -416,6 +417,27 @@ describe("POST /api/notify-callback/[token]", () => {
     const retry = await callGet(token("approve"));
     expect(retry.status).toBe(200);
     expect(delivered).toBe(1);
+  });
+
+  it("returns a recoverable 409 and keeps the claim closed when input remains pending", async () => {
+    let dispatches = 0;
+    send.mockImplementationOnce(async () => {
+      dispatches += 1;
+      throw new SessionInputPendingError("ao-5", true);
+    });
+
+    const first = await callGet(token("approve"));
+    expect(first.status).toBe(409);
+    const body = await first.text();
+    expect(body).toContain("Input awaiting submission");
+    expect(body).toContain("Submit it manually in the terminal");
+    expect(dispatches).toBe(1);
+
+    // The text already crossed the delivery boundary, so the resolving claim
+    // stays consumed and a retry cannot paste the approval a second time.
+    const retry = await callGet(token("approve"));
+    expect(retry.status).toBe(409);
+    expect(dispatches).toBe(1);
   });
 
   it("keeps the claim closed when post-dispatch bookkeeping throws — the action already fired", async () => {

@@ -12,21 +12,22 @@ import {
 import { createSessionManager } from "../session-manager.js";
 import { updateMetadata, writeMetadata, readMetadataRaw } from "../metadata.js";
 import { readObservabilitySummary } from "../observability.js";
-import type {
-  OrchestratorConfig,
-  PluginRegistry,
-  OpenCodeSessionManager,
-  Agent,
-  ActivityState,
-  SessionStatus,
-  SessionMetadata,
-  PRInfo,
-  ReviewComment,
-  ReviewReaction,
-  ReviewThreadsResult,
-  SCM,
-  Notifier,
-  NotifyAction,
+import {
+  SessionInputPendingError,
+  type OrchestratorConfig,
+  type PluginRegistry,
+  type OpenCodeSessionManager,
+  type Agent,
+  type ActivityState,
+  type SessionStatus,
+  type SessionMetadata,
+  type PRInfo,
+  type ReviewComment,
+  type ReviewReaction,
+  type ReviewThreadsResult,
+  type SCM,
+  type Notifier,
+  type NotifyAction,
 } from "../types.js";
 import {
   createTestEnvironment,
@@ -3251,6 +3252,79 @@ describe("reactions", () => {
     expect(metadata?.["lastPendingReviewDispatchHash"]).toBe("c1");
   });
 
+  it("does not retry an enriched review prompt while its editor input remains pending", async () => {
+    config.reactions = {
+      "bugbot-comments": {
+        auto: true,
+        action: "send-to-agent",
+        message: DEFAULT_BUGBOT_COMMENTS_MESSAGE,
+      },
+    };
+
+    const mockSCM = createMockSCM({
+      getReviewThreads: vi.fn().mockResolvedValue({
+        threads: [
+          {
+            id: "bot-1",
+            author: "cursor[bot]",
+            body: "Potential issue detected",
+            path: "src/worker.ts",
+            line: 9,
+            isResolved: false,
+            createdAt: new Date(),
+            url: "https://example.com/comment/pending",
+            isBot: true,
+          },
+        ],
+        reviews: [],
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    let editorPending = true;
+    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
+      state: editorPending ? "waiting_input" : "active",
+    }));
+    vi.mocked(mockSessionManager.send)
+      .mockRejectedValueOnce(new SessionInputPendingError("app-1", true))
+      .mockResolvedValue(undefined);
+
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const lm = setupCheck("app-1", {
+        session: makeSession({ status: "pr_open", pr: makePR() }),
+        registry,
+      });
+
+      await lm.check("app-1");
+      expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+      let metadata = readMetadataRaw(env.sessionsDir, "app-1");
+      expect(metadata?.["lifecycleInputPendingAt"]).toBeTruthy();
+      expect(metadata?.["lastAutomatedReviewDispatchHash"]).toBeFalsy();
+
+      now += 121_000;
+      await lm.check("app-1");
+      expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+
+      // A verified non-waiting activity signal proves the editor was cleared;
+      // the same enriched payload may now be attempted once and latched normally.
+      editorPending = false;
+      now += 121_000;
+      await lm.check("app-1");
+      expect(mockSessionManager.send).toHaveBeenCalledTimes(2);
+      metadata = readMetadataRaw(env.sessionsDir, "app-1");
+      expect(metadata?.["lifecycleInputPendingAt"]).toBeFalsy();
+      expect(metadata?.["lastAutomatedReviewDispatchHash"]).toBe("bot-1");
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   it("sends enriched review content on changes_requested transition alongside the generic message", async () => {
     config.reactions = {
       "changes-requested": {
@@ -3319,6 +3393,82 @@ describe("reactions", () => {
     vi.mocked(mockSessionManager.send).mockClear();
     await lm.check("app-1");
     expect(mockSessionManager.send).not.toHaveBeenCalled();
+  });
+
+  it("suppresses direct enriched-review retries after the transition leaves input pending", async () => {
+    config.reactions = {
+      "changes-requested": {
+        auto: true,
+        action: "send-to-agent",
+        message: "Handle requested changes.",
+      },
+    };
+
+    const mockSCM = createMockSCM({
+      getReviewDecision: vi.fn().mockResolvedValue("changes_requested"),
+      enrichSessionsPRBatch: mockBatchEnrichment({ reviewDecision: "changes_requested" }),
+      getReviewThreads: vi.fn().mockResolvedValue({
+        threads: [
+          {
+            id: "c1",
+            author: "reviewer",
+            body: "Please add validation",
+            path: "src/route.ts",
+            line: 44,
+            isResolved: false,
+            createdAt: new Date(),
+            url: "https://example.com/comment/direct-pending",
+            isBot: false,
+          },
+        ],
+        reviews: [],
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+
+    let editorPending = false;
+    vi.mocked(plugins.agent.getActivityState).mockImplementation(async () => ({
+      state: editorPending ? "waiting_input" : "active",
+    }));
+    let dispatch = 0;
+    vi.mocked(mockSessionManager.send).mockImplementation(async () => {
+      dispatch += 1;
+      if (dispatch === 2) {
+        editorPending = true;
+        throw new SessionInputPendingError("app-1", true);
+      }
+    });
+
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const lm = setupCheck("app-1", {
+        session: makeSession({ status: "pr_open", pr: makePR() }),
+        registry,
+      });
+
+      await lm.check("app-1");
+      expect(mockSessionManager.send).toHaveBeenCalledTimes(2);
+      expect(readMetadataRaw(env.sessionsDir, "app-1")?.["lifecycleInputPendingAt"]).toBeTruthy();
+
+      now += 121_000;
+      await lm.check("app-1");
+      expect(mockSessionManager.send).toHaveBeenCalledTimes(2);
+
+      editorPending = false;
+      now += 121_000;
+      await lm.check("app-1");
+      expect(mockSessionManager.send).toHaveBeenCalledTimes(3);
+      expect(readMetadataRaw(env.sessionsDir, "app-1")?.["lastPendingReviewDispatchHash"]).toBe(
+        "c1",
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it("does not double-bill reaction attempts on changes_requested transition with retries:1", async () => {
