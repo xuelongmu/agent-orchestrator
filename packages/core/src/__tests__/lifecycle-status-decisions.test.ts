@@ -46,6 +46,18 @@ describe("merge definition of done (#15)", () => {
       ],
     });
   });
+
+  it("keeps live non-policy mergeability blockers in the definition of done", () => {
+    expect(
+      resolveMergeDefinitionOfDone({
+        ...done,
+        mergeabilityBlockers: ["Branch is behind base branch", "Merge is blocked"],
+      }),
+    ).toEqual({
+      ready: false,
+      blockers: ["mergeability_blocked: Branch is behind base branch; Merge is blocked"],
+    });
+  });
 });
 
 describe("flaky CI classifier (#15)", () => {

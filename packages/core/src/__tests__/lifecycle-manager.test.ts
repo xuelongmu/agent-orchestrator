@@ -7018,8 +7018,11 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
               weight: 1,
               approvalPhrases: ["Didn't find any major issues"],
               approvalReactions: ["THUMBS_UP"],
+              rebumpMessage: "@codex review",
+              maxRebumps: 2,
+              rebumpBackoff: "30m",
             },
-            "*": { weight: 0 },
+            "*": { weight: 0.25 },
           },
         },
         "approved-and-green": {
@@ -7170,7 +7173,143 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
     );
   });
 
-  it("blocks on unresolved Codex threads but ignores bots weighted to zero", async () => {
+  it("requires human approval to target the current head", async () => {
+    const humanApproval = (commitSha: string): ReviewThreadsResult => ({
+      threads: [],
+      reviews: [
+        {
+          author: "alice",
+          state: "APPROVED",
+          body: "",
+          submittedAt: new Date(),
+          commitSha,
+        },
+      ],
+      headSha: "sha-head",
+      threadsTruncated: false,
+    });
+    const getReviewThreads = vi.fn().mockResolvedValue(humanApproval("sha-stale"));
+    const mergePR = vi.fn().mockResolvedValue(undefined);
+    const mockSCM = createMockSCM({
+      mergePR,
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi.fn().mockResolvedValue("approved"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: true,
+        ciPassing: true,
+        approved: true,
+        noConflicts: true,
+        blockers: [],
+      }),
+      getReviewThreads,
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makeMatchingPR() }),
+      registry,
+      configOverride: qualityConfig(),
+    });
+
+    await lm.check("app-1");
+    expect(mergePR).not.toHaveBeenCalled();
+
+    getReviewThreads.mockResolvedValue(humanApproval("sha-head"));
+    await lm.check("app-1");
+    expect(mergePR).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks auto-merge on live branch-protection mergeability blockers", async () => {
+    const mergePR = vi.fn().mockResolvedValue(undefined);
+    const mockSCM = createMockSCM({
+      mergePR,
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi.fn().mockResolvedValue("none"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: false,
+        ciPassing: true,
+        approved: false,
+        noConflicts: true,
+        blockers: ["Branch is behind base branch"],
+      }),
+      getReviewThreads: vi.fn().mockResolvedValue(codexApprovalResult()),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makeMatchingPR() }),
+      registry,
+      configOverride: qualityConfig(),
+    });
+
+    await lm.check("app-1");
+
+    expect(mergePR).not.toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["autoMergeBlockers"]).toContain(
+      "Branch is behind base branch",
+    );
+  });
+
+  it("re-bumps the specific secondary PR whose current head lacks approval", async () => {
+    const primary = makeMatchingPR({ number: 42 });
+    const secondary = makeMatchingPR({
+      number: 43,
+      branch: "feat/secondary",
+      url: "https://github.com/org/my-app/pull/43",
+    });
+    const postPRComment = vi.fn().mockResolvedValue(undefined);
+    const mockSCM = createMockSCM({
+      postPRComment,
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi.fn().mockResolvedValue("none"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: true,
+        ciPassing: true,
+        approved: false,
+        noConflicts: true,
+        blockers: [],
+      }),
+      getReviewThreads: vi.fn().mockImplementation(async (pr: PRInfo) =>
+        pr.number === primary.number
+          ? codexApprovalResult()
+          : {
+              threads: [],
+              reviews: [],
+              headSha: "sha-secondary",
+              threadsTruncated: false,
+            },
+      ),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: primary, prs: [primary, secondary] }),
+      registry,
+      configOverride: qualityConfig(),
+    });
+
+    await lm.check("app-1");
+
+    expect(postPRComment).toHaveBeenCalledTimes(1);
+    expect(postPRComment).toHaveBeenCalledWith(secondary, "@codex review");
+    const metadata = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(metadata?.["reviewRebumpCount:org/my-app#43"]).toBe("1");
+    expect(metadata?.["reviewRebumpCount:org/my-app#42"]).toBeFalsy();
+  });
+
+  it("keeps fractional-weight bot threads out of required fixes and the merge gate", async () => {
     const codexThread = {
       id: "codex-1",
       author: "chatgpt-codex-connector[bot]",
@@ -7192,7 +7331,7 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
     };
     const getReviewThreads = vi
       .fn()
-      .mockResolvedValueOnce(codexApprovalResult([codexThread]))
+      .mockResolvedValueOnce(codexApprovalResult([codexThread, rabbitThread]))
       .mockResolvedValue(codexApprovalResult([codexThread]));
     const mergePR = vi.fn().mockResolvedValue(undefined);
     const mockSCM = createMockSCM({
@@ -7222,10 +7361,16 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
 
     await lm.check("app-1");
     expect(mergePR).not.toHaveBeenCalled();
+    const sentMessage = vi.mocked(mockSessionManager.send).mock.calls[0]?.[1] as string;
+    expect(sentMessage).toContain("@chatgpt-codex-connector[bot]");
+    expect(sentMessage).not.toContain("coderabbitai");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundCount"]).toBe("1");
 
     getReviewThreads.mockResolvedValue(codexApprovalResult([rabbitThread]));
     await lm.check("app-1");
     expect(mergePR).toHaveBeenCalledTimes(1);
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundCountTotal"]).toBe("1");
   });
 
   it("retries classifier-confirmed flaky CI without consuming an agent fix round", async () => {

@@ -44,6 +44,7 @@ import {
   type CIFailureSummary,
   type PRInfo,
   type PRRetargetOutcome,
+  type MergeReadiness,
   type ReviewComment,
   type ReviewBotPolicy,
   type ReviewSummary,
@@ -2302,7 +2303,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       if (nonConfidenceBlockers.length > 0) {
         updateAutoMergeBlockers(session, nonConfidenceBlockers);
         if (nonConfidenceBlockers.includes("review_approval_missing")) {
-          await maybeRebumpAutomatedReviewer(session, mergeGate.headSha);
+          for (const approvalTarget of mergeGate.missingApprovalTargets) {
+            await maybeRebumpAutomatedReviewer(session, approvalTarget);
+          }
         }
         return {
           reactionType: reactionKey,
@@ -2730,9 +2733,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   function formatAutomatedReviewComments(
     session: Session,
     actionable: ReviewComment[],
-    deprioritized: ReviewComment[] = [],
   ): string {
-    const comments = [...actionable, ...deprioritized].map(toAutomatedComment);
+    const comments = actionable.map(toAutomatedComment);
     return formatAutomatedCommentsMessage(comments, session.pr ?? undefined);
   }
 
@@ -2795,6 +2797,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       clearReactionTracker(session.id, automatedReactionKey);
       lastReviewBacklogCheckAt.delete(session.id);
       updateSessionMetadata(session, {
+        ...scopedReviewRebumpMetadataCleanup(session),
         lastPendingReviewFingerprint: "",
         lastPendingReviewDispatchHash: "",
         lastPendingReviewDispatchAt: "",
@@ -3024,9 +3027,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       getReviewBotPolicies(session),
     );
     const automatedComments = automatedBuckets.actionable
-      .map((comment) => automatedById.get(comment.id))
-      .filter((comment): comment is ReviewComment => !!comment);
-    const deprioritizedAutomatedComments = automatedBuckets.deprioritized
       .map((comment) => automatedById.get(comment.id))
       .filter((comment): comment is ReviewComment => !!comment);
 
@@ -3269,11 +3269,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             reactionConfig.action &&
             (reactionConfig.auto !== false || reactionConfig.action === "notify")
           ) {
-            const enrichedMessage = formatAutomatedReviewComments(
-              session,
-              automatedComments,
-              deprioritizedAutomatedComments,
-            );
+            // Fractional-weight bot findings are context-only. Keep them out
+            // of the mandatory fix payload so they cannot consume this round
+            // or be mistaken for issues the agent must address.
+            const enrichedMessage = formatAutomatedReviewComments(session, automatedComments);
 
             // Dispatch-site confidence gate (Class B chokepoint): a low-confidence
             // hold sends ONE escalation (question + comments) to the human;
@@ -3624,7 +3623,31 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   interface AutoMergeGateResult {
     blockers: string[];
     prsToMerge: PRInfo[];
-    headSha?: string;
+    missingApprovalTargets: Array<{ pr: PRInfo; headSha?: string }>;
+  }
+
+  function liveMergeabilityBlockers(mergeability: MergeReadiness): string[] {
+    const blockers = mergeability.blockers.filter((blocker) => {
+      // CI and policy-aware review approval are evaluated independently by the
+      // DoD. In particular, Codex's informal clean verdict intentionally
+      // satisfies approval even though GitHub still says "Review required".
+      if (/^CI is /i.test(blocker) || /^Required checks are failing$/i.test(blocker)) return false;
+      if (/^Review required$/i.test(blocker)) return false;
+      // Conflicts and draft state retain their explicit stable blocker names.
+      if (/conflict/i.test(blocker) || /draft/i.test(blocker)) return false;
+      return true;
+    });
+    if (
+      !mergeability.mergeable &&
+      blockers.length === 0 &&
+      mergeability.blockers.length === 0 &&
+      mergeability.ciPassing &&
+      mergeability.approved &&
+      mergeability.noConflicts
+    ) {
+      blockers.push("SCM reported the PR is not mergeable");
+    }
+    return blockers;
   }
 
   function reviewBodyMatchesApproval(body: string, policy: ReviewBotPolicy): boolean {
@@ -3643,7 +3666,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const scm = project?.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
     const prs = normalizeSessionPRs(session);
     if (!scm || prs.length === 0 || !scm.getReviewThreads) {
-      return { blockers: ["review_data_incomplete"], prsToMerge: [] };
+      return { blockers: ["review_data_incomplete"], prsToMerge: [], missingApprovalTargets: [] };
     }
 
     const confidence = computeConfidence(gatherConfidenceSignals(session)).score;
@@ -3651,7 +3674,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       reactionConfig.confidenceThreshold ?? DEFAULT_AUTO_MERGE_CONFIDENCE_THRESHOLD;
     const blockers = new Set<string>();
     const prsToMerge: PRInfo[] = [];
-    let primaryHeadSha: string | undefined;
+    const missingApprovalTargets: Array<{ pr: PRInfo; headSha?: string }> = [];
 
     for (const pr of prs) {
       try {
@@ -3669,7 +3692,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           continue;
         }
         prsToMerge.push(pr);
-        primaryHeadSha ??= reviewData.headSha;
 
         const unresolvedRequiredThreads = reviewData.threads.filter((comment) => {
           const botName = reviewCommentBotName(comment);
@@ -3692,6 +3714,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             (!!policy && reviewBodyMatchesApproval(review.body, policy))
           );
         });
+        const humanReviewApproved = reviewData.reviews.some((review) => {
+          if (reviewSummaryBotName(review)) return false;
+          return (
+            review.state.toUpperCase() === "APPROVED" &&
+            !!reviewData.headSha &&
+            review.commitSha === reviewData.headSha
+          );
+        });
         const botReactionApproved = (reviewData.reactions ?? []).some((reaction) => {
           const botName = reaction.botName ?? (reaction.isBot ? reaction.author : undefined);
           if (!botName || reviewBotWeight(session, botName, false) < 1) return false;
@@ -3712,14 +3742,23 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         });
         const approvalSatisfied =
           reviewDecision !== "changes_requested" &&
-          (reviewDecision === "approved" || botReviewApproved || botReactionApproved);
+          (humanReviewApproved || botReviewApproved || botReactionApproved);
+
+        if (!approvalSatisfied) {
+          missingApprovalTargets.push({ pr, headSha: reviewData.headSha });
+        }
+
+        const mergeabilityBlockers = liveMergeabilityBlockers(mergeability);
+        const liveDraft =
+          pr.isDraft || mergeability.blockers.some((blocker) => /draft/i.test(blocker));
 
         const decision = resolveMergeDefinitionOfDone({
           ciGreen: ciStatus === "passing" || ciStatus === "none",
           unresolvedRequiredThreads,
           approvalSatisfied,
           noConflicts: mergeability.noConflicts,
-          isDraft: pr.isDraft,
+          isDraft: liveDraft,
+          mergeabilityBlockers,
           confidence,
           confidenceThreshold,
           reviewDataComplete: !(reviewData.threadsTruncated ?? false),
@@ -3732,7 +3771,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       }
     }
 
-    return { blockers: [...blockers], prsToMerge, headSha: primaryHeadSha };
+    return { blockers: [...blockers], prsToMerge, missingApprovalTargets };
   }
 
   function updateAutoMergeBlockers(session: Session, blockers: string[]): void {
@@ -3754,41 +3793,73 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return null;
   }
 
+  function reviewRebumpMetadataKeys(pr: PRInfo): {
+    headSha: string;
+    count: string;
+    at: string;
+    escalatedAt: string;
+  } {
+    const suffix = `${pr.owner}/${pr.repo}#${pr.number}`;
+    return {
+      headSha: `reviewRebumpHeadSha:${suffix}`,
+      count: `reviewRebumpCount:${suffix}`,
+      at: `reviewRebumpAt:${suffix}`,
+      escalatedAt: `reviewApprovalEscalatedAt:${suffix}`,
+    };
+  }
+
+  function scopedReviewRebumpMetadataCleanup(session: Session): Record<string, string> {
+    const updates: Record<string, string> = {};
+    for (const key of Object.keys(session.metadata)) {
+      if (
+        key.startsWith("reviewRebumpHeadSha:") ||
+        key.startsWith("reviewRebumpCount:") ||
+        key.startsWith("reviewRebumpAt:") ||
+        key.startsWith("reviewApprovalEscalatedAt:")
+      ) {
+        updates[key] = "";
+      }
+    }
+    return updates;
+  }
+
   /** Bounded, exponentially backed-off Codex re-bump with human fallback. */
   async function maybeRebumpAutomatedReviewer(
     session: Session,
-    headSha: string | undefined,
+    approvalTarget: { pr: PRInfo; headSha?: string },
   ): Promise<void> {
-    if (!session.pr || !headSha) return;
+    const { pr, headSha } = approvalTarget;
+    if (!headSha) return;
     const target = actionableRebumpPolicy(session);
     if (!target) return;
     const project = config.projects[session.projectId];
     const scm = project?.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
     if (!scm?.postPRComment) return;
 
-    if (session.metadata["reviewRebumpHeadSha"] !== headSha) {
+    const keys = reviewRebumpMetadataKeys(pr);
+    if (session.metadata[keys.headSha] !== headSha) {
       updateSessionMetadata(session, {
-        reviewRebumpHeadSha: headSha,
-        reviewRebumpCount: "",
-        reviewRebumpAt: "",
-        reviewApprovalEscalatedAt: "",
+        [keys.headSha]: headSha,
+        [keys.count]: "",
+        [keys.at]: "",
+        [keys.escalatedAt]: "",
       });
     }
 
-    const count = parseAttemptCount(session.metadata["reviewRebumpCount"]);
+    const count = parseAttemptCount(session.metadata[keys.count]);
     const maxRebumps = target.policy.maxRebumps ?? 0;
     const baseBackoffMs = parseDuration(target.policy.rebumpBackoff ?? "30m");
-    const lastAt = Date.parse(session.metadata["reviewRebumpAt"] ?? "");
+    const lastAt = Date.parse(session.metadata[keys.at] ?? "");
     const backoffMs = baseBackoffMs * 2 ** Math.max(0, count - 1);
     if (Number.isFinite(lastAt) && Date.now() - lastAt < backoffMs) return;
 
     if (count < maxRebumps) {
       try {
-        await scm.postPRComment(session.pr, target.policy.rebumpMessage!);
+        await scm.postPRComment(pr, target.policy.rebumpMessage!);
         updateSessionMetadata(session, {
-          reviewRebumpHeadSha: headSha,
-          reviewRebumpCount: String(count + 1),
-          reviewRebumpAt: new Date().toISOString(),
+          [keys.headSha]: headSha,
+          [keys.count]: String(count + 1),
+          [keys.at]: new Date().toISOString(),
         });
         recordActivityEvent({
           projectId: session.projectId,
@@ -3796,7 +3867,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           source: "reaction",
           kind: "review.rebumped",
           summary: `requested another review from ${normalizeReviewBotName(target.botName)}`,
-          data: { botName: target.botName, attempt: count + 1, maxRebumps, headSha },
+          data: {
+            botName: target.botName,
+            attempt: count + 1,
+            maxRebumps,
+            headSha,
+            prNumber: pr.number,
+          },
         });
       } catch {
         // Leave metadata unchanged so the next poll retries the comment.
@@ -3804,12 +3881,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       return;
     }
 
-    if (session.metadata["reviewApprovalEscalatedAt"]) return;
+    if (session.metadata[keys.escalatedAt]) return;
     const context = buildEventContext(session, prEnrichmentCache);
     const event = createEvent("reaction.escalated", {
       sessionId: session.id,
       projectId: session.projectId,
-      message: `${target.botName} did not provide an approval signal after ${maxRebumps} re-bump(s) on PR #${session.pr.number}. Human approval can satisfy the merge gate.`,
+      message: `${target.botName} did not provide an approval signal after ${maxRebumps} re-bump(s) on PR #${pr.number}. Human approval can satisfy the merge gate.`,
       data: buildReactionEscalationNotificationData({
         eventType: "reaction.escalated",
         sessionId: session.id,
@@ -3823,7 +3900,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       }),
     });
     if (await notifyHuman(event, "action")) {
-      updateSessionMetadata(session, { reviewApprovalEscalatedAt: new Date().toISOString() });
+      updateSessionMetadata(session, { [keys.escalatedAt]: new Date().toISOString() });
     }
   }
 

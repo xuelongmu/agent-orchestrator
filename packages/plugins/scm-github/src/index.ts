@@ -1408,12 +1408,18 @@ function createGitHubSCM(): SCM {
           });
 
         const reviews: ReviewSummary[] = reviewNodes
-          // Keep non-empty human reviews for display, and ALL bot reviews (even
-          // with an empty body) so completion detection can recognize a clean,
-          // no-inline-comment bot review as a real review-submission signal.
+          // Keep non-empty human reviews for display, decisive human review
+          // states for head-scoped approval checks, and ALL bot reviews so a
+          // clean no-inline-comment bot review remains an engagement signal.
           .filter((r) => {
             const author = r.author?.login ?? "unknown";
-            return (r.body && r.body.trim().length > 0) || isBotAuthor(author);
+            const state = r.state.toUpperCase();
+            return (
+              (r.body && r.body.trim().length > 0) ||
+              isBotAuthor(author) ||
+              state === "APPROVED" ||
+              state === "CHANGES_REQUESTED"
+            );
           })
           .map((r) => {
             const author = r.author?.login ?? "unknown";

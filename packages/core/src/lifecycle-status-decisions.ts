@@ -26,6 +26,8 @@ export interface MergeDefinitionOfDoneInput {
   approvalSatisfied: boolean;
   noConflicts: boolean;
   isDraft: boolean;
+  /** Live SCM blockers not already represented by CI/review/conflict/draft gates. */
+  mergeabilityBlockers?: string[];
   confidence: number;
   confidenceThreshold: number;
   reviewDataComplete: boolean;
@@ -47,6 +49,9 @@ export function resolveMergeDefinitionOfDone(
   if (!input.approvalSatisfied) blockers.push("review_approval_missing");
   if (!input.noConflicts) blockers.push("merge_conflicts");
   if (input.isDraft) blockers.push("draft_pr");
+  if (input.mergeabilityBlockers?.length) {
+    blockers.push(`mergeability_blocked: ${input.mergeabilityBlockers.join("; ")}`);
+  }
   if (input.confidence < input.confidenceThreshold) blockers.push("low_confidence");
   return { ready: blockers.length === 0, blockers };
 }
