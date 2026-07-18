@@ -573,6 +573,12 @@ export interface Agent {
   getEnvironment(config: AgentLaunchConfig): Record<string, string>;
 
   /**
+   * Optional: resolve the launch binary to an absolute path before spawn.
+   * Throw an actionable error when the binary cannot be found.
+   */
+  resolveExecutablePath?(): Promise<string>;
+
+  /**
    * Detect what the agent is currently doing from terminal output.
    * @deprecated Use getActivityState() instead - this uses hacky terminal parsing.
    */
@@ -604,7 +610,11 @@ export interface Agent {
    * Optional: get a launch command that resumes a previous session.
    * Returns null if no previous session is found (caller falls back to getLaunchCommand).
    */
-  getRestoreCommand?(session: Session, project: ProjectConfig): Promise<string | null>;
+  getRestoreCommand?(
+    session: Session,
+    project: ProjectConfig,
+    executablePath?: string,
+  ): Promise<string | null>;
 
   /**
    * Optional: run setup BEFORE the agent process is launched.
@@ -660,6 +670,8 @@ export interface Agent {
 export interface AgentLaunchConfig {
   sessionId: SessionId;
   projectConfig: ProjectConfig;
+  /** Absolute agent executable path resolved by the session manager before launch. */
+  executablePath?: string;
   /**
    * Per-session workspace path. Differs from `projectConfig.path` when the
    * workspace plugin (e.g. worktree mode) creates an isolated checkout per

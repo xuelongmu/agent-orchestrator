@@ -196,6 +196,54 @@ describe("activity event logging", () => {
   });
 });
 
+describe("agent executable resolution", () => {
+  it("resolves the binary before resource creation and passes it to launch config", async () => {
+    config.projects["my-app"]!.agent = "mock-agent";
+    const order: string[] = [];
+    ctx.mockAgent.resolveExecutablePath = vi.fn().mockImplementation(async () => {
+      order.push("resolve");
+      return "/absolute/bin/mock-agent";
+    });
+    vi.mocked(ctx.mockWorkspace.create).mockImplementation(async () => {
+      order.push("workspace");
+      return {
+        path: "/tmp/ws",
+        branch: "session/app-1",
+        sessionId: "app-1",
+        projectId: "my-app",
+      };
+    });
+    vi.mocked(ctx.mockAgent.getLaunchCommand).mockImplementation((launchConfig) => {
+      order.push("command");
+      expect(launchConfig.executablePath).toBe("/absolute/bin/mock-agent");
+      return "'/absolute/bin/mock-agent'";
+    });
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await sm.spawn({ projectId: "my-app" });
+
+    expect(order).toEqual(["resolve", "workspace", "command"]);
+    expect(ctx.mockRuntime.create).toHaveBeenCalledWith(
+      expect.objectContaining({ launchCommand: "'/absolute/bin/mock-agent'" }),
+    );
+  });
+
+  it("fails before creating resources when the binary cannot be resolved", async () => {
+    config.projects["my-app"]!.agent = "mock-agent";
+    ctx.mockAgent.resolveExecutablePath = vi
+      .fn()
+      .mockRejectedValue(new Error("agent binary `mock-agent` not found on PATH"));
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await expect(sm.spawn({ projectId: "my-app" })).rejects.toThrow(
+      "agent binary `mock-agent` not found on PATH",
+    );
+
+    expect(ctx.mockWorkspace.create).not.toHaveBeenCalled();
+    expect(ctx.mockRuntime.create).not.toHaveBeenCalled();
+  });
+});
+
 describe("deleteSession retry loop", () => {
   it("verifies retry count - calls execFileAsync 3 times when all attempts fail", async () => {
     const { execFile } = await import("node:child_process");
