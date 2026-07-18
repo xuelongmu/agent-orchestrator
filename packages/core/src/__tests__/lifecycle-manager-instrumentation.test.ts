@@ -18,6 +18,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type * as ActivityEventsModule from "../activity-events.js";
+import { SessionInputPendingError } from "../types.js";
 
 vi.mock("../activity-events.js", async (importOriginal) => {
   const original = await importOriginal<typeof ActivityEventsModule>();
@@ -548,6 +549,40 @@ describe("reaction.send_to_agent_failed", () => {
       reactionKey: "ci-failed",
       errorMessage: "agent unreachable",
     });
+  });
+
+  it("does not record reaction success while session input remains pending", async () => {
+    config.reactions = {
+      "ci-failed": { auto: true, action: "send-to-agent", message: "fix CI", retries: 5 },
+    };
+    vi.mocked(mockSessionManager.send).mockRejectedValue(
+      new SessionInputPendingError("app-1", true),
+    );
+
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: makeCiFailedScm(),
+      notifier: createMockNotifier(),
+    });
+
+    persistSession("app-1", makeSession({ status: "pr_open", pr: makeMatchingPR() }));
+
+    const lm = buildLM(registry);
+    await lm.check("app-1");
+
+    const calls = vi.mocked(recordActivityEvent).mock.calls.map((c) => c[0]);
+    expect(calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "reaction.send_to_agent_failed",
+          sessionId: "app-1",
+        }),
+      ]),
+    );
+    expect(calls).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: "reaction.action_succeeded" })]),
+    );
   });
 });
 

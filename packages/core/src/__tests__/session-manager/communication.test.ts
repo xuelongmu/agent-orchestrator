@@ -11,6 +11,7 @@ import {
   readMetadataRaw,
 } from "../../metadata.js";
 import {
+  SessionInputPendingError,
   SessionSendNotDeliveredError,
   type OrchestratorConfig,
   type PluginRegistry,
@@ -85,7 +86,7 @@ describe("send", () => {
     expect(mockRuntime.getOutput).toHaveBeenCalledTimes(3);
   });
 
-  it("reports input still pending without resending after Enter recovery", async () => {
+  it("rejects when input is still pending without resending after Enter recovery", async () => {
     writeMetadata(sessionsDir, "app-1", {
       worktree: "/tmp",
       branch: "main",
@@ -99,9 +100,13 @@ describe("send", () => {
     mockAgent.isInputPending = vi.fn((output) => output.includes("[Pasted Content"));
 
     const sm = createSessionManager({ config, registry: mockRegistry });
-    const result = await sm.send("app-1", "large multiline review context");
+    const sending = sm.send("app-1", "large multiline review context");
 
-    expect(result).toEqual({ status: "input_pending", recoveryAttempted: true });
+    await expect(sending).rejects.toMatchObject({
+      name: "SessionInputPendingError",
+      status: "input_pending",
+      recoveryAttempted: true,
+    } satisfies Partial<SessionInputPendingError>);
     expect(mockRuntime.sendMessage).toHaveBeenCalledTimes(1);
     expect(mockRuntime.submitInput).toHaveBeenCalledTimes(1);
   });

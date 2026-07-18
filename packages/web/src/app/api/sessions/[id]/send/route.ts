@@ -1,7 +1,11 @@
 import { type NextRequest } from "next/server";
 import { validateIdentifier, validateString, stripControlChars } from "@/lib/validation";
 import { getServices } from "@/lib/services";
-import { SessionNotFoundError, recordActivityEvent } from "@aoagents/ao-core";
+import {
+  SessionInputPendingError,
+  SessionNotFoundError,
+  recordActivityEvent,
+} from "@aoagents/ao-core";
 import {
   getCorrelationId,
   jsonWithCorrelation,
@@ -72,6 +76,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     if (err instanceof SessionNotFoundError) {
       return jsonWithCorrelation({ error: err.message }, { status: 404 }, correlationId);
     }
+    const inputPending = err instanceof SessionInputPendingError;
+    const statusCode = inputPending ? 409 : 500;
     const { config } = await getServices().catch(() => ({ config: undefined }));
     const projectId = config ? resolveProjectIdForSessionId(config, id) : undefined;
     if (config) {
@@ -82,7 +88,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         correlationId,
         startedAt,
         outcome: "failure",
-        statusCode: 500,
+        statusCode,
         projectId,
         sessionId: id,
         reason: err instanceof Error ? err.message : "Failed to send message",
@@ -99,6 +105,15 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       summary: `session message failed: ${msg}`,
       data: { messageLength: message.length, reason: msg },
     });
-    return jsonWithCorrelation({ error: msg }, { status: 500 }, correlationId);
+    return jsonWithCorrelation(
+      {
+        error: msg,
+        ...(inputPending
+          ? { status: err.status, recoveryAttempted: err.recoveryAttempted }
+          : {}),
+      },
+      { status: statusCode },
+      correlationId,
+    );
   }
 }

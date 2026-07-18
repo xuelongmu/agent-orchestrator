@@ -666,6 +666,14 @@ describe("isInputPending", () => {
       agent.isInputPending?.("› [Pasted Content 7096 chars]\nPress up to edit queued messages"),
     ).toBe(false);
   });
+
+  it("does not treat arbitrary Working prompt text as turn-start evidence", () => {
+    expect(
+      agent.isInputPending?.(
+        "› [Pasted Content 7096 chars]\nWorking tree changes must be committed before finishing",
+      ),
+    ).toBe(true);
+  });
 });
 
 // =========================================================================

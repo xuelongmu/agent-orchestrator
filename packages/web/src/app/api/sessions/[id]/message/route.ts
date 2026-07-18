@@ -1,7 +1,11 @@
 import { type NextRequest } from "next/server";
 import { getServices } from "@/lib/services";
 import { stripControlChars, validateIdentifier, validateString } from "@/lib/validation";
-import { SessionNotFoundError, recordActivityEvent } from "@aoagents/ao-core";
+import {
+  SessionInputPendingError,
+  SessionNotFoundError,
+  recordActivityEvent,
+} from "@aoagents/ao-core";
 import {
   getCorrelationId,
   jsonWithCorrelation,
@@ -90,6 +94,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       return jsonWithCorrelation({ success: true }, { status: 200 }, correlationId);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
+      const inputPending = err instanceof SessionInputPendingError;
+      let statusCode = 500;
+      if (err instanceof SessionNotFoundError) statusCode = 404;
+      else if (inputPending) statusCode = 409;
       recordApiObservation({
         config,
         method: "POST",
@@ -97,7 +105,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         correlationId,
         startedAt,
         outcome: "failure",
-        statusCode: err instanceof SessionNotFoundError ? 404 : 500,
+        statusCode,
         projectId,
         sessionId: id,
         reason: errorMsg,
@@ -117,8 +125,13 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       });
       console.error("Failed to send message:", errorMsg);
       return jsonWithCorrelation(
-        { error: `Failed to send message: ${errorMsg}` },
-        { status: 500 },
+        {
+          error: `Failed to send message: ${errorMsg}`,
+          ...(inputPending
+            ? { status: err.status, recoveryAttempted: err.recoveryAttempted }
+            : {}),
+        },
+        { status: statusCode },
         correlationId,
       );
     }

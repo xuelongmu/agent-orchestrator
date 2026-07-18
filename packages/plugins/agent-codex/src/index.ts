@@ -673,7 +673,6 @@ function createCodexAgent(): Agent {
       const turnEvidenceAt = Math.max(
         terminalOutput.lastIndexOf("Press up to edit queued messages"),
         terminalOutput.lastIndexOf("esc to interrupt"),
-        terminalOutput.lastIndexOf("Working"),
       );
       return pastedAt > turnEvidenceAt;
     },

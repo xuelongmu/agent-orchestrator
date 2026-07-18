@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NextRequest } from "next/server";
 import {
+  SessionInputPendingError,
   SessionNotFoundError,
   SessionNotRestorableError,
   createInitialCanonicalLifecycle,
@@ -1244,6 +1245,24 @@ describe("API Routes", () => {
       expect(res.status).toBe(404);
     });
 
+    it("does not report success while session input remains pending", async () => {
+      (mockSessionManager.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new SessionInputPendingError("backend-3", true),
+      );
+      const req = makeRequest("/api/sessions/backend-3/send", {
+        method: "POST",
+        body: JSON.stringify({ message: "large review context" }),
+        headers: { "Content-Type": "application/json" },
+      });
+
+      const res = await sendPOST(req, { params: Promise.resolve({ id: "backend-3" }) });
+      expect(res.status).toBe(409);
+      await expect(res.json()).resolves.toMatchObject({
+        status: "input_pending",
+        recoveryAttempted: true,
+      });
+    });
+
     it("returns 400 when message is missing", async () => {
       const req = makeRequest("/api/sessions/backend-3/send", {
         method: "POST",
@@ -1305,6 +1324,24 @@ describe("API Routes", () => {
 
       const res = await messagePOST(req, { params: Promise.resolve({ id: "nonexistent" }) });
       expect(res.status).toBe(404);
+    });
+
+    it("does not report success while session input remains pending", async () => {
+      (mockSessionManager.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new SessionInputPendingError("backend-3", true),
+      );
+      const req = makeRequest("/api/sessions/backend-3/message", {
+        method: "POST",
+        body: JSON.stringify({ message: "large review context" }),
+        headers: { "Content-Type": "application/json" },
+      });
+
+      const res = await messagePOST(req, { params: Promise.resolve({ id: "backend-3" }) });
+      expect(res.status).toBe(409);
+      await expect(res.json()).resolves.toMatchObject({
+        status: "input_pending",
+        recoveryAttempted: true,
+      });
     });
 
     it("returns 400 when message is missing", async () => {

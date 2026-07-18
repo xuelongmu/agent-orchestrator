@@ -22,6 +22,7 @@ import {
   isRestorable,
   isTerminalSession,
   NON_RESTORABLE_STATUSES,
+  SessionInputPendingError,
   SessionNotFoundError,
   SessionNotRestorableError,
   SessionSendNotDeliveredError,
@@ -36,7 +37,6 @@ import {
   type ClaimPRResult,
   type KillOptions,
   type KillResult,
-  type SessionSendResult,
   type LifecycleKillReason,
   type OrchestratorConfig,
   type ProjectConfig,
@@ -3191,7 +3191,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     sessionId: SessionId,
     message: string,
     scopeProjectId?: string,
-  ): Promise<undefined | SessionSendResult> {
+  ): Promise<void> {
     const { raw, sessionsDir, project, projectId } = requireSessionRecord(sessionId, scopeProjectId);
 
     // ALL setup below is PRE-DELIVERY: agent selection, OpenCode discovery, and
@@ -3460,9 +3460,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     // error text, is how the failure class is reported to the caller.
     let deliveryAttempted = false;
 
-    const sendWithConfirmation = async (
-      session: Session,
-    ): Promise<undefined | SessionSendResult> => {
+    const sendWithConfirmation = async (session: Session): Promise<void> => {
       const handle = session.runtimeHandle;
       if (!handle) {
         throw new Error(`Session ${sessionId} has no runtime handle`);
@@ -3477,15 +3475,13 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       deliveryAttempted = true;
       await runtimePlugin.sendMessage(handle, message);
 
-      // DELIVERY HAS CROSSED THE BOUNDARY. Everything below is best-effort
-      // CONFIRMATION and must never throw — the soft-success contract already
-      // documented at the tail of this function: once the message is on the
-      // runtime, a failure to *confirm* it must not be reported to the caller as a
-      // failed send. `captureOutput` is already catch-guarded; the OpenCode
-      // `session list` probe was not, so a probe failure after delivery rejected
-      // the whole send even though the message went out. Wrapping the loop makes
-      // that contract structural, not incidental to which helpers happen to
-      // swallow their own errors (#13 review).
+      // DELIVERY HAS CROSSED THE BOUNDARY. Infrastructure failures during
+      // best-effort confirmation remain soft successes because the message may
+      // have started a turn. Definitive evidence that Codex still holds the text
+      // in its editor is different: that known unsuccessful submission is surfaced
+      // below as SessionInputPendingError. `captureOutput` is already catch-guarded;
+      // wrapping the OpenCode probe makes the ambiguous-error contract structural,
+      // not incidental to which helpers swallow their own errors (#13 review).
       try {
         for (let attempt = 1; attempt <= SEND_CONFIRMATION_ATTEMPTS; attempt++) {
           // Sleep before each check (including the first) so the runtime has time
@@ -3537,14 +3533,14 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       }
 
       if (inputStillPending) {
-        return { status: "input_pending", recoveryAttempted: inputRecoveryAttempted };
+        throw new SessionInputPendingError(sessionId, inputRecoveryAttempted);
       }
 
-      // Message was already sent via runtimePlugin.sendMessage above — if we
-      // cannot *confirm* delivery (e.g. agent is slow to show output), treat it
-      // as a soft success rather than throwing.  Throwing here caused the caller
-      // to report failure, which prevented the dispatch-hash from updating and
-      // led to duplicate messages on the next poll cycle.
+      // Message was already sent via runtimePlugin.sendMessage above and no input
+      // is definitively pending. If we cannot confirm delivery (e.g. the agent is
+      // slow to show output), treat it as a soft success. Throwing here caused the
+      // caller to report failure, which prevented the dispatch-hash from updating
+      // and led to duplicate messages on the next poll cycle.
       return;
     };
 
@@ -3552,14 +3548,18 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     // retry-with-restore, etc.) emits a single `session.send_failed` event
     // (B16 — failure-only). Stage tag distinguishes which branch failed.
     let stage: "prepare" | "initial" | "restore_retry" = "prepare";
-    let sendResult: SessionSendResult | undefined;
     try {
       let prepared = await prepareSession();
 
       try {
         stage = "initial";
-        sendResult = await sendWithConfirmation(prepared);
+        await sendWithConfirmation(prepared);
       } catch (err) {
+        // The text is already present in the editor. Restoring and sending it
+        // again would violate at-most-once delivery and duplicate the prompt.
+        if (err instanceof SessionInputPendingError) {
+          throw err;
+        }
         const shouldRetryWithRestore =
           prepared.restoredAt === undefined && isRestorable(prepared);
 
@@ -3573,7 +3573,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         stage = "restore_retry";
         prepared = await prepareSession(true);
         try {
-          sendResult = await sendWithConfirmation(prepared);
+          await sendWithConfirmation(prepared);
         } catch (retryErr) {
           if (retryErr instanceof Error) {
             throw retryErr;
@@ -3605,7 +3605,6 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       }
       throw err;
     }
-    return sendResult;
   }
 
   async function claimPR(

@@ -91,6 +91,17 @@ export class MessageParser {
   }
 }
 
+/** Return the last requested PTY lines, including the current unterminated line. */
+export function formatPtyOutputTail(
+  outputBuffer: readonly string[],
+  partialLine: string,
+  lines: number,
+): string {
+  const availableLines = partialLine ? [...outputBuffer, partialLine] : outputBuffer;
+  const start = Math.max(0, availableLines.length - lines);
+  return availableLines.slice(start).join("");
+}
+
 // ---------------------------------------------------------------------------
 // Standalone entry-point
 // ---------------------------------------------------------------------------
@@ -301,8 +312,7 @@ async function runPtyHost(): Promise<void> {
         } catch {
           // Use default
         }
-        const start = Math.max(0, outputBuffer.length - lines);
-        const text = outputBuffer.slice(start).join("");
+        const text = formatPtyOutputTail(outputBuffer, partialLine, lines);
         sendToSocket(sock, encodeMessage(MSG_GET_OUTPUT_RES, text));
         break;
       }

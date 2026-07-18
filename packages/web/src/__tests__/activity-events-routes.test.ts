@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NextRequest } from "next/server";
 import {
+  SessionInputPendingError,
   SessionNotFoundError,
   SessionNotRestorableError,
   WorkspaceMissingError,
@@ -428,6 +429,30 @@ describe("API mutation routes emit activity events (api source)", () => {
           sessionId: "backend-3",
           data: expect.objectContaining({ messageLength: 2 }),
         }),
+      );
+    });
+
+    it("POST /api/sessions/:id/send records pending input as failed, not sent", async () => {
+      (mockSessionManager.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new SessionInputPendingError("backend-3", true),
+      );
+      const req = makeRequest("/api/sessions/backend-3/send", {
+        method: "POST",
+        body: JSON.stringify({ message: "large review context" }),
+        headers: { "Content-Type": "application/json" },
+      });
+
+      await sendPOST(req, { params: Promise.resolve({ id: "backend-3" }) });
+
+      expect(recorded).toHaveBeenCalledWith(
+        expect.objectContaining({
+          source: "api",
+          kind: "api.session_message_failed",
+          sessionId: "backend-3",
+        }),
+      );
+      expect(recorded).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "api.session_message_sent" }),
       );
     });
 
