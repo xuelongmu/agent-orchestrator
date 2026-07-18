@@ -11,8 +11,8 @@ import {
   readMetadataRaw,
 } from "../../metadata.js";
 import {
-  SessionInputPendingError,
   SessionSendNotDeliveredError,
+  type SessionInputPendingError,
   type OrchestratorConfig,
   type PluginRegistry,
   type Runtime,

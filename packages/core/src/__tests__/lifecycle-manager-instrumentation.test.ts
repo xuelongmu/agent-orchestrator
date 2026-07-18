@@ -18,7 +18,6 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type * as ActivityEventsModule from "../activity-events.js";
-import { SessionInputPendingError } from "../types.js";
 
 vi.mock("../activity-events.js", async (importOriginal) => {
   const original = await importOriginal<typeof ActivityEventsModule>();
@@ -32,12 +31,13 @@ import { recordActivityEvent } from "../activity-events.js";
 import { createLifecycleManager } from "../lifecycle-manager.js";
 import { writeMetadata } from "../metadata.js";
 import { enqueueSCMWebhookDelivery, processSCMWebhookQueue } from "../scm-webhook-queue.js";
-import type {
-  OpenCodeSessionManager,
-  OrchestratorConfig,
-  PRInfo,
-  PluginRegistry,
-  SessionMetadata,
+import {
+  SessionInputPendingError,
+  type OpenCodeSessionManager,
+  type OrchestratorConfig,
+  type PRInfo,
+  type PluginRegistry,
+  type SessionMetadata,
 } from "../types.js";
 import {
   createMockNotifier,
