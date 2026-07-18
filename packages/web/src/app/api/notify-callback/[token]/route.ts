@@ -2,6 +2,7 @@ import { type NextRequest } from "next/server";
 import { getServices } from "@/lib/services";
 import {
   ACTIVITY_STATE,
+  SessionInputPendingError,
   SessionNotFoundError,
   isValidSessionIdComponent,
   activeDecisionId,
@@ -531,6 +532,8 @@ export async function POST(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const notFound = err instanceof SessionNotFoundError;
+    const inputPending = err instanceof SessionInputPendingError;
+    const statusCode = notFound ? 404 : inputPending ? 409 : 500;
     const { config } = await getServices().catch(() => ({ config: undefined }));
     if (config) {
       recordApiObservation({
@@ -540,11 +543,16 @@ export async function POST(
         correlationId,
         startedAt,
         outcome: "failure",
-        statusCode: notFound ? 404 : 500,
+        statusCode,
         projectId,
         sessionId,
         reason: msg,
-        data: { action },
+        data: {
+          action,
+          ...(inputPending
+            ? { status: err.status, recoveryAttempted: err.recoveryAttempted }
+            : {}),
+        },
       });
     }
     recordActivityEvent({
@@ -554,7 +562,13 @@ export async function POST(
       kind: "api.notify_callback.failed",
       level: "error",
       summary: `notification action "${action}" failed for session ${sessionId}: ${msg}`,
-      data: { action, reason: msg },
+      data: {
+        action,
+        reason: msg,
+        ...(inputPending
+          ? { status: err.status, recoveryAttempted: err.recoveryAttempted }
+          : {}),
+      },
     });
 
     if (notFound) {
@@ -562,6 +576,14 @@ export async function POST(
         404,
         "Session not found",
         "That session no longer exists — it may have already finished or been cleaned up.",
+      );
+    }
+    if (inputPending) {
+      return htmlResponse(
+        409,
+        "Input awaiting submission",
+        `The decision was pasted into session ${sessionId}, but it remains pending in the agent ` +
+          "editor. Submit it manually in the terminal; retrying this notification action is not safe.",
       );
     }
     return htmlResponse(500, "Action failed", "Something went wrong resolving this decision.");

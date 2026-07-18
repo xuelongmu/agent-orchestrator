@@ -18,6 +18,7 @@ import {
   ACTIVITY_STATE,
   SESSION_STATUS,
   TERMINAL_STATUSES,
+  SessionInputPendingError,
   type ActivityState,
   type LifecycleCheckOptions,
   type LifecycleManager,
@@ -224,6 +225,15 @@ const CONFIDENCE_HOLD_PENDING_KEY = "confidenceHoldPending";
 /** Metadata key: activation identity of a same-state decision notification whose
  *  delivery failed and is awaiting the shared per-poll human-outcome retry. */
 const DECISION_NOTIFICATION_PENDING_KEY = "decisionNotificationPending";
+
+/** Metadata latch set when an automated lifecycle message reached the editor but
+ * did not submit. It remains closed until a live activity probe proves the editor
+ * is no longer waiting, preventing later polls from pasting over pending input. */
+const LIFECYCLE_INPUT_PENDING_AT_KEY = "lifecycleInputPendingAt";
+
+type LifecycleSendOutcome =
+  | { status: "sent" }
+  | { status: "input-pending"; error?: SessionInputPendingError };
 
 /** Explicit confidence-gate outcome. In particular, `held-delivered` means only
  *  the human received the payload; it must never be counted as an agent action. */
@@ -2313,6 +2323,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     reactionConfig: ReactionConfig,
   ): Promise<ReactionResult> {
     const { id: sessionId, projectId } = session;
+    const action = reactionConfig.action ?? "notify";
+    // A prior attempt already left text in this editor. Do not spend the
+    // reaction's retry budget while delivery is intentionally suppressed.
+    if (action === "send-to-agent" && session.metadata[LIFECYCLE_INPUT_PENDING_AT_KEY]) {
+      return {
+        reactionType: reactionKey,
+        success: false,
+        action,
+        escalated: false,
+      };
+    }
     const trackerKey = `${sessionId}:${reactionKey}`;
     let tracker = reactionTrackers.get(trackerKey);
 
@@ -2416,7 +2437,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
 
     // Execute the reaction action
-    const action = reactionConfig.action ?? "notify";
     const effectiveReactionConfig =
       action === "auto-merge" && reactionConfig.confidenceThreshold === undefined
         ? {
@@ -2482,7 +2502,18 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       case "send-to-agent": {
         if (reactionConfig.message) {
           try {
-            await sessionManager.send(sessionId, reactionConfig.message);
+            const delivery = await sendLifecycleMessage(session, reactionConfig.message);
+            if (delivery.status === "input-pending") {
+              if (delivery.error) {
+                recordReactionSendFailure(session, reactionKey, tracker.attempts, delivery.error);
+              }
+              return {
+                reactionType: reactionKey,
+                success: false,
+                action: "send-to-agent",
+                escalated: false,
+              };
+            }
             recordActivityEvent({
               projectId,
               sessionId,
@@ -2500,19 +2531,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             };
           } catch (err) {
             // Send failed — allow retry on next poll cycle (don't escalate immediately)
-            recordActivityEvent({
-              projectId,
-              sessionId,
-              source: "reaction",
-              kind: "reaction.send_to_agent_failed",
-              level: "warn",
-              summary: `send-to-agent failed for ${sessionId}`,
-              data: {
-                reactionKey,
-                attempts: tracker.attempts,
-                errorMessage: err instanceof Error ? err.message : String(err),
-              },
-            });
+            recordReactionSendFailure(session, reactionKey, tracker.attempts, err);
             return {
               reactionType: reactionKey,
               success: false,
@@ -2698,6 +2717,52 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
     session.metadata = cleaned;
     session.status = deriveLegacyStatus(session.lifecycle);
+  }
+
+  function recordReactionSendFailure(
+    session: Session | ReactionSessionContext,
+    reactionKey: string,
+    attempts: number,
+    error: unknown,
+  ): void {
+    recordActivityEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      source: "reaction",
+      kind: "reaction.send_to_agent_failed",
+      level: "warn",
+      summary: `send-to-agent failed for ${session.id}`,
+      data: {
+        reactionKey,
+        attempts,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }
+
+  /** Send an automated lifecycle prompt without pasting over editor text left by
+   * an earlier attempt. Pending-input is an at-or-after-delivery outcome, so it is
+   * latched rather than thrown into callers' ordinary retry paths. */
+  async function sendLifecycleMessage(
+    session: Session | ReactionSessionContext,
+    message: string,
+  ): Promise<LifecycleSendOutcome> {
+    if (session.metadata[LIFECYCLE_INPUT_PENDING_AT_KEY]) {
+      return { status: "input-pending" };
+    }
+
+    try {
+      await sessionManager.send(session.id, message);
+      return { status: "sent" };
+    } catch (error) {
+      if (!(error instanceof SessionInputPendingError)) throw error;
+      if ("lifecycle" in session) {
+        updateSessionMetadata(session, {
+          [LIFECYCLE_INPUT_PENDING_AT_KEY]: new Date().toISOString(),
+        });
+      }
+      return { status: "input-pending", error };
+    }
   }
 
   /**
@@ -3397,8 +3462,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             !transitionReaction?.result?.escalated
           ) {
             try {
-              await sessionManager.send(session.id, enrichedMessage);
-              success = true;
+              const delivery = await sendLifecycleMessage(session, enrichedMessage);
+              success = delivery.status === "sent";
             } catch {
               // Send failed — will retry on next unthrottled poll
             }
@@ -3532,9 +3597,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
               !transitionReaction?.result?.escalated
             ) {
               try {
-                await sessionManager.send(session.id, enrichedMessage);
-                success = true;
-                deliveredToAgent = true;
+                const delivery = await sendLifecycleMessage(session, enrichedMessage);
+                success = delivery.status === "sent";
+                deliveredToAgent = success;
               } catch {
                 // Send failed — will retry on next unthrottled poll
               }
@@ -3783,7 +3848,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
 
     try {
-      await sessionManager.send(session.id, parts.join("\n"));
+      const delivery = await sendLifecycleMessage(session, parts.join("\n"));
+      if (delivery.status === "input-pending") return;
       updateSessionMetadata(session, {
         stuckNudgeCount: String(nudgeCount + 1),
         stuckNudgeFingerprint: backlogFingerprint,
@@ -4864,7 +4930,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       child.prs.map((p) => p.number).filter((n) => n > 0),
     );
     try {
-      await sessionManager.send(child.id, message);
+      const delivery = await sendLifecycleMessage(child, message);
+      if (delivery.status === "input-pending") return;
     } catch (err) {
       recordActivityEvent({
         projectId: child.projectId,
@@ -4998,8 +5065,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // Skip if we already dispatched this exact failure set
     if (ciFingerprint === lastCIDispatchHash) return;
 
-    // Dispatch CI failure details directly via sessionManager.send() rather than
-    // executeReaction() to avoid consuming the ci-failed reaction's retry budget.
+    // Dispatch CI failure details directly via the lifecycle delivery guard
+    // rather than executeReaction() to avoid consuming the ci-failed reaction's
+    // retry budget.
     // The transition reaction owns escalation; this is a follow-up info delivery.
     const reactionConfig = getReactionConfigForSession(session, ciReactionKey);
     if (
@@ -5034,7 +5102,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
       try {
         if (reactionConfig.action === "send-to-agent") {
-          await sessionManager.send(session.id, detailedMessage);
+          const delivery = await sendLifecycleMessage(session, detailedMessage);
+          if (delivery.status === "input-pending") return;
         } else {
           // For "notify" action, send to human notifiers instead
           const context = buildEventContext(session, prEnrichmentCache);
@@ -5522,6 +5591,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       return;
     }
     let newStatus = assessment.status;
+
+    // The pending-input latch clears only on positive live evidence that the
+    // editor moved on. Unavailable/stale probes fail closed and keep automated
+    // delivery suppressed; a verified active/idle/etc. state permits one retry.
+    if (
+      session.metadata[LIFECYCLE_INPUT_PENDING_AT_KEY] &&
+      session.activitySignal.state === "valid" &&
+      session.activitySignal.activity !== ACTIVITY_STATE.WAITING_INPUT
+    ) {
+      updateSessionMetadata(session, { [LIFECYCLE_INPUT_PENDING_AT_KEY]: "" });
+    }
 
     // Budget enforcement: pause a session whose estimated cost has crossed a
     // configured cap. On the first breach we interrupt the runtime (see
