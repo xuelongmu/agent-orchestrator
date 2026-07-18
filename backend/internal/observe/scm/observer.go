@@ -1101,6 +1101,13 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 			if !hasObs {
 				failureObs = observationFromLocal(s.repo, s.known, nil)
 			}
+			// A fast PR snapshot may omit review fields precisely because the
+			// slower thread refresh failed. Carry the last durable decision/head
+			// into the failure signal so lifecycle can identify the idle overlay
+			// without treating stale threads as a successful refresh.
+			failureObs.PR.HeadSHA = firstNonEmpty(failureObs.PR.HeadSHA, s.known.HeadSHA)
+			failureObs.Review.HeadSHA = firstNonEmpty(failureObs.Review.HeadSHA, failureObs.PR.HeadSHA)
+			failureObs.Review.Decision = firstNonEmpty(failureObs.Review.Decision, string(s.known.Review))
 			failureObs.ObservedAt = now
 			if o.lifecycle != nil {
 				if fallbackErr := o.lifecycle.ApplySCMReviewFetchFailure(ctx, s.session.ID, failureObs); fallbackErr != nil {

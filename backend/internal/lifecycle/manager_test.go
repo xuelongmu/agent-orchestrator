@@ -1874,7 +1874,7 @@ func TestPRObservation_IdleReviewSendFailureHandsOffOnceAcrossRestart(t *testing
 	}
 }
 
-func TestSCMReviewFetchFailureUsesOnlyDurableAgentDeliveryProof(t *testing.T) {
+func TestSCMReviewFetchFailureHandsOffObservedOverlayWithoutMutatingDeliveryProof(t *testing.T) {
 	st := newFakeStore()
 	sink := &fakeNotificationSink{}
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
@@ -1891,7 +1891,8 @@ func TestSCMReviewFetchFailureUsesOnlyDurableAgentDeliveryProof(t *testing.T) {
 	}
 
 	// A durable escalation/handoff with no Seen review signature is explicitly
-	// undelivered. It must not become review-backlog delivery proof after restart.
+	// undelivered. It must not become agent-delivery proof after restart, but the
+	// observed idle review overlay still needs its own human fetch-failure fallback.
 	undelivered := reactionPayload{Handoffs: map[string]humanHandoffOutcome{
 		"review-handoff:" + prURL + ":round-cap": {Outcome: humanHandoffNotified, Reason: reviewRoundCapNotificationFailed},
 	}}
@@ -1905,15 +1906,28 @@ func TestSCMReviewFetchFailureUsesOnlyDurableAgentDeliveryProof(t *testing.T) {
 	if err := m.ApplySCMReviewFetchFailure(ctx, rec.ID, obs); err != nil {
 		t.Fatalf("undelivered fetch fallback: %v", err)
 	}
-	if len(sink.intents) != 0 {
-		t.Fatalf("escalated-undelivered hash treated as agent delivery: %+v", sink.intents)
+	m = New(st, nil, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now.Add(time.Minute) }
+	if err := m.ApplySCMReviewFetchFailure(ctx, rec.ID, obs); err != nil {
+		t.Fatalf("replayed undelivered fetch fallback: %v", err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("observed-overlay fetch fallback intents = %d, want exactly 1: %+v", len(sink.intents), sink.intents)
+	}
+	var afterUndelivered reactionPayload
+	if err := json.Unmarshal([]byte(st.signatures[prURL]), &afterUndelivered); err != nil {
+		t.Fatalf("decode undelivered fallback: %v", err)
+	}
+	if got := afterUndelivered.Seen["review:"+prURL]; got != "" {
+		t.Fatalf("escalated-undelivered state became agent delivery proof: %q", got)
 	}
 
-	// Once a real review delivery signature is present, the same idle overlay
-	// fetch failure requires one human fallback, durable across another restart.
+	// Once a real review delivery signature is present, the same observed overlay
+	// is already covered by the durable fetch-failure handoff and must not notify
+	// again or rewrite that delivery proof.
 	delivered := reactionPayload{
 		Seen:     map[string]string{"review:" + prURL: "thread-c1"},
-		Handoffs: undelivered.Handoffs,
+		Handoffs: afterUndelivered.Handoffs,
 	}
 	raw, err = json.Marshal(delivered)
 	if err != nil {
@@ -1931,7 +1945,7 @@ func TestSCMReviewFetchFailureUsesOnlyDurableAgentDeliveryProof(t *testing.T) {
 		t.Fatalf("replayed delivered fetch fallback: %v", err)
 	}
 	if len(sink.intents) != 1 {
-		t.Fatalf("fetch-failure handoff intents = %d, want exactly 1: %+v", len(sink.intents), sink.intents)
+		t.Fatalf("fetch-failure handoff intents = %d, want still exactly 1: %+v", len(sink.intents), sink.intents)
 	}
 	var persisted reactionPayload
 	if err := json.Unmarshal([]byte(st.signatures[prURL]), &persisted); err != nil {

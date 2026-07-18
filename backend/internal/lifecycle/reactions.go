@@ -409,11 +409,12 @@ func (m *Manager) resetMergeConflictNudges(ctx context.Context, prURL, keepKey s
 }
 
 // ApplySCMReviewFetchFailure handles the one SCM failure that can otherwise
-// leave an idle PR overlay silent forever. It only hands off when the current
-// review backlog has durable proof of a prior agent delivery. A persisted human
-// escalation alone is deliberately insufficient: handoffs and agent-delivery
-// signatures are separate facts so a daemon restart cannot reinterpret an
-// escalated-but-undelivered hash as work the agent received.
+// leave an idle PR overlay silent forever. The handoff identity comes from the
+// observed head/review pipeline state, not agent-delivery proof: a fetch failure
+// itself needs a human fallback even when the prior review reaction escalated
+// without reaching the agent. Handoffs and agent-delivery signatures remain
+// separate facts so a daemon restart cannot reinterpret that escalation as work
+// the agent received.
 func (m *Manager) ApplySCMReviewFetchFailure(ctx context.Context, id domain.SessionID, o ports.SCMObservation) error {
 	prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
 	if prURL == "" || o.PR.Merged || o.PR.Closed {
@@ -427,15 +428,36 @@ func (m *Manager) ApplySCMReviewFetchFailure(ctx context.Context, id domain.Sess
 		}
 		m.react.loaded[prURL] = true
 	}
-	deliverySig := m.react.seen["review:"+prURL]
-	if deliverySig == "" {
-		return nil
+	failureSig := reviewFetchFailureSignature(o)
+	if failureSig == "" {
+		// A prior actual delivery proves a review backlog even if an older/local
+		// provider cannot supply the overlay decision on this failed refresh.
+		if delivered := m.react.seen["review:"+prURL]; delivered != "" {
+			failureSig = "delivered\x00" + delivered
+		} else {
+			return nil
+		}
 	}
 	rec, eligible, err := m.idleReviewFailureSession(ctx, id)
 	if err != nil || !eligible {
 		return err
 	}
-	return m.deliverReviewFailureHandoffLocked(ctx, rec, o, "review:"+prURL, deliverySig, reviewFetchFailed)
+	return m.deliverReviewFailureHandoffLocked(ctx, rec, o, "review:"+prURL, failureSig, reviewFetchFailed)
+}
+
+// reviewFetchFailureSignature is the durable identity of an idle PR overlay
+// whose review threads could not be refreshed. It deliberately excludes Seen:
+// notification dedup must not promote an escalation hash into agent-delivery
+// proof. A changed head or pipeline decision opens a new failure episode.
+func reviewFetchFailureSignature(o ports.SCMObservation) string {
+	head := firstSCMNonEmpty(o.Review.HeadSHA, o.PR.HeadSHA)
+	decision := domain.ReviewDecision(o.Review.Decision)
+	overlay := decision == domain.ReviewChangesRequest || decision == domain.ReviewRequired || decision == domain.ReviewApproved ||
+		domain.Mergeability(o.Mergeability.State) == domain.MergeMergeable || domain.CIState(o.CI.Summary) == domain.CIFailing
+	if !overlay {
+		return ""
+	}
+	return strings.Join([]string{head, string(decision), o.Mergeability.State, o.CI.Summary}, "\x00")
 }
 
 // cleanupMergedSession runs the resource-owning session manager before the
