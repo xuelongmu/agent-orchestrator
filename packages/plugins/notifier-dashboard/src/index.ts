@@ -40,6 +40,12 @@ export function create(config?: Record<string, unknown>): Notifier {
   return {
     name: "dashboard",
 
+    // Not advertised as callback-capable: although the endpoints are same-origin,
+    // DashboardNotificationButton only renders `action.url`, so mutating callback
+    // actions would be silently dropped and the user would see no controls. Until
+    // the UI renders safe same-origin callback endpoints, the dashboard receives
+    // only URL actions (View PR). (#13 review)
+
     async notify(event: OrchestratorEvent): Promise<void> {
       persist(event);
     },

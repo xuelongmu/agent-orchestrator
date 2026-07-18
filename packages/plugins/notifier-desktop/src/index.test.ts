@@ -21,7 +21,7 @@ vi.mock("node:os", () => ({
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
-import { manifest, create, escapeAppleScript } from "./index.js";
+import { manifest, create, escapeAppleScript, nativeActionPayloads } from "./index.js";
 
 const mockExecFile = execFile as unknown as Mock;
 const mockExecFileSync = execFileSync as unknown as Mock;
@@ -80,6 +80,90 @@ describe("notifier-desktop", () => {
       expect(manifest.name).toBe("desktop");
       expect(manifest.slot).toBe("notifier");
       expect(manifest.version).toBe("0.1.0");
+    });
+  });
+
+  describe("nativeActionPayloads budget", () => {
+    const fiveActions = [
+      { label: "Approve", callbackEndpoint: "/api/notify-callback/a" },
+      { label: "Deny", callbackEndpoint: "/api/notify-callback/d" },
+      { label: "Nudge", callbackEndpoint: "/api/notify-callback/n" },
+      { label: "Kill", callbackEndpoint: "/api/notify-callback/k" },
+      { label: "View PR", url: "https://github.com/acme/x/pull/7" },
+    ];
+
+    it("keeps the read-only View PR within the four-action limit", () => {
+      const payloads = nativeActionPayloads(fiveActions, "https://host/ao");
+      expect(payloads).toHaveLength(4);
+      const labels = payloads.map((p) => p.label);
+      expect(labels).toContain("View PR");
+      // Mutating controls fill the remaining budget in priority order; the
+      // destructive Kill is shed first.
+      expect(labels).toEqual(["Approve", "Deny", "Nudge", "View PR"]);
+      // Reverse-proxy path prefix preserved in the resolved callback URL.
+      expect(payloads[0].callbackEndpoint).toBe("https://host/ao/api/notify-callback/a");
+    });
+
+    it("passes through when within the limit", () => {
+      const payloads = nativeActionPayloads(fiveActions.slice(0, 3), "https://host");
+      expect(payloads.map((p) => p.label)).toEqual(["Approve", "Deny", "Nudge"]);
+    });
+
+    it("never exceeds the limit even with more than four read-only actions", () => {
+      const sixReadOnly = Array.from({ length: 6 }, (_, i) => ({
+        label: `Link ${i}`,
+        url: `https://example.com/${i}`,
+      }));
+      expect(nativeActionPayloads(sixReadOnly, "https://host")).toHaveLength(4);
+    });
+  });
+
+  describe("resolvesActionCallbacks capability", () => {
+    const appInstalled = () =>
+      mockExistsSync.mockImplementation((path: string) =>
+        path.endsWith("AO Notifier.app/Contents/MacOS/ao-notifier"),
+      );
+
+    it("is true only when the actionable AO Notifier.app backend is selected", () => {
+      // auto + app installed + a resolvable callback base → resolves to ao-app
+      // (renders real buttons that can reach the AO route).
+      appInstalled();
+      const dashboardUrl = "https://host";
+      expect(create({ backend: "auto", dashboardUrl }).resolvesActionCallbacks).toBe(true);
+      expect(create({ backend: "ao-app", dashboardUrl }).resolvesActionCallbacks).toBe(true);
+    });
+
+    it("is falsy without a resolvable callback base, even when the app is selected", () => {
+      // The mutating buttons carry a RELATIVE endpoint; with no (or a malformed)
+      // dashboardUrl there is nothing to resolve it against, so nativeActionPayload
+      // would drop every button. The capability must not advertise inert labels.
+      appInstalled();
+      expect(create({ backend: "auto" }).resolvesActionCallbacks).toBeFalsy();
+      expect(create({ backend: "ao-app" }).resolvesActionCallbacks).toBeFalsy();
+      expect(
+        create({ backend: "ao-app", dashboardUrl: "localhost:3000" }).resolvesActionCallbacks,
+      ).toBeFalsy();
+    });
+
+    it("is falsy when the app is not installed", () => {
+      mockExistsSync.mockReturnValue(false); // no AO Notifier.app
+      expect(create({ backend: "auto" }).resolvesActionCallbacks).toBeFalsy();
+      // Explicit ao-app without the app installed rejects at notify time.
+      expect(create({ backend: "ao-app" }).resolvesActionCallbacks).toBeFalsy();
+    });
+
+    it("is falsy for non-actionable backends even when the app is installed", () => {
+      appInstalled();
+      expect(create({ backend: "terminal-notifier" }).resolvesActionCallbacks).toBeFalsy();
+      expect(create({ backend: "osascript" }).resolvesActionCallbacks).toBeFalsy();
+    });
+
+    it("is falsy off macOS (notify-send / WinRT never render actions)", () => {
+      appInstalled();
+      setProcessPlatform("linux");
+      expect(create({ backend: "auto" }).resolvesActionCallbacks).toBeFalsy();
+      setProcessPlatform("win32");
+      expect(create({ backend: "ao-app" }).resolvesActionCallbacks).toBeFalsy();
     });
   });
 

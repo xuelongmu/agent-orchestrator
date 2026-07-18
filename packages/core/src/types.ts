@@ -195,6 +195,14 @@ export interface ActivityLogEntry {
   source: "terminal" | "native" | "hook";
   /** Raw terminal snippet, hook event name, or other context that caused waiting_input/blocked (for debugging) */
   trigger?: string;
+  /**
+   * Compact fingerprint of the broader terminal context for an actionable
+   * (waiting_input/blocked) observation. Stable while the agent stays blocked at
+   * the exact same screen (repeated observations dedupe), but changes when
+   * intervening work precedes a text-identical prompt — so a genuinely new prompt
+   * gets a new durable boundary even when its last lines match the previous one.
+   */
+  fingerprint?: string;
 }
 
 /** Default threshold (ms) before a "ready" session becomes "idle". */
@@ -1333,6 +1341,16 @@ export interface BatchObserver {
 export interface Notifier {
   readonly name: string;
 
+  /**
+   * Whether this notifier can turn a RELATIVE `callbackEndpoint`
+   * (`/api/notify-callback/<token>`) into a working URL — i.e. it prepends its own
+   * configured dashboard base URL (and drops the control when it has none). Only
+   * such notifiers receive the mutating callback actions; others render broken
+   * controls that never reach the AO route. Absolute-URL actions (e.g. View PR)
+   * are unaffected and always delivered. Defaults to false. (#13 review)
+   */
+  readonly resolvesActionCallbacks?: boolean;
+
   /** Push a notification to the human */
   notify(event: OrchestratorEvent): Promise<void>;
 
@@ -2169,6 +2187,13 @@ export interface KillResult {
 export interface KillOptions {
   purgeOpenCode?: boolean;
   reason?: LifecycleKillReason;
+  /**
+   * Restrict the lookup to this project. Without it the session is resolved by
+   * scanning every configured project in config order, so two projects holding
+   * the same session id would let a caller kill the wrong one. Callers that know
+   * the owning project MUST pass it.
+   */
+  projectId?: string;
 }
 
 /** Session manager — CRUD for sessions */
@@ -2192,13 +2217,25 @@ export interface SessionManager {
    */
   unblock(sessionId: SessionId): Promise<Session>;
   list(projectId?: string): Promise<Session[]>;
-  get(sessionId: SessionId): Promise<Session | null>;
+  /**
+   * Look up a session by id. Without `projectId` this scans every configured
+   * project and returns the first id match, so callers that already know the
+   * project MUST pass it — two projects can hold the same session id.
+   */
+  get(sessionId: SessionId, projectId?: string): Promise<Session | null>;
   kill(sessionId: SessionId, options?: KillOptions): Promise<KillResult>;
   cleanup(
     projectId?: string,
     options?: { dryRun?: boolean; purgeOpenCode?: boolean },
   ): Promise<CleanupResult>;
-  send(sessionId: SessionId, message: string): Promise<void>;
+  /**
+   * Send a message to a session. `projectId` restricts the lookup to that
+   * project; without it the session is resolved by scanning every configured
+   * project in config order, so two projects holding the same session id would
+   * let a caller message the wrong one. Callers that know the owning project
+   * MUST pass it.
+   */
+  send(sessionId: SessionId, message: string, projectId?: string): Promise<void>;
   claimPR(sessionId: SessionId, prRef: string, options?: ClaimPROptions): Promise<ClaimPRResult>;
 }
 
@@ -2332,6 +2369,33 @@ export class SessionNotFoundError extends Error {
   constructor(public readonly sessionId: string) {
     super(`Session not found: ${sessionId}`);
     this.name = "SessionNotFoundError";
+  }
+}
+
+/**
+ * Thrown by `SessionManager.send` for a failure PROVABLY before the runtime
+ * delivery boundary (preparation, restore, readiness, or a missing handle) — the
+ * message never reached `runtimePlugin.sendMessage`. Callers relying on
+ * at-most-once semantics (the notify-callback route) may safely reopen a consumed
+ * claim ONLY for this typed failure; any failure at or after the delivery attempt
+ * is ambiguous and must keep the claim closed. The boundary is encoded here in the
+ * delivery API, never inferred from error message text. (#13 review)
+ */
+export class SessionSendNotDeliveredError extends Error {
+  constructor(
+    public readonly sessionId: string,
+    options?: { cause?: unknown },
+  ) {
+    // Preserve the underlying cause's message so existing instrumentation and
+    // assertions on the original failure text keep working; the class itself is
+    // the pre-delivery signal callers match on (instanceof), not the message.
+    const cause = options?.cause;
+    const message =
+      cause instanceof Error && cause.message
+        ? cause.message
+        : `Message not delivered to session ${sessionId} (failed before delivery)`;
+    super(message, options);
+    this.name = "SessionSendNotDeliveredError";
   }
 }
 

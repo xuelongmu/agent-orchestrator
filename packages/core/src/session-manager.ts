@@ -24,6 +24,7 @@ import {
   NON_RESTORABLE_STATUSES,
   SessionNotFoundError,
   SessionNotRestorableError,
+  SessionSendNotDeliveredError,
   WorkspaceMissingError,
   type OpenCodeSessionManager,
   type Session,
@@ -1035,8 +1036,17 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     updateMetadata(sessionsDir, sessionName, { opencodeSessionId: discovered });
   }
 
-  function findSessionRecord(sessionId: SessionId): LocatedSession | null {
-    for (const [projectId, project] of Object.entries(config.projects)) {
+  function findSessionRecord(
+    sessionId: SessionId,
+    scopeProjectId?: string,
+  ): LocatedSession | null {
+    // Unscoped, this returns the first id match across projects in config order.
+    // Callers that know the owning project pass it so a same-id session in
+    // another project can never be resolved in its place (#13 review).
+    const candidates = scopeProjectId
+      ? Object.entries(config.projects).filter(([projectId]) => projectId === scopeProjectId)
+      : Object.entries(config.projects);
+    for (const [projectId, project] of candidates) {
       const sessionsDir = getProjectSessionsDir(projectId);
       const raw = readMetadataRaw(sessionsDir, sessionId);
       if (!raw) continue;
@@ -1064,8 +1074,8 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     return null;
   }
 
-  function requireSessionRecord(sessionId: SessionId): LocatedSession {
-    const located = findSessionRecord(sessionId);
+  function requireSessionRecord(sessionId: SessionId, scopeProjectId?: string): LocatedSession {
+    const located = findSessionRecord(sessionId, scopeProjectId);
     if (!located) {
       throw new SessionNotFoundError(sessionId);
     }
@@ -2742,9 +2752,15 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     return projectId ? sessions.filter((session) => session.projectId === projectId) : sessions;
   }
 
-  async function get(sessionId: SessionId): Promise<Session | null> {
-    // Try to find the session in any project's sessions directory
-    for (const [projectId, project] of Object.entries(config.projects)) {
+  async function get(sessionId: SessionId, scopeProjectId?: string): Promise<Session | null> {
+    // Try to find the session in any project's sessions directory — or only in
+    // `scopeProjectId` when the caller already knows which project owns it, since
+    // the same session id can exist in two projects and the unscoped scan returns
+    // whichever matches first (#13 review).
+    const candidates = scopeProjectId
+      ? Object.entries(config.projects).filter(([projectId]) => projectId === scopeProjectId)
+      : Object.entries(config.projects);
+    for (const [projectId, project] of candidates) {
       const sessionsDir = getProjectSessionsDir(projectId);
       const raw = readMetadataRaw(sessionsDir, sessionId);
       if (!raw) continue;
@@ -2802,11 +2818,18 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
   }
 
   async function kill(sessionId: SessionId, options?: KillOptions): Promise<KillResult> {
-    const located = findSessionRecord(sessionId);
+    const located = findSessionRecord(sessionId, options?.projectId);
     if (!located) {
       // Session not found via findSessionRecord — check if it exists with
-      // a terminated lifecycle so auto-cleanup retries don't throw.
-      for (const [killProjectId] of Object.entries(config.projects)) {
+      // a terminated lifecycle so auto-cleanup retries don't throw. Scoped the
+      // same way as the lookup above, so it cannot report on another project's
+      // same-id session (#13 review).
+      const terminatedCandidates = options?.projectId
+        ? Object.entries(config.projects).filter(
+            ([projectId]) => projectId === options.projectId,
+          )
+        : Object.entries(config.projects);
+      for (const [killProjectId] of terminatedCandidates) {
         const sessionsDir = getProjectSessionsDir(killProjectId);
         const raw = readMetadataRaw(sessionsDir, sessionId);
         if (raw) {
@@ -3163,36 +3186,61 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     return result;
   }
 
-  async function send(sessionId: SessionId, message: string): Promise<void> {
-    const { raw, sessionsDir, project, projectId } = requireSessionRecord(sessionId);
+  async function send(
+    sessionId: SessionId,
+    message: string,
+    scopeProjectId?: string,
+  ): Promise<void> {
+    const { raw, sessionsDir, project, projectId } = requireSessionRecord(sessionId, scopeProjectId);
 
-    const selection = resolveSelectionForSession(project, sessionId, raw);
-    const selectedAgent = selection.agentName;
-    if (selectedAgent === "opencode" && !asValidOpenCodeSessionId(raw["opencodeSessionId"])) {
-      const discovered = await discoverOpenCodeSessionIdByTitle(
-        sessionId,
-        OPENCODE_INTERACTIVE_DISCOVERY_TIMEOUT_MS,
-      );
-      if (discovered) {
-        raw["opencodeSessionId"] = discovered;
-        updateMetadata(sessionsDir, sessionId, { opencodeSessionId: discovered });
-        invalidateCache();
+    // ALL setup below is PRE-DELIVERY: agent selection, OpenCode discovery, and
+    // plugin resolution all run before the runtime send is ever attempted. Classify
+    // any failure here as SessionSendNotDeliveredError so an at-most-once caller can
+    // reopen a claim that delivered nothing — notably for a session whose agent
+    // plugin is not registered in this process (the web service registers only
+    // built-ins), which would otherwise escape as a plain error and permanently
+    // consume the token. `requireSessionRecord` above already throws the typed
+    // SessionNotFoundError the route also treats as pre-delivery. (#13 review)
+    let runtimePlugin: Runtime;
+    let agentPlugin: Agent;
+    let runtimeName: string;
+    let agentName: string;
+    try {
+      const selection = resolveSelectionForSession(project, sessionId, raw);
+      const selectedAgent = selection.agentName;
+      if (selectedAgent === "opencode" && !asValidOpenCodeSessionId(raw["opencodeSessionId"])) {
+        const discovered = await discoverOpenCodeSessionIdByTitle(
+          sessionId,
+          OPENCODE_INTERACTIVE_DISCOVERY_TIMEOUT_MS,
+        );
+        if (discovered) {
+          raw["opencodeSessionId"] = discovered;
+          updateMetadata(sessionsDir, sessionId, { opencodeSessionId: discovered });
+          invalidateCache();
+        }
       }
-    }
-    const parsedHandle = raw["runtimeHandle"]
-      ? safeJsonParse<RuntimeHandle>(raw["runtimeHandle"])
-      : null;
-    const runtimeName = parsedHandle?.runtimeName ?? project.runtime ?? config.defaults.runtime;
-    const agentName = selectedAgent;
+      const parsedHandle = raw["runtimeHandle"]
+        ? safeJsonParse<RuntimeHandle>(raw["runtimeHandle"])
+        : null;
+      runtimeName = parsedHandle?.runtimeName ?? project.runtime ?? config.defaults.runtime;
+      agentName = selectedAgent;
 
-    const runtimePlugin = registry.get<Runtime>("runtime", runtimeName);
-    if (!runtimePlugin) {
-      throw new Error(`No runtime plugin for session ${sessionId}`);
-    }
+      const resolvedRuntime = registry.get<Runtime>("runtime", runtimeName);
+      if (!resolvedRuntime) {
+        throw new Error(`No runtime plugin for session ${sessionId}`);
+      }
+      runtimePlugin = resolvedRuntime;
 
-    const agentPlugin = registry.get<Agent>("agent", agentName);
-    if (!agentPlugin) {
-      throw new Error(`No agent plugin for session ${sessionId}`);
+      const resolvedAgent = registry.get<Agent>("agent", agentName);
+      if (!resolvedAgent) {
+        throw new Error(`No agent plugin for session ${sessionId}`);
+      }
+      agentPlugin = resolvedAgent;
+    } catch (setupErr) {
+      if (setupErr instanceof SessionNotFoundError) throw setupErr;
+      throw new SessionSendNotDeliveredError(sessionId, {
+        cause: setupErr instanceof Error ? setupErr : new Error(String(setupErr)),
+      });
     }
 
     const captureOutput = async (handle: RuntimeHandle): Promise<string> => {
@@ -3318,7 +3366,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
 
       let restored: Session;
       try {
-        restored = await restore(sessionId);
+        // Scope the restore to the project `send` already resolved, so a same-id
+        // session in another project is never launched in its place (#13 review).
+        restored = await restore(sessionId, projectId);
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         throw new Error(`Cannot send to session ${sessionId}: ${reason} (${detail})`, {
@@ -3344,7 +3394,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     };
 
     const prepareSession = async (forceRestore = false): Promise<Session> => {
-      const current = await get(sessionId);
+      // Scope to the resolved owning project — an unscoped get() could otherwise
+      // prepare a same-id session from a different project than the one
+      // requireSessionRecord picked above (#13 review).
+      const current = await get(sessionId, projectId);
       if (!current) {
         throw new SessionNotFoundError(sessionId);
       }
@@ -3390,6 +3443,13 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       return normalized;
     };
 
+    // The delivery boundary (#13 review). Set to true the instant before the
+    // runtime send is attempted. Everything that throws while this is false is
+    // PROVABLY pre-delivery (preparation, restore, readiness, missing handle);
+    // anything after is at-or-after the attempt and ambiguous. This flag, not the
+    // error text, is how the failure class is reported to the caller.
+    let deliveryAttempted = false;
+
     const sendWithConfirmation = async (session: Session): Promise<void> => {
       const handle = session.runtimeHandle;
       if (!handle) {
@@ -3400,28 +3460,42 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       const baselineActivity = detectActivityFromOutput(baselineOutput) ?? session.activity;
       const baselineUpdatedAt = await getOpenCodeSessionUpdatedAt();
 
+      deliveryAttempted = true;
       await runtimePlugin.sendMessage(handle, message);
 
-      for (let attempt = 1; attempt <= SEND_CONFIRMATION_ATTEMPTS; attempt++) {
-        // Sleep before each check (including the first) so the runtime has time
-        // to reflect the message in its output.
-        await sleep(SEND_CONFIRMATION_POLL_MS);
+      // DELIVERY HAS CROSSED THE BOUNDARY. Everything below is best-effort
+      // CONFIRMATION and must never throw — the soft-success contract already
+      // documented at the tail of this function: once the message is on the
+      // runtime, a failure to *confirm* it must not be reported to the caller as a
+      // failed send. `captureOutput` is already catch-guarded; the OpenCode
+      // `session list` probe was not, so a probe failure after delivery rejected
+      // the whole send even though the message went out. Wrapping the loop makes
+      // that contract structural, not incidental to which helpers happen to
+      // swallow their own errors (#13 review).
+      try {
+        for (let attempt = 1; attempt <= SEND_CONFIRMATION_ATTEMPTS; attempt++) {
+          // Sleep before each check (including the first) so the runtime has time
+          // to reflect the message in its output.
+          await sleep(SEND_CONFIRMATION_POLL_MS);
 
-        const output = await captureOutput(handle);
-        const activity = detectActivityFromOutput(output) ?? session.activity;
-        const updatedAt = await getOpenCodeSessionUpdatedAt();
-        const delivered =
-          (baselineUpdatedAt !== undefined &&
-            updatedAt !== undefined &&
-            updatedAt > baselineUpdatedAt) ||
-          hasQueuedMessage(output) ||
-          (output.length > 0 && output !== baselineOutput) ||
-          (baselineActivity !== "active" && activity === "active") ||
-          (baselineActivity !== "waiting_input" && activity === "waiting_input");
+          const output = await captureOutput(handle);
+          const activity = detectActivityFromOutput(output) ?? session.activity;
+          const updatedAt = await getOpenCodeSessionUpdatedAt();
+          const delivered =
+            (baselineUpdatedAt !== undefined &&
+              updatedAt !== undefined &&
+              updatedAt > baselineUpdatedAt) ||
+            hasQueuedMessage(output) ||
+            (output.length > 0 && output !== baselineOutput) ||
+            (baselineActivity !== "active" && activity === "active") ||
+            (baselineActivity !== "waiting_input" && activity === "waiting_input");
 
-        if (delivered) {
-          return;
+          if (delivered) {
+            return;
+          }
         }
+      } catch {
+        // Confirmation failed after delivery — fall through to soft success.
       }
 
       // Message was already sent via runtimePlugin.sendMessage above — if we
@@ -3474,9 +3548,18 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         summary: `send failed: ${sessionId}`,
         data: {
           stage,
+          delivered: deliveryAttempted,
           reason: err instanceof Error ? err.message : String(err),
         },
       });
+      // Report the failure class honestly at the delivery boundary. A proven
+      // pre-delivery failure becomes SessionSendNotDeliveredError so an
+      // at-most-once caller may reopen its claim; SessionNotFoundError is itself an
+      // unambiguous pre-delivery signal and is left intact for callers that map it
+      // to 404. Anything after the attempt propagates as-is (ambiguous → closed).
+      if (!deliveryAttempted && !(err instanceof SessionNotFoundError)) {
+        throw new SessionSendNotDeliveredError(sessionId, { cause: err });
+      }
       throw err;
     }
   }
@@ -3660,9 +3743,11 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     return discovered;
   }
 
-  async function restore(sessionId: SessionId): Promise<Session> {
-    // 1. Find session metadata across all projects
-    const activeRecord = findSessionRecord(sessionId);
+  async function restore(sessionId: SessionId, scopeProjectId?: string): Promise<Session> {
+    // 1. Find session metadata — scoped to the owning project when the caller
+    //    knows it, so a duplicate session id in another project can't be restored
+    //    in its place (#13 review).
+    const activeRecord = findSessionRecord(sessionId, scopeProjectId);
     if (!activeRecord) {
       throw new SessionNotFoundError(sessionId);
     }

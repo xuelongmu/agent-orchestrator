@@ -33,6 +33,7 @@ import {
   type Agent,
   type SCM,
   type Notifier,
+  type NotifyAction,
   type Session,
   type CanonicalSessionLifecycle,
   type EventPriority,
@@ -70,7 +71,6 @@ import {
   isWeakActivityEvidence,
 } from "./activity-signal.js";
 import {
-  AGENT_REPORT_METADATA_KEYS,
   isAgentReportFresh,
   mapAgentReportToLifecycle,
   readAgentReport,
@@ -87,12 +87,28 @@ import { evaluateBudgetBreach, resolveBudget } from "./budget.js";
 import {
   auditAgentReports,
   getReactionKeyForTrigger,
+  isDecisionReport,
+  isDecisionReportActive,
   isNeedsDecisionActive,
+  reportActivationIdentity,
   REPORT_WATCHER_METADATA_KEYS,
 } from "./report-watcher.js";
 import { createCorrelationId, createProjectObserver } from "./observability.js";
 import { resolveNotifierTarget } from "./notifier-resolution.js";
 import { recordNotificationDelivery } from "./notification-observability.js";
+import {
+  actionsForNotifier,
+  buildNotifyActions,
+  getNotifyCallbackSecret,
+  isNotifyActionEvent,
+  resolveDecisionEventType,
+  NEEDS_INPUT_DECISION_TYPES,
+} from "./notify-callback.js";
+import {
+  activeDecisionId,
+  clearSpentDecision,
+  decisionEpisodeTransition,
+} from "./notify-decision.js";
 import { resolveSessionRole } from "./agent-selection.js";
 import {
   DETECTING_MAX_ATTEMPTS,
@@ -2236,11 +2252,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         // question + confidence so the human keeps the decision context instead of
         // a generic "needs input" ping (#12). Scoped to the needs-input reactions
         // so unrelated notifications (agent-exited, etc.) are never relabeled.
-        const decision =
+        const isDecisionReaction =
           (reactionKey === "agent-needs-input" || reactionKey === "report-needs-input") &&
-          "lifecycle" in session
-            ? getActiveDecision(session)
-            : null;
+          "lifecycle" in session;
+        const decision = isDecisionReaction ? getActiveDecision(session) : null;
         const notifyMessage = decision
           ? formatNeedsDecisionMessage(decision)
           : (reactionConfig.message ?? `Reaction '${reactionKey}' triggered notification`);
@@ -2258,7 +2273,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             enrichment: getPREnrichmentForSession(session),
           }),
         });
-        await notifyHuman(event, reactionConfig.priority ?? "info");
+        // Bind the mutating buttons to the decision this reaction's content was
+        // built from, exactly as the transition/fallback callers do: a report that
+        // supersedes it while notifyHuman's async get() runs must not repoint the
+        // buttons at the newer decision. Only the needs-input reactions mint buttons;
+        // other reactions pass undefined and skip the check. (#13 review)
+        const expectedDecisionId = isDecisionReaction ? activeDecisionId(session) : undefined;
+        await notifyHuman(event, reactionConfig.priority ?? "info", expectedDecisionId);
         recordActivityEvent({
           projectId,
           sessionId,
@@ -2389,22 +2410,98 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
   /**
    * Resolve an agent decision exactly once (Class A durable store). When a
-   * needs_decision report is no longer ACTIVE (isNeedsDecisionActive false — the
-   * agent left needs_input AND the report went stale), clear the WHOLE record —
-   * reported state, timestamp, question, confidence — so every stale/blocked check
-   * sees a consistent, resolved report and a later re-entry can't reuse it. A fresh
-   * decision (even on a pr_open/mergeable session) stays active and is untouched
-   * (#12 review).
+   * decision report is no longer ACTIVE (isDecisionReportActive false — the agent
+   * left needs_input AND the report went stale), clear the WHOLE record —
+   * reported state, timestamp, question, confidence, and any notify-callback
+   * consumption marker — so every stale/blocked check sees a consistent, resolved
+   * report and a later re-entry can't reuse it. A fresh decision (even on a
+   * pr_open/mergeable session) stays active and is untouched (#12 review).
+   *
+   * This covers `needs_input` as well as `needs_decision` (#13 review). A plain
+   * needs_input report is otherwise never invalidated: checkBlockedAgent gates
+   * only needs_decision on activity, so a spent report lingers, and when the agent
+   * later stops at an unrelated bare prompt the session is `needs_input` again and
+   * the old report's timestamp would be served as the current decision identity —
+   * revalidating an unused callback token from the earlier decision against the
+   * new prompt. Retiring the spent report here is what makes a decision identity
+   * belong to the transition that activated it.
    */
+  /**
+   * Retire the session's decision record through the locked compare.
+   *
+   * `session.metadata` is a snapshot from the top of this poll cycle. The agent
+   * may have written a fresh `ao report` since, which this stale snapshot would
+   * still classify as retirable — so hand the observation to `clearSpentDecision`
+   * and let it no-op if the stored record has moved on. Clearing the NEW decision
+   * would lose it and its callback identity outright (#13 review).
+   */
+  function retireDecisionRecord(session: Session): void {
+    const report = readAgentReport(session.metadata);
+    const observed =
+      report && isDecisionReport(report) ? { state: report.state, at: report.timestamp } : null;
+    const applied = clearSpentDecision(session.projectId, session.id, observed);
+    if (!applied) return;
+    // Mirror the patch into this cycle's snapshot without a second write (re-writing
+    // the empties could clobber a report that landed in between): apply non-empty
+    // values (e.g. a backfilled acknowledgement marker) and drop emptied keys. For
+    // an observed===null retirement `applied` holds only the identity markers, so a
+    // preserved successor report stays visible for the rest of the cycle (#13 review).
+    const merged = { ...session.metadata, ...applied };
+    session.metadata = Object.fromEntries(
+      Object.entries(merged).filter(([, value]) => value !== ""),
+    );
+    sessionManager.invalidateCache();
+  }
+
   function clearStaleDecisionContext(session: Session): void {
     const report = readAgentReport(session.metadata);
-    if (report?.state !== "needs_decision" || isNeedsDecisionActive(session, report)) return;
-    updateSessionMetadata(session, {
-      [AGENT_REPORT_METADATA_KEYS.STATE]: "",
-      [AGENT_REPORT_METADATA_KEYS.AT]: "",
-      [AGENT_REPORT_METADATA_KEYS.QUESTION]: "",
-      [AGENT_REPORT_METADATA_KEYS.CONFIDENCE]: "",
-    });
+    if (!report || !isDecisionReport(report) || isDecisionReportActive(session, report)) return;
+    retireDecisionRecord(session);
+  }
+
+  /**
+   * Maintain the needs_input episode marker on its entry/exit edges — the
+   * lifetime that bounds a decision identity.
+   *
+   * A decision report stays "active" for its whole freshness window even after
+   * the agent resolves it and resumes, so the report instant alone cannot tell
+   * decision A from an unrelated bare prompt B raised inside that window. The
+   * episode boundary can: B is a new episode, so A's token stops matching.
+   *
+   * Never refreshed while genuinely parked — a marker that moved each poll would
+   * invalidate live tokens within seconds (the same reason `lastTransitionAt` is
+   * unusable here: the poll re-commits `sessionState: "needs_input"` on every
+   * waiting_input cycle).
+   *
+   * BETWEEN-POLLS RE-PARK: if the agent resolves A and stops at an unrelated bare
+   * prompt B entirely between two polls, the parked→parked edge never sees the
+   * un-parked state. `decisionEpisodeTransition` closes that with the agent's own
+   * activity timestamp (`session.activitySignal.timestamp`): frozen while the agent
+   * is blocked at a prompt, it advances the instant work resumes, so a marker that
+   * the boundary has moved past means the agent has left the marked prompt and the
+   * spent record is retired. The signal is committed by `determineStatus` above, so
+   * it reflects THIS poll. Agents that expose no activity timestamp fall back to the
+   * old edge-only behaviour (the boundary is null and only the parked/un-parked edge
+   * retires). (#13 review)
+   */
+  function maintainDecisionEpisode(session: Session): void {
+    const boundaryTs = session.activitySignal?.timestamp;
+    const episodeBoundary = boundaryTs instanceof Date ? boundaryTs.toISOString() : null;
+    const transition = decisionEpisodeTransition(
+      session,
+      episodeBoundary,
+      new Date().toISOString(),
+    );
+    if (!transition) return;
+    if (transition.kind === "stamp") {
+      updateSessionMetadata(session, transition.patch);
+      return;
+    }
+    // Episode observably exited: retire the report that activated it. A report
+    // outliving its episode is spent, and leaving it would let the NEXT episode
+    // inherit it — a bare prompt B pairing B's marker with A's retained timestamp,
+    // read as report-backed, minting fresh buttons for a prompt no agent reported.
+    retireDecisionRecord(session);
   }
 
   function makeFingerprint(ids: string[]): string {
@@ -3605,7 +3702,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     // as the session-manager spawn path (see resolveStackedChildBase).
     let parent: Session | null;
     try {
-      parent = await sessionManager.get(parentSessionId);
+      // A stacked child's parent always lives in the child's own project; scope the
+      // lookup so a same-id session in another project can't be mistaken for it
+      // (same unscoped-`get` hazard as the callback mint site) (#13 review).
+      parent = await sessionManager.get(parentSessionId, child.projectId);
     } catch {
       parent = null;
     }
@@ -4004,7 +4104,18 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * notifier accepted the event (used by callers that must not latch state on a
    * failed/undelivered notification, e.g. the round-cap escalation).
    */
-  async function notifyHuman(event: OrchestratorEvent, priority: EventPriority): Promise<boolean> {
+  async function notifyHuman(
+    event: OrchestratorEvent,
+    priority: EventPriority,
+    // The decision identity the event's CONTENT was built for, when the caller
+    // constructed it from a decision report. The mutating buttons are minted only
+    // if the freshly-loaded identity still equals this, so a superseding report
+    // that lands during the async load below cannot leave the human resolving a
+    // DIFFERENT decision than the alert describes. `null` means "no decision"
+    // (a bare-prompt transition); `undefined` (default) skips the check for
+    // non-decision callers. (#13 review)
+    expectedDecisionId?: string | null,
+  ): Promise<boolean> {
     const eventWithPriority = { ...event, priority };
     // Prefer a per-project routing override (preserves a startup-only project's
     // own routing when merged into a global scope), then top-level, then default.
@@ -4013,6 +4124,76 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       project?.notificationRouting?.[priority] ??
       config.notificationRouting[priority] ??
       config.defaults.notifiers;
+
+    // Build notification actions for decision events when a shared callback
+    // secret is configured (opt-in via env). Mutating Approve/Deny/Nudge/Kill
+    // buttons are emitted only for a needs_input backed by an ACTIVE agent
+    // decision instance; `activeDecisionId` is the one place that identity is
+    // derived, and the callback route validates against the same function, so a
+    // link can only ever answer the decision it was minted for. The session is
+    // resolved within the EVENT'S project: `get` otherwise scans every project and
+    // returns the first id match, so with a duplicate session id across projects
+    // this would mint from the wrong project's report — signing the wrong nonce or
+    // none at all, and leaving the real project's callbacks unusable (#13 review).
+    // review/merge decisions get a View PR link; non-decision events fall back to
+    // plain notify. (#13)
+    const callbackSecret = getNotifyCallbackSecret();
+    const decisionType = resolveDecisionEventType(eventWithPriority);
+    let actions: NotifyAction[] = [];
+    if (isNotifyActionEvent(decisionType)) {
+      // The read-only View PR link needs no token, so EVERY decision event — the
+      // secretless opt-out and `review.changes_requested`/`merge.ready` alike —
+      // builds its unsigned actions unconditionally (#13 review).
+      const unsignedActions = () =>
+        buildNotifyActions(eventWithPriority, {
+          secret: callbackSecret ?? undefined,
+          nonce: undefined,
+        });
+      // The MUTATING Approve/Deny/Nudge/Kill buttons exist ONLY for a needs_input
+      // decision and need a signed nonce resolved from a live `get`. That lookup
+      // runs OUTSIDE the per-notifier delivery try blocks (an unguarded throw would
+      // lose the human alert entirely, not just its buttons) and only when a secret
+      // is set. PR-only events must NOT pay for it: a `get` rejection (e.g. an
+      // OpenCode session still awaiting discovery) would otherwise strip their
+      // read-only View PR link solely because callbacks happen to be enabled. So
+      // scope the lookup to needs-input decision types. (#13 review)
+      if (callbackSecret && NEEDS_INPUT_DECISION_TYPES.includes(decisionType)) {
+        try {
+          const subject = await sessionManager.get(
+            eventWithPriority.sessionId,
+            eventWithPriority.projectId,
+          );
+          const freshId = subject ? (activeDecisionId(subject) ?? undefined) : undefined;
+          // Bind the buttons to the decision the event content describes: if the
+          // caller passed the identity it built from and the live identity has since
+          // moved on, omit the mutating actions (the alert still delivers; the new
+          // decision re-notifies on its own path). (#13 review)
+          const nonce =
+            expectedDecisionId !== undefined && freshId !== (expectedDecisionId ?? undefined)
+              ? undefined
+              : freshId;
+          actions = buildNotifyActions(eventWithPriority, {
+            secret: callbackSecret ?? undefined,
+            nonce,
+          });
+        } catch (err) {
+          // Degrade to the unsigned actions (any View PR link survives) rather than
+          // dropping every action for the alert. (#13 review)
+          actions = unsignedActions();
+          observer.recordOperation({
+            metric: "lifecycle_poll",
+            operation: "notify.actions_unavailable",
+            outcome: "failure",
+            correlationId: createCorrelationId("notify-actions"),
+            projectId: eventWithPriority.projectId,
+            sessionId: eventWithPriority.sessionId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      } else {
+        actions = unsignedActions();
+      }
+    }
 
     let delivered = false;
     for (const name of notifierNames) {
@@ -4034,15 +4215,28 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         continue;
       }
 
+      // A notifier that cannot resolve a relative callback endpoint (Slack turns
+      // it into an interaction value, OpenClaw into a relative markdown link —
+      // neither reaches the AO route) must not render mutating callback controls;
+      // ordinary URL actions (View PR) still pass through. (#13 review)
+      const notifierActions = actionsForNotifier(actions, notifier.resolvesActionCallbacks);
+
+      const useActions =
+        notifierActions.length > 0 && typeof notifier.notifyWithActions === "function";
+      const method = useActions ? "notifyWithActions" : "notify";
       try {
-        await notifier.notify(eventWithPriority);
+        if (useActions) {
+          await notifier.notifyWithActions!(eventWithPriority, notifierActions);
+        } else {
+          await notifier.notify(eventWithPriority);
+        }
         delivered = true;
         recordNotificationDelivery({
           observer,
           event: eventWithPriority,
           target,
           outcome: "success",
-          method: "notify",
+          method,
         });
       } catch (err) {
         recordNotificationDelivery({
@@ -4050,7 +4244,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           event: eventWithPriority,
           target,
           outcome: "failure",
-          method: "notify",
+          method,
           reason: err instanceof Error ? err.message : String(err),
           failureKind: "delivery_failed",
           recordActivityEvent: true,
@@ -4487,6 +4681,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       }
     }
 
+    // Stamp/clear the needs_input episode marker BEFORE anything can notify. The
+    // decision identity pairs the report instant with this marker, so it must
+    // exist by the time the first notification for this episode mints its
+    // buttons — a first notification minted without it would carry no nonce and
+    // get no buttons, and neither the transition (status unchanged) nor the
+    // report reaction (activation identity unchanged) would fire again to correct
+    // it. `determineStatus` above has already committed the lifecycle, so the
+    // parked state is settled here. (#13 review)
+    maintainDecisionEpisode(session);
+
     if (newStatus !== oldStatus) {
       const correlationId = createCorrelationId("lifecycle-transition");
       // State transition detected
@@ -4631,7 +4835,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
               enrichment: getPREnrichmentForSession(session),
             }),
           });
-          await notifyHuman(event, priority);
+          // Bind any minted controls to THIS session's decision identity so a
+          // report that supersedes it during delivery can't repoint the buttons.
+          await notifyHuman(event, priority, activeDecisionId(session));
         }
       }
     } else {
@@ -4719,8 +4925,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       maybeRetargetStackedChild(session),
     ]);
 
-    // Report watcher: audit agent reports for issues (#140)
-    await auditAndReactToReports(session);
+    // Report watcher: audit agent reports for issues (#140). Tell it whether THIS
+    // poll transitioned the session into needs_input — if so, the transition
+    // notification above already carried the decision's controls, and the report
+    // re-notify fallback must not duplicate it. If not (a report arrived while the
+    // session was already parked, e.g. after an earlier bare-prompt transition),
+    // the fallback is the ONLY path that can deliver the new controls (#13 review).
+    const transitionedToNeedsInput =
+      oldStatus !== SESSION_STATUS.NEEDS_INPUT && newStatus === SESSION_STATUS.NEEDS_INPUT;
+    await auditAndReactToReports(session, transitionedToNeedsInput);
 
     // PR-merge auto-cleanup: tear down runtime + worktree + archive metadata
     // once the agent is idle (or grace window elapses). Runs last so reactions
@@ -4732,7 +4945,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
    * Audit agent reports and trigger reactions when issues are detected.
    * Called at the end of each checkSession cycle.
    */
-  async function auditAndReactToReports(session: Session): Promise<void> {
+  async function auditAndReactToReports(
+    session: Session,
+    transitionedToNeedsInput = false,
+  ): Promise<void> {
     // Drop a resolved needs_decision's sticky question/confidence if the session
     // has since left needs_input (before reading any report below) (#12 review).
     clearStaleDecisionContext(session);
@@ -4764,17 +4980,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       session.metadata[REPORT_WATCHER_METADATA_KEYS.TRIGGER_COUNT] ?? "0",
       10,
     );
-    // A `needs_decision` report shares the `agent_needs_input` trigger with a
-    // generic needs_input, but carries distinct decision context. Fold the
-    // reported state AND the report timestamp into the activation identity so
-    // that (a) refining needs_input → needs_decision and (b) a SECOND
-    // needs_decision with a new question/confidence each count as a NEW
-    // activation — re-firing the report reaction / notification even without a
-    // status transition. Each `ao report` stamps a fresh timestamp (#12 review).
-    const activationIdentity =
-      auditResult.report?.state === "needs_decision"
-        ? `${auditResult.trigger}:needs_decision:${auditResult.report.timestamp}`
-        : auditResult.trigger;
+    // Fold the reported state + timestamp into the activation identity for EVERY
+    // decision report (needs_input as well as needs_decision), so a second report
+    // while still parked re-fires the notification with fresh, valid buttons
+    // instead of leaving the human holding the ones the new nonce just
+    // invalidated. See reportActivationIdentity (#12, #13 review).
+    const activationIdentity = reportActivationIdentity(
+      auditResult.trigger,
+      auditResult.report,
+      activeDecisionId(session) !== null,
+    );
     const priorActiveTrigger = session.metadata[REPORT_WATCHER_METADATA_KEYS.ACTIVE_TRIGGER] ?? "";
     const isNewTrigger = priorActiveTrigger !== activationIdentity;
 
@@ -4841,27 +5056,41 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       await executeReaction(session, reactionKey, reactionConfig);
     }
 
-    // Same-state needs_decision (#12 review): when an agent clarifies an EXISTING
-    // block with a new question/confidence, there is no status transition (so the
-    // built-in agent-needs-input notify never fires). Directly notify the human so
-    // the refined decision is not silently dropped. Skipped on the FIRST block
-    // (prior trigger was not already needs-input — the status transition handled
-    // that), and ONLY when NO report-needs-input reaction is configured — a
-    // configured reaction (even auto:false) owns this ping, so we respect its
-    // opt-out (#12 review) rather than notifying anyway.
+    // Report re-notify (#12, #13 review): a needs_input or needs_decision report
+    // whose activation identity is NEW changes `activeDecisionId` (invalidating any
+    // previous notification's buttons with 409), but produces no status transition
+    // in a poll where the session was already parked, and with stock config there
+    // is no report-needs-input reaction to fire. Emit a replacement actionable
+    // notification exactly once per new activation so the human is never left with
+    // only invalidated (or missing) controls. This covers BOTH a second report
+    // while parked AND the first report that lands after an earlier bare-prompt
+    // transition. Skipped when THIS poll's transition already carried the controls
+    // (`transitionedToNeedsInput`), gated on `isNewTrigger` (no per-poll duplicate),
+    // and skipped when a report-needs-input reaction owns the ping (its opt-out).
+    const decisionReportState = auditResult.report?.state;
     if (
       isNewTrigger &&
       !reactionConfig &&
-      auditResult.report?.state === "needs_decision" &&
-      priorActiveTrigger.startsWith("agent_needs_input")
+      (decisionReportState === "needs_input" || decisionReportState === "needs_decision") &&
+      !transitionedToNeedsInput
     ) {
-      const decision = getActiveDecision(session);
-      if (decision) {
+      // needs_decision carries an explicit question/confidence; a plain needs_input
+      // uses the audit finding's generic message. A needs_decision with no active
+      // decision context stays silent (unchanged behavior).
+      const decision =
+        decisionReportState === "needs_decision" ? getActiveDecision(session) : null;
+      const message =
+        decisionReportState === "needs_decision"
+          ? decision
+            ? formatNeedsDecisionMessage(decision)
+            : null
+          : auditResult.message;
+      if (message !== null) {
         const context = buildEventContext(session, prEnrichmentCache);
         const event = createEvent("reaction.triggered", {
           sessionId: session.id,
           projectId: session.projectId,
-          message: formatNeedsDecisionMessage(decision),
+          message,
           data: buildReactionNotificationData({
             eventType: "reaction.triggered",
             sessionId: session.id,
@@ -4872,7 +5101,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             enrichment: getPREnrichmentForSession(session),
           }),
         });
-        await notifyHuman(event, "urgent");
+        // Bind the controls to the identity this message was built for, so a report
+        // superseding it during delivery cannot repoint the buttons (#13 review).
+        await notifyHuman(event, "urgent", activeDecisionId(session));
       }
     }
   }

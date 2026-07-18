@@ -49,6 +49,14 @@
     "latestVersion": "0.1.0"
   },
   {
+    "id": "notifier-telegram",
+    "package": "@aoagents/ao-plugin-notifier-telegram",
+    "slot": "notifier",
+    "description": "Notifier plugin: Telegram bot push with actionable inline buttons",
+    "source": "registry",
+    "latestVersion": "0.1.0"
+  },
+  {
     "id": "tracker-gitlab",
     "package": "@aoagents/ao-plugin-tracker-gitlab",
     "slot": "tracker",

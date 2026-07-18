@@ -77,6 +77,12 @@ describe("notifier-dashboard", () => {
     expect(manifest.slot).toBe("notifier");
   });
 
+  it("does not advertise callback capability until the UI renders callback endpoints", () => {
+    // DashboardNotificationButton renders only action.url, so declaring capability
+    // would silently drop every mutating callback action. (#13 review)
+    expect(create({ configPath: makeConfigPath() }).resolvesActionCallbacks).toBeFalsy();
+  });
+
   it("persists notifications to the config-specific dashboard store", async () => {
     const configPath = makeConfigPath();
     const notifier = create({ configPath, limit: 50 });

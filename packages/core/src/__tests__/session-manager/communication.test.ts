@@ -5,15 +5,17 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { createSessionManager } from "../../session-manager.js";
+import { getProjectSessionsDir } from "../../paths.js";
 import {
   writeMetadata,
   readMetadataRaw,
 } from "../../metadata.js";
-import type {
-  OrchestratorConfig,
-  PluginRegistry,
-  Runtime,
-  Agent,
+import {
+  SessionSendNotDeliveredError,
+  type OrchestratorConfig,
+  type PluginRegistry,
+  type Runtime,
+  type Agent,
 } from "../../types.js";
 import { setupTestContext, teardownTestContext, makeHandle, type TestContext } from "../test-utils.js";
 import { installMockOpencode, installMockOpencodeSequence, PATH_SEP } from "./opencode-helpers.js";
@@ -51,6 +53,69 @@ describe("send", () => {
     await sm.send("app-1", "Fix the CI failures");
 
     expect(mockRuntime.sendMessage).toHaveBeenCalledWith(makeHandle("rt-1"), "Fix the CI failures");
+  });
+
+  it("scopes every nested lookup and restore to the token's project, not the first id match", async () => {
+    // Two projects hold the same session id. `other` is FIRST in config and alive;
+    // the scoped target (`my-app`) is dead and needs a restore. A send scoped to
+    // my-app must create/restore MY-APP's session and deliver via the restored
+    // handle — never fall through to `other`'s first-match alive runtime. This
+    // exercises the scope propagation through both prepareSession's get() and the
+    // restore() branch, not only requireSessionRecord (#13 review).
+    const myApp = config.projects["my-app"];
+    config.projects = {
+      other: {
+        name: "Other",
+        repo: "org/other",
+        path: join(tmpDir, "other"),
+        defaultBranch: "main",
+        sessionPrefix: "app",
+        scm: { plugin: "github" },
+        tracker: { plugin: "github" },
+      },
+      "my-app": myApp,
+    };
+    const otherDir = getProjectSessionsDir("other");
+    mkdirSync(otherDir, { recursive: true });
+    const wsTarget = join(tmpDir, "ws-target");
+    mkdirSync(wsTarget, { recursive: true });
+
+    writeMetadata(otherDir, "app-1", {
+      worktree: "/tmp",
+      branch: "main",
+      status: "working",
+      project: "other",
+      runtimeHandle: makeHandle("rt-other"),
+    });
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: wsTarget,
+      branch: "main",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: makeHandle("rt-target"),
+    });
+
+    // rt-target is dead (needs restore); rt-other is alive (would be sent-to if a
+    // nested lookup leaked to the first-match project).
+    vi.mocked(mockRuntime.isAlive).mockImplementation(async (handle) => handle.id !== "rt-target");
+    vi.mocked(mockAgent.isProcessRunning).mockImplementation(
+      async (handle) => handle.id !== "rt-target",
+    );
+    vi.mocked(mockRuntime.create).mockResolvedValue(makeHandle("rt-restored"));
+    vi.mocked(mockRuntime.getOutput)
+      .mockResolvedValueOnce("restored prompt")
+      .mockResolvedValueOnce("before send")
+      .mockResolvedValueOnce("after send");
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await sm.send("app-1", "scoped message", "my-app");
+
+    expect(mockRuntime.create).toHaveBeenCalled();
+    expect(mockRuntime.sendMessage).toHaveBeenCalledWith(makeHandle("rt-restored"), "scoped message");
+    expect(mockRuntime.sendMessage).not.toHaveBeenCalledWith(
+      makeHandle("rt-other"),
+      "scoped message",
+    );
   });
 
   it("restores a dead session before sending the message", async () => {
@@ -111,9 +176,9 @@ describe("send", () => {
 
       const sm = createSessionManager({ config, registry: mockRegistry });
       const sendPromise = sm.send("app-1", "hello");
-      const rejection = expect(sendPromise).rejects.toThrow(
-        "Cannot send to session app-1: session is not running",
-      );
+      // Restore/readiness failed BEFORE the delivery boundary, so send reports the
+      // typed pre-delivery failure and never attempted sendMessage. (#13 review)
+      const rejection = expect(sendPromise).rejects.toBeInstanceOf(SessionSendNotDeliveredError);
 
       await vi.runAllTimersAsync();
       await rejection;
@@ -121,6 +186,51 @@ describe("send", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("does NOT report pre-delivery when the runtime send itself throws (ambiguous)", async () => {
+    // sendMessage was reached (delivery attempted) and then rejected — an ambiguous
+    // outcome. send must propagate the original error, NOT the pre-delivery type, so
+    // an at-most-once caller keeps its claim closed. (#13 review)
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp",
+      branch: "main",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: makeHandle("rt-1"),
+    });
+    vi.mocked(mockRuntime.getOutput).mockResolvedValue("");
+    vi.mocked(mockRuntime.sendMessage).mockRejectedValueOnce(new Error("ipc write then timeout"));
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await expect(sm.send("app-1", "hello")).rejects.not.toBeInstanceOf(SessionSendNotDeliveredError);
+    expect(mockRuntime.sendMessage).toHaveBeenCalled();
+  });
+
+  it("reports a pre-delivery failure when the agent plugin is not registered", async () => {
+    // A session whose agent plugin is missing in this process (e.g. an external
+    // agent not registered by the web service) throws during plugin resolution —
+    // before any delivery attempt. That must be the typed pre-delivery failure so
+    // the callback route can reopen the claim, not a plain error. (#13 review)
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp",
+      branch: "main",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: makeHandle("rt-1"),
+    });
+    const noAgentRegistry = {
+      ...mockRegistry,
+      get: vi.fn((slot: string, name?: string) =>
+        slot === "agent"
+          ? null
+          : (mockRegistry.get as unknown as (s: string, n?: string) => unknown)(slot, name),
+      ),
+    } as unknown as PluginRegistry;
+
+    const sm = createSessionManager({ config, registry: noAgentRegistry });
+    await expect(sm.send("app-1", "hello")).rejects.toBeInstanceOf(SessionSendNotDeliveredError);
+    expect(mockRuntime.sendMessage).not.toHaveBeenCalled();
   });
 
   it("waits for spawning sessions to become interactive before considering restore", async () => {

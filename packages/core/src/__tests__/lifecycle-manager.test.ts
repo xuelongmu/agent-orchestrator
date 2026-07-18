@@ -22,6 +22,8 @@ import type {
   SessionMetadata,
   PRInfo,
   SCM,
+  Notifier,
+  NotifyAction,
 } from "../types.js";
 import {
   createTestEnvironment,
@@ -1221,6 +1223,121 @@ describe("check (single session)", () => {
     expect(lm.getStates().get("app-1")).toBe("needs_input");
   });
 
+  it("still delivers the needs_input alert when callback action lookup fails", async () => {
+    // Buttons enhance the alert; they are never a precondition for it. The action
+    // lookup re-reads the session for its decision identity and runs OUTSIDE the
+    // per-notifier delivery try blocks, so an unguarded rejection there would lose
+    // the human alert entirely instead of just its buttons (#13 review).
+    const previousSecret = process.env.AO_NOTIFY_CALLBACK_SECRET;
+    process.env.AO_NOTIFY_CALLBACK_SECRET = "lifecycle-fallback-secret";
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+    const notifier = createMockNotifier();
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      notifier,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "working" }),
+      registry,
+      configOverride: {
+        ...config,
+        // session.needs_input infers "urgent" (inferPriority), so route that.
+        notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+      },
+    });
+
+    // Read back the session setupCheck configured by INVOKING the configured mock
+    // (setupCheck only arms it, so its results list is empty and must not be read).
+    // Then re-arm: check() resolves the session first, and the NEXT lookup is the
+    // action mint — the one that must degrade rather than throw.
+    const loaded = await mockSessionManager.get("app-1");
+    expect(loaded).toBeTruthy();
+    vi.mocked(mockSessionManager.get).mockReset();
+    vi.mocked(mockSessionManager.get)
+      .mockResolvedValueOnce(loaded)
+      .mockRejectedValue(new Error("enrichment failed"));
+
+    try {
+      // Without the guard the rejection escapes notifyHuman and no notifier is
+      // ever reached, so "notify was called at all" is the regression.
+      await expect(lm.check("app-1")).resolves.toBeUndefined();
+      expect(notifier.notify).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "session.needs_input" }),
+      );
+    } finally {
+      // Assigning undefined would store the STRING "undefined", which
+      // getNotifyCallbackSecret reads as a perfectly valid secret — silently
+      // enabling callbacks for every later test in this file.
+      if (previousSecret === undefined) delete process.env.AO_NOTIFY_CALLBACK_SECRET;
+      else process.env.AO_NOTIFY_CALLBACK_SECRET = previousSecret;
+    }
+  });
+
+  it("keeps the View PR link on a PR-only notification when the decision lookup would reject", async () => {
+    // review.changes_requested / merge.ready carry only the unsigned View PR link,
+    // so notifyHuman must NOT run the needs-input nonce lookup for them: a get()
+    // rejection (e.g. an OpenCode session still awaiting discovery) would otherwise
+    // strip their read-only link purely because callbacks are enabled. (#13 review)
+    const previousSecret = process.env.AO_NOTIFY_CALLBACK_SECRET;
+    process.env.AO_NOTIFY_CALLBACK_SECRET = "pr-only-secret";
+
+    const notify = vi.fn().mockResolvedValue(undefined);
+    const notifyWithActions = vi.fn().mockResolvedValue(undefined);
+    const notifier = { name: "desktop", notify, notifyWithActions } as unknown as Notifier;
+    const mockSCM = createMockSCM({
+      getReviewDecision: vi.fn().mockResolvedValue("approved"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: true,
+        ciPassing: true,
+        approved: true,
+        noConflicts: true,
+        blockers: [],
+      }),
+      enrichSessionsPRBatch: mockBatchEnrichment({ reviewDecision: "approved", mergeable: true }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier,
+    });
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makeMatchingPR() }),
+      registry,
+      configOverride: {
+        ...config,
+        reactions: {},
+        // merge.ready infers the "action" priority (inferPriority).
+        notificationRouting: { ...config.notificationRouting, action: ["desktop"] },
+      },
+    });
+
+    // check() loads the session first; the needs-input nonce lookup would be the
+    // NEXT get(). Arm it to reject so a regression (running the lookup for a PR-only
+    // event) is caught: it would drop the View PR action.
+    const loaded = await mockSessionManager.get("app-1");
+    vi.mocked(mockSessionManager.get).mockReset();
+    vi.mocked(mockSessionManager.get)
+      .mockResolvedValueOnce(loaded)
+      .mockRejectedValue(new Error("enrichment failed"));
+
+    try {
+      await expect(lm.check("app-1")).resolves.toBeUndefined();
+      expect(lm.getStates().get("app-1")).toBe("mergeable");
+      const delivered = notifyWithActions.mock.calls.flatMap(
+        (c) => (c[1] as NotifyAction[] | undefined) ?? [],
+      );
+      expect(delivered.some((a) => a.label === "View PR" && !!a.url)).toBe(true);
+    } finally {
+      if (previousSecret === undefined) delete process.env.AO_NOTIFY_CALLBACK_SECRET;
+      else process.env.AO_NOTIFY_CALLBACK_SECRET = previousSecret;
+    }
+  });
+
   it("transitions to stuck when idle exceeds agent-stuck threshold (OpenCode-style activity)", async () => {
     config.reactions = {
       "agent-stuck": { auto: true, action: "notify", threshold: "1m" },
@@ -2338,6 +2455,505 @@ describe("reactions", () => {
       lm.stop();
       vi.useRealTimers();
     }
+  });
+
+  describe("decision re-notify when a new report changes the nonce (no reaction configured)", () => {
+    const runAudit = async (
+      reportState: "needs_input" | "needs_decision",
+      newReportAt: string,
+      priorTriggerAt: string,
+      extraMeta: Record<string, string> = {},
+    ) => {
+      const notifier = createMockNotifier();
+      const registryWithNotifier = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const priorState = reportState === "needs_decision" ? "needs_decision" : "needs_input";
+      // A single lm.check() runs one poll → one auditAndReactToReports, the
+      // deterministic path (no timer interplay). The session is already parked in
+      // needs_input, so there is NO status transition — only the report-watcher
+      // fallback can produce a notification here.
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "needs_input",
+          activity: "waiting_input",
+          createdAt: new Date("2025-01-01T11:40:00.000Z"),
+          metadata: {
+            agent: "mock-agent",
+            createdAt: "2025-01-01T11:40:00.000Z",
+            agentReportedState: reportState,
+            agentReportedAt: newReportAt,
+            agentAcknowledgedAt: priorTriggerAt,
+            reportWatcherActiveTrigger: `agent_needs_input:${priorState}:${priorTriggerAt}:answerable`,
+            reportWatcherTriggerActivatedAt: priorTriggerAt,
+            reportWatcherTriggerCount: "1",
+            notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
+            ...extraMeta,
+          },
+        }),
+        registry: registryWithNotifier,
+        configOverride: {
+          ...config,
+          reactions: {}, // no report-needs-input reaction: the fallback owns the ping
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+        },
+      });
+
+      await lm.check("app-1");
+
+      return vi.mocked(notifier.notify).mock.calls.filter((call) => {
+        const event = call[0] as { type?: string; data?: { semanticType?: string } };
+        return (
+          event?.type === "reaction.triggered" &&
+          event?.data?.semanticType === "report.needs_input"
+        );
+      });
+    };
+
+    let previousSecret: string | undefined;
+    beforeEach(() => {
+      previousSecret = process.env.AO_NOTIFY_CALLBACK_SECRET;
+      process.env.AO_NOTIFY_CALLBACK_SECRET = "re-notify-secret";
+    });
+    afterEach(() => {
+      if (previousSecret === undefined) delete process.env.AO_NOTIFY_CALLBACK_SECRET;
+      else process.env.AO_NOTIFY_CALLBACK_SECRET = previousSecret;
+    });
+
+    it("re-notifies for a SECOND needs_input report (new nonce)", async () => {
+      const notifies = await runAudit(
+        "needs_input",
+        "2025-01-01T11:55:00.000Z", // new report
+        "2025-01-01T11:50:00.000Z", // prior activation
+      );
+      expect(notifies.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("does not re-fire for the SAME needs_input report", async () => {
+      const sameTs = "2025-01-01T11:50:00.000Z";
+      const notifies = await runAudit("needs_input", sameTs, sameTs);
+      expect(notifies).toHaveLength(0);
+    });
+
+    it("emits ONE actionable replacement when the SAME report becomes answerable, then no dup (3 polls)", async () => {
+      // Finding 3 (#13 review) — answerability edge. A needs_input report maps the
+      // canonical lifecycle to needs_input while the CURRENT native signal is still
+      // active, so the first poll's alert correctly carries no controls
+      // (activeDecisionId reads the live activitySignal, not the stale persisted
+      // session.activity). When the SAME report first reads waiting_input the
+      // activation identity flips unanswerable → answerable and exactly one
+      // actionable replacement is emitted; a third poll at the same answerable
+      // identity must NOT duplicate it.
+      const reportAt = "2025-01-01T11:55:00.000Z";
+      const cap = capturingNotifier();
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier: cap.plugin,
+      });
+
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "needs_input",
+          activity: "waiting_input",
+          metadata: {
+            agent: "mock-agent",
+            agentReportedState: "needs_input",
+            agentReportedAt: reportAt,
+            // Prior activation was already recorded as UNANSWERABLE, so poll 1
+            // (native still active) is not a new trigger and stays silent.
+            reportWatcherActiveTrigger: `agent_needs_input:needs_input:${reportAt}:unanswerable`,
+            reportWatcherTriggerActivatedAt: reportAt,
+            reportWatcherTriggerCount: "1",
+            notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
+          },
+        }),
+        registry,
+        configOverride: {
+          ...config,
+          reactions: {}, // no report-needs-input reaction: the fallback owns the ping
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+        },
+      });
+
+      // Poll 1: native still active → unanswerable, identity unchanged → silent.
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "active" });
+      await lm.check("app-1");
+      expect(cap.mutatingButtons()).toHaveLength(0);
+
+      // Poll 2: same report, native now waiting_input → answerable → ONE replacement.
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+      await lm.check("app-1");
+      expect(cap.mutatingButtons().map((a) => a.label)).toEqual([
+        "Approve",
+        "Deny",
+        "Nudge",
+        "Kill",
+      ]);
+
+      // Poll 3: same answerable identity → no duplicate (still exactly one set).
+      await lm.check("app-1");
+      expect(cap.mutatingButtons().map((a) => a.label)).toEqual([
+        "Approve",
+        "Deny",
+        "Nudge",
+        "Kill",
+      ]);
+    });
+
+    it("still re-notifies for a second needs_decision report (behavior intact)", async () => {
+      const notifies = await runAudit(
+        "needs_decision",
+        "2025-01-01T11:55:00.000Z",
+        "2025-01-01T11:50:00.000Z",
+        { agentReportedQuestion: "Ship it?", agentReportedConfidence: "0.6" },
+      );
+      expect(notifies.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("re-notifies for the FIRST report that lands after a bare-prompt transition", async () => {
+      // The session is already parked (a prior poll's bare-prompt transition) with
+      // NO active trigger yet; the first report arrives with no transition this
+      // poll, so the fallback is the only path that can deliver its controls.
+      const notifies = await runAudit("needs_input", "2025-01-01T11:55:00.000Z", "", {
+        reportWatcherActiveTrigger: "",
+        reportWatcherTriggerActivatedAt: "",
+        reportWatcherTriggerCount: "",
+      });
+      expect(notifies.length).toBeGreaterThanOrEqual(1);
+    });
+
+    const capturingNotifier = () => {
+      const notify = vi.fn().mockResolvedValue(undefined);
+      const notifyWithActions = vi.fn().mockResolvedValue(undefined);
+      return {
+        notify,
+        notifyWithActions,
+        plugin: {
+          name: "desktop",
+          resolvesActionCallbacks: true,
+          notify,
+          notifyWithActions,
+        } as unknown as Notifier,
+        mutatingButtons: () =>
+          notifyWithActions.mock.calls
+            .flatMap((c) => (c[1] as NotifyAction[] | undefined) ?? [])
+            .filter((a) => a.callbackEndpoint),
+      };
+    };
+
+    const decisionSession = (reportAt: string, priorAt: string) =>
+      makeSession({
+        status: "needs_input",
+        activity: "waiting_input",
+        metadata: {
+          agent: "mock-agent",
+          agentReportedState: "needs_input",
+          agentReportedAt: reportAt,
+          reportWatcherActiveTrigger: `agent_needs_input:needs_input:${priorAt}`,
+          reportWatcherTriggerActivatedAt: priorAt,
+          reportWatcherTriggerCount: "1",
+          notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
+        },
+      });
+
+    it("omits mutating buttons when a superseding report changes the identity during delivery (B→C)", async () => {
+      // The event content is built from report B, but a superseding report C lands
+      // before the notify guard's async get(). The buttons must NOT be minted with
+      // C's identity — a human must not resolve C from B's alert. (#13 review)
+      const cap = capturingNotifier();
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier: cap.plugin,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const lm = setupCheck("app-1", {
+        session: decisionSession("2025-01-01T11:55:00.000Z", "2025-01-01T11:50:00.000Z"),
+        registry,
+        configOverride: {
+          ...config,
+          reactions: {},
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+        },
+      });
+
+      // The poll session B carries the persisted fields setupCheck merges in; C is
+      // the same session with a superseding report timestamp (a different
+      // decision identity).
+      const sessionB = (await mockSessionManager.get("app-1"))!;
+      const sessionC = {
+        ...sessionB,
+        metadata: { ...sessionB.metadata, agentReportedAt: "2025-01-01T11:59:00.000Z" },
+      };
+      // check() reads B (builds the event + expectedDecisionId); the notify guard's
+      // fresh get() sees the superseding C.
+      vi.mocked(mockSessionManager.get).mockReset();
+      vi.mocked(mockSessionManager.get).mockResolvedValueOnce(sessionB).mockResolvedValue(sessionC);
+
+      await lm.check("app-1");
+
+      expect(cap.mutatingButtons()).toHaveLength(0);
+      // The alert itself still went out.
+      expect(cap.notify.mock.calls.length + cap.notifyWithActions.mock.calls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("mints mutating buttons when the identity still matches at delivery (B==B)", async () => {
+      const cap = capturingNotifier();
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier: cap.plugin,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const sessionB = decisionSession("2025-01-01T11:55:00.000Z", "2025-01-01T11:50:00.000Z");
+      const lm = setupCheck("app-1", {
+        session: sessionB,
+        registry,
+        configOverride: {
+          ...config,
+          reactions: {},
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+        },
+      });
+      // Both reads see B: identity matches, so buttons mint.
+      vi.mocked(mockSessionManager.get).mockResolvedValue(sessionB);
+
+      await lm.check("app-1");
+
+      expect(cap.mutatingButtons().map((a) => a.label)).toEqual([
+        "Approve",
+        "Deny",
+        "Nudge",
+        "Kill",
+      ]);
+    });
+
+    it("does not duplicate when THIS poll's transition carried the controls", async () => {
+      // The report parks the session THIS poll (working → needs_input): the status
+      // transition notification carries the buttons, so the report fallback must
+      // stay silent (no report.needs_input reaction.triggered).
+      const notifier = createMockNotifier();
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "working", // transitions to needs_input this poll
+          activity: "waiting_input",
+          metadata: {
+            agent: "mock-agent",
+            agentReportedState: "needs_input",
+            agentReportedAt: "2025-01-01T11:55:00.000Z",
+            notifyDecisionEpisodeAt: "2025-01-01T11:50:05.000Z",
+          },
+        }),
+        registry,
+        configOverride: {
+          ...config,
+          reactions: {},
+          notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+        },
+      });
+
+      await lm.check("app-1");
+
+      const reportReNotifies = vi.mocked(notifier.notify).mock.calls.filter((call) => {
+        const event = call[0] as { type?: string; data?: { semanticType?: string } };
+        return (
+          event?.type === "reaction.triggered" &&
+          event?.data?.semanticType === "report.needs_input"
+        );
+      });
+      expect(reportReNotifies).toHaveLength(0);
+    });
+
+    // Finding 1 (#13 review): when a `report-needs-input` reaction IS configured,
+    // the report fallback stays silent and the default `executeReaction` notify
+    // path owns the ping. That path must bind the mutating buttons to the SAME
+    // snapshot identity, exactly like the transition and fallback callers — a
+    // superseding report during notify's async get() must not repoint them.
+    const reportNeedsInputReaction = (): OrchestratorConfig => ({
+      ...config,
+      reactions: {
+        "report-needs-input": { action: "notify" as const, auto: true, priority: "urgent" as const },
+      },
+      notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
+    });
+
+    it("executeReaction omits buttons when a superseding report changes the identity during delivery (B→C)", async () => {
+      const cap = capturingNotifier();
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier: cap.plugin,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const lm = setupCheck("app-1", {
+        session: decisionSession("2025-01-01T11:55:00.000Z", "2025-01-01T11:50:00.000Z"),
+        registry,
+        configOverride: reportNeedsInputReaction(),
+      });
+
+      const sessionB = (await mockSessionManager.get("app-1"))!;
+      const sessionC = {
+        ...sessionB,
+        metadata: { ...sessionB.metadata, agentReportedAt: "2025-01-01T11:59:00.000Z" },
+      };
+      // check() reads B (executeReaction builds the event + expectedDecisionId from
+      // it); notify's fresh get() sees the superseding C.
+      vi.mocked(mockSessionManager.get).mockReset();
+      vi.mocked(mockSessionManager.get).mockResolvedValueOnce(sessionB).mockResolvedValue(sessionC);
+
+      await lm.check("app-1");
+
+      expect(cap.mutatingButtons()).toHaveLength(0);
+      // The alert itself still went out via the reaction.
+      expect(
+        cap.notify.mock.calls.length + cap.notifyWithActions.mock.calls.length,
+      ).toBeGreaterThanOrEqual(1);
+    });
+
+    it("executeReaction mints buttons when the identity still matches at delivery (B==B)", async () => {
+      const cap = capturingNotifier();
+      const registry = createMockRegistry({
+        runtime: plugins.runtime,
+        agent: plugins.agent,
+        notifier: cap.plugin,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({ state: "waiting_input" });
+
+      const sessionB = decisionSession("2025-01-01T11:55:00.000Z", "2025-01-01T11:50:00.000Z");
+      const lm = setupCheck("app-1", {
+        session: sessionB,
+        registry,
+        configOverride: reportNeedsInputReaction(),
+      });
+      vi.mocked(mockSessionManager.get).mockResolvedValue(sessionB);
+
+      await lm.check("app-1");
+
+      expect(cap.mutatingButtons().map((a) => a.label)).toEqual(["Approve", "Deny", "Nudge", "Kill"]);
+    });
+  });
+
+  describe("between-polls decision re-park (episode boundary)", () => {
+    // Faithful parked-decision fixture: the session was created well before the
+    // decision (a report predating createdAt reads as stale and would correctly be
+    // retired), the report is FRESH but DISTINCT from the episode marker, and the
+    // episode marker is the stamped boundary. The invariant under test: while the
+    // lifecycle is needs_input and the native activity boundary equals the stamped
+    // episode, the record survives regardless of the (distinct) report instant.
+    const CREATED_AT = new Date(Date.now() - 10 * 60_000);
+    const reportAt = new Date(Date.now() - 2 * 60_000).toISOString(); // fresh (<5min)
+    const episodeAt = new Date(Date.now() - 90_000).toISOString(); // distinct from reportAt
+    const decisionMeta = () => ({
+      agent: "mock-agent",
+      createdAt: CREATED_AT.toISOString(),
+      agentReportedState: "needs_input",
+      agentReportedAt: reportAt,
+      notifyDecisionEpisodeAt: episodeAt,
+    });
+    const parkedSession = (activityTimestamp: Date) => {
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({
+        state: "waiting_input",
+        timestamp: activityTimestamp,
+      });
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "needs_input",
+          activity: "waiting_input",
+          createdAt: CREATED_AT,
+          metadata: decisionMeta(),
+        }),
+        metaOverrides: decisionMeta(),
+      });
+      // setupCheck's initial write uses the typed SessionMetadata serializer,
+      // which intentionally ignores extension keys. Seed the durable decision
+      // fields explicitly so this integration test exercises the locked retire
+      // path instead of asserting against metadata that was never persisted.
+      updateMetadata(env.sessionsDir, "app-1", decisionMeta());
+      return lm;
+    };
+
+    it("retires the spent report+episode when the agent activity boundary advances while still parked", async () => {
+      // The agent resolved prompt A and re-parked on an unrelated bare prompt B
+      // entirely between polls: its activity boundary has advanced to now, past A's
+      // marker, though both poll snapshots read waiting_input/needs_input. The spent
+      // record must be retired so A's still-live token cannot resolve against B.
+      const lm = parkedSession(new Date());
+
+      await lm.check("app-1");
+
+      const meta = readMetadataRaw(env.sessionsDir, "app-1");
+      expect(meta?.["notifyDecisionEpisodeAt"] ?? "").toBe("");
+      expect(meta?.["agentReportedState"] ?? "").toBe("");
+    });
+
+    it("keeps the decision live while the agent stays blocked at the prompt (boundary frozen)", async () => {
+      // The agent is genuinely blocked: its activity boundary IS the stamped episode
+      // instant and has not advanced, so the decision survives the poll unchanged —
+      // even though the fresh report instant is distinct from the episode marker.
+      const lm = parkedSession(new Date(episodeAt));
+
+      await lm.check("app-1");
+
+      const meta = readMetadataRaw(env.sessionsDir, "app-1");
+      expect(meta?.["notifyDecisionEpisodeAt"]).toBe(episodeAt);
+      expect(meta?.["agentReportedState"]).toBe("needs_input");
+    });
+
+    it("restamps the episode and KEEPS a fresh successor report B instead of retiring it", async () => {
+      // Finding #4 (round 18): the agent resolved A, worked, and re-parked on a NEW
+      // decision B — writing a fresh report — entirely between polls. The activity
+      // boundary advanced past A's marker, but B's report (written after A's episode,
+      // by the time the agent re-parked) is already in metadata. The poll must
+      // restamp the episode to the advanced boundary and KEEP B, not retire it with A.
+      const oldEpisode = new Date(Date.now() - 90_000).toISOString(); // A's stamp
+      const boundaryB = new Date(); // agent's advanced activity boundary (past A)
+      const reportBAt = new Date(Date.now() - 30_000).toISOString(); // after A's episode, before re-park
+      const metaB = () => ({
+        agent: "mock-agent",
+        createdAt: CREATED_AT.toISOString(),
+        agentReportedState: "needs_input",
+        agentReportedAt: reportBAt,
+        notifyDecisionEpisodeAt: oldEpisode,
+      });
+      vi.mocked(plugins.agent.getActivityState).mockResolvedValue({
+        state: "waiting_input",
+        timestamp: boundaryB,
+      });
+      const lm = setupCheck("app-1", {
+        session: makeSession({
+          status: "needs_input",
+          activity: "waiting_input",
+          createdAt: CREATED_AT,
+          metadata: metaB(),
+        }),
+        metaOverrides: metaB(),
+      });
+      updateMetadata(env.sessionsDir, "app-1", metaB());
+
+      await lm.check("app-1");
+
+      const meta = readMetadataRaw(env.sessionsDir, "app-1");
+      // Episode restamped to the advanced boundary — not cleared, not the old marker.
+      expect(meta?.["notifyDecisionEpisodeAt"]).toBe(boundaryB.toISOString());
+      // B's report survived (would have been cleared by a retire).
+      expect(meta?.["agentReportedState"]).toBe("needs_input");
+      expect(meta?.["agentReportedAt"]).toBe(reportBAt);
+    });
   });
 
   it("triggers send-to-agent reaction on CI failure", async () => {

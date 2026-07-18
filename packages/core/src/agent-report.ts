@@ -127,6 +127,14 @@ export const AGENT_REPORT_METADATA_KEYS = {
   PR_IS_DRAFT: "agentReportedPrIsDraft",
   CONFIDENCE: "agentReportedConfidence",
   QUESTION: "agentReportedQuestion",
+  /**
+   * When the agent FIRST acknowledged the task (issued any report). Monotonic and
+   * durable — it is never cleared when a decision report is retired, so the report
+   * watcher can tell "resolved a decision and resumed" from "never responded" and
+   * not fire a false no_acknowledge. Distinct from AT, which tracks the CURRENT
+   * report and is cleared on retirement. (#13 review)
+   */
+  ACKNOWLEDGED_AT: "agentAcknowledgedAt",
 } as const;
 
 /** Freshness window — agent reports older than this are ignored. */
@@ -560,6 +568,11 @@ export function applyAgentReport(
       Object.assign(next, buildLifecycleMetadataPatch(current), {
         [AGENT_REPORT_METADATA_KEYS.STATE]: input.state,
         [AGENT_REPORT_METADATA_KEYS.AT]: now,
+        // Durable acknowledgement: stamp the first time the agent reports and never
+        // overwrite it, so retiring a later decision report can't make a session
+        // that already responded look like it never acknowledged (#13 review).
+        [AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]:
+          existing[AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT] || now,
       });
       if (trimmedNote) {
         next[AGENT_REPORT_METADATA_KEYS.NOTE] = trimmedNote;

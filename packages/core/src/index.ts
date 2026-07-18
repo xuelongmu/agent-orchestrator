@@ -133,6 +133,10 @@ export {
   checkBlockedAgent,
   shouldAuditSession,
   getReactionKeyForTrigger,
+  isDecisionReport,
+  isDecisionReportActive,
+  isDecisionReportState,
+  reportActivationIdentity,
   DEFAULT_REPORT_WATCHER_CONFIG,
   REPORT_WATCHER_METADATA_KEYS,
 } from "./report-watcher.js";
@@ -271,6 +275,11 @@ export {
 } from "./scm-webhook-utils.js";
 export { asValidOpenCodeSessionId } from "./opencode-session-id.js";
 export {
+  SESSION_ID_COMPONENT_PATTERN,
+  isValidSessionIdComponent,
+  assertValidSessionIdComponent,
+} from "./utils/session-id.js";
+export {
   OPENCODE_SESSION_LIST_CACHE_TTL_MS,
   getOpenCodeTmpDir,
   ensureOpenCodeTmpDir,
@@ -328,6 +337,46 @@ export {
 } from "./observability.js";
 export { execGhObserved, getGhTraceFilePath } from "./gh-trace.js";
 export { resolveNotifierTarget } from "./notifier-resolution.js";
+export {
+  NEEDS_INPUT_DECISION_TYPES,
+  NOTIFY_ACTION_EVENT_TYPES,
+  NOTIFY_CALLBACK_ACTIONS,
+  NOTIFY_CALLBACK_DEFAULT_TTL_MS,
+  NOTIFY_CALLBACK_LABELS,
+  NOTIFY_CALLBACK_MESSAGES,
+  NOTIFY_CALLBACK_SECRET_ENV,
+  buildNotifyActions,
+  getNotifyCallbackSecret,
+  isNotifyActionEvent,
+  isNotifyCallbackAction,
+  normalizeCallbackBaseUrl,
+  resolveCallbackUrl,
+  resolveDecisionEventType,
+  signCallbackToken,
+  verifyCallbackToken,
+} from "./notify-callback.js";
+export type {
+  BuildNotifyActionsOptions,
+  NotifyCallbackAction,
+  NotifyCallbackPayload,
+} from "./notify-callback.js";
+export {
+  NOTIFY_DECISION_METADATA_KEYS,
+  RESOLVING_CALLBACK_ACTIONS,
+  activeDecisionId,
+  classifyCurrentActivity,
+  clearSpentDecision,
+  clearedDecisionMetadata,
+  consumeDecision,
+  decisionEpisodeTransition,
+  isDecisionCallbackAnswerable,
+  isNudgeBlocked,
+  isParkedOnDecision,
+  isResolvingCallbackAction,
+  releaseDecision,
+  storedDecisionId,
+  type CurrentActivityVerdict,
+} from "./notify-decision.js";
 export {
   recordNotificationDelivery,
   sanitizeNotificationDeliveryReason,

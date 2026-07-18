@@ -6,12 +6,13 @@ import {
   checkBlockedAgent,
   shouldAuditSession,
   getReactionKeyForTrigger,
+  reportActivationIdentity,
   DEFAULT_REPORT_WATCHER_CONFIG,
   type ReportWatcherConfig,
 } from "../report-watcher.js";
 import { createInitialCanonicalLifecycle } from "../lifecycle-state.js";
 import type { Session, SessionStatus } from "../types.js";
-import type { AgentReport } from "../agent-report.js";
+import { AGENT_REPORT_METADATA_KEYS, type AgentReport } from "../agent-report.js";
 
 function createMockSession(overrides: Partial<Session> = {}): Session {
   const lifecycle = createInitialCanonicalLifecycle("worker");
@@ -103,6 +104,26 @@ describe("checkAcknowledgeTimeout", () => {
     expect(result).not.toBeNull();
     expect(result?.trigger).toBe("no_acknowledge");
     expect(result?.timeSinceSpawnMs).toBeGreaterThan(config.acknowledgeTimeoutMs);
+  });
+
+  it("stays quiet past the timeout when a durable acknowledgement survives report retirement", () => {
+    // The agent reported (acknowledged) and later left needs_input via inference;
+    // the decision report was retired, so `report` is null here. The durable
+    // ACKNOWLEDGED_AT marker must suppress the false no_acknowledge. (#13 review)
+    const now = new Date();
+    const spawnTime = new Date(now.getTime() - 15 * 60 * 1000);
+    const session = createMockSession({
+      createdAt: spawnTime,
+      metadata: {
+        createdAt: spawnTime.toISOString(),
+        [AGENT_REPORT_METADATA_KEYS.ACKNOWLEDGED_AT]: new Date(
+          now.getTime() - 12 * 60 * 1000,
+        ).toISOString(),
+      },
+    });
+
+    const result = checkAcknowledgeTimeout(session, null, now, config);
+    expect(result).toBeNull();
   });
 
   it("respects checkAcknowledge config flag", () => {
@@ -329,5 +350,66 @@ describe("getReactionKeyForTrigger", () => {
     expect(getReactionKeyForTrigger("no_acknowledge")).toBe("report-no-acknowledge");
     expect(getReactionKeyForTrigger("stale_report")).toBe("report-stale");
     expect(getReactionKeyForTrigger("agent_needs_input")).toBe("report-needs-input");
+  });
+});
+
+describe("reportActivationIdentity", () => {
+  const report = (state: string, timestamp: string): AgentReport =>
+    ({ state, timestamp }) as unknown as AgentReport;
+
+  it("folds state and timestamp into the identity for a needs_input report", () => {
+    expect(reportActivationIdentity("agent_needs_input", report("needs_input", "T1"), true)).toBe(
+      "agent_needs_input:needs_input:T1:answerable",
+    );
+  });
+
+  it("folds state and timestamp into the identity for a needs_decision report", () => {
+    expect(
+      reportActivationIdentity("agent_needs_input", report("needs_decision", "T1"), true),
+    ).toBe("agent_needs_input:needs_decision:T1:answerable");
+  });
+
+  it("changes when a SECOND needs_input report is written — the fix for dead buttons", () => {
+    // Two successive needs_input reports must yield DIFFERENT identities so the
+    // lifecycle manager treats the second as a new activation and re-fires the
+    // notification. Sharing the bare trigger (the bug) would suppress the re-fire
+    // and leave the human holding the buttons the second report's nonce invalidated.
+    const first = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"), true);
+    const second = reportActivationIdentity("agent_needs_input", report("needs_input", "T2"), true);
+    expect(first).not.toBe(second);
+  });
+
+  it("changes when the SAME report becomes answerable — one actionable replacement", () => {
+    // The same report (same state + timestamp) transitioning from unanswerable
+    // (native still active, no controls) to answerable (waiting_input) must yield
+    // a DIFFERENT identity so the lifecycle manager re-fires exactly once with the
+    // now-valid buttons; staying answerable keeps the identity stable (no dup).
+    const unanswerable = reportActivationIdentity(
+      "agent_needs_input",
+      report("needs_input", "T1"),
+      false,
+    );
+    const answerable = reportActivationIdentity(
+      "agent_needs_input",
+      report("needs_input", "T1"),
+      true,
+    );
+    expect(unanswerable).not.toBe(answerable);
+    expect(answerable).toBe(
+      reportActivationIdentity("agent_needs_input", report("needs_input", "T1"), true),
+    );
+  });
+
+  it("is stable across polls for the same report — no per-poll re-fire", () => {
+    const a = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"), true);
+    const b = reportActivationIdentity("agent_needs_input", report("needs_input", "T1"), true);
+    expect(a).toBe(b);
+  });
+
+  it("uses the bare trigger for a non-decision or absent report", () => {
+    expect(reportActivationIdentity("no_acknowledge", null, false)).toBe("no_acknowledge");
+    expect(reportActivationIdentity("stale_report", report("working", "T1"), false)).toBe(
+      "stale_report",
+    );
   });
 });

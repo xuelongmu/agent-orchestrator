@@ -6,6 +6,8 @@ import {
   escapeAppleScript,
   getNotificationDataV3,
   isMac,
+  normalizeCallbackBaseUrl,
+  resolveCallbackUrl,
   type PluginModule,
   type Notifier,
   type OrchestratorEvent,
@@ -296,30 +298,15 @@ function firstUrlAction(actions: NotifyAction[] | undefined): string | undefined
   return actions?.find((action) => typeof action.url === "string")?.url;
 }
 
-function isAbsoluteHttpUrl(value: string | undefined): value is string {
-  if (!value) return false;
-  try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
 function resolveCallbackEndpoint(
   callbackEndpoint: string | undefined,
   dashboardUrl: string | undefined,
 ): string | undefined {
-  if (isAbsoluteHttpUrl(callbackEndpoint)) return callbackEndpoint;
-  if (!callbackEndpoint || !dashboardUrl) return undefined;
-  try {
-    const resolved = new URL(callbackEndpoint, dashboardUrl);
-    return resolved.protocol === "http:" || resolved.protocol === "https:"
-      ? resolved.toString()
-      : undefined;
-  } catch {
-    return undefined;
-  }
+  // Preserve a reverse-proxy path prefix: `new URL("/api/...", "https://host/ao")`
+  // discards `/ao`, so AO Notifier.app would POST outside the proxy mapping. The
+  // shared resolver appends the endpoint to the normalized base path instead, and
+  // validates the base is absolute http(s). (#13 review)
+  return resolveCallbackUrl(dashboardUrl, callbackEndpoint) ?? undefined;
 }
 
 function nativeActionPayload(
@@ -344,14 +331,27 @@ function nativeActionIndexes(
   return indexes;
 }
 
-function nativeActionPayloads(
+/** AO Notifier.app renders at most this many action buttons. */
+const NATIVE_ACTION_LIMIT = 4;
+
+export function nativeActionPayloads(
   actions: NotifyAction[] | undefined,
   dashboardUrl: string | undefined,
 ): NativeActionPayload[] {
-  return (actions ?? [])
+  const payloads = (actions ?? [])
     .map((action) => nativeActionPayload(action, dashboardUrl))
-    .filter((action): action is NativeActionPayload => Boolean(action))
-    .slice(0, 4);
+    .filter((action): action is NativeActionPayload => Boolean(action));
+  if (payloads.length <= NATIVE_ACTION_LIMIT) return payloads;
+
+  // Budget for the four-button limit so the read-only View PR link is never the
+  // one dropped: read-only URL actions are kept first (capped at the limit so the
+  // total can never exceed it), and the remaining budget is filled with mutating
+  // (callback) actions in their minted priority order (Approve, Deny, Nudge, Kill)
+  // — dropping from the tail, which sheds the destructive Kill first. (#13 review)
+  const readOnly = payloads.filter((p) => p.url).slice(0, NATIVE_ACTION_LIMIT);
+  const mutating = payloads.filter((p) => !p.url);
+  const room = Math.max(0, NATIVE_ACTION_LIMIT - readOnly.length);
+  return [...mutating.slice(0, room), ...readOnly];
 }
 
 function firstActionTarget(
@@ -546,6 +546,26 @@ export function create(config?: Record<string, unknown>): Notifier {
     appPath,
     useTerminalNotifier: hasTerminalNotifier,
   };
+  // Only AO Notifier.app renders real action buttons. notify-send (Linux), WinRT
+  // (Windows), osascript and terminal-notifier all ignore `options.actions` and
+  // show inert fallback text, so advertising callback capability there would offer
+  // controls the user cannot invoke. The macOS notify path selects ao-app when it
+  // is installed AND the backend is "auto" or "ao-app" (not an explicit
+  // terminal-notifier/osascript). Mirror that exactly so the capability is honest.
+  // (#13 review)
+  //
+  // ALSO require a valid callback base: the mutating buttons carry a RELATIVE
+  // endpoint (`/api/notify-callback/<token>`) that `nativeActionPayload` can only
+  // render once `resolveCallbackUrl` joins it onto an absolute http(s) dashboard
+  // URL. Without a normalizable base (unset or malformed `dashboardUrl` — common
+  // when desktop setup runs against a config with no explicit dashboard URL), every
+  // mutating button drops and the notification would advertise inert labels. Gate
+  // the capability on the base so core never hands us callbacks we cannot resolve.
+  // (#13 review)
+  const aoNotifierAppReady = isMac() && detectAoNotifierApp(appPath);
+  const hasCallbackBase = normalizeCallbackBaseUrl(dashboardUrl) !== null;
+  const resolvesActionCallbacks =
+    aoNotifierAppReady && (backend === "auto" || backend === "ao-app") && hasCallbackBase;
   const nextNativeNotificationId = (event: OrchestratorEvent): string => {
     nativeNotificationSequence += 1;
     return nativeNotificationId(event, nativeNotificationSequence);
@@ -553,6 +573,9 @@ export function create(config?: Record<string, unknown>): Notifier {
 
   return {
     name: "desktop",
+
+    // True only when the actionable AO Notifier.app backend is selected (see above).
+    resolvesActionCallbacks,
 
     async notify(event: OrchestratorEvent): Promise<void> {
       const content = formatContent(event);
