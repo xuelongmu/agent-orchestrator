@@ -10,6 +10,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/scmready"
 )
 
 var (
@@ -46,36 +47,51 @@ type actionStore interface {
 	GetPR(ctx context.Context, url string) (domain.PullRequest, bool, error)
 }
 
+type actionReader interface {
+	FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
+	FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error)
+}
+
 // ActionDeps are the dependencies needed to execute PR actions.
 type ActionDeps struct {
 	Store  actionStore
 	Merger ports.SCMMerger
+	Reader actionReader
 }
 
 // ActionService implements provider-neutral pull-request actions.
 type ActionService struct {
 	store  actionStore
 	merger ports.SCMMerger
+	reader actionReader
 }
 
 var _ ActionManager = (*ActionService)(nil)
 
 // NewActionService constructs the PR action executor.
 func NewActionService(deps ActionDeps) *ActionService {
-	return &ActionService{store: deps.Store, merger: deps.Merger}
+	return &ActionService{store: deps.Store, merger: deps.Merger, reader: deps.Reader}
 }
 
-// Merge squash-merges one tracked PR, pinned to the exact observed or
-// caller-supplied head. CI/review definition-of-done belongs to lifecycle; this
-// executor only validates identity, terminal state, and the provider CAS.
+// Merge squash-merges one tracked PR only when fresh SCM facts prove the shared
+// definition of done for the exact head supplied by the caller. The provider
+// merge request repeats that head as a final compare-and-swap guard.
 func (s *ActionService) Merge(ctx context.Context, request MergeRequest) (MergeResult, error) {
 	prNumber, err := parsePRNumber(request.PRID)
 	if err != nil || strings.TrimSpace(request.PRURL) == "" {
 		return MergeResult{}, fmt.Errorf("%w: invalid pull request identity", ErrInvalidPR)
 	}
-	if s.store == nil || s.merger == nil {
+	if s.store == nil || s.merger == nil || s.reader == nil {
 		return MergeResult{}, errors.New("pr: merge action is not configured")
 	}
+	expectedHead := strings.TrimSpace(request.ExpectedHeadSHA)
+	if expectedHead == "" {
+		return MergeResult{}, fmt.Errorf("%w: expected head is required", ErrPRPreconditions)
+	}
+	if !gitSHAPattern.MatchString(expectedHead) {
+		return MergeResult{}, fmt.Errorf("%w: invalid expected head", ErrInvalidPR)
+	}
+	expectedHead = strings.ToLower(expectedHead)
 
 	tracked, ok, err := s.store.GetPR(ctx, request.PRURL)
 	if err != nil {
@@ -92,12 +108,6 @@ func (s *ActionService) Merge(ctx context.Context, request MergeRequest) (MergeR
 	if storedHead == "" || !gitSHAPattern.MatchString(storedHead) {
 		return MergeResult{}, fmt.Errorf("%w: pull request head is unknown", ErrPRPreconditions)
 	}
-	expectedHead := strings.TrimSpace(request.ExpectedHeadSHA)
-	if expectedHead == "" {
-		expectedHead = storedHead
-	} else if !gitSHAPattern.MatchString(expectedHead) {
-		return MergeResult{}, fmt.Errorf("%w: invalid expected head", ErrInvalidPR)
-	}
 	if !strings.EqualFold(expectedHead, storedHead) {
 		return MergeResult{}, ErrPRHeadChanged
 	}
@@ -106,12 +116,20 @@ func (s *ActionService) Merge(ctx context.Context, request MergeRequest) (MergeR
 	if !ok {
 		return MergeResult{}, fmt.Errorf("%w: pull request repository is unknown", ErrPRPreconditions)
 	}
+	ref := ports.SCMPRRef{Repo: repo, Number: tracked.Number, URL: tracked.URL}
+	fresh, err := s.fetchMergeReadiness(ctx, ref)
+	if err != nil {
+		return MergeResult{}, err
+	}
+	if !strings.EqualFold(fresh.PR.HeadSHA, expectedHead) {
+		return MergeResult{}, ErrPRHeadChanged
+	}
+	if !scmready.IsReadyToMerge(fresh) {
+		return MergeResult{}, ErrPRPreconditions
+	}
+
 	out, err := s.merger.MergePullRequest(ctx, ports.SCMMergeRequest{
-		PR: ports.SCMPRRef{
-			Repo:   repo,
-			Number: tracked.Number,
-			URL:    tracked.URL,
-		},
+		PR:              ref,
 		ExpectedHeadSHA: expectedHead,
 		Method:          ports.SCMMergeSquash,
 	})
@@ -128,6 +146,29 @@ func (s *ActionService) Merge(ctx context.Context, request MergeRequest) (MergeR
 		}
 	}
 	return MergeResult{PRNumber: tracked.Number, Method: string(ports.SCMMergeSquash), MergeCommitSHA: out.MergeCommitSHA}, nil
+}
+
+func (s *ActionService) fetchMergeReadiness(ctx context.Context, ref ports.SCMPRRef) (ports.SCMObservation, error) {
+	observations, err := s.reader.FetchPullRequests(ctx, []ports.SCMPRRef{ref})
+	if err != nil {
+		if errors.Is(err, ports.ErrSCMNotFound) {
+			return ports.SCMObservation{}, fmt.Errorf("%w: %w", ErrPRNotFound, err)
+		}
+		return ports.SCMObservation{}, fmt.Errorf("refresh pull request before merge: %w", err)
+	}
+	if len(observations) != 1 || !observations[0].Fetched || observations[0].PR.Number != ref.Number {
+		return ports.SCMObservation{}, ErrPRNotFound
+	}
+	observation := observations[0]
+	review, err := s.reader.FetchReviewThreads(ctx, ref)
+	if err != nil {
+		if errors.Is(err, ports.ErrSCMNotFound) {
+			return ports.SCMObservation{}, fmt.Errorf("%w: %w", ErrPRNotFound, err)
+		}
+		return ports.SCMObservation{}, fmt.Errorf("refresh pull request reviews before merge: %w", err)
+	}
+	observation.Review = review
+	return observation, nil
 }
 
 func parsePRNumber(value string) (int, error) {

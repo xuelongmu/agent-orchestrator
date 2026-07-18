@@ -161,7 +161,7 @@ func (f *fakeSessionService) ListPRs(_ context.Context, id domain.SessionID) ([]
 	if _, ok := f.sessions[id]; !ok {
 		return nil, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
 	}
-	return []domain.PRFacts{{URL: "https://github.com/aoagents/agent-orchestrator/pull/142", Number: 142, CI: domain.CIPassing, Review: domain.ReviewRequired, Mergeability: domain.MergeMergeable, UpdatedAt: time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)}}, nil
+	return []domain.PRFacts{{URL: "https://github.com/aoagents/agent-orchestrator/pull/142", Number: 142, HeadSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", CI: domain.CIPassing, Review: domain.ReviewRequired, Mergeability: domain.MergeMergeable, UpdatedAt: time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)}}, nil
 }
 
 func (f *fakeSessionService) ListPRSummaries(_ context.Context, id domain.SessionID) ([]sessionsvc.PRSummary, error) {

@@ -51,6 +51,7 @@ const getDisplayPRFactsBySession = `-- name: GetDisplayPRFactsBySession :one
 SELECT
     pr.url,
     pr.number,
+    pr.head_sha,
     pr.pr_state,
     pr.review_decision,
     pr.ci_state,
@@ -74,6 +75,7 @@ LIMIT 1
 type GetDisplayPRFactsBySessionRow struct {
 	URL            string
 	Number         int64
+	HeadSha        string
 	PRState        domain.PRState
 	ReviewDecision domain.ReviewDecision
 	CIState        domain.CIState
@@ -88,6 +90,7 @@ func (q *Queries) GetDisplayPRFactsBySession(ctx context.Context, sessionID doma
 	err := row.Scan(
 		&i.URL,
 		&i.Number,
+		&i.HeadSha,
 		&i.PRState,
 		&i.ReviewDecision,
 		&i.CIState,
@@ -185,6 +188,7 @@ const listPRFactsBySession = `-- name: ListPRFactsBySession :many
 SELECT
     pr.url,
     pr.number,
+    pr.head_sha,
     pr.pr_state,
     pr.review_decision,
     pr.ci_state,
@@ -207,6 +211,7 @@ ORDER BY pr.updated_at DESC
 type ListPRFactsBySessionRow struct {
 	URL            string
 	Number         int64
+	HeadSha        string
 	PRState        domain.PRState
 	ReviewDecision domain.ReviewDecision
 	CIState        domain.CIState
@@ -232,6 +237,7 @@ func (q *Queries) ListPRFactsBySession(ctx context.Context, sessionID domain.Ses
 		if err := rows.Scan(
 			&i.URL,
 			&i.Number,
+			&i.HeadSha,
 			&i.PRState,
 			&i.ReviewDecision,
 			&i.CIState,

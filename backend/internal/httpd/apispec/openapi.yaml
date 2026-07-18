@@ -2226,6 +2226,7 @@ components:
           type: string
       required:
       - prUrl
+      - expectedHeadSha
       type: object
     MergePRResponse:
       properties:
@@ -2684,6 +2685,8 @@ components:
           - passing
           - failing
           type: string
+        headSha:
+          type: string
         mergeability:
           enum:
           - unknown
@@ -2718,6 +2721,7 @@ components:
       required:
       - url
       - number
+      - headSha
       - state
       - ci
       - review

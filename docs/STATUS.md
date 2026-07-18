@@ -37,8 +37,9 @@ surface (`npm run sqlc`, `npm run api`).
   (list/spawn/get) are wired too.
 - Project CRUD plus per-project config (`PUT /projects/{id}/config`).
 - PR action engine wired into the API: `POST /prs/{id}/merge` performs a
-  GitHub squash merge pinned to the expected PR head; `/prs/{id}/resolve-comments`
-  remains the review-thread action route.
+  GitHub squash merge pinned to the caller's exact displayed head, after a
+  fresh fail-closed check of CI, mergeability, and complete current-head review
+  facts; `/prs/{id}/resolve-comments` remains the review-thread action route.
 - Review routes registered: `GET /reviews`, `POST /reviews/execute`,
   `POST /reviews/{id}/send`.
 - Durable dashboard notifications for `needs_input`, `ready_to_merge`,

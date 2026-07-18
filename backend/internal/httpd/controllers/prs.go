@@ -46,6 +46,10 @@ func (c *PRsController) merge(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_PR", "PR URL is required", nil)
 		return
 	}
+	if strings.TrimSpace(in.ExpectedHeadSHA) == "" {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_PR", "Expected head SHA is required", nil)
+		return
+	}
 	res, err := c.Svc.Merge(r.Context(), prsvc.MergeRequest{PRID: prID, PRURL: in.PRURL, ExpectedHeadSHA: in.ExpectedHeadSHA})
 	if err != nil {
 		writePRError(w, r, err)

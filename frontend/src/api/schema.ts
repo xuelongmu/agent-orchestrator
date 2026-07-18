@@ -834,7 +834,7 @@ export interface components {
             status: "read";
         };
         MergePRRequest: {
-            expectedHeadSha?: string;
+            expectedHeadSha: string;
             prUrl: string;
         };
         MergePRResponse: {
@@ -1011,6 +1011,7 @@ export interface components {
         SessionPRFacts: {
             /** @enum {string} */
             ci: "unknown" | "pending" | "passing" | "failing";
+            headSha: string;
             /** @enum {string} */
             mergeability: "unknown" | "mergeable" | "conflicting" | "blocked" | "unstable";
             number: number;

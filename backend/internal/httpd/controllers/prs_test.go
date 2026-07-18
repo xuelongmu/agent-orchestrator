@@ -97,13 +97,24 @@ func TestPRsRoutes_Merge_MissingBodyReturns400(t *testing.T) {
 	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
 }
 
+func TestPRsRoutes_Merge_MissingExpectedHeadReturns400WithoutCallingService(t *testing.T) {
+	svc := &fakePRService{}
+	srv := newPRTestServer(t, svc)
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/42/merge", `{"prUrl":"https://github.com/acme/widgets/pull/42"}`)
+	assertJSON(t, headers)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_PR")
+	if svc.mergeRequest.PRID != "" {
+		t.Fatalf("service was called: %#v", svc.mergeRequest)
+	}
+}
+
 // ---- Merge: 404 ----
 
 func TestPRsRoutes_Merge_404(t *testing.T) {
 	svc := &fakePRService{mergeErr: prsvc.ErrPRNotFound}
 	srv := newPRTestServer(t, svc)
 
-	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/99/merge", `{"prUrl":"https://github.com/acme/widgets/pull/99"}`)
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/99/merge", `{"prUrl":"https://github.com/acme/widgets/pull/99","expectedHeadSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
 	assertJSON(t, headers)
 	assertErrorCode(t, body, status, http.StatusNotFound, "PR_NOT_FOUND")
 }
@@ -114,7 +125,7 @@ func TestPRsRoutes_Merge_409(t *testing.T) {
 	svc := &fakePRService{mergeErr: prsvc.ErrPRNotMergeable}
 	srv := newPRTestServer(t, svc)
 
-	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/merge", `{"prUrl":"https://github.com/acme/widgets/pull/1"}`)
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/merge", `{"prUrl":"https://github.com/acme/widgets/pull/1","expectedHeadSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
 	assertJSON(t, headers)
 	assertErrorCode(t, body, status, http.StatusConflict, "PR_NOT_MERGEABLE")
 }
@@ -125,7 +136,7 @@ func TestPRsRoutes_Merge_422(t *testing.T) {
 	svc := &fakePRService{mergeErr: prsvc.ErrPRPreconditions}
 	srv := newPRTestServer(t, svc)
 
-	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/merge", `{"prUrl":"https://github.com/acme/widgets/pull/1"}`)
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/merge", `{"prUrl":"https://github.com/acme/widgets/pull/1","expectedHeadSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
 	assertJSON(t, headers)
 	assertErrorCode(t, body, status, http.StatusUnprocessableEntity, "PR_PRECONDITIONS_UNMET")
 }
