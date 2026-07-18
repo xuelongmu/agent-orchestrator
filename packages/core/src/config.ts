@@ -792,7 +792,7 @@ function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
       reviewBots: {
         "chatgpt-codex-connector[bot]": {
           weight: 1,
-          approvalPhrases: ["Didn't find any major issues. Chef's kiss."],
+          approvalPhrases: ["Didn't find any major issues"],
           approvalReactions: ["THUMBS_UP"],
           rebumpMessage: "@codex review",
           maxRebumps: 2,

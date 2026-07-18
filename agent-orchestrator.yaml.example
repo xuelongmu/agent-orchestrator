@@ -175,7 +175,7 @@ projects:
 #     reviewBots:
 #       chatgpt-codex-connector[bot]:
 #         weight: 1            # actionable and merge-blocking
-#         approvalPhrases: ["Didn't find any major issues. Chef's kiss."]
+#         approvalPhrases: ["Didn't find any major issues"]
 #         approvalReactions: [THUMBS_UP]
 #         rebumpMessage: "@codex review"
 #         maxRebumps: 2

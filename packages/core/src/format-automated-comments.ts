@@ -115,7 +115,7 @@ export function formatAutomatedCommentsMessage(
     const loc = c.path
       ? ` \`${c.path}${c.line !== undefined && c.line !== null ? `:${c.line}` : ""}\``
       : "";
-    lines.push(`- **[${c.severity}] ${c.botName}**${loc}: \`${excerpt(c.body)}\``);
+    lines.push(`- **[${c.severity}] @${c.botName}**${loc}: \`${excerpt(c.body)}\``);
     lines.push(`  ${c.url}`);
     if (c.threadId) lines.push(`  Thread ID: ${c.threadId}`);
   }

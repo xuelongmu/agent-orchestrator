@@ -1351,6 +1351,10 @@ describe("Config Validation - quality policies (#15)", () => {
     expect(
       config.reactions["bugbot-comments"].reviewBots?.["chatgpt-codex-connector[bot]"]?.weight,
     ).toBe(1);
+    expect(
+      config.reactions["bugbot-comments"].reviewBots?.["chatgpt-codex-connector[bot]"]
+        ?.approvalPhrases,
+    ).toEqual(["Didn't find any major issues"]);
     expect(config.reactions["bugbot-comments"].reviewBots?.["*"]?.weight).toBeLessThan(1);
     expect(config.reactions["ci-failed"].flakyRetries).toBe(1);
     expect(config.reactions["approved-and-green"].confidenceThreshold).toBe(0.8);

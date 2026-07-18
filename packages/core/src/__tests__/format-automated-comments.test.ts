@@ -31,7 +31,7 @@ describe("formatAutomatedCommentsMessage", () => {
     const msg = formatAutomatedCommentsMessage([makeComment()]);
     // Excerpt is wrapped in a code span so untrusted content can't break out.
     expect(msg).toContain(
-      "- **[warning] cursor[bot]** `src/worker.ts:42`: `Potential issue detected`",
+      "- **[warning] @cursor[bot]** `src/worker.ts:42`: `Potential issue detected`",
     );
     expect(msg).toContain("  https://github.com/o/r/pull/9#discussion_r1");
   });
@@ -123,7 +123,7 @@ describe("formatAutomatedCommentsMessage", () => {
 
   it("omits path:line block when path is missing", () => {
     const msg = formatAutomatedCommentsMessage([makeComment({ path: undefined, line: undefined })]);
-    expect(msg).toContain("**[warning] cursor[bot]**: `Potential issue detected`");
+    expect(msg).toContain("**[warning] @cursor[bot]**: `Potential issue detected`");
     expect(msg).not.toMatch(/`:\d+`/);
   });
 

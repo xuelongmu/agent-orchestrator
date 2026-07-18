@@ -21,6 +21,9 @@ import type {
   SessionStatus,
   SessionMetadata,
   PRInfo,
+  ReviewComment,
+  ReviewReaction,
+  ReviewThreadsResult,
   SCM,
   Notifier,
   NotifyAction,
@@ -7013,7 +7016,7 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
           reviewBots: {
             "chatgpt-codex-connector[bot]": {
               weight: 1,
-              approvalPhrases: ["Didn't find any major issues. Chef's kiss."],
+              approvalPhrases: ["Didn't find any major issues"],
               approvalReactions: ["THUMBS_UP"],
             },
             "*": { weight: 0 },
@@ -7028,7 +7031,11 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
     };
   }
 
-  function codexApprovalResult(threads: unknown[] = []) {
+  function codexApprovalResult(
+    threads: ReviewComment[] = [],
+    body = "Didn't find any major issues. Chef's kiss.",
+    reactions: ReviewReaction[] = [],
+  ): ReviewThreadsResult {
     return {
       threads,
       reviews: [
@@ -7036,14 +7043,16 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
           author: "chatgpt-codex-connector[bot]",
           botName: "chatgpt-codex-connector[bot]",
           state: "COMMENTED",
-          body: "Didn't find any major issues. Chef's kiss.",
+          body,
           submittedAt: new Date(),
           isBot: true,
           isReviewBot: true,
           commitSha: "sha-head",
         },
       ],
+      reactions,
       headSha: "sha-head",
+      headCommittedAt: new Date("2026-07-18T00:00:00Z"),
       threadsTruncated: false,
     };
   }
@@ -7080,6 +7089,85 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
 
     expect(mergePR).toHaveBeenCalledWith(pr);
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["autoMergeRequestedAt"]).toBeTruthy();
+  });
+
+  it("accepts the Nice work Codex clean-verdict variant via the stable phrase", async () => {
+    const mergePR = vi.fn().mockResolvedValue(undefined);
+    const mockSCM = createMockSCM({
+      mergePR,
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi.fn().mockResolvedValue("none"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: true,
+        ciPassing: true,
+        approved: false,
+        noConflicts: true,
+        blockers: [],
+      }),
+      getReviewThreads: vi
+        .fn()
+        .mockResolvedValue(codexApprovalResult([], "Didn't find any major issues. Nice work!")),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makeMatchingPR() }),
+      registry,
+      configOverride: qualityConfig(),
+    });
+
+    await lm.check("app-1");
+
+    expect(mergePR).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not treat an eyes acknowledgement reaction as Codex approval", async () => {
+    const mergePR = vi.fn().mockResolvedValue(undefined);
+    const mockSCM = createMockSCM({
+      mergePR,
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi.fn().mockResolvedValue("none"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: true,
+        ciPassing: true,
+        approved: false,
+        noConflicts: true,
+        blockers: [],
+      }),
+      getReviewThreads: vi.fn().mockResolvedValue(
+        codexApprovalResult([], "Review acknowledged.", [
+          {
+            author: "chatgpt-codex-connector[bot]",
+            botName: "chatgpt-codex-connector[bot]",
+            content: "EYES",
+            createdAt: new Date("2026-07-18T00:01:00Z"),
+            isBot: true,
+          },
+        ]),
+      ),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makeMatchingPR() }),
+      registry,
+      configOverride: qualityConfig(),
+    });
+
+    await lm.check("app-1");
+
+    expect(mergePR).not.toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["autoMergeBlockers"]).toContain(
+      "review_approval_missing",
+    );
   });
 
   it("blocks on unresolved Codex threads but ignores bots weighted to zero", async () => {
