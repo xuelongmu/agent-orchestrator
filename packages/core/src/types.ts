@@ -1289,9 +1289,10 @@ export interface ReviewThreadsResult {
   /** Push time of `headSha`, used to reject approval reactions from an older pushed head. */
   headPushedAt?: Date;
   /**
-   * True when the returned `threads` may be incomplete (the PR has more review
-   * threads than the plugin fetched in one page). Callers must fail closed —
-   * never treat an empty/clean thread set as authoritative — when this is set.
+   * True when the returned `threads` or their participants may be incomplete
+   * (the PR has more threads/comments than the plugin fetched in one page).
+   * Callers must fail closed — never treat the snapshot as authoritatively
+   * clean — when this is set.
    */
   threadsTruncated?: boolean;
 }

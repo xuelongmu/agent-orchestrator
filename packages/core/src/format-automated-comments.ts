@@ -61,8 +61,10 @@ export function partitionAutomatedComments(
   };
   for (const comment of comments) {
     // No configured policy preserves legacy behavior for hand-constructed
-    // configs and third-party consumers. Production defaults configure Codex.
-    const weight = resolveReviewBotPolicy(comment.botName, policies)?.weight ?? 1;
+    // configs and third-party consumers. Once a policy map is explicit, an
+    // unmatched bot is ignored unless the installation provides `*`.
+    const resolvedPolicy = resolveReviewBotPolicy(comment.botName, policies);
+    const weight = resolvedPolicy?.weight ?? (policies ? 0 : 1);
     if (weight >= 1) buckets.actionable.push(comment);
     else if (weight > 0) buckets.deprioritized.push(comment);
     else buckets.ignored.push(comment);

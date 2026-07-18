@@ -8195,6 +8195,58 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
     expect(metadata?.["reviewRebumpCount:org/my-app#42"]).toBeFalsy();
   });
 
+  it("defers a missing-approval re-bump while required review threads remain", async () => {
+    const postPRComment = vi.fn().mockResolvedValue(undefined);
+    const mockSCM = createMockSCM({
+      postPRComment,
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi.fn().mockResolvedValue("pending"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: false,
+        ciPassing: true,
+        approved: false,
+        noConflicts: true,
+        blockers: ["Review required"],
+      }),
+      getReviewThreads: vi.fn().mockResolvedValue({
+        threads: [
+          {
+            id: "required-thread",
+            author: "chatgpt-codex-connector[bot]",
+            botName: "chatgpt-codex-connector[bot]",
+            body: "Fix this first",
+            isResolved: false,
+            createdAt: new Date(),
+            url: "https://example.test/required-thread",
+            isBot: true,
+            isReviewBot: true,
+          },
+        ],
+        reviews: [],
+        headSha: "sha-head",
+        threadsTruncated: false,
+      }),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "review_pending", pr: makeMatchingPR() }),
+      registry,
+      configOverride: qualityConfig(),
+    });
+
+    await lm.check("app-1");
+
+    expect(postPRComment).not.toHaveBeenCalled();
+    expect(
+      readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRebumpCount:org/my-app#42"],
+    ).toBeFalsy();
+  });
+
   it("escalates once when the SCM cannot post a review re-bump", async () => {
     const notifier = createMockNotifier();
     const mockSCM = createMockSCM({
@@ -8355,6 +8407,39 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewRoundCountTotal"]).toBe("1");
   });
 
+  it("ignores GitLab's native approval blocker after AO approval succeeds", async () => {
+    const mergePR = vi.fn().mockResolvedValue(undefined);
+    const mockSCM = createMockSCM({
+      name: "gitlab",
+      mergePR,
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi.fn().mockResolvedValue("pending"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: false,
+        ciPassing: true,
+        approved: false,
+        noConflicts: true,
+        blockers: ["Approval required"],
+      }),
+      getReviewThreads: vi.fn().mockResolvedValue(codexApprovalResult()),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "review_pending", pr: makeMatchingPR() }),
+      registry,
+      configOverride: qualityConfig(),
+    });
+
+    await lm.check("app-1");
+
+    expect(mergePR).toHaveBeenCalledWith(makeMatchingPR(), undefined, "sha-head");
+  });
+
   it("retries classifier-confirmed flaky CI without consuming an agent fix round", async () => {
     const retryCI = vi.fn().mockResolvedValue(true);
     const failedChecks = [
@@ -8409,6 +8494,68 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
     const metadata = readMetadataRaw(env.sessionsDir, "app-1");
     expect(metadata?.["flakyCIRetryCount"]).toBe("1");
     expect(metadata?.["ciFailureCountTotal"]).toBeFalsy();
+  });
+
+  it("does not extend flaky retry grace to a different CI run", async () => {
+    const retryCI = vi.fn().mockResolvedValue(true);
+    let runId = 10;
+    const getCIChecks = vi.fn().mockImplementation(async () => [
+      {
+        name: "windows",
+        status: "failed" as const,
+        conclusion: "FAILURE",
+        url: `https://github.com/org/my-app/actions/runs/${runId}/job/20`,
+      },
+    ]);
+    const mockSCM = createMockSCM({
+      getCIChecks,
+      getCISummary: vi.fn().mockResolvedValue("failing"),
+      getCIFailureSummary: vi.fn().mockImplementation(async () => ({
+        failedJobs: [
+          {
+            name: "windows",
+            runUrl: `https://github.com/org/my-app/actions/runs/${runId}/job/20`,
+            logTail: "The hosted runner was lost (ECONNRESET)",
+          },
+        ],
+      })),
+      retryCI,
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const configOverride: OrchestratorConfig = {
+      ...config,
+      reactions: {
+        "ci-failed": {
+          auto: true,
+          action: "send-to-agent",
+          retries: 2,
+          flakyRetries: 1,
+          flakyRetryBackoff: "10m",
+        },
+      },
+    };
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makeMatchingPR() }),
+      registry,
+      configOverride,
+    });
+
+    await lm.check("app-1");
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+
+    runId = 11;
+    await lm.check("app-1");
+
+    expect(retryCI).toHaveBeenCalledTimes(1);
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+    expect(mockSessionManager.send).toHaveBeenCalledWith(
+      "app-1",
+      expect.stringContaining("CI is failing"),
+    );
   });
 });
 
