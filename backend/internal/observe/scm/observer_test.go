@@ -1058,6 +1058,72 @@ func TestPoll_ReviewPollingRespectsInterval(t *testing.T) {
 	}
 }
 
+func TestPoll_HeadChangeForcesExactHeadReviewRefresh(t *testing.T) {
+	store := testStoreWithSession()
+	local := knownPR(1)
+	local.ReviewHash = "reviewed-sha1"
+	store.prs["p-1"] = []domain.PullRequest{local}
+
+	current := testObs(1)
+	current.PR.HeadSHA = "sha2"
+	current.CI.HeadSHA = "sha2"
+	review := ports.SCMReviewObservation{Decision: string(domain.ReviewNone), HeadSHA: "sha2"}
+	provider := &fakeProvider{
+		repoGuards:   map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "repo"}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): current},
+		reviews:      map[string]ports.SCMReviewObservation{prKey(testRepo, 1): review},
+	}
+	lc := &fakeLifecycle{}
+	obs := newTestObserver(store, provider, lc, time.Unix(200, 0).UTC())
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.reviewCalls != 1 {
+		t.Fatalf("review calls = %d, want 1 after head change", provider.reviewCalls)
+	}
+	if len(lc.observed) != 1 || lc.observed[0].Review.HeadSHA != "sha2" {
+		t.Fatalf("lifecycle review snapshot = %#v, want exact head sha2", lc.observed)
+	}
+}
+
+func TestPoll_CIPassingForcesExactHeadReviewRefreshBeforeReady(t *testing.T) {
+	store := testStoreWithSession()
+	local := knownPR(1)
+	local.CI = domain.CIPending
+	local.CIHash = "pending-ci"
+	local.Review = domain.ReviewApproved
+	local.ReviewHash = "reviewed-sha1"
+	store.prs["p-1"] = []domain.PullRequest{local}
+
+	current := testObs(1)
+	current.Review.Decision = string(domain.ReviewApproved)
+	review := ports.SCMReviewObservation{
+		Decision: string(domain.ReviewApproved),
+		HeadSHA:  "sha1",
+		Reviews: []ports.SCMReviewSummaryObservation{{
+			ID: "review-1", Author: "alice", State: string(domain.ReviewApproved), CommitSHA: "sha1",
+		}},
+	}
+	provider := &fakeProvider{
+		repoGuards:   map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "repo"}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): current},
+		reviews:      map[string]ports.SCMReviewObservation{prKey(testRepo, 1): review},
+	}
+	lc := &fakeLifecycle{}
+	obs := newTestObserver(store, provider, lc, time.Unix(200, 0).UTC())
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.reviewCalls != 1 {
+		t.Fatalf("review calls = %d, want 1 before CI-only observation becomes ready", provider.reviewCalls)
+	}
+	if len(lc.observed) != 1 ||
+		lc.observed[0].Review.HeadSHA != "sha1" ||
+		len(lc.observed[0].Review.Reviews) != 1 {
+		t.Fatalf("lifecycle review snapshot = %#v, want exact-head approval facts", lc.observed)
+	}
+}
+
 func TestPoll_UnchangedHashesDoNotWriteOrNotify(t *testing.T) {
 	store := testStoreWithSession()
 	obsValue := testObs(1)

@@ -1367,7 +1367,19 @@ func TestSCMObservation_Notifications(t *testing.T) {
 	}{
 		{
 			name: "ready",
-			obs:  ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: "https://github.com/o/r/pull/1", Number: 1, Title: "checkout"}, CI: ports.SCMCIObservation{Summary: string(domain.CIPassing)}, Review: ports.SCMReviewObservation{Decision: string(domain.ReviewApproved)}, Mergeability: ports.SCMMergeabilityObservation{State: string(domain.MergeMergeable)}},
+			obs: ports.SCMObservation{
+				Fetched: true,
+				PR:      ports.SCMPRObservation{URL: "https://github.com/o/r/pull/1", Number: 1, Title: "checkout", HeadSHA: "head-1"},
+				CI:      ports.SCMCIObservation{Summary: string(domain.CIPassing), HeadSHA: "head-1"},
+				Review: ports.SCMReviewObservation{
+					Decision: string(domain.ReviewApproved),
+					HeadSHA:  "head-1",
+					Reviews: []ports.SCMReviewSummaryObservation{{
+						Author: "alice", State: string(domain.ReviewApproved), CommitSHA: "head-1",
+					}},
+				},
+				Mergeability: ports.SCMMergeabilityObservation{State: string(domain.MergeMergeable)},
+			},
 			want: domain.NotificationReadyToMerge,
 		},
 		{
@@ -1394,6 +1406,71 @@ func TestSCMObservation_Notifications(t *testing.T) {
 			}
 			if got := sink.intents[0]; got.Type != tc.want || got.PRURL != tc.obs.PR.URL || got.PRNumber != tc.obs.PR.Number {
 				t.Fatalf("intent = %+v, want type %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSCMObservation_ReviewDefinitionOfDone(t *testing.T) {
+	base := ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "https://github.com/o/r/pull/1", Number: 1, HeadSHA: "head-2"},
+		CI:      ports.SCMCIObservation{Summary: string(domain.CIPassing), HeadSHA: "head-2"},
+		Review: ports.SCMReviewObservation{
+			Decision: string(domain.ReviewApproved),
+			HeadSHA:  "head-2",
+			Reviews: []ports.SCMReviewSummaryObservation{{
+				Author: "alice", State: string(domain.ReviewApproved), CommitSHA: "head-2",
+			}},
+		},
+		Mergeability: ports.SCMMergeabilityObservation{State: string(domain.MergeMergeable)},
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ports.SCMObservation)
+		ready  bool
+	}{
+		{name: "complete current-head approval", ready: true},
+		{name: "no approval required and no P1 findings", mutate: func(o *ports.SCMObservation) {
+			o.Review.Decision = string(domain.ReviewNone)
+			o.Review.Reviews = nil
+		}, ready: true},
+		{name: "stale approval", mutate: func(o *ports.SCMObservation) {
+			o.Review.Reviews[0].CommitSHA = "head-1"
+		}},
+		{name: "review snapshot for stale head", mutate: func(o *ports.SCMObservation) {
+			o.Review.HeadSHA = "head-1"
+		}},
+		{name: "CI snapshot for stale head", mutate: func(o *ports.SCMObservation) {
+			o.CI.HeadSHA = "head-1"
+		}},
+		{name: "partial review window", mutate: func(o *ports.SCMObservation) {
+			o.Review.Partial = true
+		}},
+		{name: "unresolved human thread", mutate: func(o *ports.SCMObservation) {
+			o.Review.Threads = []ports.SCMReviewThreadObservation{{ID: "human", Comments: []ports.SCMReviewCommentObservation{{Author: "alice", Body: "please fix this"}}}}
+		}},
+		{name: "unresolved Codex P1 thread", mutate: func(o *ports.SCMObservation) {
+			o.Review.Threads = []ports.SCMReviewThreadObservation{{ID: "codex-p1", IsBot: true, Comments: []ports.SCMReviewCommentObservation{{Author: "chatgpt-codex-connector[bot]", IsBot: true, Body: "[P1] Lost update can corrupt state"}}}}
+		}},
+		{name: "unresolved Codex P2 is non-blocking", mutate: func(o *ports.SCMObservation) {
+			o.Review.Threads = []ports.SCMReviewThreadObservation{{ID: "codex-p2", IsBot: true, Comments: []ports.SCMReviewCommentObservation{{Author: "chatgpt-codex-connector[bot]", IsBot: true, Body: "[P2] Consider a clearer name"}}}}
+		}, ready: true},
+		{name: "unresolved unrelated bot P1 is non-blocking", mutate: func(o *ports.SCMObservation) {
+			o.Review.Threads = []ports.SCMReviewThreadObservation{{ID: "other-p1", IsBot: true, Comments: []ports.SCMReviewCommentObservation{{Author: "other-reviewer[bot]", IsBot: true, Body: "[P1] Maybe change this"}}}}
+		}, ready: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			obs := base
+			obs.Review.Reviews = append([]ports.SCMReviewSummaryObservation(nil), base.Review.Reviews...)
+			if tc.mutate != nil {
+				tc.mutate(&obs)
+			}
+			if got := scmObservationIsReadyToMerge(obs); got != tc.ready {
+				t.Fatalf("scmObservationIsReadyToMerge() = %v, want %v", got, tc.ready)
 			}
 		})
 	}

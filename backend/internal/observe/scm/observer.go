@@ -980,10 +980,15 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		pkey := prKey(s.repo, s.known.Number)
 		obs, hasObs := observations[pkey]
 		decision := string(s.known.Review)
+		currentHeadSHA := ""
 		if hasObs && obs.Review.Decision != "" {
 			decision = obs.Review.Decision
 		}
-		if !o.needsReviewRefresh(pkey, s.known, decision, hasObs, now) {
+		if hasObs {
+			currentHeadSHA = obs.PR.HeadSHA
+		}
+		if !fastObservationNeedsReviewSnapshot(obs) &&
+			!o.needsReviewRefresh(pkey, s.known, decision, currentHeadSHA, hasObs, now) {
 			continue
 		}
 		review, err := o.provider.FetchReviewThreads(ctx, ports.SCMPRRef{Repo: s.repo, Number: s.known.Number, URL: s.known.URL})
@@ -1010,6 +1015,7 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		if review.Decision != "" {
 			obs.Review.Decision = review.Decision
 		}
+		obs.Review.HeadSHA = review.HeadSHA
 		obs.Review.Reviews = review.Reviews
 		obs.Review.Threads = review.Threads
 		obs.Review.Partial = review.Partial
@@ -1025,11 +1031,14 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 	}
 }
 
-func (o *Observer) needsReviewRefresh(key string, local domain.PullRequest, decision string, hasObs bool, now time.Time) bool {
+func (o *Observer) needsReviewRefresh(key string, local domain.PullRequest, decision, currentHeadSHA string, hasObs bool, now time.Time) bool {
 	if o.Cache.ReviewRefreshFailed[key] {
 		return true
 	}
 	if local.ReviewHash == "" {
+		return true
+	}
+	if hasObs && currentHeadSHA != "" && local.HeadSHA != "" && currentHeadSHA != local.HeadSHA {
 		return true
 	}
 	if decision == string(domain.ReviewChangesRequest) {
@@ -1043,6 +1052,19 @@ func (o *Observer) needsReviewRefresh(key string, local domain.PullRequest, deci
 		return true
 	}
 	return false
+}
+
+func fastObservationNeedsReviewSnapshot(obs ports.SCMObservation) bool {
+	if obs.PR.Merged || obs.PR.Closed || obs.PR.Draft ||
+		obs.PR.HeadSHA == "" || obs.CI.HeadSHA != obs.PR.HeadSHA {
+		return false
+	}
+	if domain.CIState(obs.CI.Summary) != domain.CIPassing ||
+		domain.Mergeability(obs.Mergeability.State) != domain.MergeMergeable {
+		return false
+	}
+	review := domain.ReviewDecision(obs.Review.Decision)
+	return review != domain.ReviewChangesRequest && review != domain.ReviewRequired
 }
 
 func (o *Observer) prepareForPersistence(obs ports.SCMObservation, local domain.PullRequest, opts persistenceOptions, now time.Time) ports.SCMObservation {
@@ -1348,11 +1370,12 @@ func ciSemanticHash(ci ports.SCMCIObservation) string {
 func reviewSemanticHash(review ports.SCMReviewObservation) string {
 	type reviewHashPayload struct {
 		Decision string
+		HeadSHA  string `json:",omitempty"`
 		Reviews  []ports.SCMReviewSummaryObservation
 		Threads  []ports.SCMReviewThreadObservation
 		Partial  bool `json:",omitempty"`
 	}
-	return stableHash(reviewHashPayload{Decision: review.Decision, Reviews: review.Reviews, Threads: review.Threads, Partial: review.Partial})
+	return stableHash(reviewHashPayload{Decision: review.Decision, HeadSHA: review.HeadSHA, Reviews: review.Reviews, Threads: review.Threads, Partial: review.Partial})
 }
 
 func threadSemanticHash(th ports.SCMReviewThreadObservation) string {
