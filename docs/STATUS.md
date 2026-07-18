@@ -36,8 +36,9 @@ surface (`npm run sqlc`, `npm run api`).
   rollback, cleanup, send, activity, PR claim/list. Orchestrator routes
   (list/spawn/get) are wired too.
 - Project CRUD plus per-project config (`PUT /projects/{id}/config`).
-- PR action engine wired into the API: `POST /prs/{id}/merge` and
-  `/prs/{id}/resolve-comments`.
+- PR action engine wired into the API: `POST /prs/{id}/merge` performs a
+  GitHub squash merge pinned to the expected PR head; `/prs/{id}/resolve-comments`
+  remains the review-thread action route.
 - Review routes registered: `GET /reviews`, `POST /reviews/execute`,
   `POST /reviews/{id}/send`.
 - Durable dashboard notifications for `needs_input`, `ready_to_merge`,

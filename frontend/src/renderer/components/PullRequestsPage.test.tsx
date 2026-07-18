@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PullRequestsPage } from "./PullRequestsPage";
 import type { PRState, PullRequestFacts, WorkspaceSession, WorkspaceSummary } from "../types/workspace";
+import { sessionScmSummaryQueryKey, type SessionPRSummary } from "../hooks/useSessionScmSummary";
 
 const { navigateMock, postMock, useWorkspaceQueryMock } = vi.hoisted(() => ({
 	navigateMock: vi.fn(),
@@ -50,9 +51,11 @@ function setWorkspaces(sessions: WorkspaceSession[]) {
 	useWorkspaceQueryMock.mockReturnValue({ data, isError: false, isLoading: false });
 }
 
-function renderPage() {
+function renderPage(seed?: { sessionId: string; prs: SessionPRSummary[] }) {
+	const client = new QueryClient();
+	if (seed) client.setQueryData(sessionScmSummaryQueryKey(seed.sessionId), seed.prs);
 	render(
-		<QueryClientProvider client={new QueryClient()}>
+		<QueryClientProvider client={client}>
 			<PullRequestsPage />
 		</QueryClientProvider>,
 	);
@@ -77,14 +80,40 @@ describe("PullRequestsPage", () => {
 
 	it("merges the PR by its own number, not the session's", async () => {
 		setWorkspaces([session("auth", [pr(41, "open"), pr(42, "draft")])]);
-		renderPage();
+		const summary: SessionPRSummary = {
+			url: "https://github.com/acme/repo/pull/42",
+			htmlUrl: "https://github.com/acme/repo/pull/42",
+			number: 42,
+			title: "child",
+			state: "draft",
+			provider: "github",
+			repo: "acme/repo",
+			author: "alice",
+			sourceBranch: "feat/child",
+			targetBranch: "main",
+			headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			additions: 1,
+			deletions: 0,
+			changedFiles: 1,
+			ci: { state: "passing", failingChecks: [] },
+			review: { decision: "approved", hasUnresolvedHumanComments: false, unresolvedBy: [] },
+			mergeability: { state: "mergeable", reasons: [], prUrl: "https://github.com/acme/repo/pull/42" },
+			updatedAt: "2026-06-15T00:00:00Z",
+		};
+		renderPage({ sessionId: "auth", prs: [summary] });
 		const user = userEvent.setup();
 
 		const childRow = screen.getByText("#42").closest("tr")!;
 		await user.click(within(childRow).getByRole("button", { name: "Merge" }));
 
 		await waitFor(() => expect(postMock).toHaveBeenCalledTimes(1));
-		expect(postMock).toHaveBeenCalledWith("/api/v1/prs/{id}/merge", { params: { path: { id: "42" } } });
+		expect(postMock).toHaveBeenCalledWith("/api/v1/prs/{id}/merge", {
+			params: { path: { id: "42" } },
+			body: {
+				prUrl: "https://github.com/acme/repo/pull/42",
+				expectedHeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			},
+		});
 	});
 
 	it("shows an empty state when no session has a PR", () => {

@@ -6,6 +6,7 @@ import type { AttentionLevel } from "./theme";
 export type DashboardPR = {
 	number: number;
 	url: string;
+	headSha?: string;
 	title?: string;
 	owner?: string;
 	repo?: string;
@@ -383,7 +384,10 @@ export async function launchOrchestrator(
 }
 
 export async function mergePR(cfg: ServerConfig, pr: DashboardPR): Promise<void> {
-	await req(cfg, `${API}/prs/${pr.number}/merge`, { method: "POST" });
+	await req(cfg, `${API}/prs/${pr.number}/merge`, {
+		method: "POST",
+		body: JSON.stringify({ prUrl: pr.url, expectedHeadSha: pr.headSha }),
+	});
 }
 
 // Quick reachability probe for the Settings "Test connection" button.

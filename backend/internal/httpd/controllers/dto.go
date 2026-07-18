@@ -577,6 +577,14 @@ type PRIDParam struct {
 	ID string `path:"id" description:"PR number."`
 }
 
+// MergePRRequest is the body of POST /api/v1/prs/{id}/merge. PRURL makes the
+// globally-numbered route unambiguous across repositories; ExpectedHeadSHA
+// pins current desktop callers to the head they displayed.
+type MergePRRequest struct {
+	PRURL           string `json:"prUrl" minLength:"1"`
+	ExpectedHeadSHA string `json:"expectedHeadSha,omitempty" pattern:"^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$"`
+}
+
 // MergePRResponse is the body of POST /api/v1/prs/{id}/merge (200).
 type MergePRResponse struct {
 	OK       bool   `json:"ok"`
