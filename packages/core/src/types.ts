@@ -2324,7 +2324,7 @@ export interface SessionManager {
     sessionId: SessionId,
     message: string,
     projectId?: string,
-  ): Promise<void | SessionSendResult>;
+  ): Promise<undefined | SessionSendResult>;
   claimPR(sessionId: SessionId, prRef: string, options?: ClaimPROptions): Promise<ClaimPRResult>;
 }
 

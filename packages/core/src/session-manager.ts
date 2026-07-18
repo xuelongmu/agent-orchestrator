@@ -3191,7 +3191,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     sessionId: SessionId,
     message: string,
     scopeProjectId?: string,
-  ): Promise<void | SessionSendResult> {
+  ): Promise<undefined | SessionSendResult> {
     const { raw, sessionsDir, project, projectId } = requireSessionRecord(sessionId, scopeProjectId);
 
     // ALL setup below is PRE-DELIVERY: agent selection, OpenCode discovery, and
@@ -3460,7 +3460,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     // error text, is how the failure class is reported to the caller.
     let deliveryAttempted = false;
 
-    const sendWithConfirmation = async (session: Session): Promise<void | SessionSendResult> => {
+    const sendWithConfirmation = async (
+      session: Session,
+    ): Promise<undefined | SessionSendResult> => {
       const handle = session.runtimeHandle;
       if (!handle) {
         throw new Error(`Session ${sessionId} has no runtime handle`);
@@ -3550,7 +3552,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     // retry-with-restore, etc.) emits a single `session.send_failed` event
     // (B16 — failure-only). Stage tag distinguishes which branch failed.
     let stage: "prepare" | "initial" | "restore_retry" = "prepare";
-    let sendResult: SessionSendResult | void = undefined;
+    let sendResult: SessionSendResult | undefined;
     try {
       let prepared = await prepareSession();
 
