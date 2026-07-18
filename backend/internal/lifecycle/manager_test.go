@@ -1954,6 +1954,24 @@ func TestSCMReviewFetchFailureHandsOffObservedOverlayWithoutMutatingDeliveryProo
 	if got := persisted.Seen["review:"+prURL]; got != "thread-c1" {
 		t.Fatalf("fetch fallback mutated agent delivery proof: %q", got)
 	}
+
+	// A genuinely clean current pipeline must not be re-alerted from that stale
+	// Seen value. Current/local overlay state, not historical delivery, owns the
+	// fetch-failure fallback decision.
+	clean := obs
+	clean.PR.HeadSHA = "sha-clean"
+	clean.Review.HeadSHA = "sha-clean"
+	clean.Review.Decision = string(domain.ReviewNone)
+	clean.Mergeability.State = string(domain.MergeUnknown)
+	clean.CI.Summary = string(domain.CIPassing)
+	m = New(st, nil, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now.Add(2 * time.Minute) }
+	if err := m.ApplySCMReviewFetchFailure(ctx, rec.ID, clean); err != nil {
+		t.Fatalf("clean pipeline fetch failure: %v", err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("stale Seen re-alerted a clean current pipeline: %+v", sink.intents)
+	}
 }
 
 func TestPRObservation_NudgesSuppressedWhileBlocked(t *testing.T) {

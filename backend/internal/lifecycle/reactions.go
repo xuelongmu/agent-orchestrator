@@ -430,13 +430,7 @@ func (m *Manager) ApplySCMReviewFetchFailure(ctx context.Context, id domain.Sess
 	}
 	failureSig := reviewFetchFailureSignature(o)
 	if failureSig == "" {
-		// A prior actual delivery proves a review backlog even if an older/local
-		// provider cannot supply the overlay decision on this failed refresh.
-		if delivered := m.react.seen["review:"+prURL]; delivered != "" {
-			failureSig = "delivered\x00" + delivered
-		} else {
-			return nil
-		}
+		return nil
 	}
 	rec, eligible, err := m.idleReviewFailureSession(ctx, id)
 	if err != nil || !eligible {
