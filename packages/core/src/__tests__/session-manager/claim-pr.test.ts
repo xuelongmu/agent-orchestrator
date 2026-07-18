@@ -105,6 +105,7 @@ describe("claimPR", () => {
       branch: "feat/existing-pr",
       status: "pr_open",
       pr: "https://github.com/org/my-app/pull/42",
+      prBaseBranch: "main",
     });
     expect(raw!["prAutoDetect"]).toBeUndefined();
   });

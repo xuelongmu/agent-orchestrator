@@ -1442,14 +1442,25 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         branch = `session/${sessionId}`;
       }
 
-      // Stacked PR: resolve the base branch this session stacks on. Explicit
-      // `baseRef` wins; otherwise derive it from the parent session's branch.
+      // Stacked PR: resolve the base branch this session stacks on. Validate the
+      // parent link first; then an explicit `baseRef` wins, otherwise derive it
+      // from the parent session's branch.
       // `stackBaseBranch` differing from the default branch signals a stacked
       // session — the workspace branches off it and the agent targets it with
       // `gh pr create --base`.
       const parentSessionId = spawnConfig.parentSessionId;
       let stackBaseBranch = spawnConfig.baseRef;
+      let stackBaseRepoPath: string | undefined;
       if (parentSessionId) {
+        // A stack link is only valid within the child's project. Resolve it even
+        // when a fresh spawn supplies baseRef explicitly, so a typo/stale parent
+        // id cannot be persisted as valid lineage and confuse later retargeting.
+        const parentRecord = findSessionRecord(parentSessionId, spawnConfig.projectId);
+        if (!parentRecord && !options?.reuseIdentity) {
+          throw new Error(
+            `Cannot stack session on parent "${parentSessionId}": parent not found`,
+          );
+        }
         if (spawnConfig.baseRef && !options?.reuseIdentity) {
           // Explicit override on a fresh spawn: `SessionSpawnConfig.baseRef` is
           // derived from `parentSessionId` only when omitted, so honor a
@@ -1458,26 +1469,22 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           // baseRef, not a fresh user choice, so it re-resolves below instead.
           stackBaseBranch = spawnConfig.baseRef;
         } else {
+          // Parent-derived bases may exist only in the parent's workspace until
+          // they are pushed. Explicit overrides, however, retain the historical
+          // project-checkout lookup so a project-local branch still works.
+          stackBaseRepoPath = parentRecord?.raw["worktree"] || undefined;
           // Re-resolve the base from the parent's CURRENT lifecycle — never replay
           // a stale persisted `baseRef`. A held child carries `baseRef` = parent
           // branch, but by the time it unblocks the parent has usually merged;
           // branching off that (deleted) branch would reintroduce the parent's
-          // work. Session ids are globally unique, so resolve across every
-          // project's sessions dir, not just this child's.
-          const parentRecord = findSessionRecord(parentSessionId);
-          if (!parentRecord && !options?.reuseIdentity) {
-            // Fresh spawn with an unknown parent — a genuine misconfiguration.
-            throw new Error(
-              `Cannot stack session on parent "${parentSessionId}": parent not found`,
-            );
-          }
+          // work. Parentage is project-local, matching lifecycle retargeting.
           // Single source of truth for the base (see resolveStackedChildBase).
           const resolved = resolveStackedChildBase(
             parentRecord
               ? {
                   lifecycle: parseLifecycleFromRaw(parentRecord.raw),
                   branch: parentRecord.raw["branch"],
-                  ownBase: parentRecord.raw["baseRef"],
+                  ownBase: parentRecord.raw["prBaseBranch"] || parentRecord.raw["baseRef"],
                 }
               : null,
           );
@@ -1584,6 +1591,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           branch,
           worktreeDir: getProjectWorktreesDir(spawnConfig.projectId),
           ...(stackBaseBranch ? { baseRef: stackBaseBranch } : {}),
+          ...(stackBaseBranch && stackBaseRepoPath ? { baseRepoPath: stackBaseRepoPath } : {}),
         });
         workspacePath = wsInfo.path;
         // Only register destroy when the path is inside a managed root —
@@ -3701,6 +3709,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     updateMetadata(sessionsDir, sessionId, {
       pr: pr.url,
       prs: newPrs,
+      prBaseBranch: pr.baseBranch,
       status: deriveLegacyStatus(claimLifecycle),
       branch: pr.branch,
       prAutoDetect: "",

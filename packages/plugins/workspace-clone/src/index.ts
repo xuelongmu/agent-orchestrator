@@ -68,6 +68,7 @@ export function create(config?: Record<string, unknown>): Workspace {
       assertSafePathSegment(cfg.sessionId, "sessionId");
 
       const repoPath = expandPath(cfg.project.path);
+      const baseRepoPath = expandPath(cfg.baseRepoPath ?? cfg.project.path);
       const projectCloneDir = join(cloneBaseDir, cfg.projectId);
       const clonePath = join(projectCloneDir, cfg.sessionId);
 
@@ -91,14 +92,22 @@ export function create(config?: Record<string, unknown>): Workspace {
       }
 
       // Stacked PR: cut the feature branch below from the parent's branch instead
-      // of the project default. Prefer the LOCAL source repo's branch — like the
+      // of the project default. Prefer the parent session's LOCAL clone — like the
       // worktree plugin — because it is the parent's freshest state (it may carry
-      // commits not yet pushed while the parent is still working). Only when the
-      // local repo lacks the branch do we clone the remote ref directly.
+      // commits not yet pushed while the parent is still working). Only when that
+      // repo lacks the branch do we clone the remote ref directly. The default
+      // branch is cloned directly: fetching it into the clone's checked-out
+      // branch would be a same-branch refspec update and can fail.
       let localBaseExists = false;
-      if (cfg.baseRef) {
+      if (cfg.baseRef && cfg.baseRef !== cfg.project.defaultBranch) {
         try {
-          await git(repoPath, "rev-parse", "--verify", "--quiet", `refs/heads/${cfg.baseRef}`);
+          await git(
+            baseRepoPath,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            `refs/heads/${cfg.baseRef}`,
+          );
           localBaseExists = true;
         } catch {
           localBaseExists = false;
@@ -140,7 +149,7 @@ export function create(config?: Record<string, unknown>): Workspace {
           await git(
             clonePath,
             "fetch",
-            repoPath,
+            baseRepoPath,
             `refs/heads/${cfg.baseRef}:refs/heads/${cfg.baseRef}`,
           );
           await git(clonePath, "checkout", cfg.baseRef);

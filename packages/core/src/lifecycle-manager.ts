@@ -986,6 +986,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           updateMetadata(sessionsDir, session.id, {
             pr: session.pr.url,
             prs: allPrUrls,
+            prBaseBranch: session.pr.baseBranch,
           });
           recordActivityEvent({
             projectId: session.projectId,
@@ -1083,6 +1084,17 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         // Keep in-memory isDraft in sync with enrichment data
         if (cached.isDraft !== undefined && session.pr) {
           session.pr.isDraft = cached.isDraft;
+        }
+        // Preserve the SCM's live base independently from the spawn-time
+        // baseRef. PRs reconstructed from persisted URLs otherwise lose their
+        // baseBranch, and a middle stack can later retarget children to a stale
+        // base after restart.
+        if (cached.baseBranch && session.pr) {
+          session.pr.baseBranch = cached.baseBranch;
+          if (session.metadata["prBaseBranch"] !== cached.baseBranch) {
+            updateMetadata(sessionsDir, session.id, { prBaseBranch: cached.baseBranch });
+            session.metadata["prBaseBranch"] = cached.baseBranch;
+          }
         }
       }
 
@@ -4712,8 +4724,18 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         ? {
             lifecycle: parent.lifecycle,
             branch: parent.branch,
-            // The parent's own base: prefer live enrichment, then persisted baseRef.
-            ownBase: parent.pr?.baseBranch || parent.metadata["baseRef"],
+            // Prefer the current poll's GraphQL base. Metadata is persisted only
+            // after all checks finish, so parent.pr may still contain the prior
+            // poll's value while a child is being retargeted.
+            ownBase:
+              (parent.pr
+                ? prEnrichmentCache.get(
+                    `${parent.pr.owner}/${parent.pr.repo}#${parent.pr.number}`,
+                  )?.baseBranch
+                : undefined) ||
+              parent.pr?.baseBranch ||
+              parent.metadata["prBaseBranch"] ||
+              parent.metadata["baseRef"],
           }
         : null,
     );
@@ -4722,7 +4744,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     // The branch the child currently stacks on (persisted at spawn). Without it
     // we can't compute the `--onto` cut point, so there's nothing safe to do.
-    const oldBase = child.metadata["baseRef"] || parent?.branch;
+    const oldBase = child.metadata["baseRef"];
     const nowIso = new Date().toISOString();
     if (!targetBase || !oldBase || oldBase === targetBase) {
       // Already on the target (or nothing resolvable) — latch so we stop polling.
@@ -4794,7 +4816,35 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           updateSessionMetadata(child, { stackRetargetedAt: nowIso });
           return;
         }
+        if (outcome === "not_found") {
+          recordActivityEvent({
+            projectId: child.projectId,
+            sessionId: child.id,
+            source: "lifecycle",
+            kind: "stacked.pr_retarget_not_found",
+            level: "warn",
+            summary: `${child.id} PR was not found; leaving stack retarget retryable`,
+            data: { parentSessionId, newBase: targetBase, prUrl: pr.url },
+          });
+          return;
+        }
       }
+    }
+
+    // Every tracked PR was confirmed on targetBase (edited or already there).
+    // Persist that SCM ground truth independently from the later handoff latch:
+    // if send() fails, a restart must still restore the PR's actual base.
+    if (child.prs.length > 0) {
+      updateSessionMetadata(child, { prBaseBranch: targetBase });
+      for (const pr of child.prs) {
+        pr.baseBranch = targetBase;
+        // pollAll() persists this cache after every check. Keep it aligned with
+        // the verified SCM edit so the stale pre-check enrichment cannot undo
+        // the new base in metadata or in memory during the same poll.
+        const cached = prEnrichmentCache.get(`${pr.owner}/${pr.repo}#${pr.number}`);
+        if (cached) cached.baseBranch = targetBase;
+      }
+      if (child.pr) child.pr.baseBranch = targetBase;
     }
 
     // Delegate the branch rebase to the agent (it owns the workspace). Only latch
@@ -4826,7 +4876,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     // Persist the new base so a later retarget of this child's own children
     // targets the right branch, and latch to stop re-processing.
-    updateSessionMetadata(child, { stackRetargetedAt: nowIso, baseRef: targetBase });
+    updateSessionMetadata(child, {
+      stackRetargetedAt: nowIso,
+      baseRef: targetBase,
+    });
     recordActivityEvent({
       projectId: child.projectId,
       sessionId: child.id,

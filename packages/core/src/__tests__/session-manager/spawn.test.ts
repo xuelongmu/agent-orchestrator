@@ -91,6 +91,7 @@ describe("spawn", () => {
 
     const createCfg = vi.mocked(mockWorkspace.create).mock.calls[0]![0];
     expect(createCfg.baseRef).toBe(parent.branch);
+    expect(createCfg.baseRepoPath).toBe(parent.workspacePath);
   });
 
   it("honors an explicit baseRef override alongside a parentSessionId on a fresh spawn (#11)", async () => {
@@ -104,6 +105,19 @@ describe("spawn", () => {
 
     const createCfg = vi.mocked(mockWorkspace.create).mock.calls[0]![0];
     expect(createCfg.baseRef).toBe("custom/base");
+    // Explicit bases retain the project-checkout lookup. Only a base derived
+    // from the parent should be probed in the parent's workspace.
+    expect(createCfg.baseRepoPath).toBeUndefined();
+  });
+
+  it("rejects an unknown parent even when a fresh spawn supplies baseRef (#66)", async () => {
+    const sm = createSessionManager({ config, registry: mockRegistry });
+
+    await expect(
+      sm.spawn({ projectId: "my-app", parentSessionId: "app-missing", baseRef: "custom/base" }),
+    ).rejects.toThrow('Cannot stack session on parent "app-missing": parent not found');
+
+    expect(mockWorkspace.create).not.toHaveBeenCalled();
   });
 
   it("forwards AO_AGENT_GH_TRACE into spawned agent runtime env when configured", async () => {

@@ -212,6 +212,7 @@ export function readMetadata(dataDir: string, sessionId: SessionId): SessionMeta
     blockedBy: readIdListField(raw["blockedBy"]),
     parentSessionId: raw["parentSessionId"] as string | undefined,
     baseRef: raw["baseRef"] as string | undefined,
+    prBaseBranch: raw["prBaseBranch"] as string | undefined,
     displayName: raw["displayName"] as string | undefined,
     displayNameUserSet:
       raw["displayNameUserSet"] === "off" ||
@@ -344,6 +345,7 @@ export function writeMetadata(
   if (blockedBySerialized) data["blockedBy"] = blockedBySerialized;
   if (metadata.parentSessionId) data["parentSessionId"] = metadata.parentSessionId;
   if (metadata.baseRef) data["baseRef"] = metadata.baseRef;
+  if (metadata.prBaseBranch) data["prBaseBranch"] = metadata.prBaseBranch;
   if (metadata.displayName) data["displayName"] = metadata.displayName;
   if (metadata.displayNameUserSet !== undefined)
     data["displayNameUserSet"] = metadata.displayNameUserSet;

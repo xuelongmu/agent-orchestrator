@@ -148,6 +148,20 @@ describe("sessionFromMetadata — multi-PR (issue #1821)", () => {
     expect(without.parentSessionId).toBeUndefined();
   });
 
+  it("restores the primary PR's durable base branch from metadata (#66)", () => {
+    const session = sessionFromMetadata(
+      "app-1",
+      {
+        pr: "https://github.com/acme/main/pull/10",
+        branch: "feat/pr-10",
+        prBaseBranch: "release/next",
+      },
+      baseOptions,
+    );
+
+    expect(session.pr?.baseBranch).toBe("release/next");
+  });
+
   it("1.13 — blocked session keeps workspacePath null despite fallback", () => {
     const blockedLifecycle = {
       version: 2,

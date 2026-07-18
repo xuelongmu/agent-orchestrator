@@ -164,6 +164,7 @@ describe("GraphQL Batch Query Generation", () => {
     expect(query).toContain("mergeable");
     expect(query).toContain("mergeStateStatus");
     expect(query).toContain("reviewDecision");
+    expect(query).toContain("baseRefName");
     expect(query).toContain("commits");
     expect(query).toContain("statusCheckRollup");
   });
@@ -378,6 +379,7 @@ describe("PR Enrichment Data Extraction", () => {
       mergeable: "MERGEABLE",
       mergeStateStatus: "CLEAN",
       reviewDecision: "APPROVED",
+      baseRefName: "release/next",
       reviews: {
         nodes: [
           { author: { login: "user1" }, state: "APPROVED", submittedAt: "2024-01-01T00:00:00Z" },
@@ -414,6 +416,7 @@ describe("PR Enrichment Data Extraction", () => {
     expect(extracted?.data.isDraft).toBe(false);
     expect(extracted?.data.hasConflicts).toBe(false);
     expect(extracted?.data.isBehind).toBe(false);
+    expect(extracted?.data.baseBranch).toBe("release/next");
     expect(extracted?.data.blockers).toEqual([]);
   });
 
