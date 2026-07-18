@@ -1,5 +1,29 @@
 # @aoagents/ao-plugin-tracker-linear
 
+## 0.10.0
+
+### Minor Changes
+
+- 2d456c4: feat(core,tracker): model parent/child + blocking relations
+
+  Extend the tracker contract with issue hierarchy and dependency relations:
+  - `CreateIssueInput` gains `parentId`, `blockedBy`, and `relatedTo`.
+  - `Issue` gains `parentId`, `children`, `blockedBy`, `blocks`, and `relatedTo`.
+  - Linear sets the parent on create, creates `blocks`/`related` relations via
+    `issueRelationCreate`, and returns hierarchy + relations from `getIssue`.
+  - GitHub and GitLab emulate relations (best-effort) via a body convention
+    (`Part of #N` / `Blocked by #N` / `Related to #N`) that round-trips through
+    `getIssue`.
+
+### Patch Changes
+
+- Updated dependencies [669ed4c]
+- Updated dependencies [1b9718a]
+- Updated dependencies [2d456c4]
+- Updated dependencies [2caaec2]
+- Updated dependencies [c0ef32c]
+  - @aoagents/ao-core@0.10.0
+
 ## 0.9.3
 
 ### Patch Changes

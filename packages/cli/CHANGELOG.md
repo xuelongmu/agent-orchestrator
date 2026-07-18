@@ -1,5 +1,99 @@
 # @aoagents/ao-cli
 
+## 0.10.0
+
+### Minor Changes
+
+- 669ed4c: feat(cli,core): `ao plan` — decompose a goal into linked tickets with an approval gate
+
+  Add a planner that turns a high-level goal into a reviewable DAG of linked
+  tickets and only creates them after human approval:
+  - `ao plan "<goal>" [--project <id>] [--yes] [--json]` runs a decomposer agent
+    headlessly (read-only), parses and validates the structured plan (unique refs,
+    resolvable relations, acyclic), renders it for review, and — on confirmation —
+    bulk-creates the tickets via the tracker in topological order so blocking and
+    parent relations resolve to real issue numbers. Per-ticket `repo` overrides
+    route tickets to the correct repository.
+  - New `core` planner module: `parsePlan`, `validatePlanGraph`, `topoSortPlan`,
+    `createPlanTickets`, `decomposeGoal`, plus codex/claude headless runners and a
+    `decomposer` agent resolver. The runner is injectable for tests and alternative
+    agents.
+  - Wires the previously-unused `decomposer` config field (`decomposer.agent`,
+    falling back to the orchestrator/worker/default agent) and documents it in
+    `ao config-help`.
+  - Teaches the orchestrator prompt when and how to decompose goals with `ao plan`.
+  - GitHub and GitLab trackers now render and parse repo-qualified cross-repo
+    relation markers (`owner/repo#N`) in issue bodies, which `ao plan` relies on for
+    cross-repo blocker ordering. Both tracker packages are bumped so a released CLI
+    ships the matching tracker behavior.
+
+- 2caaec2: feat(notifier,web): native mobile push + actionable approve/deny callbacks
+
+  Deliver actionable "needs your decision" notifications to your phone and let you
+  resolve them from the notification — closing the loop back into AO (#13).
+  - New `notifier-telegram` plugin: instant native push via a Telegram bot, with
+    inline buttons. `notifyWithActions` renders Approve / Deny / Nudge / Kill as
+    tappable URL buttons (plus a View PR link when a PR is attached). Configure
+    `notifiers.telegram.botToken` (or `TELEGRAM_BOT_TOKEN`), `chatId`, and
+    `callbackBaseUrl` (your dashboard's public URL).
+  - Core now builds those actions for decision events and routes them through
+    `notifyWithActions` when a notifier supports it. The relative mutating callbacks
+    (Approve/Deny/Nudge/Kill) are passed only to notifiers that declare the new
+    `Notifier.resolvesActionCallbacks` capability — Telegram, and the desktop backend
+    only when the actionable AO Notifier.app is selected; notifiers that cannot turn a
+    relative endpoint into a working URL (e.g. Slack, OpenClaw, and the dashboard,
+    whose UI renders only `action.url`) never receive them. Ordinary URL actions (View PR) are delivered generically to
+    every notifier. Approve/Deny/Nudge/Kill are attached to a report-backed
+    `session.needs_input` (the genuine pending decision the callback resolves);
+    `review.changes_requested` and `merge.ready` get a View PR link. Each button is an HMAC-signed, expiring token bound to the decision
+    report's timestamp and minted with the shared `AO_NOTIFY_CALLBACK_SECRET`;
+    without the secret set, notifications behave exactly as before (opt-in). New
+    core exports: `buildNotifyActions`, `signCallbackToken`, `verifyCallbackToken`,
+    `getNotifyCallbackSecret`, `isNotifyActionEvent`, `resolveDecisionEventType`,
+    and the `NOTIFY_CALLBACK_*` constants.
+  - New web route `/api/notify-callback/:token`. `GET` is inert: it verifies the
+    token and renders a confirmation page whose form submits a `POST` — a signed URL
+    proves AO minted it but not that a human tapped it, so link scanners, URL
+    unfurlers, and browser prefetch must not be able to trigger the action. The
+    `POST` is where the decision is resolved (Approve/Deny/Nudge answer back into the
+    session via `sessionManager.send`; Kill terminates it) and recorded in the audit
+    trail.
+
+### Patch Changes
+
+- Updated dependencies [669ed4c]
+- Updated dependencies [1b9718a]
+- Updated dependencies [2d456c4]
+- Updated dependencies [2caaec2]
+- Updated dependencies [3e9f3c4]
+- Updated dependencies [c0ef32c]
+  - @aoagents/ao-core@0.10.0
+  - @aoagents/ao-plugin-tracker-github@0.10.0
+  - @aoagents/ao-plugin-tracker-linear@0.10.0
+  - @aoagents/ao-plugin-notifier-telegram@0.1.0
+  - @aoagents/ao-plugin-notifier-desktop@0.10.0
+  - @aoagents/ao-web@0.10.0
+  - @aoagents/ao-plugin-scm-github@0.10.0
+  - @aoagents/ao-plugin-agent-aider@0.10.0
+  - @aoagents/ao-plugin-agent-claude-code@0.10.0
+  - @aoagents/ao-plugin-agent-codex@0.10.0
+  - @aoagents/ao-plugin-agent-cursor@0.10.0
+  - @aoagents/ao-plugin-agent-grok@0.1.5
+  - @aoagents/ao-plugin-agent-kimicode@0.10.0
+  - @aoagents/ao-plugin-agent-opencode@0.10.0
+  - @aoagents/ao-plugin-notifier-composio@0.10.0
+  - @aoagents/ao-plugin-notifier-dashboard@0.10.0
+  - @aoagents/ao-plugin-notifier-discord@0.10.0
+  - @aoagents/ao-plugin-notifier-openclaw@0.10.0
+  - @aoagents/ao-plugin-notifier-slack@0.10.0
+  - @aoagents/ao-plugin-notifier-webhook@0.10.0
+  - @aoagents/ao-plugin-runtime-process@0.10.0
+  - @aoagents/ao-plugin-runtime-tmux@0.10.0
+  - @aoagents/ao-plugin-terminal-iterm2@0.10.0
+  - @aoagents/ao-plugin-terminal-web@0.10.0
+  - @aoagents/ao-plugin-workspace-clone@0.10.0
+  - @aoagents/ao-plugin-workspace-worktree@0.10.0
+
 ## 0.9.3
 
 ### Patch Changes
