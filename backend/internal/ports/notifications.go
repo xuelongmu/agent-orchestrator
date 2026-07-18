@@ -15,6 +15,11 @@ type NotificationIntent struct {
 	ProjectID domain.ProjectID
 	PRURL     string
 	CreatedAt time.Time
+	// TitleOverride and BodyOverride let a centralized human handoff explain
+	// the condition that automation could not deliver. Normal lifecycle
+	// notifications leave them empty and use the standard type-based copy.
+	TitleOverride string
+	BodyOverride  string
 
 	// Enrichment hints. These avoid storage reads on the hot path.
 	SessionDisplayName string

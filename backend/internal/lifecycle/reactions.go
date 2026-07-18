@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,20 +21,21 @@ import (
 const reviewMaxNudge = 3
 
 const reviewRoundCapNotificationFailed = "review-round-cap-notification-failed"
+const suppressedNudgeNotificationFailed = "suppressed-nudge-notification-failed"
 
-type reviewBacklogOutcomeKind string
+type humanHandoffOutcomeKind string
 
 const (
-	reviewBacklogBlocked  reviewBacklogOutcomeKind = "blocked"
-	reviewBacklogNotified reviewBacklogOutcomeKind = "notified"
+	humanHandoffBlocked  humanHandoffOutcomeKind = "blocked"
+	humanHandoffNotified humanHandoffOutcomeKind = "notified"
 )
 
-// reviewBacklogOutcome is the durable terminal result of a human handoff.
+// humanHandoffOutcome is the durable terminal result of a human handoff.
 // A failed delivery remains blocked and retryable; only a notification sink
 // that returns success may advance it to notified.
-type reviewBacklogOutcome struct {
-	Outcome reviewBacklogOutcomeKind `json:"outcome"`
-	Reason  string                   `json:"reason"`
+type humanHandoffOutcome struct {
+	Outcome humanHandoffOutcomeKind `json:"outcome"`
+	Reason  string                  `json:"reason"`
 }
 
 // ReviewDeliveryOutcome reports what ApplyReviewResult did with a completed
@@ -125,7 +127,7 @@ type reactionState struct {
 	mu       sync.Mutex
 	seen     map[string]string
 	attempts map[string]int
-	handoffs map[string]reviewBacklogOutcome
+	handoffs map[string]humanHandoffOutcome
 	// loaded tracks PR URLs whose persisted dedup payload has been merged into
 	// seen/attempts during this process. Lazy: we only pay the DB read on the
 	// first reaction touching each PR after startup.
@@ -133,16 +135,16 @@ type reactionState struct {
 }
 
 func newReactionState() reactionState {
-	return reactionState{seen: map[string]string{}, attempts: map[string]int{}, handoffs: map[string]reviewBacklogOutcome{}, loaded: map[string]bool{}}
+	return reactionState{seen: map[string]string{}, attempts: map[string]int{}, handoffs: map[string]humanHandoffOutcome{}, loaded: map[string]bool{}}
 }
 
 // reactionPayload is the JSON document persisted in pr.last_nudge_signature.
 // Keeping the schema explicit (and stable) lets the daemon restart and resume
 // the existing dedup state without re-nudging an agent.
 type reactionPayload struct {
-	Seen     map[string]string               `json:"seen,omitempty"`
-	Attempts map[string]int                  `json:"attempts,omitempty"`
-	Handoffs map[string]reviewBacklogOutcome `json:"handoffs,omitempty"`
+	Seen     map[string]string              `json:"seen,omitempty"`
+	Attempts map[string]int                 `json:"attempts,omitempty"`
+	Handoffs map[string]humanHandoffOutcome `json:"handoffs,omitempty"`
 }
 
 func reviewRoundCapHandoffKey(prURL string) string {
@@ -178,19 +180,6 @@ func (m *Manager) ApplyReviewRoundCapHandoff(ctx context.Context, id domain.Sess
 		}
 		m.react.loaded[prURL] = true
 	}
-	if prior := m.react.handoffs[key]; prior.Outcome == reviewBacklogNotified {
-		return nil
-	}
-
-	blocked := reviewBacklogOutcome{Outcome: reviewBacklogBlocked, Reason: reviewRoundCapNotificationFailed}
-	record := func(outcome reviewBacklogOutcome) error {
-		m.react.handoffs[key] = outcome
-		return m.persistPRSignaturesLocked(ctx, prURL)
-	}
-	if m.notifications == nil {
-		persistErr := record(blocked)
-		return errors.Join(errors.New("lifecycle: review round-cap notification sink is unavailable"), persistErr)
-	}
 	intent := ports.NotificationIntent{
 		Type:               domain.NotificationNeedsInput,
 		SessionID:          rec.ID,
@@ -205,14 +194,36 @@ func (m *Manager) ApplyReviewRoundCapHandoff(ctx context.Context, id domain.Sess
 		Provider:           obs.Provider,
 		Repo:               obs.Repo,
 	}
+	return m.deliverHumanHandoffLocked(ctx, prURL, key, reviewRoundCapNotificationFailed, intent, func() error {
+		return m.parkReviewRoundCapSession(ctx, id)
+	})
+}
+
+// deliverHumanHandoffLocked is the single durable outcome chokepoint for
+// lifecycle fallbacks that must reach a human. The caller holds react.mu and
+// has loaded prURL. Only confirmed notification delivery advances to notified;
+// missing/failed delivery stays blocked and retryable.
+func (m *Manager) deliverHumanHandoffLocked(ctx context.Context, prURL, key, reason string, intent ports.NotificationIntent, afterNotify func() error) error {
+	if prior := m.react.handoffs[key]; prior.Outcome == humanHandoffNotified {
+		return nil
+	}
+	record := func(outcome humanHandoffOutcome) error {
+		m.react.handoffs[key] = outcome
+		return m.persistPRSignaturesLocked(ctx, prURL)
+	}
+	blocked := humanHandoffOutcome{Outcome: humanHandoffBlocked, Reason: reason}
+	if m.notifications == nil {
+		return errors.Join(errors.New("lifecycle: human handoff notification sink is unavailable"), record(blocked))
+	}
 	if err := m.notifications.Notify(ctx, intent); err != nil {
-		persistErr := record(blocked)
-		return errors.Join(fmt.Errorf("lifecycle: review round-cap notification: %w", err), persistErr)
+		return errors.Join(fmt.Errorf("lifecycle: human handoff notification: %w", err), record(blocked))
 	}
-	if err := m.parkReviewRoundCapSession(ctx, id); err != nil {
-		return err
+	if afterNotify != nil {
+		if err := afterNotify(); err != nil {
+			return err
+		}
 	}
-	return record(reviewBacklogOutcome{Outcome: reviewBacklogNotified, Reason: reviewRoundCapNotificationFailed})
+	return record(humanHandoffOutcome{Outcome: humanHandoffNotified, Reason: reason})
 }
 
 func (m *Manager) parkReviewRoundCapSession(ctx context.Context, id domain.SessionID) error {
@@ -850,6 +861,11 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 		return sendOnceAccounted, err
 	}
 	if outcome != sessionguard.Sent {
+		if outcome == sessionguard.SuppressedAwaitingUser {
+			if err := m.handoffSuppressedPendingNudgeLocked(ctx, id, prURL, key, sig); err != nil {
+				return sendOnceSuppressed, err
+			}
+		}
 		return sendOnceSuppressed, nil
 	}
 	// Order: Send → in-memory mutation → durable persist. Sending first means a
@@ -866,6 +882,37 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 		}
 	}
 	return sendOnceAccounted, nil
+}
+
+// handoffSuppressedPendingNudgeLocked surfaces a PR condition that could not
+// reach the worker because a previously delivered prompt is still pending in
+// its editor. The condition remains unaccounted (no seen signature or attempt)
+// so it can reach the worker after the latch clears; the human fallback is
+// durably latched by condition signature so refresh/replay cannot duplicate it.
+func (m *Manager) handoffSuppressedPendingNudgeLocked(ctx context.Context, id domain.SessionID, prURL, key, sig string) error {
+	if prURL == "" {
+		return nil
+	}
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return err
+	}
+	if rec.Metadata.PendingSubmitFingerprint == "" {
+		return nil
+	}
+	sum := sha256.Sum256([]byte(key + "\x00" + sig))
+	handoffKey := fmt.Sprintf("nudge-handoff:%s:%x", prURL, sum)
+	intent := ports.NotificationIntent{
+		Type:               domain.NotificationNeedsInput,
+		SessionID:          rec.ID,
+		ProjectID:          rec.ProjectID,
+		PRURL:              prURL,
+		CreatedAt:          m.clock(),
+		TitleOverride:      "PR feedback is waiting",
+		BodyOverride:       "New pull request feedback could not be sent to the agent while editor input is pending. Open the pull request and submit or clear the pending input.",
+		SessionDisplayName: rec.DisplayName,
+	}
+	return m.deliverHumanHandoffLocked(ctx, prURL, handoffKey, suppressedNudgeNotificationFailed, intent, nil)
 }
 
 // loadPRSignaturesLocked merges any previously persisted reaction-dedup state
@@ -905,7 +952,7 @@ func (m *Manager) loadPRSignaturesLocked(ctx context.Context, prURL string) erro
 // hold m.react.mu. A failed persist surfaces upward so the in-memory mutation
 // (which the messenger already acted on) is not silently divergent from disk.
 func (m *Manager) persistPRSignaturesLocked(ctx context.Context, prURL string) error {
-	payload := reactionPayload{Seen: map[string]string{}, Attempts: map[string]int{}, Handoffs: map[string]reviewBacklogOutcome{}}
+	payload := reactionPayload{Seen: map[string]string{}, Attempts: map[string]int{}, Handoffs: map[string]humanHandoffOutcome{}}
 	for k, v := range m.react.seen {
 		if reactionKeyTargetsPR(k, prURL) {
 			payload.Seen[k] = v

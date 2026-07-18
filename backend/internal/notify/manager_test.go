@@ -70,6 +70,25 @@ func TestManagerNotifyDuplicateDoesNotPublish(t *testing.T) {
 	}
 }
 
+func TestManagerNotifyUsesHumanHandoffCopy(t *testing.T) {
+	st := &fakeStore{}
+	mgr := New(Deps{Store: st, Clock: time.Now, NewID: func() string { return "ntf_1" }})
+	intent := Intent{
+		Type:          domain.NotificationNeedsInput,
+		SessionID:     "mer-1",
+		ProjectID:     "mer",
+		PRURL:         "https://github.com/o/r/pull/1",
+		TitleOverride: "PR feedback is waiting",
+		BodyOverride:  "CI feedback could not be sent while editor input is pending.",
+	}
+	if err := mgr.Notify(context.Background(), intent); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if len(st.rows) != 1 || st.rows[0].Title != intent.TitleOverride || st.rows[0].Body != intent.BodyOverride {
+		t.Fatalf("stored notification = %+v, want handoff copy", st.rows)
+	}
+}
+
 func TestManagerNotifyRejectsUnknownType(t *testing.T) {
 	mgr := New(Deps{Store: &fakeStore{}, Clock: func() time.Time { return time.Now() }})
 	err := mgr.Notify(context.Background(), Intent{Type: "surprise", SessionID: "mer-1", ProjectID: "mer"})

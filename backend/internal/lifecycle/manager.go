@@ -160,6 +160,16 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	if s.Valid {
 		s = m.applyToolPrecedenceLocked(id, rec.Activity.State, s)
 	}
+	// Any authoritative non-waiting signal proves an editor-pending prompt is
+	// no longer waiting to be submitted. Clear that delivery latch before the
+	// same-state fast path below: activity persistence may otherwise be a no-op,
+	// but the safety latch is an independent durable fact.
+	pendingSubmitCleared := s.Valid && !s.State.NeedsInput() &&
+		(rec.Metadata.PendingSubmitFingerprint != "" || rec.Metadata.PendingSubmitRecoveryAttempted)
+	if pendingSubmitCleared {
+		rec.Metadata.PendingSubmitFingerprint = ""
+		rec.Metadata.PendingSubmitRecoveryAttempted = false
+	}
 	if !s.Valid && !metadataChanged {
 		m.mu.Unlock()
 		return nil
@@ -186,7 +196,7 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	// first to ARRIVE may match the seeded state — e.g. a turn's "active"
 	// POST is lost and its Stop hook lands idle on the idle-seeded row.
 	if sameState && !rec.FirstSignalAt.IsZero() {
-		if metadataChanged {
+		if metadataChanged || pendingSubmitCleared {
 			rec.UpdatedAt = now
 			err := m.store.UpdateSession(ctx, rec)
 			m.mu.Unlock()
