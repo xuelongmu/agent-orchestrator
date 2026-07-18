@@ -4,6 +4,8 @@ package sessionmanager
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -119,6 +121,9 @@ type Store interface {
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
 	CreateSession(ctx context.Context, rec domain.SessionRecord) (domain.SessionRecord, error)
 	UpdateSession(ctx context.Context, rec domain.SessionRecord) error
+	SetPendingSubmit(ctx context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error)
+	ClaimPendingSubmitRecovery(ctx context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error)
+	ClearPendingSubmit(ctx context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error)
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	ListSessions(ctx context.Context, project domain.ProjectID) ([]domain.SessionRecord, error)
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
@@ -1079,6 +1084,24 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("reconcile: list sessions: %w", err)
 	}
+	// Recover an editor draft before adopting its crash-surviving runtime. The
+	// durable claim prevents a restart from repeating an Enter that the prior
+	// daemon already attempted. A failed recovery is best-effort and never
+	// blocks the rest of boot reconciliation.
+	for _, rec := range recs {
+		if rec.Metadata.PendingSubmitFingerprint == "" {
+			continue
+		}
+		if rec.IsTerminated {
+			if _, clearErr := m.store.ClearPendingSubmit(ctx, rec.ID, rec.Metadata.PendingSubmitFingerprint, m.clock()); clearErr != nil {
+				m.logger.Error("reconcile: clear terminal pending submit failed", "sessionID", rec.ID, "error", clearErr)
+			}
+			continue
+		}
+		if _, _, recoverErr := m.recoverPendingSubmit(ctx, rec); recoverErr != nil {
+			m.logger.Error("reconcile: pending submit recovery failed", "sessionID", rec.ID, "error", recoverErr)
+		}
+	}
 	for _, rec := range recs {
 		if rec.IsTerminated {
 			continue
@@ -1535,6 +1558,27 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string)
 	if err != nil {
 		return err
 	}
+	// Resolve a prior delivery boundary before any new pane write. This is the
+	// critical caller-discarded-error path: while the latch remains, never paste
+	// full text again. A retry of the same prompt becomes a no-op once terminal
+	// output confirms the original submission.
+	latched, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return fmt.Errorf("send %s: pending submit lookup: %w", id, err)
+	}
+	if ok && latched.Metadata.PendingSubmitFingerprint != "" {
+		fingerprint := pendingSubmitFingerprint(message)
+		stillPending, recoveryAttempted, recoverErr := m.recoverPendingSubmit(ctx, latched)
+		if recoverErr != nil {
+			return fmt.Errorf("send %s: recover pending submit: %w", id, recoverErr)
+		}
+		if stillPending {
+			return &InputPendingError{SessionID: id, RecoveryAttempted: recoveryAttempted}
+		}
+		if fingerprint == latched.Metadata.PendingSubmitFingerprint {
+			return nil
+		}
+	}
 	outcome, err := m.messenger.Deliver(ctx, id, message)
 	if err != nil {
 		return fmt.Errorf("send %s: %w", id, err)
@@ -1569,7 +1613,7 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string)
 		agent, agentOK := m.agents.Agent(rec.Harness)
 		if agentOK {
 			if detector, supportsPendingDetection := agent.(inputPendingDetector); supportsPendingDetection {
-				if err := m.confirmInputSubmitted(ctx, m.messenger, detector, rec); err != nil {
+				if err := m.confirmInputSubmitted(ctx, m.messenger, detector, rec, pendingSubmitFingerprint(message)); err != nil {
 					return err
 				}
 			}
@@ -1586,7 +1630,7 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string)
 // pending paste is observed, it sends Enter only through the same just-in-time
 // session guard used by confirmActive. If the paste is still pending after the
 // bounded poll budget, the typed error tells callers not to resend the text.
-func (m *Manager) confirmInputSubmitted(ctx context.Context, guard *sessionguard.Guard, detector inputPendingDetector, rec domain.SessionRecord) error {
+func (m *Manager) confirmInputSubmitted(ctx context.Context, guard *sessionguard.Guard, detector inputPendingDetector, rec domain.SessionRecord, fingerprint string) error {
 	handle := runtimeHandle(rec.Metadata)
 	if handle.ID == "" || m.runtime == nil {
 		return nil
@@ -1616,17 +1660,43 @@ func (m *Manager) confirmInputSubmitted(ctx context.Context, guard *sessionguard
 			if pending && output == "" {
 				continue
 			}
+			if pending {
+				if _, clearErr := m.store.ClearPendingSubmit(ctx, rec.ID, fingerprint, m.clock()); clearErr != nil {
+					return fmt.Errorf("clear submitted pending input: %w", clearErr)
+				}
+			}
 			return nil
 		}
 
 		pending = true
+		if !recoveryAttempted && rec.Metadata.PendingSubmitFingerprint == "" {
+			set, setErr := m.store.SetPendingSubmit(ctx, rec.ID, fingerprint, m.clock())
+			if setErr != nil {
+				m.logger.Error("send: persist pending-input latch failed", "sessionID", rec.ID, "error", setErr)
+				return &InputPendingError{SessionID: rec.ID, RecoveryAttempted: false}
+			}
+			if !set {
+				return &InputPendingError{SessionID: rec.ID, RecoveryAttempted: false}
+			}
+			rec.Metadata.PendingSubmitFingerprint = fingerprint
+		}
 		if recoveryAttempted {
 			continue
 		}
+		claimed, claimErr := m.store.ClaimPendingSubmitRecovery(ctx, rec.ID, fingerprint, m.clock())
+		if claimErr != nil {
+			return fmt.Errorf("claim pending-input recovery: %w", claimErr)
+		}
+		if !claimed {
+			return &InputPendingError{SessionID: rec.ID, RecoveryAttempted: false}
+		}
+		recoveryAttempted = true
 		outcome, recoveryErr := guard.Deliver(ctx, rec.ID, "")
-		recoveryAttempted = outcome == sessionguard.Sent
 		if recoveryErr != nil {
 			m.logger.Warn("send: pending-input Enter recovery failed", "sessionID", rec.ID, "error", recoveryErr)
+		}
+		if outcome == sessionguard.SuppressedAwaitingUser || outcome == sessionguard.SuppressedTerminated {
+			_, _ = m.store.ClearPendingSubmit(ctx, rec.ID, fingerprint, m.clock())
 		}
 		if outcome != sessionguard.Sent {
 			return &InputPendingError{SessionID: rec.ID, RecoveryAttempted: false}
@@ -1637,6 +1707,89 @@ func (m *Manager) confirmInputSubmitted(ctx context.Context, guard *sessionguard
 		return &InputPendingError{SessionID: rec.ID, RecoveryAttempted: recoveryAttempted}
 	}
 	return nil
+}
+
+// recoverPendingSubmit inspects and, when still safe and not previously
+// claimed, submits one durably latched editor draft with Enter only. It returns
+// stillPending when callers must not deliver any full prompt text.
+func (m *Manager) recoverPendingSubmit(ctx context.Context, rec domain.SessionRecord) (stillPending, recoveryAttempted bool, err error) {
+	fingerprint := rec.Metadata.PendingSubmitFingerprint
+	if fingerprint == "" {
+		return false, false, nil
+	}
+	if rec.IsTerminated || rec.Activity.State == domain.ActivityBlocked {
+		_, err := m.store.ClearPendingSubmit(ctx, rec.ID, fingerprint, m.clock())
+		return false, rec.Metadata.PendingSubmitRecoveryAttempted, err
+	}
+	if m.runtime == nil || m.agents == nil || rec.Metadata.RuntimeHandleID == "" {
+		return true, rec.Metadata.PendingSubmitRecoveryAttempted, nil
+	}
+	agent, ok := m.agents.Agent(rec.Harness)
+	if !ok {
+		return true, rec.Metadata.PendingSubmitRecoveryAttempted, nil
+	}
+	detector, ok := agent.(inputPendingDetector)
+	if !ok {
+		return true, rec.Metadata.PendingSubmitRecoveryAttempted, nil
+	}
+
+	recoveryAttempted = rec.Metadata.PendingSubmitRecoveryAttempted
+	handle := runtimeHandle(rec.Metadata)
+	for attempt := 1; attempt <= m.sendConfirm.maxAttempts; attempt++ {
+		timer := time.NewTimer(m.sendConfirm.pollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return true, recoveryAttempted, nil
+		case <-timer.C:
+		}
+
+		output, outputErr := m.runtime.GetOutput(ctx, handle, sendConfirmationOutputLines)
+		if outputErr != nil {
+			return true, recoveryAttempted, fmt.Errorf("read pending-input terminal output: %w", outputErr)
+		}
+		if !detector.IsInputPending(output) {
+			if output == "" {
+				continue
+			}
+			_, clearErr := m.store.ClearPendingSubmit(ctx, rec.ID, fingerprint, m.clock())
+			return false, recoveryAttempted, clearErr
+		}
+		if recoveryAttempted {
+			continue
+		}
+		claimed, claimErr := m.store.ClaimPendingSubmitRecovery(ctx, rec.ID, fingerprint, m.clock())
+		if claimErr != nil {
+			return true, recoveryAttempted, claimErr
+		}
+		if !claimed {
+			fresh, found, readErr := m.store.GetSession(ctx, rec.ID)
+			if readErr != nil {
+				return true, recoveryAttempted, readErr
+			}
+			if !found || fresh.IsTerminated || fresh.Activity.State == domain.ActivityBlocked {
+				_, clearErr := m.store.ClearPendingSubmit(ctx, rec.ID, fingerprint, m.clock())
+				return false, recoveryAttempted, clearErr
+			}
+			recoveryAttempted = fresh.Metadata.PendingSubmitRecoveryAttempted
+			continue
+		}
+		recoveryAttempted = true
+		outcome, sendErr := m.messenger.Deliver(ctx, rec.ID, "")
+		if sendErr != nil {
+			m.logger.Warn("send: pending-input Enter recovery failed", "sessionID", rec.ID, "error", sendErr)
+		}
+		if outcome == sessionguard.SuppressedAwaitingUser || outcome == sessionguard.SuppressedTerminated {
+			_, clearErr := m.store.ClearPendingSubmit(ctx, rec.ID, fingerprint, m.clock())
+			return false, recoveryAttempted, clearErr
+		}
+	}
+	return true, recoveryAttempted, nil
+}
+
+func pendingSubmitFingerprint(message string) string {
+	sum := sha256.Sum256([]byte(message))
+	return hex.EncodeToString(sum[:])
 }
 
 func (m *Manager) prepareOutboundMessage(ctx context.Context, id domain.SessionID, message string) (string, error) {

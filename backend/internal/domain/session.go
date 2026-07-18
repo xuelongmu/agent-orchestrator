@@ -38,6 +38,13 @@ type SessionMetadata struct {
 	// even when PreviewURL is unchanged. The desktop browser panel keys
 	// navigation on it so a repeated `ao preview <same-url>` still refreshes.
 	PreviewRevision int64 `json:"previewRevision,omitempty"`
+	// PendingSubmitFingerprint latches the digest of a prompt that reached an
+	// agent editor but was observed still waiting for submission. It is an
+	// internal delivery fact: while set, callers must never paste that prompt
+	// again. PendingSubmitRecoveryAttempted durably claims the single Enter-only
+	// recovery attempt so daemon restarts cannot repeat it.
+	PendingSubmitFingerprint       string `json:"pendingSubmitFingerprint,omitempty"`
+	PendingSubmitRecoveryAttempted bool   `json:"pendingSubmitRecoveryAttempted,omitempty"`
 }
 
 // SessionRecord is the persistence shape. It intentionally stores only durable
