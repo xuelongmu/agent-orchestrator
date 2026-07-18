@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"errors"
-	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -65,14 +64,13 @@ func (c *PRsController) resolveComments(w http.ResponseWriter, r *http.Request) 
 	}
 	prID := chi.URLParam(r, "id")
 
-	// Body is optional: omitting it resolves all unresolved threads.
 	var in ResolveCommentsRequest
-	if err := decodeJSON(r, &in); err != nil && !isEmptyBody(err) {
+	if err := decodeJSON(r, &in); err != nil {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Invalid JSON body", nil)
 		return
 	}
 
-	res, err := c.Svc.ResolveComments(r.Context(), prID, in.CommentIDs)
+	res, err := c.Svc.ResolveComments(r.Context(), prsvc.ResolveRequest{PRID: prID, PRURL: in.PRURL, ThreadIDs: in.CommentIDs})
 	if err != nil {
 		writePRError(w, r, err)
 		return
@@ -94,15 +92,15 @@ func writePRError(w http.ResponseWriter, r *http.Request, err error) {
 		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PR_HEAD_CHANGED", "PR head changed; refresh before merging", nil)
 	case errors.Is(err, prsvc.ErrPRPreconditions):
 		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "PR_PRECONDITIONS_UNMET", "PR merge preconditions are not met", nil)
+	case errors.Is(err, prsvc.ErrReviewThreadNotFound):
+		envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "REVIEW_THREAD_NOT_FOUND", "Unknown review thread", nil)
+	case errors.Is(err, prsvc.ErrPRPermissionDenied):
+		envelope.WriteAPIError(w, r, http.StatusForbidden, "forbidden", "PR_PERMISSION_DENIED", "GitHub token cannot update this pull request", nil)
 	case errors.Is(err, prsvc.ErrNothingToResolve):
 		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "NOTHING_TO_RESOLVE", "No unresolved review threads to resolve", nil)
+	case errors.Is(err, prsvc.ErrActionNotConfigured):
+		apispec.NotImplemented(w, r, "POST", "/api/v1/prs/{id}/resolve-comments")
 	default:
 		envelope.WriteAPIError(w, r, http.StatusInternalServerError, "internal", "PR_OPERATION_FAILED", "PR operation failed", nil)
 	}
-}
-
-// isEmptyBody reports whether err signals an absent or empty request body.
-// io.ErrUnexpectedEOF means a truncated/malformed body — bad request, not absent.
-func isEmptyBody(err error) bool {
-	return errors.Is(err, io.EOF)
 }

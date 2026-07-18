@@ -593,8 +593,11 @@ type MergePRResponse struct {
 	Method   string `json:"method"`
 }
 
-// ResolveCommentsRequest is the optional body of POST /api/v1/prs/{id}/resolve-comments.
+// ResolveCommentsRequest is the body of POST /api/v1/prs/{id}/resolve-comments.
+// PRURL disambiguates repository-local PR numbers; omitting CommentIDs resolves
+// every locally-known unresolved thread on that PR.
 type ResolveCommentsRequest struct {
+	PRURL      string   `json:"prUrl" minLength:"1"`
 	CommentIDs []string `json:"commentIds,omitempty"`
 }
 

@@ -362,6 +362,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/APIError'
           description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
         "404":
           content:
             application/json:
@@ -784,6 +790,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/APIError'
           description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
         "404":
           content:
             application/json:
@@ -822,6 +834,12 @@ paths:
         schema:
           description: PR number.
           type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveCommentsRequest'
+        required: true
       responses:
         "200":
           content:
@@ -829,6 +847,18 @@ paths:
               schema:
                 $ref: '#/components/schemas/ResolveCommentsResponse'
           description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
         "404":
           content:
             application/json:
@@ -2522,6 +2552,18 @@ components:
       - ok
       - sessionId
       - displayName
+      type: object
+    ResolveCommentsRequest:
+      properties:
+        commentIds:
+          items:
+            type: string
+          type: array
+        prUrl:
+          minLength: 1
+          type: string
+      required:
+      - prUrl
       type: object
     ResolveCommentsResponse:
       properties:
