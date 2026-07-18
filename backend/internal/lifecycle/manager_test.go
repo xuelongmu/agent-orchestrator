@@ -400,23 +400,35 @@ func TestPRObservation_CancelledChecksDoNotNudge(t *testing.T) {
 	}
 }
 
-func TestReviewCommentsSignatureUsesStableIDs(t *testing.T) {
+func TestReviewCommentsSignatureTracksContentNotCount(t *testing.T) {
 	original := []ports.PRCommentObservation{
 		{ID: "c1", ThreadID: "t1", Author: "alice", File: "old.go", Line: 10, Body: "old", URL: "https://old"},
 		{ID: "c2", ThreadID: "t2", Author: "bob", File: "old.go", Line: 20, Body: "old", URL: "https://old"},
 	}
-	editedAndReordered := []ports.PRCommentObservation{
-		{ID: "c2", ThreadID: "t2", Author: "bob", File: "new.go", Line: 99, Body: "edited", URL: "https://new"},
-		{ID: "c1", ThreadID: "t1", Author: "alice", File: "new.go", Line: 42, Body: "edited", URL: "https://new"},
+	reordered := []ports.PRCommentObservation{
+		{ID: "c2", ThreadID: "t2", Author: "bob", File: "old.go", Line: 20, Body: "old", URL: "https://new"},
+		{ID: "c1", ThreadID: "t1", Author: "alice", File: "old.go", Line: 10, Body: "old", URL: "https://new"},
 	}
-	if got, want := reviewCommentsSignature(editedAndReordered), reviewCommentsSignature(original); got != want {
-		t.Fatalf("signature changed after edit/reorder\n got %q\nwant %q", got, want)
+	if got, want := reviewCommentsSignature(reordered), reviewCommentsSignature(original); got != want {
+		t.Fatalf("signature changed after reorder/link refresh\n got %q\nwant %q", got, want)
 	}
 
-	withNewComment := append([]ports.PRCommentObservation(nil), original...)
-	withNewComment = append(withNewComment, ports.PRCommentObservation{ID: "c3", ThreadID: "t2", Body: "new comment in same thread"})
-	if got, old := reviewCommentsSignature(withNewComment), reviewCommentsSignature(original); got == old {
-		t.Fatalf("new comment id should change signature, got %q", got)
+	edited := append([]ports.PRCommentObservation(nil), original...)
+	edited[0].Body = "new actionable detail"
+	if got, old := reviewCommentsSignature(edited), reviewCommentsSignature(original); got == old {
+		t.Fatalf("edited comment body should change signature, got %q", got)
+	}
+
+	replacedAtSameCount := append([]ports.PRCommentObservation(nil), original...)
+	replacedAtSameCount[0] = ports.PRCommentObservation{ID: "c3", ThreadID: "t3", Author: "carol", File: "new.go", Line: 30, Body: "replacement"}
+	if got, old := reviewCommentsSignature(replacedAtSameCount), reviewCommentsSignature(original); got == old {
+		t.Fatalf("same-count replacement should change signature, got %q", got)
+	}
+
+	withoutProviderIDs := []ports.PRCommentObservation{{File: "fallback.go", Line: 7, Body: "first"}}
+	editedWithoutProviderIDs := []ports.PRCommentObservation{{File: "fallback.go", Line: 7, Body: "second"}}
+	if got, old := reviewCommentsSignature(editedWithoutProviderIDs), reviewCommentsSignature(withoutProviderIDs); got == old {
+		t.Fatalf("content-only comments should still have distinct signatures, got %q", got)
 	}
 }
 
@@ -1019,6 +1031,51 @@ func TestPRObservation_DedupSurvivesManagerRestart(t *testing.T) {
 	}
 	if len(second.msgs) != 1 {
 		t.Fatalf("new signature should send, got %d msgs", len(second.msgs))
+	}
+}
+
+func TestPRObservation_EditedReviewCommentRenudgesAcrossRestart(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	o := ports.PRObservation{
+		Fetched: true,
+		URL:     "https://github.com/o/r/pull/49",
+		Review:  domain.ReviewChangesRequest,
+		Comments: []ports.PRCommentObservation{{
+			ID: "c1", ThreadID: "t1", Author: "alice", File: "main.go", Line: 49, Body: "first request",
+		}},
+	}
+
+	first := &fakeMessenger{}
+	if err := New(st, first).ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatalf("first ApplyPRObservation: %v", err)
+	}
+	if len(first.msgs) != 1 {
+		t.Fatalf("first observation: want 1 nudge, got %d", len(first.msgs))
+	}
+
+	// A new manager proves the signature is loaded from durable PR state, not
+	// retained only in memory. Identical content remains suppressed.
+	second := &fakeMessenger{}
+	m2 := New(st, second)
+	if err := m2.ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatalf("identical post-restart ApplyPRObservation: %v", err)
+	}
+	if len(second.msgs) != 0 {
+		t.Fatalf("identical post-restart feedback re-nudged: %v", second.msgs)
+	}
+
+	// GitHub keeps the comment/thread IDs when a reviewer edits a comment.
+	// The actionable content changed while the unresolved count stayed one, so
+	// the worker must receive the revised request.
+	edited := o
+	edited.Comments = append([]ports.PRCommentObservation(nil), o.Comments...)
+	edited.Comments[0].Body = "revised request with a new constraint"
+	if err := m2.ApplyPRObservation(ctx, "mer-1", edited); err != nil {
+		t.Fatalf("edited ApplyPRObservation: %v", err)
+	}
+	if len(second.msgs) != 1 || !strings.Contains(second.msgs[0], "new constraint") {
+		t.Fatalf("edited same-count feedback did not re-nudge with new content: %v", second.msgs)
 	}
 }
 
