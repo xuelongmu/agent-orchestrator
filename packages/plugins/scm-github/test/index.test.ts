@@ -1269,7 +1269,9 @@ describe("scm-github plugin", () => {
           isBot: false,
         }),
       ]);
-      expect(ghMock.mock.calls[0]?.[1]).toContain("comments(first: 100)");
+      expect(ghMock.mock.calls[0]?.[1]).toEqual(
+        expect.arrayContaining([expect.stringContaining("comments(first: 100)")]),
+      );
     });
 
     it("pages all review submissions so an older current-head approval remains visible", async () => {
