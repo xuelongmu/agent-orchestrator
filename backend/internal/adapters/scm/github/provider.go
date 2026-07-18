@@ -15,6 +15,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 // ciFailureLogTailLines is the number of trailing lines of a failed job's
@@ -42,9 +43,12 @@ type ProviderOptions struct {
 // loop in v1 — the loop is a follow-up PR (#35); this adapter is the
 // observation primitive that loop will call.
 type Provider struct {
-	client *Client
-	logger *slog.Logger
+	client      *Client
+	logger      *slog.Logger
+	runCheckout checkoutCommandRunner
 }
+
+type checkoutCommandRunner func(ctx context.Context, dir, name string, args ...string) (string, error)
 
 // RecommendedPollDelay exposes the client's latest GitHub quota guidance to
 // polling orchestrators without making the provider-neutral observer depend on
@@ -82,7 +86,84 @@ func NewProvider(opts ProviderOptions) (*Provider, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Provider{client: c, logger: logger}, nil
+	return &Provider{client: c, logger: logger, runCheckout: runCheckoutCommand}, nil
+}
+
+// CheckoutPullRequest switches workspacePath to the PR's source branch and
+// confirms that Git checked out the exact head commit observed from GitHub.
+// The caller persists claim ownership only after this method succeeds.
+func (p *Provider) CheckoutPullRequest(ctx context.Context, ref ports.SCMPRRef, pr ports.SCMPRObservation, workspacePath string) (bool, error) {
+	branch := strings.TrimSpace(pr.SourceBranch)
+	expectedHead := strings.TrimSpace(pr.HeadSHA)
+	if branch == "" {
+		return false, errors.New("github scm: PR source branch is empty")
+	}
+	if expectedHead == "" {
+		return false, errors.New("github scm: PR head SHA is empty")
+	}
+	run := p.runCheckout
+	if run == nil {
+		run = runCheckoutCommand
+	}
+	currentBranch, err := run(ctx, workspacePath, "git", "branch", "--show-current")
+	if err != nil {
+		return false, fmt.Errorf("github scm: inspect workspace branch: %w", err)
+	}
+	currentHead, err := run(ctx, workspacePath, "git", "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return false, fmt.Errorf("github scm: inspect workspace HEAD: %w", err)
+	}
+	if strings.TrimSpace(currentBranch) == branch && strings.EqualFold(strings.TrimSpace(currentHead), expectedHead) {
+		return false, nil
+	}
+	dirty, err := run(ctx, workspacePath, "git", "status", "--porcelain")
+	if err != nil {
+		return false, fmt.Errorf("github scm: inspect workspace status: %w", err)
+	}
+	if strings.TrimSpace(dirty) != "" {
+		return false, fmt.Errorf("github scm: workspace has uncommitted changes; cannot switch to PR branch %q safely", branch)
+	}
+	repo := strings.TrimSpace(ref.Repo.Repo)
+	if repo == "" {
+		repo = strings.Trim(strings.TrimSpace(ref.Repo.Owner)+"/"+strings.TrimSpace(ref.Repo.Name), "/")
+	}
+	if _, err := run(ctx, workspacePath, "gh", "pr", "checkout", strconv.Itoa(ref.Number), "--repo", repo); err != nil {
+		return false, fmt.Errorf("github scm: check out PR #%d: %w", ref.Number, err)
+	}
+	checkedOutBranch, err := run(ctx, workspacePath, "git", "branch", "--show-current")
+	if err != nil {
+		return false, fmt.Errorf("github scm: verify workspace branch: %w", err)
+	}
+	checkedOutBranch = strings.TrimSpace(checkedOutBranch)
+	if checkedOutBranch != branch {
+		actual := fmt.Sprintf("branch %q", checkedOutBranch)
+		if checkedOutBranch == "" {
+			actual = "detached HEAD"
+		}
+		return false, fmt.Errorf("github scm: checked out PR #%d branch %q, but workspace is on %s", ref.Number, branch, actual)
+	}
+	checkedOutHead, err := run(ctx, workspacePath, "git", "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return false, fmt.Errorf("github scm: verify workspace HEAD: %w", err)
+	}
+	checkedOutHead = strings.TrimSpace(checkedOutHead)
+	if !strings.EqualFold(checkedOutHead, expectedHead) {
+		return false, fmt.Errorf("github scm: workspace HEAD %s does not match PR head %s", checkedOutHead, expectedHead)
+	}
+	return true, nil
+}
+
+func runCheckoutCommand(ctx context.Context, dir, name string, args ...string) (string, error) {
+	cmd := aoprocess.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if message := strings.TrimSpace(string(out)); message != "" {
+			return "", fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, message)
+		}
+		return "", fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
+	return string(out), nil
 }
 
 // SCMCredentialsAvailable checks whether this provider can obtain a token. The

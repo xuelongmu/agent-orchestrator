@@ -114,6 +114,10 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	if err != nil {
 		return ClaimPRResult{}, err
 	}
+	branchChanged, err := s.scm.CheckoutPullRequest(ctx, refSpec, obs.PR, rec.Metadata.WorkspacePath)
+	if err != nil {
+		return ClaimPRResult{}, fmt.Errorf("checkout PR #%d: %w", number, err)
+	}
 	now := s.clock().UTC()
 	pr, checks, reviews, threads, comments := claimRowsFromSCM(id, obs, now)
 	outcome, err := s.prClaimer.ClaimPR(ctx, pr, checks, reviews, threads, comments, reviewMode, opts.AllowTakeover)
@@ -125,10 +129,7 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 		return ClaimPRResult{}, err
 	}
 	prs = claimedFirst(prs, prURL)
-	// TODO: implement workspace branch checkout. Until then, leave BranchChanged
-	// false and let CLI output omit the checkout line rather than claiming the
-	// session was already on the PR branch.
-	res := ClaimPRResult{PRs: prs, BranchChanged: false, DonorWasTerminated: outcome.OwnerTerminated}
+	res := ClaimPRResult{PRs: prs, BranchChanged: branchChanged, DonorWasTerminated: outcome.OwnerTerminated}
 	if outcome.PreviousOwner != "" && outcome.PreviousOwner != id {
 		res.TakenOverFrom = []domain.SessionID{outcome.PreviousOwner}
 	}

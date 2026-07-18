@@ -46,6 +46,72 @@ func newFakeGH(t *testing.T) *fakeGH {
 	return f
 }
 
+func TestCheckoutPullRequestVerifiesBranchAndExactHead(t *testing.T) {
+	tests := []struct {
+		name        string
+		outputs     []string
+		wantChanged bool
+		wantErr     string
+		wantGH      bool
+	}{
+		{
+			name:        "checks out and verifies exact head",
+			outputs:     []string{"ao/mer-1\n", "old-sha\n", "", "", "fix/exact-head\n", "abc123\n"},
+			wantChanged: true,
+			wantGH:      true,
+		},
+		{
+			name:    "rejects successful checkout at wrong head",
+			outputs: []string{"ao/mer-1\n", "old-sha\n", "", "", "fix/exact-head\n", "deadbeef\n"},
+			wantErr: "workspace HEAD deadbeef does not match PR head abc123",
+			wantGH:  true,
+		},
+		{
+			name:        "already on exact branch and head",
+			outputs:     []string{"fix/exact-head\n", "abc123\n"},
+			wantChanged: false,
+		},
+		{
+			name:    "refuses dirty workspace",
+			outputs: []string{"ao/mer-1\n", "old-sha\n", " M work.go\n"},
+			wantErr: "uncommitted changes",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			ghCalled := false
+			p := &Provider{runCheckout: func(_ context.Context, _ string, name string, _ ...string) (string, error) {
+				if name == "gh" {
+					ghCalled = true
+				}
+				if calls >= len(tc.outputs) {
+					t.Fatalf("unexpected command %s", name)
+				}
+				out := tc.outputs[calls]
+				calls++
+				return out, nil
+			}}
+			changed, err := p.CheckoutPullRequest(context.Background(), ports.SCMPRRef{
+				Repo: ports.SCMRepo{Owner: "acme", Name: "repo", Repo: "acme/repo"}, Number: 7,
+			}, ports.SCMPRObservation{Number: 7, SourceBranch: "fix/exact-head", HeadSHA: "abc123"}, "/ws")
+			if tc.wantErr == "" && err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("err = %v, want substring %q", err, tc.wantErr)
+			}
+			if changed != tc.wantChanged {
+				t.Fatalf("changed = %v, want %v", changed, tc.wantChanged)
+			}
+			if ghCalled != tc.wantGH {
+				t.Fatalf("gh called = %v, want %v", ghCalled, tc.wantGH)
+			}
+		})
+	}
+}
+
 // on registers a handler for one METHOD + path tuple. Path is taken
 // verbatim (no query string).
 func (f *fakeGH) on(method, path string, h http.HandlerFunc) {
