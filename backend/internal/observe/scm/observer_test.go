@@ -36,6 +36,7 @@ type fakeStore struct {
 	sessionWorktrees map[domain.SessionID][]domain.SessionWorktreeRecord
 	prs              map[domain.SessionID][]domain.PullRequest
 	checks           map[string][]domain.PullRequestCheck
+	ciRerunAttempts  map[string]ports.SCMCIRerunAttempt
 	writeErr         error
 
 	writes []fakeWrite
@@ -131,6 +132,34 @@ func (s *fakeStore) WriteSCMObservation(_ context.Context, pr domain.PullRequest
 	return nil
 }
 
+func (s *fakeStore) GetCIRerunAttempt(_ context.Context, prURL, headSHA, checkName string) (ports.SCMCIRerunAttempt, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attempt, ok := s.ciRerunAttempts[prURL+"\x00"+headSHA+"\x00"+checkName]
+	return attempt, ok, nil
+}
+
+func (s *fakeStore) ReserveCIRerunAttempt(_ context.Context, attempt ports.SCMCIRerunAttempt) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ciRerunAttempts == nil {
+		s.ciRerunAttempts = map[string]ports.SCMCIRerunAttempt{}
+	}
+	key := attempt.PRURL + "\x00" + attempt.HeadSHA + "\x00" + attempt.CheckName
+	if _, ok := s.ciRerunAttempts[key]; ok {
+		return false, nil
+	}
+	s.ciRerunAttempts[key] = attempt
+	return true, nil
+}
+
+func (s *fakeStore) UpdateCIRerunAttempt(_ context.Context, attempt ports.SCMCIRerunAttempt) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ciRerunAttempts[attempt.PRURL+"\x00"+attempt.HeadSHA+"\x00"+attempt.CheckName] = attempt
+	return nil
+}
+
 type fakeProvider struct {
 	mu           sync.Mutex
 	repoGuards   map[string]ports.SCMGuardResult
@@ -140,6 +169,8 @@ type fakeProvider struct {
 	observations map[string]ports.SCMObservation
 	reviews      map[string]ports.SCMReviewObservation
 	logTails     map[string]string
+	changedFiles map[string][]string
+	rerunErr     error
 	fetchErr     error
 	reviewErr    error
 
@@ -152,6 +183,8 @@ type fakeProvider struct {
 	fetchBatches     [][]ports.SCMPRRef
 	logCalls         int
 	reviewCalls      int
+	changedFileCalls int
+	rerunCalls       int
 	pollDelay        time.Duration
 }
 
@@ -235,6 +268,20 @@ func (p *fakeProvider) FetchReviewThreads(_ context.Context, ref ports.SCMPRRef)
 		return ports.SCMReviewObservation{}, p.reviewErr
 	}
 	return p.reviews[prKey(ref.Repo, ref.Number)], nil
+}
+
+func (p *fakeProvider) FetchPullRequestFiles(_ context.Context, ref ports.SCMPRRef) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.changedFileCalls++
+	return append([]string(nil), p.changedFiles[prKey(ref.Repo, ref.Number)]...), nil
+}
+
+func (p *fakeProvider) RerunFailedCheck(_ context.Context, _ ports.SCMRepo, _ ports.SCMCheckObservation) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rerunCalls++
+	return p.rerunErr
 }
 
 type fakeLifecycle struct {
@@ -325,10 +372,11 @@ func quietSlog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, 
 
 func testStoreWithSession() *fakeStore {
 	return &fakeStore{
-		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "feat"}}},
-		projects: map[string]domain.ProjectRecord{"p": {ID: "p", RepoOriginURL: "https://github.com/o/r.git"}},
-		prs:      map[domain.SessionID][]domain.PullRequest{},
-		checks:   map[string][]domain.PullRequestCheck{},
+		sessions:        []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "feat"}}},
+		projects:        map[string]domain.ProjectRecord{"p": {ID: "p", RepoOriginURL: "https://github.com/o/r.git"}},
+		prs:             map[domain.SessionID][]domain.PullRequest{},
+		checks:          map[string][]domain.PullRequestCheck{},
+		ciRerunAttempts: map[string]ports.SCMCIRerunAttempt{},
 	}
 }
 
@@ -1064,6 +1112,227 @@ func TestPoll_FailingCIFetchesLogTailOnlyWhenFingerprintChanged(t *testing.T) {
 	}
 	if len(store.writes) != 0 {
 		t.Fatalf("unchanged failed fingerprint with stored log tail should not write, got %d writes", len(store.writes))
+	}
+}
+
+func ciRerunObservation(providerID, logTail string) ports.SCMObservation {
+	obs := testObs(1)
+	failed := ports.SCMCheckObservation{
+		Name: "frontend test", Status: string(domain.PRCheckFailed), Conclusion: "failure",
+		ProviderID: providerID, LogTail: logTail,
+	}
+	obs.CI = ports.SCMCIObservation{
+		Summary: "failing", HeadSHA: obs.PR.HeadSHA, FailedFingerprint: "failed-fingerprint-" + providerID,
+		Checks: []ports.SCMCheckObservation{failed}, FailedChecks: []ports.SCMCheckObservation{failed},
+		FailureLogTail: logTail,
+	}
+	obs.Mergeability = ports.SCMMergeabilityObservation{State: string(domain.MergeBlocked), Blockers: []string{"ci_failing"}}
+	return obs
+}
+
+func ciRerunPollFixture(changedFiles []string, providerID, logTail string) (*fakeStore, *fakeProvider, *fakeLifecycle, *Observer) {
+	store := testStoreWithSession()
+	local := knownPR(1)
+	local.CIHash = "previous-ci"
+	store.prs["p-1"] = []domain.PullRequest{local}
+	provider := &fakeProvider{
+		repoGuards:   map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "repo-v2"}},
+		checkGuards:  map[string]ports.SCMGuardResult{commitKey(testRepo, "sha1"): {ETag: "ci-v2"}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): ciRerunObservation(providerID, logTail)},
+		changedFiles: map[string][]string{prKey(testRepo, 1): changedFiles},
+	}
+	lifecycle := &fakeLifecycle{}
+	observer := newTestObserver(store, provider, lifecycle, time.Unix(1_000, 0).UTC())
+	return store, provider, lifecycle, observer
+}
+
+func TestPoll_CIRerunRelatedFailureDispatchesWithoutRerun(t *testing.T) {
+	_, provider, lifecycle, observer := ciRerunPollFixture(
+		[]string{"frontend/src/renderer/components/CenterPane.tsx"},
+		"101", "FAIL frontend/src/renderer/components/CenterPane.test.tsx > renders",
+	)
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.rerunCalls != 0 {
+		t.Fatalf("rerun calls = %d, want 0 for a diff-related failure", provider.rerunCalls)
+	}
+	if len(lifecycle.observed) != 1 || lifecycle.observed[0].CI.RerunRequested {
+		t.Fatalf("related failure must take normal lifecycle path: %#v", lifecycle.observed)
+	}
+}
+
+func TestPoll_CIRerunPackageRelativeFailurePathDispatchesWithoutRerun(t *testing.T) {
+	_, provider, lifecycle, observer := ciRerunPollFixture(
+		[]string{"frontend/src/renderer/components/CenterPane.tsx"},
+		"101", "FAIL src/renderer/components/CenterPane.test.tsx > renders",
+	)
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.rerunCalls != 0 {
+		t.Fatalf("rerun calls = %d, want 0 for an ambiguous package-relative failure path", provider.rerunCalls)
+	}
+	if len(lifecycle.observed) != 1 || lifecycle.observed[0].CI.RerunRequested {
+		t.Fatalf("package-relative failure must take normal lifecycle path: %#v", lifecycle.observed)
+	}
+}
+
+func TestPoll_CIRerunUnrelatedUnitFailureRerunsOnceAndSuppressesDispatch(t *testing.T) {
+	store, provider, lifecycle, observer := ciRerunPollFixture(
+		[]string{"backend/internal/lifecycle/reactions.go"},
+		"101", "FAIL frontend/src/renderer/components/CenterPane.test.tsx > renders",
+	)
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.rerunCalls != 1 {
+		t.Fatalf("rerun calls = %d, want 1", provider.rerunCalls)
+	}
+	if len(lifecycle.observed) != 1 || !lifecycle.observed[0].CI.RerunRequested {
+		t.Fatalf("accepted rerun must suppress the stale CI dispatch: %#v", lifecycle.observed)
+	}
+	if len(store.ciRerunAttempts) != 1 {
+		t.Fatalf("durable attempts = %#v, want one", store.ciRerunAttempts)
+	}
+}
+
+func TestPoll_CIRerunReproducedFailureDispatches(t *testing.T) {
+	store, provider, lifecycle, observer := ciRerunPollFixture(
+		[]string{"backend/internal/lifecycle/reactions.go"},
+		"202", "FAIL frontend/src/renderer/components/CenterPane.test.tsx > renders",
+	)
+	key := "https://github.com/o/r/pull/1\x00sha1\x00frontend test"
+	store.ciRerunAttempts[key] = ports.SCMCIRerunAttempt{
+		PRURL: "https://github.com/o/r/pull/1", HeadSHA: "sha1", CheckName: "frontend test",
+		ProviderID: "101", Status: ports.SCMCIRerunRequested, RequestedAt: time.Unix(900, 0).UTC(),
+	}
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.rerunCalls != 0 {
+		t.Fatalf("reproduced failure rerun calls = %d, want 0", provider.rerunCalls)
+	}
+	if len(lifecycle.observed) != 1 || lifecycle.observed[0].CI.RerunRequested {
+		t.Fatalf("reproduced failure must resume normal dispatch: %#v", lifecycle.observed)
+	}
+}
+
+func TestPoll_CIRerunRestartDeduplicatesPendingAttempt(t *testing.T) {
+	store, provider, lifecycle, observer := ciRerunPollFixture(
+		[]string{"backend/internal/lifecycle/reactions.go"},
+		"101", "FAIL frontend/src/renderer/components/CenterPane.test.tsx > renders",
+	)
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store.writes = nil
+	lifecycle.observed = nil
+	restarted := newTestObserver(store, provider, lifecycle, time.Unix(1_001, 0).UTC())
+	if err := restarted.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.rerunCalls != 1 {
+		t.Fatalf("rerun calls across restart = %d, want exactly 1", provider.rerunCalls)
+	}
+	if len(lifecycle.observed) != 1 || !lifecycle.observed[0].CI.RerunRequested {
+		t.Fatalf("same pending provider job must stay suppressed after restart: %#v", lifecycle.observed)
+	}
+}
+
+func TestPoll_CIRerunUnchangedFailureDispatchesAfterPendingTimeout(t *testing.T) {
+	store, provider, lifecycle, observer := ciRerunPollFixture(
+		[]string{"backend/internal/lifecycle/reactions.go"},
+		"101", "FAIL frontend/src/renderer/components/CenterPane.test.tsx > renders",
+	)
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.rerunCalls != 1 || len(store.writes) < 2 {
+		t.Fatalf("first poll reruns=%d writes=%d, want 1 and persisted acknowledgement", provider.rerunCalls, len(store.writes))
+	}
+	// Reconstruct the durable post-ack state a real SQLite store exposes after
+	// restart. The provider still reports the exact same failed job/check id.
+	store.prs["p-1"] = []domain.PullRequest{store.writes[len(store.writes)-1].pr}
+	store.checks["https://github.com/o/r/pull/1"] = append([]domain.PullRequestCheck(nil), store.writes[len(store.writes)-1].checks...)
+	store.writes = nil
+	lifecycle.observed = nil
+	restarted := newTestObserver(store, provider, lifecycle, time.Unix(1_000, 0).UTC().Add(ciRerunPendingTimeout+time.Second))
+	if err := restarted.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.rerunCalls != 1 {
+		t.Fatalf("rerun calls after timeout = %d, want still 1", provider.rerunCalls)
+	}
+	if len(lifecycle.observed) != 1 || lifecycle.observed[0].CI.RerunRequested {
+		t.Fatalf("expired unchanged failure must resume normal lifecycle dispatch: %#v", lifecycle.observed)
+	}
+}
+
+func TestPoll_CIRerunUnchangedPreFeatureFailureEntersPendingOnce(t *testing.T) {
+	store, provider, lifecycle, observer := ciRerunPollFixture(
+		[]string{"backend/internal/lifecycle/reactions.go"},
+		"101", "FAIL frontend/src/renderer/components/CenterPane.test.tsx > renders",
+	)
+	observed := provider.observations[prKey(testRepo, 1)]
+	local := store.prs["p-1"][0]
+	local.MetadataHash = metadataSemanticHash(observed)
+	local.CIHash = ciSemanticHash(observed.CI)
+	local.ReviewHash = reviewSemanticHash(observed.Review)
+	store.prs["p-1"] = []domain.PullRequest{local}
+
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.rerunCalls != 1 {
+		t.Fatalf("rerun calls = %d, want 1 for the first post-upgrade observation", provider.rerunCalls)
+	}
+	if len(lifecycle.observed) != 1 || !lifecycle.observed[0].CI.RerunRequested {
+		t.Fatalf("new rerun from unchanged facts must enter CI pending: %#v", lifecycle.observed)
+	}
+	lifecycle.observed = nil
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.rerunCalls != 1 || len(lifecycle.observed) != 0 {
+		t.Fatalf("pending unchanged poll must be quiet: reruns=%d lifecycle=%#v", provider.rerunCalls, lifecycle.observed)
+	}
+}
+
+func TestPoll_CIRerunProviderFailureResumesNormalDispatch(t *testing.T) {
+	store, provider, lifecycle, observer := ciRerunPollFixture(
+		[]string{"backend/internal/lifecycle/reactions.go"},
+		"101", "FAIL frontend/src/renderer/components/CenterPane.test.tsx > renders",
+	)
+	provider.rerunErr = errors.New("actions API unavailable")
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.rerunCalls != 1 {
+		t.Fatalf("rerun calls = %d, want 1", provider.rerunCalls)
+	}
+	if len(lifecycle.observed) != 1 || lifecycle.observed[0].CI.RerunRequested {
+		t.Fatalf("provider failure must resume normal lifecycle dispatch: %#v", lifecycle.observed)
+	}
+	for _, attempt := range store.ciRerunAttempts {
+		if attempt.Status != ports.SCMCIRerunFailed {
+			t.Fatalf("attempt status = %q, want failed", attempt.Status)
+		}
+	}
+}
+
+func TestPoll_CIRerunKnownRunnerFlakeDoesNotRequireDiffFacts(t *testing.T) {
+	_, provider, lifecycle, observer := ciRerunPollFixture(
+		nil, "101", "The runner has received a shutdown signal. This can happen when the runner service is stopped.",
+	)
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.changedFileCalls != 0 || provider.rerunCalls != 1 {
+		t.Fatalf("changed-file calls=%d rerun calls=%d, want 0/1", provider.changedFileCalls, provider.rerunCalls)
+	}
+	if len(lifecycle.observed) != 1 || !lifecycle.observed[0].CI.RerunRequested {
+		t.Fatalf("known runner flake must suppress stale failure: %#v", lifecycle.observed)
 	}
 }
 

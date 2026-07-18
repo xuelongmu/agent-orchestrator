@@ -72,6 +72,43 @@ func TestProjectCRUDAndArchive(t *testing.T) {
 	}
 }
 
+func TestCIRerunAttemptIsDurableAndUniquePerPRHeadCheck(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	session, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prURL := "https://github.com/o/r/pull/1"
+	if err := s.WritePR(ctx, domain.PullRequest{URL: prURL, SessionID: session.ID, Number: 1, UpdatedAt: time.Now().UTC()}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	attempt := ports.SCMCIRerunAttempt{
+		PRURL: prURL, HeadSHA: "abc", CheckName: "test", ProviderID: "101",
+		Status: ports.SCMCIRerunReserved, RequestedAt: time.Now().UTC().Truncate(time.Second),
+	}
+	reserved, err := s.ReserveCIRerunAttempt(ctx, attempt)
+	if err != nil || !reserved {
+		t.Fatalf("first reserve = %v, err=%v", reserved, err)
+	}
+	reserved, err = s.ReserveCIRerunAttempt(ctx, attempt)
+	if err != nil || reserved {
+		t.Fatalf("duplicate reserve = %v, err=%v", reserved, err)
+	}
+	attempt.Status = ports.SCMCIRerunRequested
+	if err := s.UpdateCIRerunAttempt(ctx, attempt); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetCIRerunAttempt(ctx, prURL, "abc", "test")
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if got.Status != ports.SCMCIRerunRequested || got.ProviderID != "101" || !got.RequestedAt.Equal(attempt.RequestedAt) {
+		t.Fatalf("attempt = %#v, want %#v", got, attempt)
+	}
+}
+
 func TestProjectConfigRoundTrips(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

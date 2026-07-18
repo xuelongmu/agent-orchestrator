@@ -12,6 +12,15 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
+type CIRerunAttempt struct {
+	PRURL       string
+	HeadSha     string
+	CheckName   string
+	ProviderID  string
+	Status      string
+	RequestedAt time.Time
+}
+
 type ChangeLog struct {
 	Seq       int64
 	ProjectID domain.ProjectID

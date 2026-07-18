@@ -160,6 +160,10 @@ type SCMCIObservation struct {
 	FailedChecks []SCMCheckObservation
 	// FailureLogTail is the combined tail of newly fetched failed-check logs.
 	FailureLogTail string
+	// RerunRequested is an observer-to-lifecycle control fact. It is set only on
+	// the lifecycle copy after AO has durably claimed and successfully requested
+	// one bounded provider rerun; lifecycle must not dispatch the stale failure.
+	RerunRequested bool
 }
 
 // SCMCheckObservation is one normalized check/status context. ProviderID is an
@@ -179,6 +183,29 @@ type SCMCheckObservation struct {
 	// ProviderID is an opaque provider id used for follow-up provider calls.
 	ProviderID string
 }
+
+// SCMCIRerunAttempt is AO's durable claim on one failed check for one exact PR
+// head. The unique (PRURL, HeadSHA, CheckName) tuple bounds automation to one
+// rerun even when GitHub returns a new job id or the daemon restarts.
+type SCMCIRerunAttempt struct {
+	PRURL       string
+	HeadSHA     string
+	CheckName   string
+	ProviderID  string
+	Status      string
+	RequestedAt time.Time
+}
+
+const (
+	// SCMCIRerunReserved is persisted before the provider mutation so two polls
+	// or processes cannot both request the same rerun.
+	SCMCIRerunReserved = "reserved"
+	// SCMCIRerunRequested means the provider accepted the rerun request.
+	SCMCIRerunRequested = "requested"
+	// SCMCIRerunFailed means the provider mutation failed; normal CI handling
+	// must resume rather than hiding the failure.
+	SCMCIRerunFailed = "failed"
+)
 
 // SCMReviewObservation carries normalized review-decision and review-thread facts.
 type SCMReviewObservation struct {
