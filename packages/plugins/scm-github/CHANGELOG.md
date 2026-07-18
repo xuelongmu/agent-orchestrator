@@ -1,5 +1,17 @@
 # @aoagents/ao-plugin-scm-github
 
+## 0.10.0
+
+### Patch Changes
+
+- 3e9f3c4: Recognize `chatgpt-codex-connector[bot]` as an automated review bot so Codex PR review comments route through the bot (`bugbot-comments`) dispatch path, consistent with other AI reviewers like `cursor[bot]`.
+- Updated dependencies [669ed4c]
+- Updated dependencies [1b9718a]
+- Updated dependencies [2d456c4]
+- Updated dependencies [2caaec2]
+- Updated dependencies [c0ef32c]
+  - @aoagents/ao-core@0.10.0
+
 ## 0.9.3
 
 ### Patch Changes
