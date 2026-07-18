@@ -465,6 +465,13 @@ export interface Runtime {
   sendMessage(handle: RuntimeHandle, message: string): Promise<void>;
 
   /**
+   * Submit text that is already present in the agent's input editor without
+   * sending that text again. Interactive runtimes can implement this as a raw
+   * Enter keypress so delivery recovery remains at-most-once.
+   */
+  submitInput?(handle: RuntimeHandle): Promise<void>;
+
+  /**
    * Interrupt the agent's in-flight work without tearing down the session.
    * Sends a cancel/stop keystroke (Escape) to the foreground process so it
    * halts the current generation (e.g. an over-budget run) while staying alive
@@ -570,6 +577,9 @@ export interface Agent {
    * @deprecated Use getActivityState() instead - this uses hacky terminal parsing.
    */
   detectActivity(terminalOutput: string): ActivityState;
+
+  /** Detect pasted terminal input that has not started or queued a turn yet. */
+  isInputPending?(terminalOutput: string): boolean;
 
   /**
    * Get current activity state using agent-native mechanism (JSONL, SQLite, etc.).
@@ -2265,6 +2275,12 @@ export interface KillOptions {
   projectId?: string;
 }
 
+/** A safe, non-throwing send outcome after the runtime delivery boundary. */
+export type SessionSendResult = {
+  status: "input_pending";
+  recoveryAttempted: boolean;
+};
+
 /** Session manager — CRUD for sessions */
 export interface SessionManager {
   spawn(config: SessionSpawnConfig): Promise<Session>;
@@ -2304,7 +2320,11 @@ export interface SessionManager {
    * let a caller message the wrong one. Callers that know the owning project
    * MUST pass it.
    */
-  send(sessionId: SessionId, message: string, projectId?: string): Promise<void>;
+  send(
+    sessionId: SessionId,
+    message: string,
+    projectId?: string,
+  ): Promise<undefined | SessionSendResult>;
   claimPR(sessionId: SessionId, prRef: string, options?: ClaimPROptions): Promise<ClaimPRResult>;
 }
 

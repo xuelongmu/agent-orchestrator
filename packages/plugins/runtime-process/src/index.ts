@@ -54,6 +54,44 @@ export function create(): Runtime {
   // Per-instance process map — each create() call gets its own isolated state
   const processes = new Map<string, ProcessEntry>();
 
+  const writeManagedStdin = async (handle: RuntimeHandle, data: string): Promise<void> => {
+    const entry = processes.get(handle.id);
+    if (!entry) {
+      throw new Error(`No process found for session ${handle.id}`);
+    }
+
+    const child = entry.process;
+    if (!child) {
+      throw new Error(`Process for session ${handle.id} is still spawning`);
+    }
+    const stdin = child.stdin;
+    if (!stdin || !stdin.writable) {
+      throw new Error(`stdin not writable for session ${handle.id}`);
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let done = false;
+      const finish = (err?: Error | null) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        if (err) reject(err);
+        else resolve();
+      };
+      const onError = (err: Error) => finish(err);
+      const onDrain = () => {
+        // Drain means backpressure cleared — still wait for write callback
+      };
+      const cleanup = () => {
+        stdin.removeListener("error", onError);
+        stdin.removeListener("drain", onDrain);
+      };
+      stdin.on("error", onError);
+      stdin.on("drain", onDrain);
+      stdin.write(data, (err) => finish(err ?? null));
+    });
+  };
+
   return {
     name: "process",
 
@@ -378,42 +416,18 @@ export function create(): Runtime {
         return;
       }
 
-      const entry = processes.get(handle.id);
-      if (!entry) {
-        throw new Error(`No process found for session ${handle.id}`);
+      await writeManagedStdin(handle, message + "\n");
+    },
+
+    async submitInput(handle: RuntimeHandle): Promise<void> {
+      const pipePath = (handle.data as Record<string, unknown>)?.pipePath as string | undefined;
+      if (pipePath) {
+        // The text is already in Codex's editor, so recovery sends only Enter.
+        await ptyHostSendRaw(pipePath, "\r");
+        return;
       }
 
-      const child = entry.process;
-      if (!child) {
-        throw new Error(`Process for session ${handle.id} is still spawning`);
-      }
-      const stdin = child.stdin;
-      if (!stdin || !stdin.writable) {
-        throw new Error(`stdin not writable for session ${handle.id}`);
-      }
-
-      // Wrap write in a promise with done-flag to prevent double resolve/reject
-      await new Promise<void>((resolve, reject) => {
-        let done = false;
-        const finish = (err?: Error | null) => {
-          if (done) return;
-          done = true;
-          cleanup();
-          if (err) reject(err);
-          else resolve();
-        };
-        const onError = (err: Error) => finish(err);
-        const onDrain = () => {
-          // Drain means backpressure cleared — still wait for write callback
-        };
-        const cleanup = () => {
-          stdin.removeListener("error", onError);
-          stdin.removeListener("drain", onDrain);
-        };
-        stdin.on("error", onError);
-        stdin.on("drain", onDrain);
-        stdin.write(message + "\n", (err) => finish(err ?? null));
-      });
+      await writeManagedStdin(handle, "\n");
     },
 
     async interrupt(handle: RuntimeHandle): Promise<void> {

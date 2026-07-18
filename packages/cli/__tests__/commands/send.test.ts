@@ -444,6 +444,38 @@ describe("send command", () => {
       );
     });
 
+    it("does not report processing while Codex input remains unsubmitted", async () => {
+      mockConfigRef.current = makeConfig();
+      mockSessionManager.get.mockResolvedValue({
+        id: "app-1",
+        projectId: "my-app",
+        status: "working",
+        activity: "idle",
+        branch: null,
+        issueId: null,
+        pr: null,
+        workspacePath: null,
+        runtimeHandle: { id: "proc-1", runtimeName: "process", data: {} },
+        agentInfo: null,
+        createdAt: new Date(),
+        lastActivityAt: new Date(),
+        metadata: { agent: "codex" },
+      });
+      mockSessionManager.send.mockResolvedValue({
+        status: "input_pending",
+        recoveryAttempted: true,
+      });
+
+      await program.parseAsync(["node", "test", "send", "app-1", "large", "review"]);
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("submission could not be confirmed"),
+      );
+      expect(consoleSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("Message sent and processing"),
+      );
+    });
+
     it("skips tmux busy detection when lifecycle send handles delivery", async () => {
       mockConfigRef.current = makeConfig();
       mockSessionManager.get.mockResolvedValue({

@@ -127,7 +127,7 @@ function makeSessionManager(
     },
     kill: async () => ({ cleaned: false, alreadyTerminated: false }),
     cleanup: async () => ({ killed: [], skipped: [], errors: [] }),
-    send: async () => {},
+    send: async () => undefined,
     claimPR: async () => {
       throw new Error("not implemented");
     },
@@ -558,6 +558,7 @@ describe("sendCodeReviewFindingsToAgent", () => {
         sessionManager: makeSessionManager(session, {
           send: async (sessionId, message) => {
             sentMessages.push({ sessionId, message });
+            return undefined;
           },
         }),
         storeFactory: () => store,
@@ -616,6 +617,7 @@ describe("sendCodeReviewFindingsToAgent", () => {
           sessionManager: makeSessionManager(session, {
             send: async (_sessionId, message) => {
               sentMessages.push(message);
+              return undefined;
             },
           }),
           storeFactory: () => store,

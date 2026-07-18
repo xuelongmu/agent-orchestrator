@@ -484,6 +484,23 @@ describe("sendMessage()", () => {
 
     await expect(runtime.sendMessage(handle, "hello")).rejects.toThrow(/write EPIPE/);
   });
+
+  it("submits existing Windows PTY input with raw Enter and no message resend", async () => {
+    const runtime = create();
+    const handle: RuntimeHandle = {
+      id: "win-pending-input",
+      runtimeName: "process",
+      data: { pipePath: "\\\\.\\pipe\\ao-pty-win-pending-input" },
+    };
+
+    await runtime.submitInput!(handle);
+
+    expect(mockPtyHostSendRaw).toHaveBeenCalledWith(
+      "\\\\.\\pipe\\ao-pty-win-pending-input",
+      "\r",
+    );
+    expect(mockPtyHostSendMessage).not.toHaveBeenCalled();
+  });
 });
 
 // =========================================================================
