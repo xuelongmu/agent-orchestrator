@@ -36,6 +36,15 @@ type notificationSink interface {
 	Notify(ctx context.Context, intent ports.NotificationIntent) error
 }
 
+// MergedSessionCleaner tears down the external resources owned by a session
+// whose pull requests reached the lifecycle completion bar. The session
+// manager implements this boundary so lifecycle keeps exclusive authority over
+// the completion decision while runtime/workspace cleanup stays in the service
+// that owns those resources.
+type MergedSessionCleaner interface {
+	CleanupMergedSession(ctx context.Context, id domain.SessionID) error
+}
+
 // Option customizes a Manager.
 type Option func(*Manager)
 
@@ -58,6 +67,7 @@ type Manager struct {
 	// nudges become no-ops but the reducer still runs.
 	guard         *sessionguard.Guard
 	notifications notificationSink
+	mergedCleaner MergedSessionCleaner
 
 	mu        sync.Mutex
 	window    time.Duration
@@ -67,6 +77,16 @@ type Manager struct {
 	// flights tracks, per session, the in-flight tool executions and the
 	// pending permission dialog's identity (see toolFlight). Guarded by mu.
 	flights map[domain.SessionID]*toolFlight
+}
+
+// SetMergedSessionCleaner wires the session-manager teardown path after both
+// components have been constructed. Daemon startup creates lifecycle first so
+// the session manager can depend on it; this late-bound edge closes that cycle
+// before the SCM observer starts polling.
+func (m *Manager) SetMergedSessionCleaner(cleaner MergedSessionCleaner) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mergedCleaner = cleaner
 }
 
 // New builds a Lifecycle Manager over the session store it writes and the messenger it uses for agent nudges.
@@ -481,6 +501,24 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 		cur.IsTerminated = true
 		cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
 		delete(m.flights, id) // runs under m.mu (mutate holds it)
+		return cur, true
+	})
+}
+
+// markMergedCleanupComplete is the only terminal write that clears the durable
+// merged-cleanup replay state. Runtime/activity termination alone says nothing
+// about whether the worktree and restore markers were released.
+func (m *Manager) markMergedCleanupComplete(ctx context.Context, id domain.SessionID) error {
+	return m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
+		changed := !cur.IsTerminated || cur.Metadata.MergedCleanupPending || cur.Metadata.MergedCleanupPRURL != ""
+		if !changed {
+			return cur, false
+		}
+		cur.IsTerminated = true
+		cur.Metadata.MergedCleanupPending = false
+		cur.Metadata.MergedCleanupPRURL = ""
+		cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
+		delete(m.flights, id)
 		return cur, true
 	})
 }

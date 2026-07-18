@@ -342,6 +342,33 @@ func TestSessionFirstSignalRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSessionMergedCleanupPendingRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	r, _ := s.CreateSession(ctx, sampleRecord("mer"))
+
+	r.Metadata.MergedCleanupPending = true
+	r.Metadata.MergedCleanupPRURL = "https://github.com/o/r/pull/57"
+	if err := s.UpdateSession(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := s.GetSession(ctx, r.ID)
+	if !got.Metadata.MergedCleanupPending || got.Metadata.MergedCleanupPRURL != r.Metadata.MergedCleanupPRURL {
+		t.Fatalf("merged cleanup replay state was not persisted: %+v", got.Metadata)
+	}
+
+	got.Metadata.MergedCleanupPending = false
+	got.Metadata.MergedCleanupPRURL = ""
+	if err := s.UpdateSession(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	cleared, _, _ := s.GetSession(ctx, r.ID)
+	if cleared.Metadata.MergedCleanupPending || cleared.Metadata.MergedCleanupPRURL != "" {
+		t.Fatalf("merged cleanup replay state was not cleared: %+v", cleared.Metadata)
+	}
+}
+
 func TestSessionPendingSubmitLatchRoundTripAndAtomicClaim(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

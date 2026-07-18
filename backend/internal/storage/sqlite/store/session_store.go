@@ -260,6 +260,8 @@ func rowToRecord(row gen.Session) domain.SessionRecord {
 			PreviewRevision:                row.PreviewRevision,
 			PendingSubmitFingerprint:       row.PendingSubmitFingerprint,
 			PendingSubmitRecoveryAttempted: row.PendingSubmitRecoveryAttempted,
+			MergedCleanupPending:           row.MergedCleanupPending,
+			MergedCleanupPRURL:             row.MergedCleanupPRURL,
 		},
 		CreatedAt: row.CreatedAt,
 		UpdatedAt: row.UpdatedAt,
@@ -290,6 +292,8 @@ func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams
 		PreviewRevision:                rec.Metadata.PreviewRevision,
 		PendingSubmitFingerprint:       pendingFingerprint,
 		PendingSubmitRecoveryAttempted: pendingAttempted,
+		MergedCleanupPending:           rec.Metadata.MergedCleanupPending,
+		MergedCleanupPRURL:             rec.Metadata.MergedCleanupPRURL,
 		CreatedAt:                      rec.CreatedAt,
 		UpdatedAt:                      rec.UpdatedAt,
 	}
@@ -317,6 +321,8 @@ func recordToUpdate(rec domain.SessionRecord) gen.UpdateSessionParams {
 		PreviewRevision:                rec.Metadata.PreviewRevision,
 		PendingSubmitFingerprint:       pendingFingerprint,
 		PendingSubmitRecoveryAttempted: pendingAttempted,
+		MergedCleanupPending:           rec.Metadata.MergedCleanupPending,
+		MergedCleanupPRURL:             rec.Metadata.MergedCleanupPRURL,
 		UpdatedAt:                      rec.UpdatedAt,
 	}
 }

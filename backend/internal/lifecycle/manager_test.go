@@ -62,6 +62,20 @@ type fakeMessenger struct {
 	err  error
 }
 
+type retryMergedCleaner struct {
+	lcm   *Manager
+	err   error
+	calls int
+}
+
+func (c *retryMergedCleaner) CleanupMergedSession(ctx context.Context, id domain.SessionID) error {
+	c.calls++
+	if c.err != nil {
+		return c.err
+	}
+	return c.lcm.MarkTerminated(ctx, id)
+}
+
 type telemetrySink struct {
 	events []ports.TelemetryEvent
 }
@@ -113,6 +127,59 @@ func TestRuntimeObservation_FailedProbeDoesNotMutate(t *testing.T) {
 	}
 	if st.sessions["mer-1"] != before {
 		t.Fatalf("failed probe should not persist a state, got %+v", st.sessions["mer-1"])
+	}
+}
+
+func TestRuntimeObservation_DeadRuntimePreservesMergedCleanupForRetry(t *testing.T) {
+	m, st, _ := newManager()
+	rec := working("mer-1")
+	rec.Activity.LastActivityAt = time.Now().Add(-2 * time.Minute)
+	rec.Metadata.MergedCleanupPending = true
+	rec.Metadata.MergedCleanupPRURL = "pr1"
+	st.sessions[rec.ID] = rec
+	st.prs[rec.ID] = []domain.PullRequest{{URL: "pr1", Merged: true}}
+	cleaner := &retryMergedCleaner{lcm: m}
+	m.SetMergedSessionCleaner(cleaner)
+
+	if err := m.ApplyRuntimeObservation(ctx, rec.ID, ports.RuntimeFacts{Probe: ports.ProbeDead}); err != nil {
+		t.Fatal(err)
+	}
+	dead := st.sessions[rec.ID]
+	if !dead.IsTerminated || !dead.Metadata.MergedCleanupPending {
+		t.Fatalf("dead runtime must stay terminated+cleanup-pending: %+v", dead)
+	}
+	if err := m.RetryMergedCleanup(ctx, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions[rec.ID]
+	if !got.IsTerminated || got.Metadata.MergedCleanupPending || got.Metadata.MergedCleanupPRURL != "" || cleaner.calls != 1 {
+		t.Fatalf("retry must clean terminal session and clear replay context: rec=%+v calls=%d", got, cleaner.calls)
+	}
+}
+
+func TestActivityExitedPreservesMergedCleanupForRetry(t *testing.T) {
+	m, st, _ := newManager()
+	rec := working("mer-1")
+	rec.Metadata.MergedCleanupPending = true
+	rec.Metadata.MergedCleanupPRURL = "pr1"
+	st.sessions[rec.ID] = rec
+	st.prs[rec.ID] = []domain.PullRequest{{URL: "pr1", Merged: true}}
+	cleaner := &retryMergedCleaner{lcm: m}
+	m.SetMergedSessionCleaner(cleaner)
+
+	if err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityExited}); err != nil {
+		t.Fatal(err)
+	}
+	exited := st.sessions[rec.ID]
+	if !exited.IsTerminated || !exited.Metadata.MergedCleanupPending {
+		t.Fatalf("agent exit must stay terminated+cleanup-pending: %+v", exited)
+	}
+	if err := m.RetryMergedCleanup(ctx, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions[rec.ID]
+	if !got.IsTerminated || got.Metadata.MergedCleanupPending || cleaner.calls != 1 {
+		t.Fatalf("retry must clean exited session: rec=%+v calls=%d", got, cleaner.calls)
 	}
 }
 
@@ -588,6 +655,103 @@ func TestPRObservation_MergedTerminatesWithoutNudge(t *testing.T) {
 	}
 }
 
+func TestPRObservation_MergedCleanupFailureRetriesFromDurableLatch(t *testing.T) {
+	m, st, _ := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	st.prs["mer-1"] = []domain.PullRequest{{URL: "pr1", Merged: true}}
+	cleaner := &retryMergedCleaner{lcm: m, err: errors.New("runtime busy")}
+	m.SetMergedSessionCleaner(cleaner)
+
+	err := m.ApplyPRObservation(ctx, "mer-1", ports.PRObservation{Fetched: true, URL: "pr1", Merged: true})
+	if err == nil || !strings.Contains(err.Error(), "runtime busy") {
+		t.Fatalf("ApplyPRObservation error = %v, want runtime busy", err)
+	}
+	failed := st.sessions["mer-1"]
+	if failed.IsTerminated || !failed.Metadata.MergedCleanupPending {
+		t.Fatalf("failed cleanup must stay live and durably pending: %+v", failed)
+	}
+	if failed.Metadata.MergedCleanupPRURL != "pr1" {
+		t.Fatalf("failed cleanup trigger URL = %q, want pr1", failed.Metadata.MergedCleanupPRURL)
+	}
+
+	cleaner.err = nil
+	if err := m.RetryMergedCleanup(ctx, "mer-1"); err != nil {
+		t.Fatalf("RetryMergedCleanup: %v", err)
+	}
+	got := st.sessions["mer-1"]
+	if !got.IsTerminated || got.Metadata.MergedCleanupPending || got.Metadata.MergedCleanupPRURL != "" {
+		t.Fatalf("successful retry must terminate and clear latch: %+v", got)
+	}
+	if cleaner.calls != 2 {
+		t.Fatalf("cleanup calls = %d, want 2", cleaner.calls)
+	}
+	if err := m.ApplyPRObservation(ctx, "mer-1", ports.PRObservation{Fetched: true, URL: "pr1", Merged: true}); err != nil {
+		t.Fatalf("repeat terminal observation: %v", err)
+	}
+	if cleaner.calls != 2 {
+		t.Fatalf("terminal re-observation repeated cleanup: calls = %d, want 2", cleaner.calls)
+	}
+}
+
+func TestPRObservation_MergedCleanupRetryResumesTerminalNotification(t *testing.T) {
+	cases := []struct {
+		name     string
+		prs      []domain.PullRequest
+		obs      ports.SCMObservation
+		wantType domain.NotificationType
+		wantURL  string
+	}{
+		{
+			name:     "merged trigger",
+			prs:      []domain.PullRequest{{URL: "pr1", Number: 1, Title: "merged", Merged: true, Provider: "github", Repo: "o/r"}},
+			obs:      ports.SCMObservation{Fetched: true, Provider: "github", Repo: "o/r", PR: ports.SCMPRObservation{URL: "pr1", Number: 1, Merged: true}},
+			wantType: domain.NotificationPRMerged,
+			wantURL:  "pr1",
+		},
+		{
+			name: "closed sibling trigger after another merge",
+			prs: []domain.PullRequest{
+				{URL: "pr1", Number: 1, Merged: true, Provider: "github", Repo: "o/r"},
+				{URL: "pr2", Number: 2, Closed: true, Provider: "github", Repo: "o/r"},
+			},
+			obs:      ports.SCMObservation{Fetched: true, Provider: "github", Repo: "o/r", PR: ports.SCMPRObservation{URL: "pr2", Number: 2, Closed: true}},
+			wantType: domain.NotificationPRClosedUnmerged,
+			wantURL:  "pr2",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.sessions["mer-1"] = working("mer-1")
+			st.prs["mer-1"] = tc.prs
+			sink := &fakeNotificationSink{}
+			m := New(st, nil, WithNotificationSink(sink))
+			cleaner := &retryMergedCleaner{lcm: m, err: errors.New("workspace busy")}
+			m.SetMergedSessionCleaner(cleaner)
+
+			if err := m.ApplySCMObservation(ctx, "mer-1", tc.obs); err == nil {
+				t.Fatal("first cleanup unexpectedly succeeded")
+			}
+			if len(sink.intents) != 0 {
+				t.Fatalf("notification emitted before cleanup success: %v", sink.intents)
+			}
+			cleaner.err = nil
+			if err := m.RetryMergedCleanup(ctx, "mer-1"); err != nil {
+				t.Fatal(err)
+			}
+			if len(sink.intents) != 1 || sink.intents[0].Type != tc.wantType || sink.intents[0].PRURL != tc.wantURL {
+				t.Fatalf("retry intents = %+v, want one %s for %s", sink.intents, tc.wantType, tc.wantURL)
+			}
+			if err := m.RetryMergedCleanup(ctx, "mer-1"); err != nil {
+				t.Fatal(err)
+			}
+			if len(sink.intents) != 1 {
+				t.Fatalf("completed retry duplicated notification: %+v", sink.intents)
+			}
+		})
+	}
+}
+
 // A session with one merged PR and one still-open PR must NOT terminate: the
 // completion bar is "no open PR remains AND at least one merged".
 func TestPRObservation_MergedWithOpenSiblingDoesNotTerminate(t *testing.T) {
@@ -633,6 +797,9 @@ func TestPRObservation_ClosedWithoutMergeDoesNotTerminate(t *testing.T) {
 	}
 	if got := st.sessions["mer-1"]; got.IsTerminated {
 		t.Fatalf("a closed-without-merge PR must not terminate the session, got %+v", got)
+	}
+	if got := st.sessions["mer-1"]; got.Metadata.MergedCleanupPending {
+		t.Fatalf("a closed-without-merge PR must not latch cleanup, got %+v", got)
 	}
 }
 

@@ -7,8 +7,8 @@ INSERT INTO sessions (
     activity_state, activity_last_at, first_signal_at, is_terminated,
     branch, workspace_path, runtime_handle_id, agent_session_id, prompt,
     preview_url, preview_revision, pending_submit_fingerprint,
-    pending_submit_recovery_attempted, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    pending_submit_recovery_attempted, merged_cleanup_pending, merged_cleanup_pr_url, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 -- name: UpdateSession :exec
 UPDATE sessions SET
@@ -16,28 +16,28 @@ UPDATE sessions SET
     activity_state = ?, activity_last_at = ?, first_signal_at = ?, is_terminated = ?,
     branch = ?, workspace_path = ?, runtime_handle_id = ?, agent_session_id = ?, prompt = ?,
     preview_url = ?, preview_revision = ?, pending_submit_fingerprint = ?,
-    pending_submit_recovery_attempted = ?, updated_at = ?
+    pending_submit_recovery_attempted = ?, merged_cleanup_pending = ?, merged_cleanup_pr_url = ?, updated_at = ?
 WHERE id = ?;
 
 -- name: GetSession :one
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, prompt, created_at, updated_at, display_name, first_signal_at, preview_url, preview_revision,
-    pending_submit_fingerprint, pending_submit_recovery_attempted
+    pending_submit_fingerprint, pending_submit_recovery_attempted, merged_cleanup_pending, merged_cleanup_pr_url
 FROM sessions WHERE id = ?;
 
 -- name: ListSessionsByProject :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, prompt, created_at, updated_at, display_name, first_signal_at, preview_url, preview_revision,
-    pending_submit_fingerprint, pending_submit_recovery_attempted
+    pending_submit_fingerprint, pending_submit_recovery_attempted, merged_cleanup_pending, merged_cleanup_pr_url
 FROM sessions WHERE project_id = ? ORDER BY num;
 
 -- name: ListAllSessions :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, prompt, created_at, updated_at, display_name, first_signal_at, preview_url, preview_revision,
-    pending_submit_fingerprint, pending_submit_recovery_attempted
+    pending_submit_fingerprint, pending_submit_recovery_attempted, merged_cleanup_pending, merged_cleanup_pr_url
 FROM sessions ORDER BY project_id, num;
 
 -- name: SetPendingSubmit :execrows

@@ -1428,6 +1428,39 @@ func TestKill_DirtyWorkspacePreservesAndRemainsRetryable(t *testing.T) {
 	}
 }
 
+func TestCleanupMergedSession_TearsDownWaitingSession(t *testing.T) {
+	m, st, rt, ws := newManager()
+	rec := mkLive("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityWaitingInput, LastActivityAt: time.Now()}
+	st.sessions["mer-1"] = rec
+
+	if err := m.CleanupMergedSession(ctx, "mer-1"); err != nil {
+		t.Fatalf("CleanupMergedSession: %v", err)
+	}
+	if rt.destroyed != 1 || ws.destroyed != 1 {
+		t.Fatalf("cleanup destroyed runtime/workspace = %d/%d, want 1/1", rt.destroyed, ws.destroyed)
+	}
+	if !st.sessions["mer-1"].IsTerminated {
+		t.Fatal("merged waiting_input session must reach terminal state")
+	}
+}
+
+func TestCleanupMergedSession_PreservesDirtyWorkspaceAndTerminates(t *testing.T) {
+	m, st, rt, ws := newManager()
+	st.sessions["mer-1"] = mkLive("mer-1")
+	ws.destroyErr = fmt.Errorf("gitworktree: refusing to remove: %w", ports.ErrWorkspaceDirty)
+
+	if err := m.CleanupMergedSession(ctx, "mer-1"); err != nil {
+		t.Fatalf("CleanupMergedSession: %v", err)
+	}
+	if rt.destroyed != 1 || ws.destroyed != 1 {
+		t.Fatalf("cleanup attempts runtime/workspace = %d/%d, want 1/1", rt.destroyed, ws.destroyed)
+	}
+	if !st.sessions["mer-1"].IsTerminated {
+		t.Fatal("dirty worktree preservation must not leave a merged runtime zombie")
+	}
+}
+
 func TestKill_DeletesStaleRestoreMarker(t *testing.T) {
 	m, st, _, _ := newManager()
 	st.sessions["mer-1"] = mkLive("mer-1")

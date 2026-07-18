@@ -703,6 +703,29 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	return freed, nil
 }
 
+// CleanupMergedSession applies the normal session teardown policy to a
+// merge-complete session. Kill owns runtime, worktree, restore-marker, agent
+// hook, and terminal-state ordering; this adapter only handles its deliberate
+// dirty-worktree deferral. In that case the runtime is already gone and the
+// worktree must remain preserved, so record the canonical terminal state and
+// leave the workspace for explicit cleanup.
+func (m *Manager) CleanupMergedSession(ctx context.Context, id domain.SessionID) error {
+	if _, err := m.Kill(ctx, id); err != nil {
+		return fmt.Errorf("cleanup merged session %s: %w", id, err)
+	}
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return fmt.Errorf("cleanup merged session %s: %w", id, err)
+	}
+	if !ok || rec.IsTerminated {
+		return nil
+	}
+	if err := m.lcm.MarkTerminated(ctx, id); err != nil {
+		return fmt.Errorf("cleanup merged session %s: mark terminated: %w", id, err)
+	}
+	return nil
+}
+
 // RetireForReplacement terminates a live orchestrator and releases its branch
 // for a replacement session. Unlike Kill, this captures uncommitted work before
 // force-removing the worktree, so a dirty canonical orchestrator worktree does
