@@ -41,6 +41,11 @@ func TestGuard_OutcomeByState(t *testing.T) {
 		wantNudge   Outcome
 	}{
 		{"active", record(domain.ActivityActive, false), true, Sent, Sent},
+		{"active with pending editor input", func() domain.SessionRecord {
+			rec := record(domain.ActivityActive, false)
+			rec.Metadata.PendingSubmitFingerprint = "sha256-prompt"
+			return rec
+		}(), true, Sent, SuppressedAwaitingUser},
 		{"idle", record(domain.ActivityIdle, false), true, Sent, Sent},
 		// waiting_input is the split that motivates two methods: a user message
 		// (or its Enter re-submit) belongs at an idle prompt; an unsolicited

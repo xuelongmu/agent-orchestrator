@@ -106,18 +106,19 @@ func (g *Guard) Send(ctx context.Context, id domain.SessionID, msg string) error
 // sitting at an idle prompt is exactly where a user message (or the Enter that
 // submits its unsent draft) belongs.
 func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
-	return g.send(ctx, id, msg, func(state domain.ActivityState) bool {
-		return state == domain.ActivityBlocked
+	return g.send(ctx, id, msg, func(rec domain.SessionRecord) bool {
+		return rec.Activity.State == domain.ActivityBlocked
 	})
 }
 
 // Nudge writes an AO-initiated (unsolicited) message into the session. It
 // refuses whenever the session awaits the human in any form — blocked on a
-// decision or waiting at the prompt — because an automated paste+Enter there
-// either answers a dialog or submits text the user never saw.
+// decision or waiting at the prompt — and while a prior prompt is durably
+// latched as pending in the editor. An automated paste+Enter in those states
+// could answer a dialog or stack text behind a draft that has not submitted.
 func (g *Guard) Nudge(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
-	return g.send(ctx, id, msg, func(state domain.ActivityState) bool {
-		return state.NeedsInput()
+	return g.send(ctx, id, msg, func(rec domain.SessionRecord) bool {
+		return rec.Activity.State.NeedsInput() || rec.Metadata.PendingSubmitFingerprint != ""
 	})
 }
 
@@ -127,7 +128,7 @@ func (g *Guard) Nudge(ctx context.Context, id domain.SessionID, msg string) (Out
 // appear mid-paste — but the just-in-time read is the strongest guarantee
 // available without scraping the terminal. Fail closed: a store error
 // suppresses the write rather than pressing Enter on an unknown state.
-func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refuse func(domain.ActivityState) bool) (Outcome, error) {
+func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refuse func(domain.SessionRecord) bool) (Outcome, error) {
 	rec, ok, err := g.store.GetSession(ctx, id)
 	if err != nil {
 		return SuppressedUnknown, fmt.Errorf("guard %s: read session: %w", id, err)
@@ -145,8 +146,12 @@ func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refus
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "terminated")
 		return SuppressedTerminated, nil
 	}
-	if refuse(rec.Activity.State) {
-		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "awaiting_user", "state", string(rec.Activity.State))
+	if refuse(rec) {
+		reason := "awaiting_user"
+		if rec.Metadata.PendingSubmitFingerprint != "" && !rec.Activity.State.NeedsInput() {
+			reason = "pending_submit"
+		}
+		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", reason, "state", string(rec.Activity.State))
 		return SuppressedAwaitingUser, nil
 	}
 	if err := g.messenger.Send(ctx, id, msg); err != nil {

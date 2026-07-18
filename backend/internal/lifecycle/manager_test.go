@@ -171,6 +171,26 @@ func TestActivity_SameStateSignalStillStoresAgentSessionID(t *testing.T) {
 	}
 }
 
+func TestActivity_SameStateNonWaitingSignalClearsPendingSubmit(t *testing.T) {
+	m, st, _ := newManager()
+	rec := working("mer-1")
+	rec.FirstSignalAt = time.Now().Add(-time.Minute)
+	rec.Metadata.PendingSubmitFingerprint = "sha256-prompt"
+	rec.Metadata.PendingSubmitRecoveryAttempted = true
+	st.sessions["mer-1"] = rec
+
+	if err := m.ApplyActivitySignal(ctx, "mer-1", ports.ActivitySignal{
+		Valid: true,
+		State: rec.Activity.State,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions["mer-1"].Metadata
+	if got.PendingSubmitFingerprint != "" || got.PendingSubmitRecoveryAttempted {
+		t.Fatalf("pending-submit latch = %+v, want cleared by authoritative non-waiting activity", got)
+	}
+}
+
 func TestActivity_BlankAgentSessionIDDoesNotOverwriteMetadata(t *testing.T) {
 	m, st, _ := newManager()
 	rec := working("mer-1")
@@ -1172,7 +1192,7 @@ func reviewRoundCapObservation() ports.SCMObservation {
 	}
 }
 
-func reviewHandoffState(t *testing.T, raw, key string) reviewBacklogOutcome {
+func reviewHandoffState(t *testing.T, raw, key string) humanHandoffOutcome {
 	t.Helper()
 	var payload reactionPayload
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
@@ -1206,7 +1226,7 @@ func TestReviewRoundCapHandoffRequiresConfirmedNotification(t *testing.T) {
 			}
 			key := reviewRoundCapHandoffKey(obs.PR.URL)
 			got := reviewHandoffState(t, st.signatures[obs.PR.URL], key)
-			if got.Outcome != reviewBacklogBlocked || got.Reason != reviewRoundCapNotificationFailed {
+			if got.Outcome != humanHandoffBlocked || got.Reason != reviewRoundCapNotificationFailed {
 				t.Fatalf("handoff = %+v, want blocked/%s", got, reviewRoundCapNotificationFailed)
 			}
 		})
@@ -1237,7 +1257,7 @@ func TestReviewRoundCapHandoffRetriesBlockedOutcomeAndParksAfterDelivery(t *test
 	}
 	key := reviewRoundCapHandoffKey(obs.PR.URL)
 	got := reviewHandoffState(t, st.signatures[obs.PR.URL], key)
-	if got.Outcome != reviewBacklogNotified || got.Reason != reviewRoundCapNotificationFailed {
+	if got.Outcome != humanHandoffNotified || got.Reason != reviewRoundCapNotificationFailed {
 		t.Fatalf("handoff = %+v, want notified/%s", got, reviewRoundCapNotificationFailed)
 	}
 
@@ -1436,6 +1456,67 @@ func TestSendOnce_NoNudgeWhenBlockedAppearsBeforeSend(t *testing.T) {
 	}
 	if len(msg.msgs) != 0 {
 		t.Fatalf("nudge sent into a session that went blocked before send: %v", msg.msgs)
+	}
+}
+
+func TestSCMObservation_PendingSubmitHandsOffOnceWithoutSpendingNudgeBudget(t *testing.T) {
+	st := newFakeStore()
+	sink := &fakeNotificationSink{}
+	msg := &fakeMessenger{}
+	m := New(st, msg, WithNotificationSink(sink))
+	rec := working("mer-1")
+	rec.Metadata.PendingSubmitFingerprint = "sha256-prompt"
+	rec.Metadata.PendingSubmitRecoveryAttempted = true
+	st.sessions["mer-1"] = rec
+	obs := ports.SCMObservation{
+		Fetched:  true,
+		Provider: "github",
+		Repo:     "o/r",
+		PR:       ports.SCMPRObservation{URL: "https://github.com/o/r/pull/1", Number: 1, Title: "fix pending input"},
+		CI: ports.SCMCIObservation{
+			Summary:      string(domain.CIFailing),
+			HeadSHA:      "sha1",
+			FailedChecks: []ports.SCMCheckObservation{{Name: "build", Status: string(domain.PRCheckFailed), LogTail: "boom"}},
+		},
+	}
+
+	if err := m.ApplySCMObservation(ctx, "mer-1", obs); err != nil {
+		t.Fatalf("ApplySCMObservation: %v", err)
+	}
+	// Rebuild the manager to simulate a daemon refresh/replay. The durable
+	// handoff and pending-submit facts must suppress both duplicate text and a
+	// duplicate human notification.
+	m = New(st, msg, WithNotificationSink(sink))
+	if err := m.ApplySCMObservation(ctx, "mer-1", obs); err != nil {
+		t.Fatalf("ApplySCMObservation after restart: %v", err)
+	}
+	if len(msg.msgs) != 0 {
+		t.Fatalf("pending editor input received duplicate nudge text: %v", msg.msgs)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("human handoff intents = %d, want exactly 1: %+v", len(sink.intents), sink.intents)
+	}
+	if got := sink.intents[0]; got.Type != domain.NotificationNeedsInput || got.PRURL != obs.PR.URL {
+		t.Fatalf("handoff = %+v, want needs-input notification for %s", got, obs.PR.URL)
+	}
+	if got := sink.intents[0]; got.TitleOverride == "" || !strings.Contains(got.BodyOverride, "pull request feedback") {
+		t.Fatalf("handoff copy does not surface the suppressed PR condition: %+v", got)
+	}
+	var payload reactionPayload
+	if err := json.Unmarshal([]byte(st.signatures[obs.PR.URL]), &payload); err != nil {
+		t.Fatalf("decode reaction payload: %v", err)
+	}
+	key := "ci:" + obs.PR.URL
+	if got := payload.Attempts[key]; got != 0 {
+		t.Fatalf("nudge attempts = %d, want 0 while delivery is suppressed", got)
+	}
+	if len(payload.Handoffs) != 1 {
+		t.Fatalf("durable handoffs = %+v, want exactly one notified outcome", payload.Handoffs)
+	}
+	for _, handoff := range payload.Handoffs {
+		if handoff.Outcome != humanHandoffNotified || handoff.Reason != suppressedNudgeNotificationFailed {
+			t.Fatalf("handoff = %+v, want notified/%s", handoff, suppressedNudgeNotificationFailed)
+		}
 	}
 }
 

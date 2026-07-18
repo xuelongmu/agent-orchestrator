@@ -22,8 +22,14 @@ func enrich(intent Intent) (domain.NotificationRecord, error) {
 	if intent.Type != domain.NotificationNeedsInput && rec.PRURL == "" {
 		return domain.NotificationRecord{}, domain.ErrInvalidNotificationRecord
 	}
-	rec.Title = titleForIntent(intent)
-	rec.Body = bodyForIntent(intent)
+	rec.Title = strings.TrimSpace(intent.TitleOverride)
+	if rec.Title == "" {
+		rec.Title = titleForIntent(intent)
+	}
+	rec.Body = strings.TrimSpace(intent.BodyOverride)
+	if rec.Body == "" {
+		rec.Body = bodyForIntent(intent)
+	}
 	if err := rec.Validate(); err != nil {
 		return domain.NotificationRecord{}, err
 	}
