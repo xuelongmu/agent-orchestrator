@@ -826,7 +826,7 @@ func (w *Workspace) refExists(ctx context.Context, repo, ref string) (bool, erro
 	if err == nil {
 		return true, nil
 	}
-	var exitErr *exec.ExitError
+	var exitErr interface{ ExitCode() int }
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 		return false, nil
 	}

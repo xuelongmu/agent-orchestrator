@@ -210,7 +210,9 @@ func TestOpenCodeLocalAuthStatusUnauthorizedWithEmptyDBAccounts(t *testing.T) {
 
 func TestOpenCodeLocalAuthStatusUnknownWhenMissing(t *testing.T) {
 	clearOpenCodeAuthEnv(t)
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 
 	status, ok, err := opencodeLocalAuthStatus(context.Background())
 	if err != nil {
@@ -225,6 +227,7 @@ func writeOpenCodeDB(t *testing.T, setup func(*sql.DB)) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	dataDir := filepath.Join(home, ".local", "share", "opencode")
 	writeOpenCodeDBAt(t, dataDir, setup)
 	return dataDir
@@ -247,6 +250,7 @@ func writeOpenCodeAuthFile(t *testing.T, content string) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	authDir := filepath.Join(home, ".local", "share", "opencode")
 	if err := os.MkdirAll(authDir, 0o700); err != nil {
 		t.Fatal(err)

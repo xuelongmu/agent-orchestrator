@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -219,10 +219,7 @@ func TestCreateWorkspaceProjectRepoPrunesStaleRegisteredWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	exitErr := exec.Command("sh", "-c", "exit 1").Run()
-	if exitErr == nil {
-		t.Fatal("expected exit error")
-	}
+	exitErr := exitCodeError(1)
 	var calls []string
 	addAttempts := 0
 	ws.run = func(_ context.Context, binary string, args ...string) ([]byte, error) {
@@ -607,7 +604,7 @@ func TestAddWorktreeRefusesBranchCheckedOutElsewhere(t *testing.T) {
 	if !errors.Is(err, ports.ErrWorkspaceBranchCheckedOutElsewhere) {
 		t.Fatalf("err = %v, want ports.ErrWorkspaceBranchCheckedOutElsewhere", err)
 	}
-	if !strings.Contains(err.Error(), otherPath) {
+	if !strings.Contains(err.Error(), strconv.Quote(otherPath)) {
 		t.Fatalf("err = %v, want message to include conflicting path %q", err, otherPath)
 	}
 }
@@ -651,11 +648,8 @@ func TestAddWorktreeReportsBranchNotFetched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	// Build a real exit-1 error so refExists treats every probe as "absent".
-	exitOne := func() error {
-		cmd := exec.Command("sh", "-c", "exit 1")
-		return cmd.Run()
-	}()
+	// Return exit code 1 so refExists treats every probe as "absent".
+	exitOne := exitCodeError(1)
 	ws.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		joined := strings.Join(args, " ")
 		switch {
@@ -685,10 +679,7 @@ func TestResolveBaseRefInfersRepoDefaultBranchWhenUnset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	exitOne := func() error {
-		cmd := exec.Command("sh", "-c", "exit 1")
-		return cmd.Run()
-	}()
+	exitOne := exitCodeError(1)
 	ws.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		joined := strings.Join(args, " ")
 		switch {
@@ -717,3 +708,8 @@ func mkdirFile(dir, name string) error {
 	}
 	return os.WriteFile(filepath.Join(dir, name), []byte("data"), 0o644)
 }
+
+type exitCodeError int
+
+func (e exitCodeError) Error() string { return "exit status " + strconv.Itoa(int(e)) }
+func (e exitCodeError) ExitCode() int { return int(e) }

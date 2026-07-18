@@ -132,8 +132,20 @@ func TestEffectiveHarnessAndAgentConfig(t *testing.T) {
 func TestApplySymlinks(t *testing.T) {
 	project := t.TempDir()
 	workspace := t.TempDir()
-	if err := os.WriteFile(filepath.Join(project, ".env"), []byte("X=1"), 0o644); err != nil {
+	source := filepath.Join(project, ".env")
+	if err := os.WriteFile(source, []byte("X=1"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+
+	// Creating symlinks on Windows may require Developer Mode or elevated
+	// privileges. Probe the capability so capable Windows hosts still exercise
+	// this behavior instead of skipping the test wholesale.
+	probe := filepath.Join(workspace, ".symlink-probe")
+	if err := os.Symlink(source, probe); err != nil {
+		t.Skipf("symlink creation is unavailable on this host: %v", err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatalf("remove symlink probe: %v", err)
 	}
 
 	// A present source is linked; a missing source is skipped, not an error.

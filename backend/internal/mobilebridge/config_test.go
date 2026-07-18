@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"testing"
 )
 
@@ -21,9 +22,17 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if got != want {
 		t.Fatalf("round trip: got %+v want %+v", got, want)
 	}
-	info, _ := os.Stat(p)
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("mode = %v want 0600", info.Mode().Perm())
+	// Windows does not expose Unix permission bits through os.FileMode. Keep
+	// exercising the full save/load path there, but only assert 0600 on systems
+	// where chmod-backed mode bits are meaningful.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("mode = %v want 0600", info.Mode().Perm())
+		}
 	}
 }
 

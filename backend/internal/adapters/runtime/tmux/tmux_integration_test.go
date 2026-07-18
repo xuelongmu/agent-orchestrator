@@ -3,6 +3,7 @@ package tmux
 import (
 	"context"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,9 @@ import (
 )
 
 func TestRuntimeIntegration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows runtime uses ConPTY; psmux is not tmux-compatible for this integration test")
+	}
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux unavailable")
 	}
@@ -81,6 +85,9 @@ func TestRuntimeIntegration(t *testing.T) {
 // TestRuntimeIntegrationExactSessionParsing verifies that IsAlive uses exact
 // session matching and does not treat a prefix as a live session.
 func TestRuntimeIntegrationExactSessionParsing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows runtime uses ConPTY; psmux is not tmux-compatible for this integration test")
+	}
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux unavailable")
 	}

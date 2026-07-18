@@ -17,6 +17,9 @@ func TestBuild_MatchesEmbedded(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 	embedded := apispec.Default().YAML()
+	// Git may check the generated YAML out with CRLF on Windows. Compare the
+	// canonical LF representation so this remains a content drift guard.
+	embedded = bytes.ReplaceAll(embedded, []byte("\r\n"), []byte("\n"))
 	if !bytes.Equal(got, embedded) {
 		t.Fatalf("embedded openapi.yaml is stale — run `go generate ./...` and commit.\n"+
 			"len(fresh)=%d len(embedded)=%d", len(got), len(embedded))

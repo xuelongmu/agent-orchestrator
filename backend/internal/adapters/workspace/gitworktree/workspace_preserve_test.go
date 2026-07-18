@@ -99,7 +99,7 @@ func TestWorkspaceIntegrationStashApplyRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read README after apply: %v", err)
 	}
-	if string(readmeBytes) != "edited by agent\n" {
+	if strings.ReplaceAll(string(readmeBytes), "\r\n", "\n") != "edited by agent\n" {
 		t.Fatalf("README content = %q, want %q", string(readmeBytes), "edited by agent\n")
 	}
 

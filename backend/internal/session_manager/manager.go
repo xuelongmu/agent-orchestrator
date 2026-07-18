@@ -1918,8 +1918,10 @@ func (m *Manager) buildSystemPrompt(ctx context.Context, kind domain.SessionKind
 // so the standing prompt stays a short pointer rather than a command dump.
 func (m *Manager) aoSkillPointer() string {
 	dir := skillassets.Dir(m.dataDir)
-	skillFile := filepath.Join(dir, "SKILL.md")
-	commandsGlob := filepath.Join(dir, "commands", "*.md")
+	// Prompts use portable slash-separated paths. Windows accepts C:/... paths,
+	// and forward slashes keep the skill reference stable for every harness.
+	skillFile := filepath.ToSlash(filepath.Join(dir, "SKILL.md"))
+	commandsGlob := filepath.ToSlash(filepath.Join(dir, "commands", "*.md"))
 	return "\n\n" + "## Using the ao CLI\n\n" +
 		"When you need to use the `ao` CLI, read `" + skillFile + "` first (and the relevant `" + commandsGlob + "`) for the full command catalog, flags, and examples."
 }

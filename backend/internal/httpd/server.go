@@ -46,7 +46,7 @@ func NewWithDeps(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager,
 	log = loggerOrDefault(log)
 	ln, err := net.Listen("tcp", cfg.Addr())
 	if err != nil {
-		if !errors.Is(err, syscall.EADDRINUSE) {
+		if !isAddrInUse(err) {
 			return nil, fmt.Errorf("bind %s: %w", cfg.Addr(), err)
 		}
 		// Configured port is taken by a non-AO process: retry on an ephemeral port.
@@ -74,6 +74,16 @@ func NewWithDeps(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return srv, nil
+}
+
+// isAddrInUse recognizes both the portable errno and Winsock's WSAEADDRINUSE.
+// Older Windows Go runtimes do not map the latter to syscall.EADDRINUSE.
+func isAddrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	const wsaeaddrinuse = syscall.Errno(10048)
+	return errors.Is(err, wsaeaddrinuse)
 }
 
 // Addr returns the actual bound address (useful when the configured port was 0
