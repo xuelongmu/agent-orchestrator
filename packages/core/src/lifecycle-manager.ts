@@ -3738,7 +3738,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
               const delivery = await sendLifecycleMessage(session, enrichedMessage);
               success = delivery.status === "sent";
               deliveredToAgent = success;
-              if (!success) {
+              if (delivery.status === "input-pending") {
                 blockedReason = "review-dispatch-input-pending";
                 blockedError = delivery.error ?? new Error("agent input remains pending");
               }
@@ -3909,7 +3909,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
                 const delivery = await sendLifecycleMessage(session, enrichedMessage);
                 success = delivery.status === "sent";
                 deliveredToAgent = success;
-                if (!success) {
+                if (delivery.status === "input-pending") {
                   blockedReason = "review-dispatch-input-pending";
                   blockedError = delivery.error ?? new Error("agent input remains pending");
                 }
