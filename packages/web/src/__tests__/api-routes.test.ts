@@ -1534,7 +1534,7 @@ describe("API Routes", () => {
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toBe("text/plain; version=0.0.4; charset=utf-8");
       expect(res.headers.get("x-correlation-id")).toBeTruthy();
-      expect(await res.text()).toContain("# TYPE ao_operation_duration_ms histogram");
+      expect(await res.text()).toContain("# TYPE ao_operation_duration_ms_bucket gauge");
     });
   });
 
