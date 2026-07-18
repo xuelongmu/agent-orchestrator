@@ -1,11 +1,84 @@
 import { describe, it, expect } from "vitest";
 import {
   createDetectingDecision,
+  classifyCIFailure,
   hashEvidence,
   isDetectingTimedOut,
+  resolveMergeDefinitionOfDone,
   DETECTING_MAX_ATTEMPTS,
   DETECTING_MAX_DURATION_MS,
 } from "../lifecycle-status-decisions.js";
+
+describe("merge definition of done (#15)", () => {
+  const done = {
+    ciGreen: true,
+    unresolvedRequiredThreads: 0,
+    approvalSatisfied: true,
+    noConflicts: true,
+    isDraft: false,
+    confidence: 0.9,
+    confidenceThreshold: 0.8,
+    reviewDataComplete: true,
+  };
+
+  it("allows merge only when every gate holds", () => {
+    expect(resolveMergeDefinitionOfDone(done)).toEqual({ ready: true, blockers: [] });
+  });
+
+  it("reports all failed gates instead of treating mergeable as sufficient", () => {
+    expect(
+      resolveMergeDefinitionOfDone({
+        ...done,
+        ciGreen: false,
+        unresolvedRequiredThreads: 2,
+        approvalSatisfied: false,
+        noConflicts: false,
+        confidence: 0.4,
+      }),
+    ).toEqual({
+      ready: false,
+      blockers: [
+        "ci_not_green",
+        "unresolved_review_threads",
+        "review_approval_missing",
+        "merge_conflicts",
+        "low_confidence",
+      ],
+    });
+  });
+});
+
+describe("flaky CI classifier (#15)", () => {
+  const check = { name: "windows", status: "failed" as const, conclusion: "FAILURE" };
+
+  it("classifies runner/network infrastructure evidence as flaky", () => {
+    expect(
+      classifyCIFailure([check], {
+        failedJobs: [
+          {
+            name: "windows",
+            runUrl: "https://example.test/run/1",
+            logTail: "The hosted runner was lost. ECONNRESET",
+          },
+        ],
+      }),
+    ).toMatchObject({ kind: "flaky" });
+  });
+
+  it("keeps ordinary assertion failures on the real-failure path", () => {
+    expect(
+      classifyCIFailure([check], {
+        failedJobs: [
+          {
+            name: "unit",
+            runUrl: "https://example.test/run/2",
+            logTail: "AssertionError: expected 1 to equal 2",
+          },
+        ],
+      }),
+    ).toEqual({ kind: "real", reason: "no flaky infrastructure signal" });
+  });
+});
 
 describe("hashEvidence", () => {
   it("returns a 12-character hex string", () => {

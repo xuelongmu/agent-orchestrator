@@ -724,6 +724,41 @@ describe("scm-github plugin", () => {
     });
   });
 
+  describe("retryCI", () => {
+    it("reruns each distinct failed GitHub Actions run", async () => {
+      ghMock.mockResolvedValue({ stdout: "" });
+      const retried = await scm.retryCI!(pr, [
+        {
+          name: "unit",
+          status: "failed",
+          url: "https://github.com/acme/repo/actions/runs/123/job/1",
+        },
+        {
+          name: "lint",
+          status: "failed",
+          url: "https://github.com/acme/repo/actions/runs/123/job/2",
+        },
+      ]);
+
+      expect(retried).toBe(true);
+      expect(ghMock).toHaveBeenCalledTimes(1);
+      expect(ghMock).toHaveBeenCalledWith(
+        expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
+        ["run", "rerun", "123", "--failed", "--repo", "acme/repo"],
+        expect.any(Object),
+      );
+    });
+
+    it("declines non-Actions checks that cannot be retried", async () => {
+      expect(
+        await scm.retryCI!(pr, [
+          { name: "external", status: "failed", url: "https://ci.example.test/1" },
+        ]),
+      ).toBe(false);
+      expect(ghMock).not.toHaveBeenCalled();
+    });
+  });
+
   // ---- getCIFailureSummary -----------------------------------------------
 
   describe("getCIFailureSummary", () => {

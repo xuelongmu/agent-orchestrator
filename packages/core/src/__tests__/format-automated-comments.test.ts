@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { formatAutomatedCommentsMessage } from "../format-automated-comments.js";
+import {
+  formatAutomatedCommentsMessage,
+  partitionAutomatedComments,
+  resolveReviewBotPolicy,
+} from "../format-automated-comments.js";
 import type { AutomatedComment, PRInfo } from "../types.js";
 
 function makeComment(overrides: Partial<AutomatedComment> = {}): AutomatedComment {
@@ -48,18 +52,14 @@ describe("formatAutomatedCommentsMessage", () => {
   it("falls back to OWNER/REPO/PR placeholders when PR is absent", () => {
     const msg = formatAutomatedCommentsMessage([makeComment()]);
     expect(msg).toContain("gh api repos/OWNER/REPO/pulls/PR/reviews --paginate");
-    expect(msg).toContain(
-      "gh api repos/OWNER/REPO/pulls/PR/reviews/REVIEW_ID/comments --paginate",
-    );
+    expect(msg).toContain("gh api repos/OWNER/REPO/pulls/PR/reviews/REVIEW_ID/comments --paginate");
   });
 
   it("paginates every enumerated gh api command (fixes #895)", () => {
     // Regression: step 2 was previously missing --paginate, reintroducing the
     // exact pagination failure mode #895 is meant to fix.
     const msg = formatAutomatedCommentsMessage([makeComment()], prInfo);
-    const commandLines = msg
-      .split("\n")
-      .filter((l) => /^\s*\d+\.\s+`gh api/.test(l));
+    const commandLines = msg.split("\n").filter((l) => /^\s*\d+\.\s+`gh api/.test(l));
     expect(commandLines).toHaveLength(3);
     for (const line of commandLines) {
       expect(line).toContain("--paginate");
@@ -173,5 +173,36 @@ describe("formatAutomatedCommentsMessage", () => {
     const secondIdx = msg.indexOf("second bug");
     expect(firstIdx).toBeGreaterThan(-1);
     expect(secondIdx).toBeGreaterThan(firstIdx);
+  });
+
+  it("includes the SCM thread id when available", () => {
+    const msg = formatAutomatedCommentsMessage([makeComment({ threadId: "PRRT_123" })]);
+    expect(msg).toContain("Thread ID: PRRT_123");
+  });
+});
+
+describe("per-bot review policy (#15)", () => {
+  const policies = {
+    "chatgpt-codex-connector[bot]": { weight: 1 },
+    "coderabbitai[bot]": { weight: 0.25 },
+    "*": { weight: 0 },
+  };
+
+  it("normalizes case and the optional [bot] suffix", () => {
+    expect(resolveReviewBotPolicy("ChatGPT-Codex-Connector", policies)?.weight).toBe(1);
+  });
+
+  it("separates actionable, context-only, and ignored bots", () => {
+    const result = partitionAutomatedComments(
+      [
+        makeComment({ id: "codex", botName: "chatgpt-codex-connector[bot]" }),
+        makeComment({ id: "rabbit", botName: "coderabbitai[bot]" }),
+        makeComment({ id: "copilot", botName: "copilot-pull-request-reviewer[bot]" }),
+      ],
+      policies,
+    );
+    expect(result.actionable.map((comment) => comment.id)).toEqual(["codex"]);
+    expect(result.deprioritized.map((comment) => comment.id)).toEqual(["rabbit"]);
+    expect(result.ignored.map((comment) => comment.id)).toEqual(["copilot"]);
   });
 });

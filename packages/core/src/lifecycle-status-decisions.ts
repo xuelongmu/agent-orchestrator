@@ -8,6 +8,8 @@ import {
   type CanonicalPRState,
   type CanonicalSessionReason,
   type CanonicalSessionState,
+  type CICheck,
+  type CIFailureSummary,
   type CIStatus,
   type PREnrichmentData,
   type SessionStatus,
@@ -17,6 +19,85 @@ import { supportsRecentLiveness } from "./activity-signal.js";
 export const DETECTING_MAX_ATTEMPTS = 3;
 /** Hard time cap for detecting state — escalate after this regardless of attempts. */
 export const DETECTING_MAX_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+
+export interface MergeDefinitionOfDoneInput {
+  ciGreen: boolean;
+  unresolvedRequiredThreads: number;
+  approvalSatisfied: boolean;
+  noConflicts: boolean;
+  isDraft: boolean;
+  confidence: number;
+  confidenceThreshold: number;
+  reviewDataComplete: boolean;
+}
+
+export interface MergeDefinitionOfDoneDecision {
+  ready: boolean;
+  blockers: string[];
+}
+
+/** Pure, fail-closed definition-of-done decision used before every auto-merge. */
+export function resolveMergeDefinitionOfDone(
+  input: MergeDefinitionOfDoneInput,
+): MergeDefinitionOfDoneDecision {
+  const blockers: string[] = [];
+  if (!input.ciGreen) blockers.push("ci_not_green");
+  if (!input.reviewDataComplete) blockers.push("review_data_incomplete");
+  if (input.unresolvedRequiredThreads > 0) blockers.push("unresolved_review_threads");
+  if (!input.approvalSatisfied) blockers.push("review_approval_missing");
+  if (!input.noConflicts) blockers.push("merge_conflicts");
+  if (input.isDraft) blockers.push("draft_pr");
+  if (input.confidence < input.confidenceThreshold) blockers.push("low_confidence");
+  return { ready: blockers.length === 0, blockers };
+}
+
+export interface CIFailureClassification {
+  kind: "flaky" | "real";
+  reason: string;
+}
+
+const FLAKY_CI_CONCLUSIONS = new Set(["STARTUP_FAILURE", "STALE"]);
+const FLAKY_CI_LOG_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+  { pattern: /\bflaky\b/i, reason: "explicit flaky marker" },
+  {
+    pattern: /(?:runner|worker) (?:was |has been )?(?:lost|disconnected|terminated)/i,
+    reason: "runner infrastructure failure",
+  },
+  {
+    pattern: /(?:ECONNRESET|EAI_AGAIN|ENETUNREACH|socket hang up)/i,
+    reason: "transient network failure",
+  },
+  {
+    pattern: /(?:HTTP |status(?: code)?[=: ]+)(?:502|503|504)\b/i,
+    reason: "transient upstream failure",
+  },
+  {
+    pattern: /no space left on device|disk quota exceeded/i,
+    reason: "runner capacity failure",
+  },
+];
+
+/**
+ * Conservative flaky-CI classifier. It retries only explicit flake/runner/
+ * transient-infrastructure evidence; ordinary test/assertion failures are real.
+ */
+export function classifyCIFailure(
+  failedChecks: CICheck[],
+  summary?: CIFailureSummary | null,
+): CIFailureClassification {
+  for (const check of failedChecks) {
+    const conclusion = check.conclusion?.toUpperCase();
+    if (conclusion && FLAKY_CI_CONCLUSIONS.has(conclusion)) {
+      return { kind: "flaky", reason: `check conclusion ${conclusion}` };
+    }
+  }
+
+  const logs = summary?.failedJobs.map((job) => job.logTail ?? "").join("\n") ?? "";
+  for (const signal of FLAKY_CI_LOG_PATTERNS) {
+    if (signal.pattern.test(logs)) return { kind: "flaky", reason: signal.reason };
+  }
+  return { kind: "real", reason: "no flaky infrastructure signal" };
+}
 
 type ProbeState = "alive" | "dead" | "unknown";
 type PRReviewDecision = PREnrichmentData["reviewDecision"];

@@ -157,6 +157,8 @@ projects:
 #     action: send-to-agent
 #     retries: 2
 #     escalateAfter: 2
+#     flakyRetries: 1          # retry classifier-confirmed flakes before nudging the agent
+#     flakyRetryBackoff: 10m
 #
 #   changes-requested:
 #     auto: true
@@ -164,9 +166,22 @@ projects:
 #     escalateAfter: 30m
 #
 #   approved-and-green:
-#     auto: false              # set to true for auto-merge
-#     action: notify
+#     auto: false
+#     action: notify           # set action: auto-merge to enable the full DoD gate
+#     confidenceThreshold: 0.8
 #     priority: action
+#
+#   bugbot-comments:
+#     reviewBots:
+#       chatgpt-codex-connector[bot]:
+#         weight: 1            # actionable and merge-blocking
+#         approvalPhrases: ["Didn't find any major issues. Chef's kiss."]
+#         approvalReactions: [THUMBS_UP]
+#         rebumpMessage: "@codex review"
+#         maxRebumps: 2
+#         rebumpBackoff: 30m
+#       "*":
+#         weight: 0.25         # context-only; use 0 to ignore other bots
 #
 #   agent-stuck:
 #     threshold: 10m

@@ -979,13 +979,13 @@ function parseCheckContexts(contexts: unknown): CICheck[] {
           rawConclusion === "TIMED_OUT" ||
           rawConclusion === "CANCELLED" ||
           rawConclusion === "ACTION_REQUIRED" ||
-          rawConclusion === "ERROR"
+          rawConclusion === "ERROR" ||
+          rawConclusion === "STARTUP_FAILURE"
         ) {
           // Explicit failure conclusions — mirrors the failure list in mapRawCheckStateToStatus()
           status = "failed";
         } else {
-          // STARTUP_FAILURE and any other unrecognized conclusion → "skipped",
-          // matching mapRawCheckStateToStatus()'s default return "skipped" in the REST path.
+          // Any other unrecognized conclusion is non-actionable.
           status = "skipped";
         }
       } else if (rawStatus === "IN_PROGRESS") {

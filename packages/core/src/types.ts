@@ -975,6 +975,13 @@ export interface SCM {
   /** Get overall CI summary */
   getCISummary(pr: PRInfo): Promise<CIStatus>;
 
+  /**
+   * Retry the failed CI runs represented by `failedChecks`.
+   * Returns true only when the SCM accepted at least one retry request.
+   * Optional because not every SCM/check provider supports reruns.
+   */
+  retryCI?(pr: PRInfo, failedChecks: CICheck[]): Promise<boolean>;
+
   // --- Review Tracking ---
 
   /** Get all reviews on a PR */
@@ -1009,6 +1016,9 @@ export interface SCM {
       forceFresh?: boolean;
     },
   ): Promise<ReviewThreadsResult>;
+
+  /** Post a top-level PR comment (used for bounded automated-review re-bumps). */
+  postPRComment?(pr: PRInfo, body: string): Promise<void>;
 
   // --- Merge Readiness ---
 
@@ -1212,6 +1222,11 @@ export interface ReviewComment {
   /** Whether the comment was authored by a known bot */
   isBot?: boolean;
   /**
+   * Stable bot login/name when this is an automated comment. Unlike `isBot`,
+   * this lets core apply a per-bot policy (Codex vs CodeRabbit/Copilot/etc.).
+   */
+  botName?: string;
+  /**
    * Whether the author is a known automated *code reviewer* (e.g. Codex,
    * Cursor) — a strict subset of `isBot` that excludes CI/coverage/dependency
    * bots. Used to gate review-loop completion on the intended reviewer.
@@ -1226,6 +1241,8 @@ export interface ReviewSummary {
   submittedAt: Date;
   /** Whether the review was submitted by a known bot. */
   isBot?: boolean;
+  /** Stable bot login/name when the review was submitted by a bot. */
+  botName?: string;
   /**
    * Whether the review was submitted by a known automated *code reviewer*
    * (e.g. Codex, Cursor) — a strict subset of `isBot`. Used to gate review-loop
@@ -1243,8 +1260,12 @@ export interface ReviewSummary {
 export interface ReviewThreadsResult {
   threads: ReviewComment[];
   reviews: ReviewSummary[];
+  /** PR-level reactions used as informal reviewer approval signals. */
+  reactions?: ReviewReaction[];
   /** Current head commit SHA of the PR, when the SCM can provide it. */
   headSha?: string;
+  /** Commit time of `headSha`, used to reject approval reactions from an older head. */
+  headCommittedAt?: Date;
   /**
    * True when the returned `threads` may be incomplete (the PR has more review
    * threads than the plugin fetched in one page). Callers must fail closed —
@@ -1262,6 +1283,16 @@ export interface AutomatedComment {
   severity: "error" | "warning" | "info";
   createdAt: Date;
   url: string;
+  /** GraphQL/thread identifier, when the SCM exposes one. */
+  threadId?: string;
+}
+
+export interface ReviewReaction {
+  author: string;
+  content: string;
+  createdAt: Date;
+  isBot?: boolean;
+  botName?: string;
 }
 
 // --- Merge Readiness ---
@@ -1463,6 +1494,25 @@ export interface OrchestratorEvent {
 // REACTIONS
 // =============================================================================
 
+/** Per-reviewer policy for the automated PR review loop. */
+export interface ReviewBotPolicy {
+  /**
+   * Importance in the review loop: 1 is actionable and merge-blocking, 0 is
+   * ignored, and values between 0 and 1 are context-only/deprioritized.
+   */
+  weight: number;
+  /** Review-body phrases that count as this bot's informal approval. */
+  approvalPhrases?: string[];
+  /** PR reaction contents that count as this bot's informal approval. */
+  approvalReactions?: string[];
+  /** Top-level PR comment used to ask this bot to review again. */
+  rebumpMessage?: string;
+  /** Maximum automatic re-bumps before AO asks for human approval. */
+  maxRebumps?: number;
+  /** Base exponential backoff between re-bumps (for example `30m`). */
+  rebumpBackoff?: string;
+}
+
 /** A configured automatic reaction to an event */
 export interface ReactionConfig {
   /** Whether this reaction is enabled */
@@ -1522,6 +1572,19 @@ export interface ReactionConfig {
    * could not actually stop the spawn.
    */
   confidenceThreshold?: number;
+
+  /**
+   * Per-bot automated-review policy, keyed by bot login. `*` is the fallback.
+   * Used by `bugbot-comments`; exact keys are matched case-insensitively and
+   * with an optional trailing `[bot]` normalized away.
+   */
+  reviewBots?: Record<string, ReviewBotPolicy>;
+
+  /** Maximum classifier-approved flaky CI reruns before the agent is nudged. */
+  flakyRetries?: number;
+
+  /** Grace period after a flaky rerun during which the same failure is not dispatched. */
+  flakyRetryBackoff?: string;
 }
 
 export interface ReactionResult {

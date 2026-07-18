@@ -14,9 +14,61 @@
  * data, not instructions.
  */
 
-import type { AutomatedComment, PRInfo } from "./types.js";
+import type { AutomatedComment, PRInfo, ReviewBotPolicy } from "./types.js";
 
 const EXCERPT_MAX = 160;
+
+export interface AutomatedCommentPolicyBuckets {
+  actionable: AutomatedComment[];
+  deprioritized: AutomatedComment[];
+  ignored: AutomatedComment[];
+}
+
+/** Normalize SCM-specific bot spellings for case-insensitive policy lookup. */
+export function normalizeReviewBotName(botName: string): string {
+  return botName
+    .trim()
+    .toLowerCase()
+    .replace(/\[bot\]$/, "");
+}
+
+/** Resolve an exact bot policy, falling back to the `*` entry when configured. */
+export function resolveReviewBotPolicy(
+  botName: string,
+  policies: Record<string, ReviewBotPolicy> | undefined,
+): ReviewBotPolicy | undefined {
+  if (!policies) return undefined;
+  const normalized = normalizeReviewBotName(botName);
+  const exact = Object.entries(policies).find(
+    ([configuredName]) =>
+      configuredName !== "*" && normalizeReviewBotName(configuredName) === normalized,
+  );
+  return exact?.[1] ?? policies["*"];
+}
+
+/**
+ * Apply review-bot weights before dispatch. Only weight=1 findings consume a
+ * review/fix round and block merge; fractional findings are context-only.
+ */
+export function partitionAutomatedComments(
+  comments: AutomatedComment[],
+  policies: Record<string, ReviewBotPolicy> | undefined,
+): AutomatedCommentPolicyBuckets {
+  const buckets: AutomatedCommentPolicyBuckets = {
+    actionable: [],
+    deprioritized: [],
+    ignored: [],
+  };
+  for (const comment of comments) {
+    // No configured policy preserves legacy behavior for hand-constructed
+    // configs and third-party consumers. Production defaults configure Codex.
+    const weight = resolveReviewBotPolicy(comment.botName, policies)?.weight ?? 1;
+    if (weight >= 1) buckets.actionable.push(comment);
+    else if (weight > 0) buckets.deprioritized.push(comment);
+    else buckets.ignored.push(comment);
+  }
+  return buckets;
+}
 
 /**
  * Extract the first non-blank line, strip common markdown markers, sanitize
@@ -65,6 +117,7 @@ export function formatAutomatedCommentsMessage(
       : "";
     lines.push(`- **[${c.severity}] ${c.botName}**${loc}: \`${excerpt(c.body)}\``);
     lines.push(`  ${c.url}`);
+    if (c.threadId) lines.push(`  Thread ID: ${c.threadId}`);
   }
   lines.push(
     "",

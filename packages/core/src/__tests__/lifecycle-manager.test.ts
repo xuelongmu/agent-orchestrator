@@ -377,9 +377,7 @@ describe("budget enforcement", () => {
 
     // The agent is actually stopped (not just relabeled) so it can't keep
     // spending tokens while reported paused.
-    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "rt-1" }),
-    );
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(expect.objectContaining({ id: "rt-1" }));
     expect(lm.getStates().get("app-1")).toBe("needs_input");
   });
 
@@ -425,9 +423,7 @@ describe("budget enforcement", () => {
 
     await lm.check("app-1");
 
-    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "rt-1" }),
-    );
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(expect.objectContaining({ id: "rt-1" }));
     expect(lm.getStates().get("app-1")).toBe("needs_input");
   });
 
@@ -448,9 +444,7 @@ describe("budget enforcement", () => {
     await lm.check("app-1");
 
     expect(mockRegistry.get).toHaveBeenCalledWith("runtime", "mock");
-    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "rt-1" }),
-    );
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(expect.objectContaining({ id: "rt-1" }));
   });
 
   it("retries the interrupt on the next poll after a transient failure", async () => {
@@ -550,9 +544,7 @@ describe("budget enforcement", () => {
     await lm.check("app-1");
 
     expect(lm.getStates().get("app-1")).toBe("needs_input");
-    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "rt-1" }),
-    );
+    expect(plugins.runtime.interrupt).toHaveBeenCalledWith(expect.objectContaining({ id: "rt-1" }));
     const meta = readMetadataRaw(env.sessionsDir, "app-1");
     expect(meta!["budgetPausedAt"]).toBeTruthy();
   });
@@ -1603,9 +1595,11 @@ describe("check (single session)", () => {
       detectPR: vi.fn().mockResolvedValue(followUpPR),
       // Enrichment cache must show closedPR as closed so the detectPR filter
       // can remove it using per-PR state rather than the aggregate lifecycle state.
-      getPRState: vi.fn().mockImplementation((pr: PRInfo) =>
-        Promise.resolve(pr.number === closedPR.number ? "closed" : "open"),
-      ),
+      getPRState: vi
+        .fn()
+        .mockImplementation((pr: PRInfo) =>
+          Promise.resolve(pr.number === closedPR.number ? "closed" : "open"),
+        ),
     });
     const registry = createMockRegistry({
       runtime: plugins.runtime,
@@ -2508,8 +2502,7 @@ describe("reactions", () => {
       return vi.mocked(notifier.notify).mock.calls.filter((call) => {
         const event = call[0] as { type?: string; data?: { semanticType?: string } };
         return (
-          event?.type === "reaction.triggered" &&
-          event?.data?.semanticType === "report.needs_input"
+          event?.type === "reaction.triggered" && event?.data?.semanticType === "report.needs_input"
         );
       });
     };
@@ -2700,7 +2693,9 @@ describe("reactions", () => {
 
       expect(cap.mutatingButtons()).toHaveLength(0);
       // The alert itself still went out.
-      expect(cap.notify.mock.calls.length + cap.notifyWithActions.mock.calls.length).toBeGreaterThanOrEqual(1);
+      expect(
+        cap.notify.mock.calls.length + cap.notifyWithActions.mock.calls.length,
+      ).toBeGreaterThanOrEqual(1);
     });
 
     it("mints mutating buttons when the identity still matches at delivery (B==B)", async () => {
@@ -2771,8 +2766,7 @@ describe("reactions", () => {
       const reportReNotifies = vi.mocked(notifier.notify).mock.calls.filter((call) => {
         const event = call[0] as { type?: string; data?: { semanticType?: string } };
         return (
-          event?.type === "reaction.triggered" &&
-          event?.data?.semanticType === "report.needs_input"
+          event?.type === "reaction.triggered" && event?.data?.semanticType === "report.needs_input"
         );
       });
       expect(reportReNotifies).toHaveLength(0);
@@ -2786,7 +2780,11 @@ describe("reactions", () => {
     const reportNeedsInputReaction = (): OrchestratorConfig => ({
       ...config,
       reactions: {
-        "report-needs-input": { action: "notify" as const, auto: true, priority: "urgent" as const },
+        "report-needs-input": {
+          action: "notify" as const,
+          auto: true,
+          priority: "urgent" as const,
+        },
       },
       notificationRouting: { ...config.notificationRouting, urgent: ["desktop"] },
     });
@@ -2844,7 +2842,12 @@ describe("reactions", () => {
 
       await lm.check("app-1");
 
-      expect(cap.mutatingButtons().map((a) => a.label)).toEqual(["Approve", "Deny", "Nudge", "Kill"]);
+      expect(cap.mutatingButtons().map((a) => a.label)).toEqual([
+        "Approve",
+        "Deny",
+        "Nudge",
+        "Kill",
+      ]);
     });
   });
 
@@ -3490,7 +3493,9 @@ describe("reactions", () => {
     const sentMessage = vi.mocked(mockSessionManager.send).mock.calls[0]![1];
     expect(sentMessage).toContain("CI is failing on your PR.");
     expect(sentMessage).toContain("Failed: build → Run pnpm test");
-    expect(sentMessage).toContain("Failure URL: https://github.com/org/repo/actions/runs/123/job/456");
+    expect(sentMessage).toContain(
+      "Failure URL: https://github.com/org/repo/actions/runs/123/job/456",
+    );
     expect(sentMessage).toContain("Log tail (last 3 lines):");
     expect(sentMessage).toContain("AssertionError: expected true to be false");
     expect(sentMessage).toContain("\u200B```");
@@ -5405,9 +5410,11 @@ describe("review loop round-cap + completion detection (#4)", () => {
     };
 
     let hasBotThreads = true;
-    const getReviewThreads = vi.fn().mockImplementation(async () =>
-      reviewedResult({ threads: hasBotThreads ? [botThread("b1")] : [] }),
-    );
+    const getReviewThreads = vi
+      .fn()
+      .mockImplementation(async () =>
+        reviewedResult({ threads: hasBotThreads ? [botThread("b1")] : [] }),
+      );
     // Default createMockSCM enrichment reports ciStatus "passing".
     const mockSCM = createMockSCM({ getReviewThreads });
     const registry = createMockRegistry({
@@ -5757,9 +5764,11 @@ describe("review loop round-cap + completion detection (#4)", () => {
     };
     let hasBotThreads = true;
     let ci = "passing";
-    const getReviewThreads = vi.fn().mockImplementation(async () =>
-      reviewedResult({ threads: hasBotThreads ? [botThread("b1")] : [] }),
-    );
+    const getReviewThreads = vi
+      .fn()
+      .mockImplementation(async () =>
+        reviewedResult({ threads: hasBotThreads ? [botThread("b1")] : [] }),
+      );
     const mockSCM = createMockSCM({
       getReviewThreads,
       getCISummary: vi.fn().mockImplementation(async () => ci),
@@ -6178,9 +6187,11 @@ describe("review loop round-cap + completion detection (#4)", () => {
       url: "https://example.com/h1",
       isBot: false,
     };
-    const getReviewThreads = vi.fn().mockImplementation(async () =>
-      reviewedResult({ threads: hasHumanThread ? [humanThread] : [] }),
-    );
+    const getReviewThreads = vi
+      .fn()
+      .mockImplementation(async () =>
+        reviewedResult({ threads: hasHumanThread ? [humanThread] : [] }),
+      );
     const mockSCM = createMockSCM({ getReviewThreads });
     const registry = createMockRegistry({
       runtime: plugins.runtime,
@@ -6547,7 +6558,12 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     const lm = setupStuckSession(getReviewThreads, {
       nudgeRetries: 3,
       withNotifier: true,
-      enrichment: { state: "open", ciStatus: "passing", reviewDecision: "pending", mergeable: false },
+      enrichment: {
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "pending",
+        mergeable: false,
+      },
     });
 
     await lm.check("app-1"); // bugbot delivers the comment once
@@ -6859,7 +6875,12 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     const lm = setupStuckSession(getReviewThreads, {
       nudgeRetries: 3,
       notifier,
-      enrichment: { state: "open", ciStatus: "passing", reviewDecision: "pending", mergeable: false },
+      enrichment: {
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "pending",
+        mergeable: false,
+      },
     });
 
     // Poll 1 settles into review_pending (a review.pending transition notify may fire).
@@ -6977,6 +6998,202 @@ describe("summary pinning", () => {
 
     // Should not throw — error is swallowed
     await expect(lm.check("app-1")).resolves.not.toThrow();
+  });
+});
+
+describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
+  function qualityConfig(): OrchestratorConfig {
+    return {
+      ...config,
+      reactions: {
+        ...config.reactions,
+        "bugbot-comments": {
+          auto: true,
+          action: "send-to-agent",
+          reviewBots: {
+            "chatgpt-codex-connector[bot]": {
+              weight: 1,
+              approvalPhrases: ["Didn't find any major issues. Chef's kiss."],
+              approvalReactions: ["THUMBS_UP"],
+            },
+            "*": { weight: 0 },
+          },
+        },
+        "approved-and-green": {
+          auto: true,
+          action: "auto-merge",
+          confidenceThreshold: 0,
+        },
+      },
+    };
+  }
+
+  function codexApprovalResult(threads: unknown[] = []) {
+    return {
+      threads,
+      reviews: [
+        {
+          author: "chatgpt-codex-connector[bot]",
+          botName: "chatgpt-codex-connector[bot]",
+          state: "COMMENTED",
+          body: "Didn't find any major issues. Chef's kiss.",
+          submittedAt: new Date(),
+          isBot: true,
+          isReviewBot: true,
+          commitSha: "sha-head",
+        },
+      ],
+      headSha: "sha-head",
+      threadsTruncated: false,
+    };
+  }
+
+  it("merges only after fresh CI, conflict, thread, approval, and confidence gates pass", async () => {
+    const mergePR = vi.fn().mockResolvedValue(undefined);
+    const mockSCM = createMockSCM({
+      mergePR,
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi.fn().mockResolvedValue("none"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: true,
+        ciPassing: true,
+        approved: false,
+        noConflicts: true,
+        blockers: [],
+      }),
+      getReviewThreads: vi.fn().mockResolvedValue(codexApprovalResult()),
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const pr = makeMatchingPR();
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr }),
+      registry,
+      configOverride: qualityConfig(),
+    });
+
+    await lm.check("app-1");
+
+    expect(mergePR).toHaveBeenCalledWith(pr);
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["autoMergeRequestedAt"]).toBeTruthy();
+  });
+
+  it("blocks on unresolved Codex threads but ignores bots weighted to zero", async () => {
+    const codexThread = {
+      id: "codex-1",
+      author: "chatgpt-codex-connector[bot]",
+      botName: "chatgpt-codex-connector[bot]",
+      body: "Fix this",
+      isResolved: false,
+      createdAt: new Date(),
+      url: "https://example.test/codex-1",
+      isBot: true,
+      isReviewBot: true,
+    };
+    const rabbitThread = {
+      ...codexThread,
+      id: "rabbit-1",
+      author: "coderabbitai[bot]",
+      botName: "coderabbitai[bot]",
+      url: "https://example.test/rabbit-1",
+      isReviewBot: false,
+    };
+    const getReviewThreads = vi
+      .fn()
+      .mockResolvedValueOnce(codexApprovalResult([codexThread]))
+      .mockResolvedValue(codexApprovalResult([codexThread]));
+    const mergePR = vi.fn().mockResolvedValue(undefined);
+    const mockSCM = createMockSCM({
+      mergePR,
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi.fn().mockResolvedValue("none"),
+      getMergeability: vi.fn().mockResolvedValue({
+        mergeable: true,
+        ciPassing: true,
+        approved: false,
+        noConflicts: true,
+        blockers: [],
+      }),
+      getReviewThreads,
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makeMatchingPR() }),
+      registry,
+      configOverride: qualityConfig(),
+    });
+
+    await lm.check("app-1");
+    expect(mergePR).not.toHaveBeenCalled();
+
+    getReviewThreads.mockResolvedValue(codexApprovalResult([rabbitThread]));
+    await lm.check("app-1");
+    expect(mergePR).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries classifier-confirmed flaky CI without consuming an agent fix round", async () => {
+    const retryCI = vi.fn().mockResolvedValue(true);
+    const failedChecks = [
+      {
+        name: "windows",
+        status: "failed" as const,
+        conclusion: "FAILURE",
+        url: "https://github.com/org/my-app/actions/runs/10/job/20",
+      },
+    ];
+    const mockSCM = createMockSCM({
+      getCIChecks: vi.fn().mockResolvedValue(failedChecks),
+      getCISummary: vi.fn().mockResolvedValue("failing"),
+      getCIFailureSummary: vi.fn().mockResolvedValue({
+        failedJobs: [
+          {
+            name: "windows",
+            runUrl: failedChecks[0]!.url,
+            logTail: "The hosted runner was lost (ECONNRESET)",
+          },
+        ],
+      }),
+      retryCI,
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+    });
+    const configOverride: OrchestratorConfig = {
+      ...config,
+      reactions: {
+        "ci-failed": {
+          auto: true,
+          action: "send-to-agent",
+          retries: 2,
+          flakyRetries: 1,
+          flakyRetryBackoff: "10m",
+        },
+      },
+    };
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: makeMatchingPR() }),
+      registry,
+      configOverride,
+    });
+
+    await lm.check("app-1");
+
+    expect(retryCI).toHaveBeenCalledWith(makeMatchingPR(), failedChecks);
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    const metadata = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(metadata?.["flakyCIRetryCount"]).toBe("1");
+    expect(metadata?.["ciFailureCountTotal"]).toBeFalsy();
   });
 });
 
@@ -7626,8 +7843,8 @@ describe("multi-PR state machine aggregation", () => {
         pr: pr10,
         prs: [pr10, { ...pr10 }],
         metadata: {
-          prEnrichment_1: "{\"state\":\"open\"}",
-          prReviewComments_1: "{\"unresolvedThreads\":0}",
+          prEnrichment_1: '{"state":"open"}',
+          prReviewComments_1: '{"unresolvedThreads":0}',
         },
       });
 
@@ -7637,13 +7854,13 @@ describe("multi-PR state machine aggregation", () => {
         metaOverrides: {
           pr: pr10.url,
           prs: `${pr10.url},${pr10.url}`,
-          prEnrichment_1: "{\"state\":\"open\"}",
-          prReviewComments_1: "{\"unresolvedThreads\":0}",
+          prEnrichment_1: '{"state":"open"}',
+          prReviewComments_1: '{"unresolvedThreads":0}',
         },
       });
       updateMetadata(env.sessionsDir, "app-1", {
-        prEnrichment_1: "{\"state\":\"open\"}",
-        prReviewComments_1: "{\"unresolvedThreads\":0}",
+        prEnrichment_1: '{"state":"open"}',
+        prReviewComments_1: '{"unresolvedThreads":0}',
       });
 
       lm.start(60_000);

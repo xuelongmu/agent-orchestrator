@@ -73,6 +73,10 @@ const BOT_AUTHORS = new Set([
  */
 const CODE_REVIEW_BOT_AUTHORS = new Set(["cursor[bot]", "chatgpt-codex-connector[bot]"]);
 
+function isBotAuthor(author: string): boolean {
+  return BOT_AUTHORS.has(author) || author.toLowerCase().endsWith("[bot]");
+}
+
 const CI_FAILURE_LOG_TAIL_LINES = 120;
 const ciSummaryFailClosedEmitted = new Set<string>();
 
@@ -170,7 +174,8 @@ function mapRawCheckStateToStatus(rawState: string | undefined): CICheck["status
     state === "TIMED_OUT" ||
     state === "CANCELLED" ||
     state === "ACTION_REQUIRED" ||
-    state === "ERROR"
+    state === "ERROR" ||
+    state === "STARTUP_FAILURE"
   ) {
     return "failed";
   }
@@ -1054,6 +1059,21 @@ function createGitHubSCM(): SCM {
       return "passing";
     },
 
+    async retryCI(pr: PRInfo, failedChecks: CICheck[]): Promise<boolean> {
+      const runIds = new Set<string>();
+      for (const check of failedChecks) {
+        const reference = extractActionRunReference(check);
+        if (reference) runIds.add(reference.runId);
+      }
+      if (runIds.size === 0) return false;
+
+      for (const runId of runIds) {
+        await gh(["run", "rerun", runId, "--failed", "--repo", repoFlag(pr)]);
+      }
+      invalidatePRCache(pr);
+      return true;
+    },
+
     async getReviews(pr: PRInfo): Promise<Review[]> {
       // 5s TTL — review array. Reviewers are async, so the lifecycle worker
       // sees a new review on its next poll cycle within 5s of the cache expiring.
@@ -1195,7 +1215,7 @@ function createGitHubSCM(): SCM {
               const c = t.comments.nodes[0];
               if (!c) return false; // skip threads with no comments
               const author = c.author?.login ?? "";
-              return !BOT_AUTHORS.has(author);
+              return !isBotAuthor(author);
             })
             .map((t) => {
               const c = t.comments.nodes[0];
@@ -1259,6 +1279,9 @@ function createGitHubSCM(): SCM {
             repository(owner: $owner, name: $name) {
               pullRequest(number: $number) {
                 headRefOid
+                commits(last: 1) {
+                  nodes { commit { committedDate } }
+                }
                 reviewThreads(last: 100) {
                   totalCount
                   nodes {
@@ -1286,6 +1309,13 @@ function createGitHubSCM(): SCM {
                     commit { oid }
                   }
                 }
+                reactions(last: 100) {
+                  nodes {
+                    content
+                    createdAt
+                    user { login }
+                  }
+                }
               }
             }
             rateLimit { cost remaining resetAt }
@@ -1299,6 +1329,9 @@ function createGitHubSCM(): SCM {
             repository: {
               pullRequest: {
                 headRefOid: string | null;
+                commits?: {
+                  nodes: Array<{ commit: { committedDate: string } }>;
+                };
                 reviewThreads: {
                   totalCount: number;
                   nodes: Array<{
@@ -1326,6 +1359,13 @@ function createGitHubSCM(): SCM {
                     commit: { oid: string } | null;
                   }>;
                 };
+                reactions?: {
+                  nodes: Array<{
+                    content: string;
+                    createdAt: string;
+                    user: { login: string } | null;
+                  }>;
+                };
               };
             };
           };
@@ -1335,6 +1375,8 @@ function createGitHubSCM(): SCM {
         const threadNodes = pullRequest.reviewThreads.nodes;
         const reviewNodes = pullRequest.reviews.nodes;
         const headSha = pullRequest.headRefOid ?? undefined;
+        const headCommittedAtRaw = pullRequest.commits?.nodes[0]?.commit.committedDate;
+        const headCommittedAt = headCommittedAtRaw ? parseDate(headCommittedAtRaw) : undefined;
         // We fetch the 100 most-recent threads; if the PR has more, an older
         // unresolved thread may be outside the window. Flag truncation so callers
         // don't treat an empty set as authoritatively clean.
@@ -1359,7 +1401,8 @@ function createGitHubSCM(): SCM {
               isResolved: t.isResolved,
               createdAt: parseDate(c.createdAt),
               url: c.url,
-              isBot: BOT_AUTHORS.has(author),
+              isBot: isBotAuthor(author),
+              botName: isBotAuthor(author) ? author : undefined,
               isReviewBot: CODE_REVIEW_BOT_AUTHORS.has(author),
             };
           });
@@ -1370,7 +1413,7 @@ function createGitHubSCM(): SCM {
           // no-inline-comment bot review as a real review-submission signal.
           .filter((r) => {
             const author = r.author?.login ?? "unknown";
-            return (r.body && r.body.trim().length > 0) || BOT_AUTHORS.has(author);
+            return (r.body && r.body.trim().length > 0) || isBotAuthor(author);
           })
           .map((r) => {
             const author = r.author?.login ?? "unknown";
@@ -1379,13 +1422,33 @@ function createGitHubSCM(): SCM {
               state: r.state,
               body: r.body,
               submittedAt: parseDate(r.submittedAt),
-              isBot: BOT_AUTHORS.has(author),
+              isBot: isBotAuthor(author),
+              botName: isBotAuthor(author) ? author : undefined,
               isReviewBot: CODE_REVIEW_BOT_AUTHORS.has(author),
               commitSha: r.commit?.oid ?? undefined,
             };
           });
 
-        const result: ReviewThreadsResult = { threads, reviews, headSha, threadsTruncated };
+        const reactions = (pullRequest.reactions?.nodes ?? []).map((reaction) => {
+          const author = reaction.user?.login ?? "unknown";
+          const bot = isBotAuthor(author);
+          return {
+            author,
+            content: reaction.content,
+            createdAt: parseDate(reaction.createdAt),
+            isBot: bot,
+            botName: bot ? author : undefined,
+          };
+        });
+
+        const result: ReviewThreadsResult = {
+          threads,
+          reviews,
+          reactions,
+          headSha,
+          headCommittedAt,
+          threadsTruncated,
+        };
         reviewThreadsCache.set(cacheKey, result);
         return result;
       } catch (err) {
@@ -1399,6 +1462,11 @@ function createGitHubSCM(): SCM {
         instanceObserver?.log("warn", `[getReviewThreads] Failed for ${cacheKey}: ${errorMsg}`);
         throw new Error("Failed to fetch review threads", { cause: err });
       }
+    },
+
+    async postPRComment(pr: PRInfo, body: string): Promise<void> {
+      await gh(["pr", "comment", String(pr.number), "--repo", repoFlag(pr), "--body", body]);
+      invalidatePRCache(pr);
     },
 
     async getMergeability(pr: PRInfo): Promise<MergeReadiness> {

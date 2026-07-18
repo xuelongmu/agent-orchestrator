@@ -798,6 +798,7 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
                 body: "",
                 submittedAt: parseDate(note.created_at),
                 isBot: true,
+                botName: author,
                 isReviewBot: true,
                 commitSha: engagedSha,
               });
@@ -809,6 +810,7 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
         if (!first) continue;
         if (!first.resolvable || first.resolved) continue;
         const author = first.author?.username ?? "unknown";
+        const bot = isBot(author);
         threads.push({
           id: String(first.id),
           threadId: d.id,
@@ -819,7 +821,8 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
           isResolved: false,
           createdAt: parseDate(first.created_at),
           url: "",
-          isBot: isBot(author),
+          isBot: bot,
+          botName: bot ? author : undefined,
           isReviewBot: isReviewBot(author),
         });
       }
@@ -836,12 +839,14 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
 
         for (const a of approvals.approved_by ?? []) {
           const username = a.user?.username ?? "unknown";
+          const bot = isBot(username);
           reviews.push({
             author: username,
             state: "APPROVED",
             body: "",
             submittedAt: new Date(0),
-            isBot: isBot(username),
+            isBot: bot,
+            botName: bot ? username : undefined,
             isReviewBot: isReviewBot(username),
           });
         }

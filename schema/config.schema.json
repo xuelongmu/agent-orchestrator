@@ -138,6 +138,47 @@
           "minimum": 0,
           "maximum": 1,
           "description": "Minimum heuristic confidence (0..1) required to run this reaction's autonomous action (auto-merge or send-to-agent auto-fix). Below it, the action is held and escalated to a human with a question. Omit to disable the gate. Not applied to spawn-session (the dependency scheduler runs independently)."
+        },
+        "reviewBots": {
+          "type": "object",
+          "description": "Per-bot automated-review policy keyed by bot login; * is the fallback.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "weight": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 1,
+                "description": "1 is actionable/merge-blocking, 0 is ignored, fractional values are context-only."
+              },
+              "approvalPhrases": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "approvalReactions": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "rebumpMessage": { "type": "string", "minLength": 1 },
+              "maxRebumps": { "type": "integer", "minimum": 0 },
+              "rebumpBackoff": {
+                "type": "string",
+                "pattern": "^\\d+(s|m|h)$"
+              }
+            }
+          }
+        },
+        "flakyRetries": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum classifier-approved flaky CI reruns before dispatching to the agent."
+        },
+        "flakyRetryBackoff": {
+          "type": "string",
+          "pattern": "^\\d+(s|m|h)$",
+          "description": "Grace period after a flaky CI rerun before the same failure may be dispatched."
         }
       }
     },
