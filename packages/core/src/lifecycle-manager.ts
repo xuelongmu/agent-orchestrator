@@ -2783,24 +2783,35 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     session: Session,
   ): Promise<PolicyAwareChangesRequested> {
     const incomplete = { required: [], contextOnly: [], complete: false };
-    if (!session.pr) return incomplete;
+    const prs = normalizeSessionPRs(session);
+    if (prs.length === 0) return incomplete;
     const project = config.projects[session.projectId];
     const scm = project?.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
     if (!scm?.getReviewThreads) return incomplete;
-    try {
-      const [reviewData, aggregateDecision] = await Promise.all([
-        scm.getReviewThreads(session.pr, { forceFresh: true }),
-        scm.getReviewDecision(session.pr),
-      ]);
-      return classifyPolicyAwareChangesRequested(
-        session,
-        reviewData.reviews,
-        aggregateDecision,
-        !(reviewData.threadsTruncated ?? false),
-      );
-    } catch {
-      return incomplete;
-    }
+    const getReviewThreads = scm.getReviewThreads;
+    const perPR = await Promise.all(
+      prs.map(async (pr): Promise<PolicyAwareChangesRequested> => {
+        try {
+          const [reviewData, aggregateDecision] = await Promise.all([
+            getReviewThreads(pr, { forceFresh: true }),
+            scm.getReviewDecision(pr),
+          ]);
+          return classifyPolicyAwareChangesRequested(
+            session,
+            reviewData.reviews,
+            aggregateDecision,
+            !(reviewData.threadsTruncated ?? false),
+          );
+        } catch {
+          return incomplete;
+        }
+      }),
+    );
+    return {
+      required: perPR.flatMap((result) => result.required),
+      contextOnly: perPR.flatMap((result) => result.contextOnly),
+      complete: perPR.every((result) => result.complete),
+    };
   }
 
   function toAutomatedComment(comment: ReviewComment) {

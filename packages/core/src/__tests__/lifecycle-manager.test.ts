@@ -7341,6 +7341,182 @@ describe("merge DoD + per-bot policy + flaky CI (#15)", () => {
     );
   });
 
+  it("aggregates context-only changes requests across every PR before suppressing transition work", async () => {
+    const primary = makeMatchingPR({ number: 42 });
+    const secondary = makeMatchingPR({
+      number: 43,
+      branch: "feat/secondary",
+      url: "https://github.com/org/my-app/pull/43",
+    });
+    const notifier = createMockNotifier();
+    const mergePR = vi.fn().mockResolvedValue(undefined);
+    const postPRComment = vi.fn().mockResolvedValue(undefined);
+    const getReviewThreads = vi.fn().mockImplementation(async (pr: PRInfo) => {
+      const headSha = pr.number === primary.number ? "sha-primary" : "sha-secondary";
+      const reviews = [
+        {
+          author: "chatgpt-codex-connector[bot]",
+          botName: "chatgpt-codex-connector[bot]",
+          state: "COMMENTED",
+          body: "Didn't find any major issues. Nice work!",
+          submittedAt: new Date(),
+          isBot: true,
+          isReviewBot: true,
+          commitSha: headSha,
+        },
+      ];
+      if (pr.number === secondary.number) {
+        reviews.push({
+          author: "coderabbitai[bot]",
+          botName: "coderabbitai[bot]",
+          state: "CHANGES_REQUESTED",
+          body: "Optional suggestion",
+          submittedAt: new Date(),
+          isBot: true,
+          isReviewBot: false,
+          commitSha: headSha,
+        });
+      }
+      return { threads: [], reviews, headSha, threadsTruncated: false };
+    });
+    const mockSCM = createMockSCM({
+      mergePR,
+      postPRComment,
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi
+        .fn()
+        .mockImplementation(async (pr: PRInfo) =>
+          pr.number === secondary.number ? "changes_requested" : "none",
+        ),
+      getMergeability: vi.fn().mockImplementation(async (pr: PRInfo) => ({
+        mergeable: pr.number === primary.number,
+        ciPassing: true,
+        approved: false,
+        noConflicts: true,
+        blockers: pr.number === secondary.number ? ["Changes requested in review"] : [],
+      })),
+      getReviewThreads,
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier,
+    });
+    const configOverride = qualityConfig();
+    configOverride.reactions["changes-requested"] = {
+      auto: true,
+      action: "send-to-agent",
+      message: "Address required changes.",
+    };
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: primary, prs: [primary, secondary] }),
+      registry,
+      configOverride,
+    });
+
+    await lm.check("app-1");
+
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(
+      vi
+        .mocked(notifier.notify)
+        .mock.calls.filter(([event]) => event.type === "review.changes_requested"),
+    ).toHaveLength(0);
+    expect(postPRComment).not.toHaveBeenCalled();
+    expect(mergePR).toHaveBeenNthCalledWith(1, primary, undefined, "sha-primary");
+    expect(mergePR).toHaveBeenNthCalledWith(2, secondary, undefined, "sha-secondary");
+  });
+
+  it("does not suppress a required changes request on a secondary PR", async () => {
+    const primary = makeMatchingPR({ number: 42 });
+    const secondary = makeMatchingPR({
+      number: 43,
+      branch: "feat/secondary",
+      url: "https://github.com/org/my-app/pull/43",
+    });
+    const notifier = createMockNotifier();
+    const mergePR = vi.fn().mockResolvedValue(undefined);
+    const getReviewThreads = vi.fn().mockImplementation(async (pr: PRInfo) => {
+      const headSha = pr.number === primary.number ? "sha-primary" : "sha-secondary";
+      return {
+        threads: [],
+        reviews:
+          pr.number === secondary.number
+            ? [
+                {
+                  author: "alice",
+                  state: "CHANGES_REQUESTED",
+                  body: "Required fix",
+                  submittedAt: new Date(),
+                  commitSha: headSha,
+                },
+              ]
+            : [
+                {
+                  author: "chatgpt-codex-connector[bot]",
+                  botName: "chatgpt-codex-connector[bot]",
+                  state: "COMMENTED",
+                  body: "Didn't find any major issues. Nice work!",
+                  submittedAt: new Date(),
+                  isBot: true,
+                  isReviewBot: true,
+                  commitSha: headSha,
+                },
+              ],
+        headSha,
+        threadsTruncated: false,
+      };
+    });
+    const mockSCM = createMockSCM({
+      mergePR,
+      postPRComment: vi.fn().mockResolvedValue(undefined),
+      getPRState: vi.fn().mockResolvedValue("open"),
+      getCISummary: vi.fn().mockResolvedValue("passing"),
+      getReviewDecision: vi
+        .fn()
+        .mockImplementation(async (pr: PRInfo) =>
+          pr.number === secondary.number ? "changes_requested" : "none",
+        ),
+      getMergeability: vi.fn().mockImplementation(async (pr: PRInfo) => ({
+        mergeable: pr.number === primary.number,
+        ciPassing: true,
+        approved: false,
+        noConflicts: true,
+        blockers: pr.number === secondary.number ? ["Changes requested in review"] : [],
+      })),
+      getReviewThreads,
+    });
+    const registry = createMockRegistry({
+      runtime: plugins.runtime,
+      agent: plugins.agent,
+      scm: mockSCM,
+      notifier,
+    });
+    const configOverride = qualityConfig();
+    configOverride.reactions["changes-requested"] = {
+      auto: true,
+      action: "send-to-agent",
+      message: "Address required changes.",
+    };
+    const lm = setupCheck("app-1", {
+      session: makeSession({ status: "pr_open", pr: primary, prs: [primary, secondary] }),
+      registry,
+      configOverride,
+    });
+
+    await lm.check("app-1");
+
+    const changesNotifications = vi
+      .mocked(notifier.notify)
+      .mock.calls.filter(([event]) => event.type === "review.changes_requested");
+    expect(
+      vi.mocked(mockSessionManager.send).mock.calls.length + changesNotifications.length,
+    ).toBeGreaterThan(0);
+    expect(mergePR).not.toHaveBeenCalled();
+  });
+
   it("evaluates reaction-only approval while GitHub still reports review pending", async () => {
     const mergePR = vi.fn().mockResolvedValue(undefined);
     let reactionCreatedAt = new Date("2026-07-18T00:05:00Z");
