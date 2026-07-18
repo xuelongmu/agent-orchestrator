@@ -82,6 +82,8 @@ type Client struct {
 	etagOut  map[string]string // key (method+path+query) -> last-seen ETag
 	bodyOut  map[string][]byte // key -> last-seen body for 304 replay
 	cacheLRU []string          // insertion-order keys for FIFO eviction
+
+	rateLimits map[string]rateLimitSnapshot
 }
 
 // cacheMaxEntries caps the number of distinct (method,path,query) tuples
@@ -90,6 +92,22 @@ type Client struct {
 // the whole daemon — without a cap, long-running daemons would grow this
 // map forever.
 const cacheMaxEntries = 512
+
+const (
+	rateLimitSnapshotTTL  = 5 * time.Minute
+	rateLimitMaxResources = 16
+	maxRetryAfter         = 24 * time.Hour
+)
+
+type rateLimitSnapshot struct {
+	limit        int64
+	remaining    int64
+	hasLimit     bool
+	hasRemaining bool
+	resetAt      time.Time
+	retryAt      time.Time
+	observedAt   time.Time
+}
 
 // NewClient returns a Client. It is intentionally tolerant of nil
 // dependencies: production passes a TokenSource; tests sometimes leave it
@@ -103,6 +121,7 @@ func NewClient(opts ClientOptions) *Client {
 		userAgent:  opts.UserAgent,
 		etagOut:    map[string]string{},
 		bodyOut:    map[string][]byte{},
+		rateLimits: map[string]rateLimitSnapshot{},
 	}
 	if c.http == nil {
 		c.http = &http.Client{Timeout: 30 * time.Second}
@@ -156,6 +175,7 @@ func (c *Client) doRESTWithETag(ctx context.Context, path string, q url.Values, 
 		return RESTResponse{}, fmt.Errorf("github scm: GET %s: %w", path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	c.observeRateLimitHeaders(resp.Header, time.Now())
 	if resp.StatusCode == http.StatusNotModified {
 		return RESTResponse{StatusCode: resp.StatusCode, NotModified: true, ETag: firstNonEmptyHeader(resp.Header.Get("ETag"), etag)}, nil
 	}
@@ -225,6 +245,7 @@ func (c *Client) doREST(ctx context.Context, method, path string, q url.Values, 
 		return RESTResponse{}, fmt.Errorf("github scm: %s %s: %w", method, path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	c.observeRateLimitHeaders(resp.Header, time.Now())
 
 	if cacheable && resp.StatusCode == http.StatusNotModified {
 		// Replay the cached body. Update the ETag if GitHub returned a
@@ -289,6 +310,7 @@ func (c *Client) doGraphQL(ctx context.Context, query string, variables map[stri
 		return nil, fmt.Errorf("github scm: POST graphql: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	c.observeRateLimitHeaders(resp.Header, time.Now())
 	respBody, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
 		return nil, fmt.Errorf("github scm: read graphql body: %w", readErr)
@@ -356,6 +378,7 @@ func (c *Client) fetchPlainText(ctx context.Context, path string) ([]byte, error
 		return nil, fmt.Errorf("github scm: GET %s: %w", path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	c.observeRateLimitHeaders(resp.Header, time.Now())
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
 		return nil, fmt.Errorf("github scm: read %s body: %w", path, readErr)
@@ -384,6 +407,143 @@ func (c *Client) storeCacheEntry(cacheKey, etag string, body []byte) {
 		delete(c.etagOut, evict)
 		delete(c.bodyOut, evict)
 	}
+}
+
+// RecommendedPollDelay widens the normal SCM poll cadence using the latest
+// GitHub quota headers observed by this client. It is deliberately advisory:
+// callers finish the current observation cycle, then apply the returned delay
+// before starting another one.
+func (c *Client) RecommendedPollDelay(now time.Time, base time.Duration) time.Duration {
+	if base <= 0 {
+		return base
+	}
+	now = now.UTC()
+	delay := base
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for resource, snapshot := range c.rateLimits {
+		if rateLimitSnapshotExpired(snapshot, now) {
+			delete(c.rateLimits, resource)
+			continue
+		}
+		if snapshot.retryAt.After(now) {
+			delay = maxDuration(delay, snapshot.retryAt.Sub(now)+time.Second)
+		}
+		if !snapshot.hasRemaining {
+			continue
+		}
+		if snapshot.remaining <= 0 {
+			if snapshot.resetAt.After(now) {
+				delay = maxDuration(delay, snapshot.resetAt.Sub(now)+time.Second)
+			} else {
+				delay = maxDuration(delay, base*8)
+			}
+			continue
+		}
+		if snapshot.hasLimit && snapshot.limit > 0 {
+			ratio := float64(snapshot.remaining) / float64(snapshot.limit)
+			switch {
+			case ratio <= 0.01:
+				delay = maxDuration(delay, base*8)
+			case ratio <= 0.05:
+				delay = maxDuration(delay, base*4)
+			case ratio <= 0.10:
+				delay = maxDuration(delay, base*2)
+			}
+			continue
+		}
+		switch {
+		case snapshot.remaining <= 25:
+			delay = maxDuration(delay, base*8)
+		case snapshot.remaining <= 100:
+			delay = maxDuration(delay, base*4)
+		case snapshot.remaining <= 250:
+			delay = maxDuration(delay, base*2)
+		}
+	}
+	return delay
+}
+
+func (c *Client) observeRateLimitHeaders(header http.Header, now time.Time) {
+	limit, hasLimit := parseRateLimitInt(header.Get("X-RateLimit-Limit"))
+	remaining, hasRemaining := parseRateLimitInt(header.Get("X-RateLimit-Remaining"))
+	resetUnix, hasReset := parseRateLimitInt(header.Get("X-RateLimit-Reset"))
+	retryAt, hasRetry := parseRetryAfter(header.Get("Retry-After"), now)
+	if !hasLimit && !hasRemaining && !hasReset && !hasRetry {
+		return
+	}
+	resource := strings.TrimSpace(header.Get("X-RateLimit-Resource"))
+	if resource == "" {
+		resource = "default"
+	}
+	snapshot := rateLimitSnapshot{
+		limit:        limit,
+		remaining:    remaining,
+		hasLimit:     hasLimit,
+		hasRemaining: hasRemaining,
+		retryAt:      retryAt,
+		observedAt:   now.UTC(),
+	}
+	if hasReset && resetUnix > 0 {
+		snapshot.resetAt = time.Unix(resetUnix, 0).UTC()
+	}
+	c.mu.Lock()
+	if _, exists := c.rateLimits[resource]; !exists && len(c.rateLimits) >= rateLimitMaxResources {
+		for staleResource := range c.rateLimits {
+			delete(c.rateLimits, staleResource)
+			break
+		}
+	}
+	c.rateLimits[resource] = snapshot
+	c.mu.Unlock()
+}
+
+func rateLimitSnapshotExpired(snapshot rateLimitSnapshot, now time.Time) bool {
+	if snapshot.retryAt.After(now) {
+		return false
+	}
+	if !snapshot.resetAt.IsZero() {
+		return !snapshot.resetAt.After(now)
+	}
+	return !snapshot.observedAt.Add(rateLimitSnapshotTTL).After(now)
+}
+
+func parseRateLimitInt(value string) (int64, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
+	return n, err == nil && n >= 0
+}
+
+func parseRetryAfter(value string, now time.Time) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
+		if seconds > int64(maxRetryAfter/time.Second) {
+			return now.UTC().Add(maxRetryAfter), true
+		}
+		return now.UTC().Add(time.Duration(seconds) * time.Second), true
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return time.Time{}, false
+	}
+	when = when.UTC()
+	if when.After(now.UTC().Add(maxRetryAfter)) {
+		when = now.UTC().Add(maxRetryAfter)
+	}
+	return when, true
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (c *Client) authorize(ctx context.Context, req *http.Request) error {

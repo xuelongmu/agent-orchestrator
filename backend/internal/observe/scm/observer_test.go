@@ -41,6 +41,7 @@ type fakeStore struct {
 
 	listEntered chan struct{}
 	listRelease chan struct{}
+	listCalls   int
 }
 
 type fakeWrite struct {
@@ -68,7 +69,14 @@ func (s *fakeStore) ListAllSessions(ctx context.Context) ([]domain.SessionRecord
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.listCalls++
 	return append([]domain.SessionRecord(nil), s.sessions...), nil
+}
+
+func (s *fakeStore) getListCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
 }
 
 func (s *fakeStore) GetProject(_ context.Context, id string) (domain.ProjectRecord, bool, error) {
@@ -137,6 +145,16 @@ type fakeProvider struct {
 	fetchBatches     [][]ports.SCMPRRef
 	logCalls         int
 	reviewCalls      int
+	pollDelay        time.Duration
+}
+
+func (p *fakeProvider) RecommendedPollDelay(_ time.Time, base time.Duration) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pollDelay > base {
+		return p.pollDelay
+	}
+	return base
 }
 
 func (p *fakeProvider) SCMCredentialsAvailable(context.Context) (bool, error) {
@@ -227,6 +245,39 @@ func (l *fakeLifecycle) ApplySCMObservation(_ context.Context, _ domain.SessionI
 
 func newTestObserver(store *fakeStore, provider *fakeProvider, lc Lifecycle, now time.Time) *Observer {
 	return New(provider, store, lc, Config{Clock: func() time.Time { return now }, Tick: time.Hour, Logger: quietSlog(), CacheMax: 128})
+}
+
+func TestStartUsesProviderRecommendedPollDelay(t *testing.T) {
+	store := &fakeStore{}
+	provider := &fakeProvider{pollDelay: 100 * time.Millisecond}
+	observer := New(provider, store, nil, Config{Tick: 10 * time.Millisecond, Logger: quietSlog()})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := observer.Start(ctx)
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for store.getListCalls() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := store.getListCalls(); got != 1 {
+		t.Fatalf("initial poll calls = %d, want 1", got)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if got := store.getListCalls(); got != 1 {
+		t.Fatalf("poll ran at base cadence despite provider backoff: calls = %d", got)
+	}
+
+	deadline = time.Now().Add(time.Second)
+	for store.getListCalls() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := store.getListCalls(); got < 2 {
+		t.Fatalf("poll did not resume after provider backoff: calls = %d", got)
+	}
 }
 
 func TestDispatchOrderIsDeterministic(t *testing.T) {

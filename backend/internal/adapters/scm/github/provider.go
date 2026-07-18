@@ -11,6 +11,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -43,6 +44,16 @@ type ProviderOptions struct {
 type Provider struct {
 	client *Client
 	logger *slog.Logger
+}
+
+// RecommendedPollDelay exposes the client's latest GitHub quota guidance to
+// polling orchestrators without making the provider-neutral observer depend on
+// GitHub response types.
+func (p *Provider) RecommendedPollDelay(now time.Time, base time.Duration) time.Duration {
+	if p == nil || p.client == nil {
+		return base
+	}
+	return p.client.RecommendedPollDelay(now, base)
 }
 
 // NewProvider returns a Provider. If opts.Client is supplied it is used
