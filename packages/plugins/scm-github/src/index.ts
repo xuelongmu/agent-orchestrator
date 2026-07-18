@@ -1067,11 +1067,30 @@ function createGitHubSCM(): SCM {
       }
       if (runIds.size === 0) return false;
 
+      let anyRetried = false;
       for (const runId of runIds) {
-        await gh(["run", "rerun", runId, "--failed", "--repo", repoFlag(pr)]);
+        try {
+          await gh(["run", "rerun", runId, "--failed", "--repo", repoFlag(pr)]);
+          anyRetried = true;
+        } catch (err) {
+          recordActivityEvent({
+            source: "scm",
+            kind: "scm.ci_retry_failed",
+            level: "warn",
+            summary: `Failed to rerun CI workflow run ${runId} for PR #${pr.number}`,
+            data: {
+              plugin: "scm-github",
+              prNumber: pr.number,
+              prOwner: pr.owner,
+              prRepo: pr.repo,
+              runId,
+              errorMessage: err instanceof Error ? err.message : String(err),
+            },
+          });
+        }
       }
-      invalidatePRCache(pr);
-      return true;
+      if (anyRetried) invalidatePRCache(pr);
+      return anyRetried;
     },
 
     async getReviews(pr: PRInfo): Promise<Review[]> {

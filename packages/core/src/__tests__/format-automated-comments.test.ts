@@ -179,6 +179,22 @@ describe("formatAutomatedCommentsMessage", () => {
     const msg = formatAutomatedCommentsMessage([makeComment({ threadId: "PRRT_123" })]);
     expect(msg).toContain("Thread ID: PRRT_123");
   });
+
+  it("renders fractional-weight findings only as explicitly optional context", () => {
+    const msg = formatAutomatedCommentsMessage(
+      [makeComment({ id: "required", botName: "codex[bot]", body: "Required fix" })],
+      prInfo,
+      [makeComment({ id: "context", botName: "coderabbitai[bot]", body: "Optional idea" })],
+    );
+    const [requiredSection, contextSection] = msg.split("### NON-BLOCKING CONTEXT (OPTIONAL)");
+
+    expect(requiredSection).toContain("@codex[bot]");
+    expect(requiredSection).not.toContain("coderabbitai");
+    expect(contextSection).toContain("@coderabbitai[bot]");
+    expect(contextSection).toContain("optional context only");
+    expect(contextSection).toContain("Do not treat them as required fixes");
+    expect(contextSection).toContain("do not spend another review/fix round");
+  });
 });
 
 describe("per-bot review policy (#15)", () => {

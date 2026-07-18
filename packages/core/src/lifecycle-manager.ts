@@ -2733,9 +2733,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   function formatAutomatedReviewComments(
     session: Session,
     actionable: ReviewComment[],
+    contextOnly: ReviewComment[] = [],
   ): string {
     const comments = actionable.map(toAutomatedComment);
-    return formatAutomatedCommentsMessage(comments, session.pr ?? undefined);
+    const context = contextOnly.map(toAutomatedComment);
+    return formatAutomatedCommentsMessage(comments, session.pr ?? undefined, context);
   }
 
   /**
@@ -3029,6 +3031,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     const automatedComments = automatedBuckets.actionable
       .map((comment) => automatedById.get(comment.id))
       .filter((comment): comment is ReviewComment => !!comment);
+    const contextOnlyAutomatedComments = automatedBuckets.deprioritized
+      .map((comment) => automatedById.get(comment.id))
+      .filter((comment): comment is ReviewComment => !!comment);
 
     // Snapshot the dispatch hashes BEFORE the human/bot blocks below mutate them,
     // so the stuck-agent nudge can distinguish "already delivered, agent went
@@ -3269,10 +3274,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             reactionConfig.action &&
             (reactionConfig.auto !== false || reactionConfig.action === "notify")
           ) {
-            // Fractional-weight bot findings are context-only. Keep them out
-            // of the mandatory fix payload so they cannot consume this round
-            // or be mistaken for issues the agent must address.
-            const enrichedMessage = formatAutomatedReviewComments(session, automatedComments);
+            // Fractional-weight findings stay out of the fingerprint, round
+            // count, and required section. Surface them only as explicitly
+            // non-blocking context alongside a genuinely actionable dispatch.
+            const enrichedMessage = formatAutomatedReviewComments(
+              session,
+              automatedComments,
+              contextOnlyAutomatedComments,
+            );
 
             // Dispatch-site confidence gate (Class B chokepoint): a low-confidence
             // hold sends ONE escalation (question + comments) to the human;
@@ -3871,6 +3880,43 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return updates;
   }
 
+  async function escalateReviewApprovalFallback(
+    session: Session,
+    pr: PRInfo,
+    target: { botName: string; policy: ReviewBotPolicy },
+    keys: ReturnType<typeof reviewRebumpMetadataKeys>,
+    attempts: number,
+    reason: "max_rebumps" | "posting_unavailable" | "posting_failed",
+  ): Promise<void> {
+    if (session.metadata[keys.escalatedAt]) return;
+    const message =
+      reason === "posting_unavailable"
+        ? `AO cannot request another review from ${target.botName} on PR #${pr.number} because this SCM cannot post PR comments. Human approval can satisfy the merge gate.`
+        : reason === "posting_failed"
+          ? `AO failed to post another review request for ${target.botName} on PR #${pr.number}. Human approval can satisfy the merge gate.`
+          : `${target.botName} did not provide an approval signal after ${attempts} re-bump(s) on PR #${pr.number}. Human approval can satisfy the merge gate.`;
+    const context = buildEventContext(session, prEnrichmentCache);
+    const event = createEvent("reaction.escalated", {
+      sessionId: session.id,
+      projectId: session.projectId,
+      message,
+      data: buildReactionEscalationNotificationData({
+        eventType: "reaction.escalated",
+        sessionId: session.id,
+        projectId: session.projectId,
+        context,
+        reactionKey: "approved-and-green",
+        action: "auto-merge",
+        attempts,
+        cause: "max_attempts",
+        enrichment: getPREnrichmentForSession(session),
+      }),
+    });
+    if (await notifyHuman(event, "action")) {
+      updateSessionMetadata(session, { [keys.escalatedAt]: new Date().toISOString() });
+    }
+  }
+
   /** Bounded, exponentially backed-off Codex re-bump with human fallback. */
   async function maybeRebumpAutomatedReviewer(
     session: Session,
@@ -3880,10 +3926,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     if (!headSha) return;
     const target = actionableRebumpPolicy(session);
     if (!target) return;
-    const project = config.projects[session.projectId];
-    const scm = project?.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
-    if (!scm?.postPRComment) return;
-
     const keys = reviewRebumpMetadataKeys(pr);
     if (session.metadata[keys.headSha] !== headSha) {
       updateSessionMetadata(session, {
@@ -3892,6 +3934,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         [keys.at]: "",
         [keys.escalatedAt]: "",
       });
+    }
+    if (session.metadata[keys.escalatedAt]) return;
+
+    const project = config.projects[session.projectId];
+    const scm = project?.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
+    if (!scm?.postPRComment) {
+      await escalateReviewApprovalFallback(session, pr, target, keys, 0, "posting_unavailable");
+      return;
     }
 
     const count = parseAttemptCount(session.metadata[keys.count]);
@@ -3924,32 +3974,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           },
         });
       } catch {
-        // Leave metadata unchanged so the next poll retries the comment.
+        await escalateReviewApprovalFallback(session, pr, target, keys, count, "posting_failed");
       }
       return;
     }
 
-    if (session.metadata[keys.escalatedAt]) return;
-    const context = buildEventContext(session, prEnrichmentCache);
-    const event = createEvent("reaction.escalated", {
-      sessionId: session.id,
-      projectId: session.projectId,
-      message: `${target.botName} did not provide an approval signal after ${maxRebumps} re-bump(s) on PR #${pr.number}. Human approval can satisfy the merge gate.`,
-      data: buildReactionEscalationNotificationData({
-        eventType: "reaction.escalated",
-        sessionId: session.id,
-        projectId: session.projectId,
-        context,
-        reactionKey: "approved-and-green",
-        action: "auto-merge",
-        attempts: maxRebumps,
-        cause: "max_attempts",
-        enrichment: getPREnrichmentForSession(session),
-      }),
-    });
-    if (await notifyHuman(event, "action")) {
-      updateSessionMetadata(session, { [keys.escalatedAt]: new Date().toISOString() });
-    }
+    await escalateReviewApprovalFallback(session, pr, target, keys, maxRebumps, "max_rebumps");
   }
 
   async function maybeAutoMergeWhenDone(session: Session, newStatus: SessionStatus): Promise<void> {
@@ -3961,6 +3991,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       reactionConfig.auto === false ||
       (newStatus !== "mergeable" &&
         newStatus !== "approved" &&
+        newStatus !== "review_pending" &&
         !session.metadata["reviewSatisfiedAt"])
     ) {
       return;

@@ -725,28 +725,58 @@ describe("scm-github plugin", () => {
   });
 
   describe("retryCI", () => {
-    it("reruns each distinct failed GitHub Actions run", async () => {
+    const failedRuns = [
+      {
+        name: "unit",
+        status: "failed" as const,
+        url: "https://github.com/acme/repo/actions/runs/123/job/1",
+      },
+      {
+        name: "lint",
+        status: "failed" as const,
+        url: "https://github.com/acme/repo/actions/runs/124/job/2",
+      },
+    ];
+
+    it("reruns every distinct failed GitHub Actions run when all requests succeed", async () => {
       ghMock.mockResolvedValue({ stdout: "" });
-      const retried = await scm.retryCI!(pr, [
-        {
-          name: "unit",
-          status: "failed",
-          url: "https://github.com/acme/repo/actions/runs/123/job/1",
-        },
-        {
-          name: "lint",
-          status: "failed",
-          url: "https://github.com/acme/repo/actions/runs/123/job/2",
-        },
-      ]);
+      const retried = await scm.retryCI!(pr, failedRuns);
 
       expect(retried).toBe(true);
-      expect(ghMock).toHaveBeenCalledTimes(1);
+      expect(ghMock).toHaveBeenCalledTimes(2);
       expect(ghMock).toHaveBeenCalledWith(
         expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
         ["run", "rerun", "123", "--failed", "--repo", "acme/repo"],
         expect.any(Object),
       );
+      expect(ghMock).toHaveBeenCalledWith(
+        expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
+        ["run", "rerun", "124", "--failed", "--repo", "acme/repo"],
+        expect.any(Object),
+      );
+    });
+
+    it("returns success when at least one workflow rerun was queued", async () => {
+      ghMock
+        .mockResolvedValueOnce({ stdout: "" })
+        .mockRejectedValueOnce(new Error("run 124 cannot be rerun"));
+
+      await expect(scm.retryCI!(pr, failedRuns)).resolves.toBe(true);
+      expect(ghMock).toHaveBeenCalledTimes(2);
+      expect(recordActivityEventMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "scm.ci_retry_failed",
+          data: expect.objectContaining({ runId: "124" }),
+        }),
+      );
+    });
+
+    it("returns false when every workflow rerun request fails", async () => {
+      ghMock.mockRejectedValue(new Error("rerun unavailable"));
+
+      await expect(scm.retryCI!(pr, failedRuns)).resolves.toBe(false);
+      expect(ghMock).toHaveBeenCalledTimes(2);
+      expect(recordActivityEventMock).toHaveBeenCalledTimes(2);
     });
 
     it("declines non-Actions checks that cannot be retried", async () => {
