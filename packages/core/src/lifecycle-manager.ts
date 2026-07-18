@@ -239,6 +239,34 @@ type LifecycleSendOutcome =
  *  the human received the payload; it must never be counted as an agent action. */
 type ConfidenceHoldOutcome = "proceed" | "held-delivered" | "held-pending";
 
+/**
+ * Single terminal result for an idle review-backlog poll. `blocked` is reserved
+ * for the one case where the chokepoint could not deliver the required human
+ * handoff; every other path is terminal for the current poll.
+ */
+type ReviewBacklogOutcome = {
+  outcome: "nudged" | "notified" | "clean" | "blocked";
+  reason: string;
+  error?: unknown;
+};
+
+/** Durable dedup latch for the human handoff owned by the backlog chokepoint. */
+const REVIEW_BACKLOG_NOTIFICATION_HASH_KEY = "reviewBacklogNotificationHash";
+const REVIEW_BACKLOG_NOTIFICATION_REASON_KEY = "reviewBacklogNotificationReason";
+const REVIEW_BACKLOG_OUTCOME_KEY = "reviewBacklogOutcome";
+const REVIEW_BACKLOG_REASON_KEY = "reviewBacklogReason";
+const REVIEW_BACKLOG_HANDOFF_REASONS = new Set([
+  "agent-delivery-unverified",
+  "agent-stuck-auto-disabled",
+  "nudge-budget-exhausted",
+  "nudge-send-failed",
+  "review-dispatch-disabled",
+  "review-dispatch-failed",
+  "review-fetch-failed",
+  "review-page-truncated",
+  "review-round-cap-notification-failed",
+]);
+
 /** Number of consecutive CI-passing polls required before the ci-failed tracker
  *  (including its escalated flag) is cleared, allowing a fresh budget for the
  *  next real CI failure incident. */
@@ -3029,6 +3057,213 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     return reactionTrackers.get(`${session.id}:${key}`)?.escalated === true;
   }
 
+  function hasRecordedReviewBacklog(session: Session): boolean {
+    return !!(
+      session.metadata["lastPendingReviewFingerprint"] ||
+      session.metadata["lastAutomatedReviewFingerprint"] ||
+      session.metadata["lastPendingReviewDispatchHash"] ||
+      session.metadata["lastAutomatedReviewDispatchHash"]
+    );
+  }
+
+  function reviewBacklogIdentity(session: Session): string {
+    const pending =
+      session.metadata["lastPendingReviewFingerprint"] ??
+      session.metadata["lastPendingReviewDispatchHash"] ??
+      "";
+    const automated =
+      session.metadata["lastAutomatedReviewFingerprint"] ??
+      session.metadata["lastAutomatedReviewDispatchHash"] ??
+      "";
+    return `pending:${pending}|automated:${automated}`;
+  }
+
+  function hasLatchedReviewBacklogHandoff(
+    session: Session,
+    identity = reviewBacklogIdentity(session),
+  ): boolean {
+    return (
+      session.metadata[REVIEW_BACKLOG_NOTIFICATION_HASH_KEY] === identity &&
+      REVIEW_BACKLOG_HANDOFF_REASONS.has(
+        session.metadata[REVIEW_BACKLOG_NOTIFICATION_REASON_KEY] ?? "",
+      )
+    );
+  }
+
+  function isIdleReviewBacklogPoll(session: Session): boolean {
+    const signal = session.activitySignal;
+    return (
+      hasRecordedReviewBacklog(session) &&
+      hasPositiveIdleEvidence(signal) &&
+      isIdleBeyondThreshold(session, signal.timestamp)
+    );
+  }
+
+  function transitionDeliveredStuckHandoff(transitionReaction?: TransitionReaction): boolean {
+    return (
+      transitionReaction?.key === "agent-stuck" &&
+      transitionReaction.result?.success === true &&
+      (transitionReaction.result.action === "notify" ||
+        transitionReaction.result.action === "escalated")
+    );
+  }
+
+  function recordReviewBacklogOutcome(
+    session: Session,
+    result: ReviewBacklogOutcome,
+    metadataUpdates: Record<string, string> = {},
+  ): ReviewBacklogOutcome {
+    const shouldRecord =
+      result.outcome !== "clean" ||
+      hasRecordedReviewBacklog(session) ||
+      !!session.metadata[REVIEW_BACKLOG_OUTCOME_KEY] ||
+      Object.keys(metadataUpdates).some((key) => !!session.metadata[key]);
+    if (!shouldRecord) return result;
+
+    const updates = {
+      ...metadataUpdates,
+      [REVIEW_BACKLOG_OUTCOME_KEY]: result.outcome,
+      [REVIEW_BACKLOG_REASON_KEY]: result.reason,
+    };
+    const changed = Object.entries(updates).some(
+      ([key, value]) => (session.metadata[key] ?? "") !== value,
+    );
+    if (changed) {
+      updateSessionMetadata(session, updates);
+      recordActivityEvent({
+        projectId: session.projectId,
+        sessionId: session.id,
+        source: "reaction",
+        kind: "review_backlog.outcome",
+        level: result.outcome === "blocked" ? "warn" : "info",
+        summary: `review backlog ${result.outcome}: ${result.reason}`,
+        data: { outcome: result.outcome, reason: result.reason },
+      });
+    }
+    return result;
+  }
+
+  /**
+   * The ONE review-backlog terminal-outcome chokepoint. A blocked nudge/fetch is
+   * converted to a deduped human handoff. The only result allowed to remain
+   * `blocked` is an undelivered notification, which deliberately retries next
+   * poll rather than pretending a human was reached.
+   */
+  async function settleReviewBacklogOutcome(
+    session: Session,
+    result: ReviewBacklogOutcome,
+  ): Promise<ReviewBacklogOutcome> {
+    const identity = reviewBacklogIdentity(session);
+    if (result.outcome === "clean") {
+      const clearLatch =
+        result.reason === "backlog-clean" ||
+        result.reason === "pr-not-open" ||
+        result.reason === "terminal";
+      return recordReviewBacklogOutcome(
+        session,
+        result,
+        clearLatch
+          ? {
+              [REVIEW_BACKLOG_NOTIFICATION_HASH_KEY]: "",
+              [REVIEW_BACKLOG_NOTIFICATION_REASON_KEY]: "",
+            }
+          : {},
+      );
+    }
+
+    if (result.outcome === "nudged") {
+      return recordReviewBacklogOutcome(session, result);
+    }
+
+    if (
+      result.outcome === "notified" ||
+      (identity && session.metadata[REVIEW_BACKLOG_NOTIFICATION_HASH_KEY] === identity)
+    ) {
+      const exhausted = result.reason === "nudge-budget-exhausted";
+      if (exhausted && session.metadata["stuckNudgeEscalated"] !== "true") {
+        recordActivityEvent({
+          projectId: session.projectId,
+          sessionId: session.id,
+          source: "reaction",
+          kind: "reaction.escalated",
+          level: "warn",
+          summary: `agent-stuck nudge exhausted for PR #${session.pr?.number}`,
+          data: {
+            reactionKey: "agent-stuck",
+            nudges: parseAttemptCount(session.metadata["stuckNudgeCount"]),
+            prNumber: session.pr?.number,
+          },
+        });
+      }
+      return recordReviewBacklogOutcome(
+        session,
+        { outcome: "notified", reason: result.reason },
+        {
+          [REVIEW_BACKLOG_NOTIFICATION_HASH_KEY]: identity,
+          [REVIEW_BACKLOG_NOTIFICATION_REASON_KEY]: result.reason,
+          ...(exhausted ? { stuckNudgeEscalated: "true" } : {}),
+        },
+      );
+    }
+
+    const stuckReaction = getReactionConfigForSession(session, "agent-stuck");
+    const context = buildEventContext(session, prEnrichmentCache);
+    const event = createEvent("reaction.escalated", {
+      sessionId: session.id,
+      projectId: session.projectId,
+      message: `Review backlog handling is blocked (${result.reason}) for PR #${session.pr?.number}. Human review needed.`,
+      data: {
+        ...buildReactionNotificationData({
+          eventType: "reaction.escalated",
+          sessionId: session.id,
+          projectId: session.projectId,
+          context,
+          reactionKey: "agent-stuck",
+          action: "notify",
+          enrichment: getPREnrichmentForSession(session),
+        }),
+        reviewBacklog: {
+          outcome: "notified",
+          reason: result.reason,
+          ...(result.error
+            ? {
+                errorMessage:
+                  result.error instanceof Error ? result.error.message : String(result.error),
+              }
+            : {}),
+        },
+      },
+    });
+    const delivered = await notifyHuman(event, stuckReaction?.priority ?? "urgent");
+    const exhausted = result.reason === "nudge-budget-exhausted";
+    if (delivered && exhausted) {
+      recordActivityEvent({
+        projectId: session.projectId,
+        sessionId: session.id,
+        source: "reaction",
+        kind: "reaction.escalated",
+        level: "warn",
+        summary: `agent-stuck nudge exhausted for PR #${session.pr?.number}`,
+        data: {
+          reactionKey: "agent-stuck",
+          nudges: parseAttemptCount(session.metadata["stuckNudgeCount"]),
+          prNumber: session.pr?.number,
+        },
+      });
+    }
+    return recordReviewBacklogOutcome(
+      session,
+      { outcome: delivered ? "notified" : "blocked", reason: result.reason },
+      delivered
+        ? {
+            [REVIEW_BACKLOG_NOTIFICATION_HASH_KEY]: identity,
+            [REVIEW_BACKLOG_NOTIFICATION_REASON_KEY]: result.reason,
+            ...(exhausted ? { stuckNudgeEscalated: "true" } : {}),
+          }
+        : {},
+    );
+  }
+
   /**
    * True when the session has an open PR whose review comments were already
    * delivered to the agent by a send-to-agent reaction. Used only to force a
@@ -3040,25 +3275,27 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   function hasDeliveredReviewBacklog(session: Session): boolean {
     if (!session.pr || session.lifecycle.pr.state !== "open") return false;
     const botDelivered =
-      !!session.metadata["lastAutomatedReviewDispatchHash"] &&
+      !!session.metadata["lastAutomatedReviewAgentDispatchHash"] &&
       reviewReactionSendsToAgent(session, "bugbot-comments");
     const humanDelivered =
-      !!session.metadata["lastPendingReviewDispatchHash"] &&
+      !!session.metadata["lastPendingReviewAgentDispatchHash"] &&
       reviewReactionSendsToAgent(session, "changes-requested");
     return botDelivered || humanDelivered;
   }
 
   async function maybeDispatchReviewBacklog(
     session: Session,
-    _oldStatus: SessionStatus,
+    oldStatus: SessionStatus,
     newStatus: SessionStatus,
     transitionReaction?: TransitionReaction,
-  ): Promise<void> {
+    transitionNotificationDelivered = false,
+  ): Promise<ReviewBacklogOutcome> {
+    const finish = (result: ReviewBacklogOutcome) => settleReviewBacklogOutcome(session, result);
     const project = config.projects[session.projectId];
-    if (!project || !session.pr) return;
+    if (!project || !session.pr) return finish({ outcome: "clean", reason: "no-pr" });
 
     const scm = project.scm?.plugin ? registry.get<SCM>("scm", project.scm.plugin) : null;
-    if (!scm) return;
+    if (!scm) return finish({ outcome: "clean", reason: "scm-unavailable" });
 
     const humanReactionKey = "changes-requested";
     const automatedReactionKey = "bugbot-comments";
@@ -3072,9 +3309,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         ...scopedAutoMergeFailureMetadataCleanup(session),
         lastPendingReviewFingerprint: "",
         lastPendingReviewDispatchHash: "",
+        lastPendingReviewAgentDispatchHash: "",
         lastPendingReviewDispatchAt: "",
         lastAutomatedReviewFingerprint: "",
         lastAutomatedReviewDispatchHash: "",
+        lastAutomatedReviewAgentDispatchHash: "",
         lastAutomatedReviewDispatchAt: "",
         reviewRoundCount: "",
         // Cumulative churn signal for the confidence gate (#12): reset only here,
@@ -3095,7 +3334,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         stuckNudgeEscalated: "",
         stuckNudgeFingerprint: "",
       });
-      return;
+      return finish({
+        outcome: "clean",
+        reason: TERMINAL_STATUSES.has(newStatus) ? "terminal" : "pr-not-open",
+      });
     }
 
     // Throttle review backlog API calls to at most once per 2 minutes.
@@ -3155,7 +3397,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       !stuckNudgeEscalated
     ) {
       if (Date.now() - lastCheckAt < REVIEW_BACKLOG_THROTTLE_MS) {
-        return;
+        return finish({ outcome: "clean", reason: "throttled" });
       }
     }
     // Force a cache-bypassing fetch when we must observe GraphQL-only thread
@@ -3211,11 +3453,14 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           errorMessage: err instanceof Error ? err.message : String(err),
         },
       });
-      // Don't update the throttle timestamp so the next poll retries immediately
-      // instead of being blocked for 2 minutes. The agent-stuck notify already
-      // fired at the transition (the nudge is purely additive), so a fetch failure
-      // only delays the optional comment re-delivery — it never silences an alert.
-      return;
+      // Don't update the throttle timestamp so the next poll retries immediately.
+      // The terminal-outcome chokepoint below owns the fallback human handoff for
+      // idle overlay states, which never fired a session.stuck transition.
+      return finish(
+        isIdleReviewBacklogPoll(session)
+          ? { outcome: "blocked", reason: "review-fetch-failed", error: err }
+          : { outcome: "clean", reason: "review-fetch-failed-no-idle-backlog" },
+      );
     }
 
     // Only stamp the throttle after a successful SCM fetch. If the fetch failed,
@@ -3321,12 +3566,36 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       .map((comment) => automatedById.get(comment.id))
       .filter((comment): comment is ReviewComment => !!comment);
 
-    // Snapshot the dispatch hashes BEFORE the human/bot blocks below mutate them,
-    // so the stuck-agent nudge can distinguish "already delivered, agent went
-    // idle" (fingerprint == prior dispatch hash) from "fresh comments delivered
-    // this cycle" (which the blocks below handle on their own).
-    const priorPendingDispatchHash = session.metadata["lastPendingReviewDispatchHash"] ?? "";
-    const priorAutomatedDispatchHash = session.metadata["lastAutomatedReviewDispatchHash"] ?? "";
+    // Snapshot durable AGENT-delivery proof before the dispatch blocks mutate it,
+    // so a human-only escalation hash can never become nudge proof after restart.
+    const priorPendingAgentDispatchHash =
+      session.metadata["lastPendingReviewAgentDispatchHash"] ?? "";
+    const priorAutomatedAgentDispatchHash =
+      session.metadata["lastAutomatedReviewAgentDispatchHash"] ?? "";
+    const stuckTransitionHandoff =
+      oldStatus !== newStatus &&
+      newStatus === SESSION_STATUS.STUCK &&
+      (transitionDeliveredStuckHandoff(transitionReaction) || transitionNotificationDelivered);
+    const currentBacklogIdentity = `pending:${makeFingerprint(
+      pendingComments.map((comment) => comment.id),
+    )}|automated:${makeFingerprint(automatedComments.map((comment) => comment.id))}`;
+    const handoffLatched = hasLatchedReviewBacklogHandoff(session, currentBacklogIdentity);
+    let dispatchOutcome: ReviewBacklogOutcome | null =
+      stuckTransitionHandoff || handoffLatched
+        ? {
+            outcome: "notified",
+            reason: handoffLatched
+              ? (session.metadata[REVIEW_BACKLOG_NOTIFICATION_REASON_KEY] ??
+                "human-handoff-latched")
+              : "stuck-transition-notified",
+          }
+        : null;
+    const observeDispatchOutcome = (result: ReviewBacklogOutcome): void => {
+      const rank = { clean: 0, nudged: 1, blocked: 2, notified: 3 } as const;
+      if (!dispatchOutcome || rank[result.outcome] > rank[dispatchOutcome.outcome]) {
+        dispatchOutcome = result;
+      }
+    };
 
     // Re-validate a previously-recorded "satisfied" mark. Clear it the moment the
     // session stops being demonstrably clean — a reappearing thread, CI no longer
@@ -3377,9 +3646,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       automatedComments.length > 0 ||
       reviewSummaries.some((review) => {
         const botName = reviewSummaryBotName(review);
-        return (
-          !!botName && reviewBotWeight(session, botName, review.isReviewBot === true) >= 1
-        );
+        return !!botName && reviewBotWeight(session, botName, review.isReviewBot === true) >= 1;
       });
     const engagementUpdates: Record<string, string> = {};
     if (anyReviewBotEngagement && session.metadata["botReviewObserved"] !== "true") {
@@ -3419,9 +3686,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         updateSessionMetadata(session, {
           lastPendingReviewFingerprint: "",
           lastPendingReviewDispatchHash: "",
+          lastPendingReviewAgentDispatchHash: "",
           lastPendingReviewDispatchAt: "",
         });
-      } else if (pendingFingerprint !== lastPendingDispatchHash) {
+      } else if (pendingFingerprint !== lastPendingDispatchHash && !handoffLatched) {
         const reactionConfig = getReactionConfigForSession(session, humanReactionKey);
         if (
           reactionConfig &&
@@ -3449,8 +3717,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
               : "proceed";
 
           let success = false;
+          let deliveredToAgent = false;
+          let blockedError: unknown;
+          let blockedReason = "review-dispatch-failed";
           if (hold !== "proceed") {
             success = hold === "held-delivered";
+            if (!success)
+              blockedError = new Error("confidence hold notification was not delivered");
           } else if (
             // When the transition handler already called executeReaction for this
             // key, send the enriched payload directly to avoid double-billing the
@@ -3464,22 +3737,48 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
             try {
               const delivery = await sendLifecycleMessage(session, enrichedMessage);
               success = delivery.status === "sent";
-            } catch {
-              // Send failed — will retry on next unthrottled poll
+              deliveredToAgent = success;
+              if (!success) {
+                blockedReason = "review-dispatch-input-pending";
+                blockedError = delivery.error ?? new Error("agent input remains pending");
+              }
+            } catch (err) {
+              blockedError = err;
             }
           } else {
             const enrichedConfig = { ...reactionConfig, message: enrichedMessage };
             const result = await executeReaction(session, humanReactionKey, enrichedConfig);
-            // Retry/duration escalation stamps (human handoff, #5 nudge invariant);
-            // a normal send stamps on success. Confidence holds were handled above.
             success = result.success;
+            deliveredToAgent = result.success && result.action === "send-to-agent";
+            if (!result.success) {
+              if (session.metadata[LIFECYCLE_INPUT_PENDING_AT_KEY]) {
+                blockedReason = "review-dispatch-input-pending";
+              }
+              blockedError = new Error(result.message ?? "review dispatch failed");
+            }
           }
           if (success) {
             updateSessionMetadata(session, {
               lastPendingReviewDispatchHash: pendingFingerprint,
+              ...(deliveredToAgent
+                ? { lastPendingReviewAgentDispatchHash: pendingFingerprint }
+                : {}),
               lastPendingReviewDispatchAt: new Date().toISOString(),
             });
+            observeDispatchOutcome(
+              deliveredToAgent
+                ? { outcome: "nudged", reason: "review-backlog-dispatched" }
+                : { outcome: "notified", reason: "review-reaction-notified" },
+            );
+          } else {
+            observeDispatchOutcome({
+              outcome: "blocked",
+              reason: blockedReason,
+              error: blockedError,
+            });
           }
+        } else {
+          observeDispatchOutcome({ outcome: "blocked", reason: "review-dispatch-disabled" });
         }
       }
     }
@@ -3521,6 +3820,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         updateSessionMetadata(session, {
           lastAutomatedReviewFingerprint: "",
           lastAutomatedReviewDispatchHash: "",
+          lastAutomatedReviewAgentDispatchHash: "",
           lastAutomatedReviewDispatchAt: "",
         });
         const wasEscalated = session.metadata["reviewRoundsEscalated"] === "true";
@@ -3550,10 +3850,15 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         // further auto-dispatch — until the bot threads clear (handled by the
         // branch above) or a human intervenes. determineStatus keeps the
         // session parked in needs_input while this flag is set.
-      } else if (hasNewBotContent) {
+      } else if (hasNewBotContent && !handoffLatched) {
         // A genuinely new batch of bot review comments = a new review round.
         if (reviewRounds >= maxReviewRounds) {
           await escalateReviewRoundCap(session, reviewRounds, maxReviewRounds);
+          observeDispatchOutcome(
+            session.metadata["reviewRoundsEscalated"] === "true"
+              ? { outcome: "notified", reason: "review-round-cap-notified" }
+              : { outcome: "blocked", reason: "review-round-cap-notification-failed" },
+          );
         } else {
           const reactionConfig = getReactionConfigForSession(session, automatedReactionKey);
           if (
@@ -3586,8 +3891,12 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
             let success = false;
             let deliveredToAgent = false;
+            let blockedError: unknown;
+            let blockedReason = "review-dispatch-failed";
             if (hold !== "proceed") {
               success = hold === "held-delivered";
+              if (!success)
+                blockedError = new Error("confidence hold notification was not delivered");
             } else if (
               // Direct-send bypass when the transition already called executeReaction;
               // NOT when it escalated (exhausted retries) — route back so the
@@ -3600,16 +3909,24 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
                 const delivery = await sendLifecycleMessage(session, enrichedMessage);
                 success = delivery.status === "sent";
                 deliveredToAgent = success;
-              } catch {
-                // Send failed — will retry on next unthrottled poll
+                if (!success) {
+                  blockedReason = "review-dispatch-input-pending";
+                  blockedError = delivery.error ?? new Error("agent input remains pending");
+                }
+              } catch (err) {
+                blockedError = err;
               }
             } else {
               const enrichedConfig = { ...reactionConfig, message: enrichedMessage };
               const result = await executeReaction(session, automatedReactionKey, enrichedConfig);
-              // Retry/duration escalation stamps (human handoff, #5 invariant); a
-              // normal send stamps on success. Confidence holds handled above.
               success = result.success;
               deliveredToAgent = result.success && result.action === "send-to-agent";
+              if (!result.success) {
+                if (session.metadata[LIFECYCLE_INPUT_PENDING_AT_KEY]) {
+                  blockedReason = "review-dispatch-input-pending";
+                }
+                blockedError = new Error(result.message ?? "review dispatch failed");
+              }
             }
             if (success) {
               const dispatchUpdates: Record<string, string> = {
@@ -3617,110 +3934,76 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
                 lastAutomatedReviewDispatchAt: new Date().toISOString(),
               };
               if (deliveredToAgent) {
+                dispatchUpdates.lastAutomatedReviewAgentDispatchHash = automatedFingerprint;
                 dispatchUpdates.reviewRoundCount = String(reviewRounds + 1);
                 dispatchUpdates.reviewRoundCountTotal = String(
                   parseAttemptCount(session.metadata["reviewRoundCountTotal"]) + 1,
                 );
               }
               updateSessionMetadata(session, dispatchUpdates);
+              observeDispatchOutcome(
+                deliveredToAgent
+                  ? { outcome: "nudged", reason: "review-backlog-dispatched" }
+                  : { outcome: "notified", reason: "review-reaction-notified" },
+              );
+            } else {
+              observeDispatchOutcome({
+                outcome: "blocked",
+                reason: blockedReason,
+                error: blockedError,
+              });
             }
+          } else {
+            observeDispatchOutcome({ outcome: "blocked", reason: "review-dispatch-disabled" });
           }
         }
       }
     }
 
     // --- Auto-nudge a stuck/idle agent sitting on already-delivered comments ---
-    await maybeNudgeStuckAgent(session, {
+    const nudgeOutcome = await maybeNudgeStuckAgent(session, {
       pendingComments,
       automatedComments,
       reviewSummaries,
-      priorPendingDispatchHash,
-      priorAutomatedDispatchHash,
+      priorPendingAgentDispatchHash,
+      priorAutomatedAgentDispatchHash,
       primaryThreadsTruncated,
+      dispatchOutcome,
     });
+    return finish(nudgeOutcome);
   }
 
-  /**
-   * Re-deliver unaddressed PR review comments to a stuck/idle agent, escalating
-   * to needs_input after the nudge budget is spent.
-   *
-   * This is PURELY ADDITIVE to the existing agent-stuck reaction: the transition
-   * handler still fires the `agent-stuck` notify exactly as it did before #5 — the
-   * nudge NEVER suppresses or defers that notification. The dispatch blocks in
-   * maybeDispatchReviewBacklog only re-deliver comments when their fingerprint
-   * CHANGES. An agent that is alive but stops noticing already-delivered comments
-   * and goes idle leaves the fingerprint unchanged, so the comments would never be
-   * re-sent. This re-delivers the outstanding, already-delivered comments
-   * (bypassing the fingerprint guard) up to `nudgeRetries` times, then escalates to
-   * needs_input so a human takes over.
-   *
-   * Distinct from runtime-death recovery (packages/core/src/recovery/*), which
-   * handles dead processes — this handles alive agents that stopped progressing.
-   */
+  /** Resolve every idle/stuck backlog branch to one structured terminal outcome. */
   async function maybeNudgeStuckAgent(
     session: Session,
     ctx: {
       pendingComments: ReviewComment[];
       automatedComments: ReviewComment[];
       reviewSummaries: ReviewSummary[];
-      priorPendingDispatchHash: string;
-      priorAutomatedDispatchHash: string;
+      priorPendingAgentDispatchHash: string;
+      priorAutomatedAgentDispatchHash: string;
       primaryThreadsTruncated: boolean;
+      dispatchOutcome: ReviewBacklogOutcome | null;
     },
-  ): Promise<void> {
+  ): Promise<ReviewBacklogOutcome> {
     const { pendingComments, automatedComments, reviewSummaries, primaryThreadsTruncated } = ctx;
     const totalUnaddressed = pendingComments.length + automatedComments.length;
-
     const stuckReaction = getReactionConfigForSession(session, "agent-stuck");
-    // Honor `auto: false`: installations that route stuck handling only to
-    // humans must not have their agents messaged automatically. The transition
-    // handler still emits the human-facing notify for the stuck reaction.
-    if (stuckReaction?.auto === false) {
-      // …but a nudge latch persisted from a prior config (auto was enabled, the
-      // session escalated, then the project was restarted/reconfigured with
-      // auto:false) must still be cleared once the backlog is confirmably clean —
-      // otherwise determineStatus keeps parking the open PR in needs_input forever
-      // after the threads are resolved. Skip sends, but not this cleanup. Fail
-      // closed on a truncated page (an unresolved thread may lie outside it).
-      if (
-        totalUnaddressed === 0 &&
-        !primaryThreadsTruncated &&
-        (session.metadata["stuckNudgeCount"] ||
-          session.metadata["stuckNudgeEscalated"] === "true" ||
-          session.metadata["stuckNudgeFingerprint"])
-      ) {
-        updateSessionMetadata(session, {
-          stuckNudgeCount: "",
-          stuckNudgeEscalated: "",
-          stuckNudgeFingerprint: "",
-        });
-      }
-      return;
-    }
-
-    // The bot review→fix loop owns its own escalation / needs_input latch.
-    if (session.metadata["reviewRoundsEscalated"] === "true") return;
-
-    // Gate on idle-beyond-threshold, NOT the derived legacy status. An agent that
-    // is idle past the agent-stuck threshold but whose PR resolves to an overlay
-    // status (changes_requested, review_pending, mergeable, approved, ci_failed)
-    // never surfaces as `stuck`, yet it is exactly the alive-but-idle agent this
-    // targets. session.activitySignal is the signal determineStatus committed this
-    // poll; an actively-working agent has no positive idle evidence.
     const idleSignal = session.activitySignal;
-    const stuck =
+    const idleBeyondThreshold =
       hasPositiveIdleEvidence(idleSignal) && isIdleBeyondThreshold(session, idleSignal.timestamp);
 
-    // Backlog confirmably clean (empty AND the fetched page is complete): release
-    // the nudge budget + escalation latch so a resolved session leaves needs_input,
-    // regardless of idle state (a resumed agent must be released too). Fail closed
-    // on a truncated page — an unresolved thread may lie outside the fetched page,
-    // so an empty page is NOT trustworthy as clean (fail closed on latch clearing).
     if (totalUnaddressed === 0) {
+      if (primaryThreadsTruncated && session.metadata["stuckNudgeEscalated"] === "true") {
+        return { outcome: "notified", reason: "nudge-budget-escalated" };
+      }
+      if (primaryThreadsTruncated && idleBeyondThreshold && hasRecordedReviewBacklog(session)) {
+        return { outcome: "blocked", reason: "review-page-truncated" };
+      }
       if (
         !primaryThreadsTruncated &&
         (session.metadata["stuckNudgeCount"] ||
-          session.metadata["stuckNudgeEscalated"] === "true" ||
+          session.metadata["stuckNudgeEscalated"] ||
           session.metadata["stuckNudgeFingerprint"])
       ) {
         updateSessionMetadata(session, {
@@ -3729,25 +4012,25 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           stuckNudgeFingerprint: "",
         });
       }
-      return;
+      return {
+        outcome: "clean",
+        reason: primaryThreadsTruncated ? "truncated-page-no-known-backlog" : "backlog-clean",
+      };
     }
 
-    // Already escalated (parked in needs_input): don't re-nudge.
-    if (session.metadata["stuckNudgeEscalated"] === "true") return;
+    if (!idleBeyondThreshold) return { outcome: "clean", reason: "agent-not-idle" };
+    if (ctx.dispatchOutcome) return ctx.dispatchOutcome;
+    if (primaryThreadsTruncated) return { outcome: "blocked", reason: "review-page-truncated" };
+    if (stuckReaction?.auto === false) {
+      return { outcome: "blocked", reason: "agent-stuck-auto-disabled" };
+    }
+    if (session.metadata["reviewRoundsEscalated"] === "true") {
+      return { outcome: "notified", reason: "review-rounds-escalated" };
+    }
+    if (session.metadata["stuckNudgeEscalated"] === "true") {
+      return { outcome: "notified", reason: "nudge-budget-escalated" };
+    }
 
-    // Not idle-beyond-threshold → not stuck; nothing to nudge.
-    if (!stuck) return;
-
-    // Preserve each review reaction's own opt-out. The dispatch hash is recorded
-    // whenever a category's reaction fires — including notify-only or auto:false
-    // configs where the comments were only surfaced to a human, never sent to the
-    // agent. Re-delivering those to the agent would bypass the opt-out, so only
-    // nudge a category whose reaction is an enabled send-to-agent action.
-    //
-    // AND skip a category whose review reaction has ESCALATED: executeReaction
-    // returns success (recording the dispatch hash) with action "escalated" even
-    // though nothing reached the agent, so nudging off that hash would re-send
-    // comments the agent never received and fight the reaction's human handoff.
     const pendingSendable =
       reviewReactionSendsToAgent(session, "changes-requested") &&
       !isReviewReactionEscalated(session, "changes-requested");
@@ -3755,14 +4038,11 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       reviewReactionSendsToAgent(session, "bugbot-comments") &&
       !isReviewReactionEscalated(session, "bugbot-comments");
 
-    // Only nudge comments the agent has ALREADY received. Fresh comments were
-    // just delivered by the dispatch blocks above this cycle — the normal path
-    // handles those. Treat a backlog whose IDs are all a SUBSET of a previously
-    // dispatched batch as already-delivered so that partial resolution (e.g. the
-    // agent resolved c1 of a dispatched {c1,c2}, leaving {c2}) still nudges and
-    // can reach exhaustion escalation, rather than silently receiving nothing.
-    const priorPendingIds = splitFingerprintIds(ctx.priorPendingDispatchHash);
-    const priorAutomatedIds = splitFingerprintIds(ctx.priorAutomatedDispatchHash);
+    // Only the agent-delivery hashes are proof for a nudge. The generic hashes also
+    // dedup notify/escalation outcomes and therefore remain intentionally untrusted
+    // after restart when the process-local reaction tracker is empty.
+    const priorPendingIds = splitFingerprintIds(ctx.priorPendingAgentDispatchHash);
+    const priorAutomatedIds = splitFingerprintIds(ctx.priorAutomatedAgentDispatchHash);
     const pendingAlreadyDelivered =
       pendingSendable &&
       pendingComments.length > 0 &&
@@ -3772,9 +4052,27 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       automatedComments.length > 0 &&
       automatedComments.every((c) => priorAutomatedIds.has(c.id));
 
-    // Nothing agent-actionable to re-deliver → nudge does nothing this poll. The
-    // transition handler already fired (and owns) the agent-stuck notify.
-    if (!pendingAlreadyDelivered && !automatedAlreadyDelivered) return;
+    const humanNotificationLatched =
+      session.metadata[REVIEW_BACKLOG_NOTIFICATION_HASH_KEY] === reviewBacklogIdentity(session);
+    const pendingHumanHandoff =
+      pendingComments.length > 0 &&
+      (isReviewReactionEscalated(session, "changes-requested") ||
+        (humanNotificationLatched &&
+          getReactionConfigForSession(session, "changes-requested")?.action === "notify"));
+    const automatedHumanHandoff =
+      automatedComments.length > 0 &&
+      (isReviewReactionEscalated(session, "bugbot-comments") ||
+        (humanNotificationLatched &&
+          getReactionConfigForSession(session, "bugbot-comments")?.action === "notify"));
+    const hasUnverifiedCategory =
+      (pendingComments.length > 0 && !pendingAlreadyDelivered && !pendingHumanHandoff) ||
+      (automatedComments.length > 0 && !automatedAlreadyDelivered && !automatedHumanHandoff);
+    if (hasUnverifiedCategory) {
+      return { outcome: "blocked", reason: "agent-delivery-unverified" };
+    }
+    if (!pendingAlreadyDelivered && !automatedAlreadyDelivered) {
+      return { outcome: "notified", reason: "review-reaction-notified" };
+    }
 
     const nudgeRetries = stuckReaction?.nudgeRetries ?? DEFAULT_STUCK_NUDGE_RETRIES;
 
@@ -3791,47 +4089,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       : parseAttemptCount(session.metadata["stuckNudgeCount"]);
 
     if (nudgeCount >= nudgeRetries) {
-      // Nudges exhausted — escalate to needs_input + notify. The latch parks the
-      // session in needs_input (honored by determineStatus) until the agent
-      // addresses the comments (clearing the backlog above) or a human steps in.
-      const context = buildEventContext(session, prEnrichmentCache);
-      const event = createEvent("reaction.escalated", {
-        sessionId: session.id,
-        projectId: session.projectId,
-        message: `Agent idle on ${totalUnaddressed} unaddressed review comment(s) after ${nudgeCount} nudge(s) on PR #${session.pr?.number}. Human review needed.`,
-        data: buildReactionEscalationNotificationData({
-          eventType: "reaction.escalated",
-          sessionId: session.id,
-          projectId: session.projectId,
-          context,
-          reactionKey: "agent-stuck",
-          action: "escalated",
-          attempts: nudgeCount,
-          cause: "max_attempts",
-          enrichment: getPREnrichmentForSession(session),
-        }),
-      });
-      // Notify FIRST, then latch — and ONLY latch when a notifier accepted the
-      // escalation, so we never silently park a session in needs_input with no
-      // human aware (mirrors escalateReviewRoundCap).
-      const delivered = await notifyHuman(event, stuckReaction?.priority ?? "urgent");
-      if (!delivered) return;
-      updateSessionMetadata(session, { stuckNudgeEscalated: "true" });
-      recordActivityEvent({
-        projectId: session.projectId,
-        sessionId: session.id,
-        source: "reaction",
-        kind: "reaction.escalated",
-        level: "warn",
-        summary: `agent-stuck nudge exhausted (${nudgeCount}) for PR #${session.pr?.number}`,
-        data: {
-          reactionKey: "agent-stuck",
-          nudges: nudgeCount,
-          nudgeRetries,
-          prNumber: session.pr?.number,
-        },
-      });
-      return;
+      return { outcome: "blocked", reason: "nudge-budget-exhausted" };
     }
 
     // Re-deliver the outstanding comments directly (bypassing the fingerprint
@@ -3849,7 +4107,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
     try {
       const delivery = await sendLifecycleMessage(session, parts.join("\n"));
-      if (delivery.status === "input-pending") return;
+      if (delivery.status === "input-pending") {
+        return {
+          outcome: "blocked",
+          reason: "nudge-input-pending",
+          error: delivery.error ?? new Error("agent input remains pending"),
+        };
+      }
       updateSessionMetadata(session, {
         stuckNudgeCount: String(nudgeCount + 1),
         stuckNudgeFingerprint: backlogFingerprint,
@@ -3867,9 +4131,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           unaddressed: totalUnaddressed,
         },
       });
+      return { outcome: "nudged", reason: "nudge-sent" };
     } catch (err) {
-      // Send failed — retry on the next poll cycle (don't consume the budget). The
-      // agent-stuck notify already fired at the transition, so a human is aware.
       recordActivityEvent({
         projectId: session.projectId,
         sessionId: session.id,
@@ -3882,6 +4145,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           errorMessage: err instanceof Error ? err.message : String(err),
         },
       });
+      return { outcome: "blocked", reason: "nudge-send-failed", error: err };
     }
   }
 
@@ -5749,6 +6013,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
     const lifecycleChanged = session.metadata["lifecycle"] !== JSON.stringify(session.lifecycle);
     let transitionReaction: TransitionReaction | undefined;
+    let transitionNotificationDelivered = false;
 
     const nextLifecycleEvidence = assessment.evidence;
     const nextDetectingAttempts =
@@ -6016,7 +6281,8 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           });
           // Bind any minted controls to THIS session's decision identity so a
           // report that supersedes it during delivery can't repoint the buttons.
-          await notifyHuman(event, priority, activeDecisionId(session));
+          const delivered = await notifyHuman(event, priority, activeDecisionId(session));
+          if (reactionKey === "agent-stuck") transitionNotificationDelivered = delivered;
         }
       }
     } else {
@@ -6098,7 +6364,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
     }
 
     await Promise.allSettled([
-      maybeDispatchReviewBacklog(session, oldStatus, newStatus, transitionReaction),
+      maybeDispatchReviewBacklog(
+        session,
+        oldStatus,
+        newStatus,
+        transitionReaction,
+        transitionNotificationDelivered,
+      ),
       maybeDispatchMergeConflicts(session, newStatus),
       maybeDispatchCIFailureDetails(
         session,

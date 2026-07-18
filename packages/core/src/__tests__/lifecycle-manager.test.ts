@@ -5547,10 +5547,14 @@ describe("rate limiting optimizations", () => {
         metadata: {
           lastPendingReviewFingerprint: "fingerprint",
           lastPendingReviewDispatchHash: "dispatch",
+          lastPendingReviewAgentDispatchHash: "dispatch",
           lastPendingReviewDispatchAt: "2025-01-01T00:00:00.000Z",
           lastAutomatedReviewFingerprint: "auto-fingerprint",
           lastAutomatedReviewDispatchHash: "auto-dispatch",
+          lastAutomatedReviewAgentDispatchHash: "auto-dispatch",
           lastAutomatedReviewDispatchAt: "2025-01-01T00:00:00.000Z",
+          reviewBacklogNotificationHash: "pending:fingerprint|automated:auto-fingerprint",
+          reviewBacklogNotificationReason: "nudge-send-failed",
         },
       }),
       registry,
@@ -5561,10 +5565,14 @@ describe("rate limiting optimizations", () => {
     const metadata = readMetadataRaw(env.sessionsDir, "app-1");
     expect(metadata?.["lastPendingReviewFingerprint"]).toBeFalsy();
     expect(metadata?.["lastPendingReviewDispatchHash"]).toBeFalsy();
+    expect(metadata?.["lastPendingReviewAgentDispatchHash"]).toBeFalsy();
     expect(metadata?.["lastPendingReviewDispatchAt"]).toBeFalsy();
     expect(metadata?.["lastAutomatedReviewFingerprint"]).toBeFalsy();
     expect(metadata?.["lastAutomatedReviewDispatchHash"]).toBeFalsy();
+    expect(metadata?.["lastAutomatedReviewAgentDispatchHash"]).toBeFalsy();
     expect(metadata?.["lastAutomatedReviewDispatchAt"]).toBeFalsy();
+    expect(metadata?.["reviewBacklogNotificationHash"]).toBeFalsy();
+    expect(metadata?.["reviewBacklogNotificationReason"]).toBeFalsy();
     expect(getPendingMock).not.toHaveBeenCalled();
     expect(getAutomatedMock).not.toHaveBeenCalled();
   });
@@ -6677,6 +6685,7 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
       metaOverrides?: Record<string, string>;
       notifier?: ReturnType<typeof createMockNotifier>;
       enrichment?: Parameters<typeof mockBatchEnrichment>[0];
+      initialStatus?: SessionStatus;
     } = {},
   ) {
     config.reactions = {
@@ -6722,7 +6731,11 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     vi.mocked(mockSessionManager.send).mockResolvedValue(undefined);
 
     return setupCheck("app-1", {
-      session: makeSession({ status: "pr_open", pr: makePR(), metadata: { agent: "mock-agent" } }),
+      session: makeSession({
+        status: opts.initialStatus ?? "pr_open",
+        pr: makePR(),
+        metadata: { agent: "mock-agent" },
+      }),
       metaOverrides: { agent: "mock-agent", ...opts.metaOverrides },
       registry,
     });
@@ -6869,6 +6882,10 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     await lm.check("app-1"); // still active → no nudge
     expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewBacklogOutcome"]).toBe("clean");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewBacklogReason"]).toBe(
+      "agent-not-idle",
+    );
   });
 
   // Finding #1: nudge must fire for an idle-beyond-threshold agent even when the
@@ -6900,10 +6917,7 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBe("1");
   });
 
-  // The nudge is ADDITIVE: the agent-stuck notify still fires at the stuck
-  // transition (pre-#5 behavior) AND the nudge re-delivers already-delivered
-  // comments — the nudge never suppresses or defers the notification.
-  it("fires the agent-stuck notify AND nudges when comments were already delivered", async () => {
+  it("chooses the stuck-transition notification before nudging on a later poll", async () => {
     const notifier = createMockNotifier();
     const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
     // Simulate a prior poll having already dispatched the comment (hash set),
@@ -6914,15 +6928,22 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
       metaOverrides: {
         lastAutomatedReviewFingerprint: "c1",
         lastAutomatedReviewDispatchHash: "c1",
+        lastAutomatedReviewAgentDispatchHash: "c1",
       },
     });
 
     await lm.check("app-1"); // pr_open → stuck transition
     expect(lm.getStates().get("app-1")).toBe("stuck");
-    // The transition notify fires (not deferred) AND the nudge re-delivers the comment.
+    // Exactly one terminal outcome: the transition notify wins this poll.
     expect(notifier.notify).toHaveBeenCalled();
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewBacklogOutcome"]).toBe("notified");
+
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
     expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBe("1");
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewBacklogOutcome"]).toBe("nudged");
   });
 
   // Finding #3: agent-stuck configured with auto:false must NOT message the agent.
@@ -6936,6 +6957,7 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
       metaOverrides: {
         lastAutomatedReviewFingerprint: "c1",
         lastAutomatedReviewDispatchHash: "c1",
+        lastAutomatedReviewAgentDispatchHash: "c1",
       },
     });
 
@@ -6956,9 +6978,11 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     const lm = setupStuckSession(getReviewThreads, {
       nudgeRetries: 3,
       withNotifier: true,
+      initialStatus: "stuck",
       metaOverrides: {
         lastAutomatedReviewFingerprint: "c1,c2",
         lastAutomatedReviewDispatchHash: "c1,c2",
+        lastAutomatedReviewAgentDispatchHash: "c1,c2",
       },
     });
 
@@ -7129,6 +7153,139 @@ describe("auto-nudge stuck/idle agents with pending PR comments (#5)", () => {
     await lm.check("app-1");
     expect(mockSessionManager.send).not.toHaveBeenCalled();
     expect(readMetadataRaw(env.sessionsDir, "app-1")?.["stuckNudgeCount"]).toBeFalsy();
+  });
+
+  it("does not trust an escalation-recorded hash as agent delivery proof after restart", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, {
+      notifier,
+      initialStatus: "review_pending",
+      enrichment: {
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "pending",
+        mergeable: false,
+      },
+      metaOverrides: {
+        lastAutomatedReviewFingerprint: "c1",
+        // This generic hash may have been stamped by a pre-restart escalation.
+        lastAutomatedReviewDispatchHash: "c1",
+      },
+    });
+
+    await lm.check("app-1");
+
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(notifier.notify).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "reaction.escalated", priority: "urgent" }),
+    );
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["lastAutomatedReviewAgentDispatchHash"]).toBeFalsy();
+    expect(meta?.["reviewBacklogOutcome"]).toBe("notified");
+    expect(meta?.["reviewBacklogReason"]).toBe("agent-delivery-unverified");
+  });
+
+  it("notifies once when an overlay-state nudge send fails", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, {
+      notifier,
+      initialStatus: "review_pending",
+      enrichment: {
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "pending",
+        mergeable: false,
+      },
+      metaOverrides: {
+        lastAutomatedReviewFingerprint: "c1",
+        lastAutomatedReviewDispatchHash: "c1",
+        lastAutomatedReviewAgentDispatchHash: "c1",
+      },
+    });
+    vi.mocked(mockSessionManager.send).mockRejectedValue(new Error("pty unavailable"));
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("review_pending");
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+    expect(notifier.notify).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "reaction.escalated", priority: "urgent" }),
+    );
+    let meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["stuckNudgeCount"]).toBeFalsy();
+    expect(meta?.["reviewBacklogOutcome"]).toBe("notified");
+    expect(meta?.["reviewBacklogReason"]).toBe("nudge-send-failed");
+
+    vi.mocked(notifier.notify).mockClear();
+    await lm.check("app-1"); // throttled clean exit must not erase the handoff latch
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+    expect(readMetadataRaw(env.sessionsDir, "app-1")?.["reviewBacklogReason"]).toBe("throttled");
+
+    await vi.advanceTimersByTimeAsync(THROTTLE_STEP_MS);
+    await lm.check("app-1");
+    // The delivered handoff latch prevents blind re-sends for this backlog.
+    expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
+    expect(notifier.notify).not.toHaveBeenCalled();
+    meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["reviewBacklogOutcome"]).toBe("notified");
+  });
+
+  it("notifies when an overlay-state review fetch fails", async () => {
+    const notifier = createMockNotifier();
+    const getReviewThreads = vi.fn().mockRejectedValue(new Error("review API unavailable"));
+    const lm = setupStuckSession(getReviewThreads, {
+      notifier,
+      initialStatus: "review_pending",
+      enrichment: {
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "pending",
+        mergeable: false,
+      },
+      metaOverrides: {
+        lastAutomatedReviewFingerprint: "c1",
+        lastAutomatedReviewDispatchHash: "c1",
+        lastAutomatedReviewAgentDispatchHash: "c1",
+      },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("review_pending");
+    expect(mockSessionManager.send).not.toHaveBeenCalled();
+    expect(notifier.notify).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "reaction.escalated", priority: "urgent" }),
+    );
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["reviewBacklogOutcome"]).toBe("notified");
+    expect(meta?.["reviewBacklogReason"]).toBe("review-fetch-failed");
+  });
+
+  it("records blocked when the chokepoint cannot deliver its human handoff", async () => {
+    const getReviewThreads = vi.fn().mockResolvedValue({ threads: [botThread("c1")], reviews: [] });
+    const lm = setupStuckSession(getReviewThreads, {
+      initialStatus: "review_pending",
+      enrichment: {
+        state: "open",
+        ciStatus: "passing",
+        reviewDecision: "pending",
+        mergeable: false,
+      },
+      metaOverrides: {
+        lastAutomatedReviewFingerprint: "c1",
+        lastAutomatedReviewDispatchHash: "c1",
+        lastAutomatedReviewAgentDispatchHash: "c1",
+      },
+    });
+    vi.mocked(mockSessionManager.send).mockRejectedValue(new Error("pty unavailable"));
+
+    await lm.check("app-1");
+
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["reviewBacklogOutcome"]).toBe("blocked");
+    expect(meta?.["reviewBacklogReason"]).toBe("nudge-send-failed");
   });
 
   // #12: a CONFIDENCE-held review send (distinct from a retry escalation) reaches
