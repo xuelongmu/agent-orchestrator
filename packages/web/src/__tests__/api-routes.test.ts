@@ -251,6 +251,7 @@ import { POST as restorePOST } from "@/app/api/sessions/[id]/restore/route";
 import { POST as remapPOST } from "@/app/api/sessions/[id]/remap/route";
 import { POST as mergePOST } from "@/app/api/prs/[id]/merge/route";
 import { GET as observabilityGET } from "@/app/api/observability/route";
+import { GET as metricsGET } from "@/app/api/metrics/route";
 import { GET as runtimeTerminalGET } from "@/app/api/runtime/terminal/route";
 import { GET as verifyGET, POST as verifyPOST } from "@/app/api/verify/route";
 import { GET as patchesGET } from "@/app/api/sessions/patches/route";
@@ -1522,6 +1523,18 @@ describe("API Routes", () => {
       expect(data).toHaveProperty("generatedAt");
       expect(data).toHaveProperty("overallStatus");
       expect(data).toHaveProperty("projects");
+    });
+  });
+
+  describe("GET /api/metrics", () => {
+    it("returns Prometheus text exposition with the required content type", async () => {
+      const req = makeRequest("/api/metrics", { method: "GET" });
+      const res = await metricsGET(req);
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("text/plain; version=0.0.4; charset=utf-8");
+      expect(res.headers.get("x-correlation-id")).toBeTruthy();
+      expect(await res.text()).toContain("# TYPE ao_operation_duration_ms histogram");
     });
   });
 
