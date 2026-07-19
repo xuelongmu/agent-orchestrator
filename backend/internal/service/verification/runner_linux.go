@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -95,7 +96,10 @@ func completeLinuxVerificationProcess(
 }
 
 func pollLinuxPIDFD(pidfd int) error {
-	poll := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	if pidfd < 0 || pidfd > math.MaxInt32 {
+		return fmt.Errorf("target pidfd is outside pollfd range: %d", pidfd)
+	}
+	poll := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}} // #nosec G115 -- pidfd is range-checked immediately above.
 	for {
 		n, err := unix.Poll(poll, -1)
 		if errors.Is(err, unix.EINTR) {
