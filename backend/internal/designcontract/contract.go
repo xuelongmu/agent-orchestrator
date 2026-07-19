@@ -43,8 +43,10 @@ const (
 	gitignoreStageMarker       = "ao-design-contract-gitignore-stage-v1"
 	gitignorePayloadPrefix     = "gitignore-"
 	gitignorePayloadSuffix     = ".stage"
-	gitignoreContainerPrefix   = ".git-"
-	gitignoreContainerSuffix   = ".stage"
+	bootstrapContainerPrefix   = ".bootstrap-"
+	bootstrapContainerSuffix   = ".stage"
+	legacyContainerPrefix      = ".git-"
+	legacyContainerSuffix      = ".stage"
 )
 
 var (
@@ -365,6 +367,7 @@ type PendingDelivery struct {
 
 var deliveryLocks sync.Map
 var projectionLocks sync.Map
+var publishGitignoreStageDirectory = publishProjectionDirectory
 
 type projectionFailureBoundary string
 
@@ -514,7 +517,7 @@ func materializeWithProjectionControls(ctx context.Context, workspace, scope, pr
 	if err := ensureProjectionGitignore(aoRoot, initialized, gitignorePath, failureHook, ops); err != nil {
 		return fmt.Errorf("ignore design contract projection: %w", err)
 	}
-	projectionStageRoot, err := openOrCreateGitignoreStage(aoRoot)
+	projectionStageRoot, err := openOrCreateGitignoreStage(aoRoot, initialized)
 	if err != nil {
 		return fmt.Errorf("open authenticated projection staging root: %w", err)
 	}
@@ -670,7 +673,10 @@ func rejectTrackedProjectionDirectory(ctx context.Context, workspace string) err
 }
 
 func projectionGitignoreContent() string {
-	return hookutil.GitignoreSentinel + "\n/.gitignore\n/.git-*.stage/\n/CONTRACT.md\n/.CONTRACT-*.tmp\n/contracts/\n"
+	// This exact byte sequence shipped before crash-atomic projection updates.
+	// It is an ownership credential, so append-only compatibility changes are
+	// not permitted here.
+	return hookutil.GitignoreSentinel + "\n/.gitignore\n/CONTRACT.md\n/.CONTRACT-*.tmp\n/contracts/\n"
 }
 
 // preflightProjectionOwnership checks every target before creating AO's child
@@ -716,7 +722,7 @@ func ensureProjectionGitignore(root *os.Root, initialized bool, ownershipTarget 
 		return nil
 	}
 	want := []byte(projectionGitignoreContent())
-	stageRoot, err := openOrCreateGitignoreStage(root)
+	stageRoot, err := openOrCreateGitignoreStage(root, false)
 	if err != nil {
 		return err
 	}
@@ -783,70 +789,52 @@ func ensureProjectionGitignore(root *os.Root, initialized bool, ownershipTarget 
 	return installProjectionGitignore(root, stageRoot, payloadName, ownershipTarget, failureHook, ops)
 }
 
-func openOrCreateGitignoreStage(root *os.Root) (*os.Root, error) {
+func openOrCreateGitignoreStage(root *os.Root, allowLegacyFinal bool) (*os.Root, error) {
 	info, err := root.Lstat(gitignoreStageDirectory)
 	if err == nil {
-		stageRoot, _, authErr := openAuthenticatedGitignoreStage(root, gitignoreStageDirectory, info)
+		stageRoot, _, authErr := openAuthenticatedGitignoreStage(root, info, allowLegacyFinal)
 		return stageRoot, authErr
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect design contract gitignore staging directory: %w", err)
 	}
 
-	// A crash after authenticating the random container but before its final
-	// rename leaves a resumable stage. Unauthenticated lookalikes are foreign
-	// and are neither adopted nor removed.
-	entries, err := readRootEntries(root)
+	// The exact nested .git component is ignored by Git from the instant it is
+	// created, before AO owns .ao/.gitignore. Abandoned bootstrap containers are
+	// deliberately never enumerated or trusted; a restart creates a fresh one.
+	bootstrapName, err := newBootstrapContainerName()
 	if err != nil {
 		return nil, err
 	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if !isGitignoreStageContainer(name) {
-			continue
-		}
-		candidateInfo, statErr := root.Lstat(name)
-		if statErr != nil {
-			continue
-		}
-		candidate, identity, authErr := openAuthenticatedGitignoreStage(root, name, candidateInfo)
-		if authErr != nil {
-			continue
-		}
-		_ = candidate.Close()
-		if err := publishProjectionDirectory(root, name, gitignoreStageDirectory, identity); err != nil {
-			if finalInfo, finalErr := root.Lstat(gitignoreStageDirectory); finalErr == nil {
-				finalRoot, _, finalAuthErr := openAuthenticatedGitignoreStage(root, gitignoreStageDirectory, finalInfo)
-				if finalAuthErr == nil {
-					return finalRoot, nil
-				}
-			}
-			return nil, fmt.Errorf("publish recovered gitignore staging directory: %w", err)
-		}
-		return openPublishedGitignoreStage(root)
+	if err := root.Mkdir(bootstrapName, 0o700); err != nil {
+		return nil, fmt.Errorf("create design contract bootstrap container: %w", err)
 	}
-
-	stageName, err := newGitignoreContainerName()
+	bootstrapInfo, err := root.Lstat(bootstrapName)
+	if err != nil {
+		return nil, fmt.Errorf("inspect design contract bootstrap container: %w", err)
+	}
+	bootstrapRoot, _, err := openVerifiedSubroot(root, bootstrapName, bootstrapInfo)
 	if err != nil {
 		return nil, err
 	}
-	if err := root.Mkdir(stageName, 0o700); err != nil {
-		return nil, fmt.Errorf("create random design contract gitignore staging directory: %w", err)
+	defer func() { _ = bootstrapRoot.Close() }()
+	if err := bootstrapRoot.Mkdir(gitignoreStageDirectory, 0o700); err != nil {
+		return nil, fmt.Errorf("create git-invisible design contract staging directory: %w", err)
 	}
-	stageInfo, err := root.Lstat(stageName)
+	stageInfo, err := bootstrapRoot.Lstat(gitignoreStageDirectory)
 	if err != nil {
-		return nil, fmt.Errorf("inspect random gitignore staging directory: %w", err)
+		return nil, fmt.Errorf("inspect git-invisible design contract staging directory: %w", err)
 	}
-	stageRoot, stageIdentity, err := openVerifiedSubroot(root, stageName, stageInfo)
+	stageRoot, stageIdentity, err := openVerifiedSubroot(bootstrapRoot, gitignoreStageDirectory, stageInfo)
 	if err != nil {
 		return nil, err
 	}
 	marker, err := stageRoot.OpenFile(gitignoreStageMarker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		_ = stageRoot.Close()
-		return nil, fmt.Errorf("authenticate random gitignore staging directory: %w", err)
+		return nil, fmt.Errorf("authenticate git-invisible staging directory: %w", err)
 	}
-	if _, err := marker.Write(gitignoreStageMarkerContent(stageName)); err != nil {
+	if _, err := marker.Write(gitignoreStageMarkerContent(bootstrapName)); err != nil {
 		_ = marker.Close()
 		_ = stageRoot.Close()
 		return nil, fmt.Errorf("write gitignore staging ownership marker: %w", err)
@@ -864,36 +852,40 @@ func openOrCreateGitignoreStage(root *os.Root) (*os.Root, error) {
 		_ = stageRoot.Close()
 		return nil, fmt.Errorf("sync authenticated gitignore staging container: %w", err)
 	}
+	if err := syncProjectionContainer(bootstrapRoot); err != nil {
+		_ = stageRoot.Close()
+		return nil, fmt.Errorf("sync nested gitignore staging directory entry: %w", err)
+	}
 	if err := syncProjectionContainer(root); err != nil {
 		_ = stageRoot.Close()
-		return nil, fmt.Errorf("sync random gitignore staging directory entry: %w", err)
+		return nil, fmt.Errorf("sync bootstrap container entry: %w", err)
 	}
 	_ = stageRoot.Close()
-	if err := publishProjectionDirectory(root, stageName, gitignoreStageDirectory, stageIdentity); err != nil {
+	if err := publishGitignoreStageDirectory(bootstrapRoot, root, gitignoreStageDirectory, gitignoreStageDirectory, stageIdentity); err != nil {
 		return nil, fmt.Errorf("publish authenticated gitignore staging directory: %w", err)
 	}
-	return openPublishedGitignoreStage(root)
+	return openPublishedGitignoreStage(root, false)
 }
 
-func openPublishedGitignoreStage(root *os.Root) (*os.Root, error) {
+func openPublishedGitignoreStage(root *os.Root, allowLegacyFinal bool) (*os.Root, error) {
 	info, err := root.Lstat(gitignoreStageDirectory)
 	if err != nil {
 		return nil, err
 	}
-	stageRoot, _, err := openAuthenticatedGitignoreStage(root, gitignoreStageDirectory, info)
+	stageRoot, _, err := openAuthenticatedGitignoreStage(root, info, allowLegacyFinal)
 	return stageRoot, err
 }
 
-func openAuthenticatedGitignoreStage(root *os.Root, name string, info os.FileInfo) (*os.Root, os.FileInfo, error) {
+func openAuthenticatedGitignoreStage(root *os.Root, info os.FileInfo, allowLegacyFinal bool) (*os.Root, os.FileInfo, error) {
 	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, nil, errors.New("foreign .ao/.git staging path prevents safe projection initialization")
 	}
-	stageRoot, identity, err := openVerifiedSubroot(root, name, info)
+	stageRoot, identity, err := openVerifiedSubroot(root, gitignoreStageDirectory, info)
 	if err != nil {
 		return nil, nil, err
 	}
 	marker, exists, err := readUnlinkedRegularFile(stageRoot, gitignoreStageMarker)
-	if err != nil || !exists || !validGitignoreStageMarker(name, marker) {
+	if err != nil || !exists || !validGitignoreStageMarker(marker, allowLegacyFinal) {
 		_ = stageRoot.Close()
 		return nil, nil, errors.New("unauthenticated .ao/.git staging directory prevents safe projection initialization")
 	}
@@ -915,12 +907,12 @@ func gitignoreStageMarkerContent(stageName string) []byte {
 	return []byte(gitignoreStageMarker + "\n" + stageName + "\n")
 }
 
-func validGitignoreStageMarker(container string, marker []byte) bool {
-	parts := strings.Split(string(marker), "\n")
-	if len(parts) != 3 || parts[0] != gitignoreStageMarker || parts[2] != "" || !isGitignoreStageContainer(parts[1]) {
-		return false
+func validGitignoreStageMarker(marker []byte, allowLegacyFinal bool) bool {
+	if allowLegacyFinal && len(marker) == 0 {
+		return true
 	}
-	return container == gitignoreStageDirectory || container == parts[1]
+	parts := strings.Split(string(marker), "\n")
+	return len(parts) == 3 && parts[0] == gitignoreStageMarker && parts[2] == "" && (isBootstrapContainer(parts[1]) || isLegacyStageContainer(parts[1]))
 }
 
 func installProjectionGitignore(root, stageRoot *os.Root, payloadName, ownershipTarget string, failureHook projectionFailureHook, ops *projectionIO) error {
@@ -952,8 +944,28 @@ func isGitignoreStagePayload(name string) bool {
 	return strings.HasPrefix(name, gitignorePayloadPrefix) && strings.HasSuffix(name, gitignorePayloadSuffix)
 }
 
-func isGitignoreStageContainer(name string) bool {
-	return strings.HasPrefix(name, gitignoreContainerPrefix) && strings.HasSuffix(name, gitignoreContainerSuffix)
+func isBootstrapContainer(name string) bool {
+	return isRandomStageContainer(name, bootstrapContainerPrefix, bootstrapContainerSuffix)
+}
+
+func isLegacyStageContainer(name string) bool {
+	return isRandomStageContainer(name, legacyContainerPrefix, legacyContainerSuffix)
+}
+
+func isRandomStageContainer(name, prefix, suffix string) bool {
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return false
+	}
+	nonce := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+	if len(nonce) != 32 {
+		return false
+	}
+	for _, r := range nonce {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func isProjectionStage(name string) bool {
@@ -968,12 +980,12 @@ func newGitignoreStageName() (string, error) {
 	return gitignorePayloadPrefix + strings.TrimSuffix(strings.TrimPrefix(name, ".CONTRACT-"), ".tmp") + gitignorePayloadSuffix, nil
 }
 
-func newGitignoreContainerName() (string, error) {
+func newBootstrapContainerName() (string, error) {
 	name, err := newProjectionStageName()
 	if err != nil {
 		return "", err
 	}
-	return gitignoreContainerPrefix + strings.TrimSuffix(strings.TrimPrefix(name, ".CONTRACT-"), ".tmp") + gitignoreContainerSuffix, nil
+	return bootstrapContainerPrefix + strings.TrimSuffix(strings.TrimPrefix(name, ".CONTRACT-"), ".tmp") + bootstrapContainerSuffix, nil
 }
 
 func readRootEntries(root *os.Root) ([]os.DirEntry, error) {

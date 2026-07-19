@@ -95,8 +95,8 @@ func publishProjectionFile(sourceRoot, targetRoot *os.Root, _ *os.File, stageIde
 	return nil
 }
 
-func publishProjectionDirectory(root *os.Root, stageName, targetName string, stageIdentity os.FileInfo) error {
-	stagePath := filepath.Join(root.Name(), filepath.FromSlash(stageName))
+func publishProjectionDirectory(sourceRoot, targetRoot *os.Root, stageName, targetName string, stageIdentity os.FileInfo) error {
+	stagePath := filepath.Join(sourceRoot.Name(), filepath.FromSlash(stageName))
 	path, err := windows.UTF16PtrFromString(stagePath)
 	if err != nil {
 		return err
@@ -111,31 +111,44 @@ func publishProjectionDirectory(root *os.Root, stageName, targetName string, sta
 		_ = stage.Close()
 		return errors.New("opened Windows staging directory does not match validated identity")
 	}
-	if current, err := root.Lstat(stageName); err != nil || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, info) {
+	if current, err := sourceRoot.Lstat(stageName); err != nil || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, info) {
 		_ = stage.Close()
 		return errors.New("Windows staging directory changed before no-replace publish")
 	}
-	directory, directoryHandle, err := openDurableWindowsDirectory(root)
+	sourceDirectory, sourceDirectoryHandle, err := openDurableWindowsDirectory(sourceRoot)
 	if err != nil {
 		_ = stage.Close()
 		return err
 	}
-	defer func() { _ = directory.Close() }()
-	if err := windowsProjectionAPI.flushFileBuffers(directoryHandle); err != nil {
+	defer func() { _ = sourceDirectory.Close() }()
+	targetDirectory, targetDirectoryHandle, err := openDurableWindowsDirectory(targetRoot)
+	if err != nil {
+		_ = stage.Close()
+		return err
+	}
+	defer func() { _ = targetDirectory.Close() }()
+	if err := windowsProjectionAPI.flushFileBuffers(sourceDirectoryHandle); err != nil {
+		_ = stage.Close()
+		return err
+	}
+	if err := windowsProjectionAPI.flushFileBuffers(targetDirectoryHandle); err != nil {
 		_ = stage.Close()
 		return err
 	}
 	if err := stage.Close(); err != nil {
 		return err
 	}
-	targetPath, err := windows.UTF16PtrFromString(filepath.Join(root.Name(), filepath.FromSlash(targetName)))
+	targetPath, err := windows.UTF16PtrFromString(filepath.Join(targetRoot.Name(), filepath.FromSlash(targetName)))
 	if err != nil {
 		return err
 	}
 	if err := windowsProjectionAPI.moveFileEx(path, targetPath, windows.MOVEFILE_WRITE_THROUGH); err != nil {
 		return err
 	}
-	return windowsProjectionAPI.flushFileBuffers(directoryHandle)
+	if err := windowsProjectionAPI.flushFileBuffers(sourceDirectoryHandle); err != nil {
+		return err
+	}
+	return windowsProjectionAPI.flushFileBuffers(targetDirectoryHandle)
 }
 
 func openLockedWindowsProjectionFile(root *os.Root, name string, access uint32, expected os.FileInfo) (*os.File, windows.Handle, error) {

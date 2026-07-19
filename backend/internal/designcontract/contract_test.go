@@ -489,44 +489,72 @@ func TestMaterializeDoesNotClaimForeignGitignoreStagingPath(t *testing.T) {
 }
 
 func TestGitignoreBootstrapCrashRecoveryMatrix(t *testing.T) {
-	const stagedName = ".git-0123456789abcdef0123456789abcdef.stage"
+	const bootstrapName = ".bootstrap-0123456789abcdef0123456789abcdef.stage"
 	for _, tc := range []struct {
-		name          string
-		prepare       func(*testing.T, string)
-		stageSurvives bool
+		name        string
+		prepare     func(*testing.T, string)
+		innerExists bool
 	}{
 		{
-			name: "crash after random container mkdir before authentication",
+			name: "crash after outer container mkdir",
 			prepare: func(t *testing.T, aoDir string) {
 				t.Helper()
-				if err := os.Mkdir(filepath.Join(aoDir, stagedName), 0o700); err != nil {
+				if err := os.Mkdir(filepath.Join(aoDir, bootstrapName), 0o700); err != nil {
 					t.Fatal(err)
 				}
 			},
-			stageSurvives: true,
 		},
 		{
-			name: "crash after authenticated marker sync before no-replace rename",
+			name: "crash after nested exact git mkdir",
 			prepare: func(t *testing.T, aoDir string) {
 				t.Helper()
-				stage := filepath.Join(aoDir, stagedName)
-				if err := os.Mkdir(stage, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(stage, gitignoreStageMarker), gitignoreStageMarkerContent(stagedName), 0o600); err != nil {
+				stage := filepath.Join(aoDir, bootstrapName, gitignoreStageDirectory)
+				if err := os.MkdirAll(stage, 0o700); err != nil {
 					t.Fatal(err)
 				}
 			},
+			innerExists: true,
+		},
+		{
+			name: "crash after zero-byte marker create",
+			prepare: func(t *testing.T, aoDir string) {
+				t.Helper()
+				stage := filepath.Join(aoDir, bootstrapName, gitignoreStageDirectory)
+				if err := os.MkdirAll(stage, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(stage, gitignoreStageMarker), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			innerExists: true,
+		},
+		{
+			name: "crash after authenticated marker sync",
+			prepare: func(t *testing.T, aoDir string) {
+				t.Helper()
+				stage := filepath.Join(aoDir, bootstrapName, gitignoreStageDirectory)
+				if err := os.MkdirAll(stage, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(stage, gitignoreStageMarker), gitignoreStageMarkerContent(bootstrapName), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			innerExists: true,
 		},
 		{
 			name: "crash after no-replace rename before payload creation",
 			prepare: func(t *testing.T, aoDir string) {
 				t.Helper()
-				final := filepath.Join(aoDir, gitignoreStageDirectory)
-				if err := os.Mkdir(final, 0o700); err != nil {
+				stage := filepath.Join(aoDir, bootstrapName, gitignoreStageDirectory)
+				if err := os.MkdirAll(stage, 0o700); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join(final, gitignoreStageMarker), gitignoreStageMarkerContent(stagedName), 0o600); err != nil {
+				if err := os.WriteFile(filepath.Join(stage, gitignoreStageMarker), gitignoreStageMarkerContent(bootstrapName), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(stage, filepath.Join(aoDir, gitignoreStageDirectory)); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -539,6 +567,9 @@ func TestGitignoreBootstrapCrashRecoveryMatrix(t *testing.T) {
 				t.Fatal(err)
 			}
 			tc.prepare(t, aoDir)
+			// Crash/error state must be invisible before any restart or AO-owned
+			// .ao/.gitignore exists.
+			assertCleanGitStatus(t, workspace)
 			if err := Materialize(context.Background(), workspace, "recovered complete contract"); err != nil {
 				t.Fatal(err)
 			}
@@ -546,17 +577,107 @@ func TestGitignoreBootstrapCrashRecoveryMatrix(t *testing.T) {
 			if err != nil || !strings.Contains(string(got), "recovered complete contract") {
 				t.Fatalf("recovered projection = %q, %v", got, err)
 			}
-			_, stageErr := os.Stat(filepath.Join(aoDir, stagedName))
-			if tc.stageSurvives {
-				if stageErr != nil {
-					t.Fatalf("unauthenticated foreign crash residue was mutated: %v", stageErr)
-				}
-			} else if !errors.Is(stageErr, os.ErrNotExist) {
-				t.Fatalf("authenticated crash stage was not consumed: %v", stageErr)
+			bootstrapPath := filepath.Join(aoDir, bootstrapName)
+			if _, stageErr := os.Stat(bootstrapPath); stageErr != nil {
+				t.Fatalf("abandoned bootstrap container was enumerated or mutated: %v", stageErr)
+			}
+			_, innerErr := os.Stat(filepath.Join(bootstrapPath, gitignoreStageDirectory))
+			if tc.innerExists && innerErr != nil {
+				t.Fatalf("abandoned nested stage was enumerated or consumed: %v", innerErr)
+			}
+			if !tc.innerExists && !errors.Is(innerErr, os.ErrNotExist) {
+				t.Fatalf("unexpected abandoned nested stage state: %v", innerErr)
 			}
 			assertCleanGitStatus(t, workspace)
 		})
 	}
+}
+
+func TestMaterializeUpgradesLegacyZeroByteFinalStageMarker(t *testing.T) {
+	workspace := initRepo(t)
+	aoDir := filepath.Join(workspace, directory)
+	if err := os.MkdirAll(filepath.Join(aoDir, gitignoreStageDirectory), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(aoDir, ".gitignore"), []byte(projectionGitignoreContent()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(aoDir, gitignoreStageDirectory, gitignoreStageMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	targetRel := filepath.ToSlash(filepath.Join(directory, filename))
+	legacyProjection := projectionContent(targetRel, "Session draft (no PR identity yet)", "legacy complete contract")
+	if err := os.WriteFile(Path(workspace), []byte(legacyProjection), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertCleanGitStatus(t, workspace)
+
+	if err := Materialize(context.Background(), workspace, "upgraded complete contract"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(Path(workspace))
+	if err != nil || !strings.Contains(string(got), "upgraded complete contract") || strings.Contains(string(got), "legacy complete contract") {
+		t.Fatalf("upgraded projection = %q, %v", got, err)
+	}
+	marker, err := os.ReadFile(filepath.Join(aoDir, gitignoreStageDirectory, gitignoreStageMarker))
+	if err != nil || len(marker) != 0 {
+		t.Fatalf("legacy final marker was not accepted in place: %q, %v", marker, err)
+	}
+	assertCleanGitStatus(t, workspace)
+}
+
+func TestLegacyZeroByteFinalMarkerDoesNotOverrideForeignProjection(t *testing.T) {
+	workspace := initRepo(t)
+	aoDir := filepath.Join(workspace, directory)
+	if err := os.MkdirAll(filepath.Join(aoDir, gitignoreStageDirectory), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(aoDir, ".gitignore"), []byte(projectionGitignoreContent()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(aoDir, gitignoreStageDirectory, gitignoreStageMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	foreign := []byte("foreign projection must survive\n")
+	if err := os.WriteFile(Path(workspace), foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Materialize(context.Background(), workspace, "replacement"); err == nil {
+		t.Fatal("legacy marker bypassed AO-owned projection validation")
+	}
+	got, err := os.ReadFile(Path(workspace))
+	if err != nil || string(got) != string(foreign) {
+		t.Fatalf("foreign projection changed: %q, %v", got, err)
+	}
+}
+
+func TestGitignoreBootstrapRenameErrorIsImmediatelyInvisibleAndRecoverable(t *testing.T) {
+	workspace := initRepo(t)
+	original := publishGitignoreStageDirectory
+	publishGitignoreStageDirectory = func(_, _ *os.Root, _, _ string, _ os.FileInfo) error {
+		return errors.New("injected no-replace directory rename")
+	}
+	if err := Materialize(context.Background(), workspace, "complete after restart"); err == nil {
+		t.Fatal("injected bootstrap rename error was not reported")
+	}
+	// No AO-owned ignore file exists yet, so cleanliness here proves the nested
+	// exact .git component hid the abandoned stage immediately.
+	if _, err := os.Stat(filepath.Join(workspace, directory, ".gitignore")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("gitignore appeared after failed bootstrap rename: %v", err)
+	}
+	assertCleanGitStatus(t, workspace)
+
+	publishGitignoreStageDirectory = original
+	t.Cleanup(func() { publishGitignoreStageDirectory = original })
+	if err := Materialize(context.Background(), workspace, "complete after restart"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(Path(workspace))
+	if err != nil || !strings.Contains(string(got), "complete after restart") {
+		t.Fatalf("recovered projection = %q, %v", got, err)
+	}
+	assertCleanGitStatus(t, workspace)
 }
 
 func TestMaterializeDoesNotInitializeOwnershipOverForeignTargets(t *testing.T) {

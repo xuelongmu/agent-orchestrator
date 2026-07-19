@@ -65,18 +65,26 @@ func publishProjectionFile(sourceRoot, targetRoot *os.Root, stageFile *os.File, 
 	return syncProjectionDirectory(targetRoot, targetName)
 }
 
-func publishProjectionDirectory(root *os.Root, stageName, targetName string, stageIdentity os.FileInfo) error {
-	dir, err := root.Open(".")
+func publishProjectionDirectory(sourceRoot, targetRoot *os.Root, stageName, targetName string, stageIdentity os.FileInfo) error {
+	sourceDir, err := sourceRoot.Open(".")
 	if err != nil {
 		return err
 	}
-	defer func() { _ = dir.Close() }()
-	current, err := root.Lstat(stageName)
+	defer func() { _ = sourceDir.Close() }()
+	targetDir, err := targetRoot.Open(".")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = targetDir.Close() }()
+	current, err := sourceRoot.Lstat(stageName)
 	if err != nil || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, stageIdentity) {
 		return errors.New("gitignore staging directory changed before no-replace publish")
 	}
-	if err := darwinProjectionRenameatxNp(int(dir.Fd()), stageName, int(dir.Fd()), targetName, unix.RENAME_EXCL); err != nil {
+	if err := darwinProjectionRenameatxNp(int(sourceDir.Fd()), stageName, int(targetDir.Fd()), targetName, unix.RENAME_EXCL); err != nil {
 		return err
 	}
-	return dir.Sync()
+	if err := sourceDir.Sync(); err != nil {
+		return err
+	}
+	return targetDir.Sync()
 }
