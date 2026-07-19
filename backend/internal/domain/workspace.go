@@ -6,9 +6,12 @@ package domain
 type WorkspaceKind string
 
 const (
+	// WorkspaceKindWorktree selects an isolated git worktree.
 	WorkspaceKindWorktree WorkspaceKind = "worktree"
-	WorkspaceKindScratch  WorkspaceKind = "scratch"
-	WorkspaceKindDir      WorkspaceKind = "dir"
+	// WorkspaceKindScratch selects an isolated ephemeral directory without git.
+	WorkspaceKindScratch WorkspaceKind = "scratch"
+	// WorkspaceKindDir selects the registered project's shared directory.
+	WorkspaceKindDir WorkspaceKind = "dir"
 )
 
 // WithDefault preserves the historical git-worktree behavior for records and

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -59,7 +60,8 @@ func TestSpawnCommandValidatesWorkspaceKindBeforeNetwork(t *testing.T) {
 		if err == nil {
 			t.Fatalf("args %v: expected usage error", args)
 		}
-		if _, ok := err.(usageError); !ok {
+		var usageErr usageError
+		if !errors.As(err, &usageErr) {
 			t.Fatalf("args %v: error = %T %v, want usageError", args, err, err)
 		}
 	}

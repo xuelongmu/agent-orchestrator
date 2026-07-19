@@ -16,8 +16,12 @@ import (
 
 const removeAttempts = 6
 
+// ErrUnsafePath reports a scratch path or identifier outside the adapter's
+// managed root.
 var ErrUnsafePath = errors.New("scratch: unsafe workspace path")
 
+// Workspace manages ephemeral, non-git session directories below one guarded
+// root.
 type Workspace struct {
 	managedRoot string
 	removeAll   func(string) error
@@ -25,6 +29,7 @@ type Workspace struct {
 
 var _ ports.Workspace = (*Workspace)(nil)
 
+// New constructs a scratch adapter rooted at managedRoot.
 func New(managedRoot string) (*Workspace, error) {
 	if strings.TrimSpace(managedRoot) == "" {
 		return nil, errors.New("scratch: managed root is required")
@@ -43,6 +48,7 @@ func New(managedRoot string) (*Workspace, error) {
 	return &Workspace{managedRoot: root, removeAll: os.RemoveAll}, nil
 }
 
+// Create makes a new empty directory for the requested session.
 func (w *Workspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
 	if err := validateConfig(cfg); err != nil {
 		return ports.WorkspaceInfo{}, err
@@ -67,6 +73,8 @@ func (w *Workspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (ports.
 	}, nil
 }
 
+// Restore reattaches an existing scratch directory after validating that it is
+// still inside the managed root.
 func (w *Workspace) Restore(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
 	if err := validateConfig(cfg); err != nil {
 		return ports.WorkspaceInfo{}, err
@@ -88,6 +96,8 @@ func (w *Workspace) Restore(_ context.Context, cfg ports.WorkspaceConfig) (ports
 	return ports.WorkspaceInfo{Path: path, WorkspaceKind: domain.WorkspaceKindScratch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}, nil
 }
 
+// Destroy removes a scratch directory with retries for transient file-handle
+// contention.
 func (w *Workspace) Destroy(ctx context.Context, info ports.WorkspaceInfo) error {
 	path, err := w.validateManagedPath(info.Path)
 	if err != nil {
@@ -99,14 +109,20 @@ func (w *Workspace) Destroy(ctx context.Context, info ports.WorkspaceInfo) error
 	return nil
 }
 
+// ForceDestroy uses the same guarded removal as Destroy because scratch
+// workspaces have no dirty-git refusal.
 func (w *Workspace) ForceDestroy(ctx context.Context, info ports.WorkspaceInfo) error {
 	return w.Destroy(ctx, info)
 }
 
+// StashUncommitted is a no-op because scratch workspaces contain no managed git
+// state.
 func (*Workspace) StashUncommitted(context.Context, ports.WorkspaceInfo) (string, error) {
 	return "", nil
 }
 
+// ApplyPreserved accepts only the empty preservation reference used by non-git
+// workspace lifecycle paths.
 func (*Workspace) ApplyPreserved(_ context.Context, _ ports.WorkspaceInfo, ref string) error {
 	if ref != "" {
 		return errors.New("scratch: preserved git state is not supported")
@@ -117,11 +133,11 @@ func (*Workspace) ApplyPreserved(_ context.Context, _ ports.WorkspaceInfo, ref s
 func (w *Workspace) removeDirWithRetry(ctx context.Context, path string) error {
 	var last error
 	for attempt := 0; attempt < removeAttempts; attempt++ {
-		if err := w.removeAll(path); err == nil {
+		err := w.removeAll(path)
+		if err == nil {
 			return nil
-		} else {
-			last = err
 		}
+		last = err
 		if attempt == removeAttempts-1 {
 			break
 		}

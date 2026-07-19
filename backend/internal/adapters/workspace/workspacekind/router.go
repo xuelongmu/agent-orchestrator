@@ -11,6 +11,8 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
+// Router delegates each workspace operation to the adapter selected by the
+// durable workspace kind.
 type Router struct {
 	worktree ports.Workspace
 	scratch  ports.Workspace
@@ -20,6 +22,7 @@ type Router struct {
 var _ ports.Workspace = (*Router)(nil)
 var _ ports.WorkspaceProject = (*Router)(nil)
 
+// New constructs a workspace-kind router from all supported adapters.
 func New(worktree, scratch, dir ports.Workspace) (*Router, error) {
 	if worktree == nil || scratch == nil || dir == nil {
 		return nil, errors.New("workspace router: worktree, scratch, and dir adapters are required")
@@ -40,6 +43,7 @@ func (r *Router) adapter(kind domain.WorkspaceKind) (ports.Workspace, error) {
 	}
 }
 
+// Create delegates workspace creation to the requested kind.
 func (r *Router) Create(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
 	a, err := r.adapter(cfg.WorkspaceKind)
 	if err != nil {
@@ -47,6 +51,8 @@ func (r *Router) Create(ctx context.Context, cfg ports.WorkspaceConfig) (ports.W
 	}
 	return a.Create(ctx, cfg)
 }
+
+// Restore delegates workspace restoration to the persisted kind.
 func (r *Router) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
 	a, err := r.adapter(cfg.WorkspaceKind)
 	if err != nil {
@@ -54,6 +60,8 @@ func (r *Router) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (ports.
 	}
 	return a.Restore(ctx, cfg)
 }
+
+// Destroy delegates safe workspace teardown to the persisted kind.
 func (r *Router) Destroy(ctx context.Context, info ports.WorkspaceInfo) error {
 	a, err := r.adapter(info.WorkspaceKind)
 	if err != nil {
@@ -61,6 +69,8 @@ func (r *Router) Destroy(ctx context.Context, info ports.WorkspaceInfo) error {
 	}
 	return a.Destroy(ctx, info)
 }
+
+// ForceDestroy delegates forced teardown to the persisted kind.
 func (r *Router) ForceDestroy(ctx context.Context, info ports.WorkspaceInfo) error {
 	a, err := r.adapter(info.WorkspaceKind)
 	if err != nil {
@@ -68,6 +78,8 @@ func (r *Router) ForceDestroy(ctx context.Context, info ports.WorkspaceInfo) err
 	}
 	return a.ForceDestroy(ctx, info)
 }
+
+// StashUncommitted delegates state preservation to the persisted kind.
 func (r *Router) StashUncommitted(ctx context.Context, info ports.WorkspaceInfo) (string, error) {
 	a, err := r.adapter(info.WorkspaceKind)
 	if err != nil {
@@ -75,6 +87,8 @@ func (r *Router) StashUncommitted(ctx context.Context, info ports.WorkspaceInfo)
 	}
 	return a.StashUncommitted(ctx, info)
 }
+
+// ApplyPreserved delegates preserved-state replay to the persisted kind.
 func (r *Router) ApplyPreserved(ctx context.Context, info ports.WorkspaceInfo, ref string) error {
 	a, err := r.adapter(info.WorkspaceKind)
 	if err != nil {
@@ -83,6 +97,8 @@ func (r *Router) ApplyPreserved(ctx context.Context, info ports.WorkspaceInfo, r
 	return a.ApplyPreserved(ctx, info, ref)
 }
 
+// CreateWorkspaceProject preserves the existing multi-repository worktree
+// extension by delegating it to the worktree adapter.
 func (r *Router) CreateWorkspaceProject(ctx context.Context, cfg ports.WorkspaceProjectConfig) (ports.WorkspaceProjectInfo, error) {
 	a, ok := r.worktree.(ports.WorkspaceProject)
 	if !ok {
@@ -90,6 +106,9 @@ func (r *Router) CreateWorkspaceProject(ctx context.Context, cfg ports.Workspace
 	}
 	return a.CreateWorkspaceProject(ctx, cfg)
 }
+
+// DestroyWorkspaceProject preserves the existing multi-repository worktree
+// extension by delegating it to the worktree adapter.
 func (r *Router) DestroyWorkspaceProject(ctx context.Context, info ports.WorkspaceProjectInfo) error {
 	a, ok := r.worktree.(ports.WorkspaceProject)
 	if !ok {

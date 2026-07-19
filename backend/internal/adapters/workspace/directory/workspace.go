@@ -14,28 +14,41 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
+// Workspace exposes the registered project directory without filesystem
+// isolation and never removes that shared directory.
 type Workspace struct{}
 
 var _ ports.Workspace = (*Workspace)(nil)
 
+// New returns a shared-directory workspace adapter.
 func New() *Workspace { return &Workspace{} }
 
+// Create attaches a session to its registered project directory.
 func (*Workspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
 	return workspaceInfo(cfg, cfg.RepoPath)
 }
 
+// Restore reattaches a session to its persisted shared directory.
 func (*Workspace) Restore(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
 	return workspaceInfo(cfg, cfg.Path)
 }
 
 // Destroy intentionally leaves the shared directory untouched.
 func (*Workspace) Destroy(context.Context, ports.WorkspaceInfo) error { return nil }
+
+// ForceDestroy intentionally leaves the shared directory untouched.
 func (w *Workspace) ForceDestroy(ctx context.Context, info ports.WorkspaceInfo) error {
 	return w.Destroy(ctx, info)
 }
+
+// StashUncommitted is a no-op because directory workspaces have no AO-managed
+// git preservation lifecycle.
 func (*Workspace) StashUncommitted(context.Context, ports.WorkspaceInfo) (string, error) {
 	return "", nil
 }
+
+// ApplyPreserved accepts only the empty preservation reference used by non-git
+// workspace lifecycle paths.
 func (*Workspace) ApplyPreserved(_ context.Context, _ ports.WorkspaceInfo, ref string) error {
 	if ref != "" {
 		return errors.New("directory: preserved git state is not supported")

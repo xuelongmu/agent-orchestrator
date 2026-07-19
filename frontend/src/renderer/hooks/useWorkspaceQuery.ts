@@ -49,26 +49,29 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 		orchestratorAgent: project.orchestratorAgent ? toAgentProvider(project.orchestratorAgent) : undefined,
 		sessions: (sessionsData?.sessions ?? [])
 			.filter((session) => session.projectId === project.id)
-			.map((session) => ({
-				id: session.id,
-				terminalHandleId: session.terminalHandleId,
-				workspaceId: project.id,
-				workspaceName: project.name,
-				title: session.displayName ?? session.issueId ?? session.id,
-				issueId: session.issueId,
-				provider: toAgentProvider(session.harness),
-				kind: session.kind === "orchestrator" ? "orchestrator" : session.kind === "worker" ? "worker" : undefined,
-				workspaceKind: (session.workspaceKind ?? "worktree") as WorkspaceKind,
-				branch: session.branch ?? "",
-				status: toSessionStatus(session.status, session.isTerminated),
-				createdAt: session.createdAt,
-				updatedAt: session.updatedAt,
-				activity: toSessionActivity(session.activity),
-				diagnostic: session.diagnostic,
-				previewUrl: session.previewUrl,
-				previewRevision: session.previewRevision,
-				prs: (session.prs ?? []).map(toPullRequestFacts),
-			})),
+			.map((session) => {
+				const workspaceKind = (session.workspaceKind ?? "worktree") as WorkspaceKind;
+				return {
+					id: session.id,
+					terminalHandleId: session.terminalHandleId,
+					workspaceId: project.id,
+					workspaceName: project.name,
+					title: session.displayName ?? session.issueId ?? session.id,
+					issueId: session.issueId,
+					provider: toAgentProvider(session.harness),
+					kind: session.kind === "orchestrator" ? "orchestrator" : session.kind === "worker" ? "worker" : undefined,
+					workspaceKind,
+					branch: session.branch ?? (workspaceKind === "worktree" ? `session/${session.id}` : ""),
+					status: toSessionStatus(session.status, session.isTerminated),
+					createdAt: session.createdAt,
+					updatedAt: session.updatedAt,
+					activity: toSessionActivity(session.activity),
+					diagnostic: session.diagnostic,
+					previewUrl: session.previewUrl,
+					previewRevision: session.previewRevision,
+					prs: (session.prs ?? []).map(toPullRequestFacts),
+				};
+			}),
 	}));
 }
 
