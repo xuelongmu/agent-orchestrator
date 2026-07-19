@@ -178,6 +178,11 @@ type Store interface {
 	DeleteSessionWorktrees(ctx context.Context, id domain.SessionID) error
 }
 
+type claimedSessionStore interface {
+	CreateClaimedSession(ctx context.Context, rec domain.SessionRecord, claim ports.TrackerIntakeClaim, admittedAt time.Time) (domain.SessionRecord, error)
+	MarkTrackerIntakeSpawnStarted(ctx context.Context, claim ports.TrackerIntakeClaim, sessionID domain.SessionID, startedAt time.Time) (bool, error)
+}
+
 // Manager coordinates internal session spawn, restore, kill, and cleanup over
 // the outbound ports. User-facing read-model assembly lives in the service package.
 type Manager struct {
@@ -365,7 +370,19 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn: prompt: %w", err)
 	}
 
-	rec, err := m.store.CreateSession(ctx, seedRecord(cfg, m.clock()))
+	seed := seedRecord(cfg, m.clock())
+	var rec domain.SessionRecord
+	var claimedStore claimedSessionStore
+	if cfg.IntakeClaim != nil {
+		var ok bool
+		claimedStore, ok = m.store.(claimedSessionStore)
+		if !ok {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: %w: store does not support claimed admission", ports.ErrTrackerIntakeClaimLost)
+		}
+		rec, err = claimedStore.CreateClaimedSession(ctx, seed, *cfg.IntakeClaim, m.clock().UTC())
+	} else {
+		rec, err = m.store.CreateSession(ctx, seed)
+	}
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: create: %w", err)
 	}
@@ -385,6 +402,16 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	branch := cfg.Branch
 	if cfg.WorkspaceKind == domain.WorkspaceKindWorktree && branch == "" {
 		branch = defaultSpawnBranch(id, cfg.Kind, sessionPrefix(project), project.Kind.WithDefault())
+	}
+	if cfg.IntakeClaim != nil {
+		started, startErr := claimedStore.MarkTrackerIntakeSpawnStarted(ctx, *cfg.IntakeClaim, id, m.clock().UTC())
+		if startErr != nil || !started {
+			m.rollbackSpawnSeedRow(ctx, id)
+			if startErr != nil {
+				return domain.SessionRecord{}, fmt.Errorf("spawn %s: intake side-effect fence: %w", id, startErr)
+			}
+			return domain.SessionRecord{}, fmt.Errorf("spawn %s: intake side-effect fence: %w", id, ports.ErrTrackerIntakeClaimLost)
+		}
 	}
 	ws, workspaceProject, err := m.createSessionWorkspace(ctx, project, cfg, id, branch)
 	if err != nil {

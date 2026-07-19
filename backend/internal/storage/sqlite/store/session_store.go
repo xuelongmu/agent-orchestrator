@@ -62,6 +62,71 @@ func (s *Store) CreateSession(ctx context.Context, rec domain.SessionRecord) (do
 	return rec, nil
 }
 
+// CreateClaimedSession atomically fences tracker-intake admission against the
+// exact live claim generation before inserting the provisional session seed.
+// A lease takeover committed first makes this a no-op. The session manager must
+// durably advance the attached seed to spawning before any external side effect;
+// only a seed that never crossed that fence may be reaped after lease expiry.
+func (s *Store) CreateClaimedSession(ctx context.Context, rec domain.SessionRecord, claim ports.TrackerIntakeClaim, admittedAt time.Time) (domain.SessionRecord, error) {
+	if rec.ProjectID != claim.ProjectID || rec.IssueID != domain.IssueID(string(claim.Provider)+":"+claim.IssueID) || admittedAt.IsZero() {
+		return domain.SessionRecord{}, fmt.Errorf("create claimed session: %w", ports.ErrTrackerIntakeClaimLost)
+	}
+	rawDeps, err := domain.DecodeSessionDependencyIDs(rec.DependencyIDs)
+	if err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("create session dependencies: %w", err)
+	}
+	deps, err := normalizeDependencies(rawDeps)
+	if err != nil {
+		return domain.SessionRecord{}, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	err = s.inImmediateConnTx(ctx, "create claimed session", func(conn *sql.Conn, q *gen.Queries) error {
+		owned, err := q.TrackerIntakeClaimOwned(ctx, gen.TrackerIntakeClaimOwnedParams{
+			ProjectID: string(claim.ProjectID), Provider: string(claim.Provider), Repo: claim.Repo,
+			IssueID: claim.IssueID, OwnerToken: claim.OwnerToken, LeaseExpiresAt: admittedAt,
+		})
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ports.ErrTrackerIntakeClaimLost
+		}
+		num, err := q.NextSessionNum(ctx, rec.ProjectID)
+		if err != nil {
+			return fmt.Errorf("next session num for %s: %w", rec.ProjectID, err)
+		}
+		rec.ID = domain.SessionID(fmt.Sprintf("%s-%d", rec.ProjectID, num))
+		if err := validateDependencies(ctx, conn, rec.ID, rec.ProjectID, deps); err != nil {
+			return err
+		}
+		if err := q.InsertSession(ctx, recordToInsert(rec, num)); err != nil {
+			return fmt.Errorf("insert session %s: %w", rec.ID, err)
+		}
+		attached, err := q.AttachTrackerIntakeClaimSeed(ctx, gen.AttachTrackerIntakeClaimSeedParams{
+			SessionID: string(rec.ID), ProjectID: string(claim.ProjectID), Provider: string(claim.Provider), Repo: claim.Repo,
+			IssueID: claim.IssueID, OwnerToken: claim.OwnerToken, LeaseExpiresAt: admittedAt,
+		})
+		if err != nil {
+			return err
+		}
+		if attached != 1 {
+			return ports.ErrTrackerIntakeClaimLost
+		}
+		for _, dependencyID := range deps {
+			if err := q.InsertSessionDependency(ctx, gen.InsertSessionDependencyParams{SessionID: rec.ID, DependsOnSessionID: dependencyID}); err != nil {
+				return fmt.Errorf("insert dependency %s -> %s: %w", rec.ID, dependencyID, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("create claimed session: %w", err)
+	}
+	rec.DependencyIDs = domain.EncodeSessionDependencyIDs(deps)
+	return rec, nil
+}
+
 type dependencyQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }

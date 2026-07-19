@@ -303,6 +303,19 @@ type TelemetryEvent struct {
 	PayloadJson string
 }
 
+type TrackerIntakeClaim struct {
+	ProjectID      string
+	Provider       string
+	Repo           string
+	IssueID        string
+	OwnerToken     string
+	Status         string
+	SessionID      string
+	ClaimedAt      time.Time
+	LeaseExpiresAt time.Time
+	CompletedAt    sql.NullTime
+}
+
 type WorkspaceRepo struct {
 	ProjectID     domain.ProjectID
 	Name          string
