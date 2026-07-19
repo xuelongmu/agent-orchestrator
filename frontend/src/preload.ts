@@ -1,6 +1,10 @@
 import { contextBridge, ipcRenderer } from "electron";
 import { NEW_SESSION_SHORTCUT_CHANNEL } from "./shared/shortcuts";
-import type { BrowserNavState, BrowserRect } from "./main/browser-view-host";
+import type {
+	BrowserBoundsInput,
+	BrowserNavigateInput,
+	BrowserNavState,
+} from "./main/browser-view-host";
 import type { DaemonStatus } from "./shared/daemon-status";
 import type { TelemetryBootstrap } from "./shared/telemetry";
 import type { MigrationState } from "./main/app-state";
@@ -10,18 +14,6 @@ import type {
 	BrowserAnnotationModeInput,
 	BrowserAnnotationSubmitPayload,
 } from "./shared/browser-annotations";
-
-export type BrowserBoundsInput = {
-	viewId: string;
-	rect: BrowserRect;
-	visible: boolean;
-	parked?: boolean;
-};
-
-export type BrowserNavigateInput = {
-	viewId: string;
-	url: string;
-};
 
 export type ImportFolderMode = "project" | "workspace";
 

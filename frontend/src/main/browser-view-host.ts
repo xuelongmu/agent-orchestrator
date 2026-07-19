@@ -29,14 +29,14 @@ export type BrowserNavState = {
 	error?: string;
 };
 
-type BrowserBoundsInput = {
+export type BrowserBoundsInput = {
 	viewId: string;
 	rect: BrowserRect;
 	visible: boolean;
 	parked?: boolean;
 };
 
-type BrowserNavigateInput = {
+export type BrowserNavigateInput = {
 	viewId: string;
 	url: string;
 };
