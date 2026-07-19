@@ -36,9 +36,9 @@ import { Accordions, Accordion } from "fumadocs-ui/components/accordion";
 </Accordion>
 
 <Accordion title="Where does session state live?">
-	AO keeps durable session and activity state in SQLite under `~/.ao/data`. Worktrees, the daemon's `running.json`
-	handshake, and Electron profile data are also kept under `~/.ao`; transient runtime state stays in memory. Set
-	`AO_DATA_DIR` to override the daemon data directory.
+	AO keeps durable session and activity state in SQLite under `AO_DATA_DIR` (default `~/.ao/data`). Managed worktrees
+	live at `<AO_DATA_DIR>/worktrees` (default `~/.ao/data/worktrees`). The daemon's `running.json` handshake and Electron
+	profile data are kept under `~/.ao` by default; transient runtime state stays in memory.
 </Accordion>
 
 <Accordion title="Can I run AO on a remote server?">
@@ -78,6 +78,6 @@ import { Accordions, Accordion } from "fumadocs-ui/components/accordion";
 
   <Accordion title="How do I completely uninstall?">
     `npm uninstall -g @aoagents/ao`, then `rm -rf ~/.ao` if you want to wipe all state stored in the default
-    location. If you set `AO_DATA_DIR`, remove that directory separately.
+    location. If you set `AO_DATA_DIR`, remove that directory separately; if you set `AO_RUN_FILE`, remove that file too.
   </Accordion>
 </Accordions>
