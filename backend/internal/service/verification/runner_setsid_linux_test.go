@@ -4,6 +4,7 @@ package verification
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -114,6 +115,9 @@ func assertProcessDies(t *testing.T, pid int, message string) {
 	t.Helper()
 	fd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return
+		}
 		t.Fatalf("open pidfd %d: %v", pid, err)
 	}
 	defer func() { _ = unix.Close(fd) }()
