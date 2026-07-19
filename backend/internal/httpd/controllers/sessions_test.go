@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -73,7 +74,7 @@ func (f *fakeSessionService) Spawn(_ context.Context, cfg ports.SpawnConfig) (do
 	}
 	now := time.Now().UTC()
 	f.lastSpawn = cfg
-	s := domain.Session{SessionRecord: domain.SessionRecord{ID: domain.SessionID(string(cfg.ProjectID) + "-2"), ProjectID: cfg.ProjectID, IssueID: cfg.IssueID, Kind: cfg.Kind, Harness: cfg.Harness, DisplayName: cfg.DisplayName, Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}, Metadata: domain.SessionMetadata{WorkspaceKind: cfg.WorkspaceKind}, CreatedAt: now, UpdatedAt: now}, Status: domain.StatusIdle}
+	s := domain.Session{SessionRecord: domain.SessionRecord{ID: domain.SessionID(string(cfg.ProjectID) + "-2"), ProjectID: cfg.ProjectID, IssueID: cfg.IssueID, Kind: cfg.Kind, Harness: cfg.Harness, DisplayName: cfg.DisplayName, Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}, Metadata: domain.SessionMetadata{WorkspaceKind: cfg.WorkspaceKind}, CreatedAt: now, UpdatedAt: now}, Status: domain.StatusIdle, DependsOn: cfg.DependsOn}
 	f.sessions[s.ID] = s
 	return s, nil
 }
@@ -300,6 +301,7 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	svc := newFakeSessionService()
 	s := svc.sessions["ao-1"]
 	s.Metadata = domain.SessionMetadata{Branch: "qa/modal-worker", WorkspacePath: "/tmp/private-worktree", RuntimeHandleID: "runtime-1", Prompt: "private prompt"}
+	s.DependsOn = []domain.SessionID{"ao-parent"}
 	s.Diagnostic = &domain.LifecycleDiagnostic{Trigger: domain.DiagnosticRuntimeProbeFailed, TerminalTail: "probe timed out", CapturedAt: time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)}
 	svc.sessions["ao-1"] = s
 	srv := newSessionTestServer(t, svc)
@@ -321,6 +323,9 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	if list.Sessions[0].Diagnostic == nil || list.Sessions[0].Diagnostic.TerminalTail != "probe timed out" {
 		t.Fatalf("diagnostic = %#v, want persisted terminal tail", list.Sessions[0].Diagnostic)
 	}
+	if !reflect.DeepEqual(list.Sessions[0].DependsOn, []domain.SessionID{"ao-parent"}) {
+		t.Fatalf("dependsOn = %#v", list.Sessions[0].DependsOn)
+	}
 	var rawList struct {
 		Sessions []map[string]any `json:"sessions"`
 	}
@@ -335,7 +340,7 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 		t.Fatalf("list leaked prompt: %s", body)
 	}
 
-	body, status, _ = doRequest(t, srv, "POST", "/api/v1/sessions", `{"projectId":"ao","issueId":"ISS-1","kind":"worker","harness":"codex","workspaceKind":"scratch","prompt":"fix","displayName":"my worker"}`)
+	body, status, _ = doRequest(t, srv, "POST", "/api/v1/sessions", `{"projectId":"ao","issueId":"ISS-1","kind":"worker","harness":"codex","workspaceKind":"scratch","prompt":"fix","displayName":"my worker","dependsOn":["ao-1","ao-1"]}`)
 	if status != http.StatusCreated {
 		t.Fatalf("POST session = %d, want 201; body=%s", status, body)
 	}
@@ -351,6 +356,9 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	}
 	if svc.lastSpawn.WorkspaceKind != domain.WorkspaceKindScratch {
 		t.Fatalf("spawn workspace kind = %q, want scratch", svc.lastSpawn.WorkspaceKind)
+	}
+	if got, want := svc.lastSpawn.DependsOn, []domain.SessionID{"ao-1", "ao-1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("spawn dependsOn = %#v, want %#v", got, want)
 	}
 
 	body, status, _ = doRequest(t, srv, "GET", "/api/v1/sessions/ao-2", "")
@@ -973,6 +981,7 @@ type sessionBody struct {
 	Status           string                      `json:"status"`
 	TerminalHandleID string                      `json:"terminalHandleId"`
 	Diagnostic       *domain.LifecycleDiagnostic `json:"diagnostic"`
+	DependsOn        []domain.SessionID          `json:"dependsOn"`
 }
 
 func TestSessionsAPI_PRRoutes(t *testing.T) {

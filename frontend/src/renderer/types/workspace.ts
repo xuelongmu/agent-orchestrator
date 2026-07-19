@@ -140,6 +140,8 @@ export type WorkspaceSession = {
 	title: string;
 	/** Raw issue/task identifier from the daemon. Intake ids are provider-prefixed. */
 	issueId?: string;
+	/** Session ids that this session declares as prerequisites. */
+	dependsOn?: string[];
 	provider: AgentProvider;
 	kind?: SessionKind;
 	workspaceKind?: WorkspaceKind;

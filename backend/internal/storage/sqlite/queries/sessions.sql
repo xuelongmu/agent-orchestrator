@@ -83,6 +83,21 @@ SELECT id, project_id, num, issue_id, kind, harness,
     diagnostic_captured_at, workspace_kind
 FROM sessions ORDER BY project_id, num;
 
+-- name: InsertSessionDependency :exec
+INSERT INTO session_dependencies (session_id, depends_on_session_id)
+VALUES (?, ?);
+
+-- name: ListSessionDependencies :many
+SELECT depends_on_session_id
+FROM session_dependencies
+WHERE session_id = ?
+ORDER BY depends_on_session_id;
+
+-- name: ListAllSessionDependencies :many
+SELECT session_id, depends_on_session_id
+FROM session_dependencies
+ORDER BY session_id, depends_on_session_id;
+
 -- name: SetPendingSubmit :execrows
 UPDATE sessions SET
     pending_submit_fingerprint = ?, pending_submit_recovery_attempted = FALSE,

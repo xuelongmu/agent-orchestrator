@@ -184,6 +184,50 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 	return err
 }
 
+const insertSessionDependency = `-- name: InsertSessionDependency :exec
+INSERT INTO session_dependencies (session_id, depends_on_session_id)
+VALUES (?, ?)
+`
+
+type InsertSessionDependencyParams struct {
+	SessionID          domain.SessionID
+	DependsOnSessionID domain.SessionID
+}
+
+func (q *Queries) InsertSessionDependency(ctx context.Context, arg InsertSessionDependencyParams) error {
+	_, err := q.db.ExecContext(ctx, insertSessionDependency, arg.SessionID, arg.DependsOnSessionID)
+	return err
+}
+
+const listAllSessionDependencies = `-- name: ListAllSessionDependencies :many
+SELECT session_id, depends_on_session_id
+FROM session_dependencies
+ORDER BY session_id, depends_on_session_id
+`
+
+func (q *Queries) ListAllSessionDependencies(ctx context.Context) ([]SessionDependency, error) {
+	rows, err := q.db.QueryContext(ctx, listAllSessionDependencies)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SessionDependency{}
+	for rows.Next() {
+		var i SessionDependency
+		if err := rows.Scan(&i.SessionID, &i.DependsOnSessionID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAllSessions = `-- name: ListAllSessions :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
@@ -238,6 +282,36 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]Session, error) {
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSessionDependencies = `-- name: ListSessionDependencies :many
+SELECT depends_on_session_id
+FROM session_dependencies
+WHERE session_id = ?
+ORDER BY depends_on_session_id
+`
+
+func (q *Queries) ListSessionDependencies(ctx context.Context, sessionID domain.SessionID) ([]domain.SessionID, error) {
+	rows, err := q.db.QueryContext(ctx, listSessionDependencies, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []domain.SessionID{}
+	for rows.Next() {
+		var depends_on_session_id domain.SessionID
+		if err := rows.Scan(&depends_on_session_id); err != nil {
+			return nil, err
+		}
+		items = append(items, depends_on_session_id)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err

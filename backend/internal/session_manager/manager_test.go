@@ -148,6 +148,17 @@ func (f *fakeStore) DeleteSession(_ context.Context, id domain.SessionID) (bool,
 	if rec.IsTerminated || rec.Metadata.WorkspacePath != "" || rec.Metadata.RuntimeHandleID != "" || rec.Metadata.AgentSessionID != "" || rec.Metadata.Prompt != "" {
 		return false, nil
 	}
+	for _, other := range f.sessions {
+		dependencyIDs, err := domain.DecodeSessionDependencyIDs(other.DependencyIDs)
+		if err != nil {
+			return false, err
+		}
+		for _, dependencyID := range dependencyIDs {
+			if dependencyID == id {
+				return false, errors.New("FOREIGN KEY constraint failed: dependency parent is referenced")
+			}
+		}
+	}
 	delete(f.sessions, id)
 	return true, nil
 }
@@ -487,9 +498,18 @@ type fakeWorkspace struct {
 	// sharedLog, when non-nil, receives entries alongside calls so ordering
 	// tests can compare workspace calls against store calls in one sequence.
 	sharedLog *[]string
+	// createStarted/createRelease coordinate deterministic in-flight spawn tests.
+	createStarted chan domain.SessionID
+	createRelease <-chan struct{}
 }
 
 func (w *fakeWorkspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+	if w.createStarted != nil {
+		w.createStarted <- cfg.SessionID
+	}
+	if w.createRelease != nil {
+		<-w.createRelease
+	}
 	if w.createErr != nil {
 		return ports.WorkspaceInfo{}, w.createErr
 	}
@@ -817,7 +837,7 @@ func TestSpawn_ExplicitHarnessWinsWithoutProjectRoleHarness(t *testing.T) {
 
 func TestSpawn_AssignsIDAndGoesIdle(t *testing.T) {
 	m, st, rt, _ := newManager()
-	s, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode, Prompt: "do it"})
+	s, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode, Prompt: "do it", DependsOn: []domain.SessionID{"mer-parent"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -832,6 +852,13 @@ func TestSpawn_AssignsIDAndGoesIdle(t *testing.T) {
 	}
 	if st.sessions["mer-1"].Metadata.RuntimeHandleID != "h1" {
 		t.Fatal("handle not folded")
+	}
+	got, err := domain.DecodeSessionDependencyIDs(st.sessions["mer-1"].DependencyIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []domain.SessionID{"mer-parent"}) {
+		t.Fatalf("dependencies not forwarded to seed record: %#v", got)
 	}
 }
 
@@ -1308,6 +1335,48 @@ func TestSpawn_ParksRowTerminatedWhenSeedDeleteFails(t *testing.T) {
 	}
 	if !st.sessions["mer-1"].IsTerminated {
 		t.Fatal("row must fall back to terminated when the seed delete fails")
+	}
+}
+
+func TestSpawn_ParksReferencedInFlightParentWithoutDroppingChildEdge(t *testing.T) {
+	m, st, _, ws := newManager()
+	started := make(chan domain.SessionID, 1)
+	release := make(chan struct{})
+	ws.createStarted = started
+	ws.createRelease = release
+	ws.createErr = ports.ErrWorkspaceBranchNotFetched
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker})
+		errCh <- err
+	}()
+	parentID := <-started // seed row exists; workspace creation is still in flight.
+	child, err := st.CreateSession(ctx, domain.SessionRecord{
+		ProjectID:     "mer",
+		Kind:          domain.KindWorker,
+		DependencyIDs: domain.EncodeSessionDependencyIDs([]domain.SessionID{parentID}),
+		Activity:      domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now().UTC()},
+		CreatedAt:     time.Now().UTC(),
+		UpdatedAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-errCh; !errors.Is(err, ports.ErrWorkspaceBranchNotFetched) {
+		t.Fatalf("parent spawn error = %v", err)
+	}
+	parent, ok := st.sessions[parentID]
+	if !ok || !parent.IsTerminated {
+		t.Fatalf("referenced failed parent = %#v ok=%v, want durable terminal row", parent, ok)
+	}
+	got, err := domain.DecodeSessionDependencyIDs(st.sessions[child.ID].DependencyIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []domain.SessionID{parentID}) {
+		t.Fatalf("child dependency after parent rollback = %#v", got)
 	}
 }
 

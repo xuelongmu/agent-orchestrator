@@ -110,6 +110,14 @@ sql:
             go_type:
               import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"
               type: "ActivityState"
+          - column: "session_dependencies.session_id"
+            go_type:
+              import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"
+              type: "SessionID"
+          - column: "session_dependencies.depends_on_session_id"
+            go_type:
+              import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"
+              type: "SessionID"
           - column: "review.session_id"
             go_type:
               import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"

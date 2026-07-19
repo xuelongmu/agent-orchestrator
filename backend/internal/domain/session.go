@@ -1,6 +1,10 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
 
 // These ID types are distinct string types so they can't be swapped at a call
 // site by accident.
@@ -20,6 +24,9 @@ type SessionKind string
 const (
 	KindWorker       SessionKind = "worker"
 	KindOrchestrator SessionKind = "orchestrator"
+	// MaxSessionDependencies bounds one spawn request and its durable outgoing
+	// graph fan-out. Scheduling semantics are intentionally outside Part 1.
+	MaxSessionDependencies = 32
 )
 
 // SessionMetadata is the typed, off-status metadata for a session: operational
@@ -68,7 +75,11 @@ type SessionRecord struct {
 	Kind        SessionKind  `json:"kind"`
 	Harness     AgentHarness `json:"harness,omitempty"`
 	DisplayName string       `json:"displayName,omitempty"`
-	Activity    Activity     `json:"activity"`
+	// DependencyIDs is the internal, comparable encoding of declared dependency
+	// ids. The API read model exposes DependsOn as a slice. Keeping the durable
+	// record comparable preserves lifecycle snapshot/CAS invariants.
+	DependencyIDs string   `json:"-"`
+	Activity      Activity `json:"activity"`
 	// FirstSignalAt is when the FIRST agent hook callback arrived for the
 	// current spawn/restore: raw signal receipt, independent of the derived
 	// activity state. Zero means no hook has ever reported, which deriveStatus
@@ -91,8 +102,37 @@ type Session struct {
 	SessionRecord
 	Status           SessionStatus `json:"status" enum:"working,pr_open,draft,ci_failed,review_pending,changes_requested,approved,mergeable,merged,needs_input,rate_limited,idle,terminated,no_signal"`
 	TerminalHandleID string        `json:"terminalHandleId,omitempty"`
+	// DependsOn is the deduplicated, declared prerequisite graph for this
+	// session. Part 1 is read-only metadata: it does not gate launch or status;
+	// scheduling enforcement follows in Part 2.
+	DependsOn []SessionID `json:"dependsOn,omitempty"`
 	// PRs are the session's attributed pull requests (one session can own many).
 	// They feed status derivation and are surfaced on the API read model. Not
 	// serialized here: the HTTP boundary maps them to the curated wire shape.
 	PRs []PRFacts `json:"-"`
+}
+
+// EncodeSessionDependencyIDs stores dependency ids in a comparable record
+// field using collision-free JSON. String-only arrays cannot fail to marshal.
+func EncodeSessionDependencyIDs(ids []SessionID) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	encoded, _ := json.Marshal(ids)
+	return string(encoded)
+}
+
+// DecodeSessionDependencyIDs returns the API/store slice for an encoded record.
+func DecodeSessionDependencyIDs(encoded string) ([]SessionID, error) {
+	if encoded == "" {
+		return nil, nil
+	}
+	var ids []SessionID
+	if err := json.Unmarshal([]byte(encoded), &ids); err != nil {
+		return nil, fmt.Errorf("decode session dependency ids: %w", err)
+	}
+	if ids == nil {
+		return nil, fmt.Errorf("decode session dependency ids: expected JSON array")
+	}
+	return ids, nil
 }

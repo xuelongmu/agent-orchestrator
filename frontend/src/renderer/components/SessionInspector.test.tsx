@@ -131,6 +131,13 @@ afterEach(() => {
 });
 
 describe("SessionInspector tabs", () => {
+	it("renders dependency edges read-only in the overview", () => {
+		renderWithQuery(<SessionInspector session={session([], { dependsOn: ["sess-parent", "sess-api"] })} />);
+
+		expect(screen.getByText("Declared prerequisites")).toBeInTheDocument();
+		expect(screen.getByText("sess-parent, sess-api")).toBeInTheDocument();
+	});
+
 	it("sizes rail tabs to their labels instead of stretching across the inspector", () => {
 		renderWithQuery(<SessionInspector session={session([])} />);
 

@@ -269,6 +269,9 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 				<dl className="flex flex-col gap-1">
 					<Row k="Agent" v={session.provider} mono />
 					{issueId && <Row k="Issue" v={issueId} mono />}
+					{session.dependsOn && session.dependsOn.length > 0 ? (
+						<Row k="Declared prerequisites" v={session.dependsOn.join(", ")} mono />
+					) : null}
 					<Row k="Workspace" v={workspaceKind} mono />
 					{session.branch && <Row k="Branch" v={session.branch} mono />}
 					<Row k="Started" v={formatTimeCompact(session.createdAt ?? session.updatedAt)} mono />

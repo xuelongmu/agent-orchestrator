@@ -163,6 +163,9 @@ type SpawnSessionRequest struct {
 	// `ao spawn --name` always sets it; other clients (e.g. the desktop new-task
 	// dialog) may omit it and fall back to the session id in the read model.
 	DisplayName string `json:"displayName,omitempty" maxLength:"20"`
+	// DependsOn declares read-only prerequisite graph edges. The persistence
+	// boundary validates them, but Part 1 does not delay or schedule the child.
+	DependsOn []domain.SessionID `json:"dependsOn,omitempty" maxItems:"32"`
 }
 
 // SessionResponse is the { session } body shared by session create/get.
