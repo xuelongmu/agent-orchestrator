@@ -212,7 +212,9 @@ export function SessionInspector({
 				)}
 			>
 				{view === "summary" ? <SummaryView session={inspectedSession} /> : null}
-				{view === "reviews" ? <ReviewsView onOpenReviewerTerminal={onOpenReviewerTerminal} session={inspectedSession} /> : null}
+				{view === "reviews" ? (
+					<ReviewsView onOpenReviewerTerminal={onOpenReviewerTerminal} session={inspectedSession} />
+				) : null}
 				{view === "browser" ? (
 					<BrowserView
 						browserPoppedOut={browserPoppedOut}
