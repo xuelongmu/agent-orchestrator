@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -179,7 +180,7 @@ func (c *commandContext) openImportPlanningStore(dataDir string) (legacyimport.S
 		// Creating/removing the private child changes the parent timestamp on
 		// Windows and POSIX. Restore it so a completed dry run leaves the source
 		// directory inventory and stable metadata byte-for-byte unchanged.
-		return os.Chtimes(dataDir, dataDirInfo.ModTime(), dataDirInfo.ModTime())
+		return os.Chtimes(dataDir, time.Time{}, dataDirInfo.ModTime())
 	}
 
 	for _, name := range []string{"ao.db", "ao.db-wal"} {

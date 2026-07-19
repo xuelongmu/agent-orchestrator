@@ -370,6 +370,9 @@ func captureDirectoryState(t *testing.T, root string) sourceDirectoryState {
 			return err
 		}
 		entry := sourceEntryState{Mode: info.Mode()}
+		if rel == "." {
+			entry.ModTime = info.ModTime()
+		}
 		if info.Mode().IsRegular() {
 			entry.Size = info.Size()
 			entry.ModTime = info.ModTime()
