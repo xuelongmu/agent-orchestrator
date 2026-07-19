@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { NotificationCenter } from "./NotificationCenter";
 import type { NotificationDTO } from "../lib/notifications";
@@ -81,11 +82,12 @@ describe("NotificationCenter", () => {
 		expect(count).not.toHaveClass("text-background");
 	});
 
-	it("does not offer an open action for control-plane notifications", () => {
+	it("does not offer an open action for control-plane notifications", async () => {
+		const user = userEvent.setup();
 		renderNotificationCenter();
-		fireEvent.click(screen.getByRole("button", { name: "3 unread notifications" }));
+		await user.click(screen.getByRole("button", { name: "3 unread notifications" }));
 
-		const title = screen.getByText("GitHub authentication needs attention");
+		const title = await screen.findByText("GitHub authentication needs attention");
 		const item = title.closest(".grid");
 		expect(item).not.toBeNull();
 		expect(within(item as HTMLElement).queryByTitle("Open target")).not.toBeInTheDocument();
