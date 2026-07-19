@@ -110,6 +110,18 @@ func (s *Store) CompleteReviewRunWithFindings(ctx context.Context, id string, ve
 	return updated && err == nil, err
 }
 
+// RefreshReviewRunSimplificationClass atomically derives and persists the
+// escalation class from the post-deflection actionable ledger.
+func (s *Store) RefreshReviewRunSimplificationClass(ctx context.Context, id string) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	n, err := s.qw.RefreshReviewRunSimplificationClass(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // SupersedeStaleRunningReviewRuns marks older running unverdicted passes for a
 // worker failed before starting a review for a newer commit.
 func (s *Store) SupersedeStaleRunningReviewRuns(ctx context.Context, sessionID domain.SessionID, prURL, targetSHA, body string) (int64, error) {

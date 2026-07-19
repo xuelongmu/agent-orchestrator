@@ -113,6 +113,23 @@ func (f *fakeStore) CompleteReviewRunWithFindings(_ context.Context, id string, 
 	return true, nil
 }
 
+func (f *fakeStore) RefreshReviewRunSimplificationClass(_ context.Context, id string) (bool, error) {
+	for i := range f.batchRuns {
+		if f.batchRuns[i].ID == id && f.batchRuns[i].Status == domain.ReviewRunComplete && f.batchRuns[i].DeliveredAt == nil {
+			f.batchRuns[i].SimplificationClass = reviewcore.SimplificationClassForRun(findingsForPR(f.findings, f.batchRuns[i].PRURL), id)
+			if f.run.ID == id {
+				f.run = f.batchRuns[i]
+			}
+			return true, nil
+		}
+	}
+	if f.run.ID == id && f.run.Status == domain.ReviewRunComplete && f.run.DeliveredAt == nil {
+		f.run.SimplificationClass = reviewcore.SimplificationClassForRun(findingsForPR(f.findings, f.run.PRURL), id)
+		return true, nil
+	}
+	return false, nil
+}
+
 func (f *fakeStore) UpdateReviewRunResult(_ context.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string) (bool, error) {
 	for i := range f.batchRuns {
 		if f.batchRuns[i].ID == id && f.batchRuns[i].Status == domain.ReviewRunRunning {
@@ -510,6 +527,44 @@ func TestSubmitPersistsSimplificationOnlyForCurrentRepeatedClass(t *testing.T) {
 	}
 	if reducer.got.SimplificationClass != "" || st.batchRuns[3].SimplificationClass != "" {
 		t.Fatalf("historical class leaked into later run: result=%q run=%q", reducer.got.SimplificationClass, st.batchRuns[3].SimplificationClass)
+	}
+}
+
+func TestSubmitClearsSimplificationClassAfterThresholdFindingIsDeflected(t *testing.T) {
+	st := &fakeStore{
+		batchRuns: []domain.ReviewRun{
+			{ID: "run-1", SessionID: "mer-1", PRURL: "pr1", TargetSHA: "sha1", Status: domain.ReviewRunDelivered},
+			{ID: "run-2", SessionID: "mer-1", PRURL: "pr1", TargetSHA: "sha2", Status: domain.ReviewRunDelivered},
+			{ID: "run-3", SessionID: "mer-1", PRURL: "pr1", TargetSHA: "sha3", Status: domain.ReviewRunRunning},
+		},
+		prs:      []domain.PullRequest{{URL: "pr1", HeadSHA: "sha3"}},
+		sessions: map[domain.SessionID]domain.SessionRecord{"mer-1": {ID: "mer-1", ProjectID: "mer"}},
+		project:  domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{ReviewPolicy: domain.ReviewPolicyConfig{OutOfScopeDeflection: true}}},
+		findings: []domain.ReviewFinding{
+			{ID: "run-1:1", RunID: "run-1", SessionID: "mer-1", PRURL: "pr1", Round: 1, ClassTag: "missing-notify"},
+			{ID: "run-2:1", RunID: "run-2", SessionID: "mer-1", PRURL: "pr1", Round: 2, ClassTag: "missing-notify"},
+		},
+	}
+	reducer := &fakeReducer{outcome: lifecycle.ReviewDeliverySent}
+	svc := New(nil, st, WithLifecycleReducer(reducer), WithFindingDeflector(&fakeDeflector{}))
+	runs, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{{
+		RunID: "run-3", Verdict: domain.VerdictChangesRequested, Body: "two findings", GithubReviewID: "review-3",
+		Findings: []SubmittedFinding{
+			{ClassTag: "missing-notify", Body: "unrelated subsystem", ThreadID: "thread-3", OutOfScope: true},
+			{ClassTag: "nil-safety", Body: "fix the current nil path"},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reducer.calls != 1 || reducer.got.SimplificationClass != "" {
+		t.Fatalf("deflected threshold class leaked into dispatch: calls=%d result=%+v", reducer.calls, reducer.got)
+	}
+	if st.batchRuns[2].SimplificationClass != "" || len(runs) != 1 || runs[0].SimplificationClass != "" {
+		t.Fatalf("post-deflection simplification was not cleared durably: store=%+v runs=%+v", st.batchRuns[2], runs)
+	}
+	if !strings.Contains(reducer.got.Findings[1].Body, "current nil path") {
+		t.Fatalf("unrelated actionable finding was not dispatched: %+v", reducer.got.Findings)
 	}
 }
 

@@ -53,8 +53,9 @@ type ReviewRun struct {
 	GithubReviewID string     `json:"githubReviewId"`
 	CreatedAt      time.Time  `json:"createdAt"`
 	DeliveredAt    *time.Time `json:"deliveredAt,omitempty"`
-	// SimplificationClass is selected atomically with the finding set for this
-	// run. It is empty unless a class present in this run crossed the repetition
+	// SimplificationClass is initially selected atomically with the finding set,
+	// then atomically refreshed from the actionable ledger after deflection. It
+	// is empty unless an actionable class in this run crossed the repetition
 	// threshold. SimplificationDispatchedAt records durable delivery of that mode.
 	SimplificationClass        string     `json:"-"`
 	SimplificationDispatchedAt *time.Time `json:"-"`
@@ -81,6 +82,13 @@ type ReviewFinding struct {
 	ThreadResolved   bool      `json:"threadResolved,omitempty"`
 	ThreadReplyID    string    `json:"-"`
 	CreatedAt        time.Time `json:"createdAt"`
+}
+
+// FullyDeflected reports whether provider-backed deflection is durably
+// complete. Partial external work remains actionable until both the backlog
+// issue and the bound review-thread resolution have receipts.
+func (f ReviewFinding) FullyDeflected() bool {
+	return f.OutOfScope && f.DeferredIssueURL != "" && f.ThreadID != "" && f.ThreadResolved
 }
 
 // FindingClassCount summarizes a finding taxonomy for dispatch and UI use.

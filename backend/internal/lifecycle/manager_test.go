@@ -1594,6 +1594,20 @@ func TestApplyReviewResultThirdClassOccurrenceUsesSimplificationRound(t *testing
 	}
 }
 
+func TestActionableReviewBodyKeepsPartialDeflection(t *testing.T) {
+	result := ReviewResult{Findings: []domain.ReviewFinding{
+		{ClassTag: "partial", Body: "still resolve the bound thread", OutOfScope: true, DeferredIssueURL: "issue", ThreadID: "thread"},
+		{ClassTag: "done", Body: "already deferred", OutOfScope: true, DeferredIssueURL: "issue", ThreadID: "thread", ThreadResolved: true},
+	}}
+	body := actionableReviewBody(result)
+	if !strings.Contains(body, "still resolve the bound thread") {
+		t.Fatalf("partial deflection omitted from dispatch: %q", body)
+	}
+	if strings.Contains(body, "already deferred") {
+		t.Fatalf("fully deflected finding remained actionable: %q", body)
+	}
+}
+
 func TestApplyReviewResultSuppressedByJITGuardIsNotDelivered(t *testing.T) {
 	// The worker is working at ApplyReviewResult's entry guard (read #1) but a
 	// permission dialog stores blocked before sendOnce's just-in-time re-read

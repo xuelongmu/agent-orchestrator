@@ -135,7 +135,7 @@ func currentRunFindingsDeflected(findings []domain.ReviewFinding, runID string) 
 			continue
 		}
 		found = true
-		if !finding.OutOfScope || finding.DeferredIssueURL == "" || finding.ThreadID == "" || !finding.ThreadResolved {
+		if !finding.FullyDeflected() {
 			return false
 		}
 	}

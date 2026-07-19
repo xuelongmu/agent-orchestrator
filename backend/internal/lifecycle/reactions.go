@@ -167,7 +167,7 @@ func actionableReviewBody(r ReviewResult) string {
 	}
 	var lines []string
 	for _, finding := range r.Findings {
-		if finding.OutOfScope && finding.DeferredIssueURL != "" {
+		if finding.FullyDeflected() {
 			continue
 		}
 		line := fmt.Sprintf("- [%s]", finding.ClassTag)

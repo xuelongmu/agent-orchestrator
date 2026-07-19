@@ -23,6 +23,34 @@ UPDATE review_run
 SET status = 'complete', verdict = ?, body = ?, github_review_id = ?, simplification_class = ?
 WHERE id = ? AND status = 'running';
 
+-- name: RefreshReviewRunSimplificationClass :execrows
+UPDATE review_run
+SET simplification_class = COALESCE((
+    SELECT TRIM(history.class_tag)
+    FROM review_finding AS history
+    WHERE history.session_id = review_run.session_id
+      AND history.pr_url = review_run.pr_url
+      AND NOT (
+        history.out_of_scope = 1 AND history.deferred_issue_url != ''
+        AND history.thread_id != '' AND history.thread_resolved = 1
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM review_finding AS current
+        WHERE current.run_id = review_run.id
+          AND TRIM(current.class_tag) = TRIM(history.class_tag)
+          AND NOT (
+            current.out_of_scope = 1 AND current.deferred_issue_url != ''
+            AND current.thread_id != '' AND current.thread_resolved = 1
+          )
+      )
+    GROUP BY TRIM(history.class_tag)
+    HAVING COUNT(*) >= 3
+    ORDER BY COUNT(*) DESC, TRIM(history.class_tag) ASC
+    LIMIT 1
+), '')
+WHERE review_run.id = ? AND review_run.status = 'complete' AND review_run.delivered_at IS NULL;
+
 -- name: SupersedeStaleRunningReviewRuns :execrows
 UPDATE review_run SET status = 'failed', body = ? WHERE session_id = ? AND pr_url = ? AND target_sha != ? AND status = 'running' AND verdict = '';
 
@@ -96,7 +124,10 @@ ORDER BY created_at ASC, id ASC;
 -- name: SetPendingReviewFindingFixCommit :execrows
 UPDATE review_finding
 SET fix_commit = ?
-WHERE session_id = ? AND pr_url = ? AND fix_commit = '' AND out_of_scope = 0;
+WHERE session_id = ? AND pr_url = ? AND fix_commit = ''
+  AND NOT (
+    out_of_scope = 1 AND deferred_issue_url != '' AND thread_id != '' AND thread_resolved = 1
+  );
 
 -- name: ClaimReviewFindingIssueAction :execrows
 UPDATE review_finding

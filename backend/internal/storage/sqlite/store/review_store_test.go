@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -329,7 +330,7 @@ func TestReviewFindingLedgerRoundTripsDeflectionReceipts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n, err := s.SetPendingReviewFindingFixCommit(ctx, rec.ID, "pr1", "sha2"); err != nil || n != 0 {
+	if n, err := s.SetPendingReviewFindingFixCommit(ctx, rec.ID, "pr1", "sha2"); err != nil || n != 1 {
 		t.Fatalf("bind fix commit = %d, %v", n, err)
 	}
 	if ok, err := s.ClaimReviewFindingIssueAction(ctx, finding.ID, "issue-token", now.Add(time.Minute), now); err != nil || !ok {
@@ -366,7 +367,7 @@ func TestReviewFindingLedgerRoundTripsDeflectionReceipts(t *testing.T) {
 	if err != nil || len(got) != 1 {
 		t.Fatalf("findings = %+v, %v", got, err)
 	}
-	if got[0].FixCommit != "" || got[0].DeferredIssueURL == "" || !got[0].ThreadResolved || got[0].ThreadReplyID != "reply-1" {
+	if got[0].FixCommit != "sha2" || got[0].DeferredIssueURL == "" || !got[0].ThreadResolved || got[0].ThreadReplyID != "reply-1" {
 		t.Fatalf("finding = %+v", got[0])
 	}
 }
@@ -400,6 +401,21 @@ func TestCompleteReviewRunWithFindingsIsAtomicAndPersistsSimplificationDispatch(
 	if ok, err := s.CompleteReviewRunWithFindings(ctx, "run-1", domain.VerdictChangesRequested, "fix", "123", "missing-notify", []domain.ReviewFinding{duplicate}); err != nil || !ok {
 		t.Fatalf("complete = %v, %v", ok, err)
 	}
+	if ok, err := s.RefreshReviewRunSimplificationClass(ctx, "run-1"); err != nil || !ok {
+		t.Fatalf("clear simplification = %v, %v", ok, err)
+	}
+	run, _, err = s.GetReviewRun(ctx, "run-1")
+	if err != nil || run.SimplificationClass != "" {
+		t.Fatalf("cleared simplification = %+v, %v", run, err)
+	}
+	for i := 2; i <= 3; i++ {
+		if err := s.InsertReviewFinding(ctx, domain.ReviewFinding{ID: fmt.Sprintf("run-1:%d", i), RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: i, ClassTag: "missing-notify", CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ok, err := s.RefreshReviewRunSimplificationClass(ctx, "run-1"); err != nil || !ok {
+		t.Fatalf("restore simplification = %v, %v", ok, err)
+	}
 	if ok, err := s.MarkReviewRunDelivered(ctx, "run-1", now.Add(time.Minute)); err != nil || !ok {
 		t.Fatalf("deliver = %v, %v", ok, err)
 	}
@@ -412,7 +428,7 @@ func TestCompleteReviewRunWithFindingsIsAtomicAndPersistsSimplificationDispatch(
 	}
 }
 
-func TestSetPendingReviewFindingFixCommitExcludesDeferredFindings(t *testing.T) {
+func TestSetPendingReviewFindingFixCommitExcludesOnlyFullyDeflectedFindings(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	seedProject(t, s, "mer")
@@ -429,18 +445,19 @@ func TestSetPendingReviewFindingFixCommitExcludesDeferredFindings(t *testing.T) 
 	}
 	findings := []domain.ReviewFinding{
 		{ID: "run-1:1", RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: 1, ClassTag: "actionable", CreatedAt: now},
-		{ID: "run-1:2", RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: 1, ClassTag: "deferred", OutOfScope: true, CreatedAt: now},
+		{ID: "run-1:2", RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: 1, ClassTag: "partial", OutOfScope: true, DeferredIssueURL: "issue", ThreadID: "thread", CreatedAt: now},
+		{ID: "run-1:3", RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: 1, ClassTag: "deferred", OutOfScope: true, DeferredIssueURL: "issue", ThreadID: "thread", ThreadResolved: true, CreatedAt: now},
 	}
 	for _, finding := range findings {
 		if err := s.InsertReviewFinding(ctx, finding); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if n, err := s.SetPendingReviewFindingFixCommit(ctx, rec.ID, "pr1", "sha2"); err != nil || n != 1 {
+	if n, err := s.SetPendingReviewFindingFixCommit(ctx, rec.ID, "pr1", "sha2"); err != nil || n != 2 {
 		t.Fatalf("updated = %d, %v", n, err)
 	}
 	got, err := s.ListReviewFindingsByRun(ctx, "run-1")
-	if err != nil || got[0].FixCommit != "sha2" || got[1].FixCommit != "" {
+	if err != nil || got[0].FixCommit != "sha2" || got[1].FixCommit != "sha2" || got[2].FixCommit != "" {
 		t.Fatalf("findings = %+v, %v", got, err)
 	}
 }

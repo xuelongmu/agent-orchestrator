@@ -51,6 +51,7 @@ var _ Manager = (*Service)(nil)
 type Store interface {
 	GetReviewRun(ctx context.Context, id string) (domain.ReviewRun, bool, error)
 	CompleteReviewRunWithFindings(ctx context.Context, id string, verdict domain.ReviewVerdict, body, githubReviewID, simplificationClass string, findings []domain.ReviewFinding) (bool, error)
+	RefreshReviewRunSimplificationClass(ctx context.Context, id string) (bool, error)
 	MarkReviewRunDelivered(ctx context.Context, id string, deliveredAt time.Time) (bool, error)
 	MarkReviewRunDeflectedReviewCleared(ctx context.Context, id string, clearedAt time.Time) (bool, error)
 	ListReviewRunsByBatch(ctx context.Context, sessionID domain.SessionID, batchID string) ([]domain.ReviewRun, error)
@@ -328,11 +329,16 @@ func (s *Service) deliverSubmitted(ctx context.Context, workerID domain.SessionI
 	// findings belong in the worker fix dispatch. This path is also used by the
 	// SCM coordinator after restart, so a transient provider failure cannot turn
 	// a deferred finding back into fix work.
-	for _, run := range runs {
+	for i, run := range runs {
 		if run.Status == domain.ReviewRunComplete && run.Verdict == domain.VerdictChangesRequested {
 			if err := s.deflectOutOfScope(ctx, run); err != nil {
 				return nil, err
 			}
+			refreshed, err := s.refreshSimplificationClass(ctx, run)
+			if err != nil {
+				return nil, err
+			}
+			runs[i] = refreshed
 		}
 	}
 	deliverable, err := s.deliverableRuns(ctx, workerID, runs)
@@ -404,11 +410,40 @@ func (s *Service) deliverableRuns(ctx context.Context, workerID domain.SessionID
 
 func hasActionableFinding(findings []domain.ReviewFinding) bool {
 	for _, finding := range findings {
-		if !finding.OutOfScope || finding.DeferredIssueURL == "" || finding.ThreadID == "" || !finding.ThreadResolved {
+		if !finding.FullyDeflected() {
 			return true
 		}
 	}
 	return false
+}
+
+// refreshSimplificationClass derives escalation from the durable ledger after
+// deflection. Persisting the derived value before dispatch makes crash replay
+// observe the same actionable finding set and clears a pre-deflection class
+// that was successfully deferred.
+func (s *Service) refreshSimplificationClass(ctx context.Context, run domain.ReviewRun) (domain.ReviewRun, error) {
+	updated, err := s.store.RefreshReviewRunSimplificationClass(ctx, run.ID)
+	if err != nil {
+		return domain.ReviewRun{}, err
+	}
+	if !updated {
+		current, ok, getErr := s.store.GetReviewRun(ctx, run.ID)
+		if getErr != nil {
+			return domain.ReviewRun{}, getErr
+		}
+		if !ok {
+			return domain.ReviewRun{}, fmt.Errorf("%w: review run %q", ErrNotFound, run.ID)
+		}
+		return current, nil
+	}
+	current, ok, err := s.store.GetReviewRun(ctx, run.ID)
+	if err != nil {
+		return domain.ReviewRun{}, err
+	}
+	if !ok {
+		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q", ErrNotFound, run.ID)
+	}
+	return current, nil
 }
 
 func (s *Service) buildFindings(ctx context.Context, run domain.ReviewRun, submitted []SubmittedFinding) ([]domain.ReviewFinding, error) {
@@ -512,7 +547,7 @@ func (s *Service) deflectOutOfScope(ctx context.Context, run domain.ReviewRun) e
 		if !finding.OutOfScope {
 			continue
 		}
-		if finding.DeferredIssueURL != "" && finding.ThreadID != "" && finding.ThreadResolved {
+		if finding.FullyDeflected() {
 			continue
 		}
 		binding := ports.SCMReviewThreadBinding{

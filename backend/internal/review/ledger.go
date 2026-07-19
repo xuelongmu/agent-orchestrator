@@ -7,15 +7,15 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
-// FindingLedger summarizes a durable finding history deterministically. Filed
-// out-of-scope findings remain visible in TotalFindings but do not participate
-// in class counts because they no longer belong to the fix loop.
+// FindingLedger summarizes a durable finding history deterministically. Fully
+// deflected out-of-scope findings remain visible in TotalFindings but do not
+// participate in class counts because they no longer belong to the fix loop.
 func FindingLedger(findings []domain.ReviewFinding) domain.FindingLedgerSummary {
 	rounds := map[int]struct{}{}
 	counts := map[string]int{}
 	for _, finding := range findings {
 		rounds[finding.Round] = struct{}{}
-		if finding.OutOfScope && finding.DeferredIssueURL != "" {
+		if finding.FullyDeflected() {
 			continue
 		}
 		tag := strings.TrimSpace(finding.ClassTag)
@@ -44,7 +44,7 @@ func FindingLedger(findings []domain.ReviewFinding) domain.FindingLedgerSummary 
 func SimplificationClassForRun(findings []domain.ReviewFinding, runID string) string {
 	current := map[string]bool{}
 	for _, finding := range findings {
-		if finding.RunID == runID && (!finding.OutOfScope || finding.DeferredIssueURL == "") {
+		if finding.RunID == runID && !finding.FullyDeflected() {
 			current[strings.TrimSpace(finding.ClassTag)] = true
 		}
 	}
