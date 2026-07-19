@@ -51,7 +51,7 @@ func runHostedProcess(argv []string, owner io.Reader, stdout, stderr io.Writer) 
 		_, _ = io.WriteString(stderr, "prepare verification descendant ownership: "+ownerErr.Error()+"\n")
 		return 126
 	}
-	defer descendants.Close()
+	defer func() { _ = descendants.Close() }()
 
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
