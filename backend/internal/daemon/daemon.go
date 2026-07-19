@@ -15,6 +15,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/runtimeselect"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/coordination"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemon/supervisor"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
@@ -30,7 +31,6 @@ import (
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
-	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
 )
 
@@ -61,11 +61,26 @@ func Run() error {
 	// Open the durable store and bring up the CDC substrate: DB triggers capture
 	// changes into change_log, the poller tails it, and the broadcaster fans
 	// events out to live transports.
-	store, err := sqlite.Open(cfg.DataDir)
+	store, coordinationLease, err := coordination.OpenExclusive(context.Background(), cfg.DataDir, os.Getpid())
 	if err != nil {
-		return fmt.Errorf("open store: %w", err)
+		return fmt.Errorf("open exclusive store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	defer func() {
+		if err := coordinationLease.Release(context.Background()); err != nil {
+			log.Warn("release daemon coordination claim", "err", err)
+		}
+	}()
+
+	// Root every background loop and reconcile operation in the same context
+	// that lease loss cancels. Renewal starts before any side effect does.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	leaseDone := coordinationLease.Maintain(ctx, stop, log)
+	defer func() {
+		stop()
+		<-leaseDone
+	}()
 
 	// Refresh the embedded using-ao skill into the data dir so worker sessions
 	// in any project can read the ao CLI catalog from a stable absolute path.
@@ -86,11 +101,6 @@ func Run() error {
 			"agent": cfg.Agent,
 		},
 	})
-
-	// signal.NotifyContext cancels ctx on SIGINT/SIGTERM, which drives the
-	// graceful shutdown inside Server.Run and stops the background goroutines.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	cdcPipe, err := startCDC(ctx, store, log)
 	if err != nil {

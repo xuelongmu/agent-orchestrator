@@ -14,9 +14,11 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/coordination"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemon"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 	"github.com/aoagents/agent-orchestrator/backend/internal/processalive"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
 // Execute runs the ao CLI with process stdio.
@@ -75,6 +77,11 @@ type Deps struct {
 	DoctorGitHubRESTBase string
 	Now                  func() time.Time
 	Sleep                func(time.Duration)
+	// OpenStore is used only by the legacy import command, the one CLI path
+	// permitted to access SQLite directly. Dry-run uses the read-only behavior;
+	// writes must use OpenExclusiveStore so no unfenced handle escapes.
+	OpenStore          func(dataDir string) (*sqlite.Store, error)
+	OpenExclusiveStore func(ctx context.Context, dataDir string, ownerPID int) (*sqlite.Store, *coordination.Lease, error)
 }
 
 // DefaultDeps returns production dependencies.
@@ -93,6 +100,8 @@ func DefaultDeps() Deps {
 		DoctorGitHubRESTBase: defaultDoctorGitHubRESTBase,
 		Now:                  time.Now,
 		Sleep:                time.Sleep,
+		OpenStore:            sqlite.Open,
+		OpenExclusiveStore:   coordination.OpenExclusive,
 	}
 }
 
@@ -137,6 +146,12 @@ func (d Deps) withDefaults() Deps {
 	}
 	if d.CommandOutputInDir == nil {
 		d.CommandOutputInDir = def.CommandOutputInDir
+	}
+	if d.OpenStore == nil {
+		d.OpenStore = def.OpenStore
+	}
+	if d.OpenExclusiveStore == nil {
+		d.OpenExclusiveStore = def.OpenExclusiveStore
 	}
 	if d.DoctorGitHubRESTBase == "" {
 		d.DoctorGitHubRESTBase = def.DoctorGitHubRESTBase

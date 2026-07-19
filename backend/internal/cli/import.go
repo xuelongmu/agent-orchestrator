@@ -13,7 +13,6 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/legacyimport"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
-	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
 type importOptions struct {
@@ -103,15 +102,37 @@ func (c *commandContext) runImport(cmd *cobra.Command, opts importOptions) error
 
 // executeImport opens the rewrite store, runs the import, and closes the store.
 // It is the one CLI path that opens the database directly: the import is a
-// one-time bootstrap that must run with the daemon stopped (guarded by the
-// caller), so it cannot go through the daemon's loopback API.
-func (c *commandContext) executeImport(ctx context.Context, cfg config.Config, opts legacyimport.Options) (legacyimport.Report, error) {
-	store, err := sqlite.Open(cfg.DataDir)
+// one-time bootstrap that cannot go through the daemon's loopback API. A
+// non-dry-run import takes the same renewable exclusive-writer lease as the
+// daemon immediately after opening SQLite and before its first write, closing
+// the confirmation-prompt/startup TOCTOU left by the preliminary run-file check.
+func (c *commandContext) executeImport(ctx context.Context, cfg config.Config, opts legacyimport.Options) (rep legacyimport.Report, err error) {
+	if opts.DryRun {
+		store, err := c.deps.OpenStore(cfg.DataDir)
+		if err != nil {
+			return legacyimport.Report{}, fmt.Errorf("open store: %w", err)
+		}
+		defer func() { _ = store.Close() }()
+		return legacyimport.Run(ctx, store, opts)
+	}
+
+	store, lease, err := c.deps.OpenExclusiveStore(ctx, cfg.DataDir, os.Getpid())
 	if err != nil {
-		return legacyimport.Report{}, fmt.Errorf("open store: %w", err)
+		return legacyimport.Report{}, fmt.Errorf("open exclusive import store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
-	return legacyimport.Run(ctx, store, opts)
+	defer func() {
+		if releaseErr := lease.Release(context.Background()); releaseErr != nil && err == nil {
+			err = fmt.Errorf("release import database-writer lease: %w", releaseErr)
+		}
+	}()
+	writeCtx, cancel := context.WithCancel(ctx)
+	leaseDone := lease.Maintain(writeCtx, cancel, nil)
+	defer func() {
+		cancel()
+		<-leaseDone
+	}()
+	return legacyimport.Run(writeCtx, store, opts)
 }
 
 func writeImportSummary(w io.Writer, rep legacyimport.Report) error {
