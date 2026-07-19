@@ -85,25 +85,42 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 	}
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
-	select {
-	case err = <-wait:
-		_ = ownerWrite.Close()
-	case <-ctx.Done():
-		_ = ownerWrite.Close()
-		_ = windows.TerminateJobObject(job, 1)
-		err = <-wait
+	var copyErr error
+	copyFinished := false
+	guardianDone := false
+	for !guardianDone {
+		select {
+		case err = <-wait:
+			guardianDone = true
+			_ = ownerWrite.Close()
+		case copyErr = <-copyDone:
+			copyFinished = true
+			if copyErr != nil {
+				_ = ownerWrite.Close()
+				_ = windows.TerminateJobObject(job, 1)
+				err = <-wait
+				guardianDone = true
+			}
+		case <-ctx.Done():
+			_ = ownerWrite.Close()
+			_ = windows.TerminateJobObject(job, 1)
+			err = <-wait
+			guardianDone = true
+		}
 	}
 	// A verifier descendant may inherit the guardian's stdout/stderr handles.
 	// Terminate the Job as soon as the guardian exits so those handles close;
 	// only then drain our explicitly owned copy pipe. Using *os.File on exec.Cmd
 	// keeps cmd.Wait independent from os/exec's internal copy goroutines.
 	_ = windows.TerminateJobObject(job, 1)
-	copyErr := <-copyDone
+	if !copyFinished {
+		copyErr = <-copyDone
+	}
 	_ = outputRead.Close()
 	if ctx.Err() != nil {
 		return RunResult{ExitCode: -1}, ctx.Err()
 	}
-	if err == nil && copyErr != nil {
+	if copyErr != nil {
 		return RunResult{ExitCode: -1}, copyErr
 	}
 	return processResult(err)

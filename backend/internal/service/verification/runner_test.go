@@ -185,6 +185,11 @@ func TestVerificationProcessHelper(t *testing.T) {
 			os.Exit(94)
 		}
 		os.Exit(0)
+	case "chatty":
+		payload := strings.Repeat("output", 16*1024)
+		for {
+			_, _ = io.WriteString(os.Stdout, payload)
+		}
 	case "child":
 		for {
 			time.Sleep(time.Second)

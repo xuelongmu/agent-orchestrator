@@ -5,6 +5,7 @@ package verification
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -84,5 +85,28 @@ func TestWindowsInheritedOutputDescendantDoesNotDelayJobClose(t *testing.T) {
 	}
 	if processalive.Alive(pid) {
 		t.Fatalf("inherited-output descendant pid %d survived Job close", pid)
+	}
+}
+
+type failingOutputWriter struct{ err error }
+
+func (w failingOutputWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestWindowsOutputFailureTerminatesChattyJob(t *testing.T) {
+	wantErr := errors.New("verification log write failed")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := testOSRunner().Run(ctx, RunSpec{
+		Argv:   []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "chatty"},
+		Dir:    t.TempDir(),
+		Env:    append(os.Environ(), "GO_WANT_VERIFY_HELPER=1"),
+		Output: failingOutputWriter{err: wantErr},
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Run() error = %v, want %v", err, wantErr)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("output failure took %s; Job was not terminated promptly", elapsed)
 	}
 }
