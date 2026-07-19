@@ -50,7 +50,7 @@ export function LandingFooter() {
 							<span className="text-[16px] font-semibold text-[color:var(--fg)]">Agent Orchestrator</span>
 						</a>
 						<p className="mt-4 max-w-md text-[14px] leading-relaxed text-[color:var(--fg-muted)]">
-							Open-source orchestration for terminal-native coding agents. Local daemon, isolated worktrees, live
+							Open-source orchestration for terminal-native coding agents. Local daemon, separate worktrees, live
 							sessions, and PR feedback routed to the right worker.
 						</p>
 						<div className="mt-5 flex flex-wrap gap-2">

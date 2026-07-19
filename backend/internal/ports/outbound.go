@@ -182,7 +182,7 @@ type Workspace interface {
 	Create(ctx context.Context, cfg WorkspaceConfig) (WorkspaceInfo, error)
 	Destroy(ctx context.Context, info WorkspaceInfo) error
 	Restore(ctx context.Context, cfg WorkspaceConfig) (WorkspaceInfo, error)
-	// ForceDestroy removes an isolated workspace unconditionally, bypassing the
+	// ForceDestroy removes a managed workspace unconditionally, bypassing the
 	// dirty-worktree refusal that the git adapter enforces. Shared-directory
 	// adapters must leave their directory untouched.
 	ForceDestroy(ctx context.Context, info WorkspaceInfo) error
