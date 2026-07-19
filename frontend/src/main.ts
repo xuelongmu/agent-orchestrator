@@ -56,12 +56,13 @@ import { shouldLinkOnAttach } from "./main/daemon-owner";
 import {
 	DaemonOwnershipController,
 	DaemonRestartController,
+	DaemonStopIntentController,
 	isCrashLikeDaemonExit,
 	resolveReachableDaemon,
 	stopAdoptedDaemon,
 	validatedDaemonOwner,
 } from "./main/daemon-restart";
-import { probeProcessLiveness, terminateProcessTree } from "./main/process-lifecycle";
+import { probeProcessLiveness, terminateProcess } from "./main/process-lifecycle";
 import { readMigrationState, updateMigration, writeAppStateMarker, type MigrationState } from "./main/app-state";
 import { isAllowedAppExternalURL, openAllowedAppExternalURL } from "./main/external-open";
 
@@ -109,6 +110,7 @@ let daemonStatus: DaemonStatus = { state: "stopped" };
 let browserViewHost: BrowserViewHost | null = null;
 let appQuitting = false;
 const daemonOwnership = new DaemonOwnershipController();
+const daemonStopIntent = new DaemonStopIntentController();
 
 // The desktop app owns the daemon it spawns, so replace an unexpectedly exited
 // child with a bounded retry loop. Go's boot reconciliation adopts the durable
@@ -117,7 +119,7 @@ const daemonOwnership = new DaemonOwnershipController();
 // needed in either process.
 const daemonRestart = new DaemonRestartController({
 	restart: () => (daemonProcess ? undefined : startDaemon()),
-	shouldRestart: () => daemonOwnership.appOwned && !appQuitting,
+	shouldRestart: () => daemonOwnership.appOwned && !appQuitting && !daemonStopIntent.stopping,
 	log: (message) => console.log(`AO: ${message}`),
 	onExhausted: () => daemonOwnership.clear(),
 });
@@ -673,6 +675,11 @@ async function readValidatedDaemonOwner(pid: number | undefined): Promise<string
 }
 
 async function refreshDaemonStatus(): Promise<DaemonStatus> {
+	const refreshEpoch = daemonStopIntent.currentEpoch;
+	// An explicit stop remains authoritative through the supervisor's delayed
+	// grace window. In particular, renderer polling must not re-adopt and relink
+	// the same run-file before the daemon finishes stopping.
+	if (!daemonStopIntent.permitsAdoption(refreshEpoch)) return daemonStatus;
 	if (daemonProcess) {
 		return daemonStatus;
 	}
@@ -694,11 +701,13 @@ async function refreshDaemonStatus(): Promise<DaemonStatus> {
 				identityError: (probe) => daemonIdentityError(launch, probe),
 			}),
 	);
+	if (!daemonStopIntent.permitsAdoption(refreshEpoch)) return daemonStatus;
 	if (reachable) {
 		const wasReady = daemonStatus.state === "ready";
 		const status = reachable.source === "run-file" ? reachable.value.status : reachable.value;
 		const owner =
 			reachable.source === "run-file" ? reachable.value.owner : await readValidatedDaemonOwner(reachable.value.pid);
+		if (!daemonStopIntent.permitsAdoption(refreshEpoch)) return daemonStatus;
 		const appOwned = shouldLinkOnAttach(owner);
 		daemonOwnership.setAppOwned(appOwned);
 		setDaemonStatus(status);
@@ -707,11 +716,9 @@ async function refreshDaemonStatus(): Promise<DaemonStatus> {
 			if (!daemonOwnership.hasSupervisorLink) establishSupervisorLink();
 		}
 	} else if (previousStatus.state === "ready" || (previousStatus.state === "error" && previousStatus.pid)) {
-		const loss = daemonOwnership.classifyAdoptedLoss(
-			await readCurrentRunFile(),
-			previousStatus.pid,
-			probeProcessLiveness,
-		);
+		const currentRunFile = await readCurrentRunFile();
+		if (!daemonStopIntent.permitsAdoption(refreshEpoch)) return daemonStatus;
+		const loss = daemonOwnership.classifyAdoptedLoss(currentRunFile, previousStatus.pid, probeProcessLiveness);
 		daemonRestart.onAdoptedLoss(loss);
 		if (loss === "still-running") {
 			setDaemonStatus({
@@ -742,7 +749,8 @@ async function refreshDaemonStatus(): Promise<DaemonStatus> {
 	return daemonStatus;
 }
 
-async function startDaemon(): Promise<DaemonStatus> {
+async function startDaemon(explicitStart = false): Promise<DaemonStatus> {
+	if (explicitStart) daemonStopIntent.allowExplicitStart();
 	if (daemonStartPromise) {
 		return daemonStartPromise;
 	}
@@ -828,6 +836,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		// A direct-port attach deliberately distrusts stale running.json ownership.
 		// Re-link only when the run-file PID names the daemon that answered the probe.
 		const portAttachOwner = await readValidatedDaemonOwner(directDaemon.pid);
+		if (startEpoch !== daemonStartEpoch || daemonStopIntent.stopping) return daemonStatus;
 		const appOwned = shouldLinkOnAttach(portAttachOwner);
 		daemonOwnership.setAppOwned(appOwned);
 		if (appOwned) {
@@ -864,7 +873,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		// PID as a last resort (a wedged daemon may not have written a fresh run-file).
 		const pidToKill = runFilePid ?? orphanProbe?.pid ?? null;
 		if (pidToKill) {
-			await terminateProcessTree(pidToKill);
+			await terminateProcess(pidToKill);
 		}
 		// Poll until the port is free (probe returns null) or 8 s elapses.
 		const TAKEOVER_TIMEOUT_MS = 8_000;
@@ -880,6 +889,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 			await rm(runFilePath_, { force: true });
 		}
 	}
+	if (startEpoch !== daemonStartEpoch || daemonStopIntent.stopping) return daemonStatus;
 
 	if (launch.source === "bundled" && !existsSync(launch.command)) {
 		daemonOwnership.clear();
@@ -1045,6 +1055,7 @@ function killDaemon(child: ChildProcessWithoutNullStreams): void {
 }
 
 async function stopDaemon(): Promise<DaemonStatus> {
+	daemonStopIntent.requestStop();
 	daemonRestart.cancel();
 	daemonStartEpoch += 1;
 	daemonStartPromise = null;
@@ -1064,6 +1075,20 @@ async function stopDaemon(): Promise<DaemonStatus> {
 	const ownedPID =
 		runFile.state === "present" && validatedDaemonOwner(runFile.info, previousPID) === "app" ? previousPID : undefined;
 	const port = daemonStatus.port;
+	const confirmStopped = async (): Promise<boolean> => {
+		const deadline = Date.now() + 7_000;
+		while (Date.now() < deadline) {
+			const currentRunFile = await readRunFileForStop();
+			if (
+				currentRunFile.state === "missing" ||
+				(previousPID !== undefined && probeProcessLiveness(previousPID) === "dead")
+			) {
+				return true;
+			}
+			await new Promise<void>((resolve) => setTimeout(resolve, 200));
+		}
+		return false;
+	};
 	const stopped = await stopAdoptedDaemon({
 		appOwned: daemonOwnership.appOwned,
 		alreadyStopped,
@@ -1073,7 +1098,8 @@ async function stopDaemon(): Promise<DaemonStatus> {
 			ownedPID !== undefined && port !== undefined
 				? requestAdoptedDaemonShutdown(port, ownedPID)
 				: Promise.resolve(false),
-		terminateProcess: terminateProcessTree,
+		confirmStopped,
+		terminateProcess,
 		clearOwnership: () => daemonOwnership.clear(),
 	});
 	if (stopped) {
@@ -1090,7 +1116,7 @@ async function stopDaemon(): Promise<DaemonStatus> {
 }
 
 ipcMain.handle("daemon:getStatus", () => refreshDaemonStatus());
-ipcMain.handle("daemon:start", () => startDaemon());
+ipcMain.handle("daemon:start", () => startDaemon(true));
 ipcMain.handle("daemon:stop", () => stopDaemon());
 ipcMain.handle("app:getVersion", () => app.getVersion());
 ipcMain.handle("app:openExternal", async (_event, url: string) => {

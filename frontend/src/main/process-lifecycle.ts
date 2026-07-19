@@ -25,15 +25,15 @@ export function probeProcessLiveness(
 	}
 }
 
-type TerminateProcessTreeOptions = {
+type TerminateProcessOptions = {
 	platform?: NodeJS.Platform;
 	signalProcess?: SignalProcess;
-	runTaskkill?: (pid: number) => Promise<void>;
+	runCommand?: (command: string, args: string[]) => Promise<void>;
 };
 
-function runTaskkill(pid: number): Promise<void> {
+function runCommand(command: string, args: string[]): Promise<void> {
 	return new Promise((resolve, reject) => {
-		execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, (error) => {
+		execFile(command, args, { windowsHide: true }, (error) => {
 			if (error) reject(error);
 			else resolve();
 		});
@@ -41,17 +41,19 @@ function runTaskkill(pid: number): Promise<void> {
 }
 
 /**
- * Start a cross-platform process-tree stop, or confirm that the PID is already
- * dead. Callers may report success once this returns true.
+ * Start a cross-platform stop for only the requested PID, or confirm that it is
+ * already dead. Session-host child processes must be left for reconciliation.
  */
-export async function terminateProcessTree(pid: number, options: TerminateProcessTreeOptions = {}): Promise<boolean> {
+export async function terminateProcess(pid: number, options: TerminateProcessOptions = {}): Promise<boolean> {
 	const signalProcess = options.signalProcess ?? process.kill.bind(process);
 	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
 	if (probeProcessLiveness(pid, signalProcess) === "dead") return true;
 
 	if ((options.platform ?? process.platform) === "win32") {
 		try {
-			await (options.runTaskkill ?? runTaskkill)(pid);
+			// Deliberately omit /T: ConPTY session hosts are daemon children and must
+			// survive daemon replacement so boot reconciliation can adopt them.
+			await (options.runCommand ?? runCommand)("taskkill", ["/PID", String(pid), "/F"]);
 			return true;
 		} catch {
 			return probeProcessLiveness(pid, signalProcess) === "dead";
@@ -59,14 +61,11 @@ export async function terminateProcessTree(pid: number, options: TerminateProces
 	}
 
 	try {
-		signalProcess(-pid, "SIGTERM");
+		// Adopted-daemon fallback targets only the daemon. Its session processes
+		// intentionally outlive it and are reconciled by the replacement daemon.
+		signalProcess(pid, "SIGTERM");
 		return true;
 	} catch {
-		try {
-			signalProcess(pid, "SIGTERM");
-			return true;
-		} catch {
-			return probeProcessLiveness(pid, signalProcess) === "dead";
-		}
+		return probeProcessLiveness(pid, signalProcess) === "dead";
 	}
 }

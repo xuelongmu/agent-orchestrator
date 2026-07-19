@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
-import { probeProcessLiveness, terminateProcessTree } from "./process-lifecycle";
+import { probeProcessLiveness, terminateProcess } from "./process-lifecycle";
 
 function errno(code: string): NodeJS.ErrnoException {
 	return Object.assign(new Error(code), { code });
@@ -26,25 +26,23 @@ describe("probeProcessLiveness", () => {
 	});
 });
 
-describe("terminateProcessTree", () => {
-	it("uses taskkill for a live Windows process tree", async () => {
+describe("terminateProcess", () => {
+	it("uses taskkill without the child-tree flag for a live Windows daemon", async () => {
 		const signalProcess = vi.fn(() => true);
-		const runTaskkill = vi.fn(async () => undefined);
+		const runCommand = vi.fn(async () => undefined);
 
-		await expect(terminateProcessTree(42, { platform: "win32", signalProcess, runTaskkill })).resolves.toBe(true);
-		expect(runTaskkill).toHaveBeenCalledWith(42);
+		await expect(terminateProcess(42, { platform: "win32", signalProcess, runCommand })).resolves.toBe(true);
+		expect(runCommand).toHaveBeenCalledWith("taskkill", ["/PID", "42", "/F"]);
+		expect(runCommand.mock.calls[0]?.[1]).not.toContain("/T");
 		expect(signalProcess).toHaveBeenCalledWith(42, 0);
 	});
 
-	it("signals the process group on POSIX with a direct-PID fallback", async () => {
-		const signalProcess = vi.fn((pid: number) => {
-			if (pid < 0) throw errno("ESRCH");
-			return true;
-		});
+	it("signals only the daemon PID on POSIX", async () => {
+		const signalProcess = vi.fn(() => true);
 
-		await expect(terminateProcessTree(42, { platform: "linux", signalProcess })).resolves.toBe(true);
+		await expect(terminateProcess(42, { platform: "linux", signalProcess })).resolves.toBe(true);
 		expect(signalProcess).toHaveBeenNthCalledWith(1, 42, 0);
-		expect(signalProcess).toHaveBeenNthCalledWith(2, -42, "SIGTERM");
-		expect(signalProcess).toHaveBeenNthCalledWith(3, 42, "SIGTERM");
+		expect(signalProcess).toHaveBeenNthCalledWith(2, 42, "SIGTERM");
+		expect(signalProcess).not.toHaveBeenCalledWith(-42, "SIGTERM");
 	});
 });

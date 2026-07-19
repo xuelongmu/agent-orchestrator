@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	DaemonOwnershipController,
 	DaemonRestartController,
+	DaemonStopIntentController,
 	isCrashLikeDaemonExit,
 	resolveReachableDaemon,
 	stopAdoptedDaemon,
@@ -106,6 +107,23 @@ describe("DaemonRestartController", () => {
 		await vi.advanceTimersByTimeAsync(100);
 
 		expect(restart).toHaveBeenCalledTimes(1);
+	});
+
+	it("cancels a scheduled restart when the adopted PID is later found live without replenishing budget", async () => {
+		const onExhausted = vi.fn();
+		const { controller, restart } = createController({ maxRestarts: 1, onExhausted });
+
+		controller.onUnexpectedExit();
+		controller.onAdoptedLoss("still-running");
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(restart).not.toHaveBeenCalled();
+
+		controller.onUnexpectedExit();
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(restart).not.toHaveBeenCalled();
+		expect(onExhausted).toHaveBeenCalledTimes(1);
 	});
 
 	it("does not reset the retry budget when readiness is followed by another quick crash", async () => {
@@ -269,6 +287,20 @@ describe("daemon restart ownership and reachability", () => {
 });
 
 describe("adopted daemon stop", () => {
+	it("invalidates an in-flight refresh and suppresses re-adoption until an explicit start", () => {
+		const intent = new DaemonStopIntentController();
+		const inFlightRefreshEpoch = intent.currentEpoch;
+
+		intent.requestStop();
+
+		expect(intent.permitsAdoption(inFlightRefreshEpoch)).toBe(false);
+		expect(intent.permitsAdoption()).toBe(false);
+
+		intent.allowExplicitStart();
+		expect(intent.permitsAdoption()).toBe(true);
+		expect(intent.permitsAdoption(inFlightRefreshEpoch)).toBe(false);
+	});
+
 	it("falls back to the owned PID before clearing a disconnected supervisor link", async () => {
 		const events: string[] = [];
 		const stopped = await stopAdoptedDaemon({
@@ -280,6 +312,7 @@ describe("adopted daemon stop", () => {
 				events.push("shutdown-request");
 				return false;
 			},
+			confirmStopped: async () => true,
 			terminateProcess: async (pid) => {
 				events.push(`terminate-${pid}`);
 				return true;
@@ -299,6 +332,7 @@ describe("adopted daemon stop", () => {
 			supervisorConnected: false,
 			pid: 42,
 			requestShutdown: async () => false,
+			confirmStopped: async () => false,
 			terminateProcess: async () => false,
 			clearOwnership,
 		});
@@ -307,22 +341,37 @@ describe("adopted daemon stop", () => {
 		expect(clearOwnership).not.toHaveBeenCalled();
 	});
 
-	it("releases a connected supervisor link after the HTTP path is unavailable", async () => {
-		const clearOwnership = vi.fn();
-		const terminateProcess = vi.fn();
-		const stopped = await stopAdoptedDaemon({
+	it("waits for a connected supervisor stop to complete before reporting success", async () => {
+		const events: string[] = [];
+		let confirmStop: (stopped: boolean) => void = () => undefined;
+		const confirmation = new Promise<boolean>((resolve) => {
+			confirmStop = resolve;
+		});
+		const terminateProcess = vi.fn(async () => true);
+		let settled = false;
+		const stopPromise = stopAdoptedDaemon({
 			appOwned: true,
 			alreadyStopped: false,
 			supervisorConnected: true,
 			pid: 42,
 			requestShutdown: async () => false,
+			confirmStopped: () => confirmation,
 			terminateProcess,
-			clearOwnership,
+			clearOwnership: () => events.push("clear"),
+		}).then((result) => {
+			settled = true;
+			return result;
 		});
+		await Promise.resolve();
+		await Promise.resolve();
 
-		expect(stopped).toBe(true);
-		expect(clearOwnership).toHaveBeenCalledTimes(1);
+		expect(events).toEqual(["clear"]);
+		expect(settled).toBe(false);
 		expect(terminateProcess).not.toHaveBeenCalled();
+
+		confirmStop(true);
+		await expect(stopPromise).resolves.toBe(true);
+		expect(settled).toBe(true);
 	});
 });
 
