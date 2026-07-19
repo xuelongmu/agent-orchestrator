@@ -37,9 +37,11 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 		_ = ownerWrite.Close()
 	case <-ctx.Done():
 		_ = ownerWrite.Close()
+		// Kill while the leader is still retained by os/exec. Sending a
+		// numeric group signal after Wait can target a reused PGID.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		err = <-wait
 	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	if ctx.Err() != nil {
 		return RunResult{ExitCode: -1}, ctx.Err()
 	}
@@ -47,6 +49,13 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 }
 
 func runHostedProcess(argv []string, owner io.Reader, stdout, stderr io.Writer) int {
+	descendants, ownerErr := newVerificationDescendantOwner()
+	if ownerErr != nil {
+		_, _ = io.WriteString(stderr, "prepare verification descendant ownership: "+ownerErr.Error()+"\n")
+		return 126
+	}
+	defer descendants.Close()
+
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.Env = targetEnvironment()
@@ -60,15 +69,22 @@ func runHostedProcess(argv []string, owner io.Reader, stdout, stderr io.Writer) 
 	select {
 	case err = <-wait:
 	case <-ownershipCanceled(owner):
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		killVerificationProcessGroup(cmd.Process.Pid)
 		err = <-wait
 	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	if cleanupErr := descendants.Terminate(cmd.Process.Pid); cleanupErr != nil {
+		_, _ = io.WriteString(stderr, "terminate verification descendants: "+cleanupErr.Error()+"\n")
+		return 126
+	}
 	result, resultErr := processResult(err)
 	if resultErr != nil {
 		return 126
 	}
 	return result.ExitCode
+}
+
+func killVerificationProcessGroup(pid int) {
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
 func processResult(err error) (RunResult, error) {

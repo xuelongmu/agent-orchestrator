@@ -98,10 +98,18 @@ therefore outside the worker ConPTY process tree and cannot run before Windows
 containment is established. A restarted daemon does not adopt an earlier run:
 it allocates the next log number and applies the same retention cleanup.
 
-Unix process groups contain ordinary child and grandchild processes, including
-when the daemon exits unexpectedly. A deliberately hostile verifier descendant
-can call `setsid(2)` to leave that process group and is not yet covered;
-portable Darwin job-style containment is not available. This limitation is
-tracked in [#149](https://github.com/xuelongmu/agent-orchestrator/issues/149),
-so operator policy must approve only trusted verification tools. Windows Job
-Object containment does not have this gap.
+The descendant ownership guarantee is platform-specific:
+
+| Platform | Supported ownership guarantee |
+| --- | --- |
+| Linux | The guardian is a kernel child subreaper. After killing the target process group, it adopts, enumerates through procfs, kills, and reaps descendants that called `setsid(2)` or otherwise left the PGID. This applies on request cancellation, normal target-parent completion, and daemon exit while the guardian remains runnable. Verification refuses to start if the required subreaper or procfs support is unavailable. |
+| macOS | The guardian owns only the target process group. A descendant that calls `setsid(2)` or reparents is outside the supported guarantee and can survive cancellation, target-parent completion, or daemon exit. Darwin exposes no public, unprivileged subreaper, job object, or container primitive for this use; XNU rejects the otherwise promising `EVFILT_PROC` `NOTE_TRACK` flag with `ENOTSUP`. Operator policy must therefore approve only trusted verification tools on macOS. |
+| Windows | The kill-on-close Job Object owns the complete verifier process tree, including descendants that create another process group. |
+
+On every platform, unrelated worker processes are siblings of the dedicated
+guardian and are never included in verifier ownership. On Unix, an
+uncatchable `SIGKILL` delivered to the guardian itself is outside the guarantee:
+neither the Linux subreaper nor a Darwin process group is a persistent
+container after its owner is gone. This is distinct from daemon death: the
+daemon-to-guardian ownership pipe is designed to let the still-running guardian
+perform cleanup when the daemon exits unexpectedly.
