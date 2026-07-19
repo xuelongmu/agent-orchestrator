@@ -60,10 +60,12 @@ sql:
             go_type:
               import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"
               type: "SessionID"
+              pointer: true
           - column: "notifications.project_id"
             go_type:
               import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"
               type: "ProjectID"
+              pointer: true
           - column: "notifications.type"
             go_type:
               import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"

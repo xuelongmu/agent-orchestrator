@@ -29,7 +29,7 @@ const (
 var (
 	ErrNotFound         = ports.ErrSCMNotFound
 	ErrPermissionDenied = ports.ErrSCMPermissionDenied
-	ErrAuthFailed       = errors.New("github scm: authentication failed")
+	ErrAuthFailed       = fmt.Errorf("github scm: authentication failed: %w", ports.ErrSCMAuthentication)
 	ErrRateLimited      = errors.New("github scm: rate limited")
 )
 

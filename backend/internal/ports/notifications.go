@@ -1,14 +1,22 @@
 package ports
 
 import (
+	"context"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
-// NotificationIntent is the lifecycle-to-notification-producer contract. It is
-// not an HTTP DTO; lifecycle fills it from facts it already has after the
-// underlying session/PR state write succeeds.
+// NotificationSink is the shared write-side boundary for user-facing
+// notifications. Producers submit intents without depending on persistence or
+// live-delivery details; the daemon wires them to the notify pipeline.
+type NotificationSink interface {
+	Notify(ctx context.Context, intent NotificationIntent) error
+}
+
+// NotificationIntent is the producer-to-notification-pipeline contract. It is
+// not an HTTP DTO. Session lifecycle producers fill the session/project fields;
+// daemon-wide control-plane producers deliberately leave them empty.
 type NotificationIntent struct {
 	Type      domain.NotificationType
 	SessionID domain.SessionID

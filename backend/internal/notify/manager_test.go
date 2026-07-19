@@ -89,6 +89,28 @@ func TestManagerNotifyUsesHumanHandoffCopy(t *testing.T) {
 	}
 }
 
+func TestManagerNotifyPersistsDaemonScopedControlPlaneIntent(t *testing.T) {
+	st := &fakeStore{}
+	now := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+	mgr := New(Deps{Store: st, Clock: func() time.Time { return now }, NewID: func() string { return "ntf_control" }})
+
+	if err := mgr.Notify(context.Background(), Intent{
+		Type:          domain.NotificationControlPlaneFailed,
+		TitleOverride: "GitHub authentication needs attention",
+		BodyOverride:  "Run `gh auth login` and restart AO.",
+	}); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+
+	if len(st.rows) != 1 {
+		t.Fatalf("stored rows = %d, want 1", len(st.rows))
+	}
+	got := st.rows[0]
+	if got.ID != "ntf_control" || got.SessionID != "" || got.ProjectID != "" || got.Type != domain.NotificationControlPlaneFailed {
+		t.Fatalf("stored control notification = %#v", got)
+	}
+}
+
 func TestManagerNotifyRejectsUnknownType(t *testing.T) {
 	mgr := New(Deps{Store: &fakeStore{}, Clock: func() time.Time { return time.Now() }})
 	err := mgr.Notify(context.Background(), Intent{Type: "surprise", SessionID: "mer-1", ProjectID: "mer"})
@@ -110,5 +132,41 @@ func TestHubProjectFilter(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected filtered notification")
+	}
+}
+
+func TestHubBroadcastsControlPlaneNotificationsWithoutWeakeningProjectIsolation(t *testing.T) {
+	hub := NewHub()
+	merCh, unsubscribeMer := hub.Subscribe("mer")
+	defer unsubscribeMer()
+	aoCh, unsubscribeAO := hub.Subscribe("ao")
+	defer unsubscribeAO()
+
+	_ = hub.Publish(context.Background(), domain.NotificationRecord{ID: "mer-only", Type: domain.NotificationNeedsInput, ProjectID: "mer"})
+	select {
+	case got := <-merCh:
+		if got.ID != "mer-only" {
+			t.Fatalf("project notification = %+v", got)
+		}
+	default:
+		t.Fatal("matching project subscriber did not receive ordinary notification")
+	}
+	select {
+	case got := <-aoCh:
+		t.Fatalf("other project subscriber received ordinary notification: %+v", got)
+	default:
+	}
+
+	control := domain.NotificationRecord{ID: "control", Type: domain.NotificationControlPlaneFailed}
+	_ = hub.Publish(context.Background(), control)
+	for project, ch := range map[string]<-chan domain.NotificationRecord{"mer": merCh, "ao": aoCh} {
+		select {
+		case got := <-ch:
+			if got.ID != control.ID {
+				t.Fatalf("%s control notification = %+v", project, got)
+			}
+		default:
+			t.Fatalf("%s project subscriber did not receive daemon control notification", project)
+		}
 	}
 }

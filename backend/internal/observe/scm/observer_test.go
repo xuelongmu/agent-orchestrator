@@ -65,6 +65,16 @@ func (s *captureTelemetrySink) Emit(_ context.Context, ev ports.TelemetryEvent) 
 
 func (s *captureTelemetrySink) Close(context.Context) error { return nil }
 
+type captureNotificationSink struct {
+	intents []ports.NotificationIntent
+	err     error
+}
+
+func (s *captureNotificationSink) Notify(_ context.Context, intent ports.NotificationIntent) error {
+	s.intents = append(s.intents, intent)
+	return s.err
+}
+
 func (s *fakeStore) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error) {
 	if s.listHook != nil {
 		s.listHook()
@@ -180,6 +190,7 @@ type fakeProvider struct {
 	checkGuards  map[string]ports.SCMGuardResult
 	openPRs      map[string][]ports.SCMPRObservation
 	listErr      error
+	repoGuardErr error
 	observations map[string]ports.SCMObservation
 	reviews      map[string]ports.SCMReviewObservation
 	logTails     map[string]string
@@ -243,7 +254,7 @@ func (p *fakeProvider) RepoPRListGuard(_ context.Context, repo ports.SCMRepo, _ 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.repoGuardCalls++
-	return p.repoGuards[prKey(repo, 0)], nil
+	return p.repoGuards[prKey(repo, 0)], p.repoGuardErr
 }
 func (p *fakeProvider) ListOpenPRsByRepo(_ context.Context, repo ports.SCMRepo) ([]ports.SCMPRObservation, error) {
 	p.mu.Lock()
@@ -562,6 +573,181 @@ func TestPollDoesNotDegradeHealthForShutdownCancellation(t *testing.T) {
 	}
 }
 
+func TestPollFirstFailureNotifiesControlPlaneTransition(t *testing.T) {
+	now := time.Unix(4_000, 0).UTC()
+	notifications := &captureNotificationSink{}
+	telemetry := &captureTelemetrySink{}
+	observer := New(nil, nil, nil, Config{
+		Clock:         func() time.Time { return now },
+		Logger:        quietSlog(),
+		Telemetry:     telemetry,
+		Notifications: notifications,
+	})
+	pollErr := errors.New("database unavailable")
+
+	if err := observer.runPoll(context.Background(), func(context.Context) error { return pollErr }); !errors.Is(err, pollErr) {
+		t.Fatalf("runPoll error = %v, want original poll error", err)
+	}
+
+	if len(notifications.intents) != 1 {
+		t.Fatalf("notifications = %d, want 1", len(notifications.intents))
+	}
+	intent := notifications.intents[0]
+	if intent.Type != domain.NotificationControlPlaneFailed || intent.SessionID != "" || intent.ProjectID != "" {
+		t.Fatalf("intent = %#v, want daemon-scoped first-failure notification", intent)
+	}
+	if len(telemetry.events) != 1 || telemetry.events[0].Level != ports.TelemetryLevelError || telemetry.events[0].Payload["health_status"] != "error" {
+		t.Fatalf("failure telemetry = %#v", telemetry.events)
+	}
+}
+
+func TestPollRepeatedFailuresThrottleAndEscalateOnce(t *testing.T) {
+	now := time.Unix(5_000, 0).UTC()
+	notifications := &captureNotificationSink{}
+	observer := New(nil, nil, nil, Config{
+		Clock:         func() time.Time { return now },
+		Logger:        quietSlog(),
+		Notifications: notifications,
+	})
+
+	for failure := 1; failure <= 7; failure++ {
+		now = now.Add(time.Second)
+		_ = observer.runPoll(context.Background(), func(context.Context) error { return errors.New("still down") })
+	}
+
+	if len(notifications.intents) != 2 {
+		t.Fatalf("notifications = %d, want first failure plus one escalation: %#v", len(notifications.intents), notifications.intents)
+	}
+	if notifications.intents[0].Type != domain.NotificationControlPlaneFailed || notifications.intents[1].Type != domain.NotificationControlPlaneEscalated {
+		t.Fatalf("notification types = %q, %q", notifications.intents[0].Type, notifications.intents[1].Type)
+	}
+	if !strings.Contains(notifications.intents[1].BodyOverride, "3 polls in a row") {
+		t.Fatalf("escalation body = %q, want threshold count", notifications.intents[1].BodyOverride)
+	}
+}
+
+func TestPollRecoveryNotifiesOnceAndResetsEpisode(t *testing.T) {
+	now := time.Unix(6_000, 0).UTC()
+	notifications := &captureNotificationSink{}
+	observer := New(nil, nil, nil, Config{
+		Clock:         func() time.Time { return now },
+		Logger:        quietSlog(),
+		Notifications: notifications,
+	})
+	_ = observer.runPoll(context.Background(), func(context.Context) error { return errors.New("down") })
+	_ = observer.runPoll(context.Background(), func(context.Context) error { return errors.New("down") })
+	_ = observer.runPoll(context.Background(), func(context.Context) error { return nil })
+	_ = observer.runPoll(context.Background(), func(context.Context) error { return nil })
+
+	if len(notifications.intents) != 2 {
+		t.Fatalf("notifications = %d, want failure and one recovery: %#v", len(notifications.intents), notifications.intents)
+	}
+	recovery := notifications.intents[1]
+	if recovery.Type != domain.NotificationControlPlaneRecovered || !strings.Contains(recovery.BodyOverride, "after 2 failed polls") {
+		t.Fatalf("recovery = %#v", recovery)
+	}
+	if observer.consecutiveFailures != 0 || observer.failureWasAuth {
+		t.Fatalf("episode state not reset: failures=%d auth=%v", observer.consecutiveFailures, observer.failureWasAuth)
+	}
+}
+
+func TestPollGitHubAuthClassificationIsActionableAndRedacted(t *testing.T) {
+	now := time.Unix(7_000, 0).UTC()
+	notifications := &captureNotificationSink{}
+	telemetry := &captureTelemetrySink{}
+	observer := New(nil, nil, nil, Config{
+		Clock:         func() time.Time { return now },
+		Logger:        quietSlog(),
+		Telemetry:     telemetry,
+		Notifications: notifications,
+	})
+	secret := "ghp_super_secret_token"
+	authErr := fmt.Errorf("%w: Bad credentials at https://oauth2:%s@github.com", ports.ErrSCMAuthentication, secret)
+
+	_ = observer.runPoll(context.Background(), func(context.Context) error { return authErr })
+
+	if len(notifications.intents) != 1 {
+		t.Fatalf("notifications = %d, want 1", len(notifications.intents))
+	}
+	intent := notifications.intents[0]
+	messageCopy := intent.TitleOverride + "\n" + intent.BodyOverride
+	for _, want := range []string{"AO_GITHUB_TOKEN", "GITHUB_TOKEN", "take precedence", "gh auth login"} {
+		if !strings.Contains(messageCopy, want) {
+			t.Fatalf("auth notification missing %q: %q", want, messageCopy)
+		}
+	}
+	if !strings.Contains(strings.ToLower(messageCopy), "github authentication") {
+		t.Fatalf("auth notification is not actionable: %q", messageCopy)
+	}
+	for _, forbidden := range []string{secret, "oauth2", "Bad credentials", authErr.Error()} {
+		if strings.Contains(messageCopy, forbidden) {
+			t.Fatalf("auth notification leaked %q: %q", forbidden, messageCopy)
+		}
+	}
+	if got := safePollError(authErr); got != ports.ErrSCMAuthentication.Error() || strings.Contains(got, secret) {
+		t.Fatalf("safePollError = %q", got)
+	}
+	if got := telemetry.events[0].Payload["reason"]; got != "github_authentication" {
+		t.Fatalf("telemetry reason = %#v, want github_authentication", got)
+	}
+}
+
+func TestPollRoutesProviderAuthenticationFailureToControlPlaneNotifier(t *testing.T) {
+	store := testStoreWithSession()
+	local := knownPR(1)
+	local.Review = domain.ReviewChangesRequest
+	store.prs["p-1"] = []domain.PullRequest{local}
+	provider := &fakeProvider{
+		repoGuards:   map[string]ports.SCMGuardResult{},
+		repoGuardErr: fmt.Errorf("%w: Bad credentials", ports.ErrSCMAuthentication),
+	}
+	notifications := &captureNotificationSink{}
+	lifecycle := &fakeLifecycle{}
+	observer := New(provider, store, lifecycle, Config{
+		Clock:         func() time.Time { return time.Unix(7_100, 0).UTC() },
+		Logger:        quietSlog(),
+		Notifications: notifications,
+	})
+
+	err := observer.Poll(context.Background())
+	if !errors.Is(err, ports.ErrSCMAuthentication) {
+		t.Fatalf("Poll error = %v, want provider-neutral auth classification", err)
+	}
+	if len(notifications.intents) != 1 || notifications.intents[0].Type != domain.NotificationControlPlaneFailed || !strings.Contains(notifications.intents[0].BodyOverride, "gh auth login") {
+		t.Fatalf("notifications = %#v", notifications.intents)
+	}
+	if provider.listCalls != 0 {
+		t.Fatalf("open PR list calls = %d, want auth guard to stop provider work", provider.listCalls)
+	}
+	if len(lifecycle.reviewFetchFailures) != 1 || lifecycle.reviewFetchFailures[0].PR.URL != local.URL {
+		t.Fatalf("authentication fallback = %#v, want durable local PR %s", lifecycle.reviewFetchFailures, local.URL)
+	}
+}
+
+func TestPollNotifierFailureIsIsolatedAndRedacted(t *testing.T) {
+	now := time.Unix(8_000, 0).UTC()
+	secret := "hook-secret"
+	notifications := &captureNotificationSink{err: fmt.Errorf("post https://%s@example.test: refused", secret)}
+	buf := &syncBuffer{}
+	observer := New(nil, nil, nil, Config{
+		Clock:         func() time.Time { return now },
+		Logger:        slog.New(slog.NewTextHandler(buf, nil)),
+		Notifications: notifications,
+	})
+	pollErr := errors.New("poll failed")
+
+	err := observer.runPoll(context.Background(), func(context.Context) error { return pollErr })
+	if !errors.Is(err, pollErr) {
+		t.Fatalf("runPoll error = %v, want original poll error", err)
+	}
+	if strings.Contains(buf.String(), secret) {
+		t.Fatalf("notifier diagnostic leaked credentials:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "notifier_failed") {
+		t.Fatalf("missing isolated notifier diagnostic:\n%s", buf.String())
+	}
+}
+
 func TestPollRetriesDurableMergedCleanupBeforeProviderRefresh(t *testing.T) {
 	store := testStoreWithSession()
 	store.sessions[0].Metadata.MergedCleanupPending = true
@@ -757,23 +943,46 @@ func TestPoll_DisablesOnceWhenCredentialsUnavailable(t *testing.T) {
 	}
 }
 
-func TestPoll_RetriesTransientCredentialErrors(t *testing.T) {
+func TestPoll_CredentialProbeErrorsRetryEscalateAndRecover(t *testing.T) {
 	store := testStoreWithSession()
+	notifications := &captureNotificationSink{}
 	provider := &fakeProvider{
 		credentialGate: true,
 		credentialErr:  errors.New("gh auth token failed transiently"),
 		repoGuards:     map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v1"}},
 		observations:   map[string]ports.SCMObservation{},
 	}
-	obs := newTestObserver(store, provider, &fakeLifecycle{}, time.Unix(1, 0).UTC())
-	if err := obs.Poll(context.Background()); err != nil {
-		t.Fatal(err)
+	obs := New(provider, store, &fakeLifecycle{}, Config{
+		Clock:         func() time.Time { return time.Unix(1, 0).UTC() },
+		Tick:          time.Hour,
+		Logger:        quietSlog(),
+		Notifications: notifications,
+		CacheMax:      128,
+	})
+	for poll := 1; poll <= controlPlaneEscalationFailureCount; poll++ {
+		if err := obs.Poll(context.Background()); err != nil {
+			t.Fatalf("poll %d: %v", poll, err)
+		}
 	}
 	if obs.credentialsChecked || obs.disabled {
 		t.Fatalf("transient credential error should not commit checked/disabled: checked=%v disabled=%v", obs.credentialsChecked, obs.disabled)
 	}
-	if provider.credentialChecks != 1 || provider.repoGuardCalls != 0 {
-		t.Fatalf("first poll should check credentials only: checks=%d repoGuards=%d", provider.credentialChecks, provider.repoGuardCalls)
+	if provider.credentialChecks != controlPlaneEscalationFailureCount || provider.repoGuardCalls != 0 {
+		t.Fatalf("failed probes should retry without provider APIs: checks=%d repoGuards=%d", provider.credentialChecks, provider.repoGuardCalls)
+	}
+	if len(notifications.intents) != 2 || notifications.intents[0].Type != domain.NotificationControlPlaneFailed || notifications.intents[1].Type != domain.NotificationControlPlaneEscalated {
+		t.Fatalf("credential failure notifications = %#v, want first failure and one escalation", notifications.intents)
+	}
+	for _, intent := range notifications.intents {
+		notificationText := intent.TitleOverride + "\n" + intent.BodyOverride
+		for _, want := range []string{"AO_GITHUB_TOKEN", "GITHUB_TOKEN", "take precedence", "gh auth login"} {
+			if !strings.Contains(notificationText, want) {
+				t.Fatalf("credential failure notification missing %q: %q", want, notificationText)
+			}
+		}
+		if strings.Contains(notificationText, provider.credentialErr.Error()) {
+			t.Fatalf("credential failure notification leaked probe error: %q", notificationText)
+		}
 	}
 
 	provider.mu.Lock()
@@ -786,8 +995,11 @@ func TestPoll_RetriesTransientCredentialErrors(t *testing.T) {
 	if !obs.credentialsChecked || obs.disabled {
 		t.Fatalf("successful retry should commit checked without disabling: checked=%v disabled=%v", obs.credentialsChecked, obs.disabled)
 	}
-	if provider.credentialChecks != 2 || provider.repoGuardCalls != 1 {
+	if provider.credentialChecks != controlPlaneEscalationFailureCount+1 || provider.repoGuardCalls != 1 {
 		t.Fatalf("second poll should retry credentials and continue: checks=%d repoGuards=%d", provider.credentialChecks, provider.repoGuardCalls)
+	}
+	if len(notifications.intents) != 3 || notifications.intents[2].Type != domain.NotificationControlPlaneRecovered {
+		t.Fatalf("credential recovery notifications = %#v, want one recovery", notifications.intents)
 	}
 }
 

@@ -1043,6 +1043,9 @@ func TestObserve_AuthFailedSurfacesAsErrAuthFailed(t *testing.T) {
 	if !errors.Is(err, ErrAuthFailed) {
 		t.Fatalf("err = %v, want ErrAuthFailed", err)
 	}
+	if !errors.Is(err, ports.ErrSCMAuthentication) {
+		t.Fatalf("err = %v, want provider-neutral SCM authentication classification", err)
+	}
 	if obs.Fetched {
 		t.Fatalf("Fetched = true on auth-failed; want false")
 	}

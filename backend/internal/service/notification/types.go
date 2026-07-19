@@ -11,6 +11,8 @@ const (
 	TargetSession TargetKind = "session"
 	// TargetPR navigates to a pull request view.
 	TargetPR TargetKind = "pr"
+	// TargetControlPlane has no session navigation target.
+	TargetControlPlane TargetKind = "control_plane"
 )
 
 // Target is the service-facing navigation metadata for a notification.
