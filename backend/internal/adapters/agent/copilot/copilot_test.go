@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -606,6 +608,94 @@ func TestGetAgentHooksIgnoresSessionCopilotAgentInLinkedWorktreeCommonExclude(t 
 	}
 	if _, err := os.Stat(filepath.Join(worktreeGitDir, "info", "exclude")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("worktree-local exclude exists or stat failed: %v", err)
+	}
+}
+
+func TestIgnoreCopilotPathSerializesConcurrentCommonExcludeUpdates(t *testing.T) {
+	dir := t.TempDir()
+	commonGitDir := filepath.Join(dir, "repo", ".git")
+	if err := os.MkdirAll(filepath.Join(commonGitDir, "info"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(commonGitDir, "info", "exclude"), []byte("# existing\n/user-entry\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	workspaces := []string{filepath.Join(dir, "worktree-1"), filepath.Join(dir, "worktree-2")}
+	patterns := []string{"/.github/agents/ao-sess-1.agent.md", "/.github/agents/ao-sess-2.agent.md"}
+	for i, workspace := range workspaces {
+		worktreeGitDir := filepath.Join(commonGitDir, "worktrees", fmt.Sprintf("sess-%d", i+1))
+		if err := os.MkdirAll(worktreeGitDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(workspace, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(workspace, ".git"), []byte("gitdir: "+worktreeGitDir+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(worktreeGitDir, "commondir"), []byte("../..\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Hold the same cross-process lock used by ignoreCopilotPath so both
+	// goroutines queue before either can perform its read-modify-write.
+	unlock, err := lockCopilotExclude(filepath.Join(commonGitDir, "info", "exclude.ao.lock"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
+	blocked := make(chan struct{}, len(workspaces))
+	errs := make(chan error, len(workspaces))
+	var wg sync.WaitGroup
+	for i := range workspaces {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- ignoreCopilotPathWithLockContention(workspaces[i], patterns[i], func() {
+				blocked <- struct{}{}
+			})
+		}(i)
+	}
+	for range workspaces {
+		<-blocked
+	}
+	select {
+	case err := <-errs:
+		t.Fatalf("exclude update completed while common lock was held: %v", err)
+	default:
+	}
+	before, err := os.ReadFile(filepath.Join(commonGitDir, "info", "exclude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != "# existing\n/user-entry\n" {
+		t.Fatalf("exclude changed while common lock was held:\n%s", before)
+	}
+	unlock()
+	locked = false
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(commonGitDir, "info", "exclude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range append([]string{"/user-entry"}, patterns...) {
+		if count := strings.Count(string(data), want+"\n"); count != 1 {
+			t.Fatalf("exclude entry %q count = %d, want 1:\n%s", want, count, data)
+		}
 	}
 }
 
