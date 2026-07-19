@@ -77,7 +77,9 @@ import { Accordions, Accordion } from "fumadocs-ui/components/accordion";
 </Accordion>
 
   <Accordion title="How do I completely uninstall?">
-    `npm uninstall -g @aoagents/ao`, then `rm -rf ~/.ao` if you want to wipe all state stored in the default
-    location. If you set `AO_DATA_DIR`, remove that directory separately; if you set `AO_RUN_FILE`, remove that file too.
+    Uninstall the Agent Orchestrator desktop app using your operating system's normal app-removal flow. If you installed
+    the frozen npm launcher, also run `npm uninstall -g @aoagents/ao`. Remove `~/.ao` if you want to wipe all state stored
+    in the default location. If you set `AO_DATA_DIR`, remove that directory separately; if you set `AO_RUN_FILE`, remove
+    both that file and the sibling `app-state.json` marker.
   </Accordion>
 </Accordions>
