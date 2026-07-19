@@ -39,19 +39,30 @@ type reviewRunResponse struct {
 
 // submitReviewItem mirrors controllers.SubmitReviewItem.
 type submitReviewItem struct {
-	RunID          string `json:"runId"`
-	Verdict        string `json:"verdict"`
-	Body           string `json:"body,omitempty"`
-	GithubReviewID string `json:"githubReviewId,omitempty"`
+	RunID          string              `json:"runId"`
+	Verdict        string              `json:"verdict"`
+	Body           string              `json:"body,omitempty"`
+	GithubReviewID string              `json:"githubReviewId,omitempty"`
+	Findings       []submitFindingItem `json:"findings,omitempty"`
+}
+
+type submitFindingItem struct {
+	File          string `json:"file,omitempty"`
+	ClassTag      string `json:"classTag"`
+	RootCauseNote string `json:"rootCauseNote"`
+	ThreadID      string `json:"threadId,omitempty"`
+	Body          string `json:"body,omitempty"`
+	OutOfScope    bool   `json:"outOfScope,omitempty"`
 }
 
 // submitReviewRequest mirrors controllers.SubmitReviewInput.
 type submitReviewRequest struct {
-	RunID          string             `json:"runId,omitempty"`
-	Verdict        string             `json:"verdict,omitempty"`
-	Body           string             `json:"body,omitempty"`
-	GithubReviewID string             `json:"githubReviewId,omitempty"`
-	Reviews        []submitReviewItem `json:"reviews,omitempty"`
+	RunID          string              `json:"runId,omitempty"`
+	Verdict        string              `json:"verdict,omitempty"`
+	Body           string              `json:"body,omitempty"`
+	GithubReviewID string              `json:"githubReviewId,omitempty"`
+	Findings       []submitFindingItem `json:"findings,omitempty"`
+	Reviews        []submitReviewItem  `json:"reviews,omitempty"`
 }
 
 type reviewSubmitOptions struct {

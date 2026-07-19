@@ -85,6 +85,7 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 		model: config.agentConfig?.model ?? "",
 		permissions: config.agentConfig?.permissions ?? "",
 		reviewerHarness: config.reviewers?.[0]?.harness ?? "",
+		outOfScopeDeflection: config.reviewPolicy?.outOfScopeDeflection ?? false,
 		intakeEnabled: intake.enabled ?? false,
 		intakeRepo: intake.repo ?? "",
 		intakeAssignee: intake.assignee ?? "",
@@ -139,6 +140,9 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 					permissions: form.permissions || undefined,
 				}),
 				reviewers: form.reviewerHarness ? [{ harness: form.reviewerHarness }] : undefined,
+				...(form.outOfScopeDeflection || config.reviewPolicy
+					? { reviewPolicy: { ...config.reviewPolicy, outOfScopeDeflection: form.outOfScopeDeflection || undefined } }
+					: {}),
 				trackerIntake: buildIntake(intakeForm),
 			};
 			const { error } = await apiClient.PUT("/api/v1/projects/{id}/config", {
@@ -359,6 +363,20 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 							onChange={(v) => setForm((f) => ({ ...f, reviewerHarness: v }))}
 						/>
 					</Field>
+					<label className="flex items-start gap-2.5 text-control text-foreground">
+						<input
+							type="checkbox"
+							className="mt-0.5 size-icon-base accent-accent"
+							checked={form.outOfScopeDeflection}
+							onChange={(event) => setForm((current) => ({ ...current, outOfScopeDeflection: event.target.checked }))}
+						/>
+						<span>
+							Deflect out-of-scope findings
+							<span className="mt-1 block text-xs leading-row text-muted-foreground">
+								File a follow-up issue and resolve its review thread instead of starting another fix round.
+							</span>
+						</span>
+					</label>
 				</CardContent>
 			</Card>
 

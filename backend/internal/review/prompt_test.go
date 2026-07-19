@@ -31,6 +31,9 @@ func TestReviewTextsIncludesMultiPRQueue(t *testing.T) {
 		"do not use a heredoc",
 		"ao review submit --session mer-1 --reviews -",
 		`"reviews": [`,
+		`"classTag": "<root-cause-class>"`,
+		`"outOfScope": false`,
+		"query the PR's reviewThreads",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
@@ -50,5 +53,8 @@ func TestReviewTextsKeepsLowPriorityFindingsOutOfBlockingInlineThreads(t *testin
 	}
 	if !strings.Contains(systemPrompt, "Do not post P2/P3 findings as inline comments") {
 		t.Fatalf("system prompt does not keep low-priority findings non-blocking:\n%s", systemPrompt)
+	}
+	if !strings.Contains(systemPrompt, "stable lowercase kebab-case classTag") || !strings.Contains(systemPrompt, "rootCauseNote") {
+		t.Fatalf("system prompt does not require finding taxonomy:\n%s", systemPrompt)
 	}
 }

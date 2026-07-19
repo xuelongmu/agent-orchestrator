@@ -170,7 +170,7 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 		Launcher:        reviewcore.NewLauncher(reviewers, runtime),
 		RoundCapHandoff: lcm,
 	})
-	reviewSvc := reviewsvc.New(reviewEngine, store, reviewsvc.WithLifecycleReducer(lcm))
+	reviewSvc := reviewsvc.New(reviewEngine, store, reviewsvc.WithLifecycleReducer(lcm), reviewsvc.WithFindingDeflector(scmProvider))
 	return sessionSvc, reviewSvc, mgr, nil
 }
 
