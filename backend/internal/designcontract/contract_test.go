@@ -625,18 +625,6 @@ func TestMaterializeRefreshesOnlyGenuineAOProjectionsAcrossRestart(t *testing.T)
 	// A second call has no in-memory ownership state, matching refresh after a
 	// daemon restart. Deterministic ownership markers must allow the refresh.
 	refreshErr := MaterializePR(context.Background(), workspace, prURL, "second canonical")
-	if runtime.GOOS != "windows" {
-		if refreshErr == nil {
-			t.Fatal("refresh unexpectedly succeeded without an identity-conditional platform primitive")
-		}
-		for _, target := range []string{currentPath, keyedPath} {
-			got, err := os.ReadFile(target)
-			if err != nil || !strings.Contains(string(got), "first canonical") || strings.Contains(string(got), "second canonical") {
-				t.Fatalf("fail-closed projection %s changed: %q, %v", target, got, err)
-			}
-		}
-		return
-	}
 	if refreshErr != nil {
 		t.Fatal(refreshErr)
 	}
