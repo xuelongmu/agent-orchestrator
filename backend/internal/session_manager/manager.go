@@ -94,6 +94,10 @@ const (
 	EnvIssueID   = "AO_ISSUE_ID"
 	// EnvDataDir tells a spawned agent's AO hook commands where the store lives.
 	EnvDataDir = "AO_DATA_DIR"
+	// sharedDirCleanupPendingHandle is a durable lease marker used when a dir
+	// spawn installed hooks but failed before a runtime handle existed and hook
+	// rollback also failed. It is never passed to the runtime adapter.
+	sharedDirCleanupPendingHandle = "__ao_shared_dir_cleanup_pending__"
 )
 
 // hookBinaryName is the executable name the workspace hook commands invoke:
@@ -122,6 +126,13 @@ type runtimeController interface {
 // needs the contract.
 type inputPendingDetector interface {
 	IsInputPending(terminalOutput string) bool
+}
+
+// sharedDirHookScope lets adapters whose hooks are global explicitly reject
+// shared-directory sessions. Those hooks cannot be removed for one directory
+// owner without affecting unrelated sessions using the same global config.
+type sharedDirHookScope interface {
+	SupportsSharedDirHooks() bool
 }
 
 // Store is the persistence surface needed by the internal session Manager.
@@ -191,6 +202,11 @@ type Manager struct {
 	// sharedDirMu serializes the durable lease check with dir spawn/restore so
 	// concurrent requests cannot both observe the project directory as free.
 	sharedDirMu sync.Mutex
+	// cleanupRetries coalesces same-daemon retries for durable non-git cleanup
+	// markers left behind by a transient natural-completion failure.
+	cleanupRetryMu    sync.Mutex
+	cleanupRetries    map[domain.SessionID]struct{}
+	cleanupRetryDelay time.Duration
 }
 
 // sendConfirmConfig bounds the best-effort activity-confirmation loop run after
@@ -262,7 +278,9 @@ func New(d Deps) *Manager {
 			attemptDeadline: sendConfirmAttemptDeadline,
 			maxAttempts:     sendConfirmMaxAttempts,
 		},
-		logger: d.Logger,
+		logger:            d.Logger,
+		cleanupRetries:    make(map[domain.SessionID]struct{}),
+		cleanupRetryDelay: time.Second,
 	}
 	if m.clock == nil {
 		// UTC so spawn-stamped CreatedAt/UpdatedAt match every other session
@@ -319,6 +337,9 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		if _, ok := agent.(workspaceHookUninstaller); !ok {
 			return domain.SessionRecord{}, fmt.Errorf("spawn: %w: %s", ErrSharedDirUnsupported, cfg.Harness)
 		}
+		if scope, ok := agent.(sharedDirHookScope); ok && !scope.SupportsSharedDirHooks() {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: %w: %s uses global hooks", ErrSharedDirUnsupported, cfg.Harness)
+		}
 		m.sharedDirMu.Lock()
 		defer m.sharedDirMu.Unlock()
 		if err := m.ensureSharedDirAvailable(ctx, cfg.ProjectID, ""); err != nil {
@@ -371,9 +392,11 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	env := m.runtimeEnv(id, cfg.ProjectID, cfg.IssueID, project.Config.Env)
 	m.augmentAgentRuntimeEnv(agent, env)
 	if err := m.prepareWorkspace(ctx, agent, id, ws.WorkspaceKind.WithDefault(), ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
-		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: %w", id, err), cleanupErr)
 	}
 	launchCfg := ports.LaunchConfig{
 		DataDir:          m.dataDir,
@@ -389,27 +412,33 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	}
 	delivery, err := agent.GetPromptDeliveryStrategy(ctx, launchCfg)
 	if err != nil {
-		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: prompt delivery: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: prompt delivery: %w", id, err), cleanupErr)
 	}
 	if delivery == ports.PromptDeliveryAfterStart {
 		launchCfg.Prompt = ""
 	}
 	argv, err := agent.GetLaunchCommand(ctx, launchCfg)
 	if err != nil {
-		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: launch command: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: launch command: %w", id, err), cleanupErr)
 	}
 	// Pre-flight: confirm argv[0] actually exists on PATH (or as an absolute
 	// path the adapter returned) BEFORE handing the launch to the runtime.
 	// tmux happily creates a session+pane around a missing command, so an
 	// unresolved binary would leak through as a "live" session that never ran.
 	if err := m.validateAgentBinary(argv); err != nil {
-		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: %w", id, err), cleanupErr)
 	}
 	handle, err := m.runtime.Create(ctx, ports.RuntimeConfig{
 		SessionID:     id,
@@ -418,24 +447,30 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		Env:           env,
 	})
 	if err != nil {
-		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: runtime: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: runtime: %w", id, err), cleanupErr)
 	}
 
 	metadata := domain.SessionMetadata{WorkspaceKind: ws.WorkspaceKind.WithDefault(), Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, Prompt: prompt}
 	if err := m.lcm.MarkSpawned(ctx, id, metadata); err != nil {
 		_ = m.runtime.Destroy(ctx, handle)
-		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-		m.markSpawnFailedTerminated(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: completed: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.markSpawnFailedTerminated(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: completed: %w", id, err), cleanupErr)
 	}
 	if delivery == ports.PromptDeliveryAfterStart && prompt != "" {
 		if err := m.deliverAfterStartPrompt(ctx, agent, launchCfg, handle, id, prompt); err != nil {
 			_ = m.runtime.Destroy(ctx, handle)
-			m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-			m.markSpawnFailedTerminatedWithoutWorkspace(ctx, id)
-			return domain.SessionRecord{}, fmt.Errorf("spawn %s: deliver prompt: %w", id, err)
+			cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+			if cleanupErr == nil {
+				m.markSpawnFailedTerminatedWithoutWorkspace(ctx, id)
+			}
+			return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: deliver prompt: %w", id, err), cleanupErr)
 		}
 	}
 	return m.getRecord(ctx, id)
@@ -532,10 +567,41 @@ func (m *Manager) destroySpawnWorkspace(ctx context.Context, ws ports.WorkspaceI
 	return err == nil
 }
 
-func (m *Manager) rollbackPreparedSpawnWorkspace(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo) {
-	if m.destroySpawnWorkspace(ctx, ws, workspaceProject) {
-		m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
+func (m *Manager) rollbackPreparedSpawnWorkspace(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo) error {
+	if !m.destroySpawnWorkspace(ctx, ws, workspaceProject) {
+		return errors.New("spawn rollback: workspace teardown failed")
 	}
+	if err := m.cleanupAgentWorkspace(ctx, rec, ws.Path); err != nil {
+		if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+			return errors.Join(fmt.Errorf("spawn rollback: shared directory cleanup: %w", err), m.persistSharedDirCleanupPending(ctx, rec, ws.Path))
+		}
+		m.logger.Warn("spawn rollback: agent workspace cleanup failed", "sessionID", rec.ID, "workspacePath", ws.Path, "error", err)
+	}
+	return nil
+}
+
+func (m *Manager) persistSharedDirCleanupPending(ctx context.Context, rec domain.SessionRecord, workspacePath string) error {
+	latest, ok, err := m.store.GetSession(ctx, rec.ID)
+	if err != nil {
+		return fmt.Errorf("persist shared directory cleanup: load: %w", err)
+	}
+	if ok {
+		rec = latest
+	}
+	rec.Metadata.WorkspaceKind = domain.WorkspaceKindDir
+	rec.Metadata.WorkspacePath = workspacePath
+	if rec.Metadata.RuntimeHandleID == "" {
+		rec.Metadata.RuntimeHandleID = sharedDirCleanupPendingHandle
+	}
+	if err := m.store.UpdateSession(ctx, rec); err != nil {
+		return fmt.Errorf("persist shared directory cleanup: update: %w", err)
+	}
+	if !rec.IsTerminated {
+		if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
+			return fmt.Errorf("persist shared directory cleanup: mark terminated: %w", err)
+		}
+	}
+	return nil
 }
 
 // effectiveHarness resolves the harness for a spawn: an explicit harness wins;
@@ -688,13 +754,29 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 	if !ok {
 		return false, nil // already gone: benign race
 	}
-	if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+	dirWorkspace := rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir
+	expectedHandleID := rec.Metadata.RuntimeHandleID
+	if dirWorkspace {
 		// Serialize teardown with the spawn/restore lease check. A new shared-dir
 		// session must not install hooks until the previous session has fully
 		// uninstalled its workspace-local configuration and released its durable
 		// runtime-handle marker.
 		m.sharedDirMu.Lock()
 		defer m.sharedDirMu.Unlock()
+		latest, exists, readErr := m.store.GetSession(ctx, id)
+		if readErr != nil {
+			return false, fmt.Errorf("kill %s: claim shared directory cleanup: %w", id, readErr)
+		}
+		if !exists {
+			return false, nil
+		}
+		// The durable runtime handle is the cleanup ownership token. A duplicate
+		// teardown that waited behind the prior owner must not touch hooks a
+		// replacement session may already have installed in the shared path.
+		if expectedHandleID != latest.Metadata.RuntimeHandleID || latest.Metadata.RuntimeHandleID == "" && (latest.IsTerminated || !markTerminated) {
+			return false, nil
+		}
+		rec = latest
 	}
 	handle := runtimeHandle(rec.Metadata)
 	ws := workspaceInfo(rec)
@@ -710,9 +792,9 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 		workspaceProject = true
 	}
 
-	if handle.ID != "" {
+	if handle.ID != "" && handle.ID != sharedDirCleanupPendingHandle {
 		if err := m.runtime.Destroy(ctx, handle); err != nil {
-			if !completedNonGit {
+			if !completedNonGit || dirWorkspace {
 				return false, fmt.Errorf("kill %s: runtime: %w", id, err)
 			}
 			completedCleanupErrs = append(completedCleanupErrs, fmt.Errorf("runtime: %w", err))
@@ -757,11 +839,8 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 			completedCleanupErrs = append(completedCleanupErrs, fmt.Errorf("workspace: %w", err))
 		} else {
 			freed = true
-			if cleanupErr := m.cleanupAgentWorkspace(ctx, rec, ws.Path); cleanupErr != nil && rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
-				if !completedNonGit {
-					return false, fmt.Errorf("kill %s: shared directory cleanup: %w", id, cleanupErr)
-				}
-				completedCleanupErrs = append(completedCleanupErrs, fmt.Errorf("shared directory cleanup: %w", cleanupErr))
+			if cleanupErr := m.cleanupAgentWorkspace(ctx, rec, ws.Path); cleanupErr != nil && dirWorkspace {
+				return false, fmt.Errorf("kill %s: shared directory cleanup: %w", id, cleanupErr)
 			}
 		}
 	}
@@ -781,12 +860,24 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 		return false, fmt.Errorf("kill %s: %w", id, errors.Join(completedCleanupErrs...))
 	}
 	if rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
-		if err := m.clearCompletedRuntimeHandle(ctx, rec.ID); err != nil {
+		if err := m.clearCompletedRuntimeHandleIfOwned(ctx, rec.ID, handle.ID); err != nil {
 			return false, fmt.Errorf("kill %s: clear completed runtime handle: %w", id, err)
 		}
 	}
 	m.cleanupSystemPromptDir(id)
 	return freed, nil
+}
+
+func (m *Manager) clearCompletedRuntimeHandleIfOwned(ctx context.Context, id domain.SessionID, expected string) error {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return err
+	}
+	if rec.Metadata.RuntimeHandleID != expected {
+		return nil
+	}
+	rec.Metadata.RuntimeHandleID = ""
+	return m.store.UpdateSession(ctx, rec)
 }
 
 // CleanupMergedSession tears down only the resources of a merge-complete
@@ -862,6 +953,12 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 		return fmt.Errorf("retire replacement %s: %w", id, err)
 	}
 	if !ok || rec.IsTerminated {
+		return nil
+	}
+	if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+		if _, err := m.kill(ctx, id, true); err != nil {
+			return fmt.Errorf("retire replacement %s: shared directory teardown: %w", id, err)
+		}
 		return nil
 	}
 	if rec.Metadata.WorkspacePath == "" || (rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree && rec.Metadata.Branch == "") {
@@ -1025,13 +1122,14 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 	env := m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
 	m.augmentAgentRuntimeEnv(agent, env)
 	if err := m.prepareWorkspace(ctx, agent, rec.ID, ws.WorkspaceKind.WithDefault(), ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", rec.ID, err)
+		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
 	}
 	argv, delivery, err := restoreArgv(ctx, agent, rec.ID, ws.Path, rec.Metadata, systemPrompt, systemPromptFile, agentConfig, rec.Kind, rec.Harness, m.dataDir)
 	if err != nil {
-		m.cleanupPreparedAgentWorkspace(ctx, agent, rec.ID, ws.WorkspaceKind.WithDefault(), ws.Path, env)
+		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", rec.ID, err)
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
 	}
 	handle, err := m.runtime.Create(ctx, ports.RuntimeConfig{
 		SessionID:     rec.ID,
@@ -1040,16 +1138,16 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 		Env:           env,
 	})
 	if err != nil {
-		m.cleanupPreparedAgentWorkspace(ctx, agent, rec.ID, ws.WorkspaceKind.WithDefault(), ws.Path, env)
+		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: runtime: %w", rec.ID, err)
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: runtime: %w", rec.ID, err), cleanupErr)
 	}
 	metadata := domain.SessionMetadata{WorkspaceKind: ws.WorkspaceKind.WithDefault(), Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, AgentSessionID: rec.Metadata.AgentSessionID, Prompt: rec.Metadata.Prompt}
 	if err := m.lcm.MarkSpawned(ctx, rec.ID, metadata); err != nil {
 		_ = m.runtime.Destroy(ctx, handle)
-		m.cleanupPreparedAgentWorkspace(ctx, agent, rec.ID, ws.WorkspaceKind.WithDefault(), ws.Path, env)
+		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: completed: %w", rec.ID, err)
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: completed: %w", rec.ID, err), cleanupErr)
 	}
 	if delivery == ports.PromptDeliveryAfterStart && rec.Metadata.Prompt != "" {
 		launchCfg := ports.LaunchConfig{
@@ -1065,13 +1163,23 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 		}
 		if err := m.deliverAfterStartPrompt(ctx, agent, launchCfg, handle, rec.ID, rec.Metadata.Prompt); err != nil {
 			_ = m.runtime.Destroy(ctx, handle)
-			m.cleanupPreparedAgentWorkspace(ctx, agent, rec.ID, ws.WorkspaceKind.WithDefault(), ws.Path, env)
-			_ = m.lcm.MarkTerminated(ctx, rec.ID)
+			cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+			if cleanupErr == nil {
+				_ = m.lcm.MarkTerminated(ctx, rec.ID)
+			}
 			m.cleanupSystemPromptDir(rec.ID)
-			return domain.SessionRecord{}, fmt.Errorf("restore %s: deliver prompt: %w", rec.ID, err)
+			return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: deliver prompt: %w", rec.ID, err), cleanupErr)
 		}
 	}
 	return m.getRecord(ctx, rec.ID)
+}
+
+func (m *Manager) cleanupRestoredPreparation(ctx context.Context, rec domain.SessionRecord, agent ports.Agent, ws ports.WorkspaceInfo, env map[string]string) error {
+	cleanupErr := m.cleanupPreparedAgentWorkspace(ctx, agent, rec.ID, ws.WorkspaceKind.WithDefault(), ws.Path, env)
+	if cleanupErr == nil || ws.WorkspaceKind.WithDefault() != domain.WorkspaceKindDir {
+		return cleanupErr
+	}
+	return errors.Join(cleanupErr, m.persistSharedDirCleanupPending(ctx, rec, ws.Path))
 }
 
 func (m *Manager) getRecord(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error) {
@@ -2231,6 +2339,15 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 		if !rec.IsTerminated {
 			continue
 		}
+		if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+			if _, err := m.kill(ctx, rec.ID, false); err != nil {
+				m.logger.Warn("cleanup: shared directory teardown failed", "sessionID", rec.ID, "error", err)
+				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "shared directory teardown failed"})
+				continue
+			}
+			result.Cleaned = append(result.Cleaned, rec.ID)
+			continue
+		}
 		ws := workspaceInfo(rec)
 		if ws.Path == "" {
 			m.cleanupSystemPromptDir(rec.ID)
@@ -2768,30 +2885,28 @@ func (m *Manager) prepareWorkspace(ctx context.Context, agent ports.Agent, id do
 		SystemPromptFile: systemPromptFile,
 		Config:           agentConfig,
 	}); err != nil {
-		m.cleanupPreparedAgentWorkspace(ctx, agent, id, workspaceKind, workspacePath, env)
 		return fmt.Errorf("install hooks: %w", err)
 	}
 	if pl, ok := agent.(preLauncher); ok {
 		if err := pl.PreLaunch(ctx, ports.LaunchConfig{DataDir: m.dataDir, SessionID: string(id), WorkspacePath: workspacePath}); err != nil {
-			m.cleanupPreparedAgentWorkspace(ctx, agent, id, workspaceKind, workspacePath, env)
 			return fmt.Errorf("pre-launch: %w", err)
 		}
 	}
 	return nil
 }
 
-func (m *Manager) cleanupPreparedAgentWorkspace(ctx context.Context, agent ports.Agent, id domain.SessionID, workspaceKind domain.WorkspaceKind, workspacePath string, env map[string]string) {
+func (m *Manager) cleanupPreparedAgentWorkspace(ctx context.Context, agent ports.Agent, id domain.SessionID, workspaceKind domain.WorkspaceKind, workspacePath string, env map[string]string) error {
+	var cleanupErr error
 	if workspaceKind.WithDefault() == domain.WorkspaceKindDir {
 		if uninstaller, ok := agent.(workspaceHookUninstaller); ok {
 			if err := uninstaller.UninstallHooks(ctx, workspacePath); err != nil {
-				m.logger.Warn("session prepare rollback: failed to uninstall shared-directory hooks",
-					"session", id, "workspacePath", workspacePath, "error", err)
+				cleanupErr = fmt.Errorf("uninstall shared-directory hooks: %w", err)
 			}
 		}
 	}
 	cleaner, ok := agent.(workspaceCleaner)
 	if !ok {
-		return
+		return cleanupErr
 	}
 	if err := cleaner.CleanupWorkspace(ctx, ports.WorkspaceHookConfig{
 		SessionID:     string(id),
@@ -2801,7 +2916,11 @@ func (m *Manager) cleanupPreparedAgentWorkspace(ctx context.Context, agent ports
 	}); err != nil {
 		m.logger.Warn("session prepare rollback: failed to clean agent workspace state",
 			"session", id, "workspacePath", workspacePath, "error", err)
+		if cleanupErr == nil {
+			cleanupErr = fmt.Errorf("clean agent workspace state: %w", err)
+		}
 	}
+	return cleanupErr
 }
 
 func (m *Manager) cleanupAgentWorkspace(ctx context.Context, rec domain.SessionRecord, workspacePath string) error {
