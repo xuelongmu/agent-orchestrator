@@ -40,6 +40,12 @@ func newVerificationDescendantOwner() (*linuxVerificationDescendantOwner, error)
 func (*linuxVerificationDescendantOwner) Close() error { return nil }
 
 func (*linuxVerificationDescendantOwner) Terminate(targetPID int) error {
+	// Ensure ordinary in-group descendants are stopped as well. The pidfd
+	// cleanup below handles descendants which escaped with setsid.
+	killVerificationProcessGroup(targetPID)
+	// Give the kernel a scheduling/reparenting turn before observing adopted
+	// children; procfs can legitimately lag the group leader's exit.
+	time.Sleep(50 * time.Millisecond)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := reapExitedLinuxChildren(); err != nil {
