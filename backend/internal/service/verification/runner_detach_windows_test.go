@@ -27,6 +27,8 @@ func configureDetachedChild(cmd *exec.Cmd) {
 	}
 }
 
+func detachCurrentProcessSession() error { return nil }
+
 func TestWindowsNPMTargetUsesNodeWithoutCommandShell(t *testing.T) {
 	argv, err := prepareWindowsTarget([]string{"npm", "--version"})
 	if err != nil {

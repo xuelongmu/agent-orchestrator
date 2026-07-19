@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"github.com/aoagents/agent-orchestrator/backend/internal/processalive"
 )
 
 func TestUnixGuardianCleansDescendantsAfterRunnerHardExit(t *testing.T) {
@@ -26,17 +24,17 @@ func TestUnixGuardianCleansDescendantsAfterRunnerHardExit(t *testing.T) {
 	}()
 
 	pid := waitForPIDFile(t, pidFile)
+	exit, err := newProcessExitWatcher(pid)
+	if err != nil {
+		t.Fatalf("watch descendant pid %d: %v", pid, err)
+	}
+	defer func() { _ = exit.Close() }()
 	if err := outer.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
 	_ = outer.Wait()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for processalive.Alive(pid) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if processalive.Alive(pid) {
-		t.Fatalf("descendant pid %d survived runner hard exit", pid)
+	if err := exit.Wait(5 * time.Second); err != nil {
+		t.Fatalf("descendant pid %d survived runner hard exit: %v", pid, err)
 	}
 }
 
