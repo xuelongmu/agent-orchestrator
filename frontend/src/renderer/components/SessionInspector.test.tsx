@@ -602,7 +602,19 @@ describe("SessionInspector reviews tab", () => {
 						reviewerHandleId: "reviewer-pane",
 						reviews: [reviewState(3, "changes_requested", "abc123")],
 						ledger: { totalFindings: 3, rounds: 3, classes: [{ classTag: "missing-notify", count: 3 }] },
-						findings: [{ id: "f-1", runId: "run-1", sessionId: "sess-1", prUrl: pr(3, "open").url, round: 3, file: "notify.go", classTag: "missing-notify", rootCauseNote: "Every broken path must notify.", createdAt: "2026-06-15T00:00:00Z" }],
+						findings: [
+							{
+								id: "f-1",
+								runId: "run-1",
+								sessionId: "sess-1",
+								prUrl: pr(3, "open").url,
+								round: 3,
+								file: "notify.go",
+								classTag: "missing-notify",
+								rootCauseNote: "Every broken path must notify.",
+								createdAt: "2026-06-15T00:00:00Z",
+							},
+						],
 					},
 				};
 			}

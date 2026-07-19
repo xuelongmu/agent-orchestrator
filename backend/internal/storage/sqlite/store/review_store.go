@@ -236,11 +236,13 @@ func (s *Store) SetPendingReviewFindingFixCommit(ctx context.Context, id domain.
 	})
 }
 
+// MarkReviewFindingIssueFiled records the issue filed for a deferred review finding.
 func (s *Store) MarkReviewFindingIssueFiled(ctx context.Context, id, issueURL string) (bool, error) {
 	n, err := s.qw.MarkReviewFindingIssueFiled(ctx, gen.MarkReviewFindingIssueFiledParams{DeferredIssueURL: issueURL, ID: id})
 	return n > 0, err
 }
 
+// MarkReviewFindingThreadResolved records that a review finding's thread was resolved.
 func (s *Store) MarkReviewFindingThreadResolved(ctx context.Context, id string) (bool, error) {
 	n, err := s.qw.MarkReviewFindingThreadResolved(ctx, id)
 	return n > 0, err

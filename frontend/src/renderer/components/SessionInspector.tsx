@@ -497,7 +497,15 @@ function ReviewsView({
 				params: { path: { sessionId: session.id } },
 			});
 			if (error) throw new Error(apiErrorMessage(error, "Unable to load reviews"));
-			return data ?? ({ reviewerHandleId: "", reviews: [], findings: [], ledger: { totalFindings: 0, rounds: 0, classes: [] } } satisfies ReviewsResponse);
+			return (
+				data ??
+				({
+					reviewerHandleId: "",
+					reviews: [],
+					findings: [],
+					ledger: { totalFindings: 0, rounds: 0, classes: [] },
+				} satisfies ReviewsResponse)
+			);
 		},
 	});
 	const projectConfigQuery = useQuery({
@@ -782,7 +790,10 @@ function ReviewPanel({
 
 function FindingLedger({ ledger, findings }: { ledger: FindingLedgerSummary; findings: ReviewFinding[] }) {
 	return (
-		<div className="flex flex-col gap-3 overflow-hidden rounded-lg border border-border bg-surface p-3" data-testid="finding-ledger">
+		<div
+			className="flex flex-col gap-3 overflow-hidden rounded-lg border border-border bg-surface p-3"
+			data-testid="finding-ledger"
+		>
 			<div className="flex items-center justify-between gap-2">
 				<span className="text-xs font-semibold text-foreground">Finding-class ledger</span>
 				<span className="text-2xs text-passive">
@@ -805,7 +816,12 @@ function FindingLedger({ ledger, findings }: { ledger: FindingLedgerSummary; fin
 						</div>
 						<p className="mt-1 text-xs leading-normal text-muted-foreground">{finding.rootCauseNote}</p>
 						{finding.deferredIssueUrl ? (
-							<a className="mt-1 inline-flex text-accent hover:underline" href={finding.deferredIssueUrl} target="_blank" rel="noopener noreferrer">
+							<a
+								className="mt-1 inline-flex text-accent hover:underline"
+								href={finding.deferredIssueUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+							>
 								Deferred issue
 							</a>
 						) : null}
