@@ -38,7 +38,7 @@ type Lease struct {
 	ownerPID int
 	duration time.Duration
 	// confirmedUntil is the holder's local monotonic watchdog deadline for
-	// the lease established by acquireAt. Only the renewal goroutine advances it.
+	// the acquired lease. Only the renewal goroutine advances it.
 	confirmedUntil time.Time
 }
 
@@ -64,12 +64,6 @@ func OpenExclusive(ctx context.Context, dataDir string, ownerPID int) (*sqlite.S
 // generation, so PID reuse cannot impersonate a crashed holder.
 func Acquire(ctx context.Context, st store, ownerPID int) (*Lease, error) {
 	return acquireWithClock(ctx, st, ownerPID, uuid.NewString(), leaseDuration, time.Now, waitMonotonic)
-}
-
-func acquireAt(ctx context.Context, st store, ownerPID int, token string, now time.Time, duration time.Duration) (*Lease, error) {
-	// Tests that do not exercise takeover timing use a fixed wall clock and a
-	// quarantine seam that has already elapsed.
-	return acquireWithClock(ctx, st, ownerPID, token, duration, func() time.Time { return now }, func(context.Context, time.Duration) error { return nil })
 }
 
 func acquireWithClock(
@@ -149,6 +143,20 @@ func acquireWithClock(
 		return nil, err
 	}
 	if taken {
+		return lease, nil
+	}
+
+	// A release racing the guarded update also produces a false CAS. Make one
+	// final insert attempt so voluntary holder shutdown does not unnecessarily
+	// fail startup. A racing renewal or takeover leaves the row present and is
+	// still refused without beginning another quarantine.
+	finalAt := now()
+	lease = leaseAt(finalAt)
+	_, acquired, err = st.TryAcquireCoordinationClaim(ctx, lease.claimAt(finalAt.UTC()))
+	if err != nil {
+		return nil, err
+	}
+	if acquired {
 		return lease, nil
 	}
 	return nil, errors.New("exclusive database-writer lease changed during takeover")

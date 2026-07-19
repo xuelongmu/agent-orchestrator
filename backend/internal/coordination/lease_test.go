@@ -86,15 +86,23 @@ func openStore(t *testing.T) *sqlite.Store {
 	return store
 }
 
+func acquireAt(ctx context.Context, st store, ownerPID int, token string, now time.Time) (*Lease, error) {
+	return acquireWithClock(
+		ctx, st, ownerPID, token, 10*time.Second,
+		func() time.Time { return now },
+		func(context.Context, time.Duration) error { return nil },
+	)
+}
+
 func TestLiveOwnerIsNotStolenAfterFailedHealthProbe(t *testing.T) {
 	store := openStore(t)
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	if _, err := acquireAt(context.Background(), store, 101, "generation-a", now, 10*time.Second); err != nil {
+	if _, err := acquireAt(context.Background(), store, 101, "generation-a", now); err != nil {
 		t.Fatalf("acquire live owner: %v", err)
 	}
 	// No run-file or health result participates in leasing. Even the same PID
 	// (the PID-reuse case) cannot acquire a different generation before expiry.
-	if _, err := acquireAt(context.Background(), store, 101, "generation-b", now.Add(time.Second), 10*time.Second); err == nil {
+	if _, err := acquireAt(context.Background(), store, 101, "generation-b", now.Add(time.Second)); err == nil {
 		t.Fatal("live unexpired generation was stolen")
 	}
 }
@@ -102,7 +110,7 @@ func TestLiveOwnerIsNotStolenAfterFailedHealthProbe(t *testing.T) {
 func TestCrashBeforeRunFileWithPIDReuseIsReclaimableAfterExpiry(t *testing.T) {
 	store := openStore(t)
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	if _, err := acquireAt(context.Background(), store, 101, "crashed-generation", now, 10*time.Second); err != nil {
+	if _, err := acquireAt(context.Background(), store, 101, "crashed-generation", now); err != nil {
 		t.Fatal(err)
 	}
 	waits := 0
@@ -129,7 +137,7 @@ func TestForwardWallJumpRenewalBlocksTakeover(t *testing.T) {
 	store := openStore(t)
 	ctx := context.Background()
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	holder, err := acquireAt(ctx, store, 101, "holder", base, 10*time.Second)
+	holder, err := acquireAt(ctx, store, 101, "holder", base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +174,7 @@ func TestForwardWallJumpCrashedHolderIsTakenOverAfterQuarantine(t *testing.T) {
 	store := openStore(t)
 	ctx := context.Background()
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	if _, err := acquireAt(ctx, store, 101, "crashed", base, 10*time.Second); err != nil {
+	if _, err := acquireAt(ctx, store, 101, "crashed", base); err != nil {
 		t.Fatal(err)
 	}
 
@@ -195,7 +203,7 @@ func TestRenewalRacingTakeoverCASPreservesHolder(t *testing.T) {
 	underlying := openStore(t)
 	ctx := context.Background()
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	holder, err := acquireAt(ctx, underlying, 101, "holder", base, 10*time.Second)
+	holder, err := acquireAt(ctx, underlying, 101, "holder", base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,10 +232,42 @@ func TestRenewalRacingTakeoverCASPreservesHolder(t *testing.T) {
 	}
 }
 
+func TestReleaseRacingTakeoverCASAllowsFinalAcquire(t *testing.T) {
+	underlying := openStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	holder, err := acquireAt(ctx, underlying, 101, "holder", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hooked := &takeoverHookStore{store: underlying}
+	hooked.beforeTakeover = func() {
+		if releaseErr := holder.Release(ctx); releaseErr != nil {
+			t.Fatalf("racing release: %v", releaseErr)
+		}
+	}
+	jumped := base.Add(365 * 24 * time.Hour)
+	lease, err := acquireWithClock(
+		ctx, hooked, 202, "contender", 10*time.Second,
+		func() time.Time { return jumped },
+		func(context.Context, time.Duration) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("acquire after racing release: %v", err)
+	}
+	if lease == nil || lease.token != "contender" {
+		t.Fatalf("lease=%+v, want contender", lease)
+	}
+	if hooked.reads != 2 || hooked.beforeTakeover != nil {
+		t.Fatalf("reads=%d hook pending=%v, want two stable reads then CAS hook", hooked.reads, hooked.beforeTakeover != nil)
+	}
+}
+
 func TestTakeoverQuarantineHonorsCancellation(t *testing.T) {
 	store := openStore(t)
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	holder, err := acquireAt(context.Background(), store, 101, "holder", base, 10*time.Second)
+	holder, err := acquireAt(context.Background(), store, 101, "holder", base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +292,7 @@ func TestStaleObservedTokenCannotTakeOverNewGeneration(t *testing.T) {
 	store := openStore(t)
 	ctx := context.Background()
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	if _, err := acquireAt(ctx, store, 101, "observed", base, 10*time.Second); err != nil {
+	if _, err := acquireAt(ctx, store, 101, "observed", base); err != nil {
 		t.Fatal(err)
 	}
 	replacement := sqlitestore.CoordinationClaim{
@@ -285,11 +325,11 @@ func TestStaleOwnerCannotRenewOrReleaseSuccessor(t *testing.T) {
 	store := openStore(t)
 	ctx := context.Background()
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	stale, err := acquireAt(ctx, store, 101, "stale", now, 10*time.Second)
+	stale, err := acquireAt(ctx, store, 101, "stale", now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	successor, err := acquireAt(ctx, store, 202, "successor", now.Add(10*time.Second), 10*time.Second)
+	successor, err := acquireAt(ctx, store, 202, "successor", now.Add(10*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +347,7 @@ func TestStaleOwnerCannotRenewOrReleaseSuccessor(t *testing.T) {
 func TestDelayedTickerPayloadCannotRenewAfterExecutionTimeExpiry(t *testing.T) {
 	store := openStore(t)
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	lease, err := acquireAt(context.Background(), store, 101, "owner", base, 10*time.Second)
+	lease, err := acquireAt(context.Background(), store, 101, "owner", base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +365,7 @@ func TestDelayedTickerPayloadCannotRenewAfterExecutionTimeExpiry(t *testing.T) {
 func TestBackwardClockRenewalDoesNotShortenLocalWatchdog(t *testing.T) {
 	store := openStore(t)
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	lease, err := acquireAt(context.Background(), store, 101, "owner", base, 10*time.Second)
+	lease, err := acquireAt(context.Background(), store, 101, "owner", base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,11 +388,11 @@ func TestBackwardClockRenewalDoesNotShortenLocalWatchdog(t *testing.T) {
 func TestRunningHolderStopsWorkAfterSuccessorTakesLease(t *testing.T) {
 	store := openStore(t)
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	stale, err := acquireAt(context.Background(), store, os.Getpid(), "stale", base, 10*time.Second)
+	stale, err := acquireAt(context.Background(), store, os.Getpid(), "stale", base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquireAt(context.Background(), store, os.Getpid(), "successor", base.Add(10*time.Second), 10*time.Second); err != nil {
+	if _, err := acquireAt(context.Background(), store, os.Getpid(), "successor", base.Add(10*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	workCtx, cancel := context.WithCancel(context.Background())
@@ -371,7 +411,7 @@ func TestRunningHolderStopsWorkAfterSuccessorTakesLease(t *testing.T) {
 func TestWatchdogStopsWorkWhenRenewalIsDelayed(t *testing.T) {
 	store := openStore(t)
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	lease, err := acquireAt(context.Background(), store, 101, "owner", base, 10*time.Second)
+	lease, err := acquireAt(context.Background(), store, 101, "owner", base)
 	if err != nil {
 		t.Fatal(err)
 	}
