@@ -2,8 +2,33 @@ package ports
 
 import (
 	"context"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+)
+
+// TrackerIntakeClaim is one token-fenced attempt to spawn a session for an
+// issue discovered by tracker intake. IssueID is provider-native; Provider and
+// Repo are separate parts of the durable claim key.
+type TrackerIntakeClaim struct {
+	ProjectID      domain.ProjectID
+	Provider       domain.TrackerProvider
+	Repo           string
+	IssueID        string
+	OwnerToken     string
+	ClaimedAt      time.Time
+	LeaseExpiresAt time.Time
+}
+
+// TrackerIntakeClaimResult explains why an intake candidate may or may not
+// proceed to the external spawn side effect.
+type TrackerIntakeClaimResult uint8
+
+const (
+	TrackerIntakeClaimAcquired TrackerIntakeClaimResult = iota + 1
+	TrackerIntakeClaimAlreadyProcessed
+	TrackerIntakeClaimBusy
+	TrackerIntakeClaimCapacityReached
 )
 
 // Tracker is the outbound read-only port for issue trackers:

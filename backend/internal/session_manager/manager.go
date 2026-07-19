@@ -178,6 +178,10 @@ type Store interface {
 	DeleteSessionWorktrees(ctx context.Context, id domain.SessionID) error
 }
 
+type claimedSessionStore interface {
+	CreateClaimedSession(ctx context.Context, rec domain.SessionRecord, claim ports.TrackerIntakeClaim, admittedAt time.Time) (domain.SessionRecord, error)
+}
+
 // Manager coordinates internal session spawn, restore, kill, and cleanup over
 // the outbound ports. User-facing read-model assembly lives in the service package.
 type Manager struct {
@@ -365,7 +369,17 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn: prompt: %w", err)
 	}
 
-	rec, err := m.store.CreateSession(ctx, seedRecord(cfg, m.clock()))
+	seed := seedRecord(cfg, m.clock())
+	var rec domain.SessionRecord
+	if cfg.IntakeClaim != nil {
+		claimedStore, ok := m.store.(claimedSessionStore)
+		if !ok {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: %w: store does not support claimed admission", ports.ErrTrackerIntakeClaimLost)
+		}
+		rec, err = claimedStore.CreateClaimedSession(ctx, seed, *cfg.IntakeClaim, m.clock().UTC())
+	} else {
+		rec, err = m.store.CreateSession(ctx, seed)
+	}
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: create: %w", err)
 	}
