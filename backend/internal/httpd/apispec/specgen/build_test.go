@@ -70,3 +70,25 @@ func TestBuild_VerificationAuthorizationContract(t *testing.T) {
 		}
 	}
 }
+
+func TestBuild_HandoffDocumentsByteLimitsWithoutCodePointMaxLength(t *testing.T) {
+	got, err := specgen.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	start := bytes.Index(got, []byte("    SubmitSessionHandoffRequest:"))
+	end := bytes.Index(got[start+1:], []byte("\n    SubmitSessionHandoffResponse:"))
+	if start < 0 || end < 0 {
+		t.Fatal("generated contract is missing handoff request schemas")
+	}
+	schema := got[start : start+1+end]
+	normalized := bytes.Join(bytes.Fields(schema), []byte(" "))
+	if bytes.Contains(schema, []byte("maxLength:")) {
+		t.Fatalf("handoff schema advertises code-point maxLength for byte limits:\n%s", schema)
+	}
+	for _, want := range [][]byte{[]byte("1024 UTF-8 bytes"), []byte("4096 UTF-8 bytes"), []byte("8192 UTF-8 bytes")} {
+		if !bytes.Contains(normalized, want) {
+			t.Fatalf("handoff schema missing byte-limit description %q:\n%s", want, schema)
+		}
+	}
+}

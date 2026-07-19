@@ -141,6 +141,7 @@ var schemaNames = map[string]string{
 	"DomainAgentConfig":         "AgentConfig",
 	"DomainRoleOverride":        "RoleOverride",
 	"DomainVerificationCommand": "VerificationCommand",
+	"DomainAgentHandoff":        "AgentHandoff",
 	// httpd/controllers (wire envelopes)
 	"ControllersListProjectsResponse":               "ListProjectsResponse",
 	"ControllersProjectResponse":                    "ProjectResponse",
@@ -152,6 +153,8 @@ var schemaNames = map[string]string{
 	"ControllersListSessionsResponse":               "ListSessionsResponse",
 	"ControllersSpawnSessionRequest":                "SpawnSessionRequest",
 	"ControllersSessionResponse":                    "SessionResponse",
+	"ControllersSubmitSessionHandoffRequest":        "SubmitSessionHandoffRequest",
+	"ControllersSubmitSessionHandoffResponse":       "SubmitSessionHandoffResponse",
 	"ControllersSessionPreviewResponse":             "SessionPreviewResponse",
 	"ControllersSetSessionPreviewRequest":           "SetSessionPreviewRequest",
 	"ControllersRenameSessionRequest":               "RenameSessionRequest",
@@ -673,6 +676,20 @@ func sessionOperations() []operation {
 				{http.StatusOK, controllers.SessionResponse{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/handoff", id: "submitSessionHandoff", tag: "sessions",
+			summary:    "Submit an immutable structured completion handoff without changing lifecycle state",
+			pathParams: []any{controllers.SessionIDParam{}},
+			reqBody:    controllers.SubmitSessionHandoffRequest{},
+			resps: []respUnit{
+				{http.StatusOK, controllers.SubmitSessionHandoffResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
 			},
 		},
 		{

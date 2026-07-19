@@ -15,13 +15,16 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/telemetrymeta"
 )
 
-// Store is the read-only persistence surface needed to assemble controller-facing session read models.
+// Store is the narrow persistence surface needed to assemble session read
+// models plus the explicit immutable handoff write boundary.
 type Store interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	ListSessions(ctx context.Context, project domain.ProjectID) ([]domain.SessionRecord, error)
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
 	RenameSession(ctx context.Context, id domain.SessionID, displayName string, updatedAt time.Time) (bool, error)
 	SetSessionPreviewURL(ctx context.Context, id domain.SessionID, previewURL string, updatedAt time.Time) (bool, error)
+	PutSessionHandoff(ctx context.Context, id domain.SessionID, handoff domain.AgentHandoff, createdAt time.Time) (bool, error)
+	GetSessionHandoff(ctx context.Context, id domain.SessionID) (domain.AgentHandoff, bool, error)
 	GetDisplayPRFactsForSession(ctx context.Context, id domain.SessionID) (domain.PRFacts, bool, error)
 	ListPRFactsForSession(ctx context.Context, id domain.SessionID) ([]domain.PRFacts, error)
 	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
@@ -160,7 +163,7 @@ func (s *Service) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	if firstSession {
 		s.emitFirstSessionSpawned(rec, project)
 	}
-	return s.toSession(ctx, rec)
+	return s.toSession(ctx, rec, true)
 }
 
 // requireProject verifies the project is registered before any spawn write
@@ -392,7 +395,7 @@ func (s *Service) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	if err != nil {
 		return domain.Session{}, toAPIError(err)
 	}
-	return s.toSession(ctx, rec)
+	return s.toSession(ctx, rec, true)
 }
 
 // Kill delegates terminal intent and teardown to the internal manager.
@@ -499,7 +502,7 @@ func (s *Service) List(ctx context.Context, filter ListFilter) ([]domain.Session
 		if !matchesSessionFilter(rec, filter) {
 			continue
 		}
-		sess, err := s.toSession(ctx, rec)
+		sess, err := s.toSession(ctx, rec, false)
 		if err != nil {
 			return nil, err
 		}
@@ -546,7 +549,27 @@ func (s *Service) Get(ctx context.Context, id domain.SessionID) (domain.Session,
 	if !ok {
 		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
 	}
-	return s.toSession(ctx, rec)
+	return s.toSession(ctx, rec, true)
+}
+
+// SubmitHandoff persists an agent's immutable structured completion summary.
+// This explicit submission boundary deliberately does not report activity,
+// terminate the session, or trigger dependency scheduling.
+func (s *Service) SubmitHandoff(ctx context.Context, id domain.SessionID, handoff domain.AgentHandoff) (bool, error) {
+	if err := domain.ValidateAgentHandoff(handoff); err != nil {
+		return false, apierr.Invalid("HANDOFF_INVALID", err.Error(), nil)
+	}
+	created, err := s.store.PutSessionHandoff(ctx, id, handoff, s.now())
+	switch {
+	case err == nil:
+		return created, nil
+	case errors.Is(err, ports.ErrSessionNotFound):
+		return false, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	case errors.Is(err, ports.ErrHandoffConflict):
+		return false, apierr.Conflict("HANDOFF_ALREADY_SUBMITTED", "Session already has a different completion handoff", nil)
+	default:
+		return false, fmt.Errorf("submit handoff for %s: %w", id, err)
+	}
 }
 
 // toAPIError maps the session engine's sentinel errors to their REST API
@@ -608,7 +631,7 @@ func toAPIError(err error) error {
 	}
 }
 
-func (s *Service) toSession(ctx context.Context, rec domain.SessionRecord) (domain.Session, error) {
+func (s *Service) toSession(ctx context.Context, rec domain.SessionRecord, includeHandoff bool) (domain.Session, error) {
 	prs, err := s.store.ListPRFactsForSession(ctx, rec.ID)
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("pr facts %s: %w", rec.ID, err)
@@ -617,7 +640,17 @@ func (s *Service) toSession(ctx context.Context, rec domain.SessionRecord) (doma
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("dependency ids %s: %w", rec.ID, err)
 	}
-	return domain.Session{SessionRecord: rec, Status: deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness)), TerminalHandleID: rec.Metadata.RuntimeHandleID, DependsOn: dependsOn, PRs: prs}, nil
+	var handoffView *domain.AgentHandoff
+	if includeHandoff {
+		handoff, hasHandoff, err := s.store.GetSessionHandoff(ctx, rec.ID)
+		if err != nil {
+			return domain.Session{}, fmt.Errorf("handoff %s: %w", rec.ID, err)
+		}
+		if hasHandoff {
+			handoffView = &handoff
+		}
+	}
+	return domain.Session{SessionRecord: rec, Status: deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness)), TerminalHandleID: rec.Metadata.RuntimeHandleID, Handoff: handoffView, DependsOn: dependsOn, PRs: prs}, nil
 }
 
 // now tolerates a zero-value Service (tests construct the struct literally

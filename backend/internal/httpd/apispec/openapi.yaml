@@ -1223,6 +1223,64 @@ paths:
       summary: Append an explicit invariant to one owned PR design contract
       tags:
       - sessions
+  /api/v1/sessions/{sessionId}/handoff:
+    post:
+      operationId: submitSessionHandoff
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitSessionHandoffRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmitSessionHandoffResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Submit an immutable structured completion handoff without changing
+        lifecycle state
+      tags:
+      - sessions
   /api/v1/sessions/{sessionId}/kill:
     post:
       operationId: killSession
@@ -2097,6 +2155,30 @@ components:
         permissions:
           type: string
       type: object
+    AgentHandoff:
+      properties:
+        changedFiles:
+          description: Changed paths; each item is bounded by the server to 1024 UTF-8
+            bytes.
+          items:
+            type: string
+          maxItems: 128
+          type: array
+        residualRisk:
+          description: Remaining risk, bounded by the server to 8192 UTF-8 bytes.
+          type: string
+        verificationCommands:
+          description: Commands run; each item is bounded by the server to 4096 UTF-8
+            bytes.
+          items:
+            type: string
+          maxItems: 32
+          type: array
+      required:
+      - changedFiles
+      - verificationCommands
+      - residualRisk
+      type: object
     AgentInfo:
       properties:
         authStatus:
@@ -2216,6 +2298,8 @@ components:
           $ref: '#/components/schemas/LifecycleDiagnostic'
         displayName:
           type: string
+        handoff:
+          $ref: '#/components/schemas/AgentHandoff'
         harness:
           type: string
         id:
@@ -3524,6 +3608,46 @@ components:
       required:
       - runId
       - verdict
+      type: object
+    SubmitSessionHandoffRequest:
+      properties:
+        changedFiles:
+          description: Changed paths; each item is bounded by the server to 1024 UTF-8
+            bytes.
+          items:
+            type: string
+          maxItems: 128
+          type: array
+        residualRisk:
+          description: Remaining risk, bounded by the server to 8192 UTF-8 bytes.
+          type: string
+        verificationCommands:
+          description: Commands run; each item is bounded by the server to 4096 UTF-8
+            bytes.
+          items:
+            type: string
+          maxItems: 32
+          type: array
+      required:
+      - changedFiles
+      - verificationCommands
+      - residualRisk
+      type: object
+    SubmitSessionHandoffResponse:
+      properties:
+        created:
+          type: boolean
+        handoff:
+          $ref: '#/components/schemas/AgentHandoff'
+        ok:
+          type: boolean
+        sessionId:
+          type: string
+      required:
+      - ok
+      - sessionId
+      - created
+      - handoff
       type: object
     TrackerIntakeConfig:
       properties:

@@ -105,6 +105,17 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (Session,
 	return i, err
 }
 
+const getSessionHandoffPayload = `-- name: GetSessionHandoffPayload :one
+SELECT payload FROM agent_handoffs WHERE session_id = ?
+`
+
+func (q *Queries) GetSessionHandoffPayload(ctx context.Context, sessionID domain.SessionID) (string, error) {
+	row := q.db.QueryRowContext(ctx, getSessionHandoffPayload, sessionID)
+	var payload string
+	err := row.Scan(&payload)
+	return payload, err
+}
+
 const insertSession = `-- name: InsertSession :exec
 INSERT INTO sessions (
     id, project_id, num, issue_id, kind, harness, display_name,
@@ -197,6 +208,25 @@ type InsertSessionDependencyParams struct {
 func (q *Queries) InsertSessionDependency(ctx context.Context, arg InsertSessionDependencyParams) error {
 	_, err := q.db.ExecContext(ctx, insertSessionDependency, arg.SessionID, arg.DependsOnSessionID)
 	return err
+}
+
+const insertSessionHandoff = `-- name: InsertSessionHandoff :execrows
+INSERT OR IGNORE INTO agent_handoffs (session_id, payload, created_at)
+VALUES (?, ?, ?)
+`
+
+type InsertSessionHandoffParams struct {
+	SessionID domain.SessionID
+	Payload   string
+	CreatedAt time.Time
+}
+
+func (q *Queries) InsertSessionHandoff(ctx context.Context, arg InsertSessionHandoffParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, insertSessionHandoff, arg.SessionID, arg.Payload, arg.CreatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const listAllSessionDependencies = `-- name: ListAllSessionDependencies :many
