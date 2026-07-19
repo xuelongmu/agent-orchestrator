@@ -284,7 +284,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		submitted := review.Findings
 		if verdict == domain.VerdictChangesRequested && len(submitted) == 0 {
 			submitted = inferFindings(body)
-			if len(submitted) == 0 && reviewcore.ReviewBodyHasBlockingFindings(body) {
+			if len(submitted) == 0 && reviewcore.BodyHasBlockingFindings(body) {
 				submitted = []SubmittedFinding{{
 					ClassTag: "unclassified-blocking", RootCauseNote: strings.TrimSpace(body), Body: strings.TrimSpace(body),
 				}}

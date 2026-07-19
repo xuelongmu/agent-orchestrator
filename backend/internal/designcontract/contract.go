@@ -102,14 +102,17 @@ func ParseReviewFixInvariantDeclaration(message string) (ReviewFixInvariantDecla
 	value := strings.TrimPrefix(lines[last], prefix)
 	decoder := json.NewDecoder(bytes.NewBufferString(value))
 	start, err := decoder.Token()
-	if err != nil || start != json.Delim('{') {
-		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %v", ErrReviewFixDeclarationMalformed, err)
+	if err != nil {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %w", ErrReviewFixDeclarationMalformed, err)
+	}
+	if start != json.Delim('{') {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: JSON value must be an object", ErrReviewFixDeclarationMalformed)
 	}
 	fields := make(map[string]json.RawMessage, 3)
 	for decoder.More() {
 		key, err := decoder.Token()
 		if err != nil {
-			return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %v", ErrReviewFixDeclarationMalformed, err)
+			return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %w", ErrReviewFixDeclarationMalformed, err)
 		}
 		name, ok := key.(string)
 		if !ok {
@@ -120,25 +123,25 @@ func ParseReviewFixInvariantDeclaration(message string) (ReviewFixInvariantDecla
 		}
 		var raw json.RawMessage
 		if err := decoder.Decode(&raw); err != nil {
-			return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON field %q: %v", ErrReviewFixDeclarationMalformed, name, err)
+			return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON field %q: %w", ErrReviewFixDeclarationMalformed, name, err)
 		}
 		fields[name] = raw
 	}
 	if _, err := decoder.Token(); err != nil {
-		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %v", ErrReviewFixDeclarationMalformed, err)
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %w", ErrReviewFixDeclarationMalformed, err)
 	}
 	if decoder.Decode(&struct{}{}) != io.EOF {
 		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: trailer must contain one JSON object", ErrReviewFixDeclarationMalformed)
 	}
 	canonical, err := json.Marshal(fields)
 	if err != nil {
-		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: encode parsed JSON: %v", ErrReviewFixDeclarationMalformed, err)
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: encode parsed JSON: %w", ErrReviewFixDeclarationMalformed, err)
 	}
 	strict := json.NewDecoder(bytes.NewReader(canonical))
 	strict.DisallowUnknownFields()
 	var declaration ReviewFixInvariantDeclaration
 	if err := strict.Decode(&declaration); err != nil {
-		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %v", ErrReviewFixDeclarationMalformed, err)
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %w", ErrReviewFixDeclarationMalformed, err)
 	}
 	if declaration.PR == "" || declaration.Invariant == "" {
 		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: pr, mode, and invariant are required", ErrReviewFixDeclarationMalformed)

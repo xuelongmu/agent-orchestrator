@@ -59,7 +59,7 @@ func (s *Store) AcceptReviewFixCommit(ctx context.Context, sessionID domain.Sess
 		case "add":
 			invariant, err = designcontract.NormalizeInvariant(invariant)
 			if err != nil {
-				return fmt.Errorf("%w: %v", designcontract.ErrReviewFixDeclarationMalformed, err)
+				return fmt.Errorf("%w: %w", designcontract.ErrReviewFixDeclarationMalformed, err)
 			}
 		default:
 			return fmt.Errorf("%w: mode must be %q or %q", designcontract.ErrReviewFixDeclarationMalformed, "preserve", "add")

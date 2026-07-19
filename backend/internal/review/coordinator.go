@@ -96,7 +96,7 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 				outcome = CoordinateSatisfied
 			} else if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictChangesRequested && allDeflected && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
 				outcome = CoordinateSatisfied
-			} else if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictChangesRequested && !ReviewBodyHasBlockingFindings(current.Body) && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
+			} else if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictChangesRequested && !BodyHasBlockingFindings(current.Body) && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
 				outcome = CoordinateSatisfied
 			}
 			return CoordinateResult{Outcome: outcome, Round: round, Run: current}, nil
@@ -140,7 +140,7 @@ func (e *Engine) legacyReviewFixDeclarationRequired(ctx stdctx.Context, runs []d
 			latest, found = run, true
 		}
 	}
-	if !found || latest.Verdict != domain.VerdictChangesRequested || !ReviewBodyHasBlockingFindings(latest.Body) {
+	if !found || latest.Verdict != domain.VerdictChangesRequested || !BodyHasBlockingFindings(latest.Body) {
 		return false, nil
 	}
 	findings, err := e.store.ListReviewFindingsByRun(ctx, latest.ID)
@@ -217,13 +217,11 @@ func automaticReviewRetryDelay(attempts int) time.Duration {
 	return delay
 }
 
-// A changes-requested result from an older reviewer may predate the priority
-// contract. Untagged findings therefore fail closed. Once the reviewer uses the
-// required tags, P2/P3-only feedback is explicitly non-blocking.
-// ReviewBodyHasBlockingFindings applies the durable priority policy used by
-// both coordination and fallback finding persistence. Untagged
-// changes-requested feedback fails closed as blocking.
-func ReviewBodyHasBlockingFindings(body string) bool {
+// BodyHasBlockingFindings applies the durable priority policy used by both
+// coordination and fallback finding persistence. An older changes-requested
+// result may predate priority tags, so untagged feedback fails closed while
+// explicitly P2/P3-only feedback is non-blocking.
+func BodyHasBlockingFindings(body string) bool {
 	body = strings.ToLower(body)
 	if reviewpolicy.HasP0OrP1(body) {
 		return true
