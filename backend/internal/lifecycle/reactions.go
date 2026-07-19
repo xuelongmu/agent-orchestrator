@@ -61,8 +61,8 @@ const (
 )
 
 // ReviewResult is the already-persisted result of an AO-internal review pass.
-// Lifecycle treats it as input to the reaction reducer; it does not write the
-// review_run row.
+// Lifecycle treats it as input to the reaction reducer; its only review_run
+// mutation is claiming the simplification activity receipt before emission.
 type ReviewResult struct {
 	RunID               string
 	BatchID             string
@@ -134,7 +134,9 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 		return ReviewDeliveryNoop, nil
 	}
 	for _, result := range results {
-		m.emitSimplificationRound(ctx, rec, result)
+		if err := m.emitSimplificationRound(ctx, rec, result); err != nil {
+			return ReviewDeliveryNoop, err
+		}
 	}
 	return ReviewDeliverySent, nil
 }
@@ -194,16 +196,29 @@ func reviewBodyLabel(r ReviewResult) string {
 	return "Actionable findings"
 }
 
-func (m *Manager) emitSimplificationRound(ctx context.Context, rec domain.SessionRecord, r ReviewResult) {
+func (m *Manager) emitSimplificationRound(ctx context.Context, rec domain.SessionRecord, r ReviewResult) error {
 	if r.SimplificationClass == "" {
-		return
+		return nil
+	}
+	receipts, ok := m.store.(simplificationDispatchStore)
+	if !ok {
+		return errors.New("lifecycle: review store does not support simplification dispatch receipts")
+	}
+	dispatchedAt := m.clock()
+	claimed, err := receipts.ClaimReviewRunSimplificationDispatch(ctx, r.RunID, r.TargetSHA, dispatchedAt)
+	if err != nil {
+		return fmt.Errorf("claim simplification dispatch for review run %q: %w", r.RunID, err)
+	}
+	if !claimed {
+		return nil
 	}
 	projectID, sessionID := rec.ProjectID, rec.ID
 	m.emitTelemetry(ctx, ports.TelemetryEvent{
-		Name: "review_simplification_round", Source: "lifecycle", OccurredAt: m.clock(),
+		Name: "review_simplification_round", Source: "lifecycle", OccurredAt: dispatchedAt,
 		Level: ports.TelemetryLevelInfo, ProjectID: &projectID, SessionID: &sessionID,
 		Payload: map[string]any{"pr_url": r.PRURL, "class_tag": r.SimplificationClass, "findings": r.Ledger.TotalFindings, "rounds": r.Ledger.Rounds},
 	})
+	return nil
 }
 
 type reactionState struct {
@@ -905,7 +920,8 @@ func (m *Manager) mergedCleanupNotificationIntent(ctx context.Context, rec domai
 
 // ApplyReviewResult reacts to a completed AO-internal review pass after the
 // review service has persisted the run result. It mirrors ApplyPRObservation:
-// no change_log reads, no review_run writes, only lifecycle side effects.
+// no change_log reads and only lifecycle side effects plus the durable
+// simplification activity receipt.
 func (m *Manager) ApplyReviewResult(ctx context.Context, workerID domain.SessionID, r ReviewResult) (ReviewDeliveryOutcome, error) {
 	if r.Verdict != domain.VerdictChangesRequested || r.DeliveredAt != nil {
 		return ReviewDeliveryNoop, nil
@@ -944,7 +960,9 @@ func (m *Manager) ApplyReviewResult(ctx context.Context, workerID domain.Session
 		// undelivered to re-fire on the next observation.
 		return ReviewDeliveryNoop, nil
 	}
-	m.emitSimplificationRound(ctx, rec, r)
+	if err := m.emitSimplificationRound(ctx, rec, r); err != nil {
+		return ReviewDeliveryNoop, err
+	}
 	return ReviewDeliverySent, nil
 }
 

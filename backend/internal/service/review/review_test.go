@@ -27,6 +27,7 @@ type fakeStore struct {
 	findings     []domain.ReviewFinding
 	project      domain.ProjectRecord
 	completeErr  error
+	markErr      error
 	issueClaims  map[string]string
 	threadClaims map[string]string
 }
@@ -65,6 +66,14 @@ func (f *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) 
 	f.msgs = append(f.msgs, msg)
 	return nil
 }
+
+type fakeTelemetrySink struct{ events []ports.TelemetryEvent }
+
+func (f *fakeTelemetrySink) Emit(_ context.Context, event ports.TelemetryEvent) {
+	f.events = append(f.events, event)
+}
+
+func (*fakeTelemetrySink) Close(context.Context) error { return nil }
 
 func (f *fakeStore) GetReviewRun(_ context.Context, id string) (domain.ReviewRun, bool, error) {
 	for _, run := range f.batchRuns {
@@ -149,20 +158,19 @@ func (f *fakeStore) UpdateReviewRunResult(_ context.Context, id string, status d
 func (f *fakeStore) MarkReviewRunDelivered(_ context.Context, id string, deliveredAt time.Time) (bool, error) {
 	f.markCalls++
 	f.markedIDs = append(f.markedIDs, id)
+	if f.markErr != nil {
+		err := f.markErr
+		f.markErr = nil
+		return false, err
+	}
 	if f.run.ID == id && f.run.Status == domain.ReviewRunComplete && f.run.DeliveredAt == nil {
 		f.run.Status = domain.ReviewRunDelivered
 		f.run.DeliveredAt = &deliveredAt
-		if f.run.SimplificationClass != "" {
-			f.run.SimplificationDispatchedAt = &deliveredAt
-		}
 	}
 	for i := range f.batchRuns {
 		if f.batchRuns[i].ID == id && f.batchRuns[i].Status == domain.ReviewRunComplete && f.batchRuns[i].DeliveredAt == nil {
 			f.batchRuns[i].Status = domain.ReviewRunDelivered
 			f.batchRuns[i].DeliveredAt = &deliveredAt
-			if f.batchRuns[i].SimplificationClass != "" {
-				f.batchRuns[i].SimplificationDispatchedAt = &deliveredAt
-			}
 			return true, nil
 		}
 	}
@@ -170,6 +178,25 @@ func (f *fakeStore) MarkReviewRunDelivered(_ context.Context, id string, deliver
 		return false, nil
 	}
 	return true, nil
+}
+
+func (f *fakeStore) ClaimReviewRunSimplificationDispatch(_ context.Context, id, targetSHA string, dispatchedAt time.Time) (bool, error) {
+	if f.run.ID == id && f.run.TargetSHA == targetSHA && f.run.Status == domain.ReviewRunComplete && f.run.SimplificationClass != "" && f.run.SimplificationDispatchedAt == nil {
+		f.run.SimplificationDispatchedAt = &dispatchedAt
+		for i := range f.batchRuns {
+			if f.batchRuns[i].ID == id {
+				f.batchRuns[i].SimplificationDispatchedAt = &dispatchedAt
+			}
+		}
+		return true, nil
+	}
+	for i := range f.batchRuns {
+		if f.batchRuns[i].ID == id && f.batchRuns[i].TargetSHA == targetSHA && f.batchRuns[i].Status == domain.ReviewRunComplete && f.batchRuns[i].SimplificationClass != "" && f.batchRuns[i].SimplificationDispatchedAt == nil {
+			f.batchRuns[i].SimplificationDispatchedAt = &dispatchedAt
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (f *fakeStore) MarkReviewRunDeflectedReviewCleared(_ context.Context, id string, clearedAt time.Time) (bool, error) {
@@ -383,6 +410,57 @@ func TestSubmitPersistsThenAppliesThenStampsDelivered(t *testing.T) {
 	}
 	if run.Status != domain.ReviewRunDelivered || run.DeliveredAt == nil || !run.DeliveredAt.Equal(now) {
 		t.Fatalf("run not stamped delivered: %+v", run)
+	}
+}
+
+func TestDeliverSubmittedSimplificationReceiptSurvivesDeliveryStampFailureAndRestart(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	run := domain.ReviewRun{
+		ID: "run-3", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha3",
+		Status: domain.ReviewRunComplete, Verdict: domain.VerdictChangesRequested, Body: "fix the invariant",
+	}
+	st := &fakeStore{
+		ok: true, run: run, markErr: errors.New("delivery stamp unavailable"),
+		prs: []domain.PullRequest{{URL: run.PRURL, HeadSHA: run.TargetSHA}},
+		sessions: map[domain.SessionID]domain.SessionRecord{
+			"mer-1": {ID: "mer-1", ProjectID: "mer", Activity: domain.Activity{State: domain.ActivityActive}},
+		},
+		findings: []domain.ReviewFinding{
+			{ID: "finding-1", RunID: "run-1", SessionID: "mer-1", PRURL: run.PRURL, Round: 1, ClassTag: "missing-notify"},
+			{ID: "finding-2", RunID: "run-2", SessionID: "mer-1", PRURL: run.PRURL, Round: 2, ClassTag: "missing-notify"},
+			{ID: "finding-3", RunID: run.ID, SessionID: "mer-1", PRURL: run.PRURL, Round: 3, ClassTag: "missing-notify"},
+		},
+	}
+	messenger := &fakeMessenger{}
+	telemetry := &fakeTelemetrySink{}
+	manager := lifecycle.New(st, messenger, lifecycle.WithTelemetry(telemetry))
+	svc := New(nil, st, WithLifecycleReducer(manager), WithClock(func() time.Time { return now }))
+
+	if _, err := svc.deliverSubmitted(context.Background(), "mer-1", []domain.ReviewRun{run}); err == nil || !strings.Contains(err.Error(), "delivery stamp unavailable") {
+		t.Fatalf("first delivery error = %v, want delivery stamp failure", err)
+	}
+	if len(messenger.msgs) != 1 || len(telemetry.events) != 1 {
+		t.Fatalf("first delivery sends/events = %d/%d, want 1/1", len(messenger.msgs), len(telemetry.events))
+	}
+	if telemetry.events[0].Name != "review_simplification_round" {
+		t.Fatalf("first telemetry event = %q", telemetry.events[0].Name)
+	}
+	if st.run.DeliveredAt != nil || st.run.SimplificationDispatchedAt == nil {
+		t.Fatalf("failed delivery stamp lost independent simplification receipt: %+v", st.run)
+	}
+
+	// Recreate lifecycle to prove both receipts survive process-local state.
+	restartedManager := lifecycle.New(st, messenger, lifecycle.WithTelemetry(telemetry))
+	restartedService := New(nil, st, WithLifecycleReducer(restartedManager), WithClock(func() time.Time { return now.Add(time.Minute) }))
+	delivered, err := restartedService.deliverSubmitted(context.Background(), "mer-1", []domain.ReviewRun{st.run})
+	if err != nil {
+		t.Fatalf("retry delivery: %v", err)
+	}
+	if len(delivered) != 1 || delivered[0].Status != domain.ReviewRunDelivered {
+		t.Fatalf("retry delivered = %+v, want one delivered run", delivered)
+	}
+	if len(messenger.msgs) != 1 || len(telemetry.events) != 1 {
+		t.Fatalf("retry sends/events = %d/%d, want no duplicates", len(messenger.msgs), len(telemetry.events))
 	}
 }
 

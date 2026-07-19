@@ -84,6 +84,27 @@ func (q *Queries) ClaimReviewFindingThreadAction(ctx context.Context, arg ClaimR
 	return result.RowsAffected()
 }
 
+const claimReviewRunSimplificationDispatch = `-- name: ClaimReviewRunSimplificationDispatch :execrows
+UPDATE review_run
+SET simplification_dispatched_at = ?
+WHERE id = ? AND target_sha = ? AND status = 'complete'
+  AND simplification_class != '' AND simplification_dispatched_at IS NULL
+`
+
+type ClaimReviewRunSimplificationDispatchParams struct {
+	SimplificationDispatchedAt sql.NullTime
+	ID                         string
+	TargetSha                  string
+}
+
+func (q *Queries) ClaimReviewRunSimplificationDispatch(ctx context.Context, arg ClaimReviewRunSimplificationDispatchParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, claimReviewRunSimplificationDispatch, arg.SimplificationDispatchedAt, arg.ID, arg.TargetSha)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const completeReviewFindingIssueAction = `-- name: CompleteReviewFindingIssueAction :execrows
 UPDATE review_finding
 SET deferred_issue_url = ?, issue_action_token = '', issue_action_lease_until = NULL
@@ -641,19 +662,17 @@ func (q *Queries) MarkReviewRunDeflectedReviewCleared(ctx context.Context, arg M
 
 const markReviewRunDelivered = `-- name: MarkReviewRunDelivered :execrows
 UPDATE review_run
-SET status = 'delivered', delivered_at = ?,
-    simplification_dispatched_at = CASE WHEN simplification_class != '' THEN ? ELSE simplification_dispatched_at END
+SET status = 'delivered', delivered_at = ?
 WHERE id = ? AND status = 'complete' AND delivered_at IS NULL
 `
 
 type MarkReviewRunDeliveredParams struct {
-	DeliveredAt                sql.NullTime
-	SimplificationDispatchedAt sql.NullTime
-	ID                         string
+	DeliveredAt sql.NullTime
+	ID          string
 }
 
 func (q *Queries) MarkReviewRunDelivered(ctx context.Context, arg MarkReviewRunDeliveredParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, markReviewRunDelivered, arg.DeliveredAt, arg.SimplificationDispatchedAt, arg.ID)
+	result, err := q.db.ExecContext(ctx, markReviewRunDelivered, arg.DeliveredAt, arg.ID)
 	if err != nil {
 		return 0, err
 	}

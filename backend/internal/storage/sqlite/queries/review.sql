@@ -59,9 +59,14 @@ UPDATE review_run SET status = 'cancelled', body = ? WHERE session_id = ? AND st
 
 -- name: MarkReviewRunDelivered :execrows
 UPDATE review_run
-SET status = 'delivered', delivered_at = ?,
-    simplification_dispatched_at = CASE WHEN simplification_class != '' THEN ? ELSE simplification_dispatched_at END
+SET status = 'delivered', delivered_at = ?
 WHERE id = ? AND status = 'complete' AND delivered_at IS NULL;
+
+-- name: ClaimReviewRunSimplificationDispatch :execrows
+UPDATE review_run
+SET simplification_dispatched_at = ?
+WHERE id = ? AND target_sha = ? AND status = 'complete'
+  AND simplification_class != '' AND simplification_dispatched_at IS NULL;
 
 -- name: MarkReviewRunDeflectedReviewCleared :execrows
 UPDATE review_run

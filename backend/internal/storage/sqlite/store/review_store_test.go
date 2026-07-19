@@ -416,6 +416,16 @@ func TestCompleteReviewRunWithFindingsIsAtomicAndPersistsSimplificationDispatch(
 	if ok, err := s.RefreshReviewRunSimplificationClass(ctx, "run-1"); err != nil || !ok {
 		t.Fatalf("restore simplification = %v, %v", ok, err)
 	}
+	dispatchedAt := now.Add(30 * time.Second)
+	if ok, err := s.ClaimReviewRunSimplificationDispatch(ctx, "run-1", "wrong-sha", dispatchedAt); err != nil || ok {
+		t.Fatalf("wrong-head simplification claim = %v, %v", ok, err)
+	}
+	if ok, err := s.ClaimReviewRunSimplificationDispatch(ctx, "run-1", "sha1", dispatchedAt); err != nil || !ok {
+		t.Fatalf("simplification claim = %v, %v", ok, err)
+	}
+	if ok, err := s.ClaimReviewRunSimplificationDispatch(ctx, "run-1", "sha1", dispatchedAt); err != nil || ok {
+		t.Fatalf("duplicate simplification claim = %v, %v", ok, err)
+	}
 	if ok, err := s.MarkReviewRunDelivered(ctx, "run-1", now.Add(time.Minute)); err != nil || !ok {
 		t.Fatalf("deliver = %v, %v", ok, err)
 	}
@@ -423,7 +433,7 @@ func TestCompleteReviewRunWithFindingsIsAtomicAndPersistsSimplificationDispatch(
 		t.Fatalf("clear review = %v, %v", ok, err)
 	}
 	run, _, err = s.GetReviewRun(ctx, "run-1")
-	if err != nil || run.SimplificationClass != "missing-notify" || run.SimplificationDispatchedAt == nil || run.DeflectedReviewClearedAt == nil {
+	if err != nil || run.SimplificationClass != "missing-notify" || run.SimplificationDispatchedAt == nil || !run.SimplificationDispatchedAt.Equal(dispatchedAt) || run.DeflectedReviewClearedAt == nil {
 		t.Fatalf("durable simplification = %+v, %v", run, err)
 	}
 }

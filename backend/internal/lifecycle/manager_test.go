@@ -16,9 +16,10 @@ import (
 var ctx = context.Background()
 
 type fakeStore struct {
-	sessions   map[domain.SessionID]domain.SessionRecord
-	prs        map[domain.SessionID][]domain.PullRequest
-	signatures map[string]string
+	sessions               map[domain.SessionID]domain.SessionRecord
+	prs                    map[domain.SessionID][]domain.PullRequest
+	signatures             map[string]string
+	simplificationReceipts map[string]time.Time
 	// afterSessionRead deterministically models a concurrent reducer committing
 	// new activity immediately after a caller's store snapshot.
 	afterSessionRead func(domain.SessionID, int)
@@ -29,7 +30,10 @@ type fakeStore struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{sessions: map[domain.SessionID]domain.SessionRecord{}, prs: map[domain.SessionID][]domain.PullRequest{}, signatures: map[string]string{}}
+	return &fakeStore{
+		sessions: map[domain.SessionID]domain.SessionRecord{}, prs: map[domain.SessionID][]domain.PullRequest{},
+		signatures: map[string]string{}, simplificationReceipts: map[string]time.Time{},
+	}
 }
 
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
@@ -68,6 +72,15 @@ func (f *fakeStore) UpdatePRLastNudgeSignature(_ context.Context, prURL, payload
 	f.signatures[prURL] = payload
 	f.signatureWrites++
 	return nil
+}
+
+func (f *fakeStore) ClaimReviewRunSimplificationDispatch(_ context.Context, id, targetSHA string, dispatchedAt time.Time) (bool, error) {
+	key := id + "\x00" + targetSHA
+	if _, ok := f.simplificationReceipts[key]; ok {
+		return false, nil
+	}
+	f.simplificationReceipts[key] = dispatchedAt
+	return true, nil
 }
 
 type fakeMessenger struct {

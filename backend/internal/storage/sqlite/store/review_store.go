@@ -152,9 +152,26 @@ func (s *Store) MarkReviewRunDelivered(ctx context.Context, id string, delivered
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	n, err := s.qw.MarkReviewRunDelivered(ctx, gen.MarkReviewRunDeliveredParams{
-		DeliveredAt:                sql.NullTime{Time: deliveredAt, Valid: true},
-		SimplificationDispatchedAt: sql.NullTime{Time: deliveredAt, Valid: true},
+		DeliveredAt: sql.NullTime{Time: deliveredAt, Valid: true},
+		ID:          id,
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ClaimReviewRunSimplificationDispatch durably reserves the simplification
+// activity for one review run at its exact reviewed head. The reservation is
+// separate from the later delivery stamp so a delivery-stamp retry cannot emit
+// the activity a second time.
+func (s *Store) ClaimReviewRunSimplificationDispatch(ctx context.Context, id, targetSHA string, dispatchedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	n, err := s.qw.ClaimReviewRunSimplificationDispatch(ctx, gen.ClaimReviewRunSimplificationDispatchParams{
+		SimplificationDispatchedAt: sql.NullTime{Time: dispatchedAt, Valid: true},
 		ID:                         id,
+		TargetSha:                  targetSHA,
 	})
 	if err != nil {
 		return false, err
