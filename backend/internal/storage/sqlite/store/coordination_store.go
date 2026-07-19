@@ -79,9 +79,9 @@ func (s *Store) TakeOverCoordinationClaim(ctx context.Context, expectedOwnerToke
 	return rows == 1, nil
 }
 
-// RenewCoordinationClaim extends only the unexpired lease held by ownerToken.
-// A stale generation cannot renew a successor, and an expired holder cannot
-// resurrect itself after another process becomes eligible to take over.
+// RenewCoordinationClaim strictly extends only the unexpired lease held by
+// ownerToken. A renewal that cannot advance the persisted expiry fails closed,
+// so a backward wall-clock step cannot extend only the holder's local watchdog.
 func (s *Store) RenewCoordinationClaim(ctx context.Context, key, ownerToken string, now, leaseExpiresAt time.Time) (bool, error) {
 	if key == "" || ownerToken == "" || !leaseExpiresAt.After(now) {
 		return false, fmt.Errorf("invalid coordination renewal key=%q", key)
@@ -89,11 +89,10 @@ func (s *Store) RenewCoordinationClaim(ctx context.Context, key, ownerToken stri
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	rows, err := s.qw.RenewCoordinationClaim(ctx, gen.RenewCoordinationClaimParams{
-		LeaseExpiresAt:   leaseExpiresAt,
-		LeaseExpiresAt_2: leaseExpiresAt,
-		ClaimKey:         key,
-		OwnerToken:       ownerToken,
-		LeaseExpiresAt_3: now,
+		ProposedExpiry: leaseExpiresAt,
+		ClaimKey:       key,
+		OwnerToken:     ownerToken,
+		Now:            now,
 	})
 	if err != nil {
 		return false, fmt.Errorf("renew coordination claim %q: %w", key, err)
