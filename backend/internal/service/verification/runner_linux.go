@@ -52,7 +52,6 @@ func (*linuxVerificationDescendantOwner) Terminate(targetPID int) error {
 	// The target leader has already been reaped by the caller. Never issue a
 	// numeric process-group signal here: the PGID may have been reused.
 	deadline := time.Now().Add(5 * time.Second)
-	echildSeen := false
 	for time.Now().Before(deadline) {
 		none, err := reapExitedLinuxChildren()
 		if err != nil {
@@ -66,14 +65,7 @@ func (*linuxVerificationDescendantOwner) Terminate(targetPID int) error {
 			// Wait4/ECHILD is the kernel-backed completion barrier. Do not rely
 			// on repeated procfs observations, which can race delayed reparenting.
 			if none {
-				if echildSeen {
-					return nil
-				}
-				echildSeen = true
-				// Reparenting can complete immediately after wait4 reports
-				// ECHILD; give the kernel a turn before declaring convergence.
-				time.Sleep(25 * time.Millisecond)
-				continue
+				return nil
 			}
 		}
 		for _, pid := range children {
