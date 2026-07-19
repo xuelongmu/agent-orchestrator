@@ -66,8 +66,7 @@ export function isCrashLikeDaemonExit(code: number | null, signal: string | null
 }
 
 export type ReachableDaemon<TFromRunFile, TFromPort> =
-	| { source: "run-file"; value: TFromRunFile }
-	| { source: "port"; value: TFromPort };
+	{ source: "run-file"; value: TFromRunFile } | { source: "port"; value: TFromPort };
 
 /** Fall back to the expected port before declaring an adopted daemon gone. */
 export async function resolveReachableDaemon<TFromRunFile, TFromPort>(
