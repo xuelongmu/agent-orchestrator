@@ -30,6 +30,11 @@ const (
 	// DefaultReviewInterval is the minimum interval between review-thread polls
 	// for a PR whose review state warrants thread refresh.
 	DefaultReviewInterval = 2 * time.Minute
+	// DefaultIdleReviewDecisionThreshold is the earliest an idle session needs
+	// a forced complete backlog snapshot. Lifecycle remains authoritative for
+	// the defer/notify decision; this observer-side floor only avoids spending
+	// provider calls on freshly idle workers inside the normal review cadence.
+	DefaultIdleReviewDecisionThreshold = 60 * time.Second
 	// DefaultCacheMax bounds each in-memory ETag/review cache map.
 	DefaultCacheMax = 512
 	// BatchSize is the maximum number of PRs in one provider batch fetch.
@@ -69,6 +74,7 @@ type Store interface {
 type Lifecycle interface {
 	ApplySCMObservation(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
 	ApplySCMReviewFetchFailure(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
+	ApplyIdleReviewSnapshot(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
 	RetryMergedCleanup(ctx context.Context, sessionID domain.SessionID) error
 }
 
@@ -306,7 +312,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 		return err
 	}
 	if o.disabled {
-		return nil
+		return o.applyUnavailableSCMFallbacks(ctx, now, nil)
 	}
 	subjects, sessionRepos, err := o.discoverSubjects(ctx)
 	if err != nil {
@@ -320,7 +326,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 		return err
 	}
 	if !proceed || o.disabled {
-		return nil
+		return o.applyUnavailableSCMFallbacks(ctx, now, subjects)
 	}
 
 	repoGuards := o.guardRepos(ctx, sessionRepos)
@@ -427,6 +433,18 @@ func (o *Observer) Poll(ctx context.Context) error {
 						continue
 					}
 				}
+				// Idle review deferral is level-triggered, not a semantic PR
+				// transition. Feed only a freshly fetched, unchanged snapshot to
+				// its centralized decision point: changed snapshots first belong
+				// to the normal dispatcher, avoiding a duplicate reminder in the
+				// same poll that delivered new feedback.
+				if reviewMode != ports.ReviewWritePreserve {
+					if err := o.lifecycle.ApplyIdleReviewSnapshot(ctx, subj.session.ID, prepared); err != nil {
+						o.logger.Error("scm observer: idle review decision failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
+						markRepoRefreshFailed(subj.repo)
+						continue
+					}
+				}
 			}
 			if !o.coordinateReview(ctx, subj.session.ID, prepared) {
 				markRepoRefreshFailed(subj.repo)
@@ -498,6 +516,32 @@ func (o *Observer) Poll(ctx context.Context) error {
 		}
 		if etag := repoGuards[key].result.ETag; etag != "" {
 			o.cacheSetString(o.Cache.RepoPRListETag, &o.Cache.repoOrder, key, etag)
+		}
+	}
+	return nil
+}
+
+// applyUnavailableSCMFallbacks keeps the fail-closed human handoff alive when
+// the SCM adapter/credentials are unavailable. It uses only durable local PR
+// facts (no provider calls) and deliberately runs on every disabled poll so a
+// failed notification remains retryable and a session that becomes idle later
+// is not silently missed. Lifecycle owns exact-once episode dedup.
+func (o *Observer) applyUnavailableSCMFallbacks(ctx context.Context, now time.Time, subjects map[string]*subject) error {
+	if subjects == nil {
+		var err error
+		subjects, _, err = o.discoverSubjects(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	if o.lifecycle == nil {
+		return nil
+	}
+	for _, subj := range subjects {
+		obs := observationFromLocal(subj.repo, subj.known, nil)
+		obs.ObservedAt = now
+		if err := o.lifecycle.ApplySCMReviewFetchFailure(ctx, subj.session.ID, obs); err != nil {
+			o.logger.Error("scm observer: unavailable SCM fallback failed", "session", subj.session.ID, "pr", subj.known.URL, "err", err)
 		}
 	}
 	return nil
@@ -1089,7 +1133,14 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		if o.reviewCoordinator != nil {
 			needsFastSnapshot = needsFastSnapshot || coordinationObservationNeedsReviewSnapshot(obs)
 		}
-		if !needsFastSnapshot &&
+		// An idle session needs a current, complete backlog decision even inside
+		// the ordinary two-minute review throttle. Lifecycle applies the actual
+		// idle threshold and durable defer/notify policy; the observer only makes
+		// sure stale cache timing cannot swallow that decision.
+		needsIdleBacklogDecision := s.session.Activity.State == domain.ActivityIdle &&
+			!s.session.Activity.LastActivityAt.IsZero() &&
+			now.Sub(s.session.Activity.LastActivityAt) >= DefaultIdleReviewDecisionThreshold
+		if !needsFastSnapshot && !needsIdleBacklogDecision &&
 			!o.needsReviewRefresh(pkey, s.known, decision, currentHeadSHA, hasObs, now) {
 			continue
 		}

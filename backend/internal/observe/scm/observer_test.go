@@ -286,6 +286,7 @@ func (p *fakeProvider) RerunFailedCheck(_ context.Context, _ ports.SCMRepo, _ po
 
 type fakeLifecycle struct {
 	observed            []ports.SCMObservation
+	idleReviewSnapshots []ports.SCMObservation
 	reviewFetchFailures []ports.SCMObservation
 	retried             []domain.SessionID
 	err                 error
@@ -314,6 +315,14 @@ func (l *fakeLifecycle) ApplySCMReviewFetchFailure(_ context.Context, _ domain.S
 		return l.err
 	}
 	l.reviewFetchFailures = append(l.reviewFetchFailures, obs)
+	return nil
+}
+
+func (l *fakeLifecycle) ApplyIdleReviewSnapshot(_ context.Context, _ domain.SessionID, obs ports.SCMObservation) error {
+	if l.err != nil {
+		return l.err
+	}
+	l.idleReviewSnapshots = append(l.idleReviewSnapshots, obs)
 	return nil
 }
 
@@ -398,6 +407,31 @@ func TestPollRetriesDurableMergedCleanupWhenObserverDisabled(t *testing.T) {
 	}
 	if provider.credentialChecks != 1 || provider.repoGuardCalls != 0 || provider.listCalls != 0 || len(provider.fetchBatches) != 0 {
 		t.Fatalf("provider use while disabled: credentials=%d guards=%d lists=%d fetches=%d", provider.credentialChecks, provider.repoGuardCalls, provider.listCalls, len(provider.fetchBatches))
+	}
+}
+
+func TestPoll_DisabledSCMStillFeedsIdleOverlayFallback(t *testing.T) {
+	store := testStoreWithSession()
+	now := time.Unix(120, 0).UTC()
+	store.sessions[0].Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	local := knownPR(1)
+	local.Review = domain.ReviewChangesRequest
+	store.prs["p-1"] = []domain.PullRequest{local}
+	provider := &fakeProvider{credentialGate: true, credentialOK: false}
+	lifecycle := &fakeLifecycle{}
+	observer := newTestObserver(store, provider, lifecycle, now)
+
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatalf("first Poll: %v", err)
+	}
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatalf("disabled retry Poll: %v", err)
+	}
+	if len(lifecycle.reviewFetchFailures) != 2 {
+		t.Fatalf("disabled SCM fallback attempts = %d, want one per poll for durable lifecycle dedup/retry", len(lifecycle.reviewFetchFailures))
+	}
+	if provider.repoGuardCalls != 0 || provider.listCalls != 0 || len(provider.fetchBatches) != 0 {
+		t.Fatalf("disabled fallback made provider calls: guards=%d lists=%d batches=%d", provider.repoGuardCalls, provider.listCalls, len(provider.fetchBatches))
 	}
 }
 
@@ -1446,6 +1480,44 @@ func TestPoll_ReviewPollingRespectsInterval(t *testing.T) {
 	}
 	if len(store.writes) == 0 || store.writes[0].reviewMode != ports.ReviewWriteReplace {
 		t.Fatalf("review refresh not persisted with replace mode: %#v", store.writes)
+	}
+}
+
+func TestPoll_IdleSessionForcesFreshBacklogDecisionInsideReviewThrottle(t *testing.T) {
+	store := testStoreWithSession()
+	now := time.Unix(120, 0).UTC()
+	store.sessions[0].Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	local := knownPR(1)
+	review := ports.SCMReviewObservation{
+		Decision: string(domain.ReviewChangesRequest),
+		HeadSHA:  local.HeadSHA,
+		Threads: []ports.SCMReviewThreadObservation{{
+			ID: "t1", Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix"}},
+		}},
+	}
+	local.Review = domain.ReviewChangesRequest
+	local.ReviewHash = reviewSemanticHash(review)
+	store.prs["p-1"] = []domain.PullRequest{local}
+	provider := &fakeProvider{
+		repoGuards: map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "repo", NotModified: true}},
+		reviews:    map[string]ports.SCMReviewObservation{prKey(testRepo, 1): review},
+	}
+	lifecycle := &fakeLifecycle{}
+	obs := newTestObserver(store, provider, lifecycle, now)
+	obs.Cache.RepoPRListETag[prKey(testRepo, 0)] = "repo"
+	obs.Cache.LastReviewPollAt[prKey(testRepo, 1)] = now.Add(-30 * time.Second)
+
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.reviewCalls != 1 {
+		t.Fatalf("idle backlog refresh calls = %d, want 1 inside throttle window", provider.reviewCalls)
+	}
+	if len(lifecycle.idleReviewSnapshots) != 1 {
+		t.Fatalf("central idle decisions = %d, want 1: %#v", len(lifecycle.idleReviewSnapshots), lifecycle.idleReviewSnapshots)
+	}
+	if len(lifecycle.observed) != 0 {
+		t.Fatalf("unchanged snapshot also fired transition lifecycle: %#v", lifecycle.observed)
 	}
 }
 
