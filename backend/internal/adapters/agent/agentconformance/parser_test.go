@@ -33,8 +33,57 @@ callHookSync("stop", {}) // ao hooks inline-comment notification
 		{Token: "template", Event: "session-start"},
 		{Token: "template", Event: "stop"},
 	}
-	if got := hookCommands(text); !reflect.DeepEqual(got, want) {
+	got, err := hookCommands(text)
+	if err != nil {
+		t.Fatalf("hookCommands error: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("hookCommands = %#v, want %#v", got, want)
+	}
+}
+
+func TestHookCommandsRetainsUnknownExecutableEvents(t *testing.T) {
+	text := `
+// ao hooks ignored comment-typo
+/* ao hooks ignored block-typo */
+{"command":"ao hooks literal event-typo"}
+function hookCmd(hookName: string) {
+  return ` + "`exec ao hooks template ${hookName}`" + `
+}
+callHookSync("another-typo", {})
+callHookSync("stop", {})
+`
+	want := []HookCommand{
+		{Token: "literal", Event: "event-typo"},
+		{Token: "template", Event: "another-typo"},
+		{Token: "template", Event: "stop"},
+	}
+	got, err := hookCommands(text)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("hookCommands = %#v, want %#v", got, want)
+	}
+	for _, unknown := range []string{"literal/event-typo", "template/another-typo"} {
+		if err == nil || !strings.Contains(err.Error(), unknown) {
+			t.Errorf("hookCommands error = %v, want unknown event %q", err, unknown)
+		}
+	}
+}
+
+func TestCustomAgentInstructionsRequireGeneratedEvidence(t *testing.T) {
+	promptFile := filepath.Join(t.TempDir(), "standing.md")
+	if err := os.WriteFile(promptFile, []byte("standing instructions\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := ports.LaunchConfig{SystemPromptFile: promptFile}
+
+	if err := customAgentInstructionsError(cfg, `{"prompt":"file://`+filepath.ToSlash(promptFile)+`"}`); err != nil {
+		t.Fatalf("referenced standing prompt rejected: %v", err)
+	}
+	if err := customAgentInstructionsError(cfg, `{"name":"ao"}`); err == nil {
+		t.Fatal("unreferenced standing prompt passed custom-agent validation")
+	}
+	if err := customAgentInstructionsError(ports.LaunchConfig{}, `{"name":"ao"}`); err == nil {
+		t.Fatal("missing standing prompt passed custom-agent validation")
 	}
 }
 

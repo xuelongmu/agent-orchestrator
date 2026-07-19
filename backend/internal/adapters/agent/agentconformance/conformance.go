@@ -129,19 +129,27 @@ func runAdapter(t *testing.T, harness domain.AgentHarness, manifest adapters.Man
 
 	workspace := filepath.Join(sandbox, "workspace")
 	dataDir := filepath.Join(sandbox, "data")
-	if err := os.MkdirAll(workspace, 0o750); err != nil {
-		t.Fatalf("create workspace: %v", err)
+	for _, dir := range []string{workspace, dataDir} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatalf("create conformance directory: %v", err)
+		}
+	}
+	standingPromptFile := filepath.Join(dataDir, "standing-prompt.md")
+	if err := os.WriteFile(standingPromptFile, []byte("AO conformance standing instructions\n"), 0o600); err != nil {
+		t.Fatalf("write standing prompt fixture: %v", err)
 	}
 	hookCfg := ports.WorkspaceHookConfig{
-		DataDir:       dataDir,
-		Env:           map[string]string{"KIMI_CODE_HOME": filepath.Join(dataDir, "kimi")},
-		SessionID:     "conformance-session",
-		WorkspacePath: workspace,
+		DataDir:          dataDir,
+		Env:              map[string]string{"KIMI_CODE_HOME": filepath.Join(dataDir, "kimi")},
+		SessionID:        "conformance-session",
+		SystemPromptFile: standingPromptFile,
+		WorkspacePath:    workspace,
 	}
 	launchCfg := ports.LaunchConfig{
-		DataDir:       dataDir,
-		SessionID:     "conformance-session",
-		WorkspacePath: workspace,
+		DataDir:          dataDir,
+		SessionID:        "conformance-session",
+		SystemPromptFile: standingPromptFile,
+		WorkspacePath:    workspace,
 	}
 	sessionRef := ports.SessionRef{
 		ID:            "conformance-session",
@@ -159,6 +167,7 @@ func runAdapter(t *testing.T, harness domain.AgentHarness, manifest adapters.Man
 	if err := agent.GetAgentHooks(context.Background(), hookCfg); err != nil {
 		t.Fatalf("GetAgentHooks in sandbox: %v", err)
 	}
+	workspaceArtifacts := readSandboxFiles(t, workspace)
 
 	var launchText strings.Builder
 	for _, cfg := range []ports.LaunchConfig{
@@ -169,6 +178,7 @@ func runAdapter(t *testing.T, harness domain.AgentHarness, manifest adapters.Man
 	} {
 		cfg.DataDir = dataDir
 		cfg.SessionID = "conformance-session"
+		cfg.SystemPromptFile = standingPromptFile
 		cfg.WorkspacePath = workspace
 		strategy, err := agent.GetPromptDeliveryStrategy(context.Background(), cfg)
 		if err != nil {
@@ -184,18 +194,27 @@ func runAdapter(t *testing.T, harness domain.AgentHarness, manifest adapters.Man
 			t.Errorf("GetLaunchCommand(%s, prompt=%t) returned an empty command", cfg.Kind, cfg.Prompt != "")
 			continue
 		}
-		validatePromptDelivery(t, strategy, cfg.Prompt, launch)
+		validatePromptDelivery(t, strategy, cfg, launch, workspaceArtifacts)
 		launchText.WriteString(strings.Join(launch, "\n"))
 		launchText.WriteByte('\n')
 	}
 
 	hookText := launchText.String() + readSandboxFiles(t, sandbox)
-	hooks := hookCommands(hookText)
+	hooks, err := hookCommands(hookText)
+	if err != nil {
+		t.Error(err)
+	}
 	validateHookDispatch(t, hooks, opts)
 	return hooks
 }
 
-func validatePromptDelivery(t *testing.T, strategy ports.PromptDeliveryStrategy, prompt string, launch []string) {
+func validatePromptDelivery(
+	t *testing.T,
+	strategy ports.PromptDeliveryStrategy,
+	cfg ports.LaunchConfig,
+	launch []string,
+	workspaceArtifacts string,
+) {
 	t.Helper()
 	legal := slices.Contains([]ports.PromptDeliveryStrategy{
 		ports.PromptDeliveryInCommand,
@@ -206,22 +225,57 @@ func validatePromptDelivery(t *testing.T, strategy ports.PromptDeliveryStrategy,
 		t.Errorf("prompt delivery strategy = %q", strategy)
 		return
 	}
-	if prompt == "" {
-		return
-	}
-	containsPrompt := strings.Contains(strings.Join(launch, "\x00"), prompt)
+	containsPrompt := cfg.Prompt != "" && strings.Contains(strings.Join(launch, "\x00"), cfg.Prompt)
 	switch strategy {
 	case ports.PromptDeliveryInCommand:
-		if !containsPrompt {
-			t.Errorf("in-command prompt %q is absent from launch argv %q", prompt, launch)
+		if cfg.Prompt != "" && !containsPrompt {
+			t.Errorf("in-command prompt %q is absent from launch argv %q", cfg.Prompt, launch)
 		}
 	case ports.PromptDeliveryAfterStart:
 		if containsPrompt {
-			t.Errorf("after-start prompt %q leaked into launch argv %q", prompt, launch)
+			t.Errorf("after-start prompt %q leaked into launch argv %q", cfg.Prompt, launch)
 		}
 	case ports.PromptDeliveryCustomAgent:
-		t.Errorf("custom-agent delivery cannot carry a separate prompt %q", prompt)
+		if cfg.Prompt != "" {
+			t.Errorf("custom-agent delivery cannot carry a separate prompt %q", cfg.Prompt)
+		}
+		validateCustomAgentInstructions(t, cfg, workspaceArtifacts)
 	}
+}
+
+func validateCustomAgentInstructions(t *testing.T, cfg ports.LaunchConfig, workspaceArtifacts string) {
+	t.Helper()
+	if err := customAgentInstructionsError(cfg, workspaceArtifacts); err != nil {
+		t.Error(err)
+	}
+}
+
+func customAgentInstructionsError(cfg ports.LaunchConfig, workspaceArtifacts string) error {
+	if strings.TrimSpace(cfg.SystemPrompt) == "" && strings.TrimSpace(cfg.SystemPromptFile) == "" {
+		return errors.New("custom-agent delivery has no standing SystemPrompt or SystemPromptFile")
+	}
+	if strings.TrimSpace(workspaceArtifacts) == "" {
+		return errors.New("custom-agent delivery generated no workspace artifact")
+	}
+
+	evidence := strings.TrimSpace(cfg.SystemPrompt) != "" && strings.Contains(workspaceArtifacts, cfg.SystemPrompt)
+	if promptFile := strings.TrimSpace(cfg.SystemPromptFile); promptFile != "" {
+		for _, reference := range []string{promptFile, filepath.ToSlash(promptFile), "file://" + filepath.ToSlash(promptFile)} {
+			if strings.Contains(workspaceArtifacts, reference) {
+				evidence = true
+			}
+		}
+		prompt, err := os.ReadFile(promptFile) //nolint:gosec // test-owned standing prompt fixture
+		if err != nil {
+			return fmt.Errorf("read custom-agent SystemPromptFile: %w", err)
+		} else if body := strings.TrimSpace(string(prompt)); body != "" && strings.Contains(workspaceArtifacts, body) {
+			evidence = true
+		}
+	}
+	if !evidence {
+		return errors.New("custom-agent workspace artifacts do not contain or reference standing instructions")
+	}
+	return nil
 }
 
 func validateHookDispatch(t *testing.T, hooks []HookCommand, opts RegistryOptions) {
@@ -230,6 +284,10 @@ func validateHookDispatch(t *testing.T, hooks []HookCommand, opts RegistryOption
 	seenToken := map[string]bool{}
 	for _, hook := range hooks {
 		seenToken[hook.Token] = true
+		if !normalizedHookEvents[hook.Event] {
+			t.Errorf("generated hook %s/%s uses an unknown event", hook.Token, hook.Event)
+			continue
+		}
 		if opts.SupportsHookToken == nil || !opts.SupportsHookToken(hook.Token) {
 			t.Errorf("hook token %q has no activity dispatcher", hook.Token)
 			continue
@@ -472,7 +530,7 @@ type HookCommand struct {
 	Event string
 }
 
-func hookCommands(text string) []HookCommand {
+func hookCommands(text string) ([]HookCommand, error) {
 	seen := map[HookCommand]bool{}
 	var hooks []HookCommand
 	uncommented := withoutSourceComments(text)
@@ -483,9 +541,6 @@ func hookCommands(text string) []HookCommand {
 		}
 	}
 	for _, match := range hookCommandPattern.FindAllStringSubmatch(uncommented, -1) {
-		if !normalizedHookEvents[match[2]] {
-			continue
-		}
 		add(HookCommand{Token: match[1], Event: match[2]})
 	}
 	// Embedded JS/TS plugins build `ao hooks <token> ${hookName}` and call a
@@ -493,12 +548,19 @@ func hookCommands(text string) []HookCommand {
 	// executable pieces instead of accepting examples written only in comments.
 	for _, template := range hookTemplatePattern.FindAllStringSubmatch(uncommented, -1) {
 		for _, invocation := range hookInvocationPattern.FindAllStringSubmatch(uncommented, -1) {
-			if normalizedHookEvents[invocation[1]] {
-				add(HookCommand{Token: template[1], Event: invocation[1]})
-			}
+			add(HookCommand{Token: template[1], Event: invocation[1]})
 		}
 	}
-	return hooks
+	var unknown []string
+	for _, hook := range hooks {
+		if !normalizedHookEvents[hook.Event] {
+			unknown = append(unknown, hook.Token+"/"+hook.Event)
+		}
+	}
+	if len(unknown) != 0 {
+		return hooks, fmt.Errorf("unknown executable hook events: %s", strings.Join(unknown, ", "))
+	}
+	return hooks, nil
 }
 
 // withoutSourceComments removes JavaScript/TypeScript line and block comments
