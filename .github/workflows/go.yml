@@ -92,6 +92,10 @@ jobs:
           go-version-file: backend/go.mod
           cache: false
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Test out-of-band verification lifecycle
         run: go test -count=1 ./internal/service/verification
 

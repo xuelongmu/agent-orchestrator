@@ -30,7 +30,7 @@ func configureDetachedChild(cmd *exec.Cmd) {
 func TestWindowsNPMTargetUsesNodeWithoutCommandShell(t *testing.T) {
 	argv, err := prepareWindowsTarget([]string{"npm", "--version"})
 	if err != nil {
-		t.Skipf("npm is unavailable: %v", err)
+		t.Fatalf("npm is unavailable: %v", err)
 	}
 	if strings.ToLower(filepath.Base(argv[0])) != "node.exe" || filepath.Base(argv[1]) != "npm-cli.js" {
 		t.Fatalf("resolved argv = %#v", argv)
