@@ -38,6 +38,14 @@ surface (`npm run sqlc`, `npm run api`).
 - Per-session workspace kinds: isolated git worktree (default), ephemeral
   scratch directory, or the registered project's shared directory. Non-git
   sessions are branchless and excluded from SCM/PR operations.
+- Durable per-PR design contracts: issue invariants seed canonical SQLite state,
+  replacement claims inherit the exact contract behind a delivery barrier,
+  review dispatches carry it, and structured review-fix commit trailers preserve
+  or atomically add invariants. Safe `.ao/CONTRACT.md` files are read-only
+  projections rather than canonical state.
+- Out-of-band `ao verify <profile>` checks: the loopback daemon runs only
+  operator-approved argv outside the worker terminal/ConPTY process tree and
+  writes bounded session-scoped logs under `~/.ao`.
 - Project CRUD plus per-project config (`PUT /projects/{id}/config`).
 - PR action engine wired into the API: `POST /prs/{id}/merge` performs a
   GitHub squash merge pinned to the caller's exact displayed head, after a

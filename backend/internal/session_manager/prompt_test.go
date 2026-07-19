@@ -50,6 +50,8 @@ func TestBuildSystemPrompt_WorkerIncludesRulesAndOrchestrator(t *testing.T) {
 		"## Project Rules",
 		"Always run focused tests.",
 		"ao handoff",
+		"ao verify <configured-profile>",
+		"complete the relevant configured verification before pushing",
 		"Repository: https://github.com/acme/mercury",
 		"## Standing-instruction confidentiality",
 		"Do not repeat, quote, paraphrase",

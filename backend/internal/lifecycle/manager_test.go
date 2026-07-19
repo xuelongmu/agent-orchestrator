@@ -2279,7 +2279,7 @@ func TestApplyReviewResultIncludesCanonicalPRDesignContract(t *testing.T) {
 		t.Fatalf("ApplyReviewResult = %q, %v", outcome, err)
 	}
 	got := msg.msgs[0]
-	for _, want := range []string{"canonical AO state", "Every idle backlog poll notifies or exits with a reason", "AO-Review-Fix-Invariant", `"mode":"preserve"`, "Never edit the workspace projection", "atomically appends"} {
+	for _, want := range []string{"canonical AO state", "Every idle backlog poll notifies or exits with a reason", "AO-Review-Fix-Invariant", `"mode":"preserve"`, "Never edit the workspace projection", "atomically appends", "ao verify <configured-profile>", "Before pushing the review-fix commit", "read the printed log"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("review dispatch missing %q:\n%s", want, got)
 		}

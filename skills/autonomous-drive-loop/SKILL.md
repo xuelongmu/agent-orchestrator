@@ -316,6 +316,10 @@ After the retry limit, surface non-convergence instead of scheduling more retrie
   `AO-Review-Fix-Invariant: {"pr":"<exact normalized PR URL>","mode":"preserve|add","invariant":"<one-line guarantee>"}`
   trailer. `preserve` must name exact canonical list-item text; `add` is
   grammar-checked and appended atomically with the pending-finding binding.
+- **Out-of-band verification:** before pushing a review-fix round, use
+  `ao verify <configured-profile>` for applicable configured checks that could
+  fan out or destabilize the worker terminal, then read the printed bounded log.
+  Never guess an operator-owned profile or bypass repository verification rules.
 - **Out-of-scope deflection:** when a finding belongs to another subsystem and is
   not required for this PR's correctness, first verify operator authority to file
   issues. If authorized, file a linked issue with the evidence and record the
