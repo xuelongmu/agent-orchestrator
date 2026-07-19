@@ -103,9 +103,11 @@ func TestLinuxGuardianDoesNotOwnUnrelatedWorker(t *testing.T) {
 		t.Fatal("runner did not cancel")
 	}
 	assertProcessDies(t, pid, "setsid descendant survived cancellation")
-	if !processalive.Alive(worker.Process.Pid) {
+	workerFD, workerErr := unix.PidfdOpen(worker.Process.Pid, 0)
+	if workerErr != nil {
 		t.Fatalf("unrelated worker pid %d was accidentally owned by verifier guardian", worker.Process.Pid)
 	}
+	_ = unix.Close(workerFD)
 }
 
 func assertProcessDies(t *testing.T, pid int, message string) {
