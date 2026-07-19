@@ -1413,6 +1413,7 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 			obs.Review.Decision = review.Decision
 		}
 		obs.Review.HeadSHA = review.HeadSHA
+		obs.PR.HeadCommitMessage = review.HeadCommitMessage
 		obs.Review.Reviews = review.Reviews
 		obs.Review.Threads = review.Threads
 		obs.Review.Partial = review.Partial

@@ -14,6 +14,57 @@ import (
 	"testing"
 )
 
+func TestParseReviewFixInvariantDeclarationRequiresExactFinalTrailer(t *testing.T) {
+	valid := `fix: preserve ownership
+
+The parser token in prose is not enough.
+
+AO-Review-Fix-Invariant: {"pr":"https://github.com/o/r/pull/7","mode":"preserve","invariant":"Every write has one owner."}`
+	got, err := ParseReviewFixInvariantDeclaration(valid)
+	if err != nil {
+		t.Fatalf("parse valid trailer: %v", err)
+	}
+	if got.PR != "https://github.com/o/r/pull/7" || got.Mode != "preserve" || got.Invariant != "Every write has one owner." {
+		t.Fatalf("declaration = %+v", got)
+	}
+
+	tests := []struct {
+		name    string
+		message string
+		want    error
+	}{
+		{"missing", "fix: no declaration", ErrReviewFixDeclarationMissing},
+		{"body only", "AO-Review-Fix-Invariant: {}\n\nmore prose", ErrReviewFixDeclarationMalformed},
+		{"duplicate", valid + "\nAO-Review-Fix-Invariant: {}", ErrReviewFixDeclarationMalformed},
+		{"unknown field", "x\n\nAO-Review-Fix-Invariant: {\"pr\":\"p\",\"mode\":\"add\",\"invariant\":\"i\",\"other\":true}", ErrReviewFixDeclarationMalformed},
+		{"duplicate key", "x\n\nAO-Review-Fix-Invariant: {\"pr\":\"sibling\",\"pr\":\"p\",\"mode\":\"add\",\"invariant\":\"i\"}", ErrReviewFixDeclarationMalformed},
+		{"trailing json", "x\n\nAO-Review-Fix-Invariant: {\"pr\":\"p\",\"mode\":\"add\",\"invariant\":\"i\"} {}", ErrReviewFixDeclarationMalformed},
+		{"bad mode", "x\n\nAO-Review-Fix-Invariant: {\"pr\":\"p\",\"mode\":\"new\",\"invariant\":\"i\"}", ErrReviewFixDeclarationMalformed},
+		{"multiline value", "x\n\nAO-Review-Fix-Invariant: {\"pr\":\"p\",\"mode\":\"add\",\"invariant\":\"a\\nb\"}", ErrReviewFixDeclarationMalformed},
+		{"leading whitespace", "x\n\n AO-Review-Fix-Invariant: {\"pr\":\"p\",\"mode\":\"add\",\"invariant\":\"i\"}", ErrReviewFixDeclarationMissing},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseReviewFixInvariantDeclaration(tc.message)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("error = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasExactInvariantDoesNotNormalizeDeclaration(t *testing.T) {
+	contract := "## Invariants\n\n- Preserve exact casing.\n"
+	if !HasExactInvariant(contract, "Preserve exact casing.") {
+		t.Fatal("exact invariant not found")
+	}
+	for _, near := range []string{"preserve exact casing.", " Preserve exact casing.", "Preserve exact casing. "} {
+		if HasExactInvariant(contract, near) {
+			t.Fatalf("near match %q unexpectedly accepted", near)
+		}
+	}
+}
+
 func TestBuildSeedExtractsInvariantsAndPreservesTrackerTrustBoundary(t *testing.T) {
 	issueContext := "Body:\n## Invariants\n- Every idle backlog poll has one terminal action.\n\n### Why\nRetries count.\n\n## Acceptance\n- covered"
 	got := BuildSeed("61", issueContext)

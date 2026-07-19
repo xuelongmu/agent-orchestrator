@@ -335,6 +335,21 @@ func (s *Store) ListReviewRunsBySession(ctx context.Context, id domain.SessionID
 	return out, nil
 }
 
+// ListReviewRunsByPR returns the durable history for one exact normalized PR
+// across session replacement. Ownership is checked separately at mutation
+// boundaries; review rounds belong to the PR, not its disposable worker.
+func (s *Store) ListReviewRunsByPR(ctx context.Context, prURL string) ([]domain.ReviewRun, error) {
+	rows, err := s.qr.ListReviewRunsByPR(ctx, prURL)
+	if err != nil {
+		return nil, fmt.Errorf("list review runs for PR %s: %w", prURL, err)
+	}
+	out := make([]domain.ReviewRun, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, reviewRunFromRow(row))
+	}
+	return out, nil
+}
+
 // ListRunningReviewRunsBySession returns only currently running unverdicted
 // review passes for a worker session, newest first.
 func (s *Store) ListRunningReviewRunsBySession(ctx context.Context, id domain.SessionID) ([]domain.ReviewRun, error) {

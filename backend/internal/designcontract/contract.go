@@ -4,8 +4,10 @@
 package designcontract
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +31,9 @@ const (
 	// MaxCanonicalBytes is the explicit SQLite contract capacity.
 	MaxCanonicalBytes = 1024 * 1024
 	maxInvariantBytes = 512
+	// ReviewFixInvariantTrailer is the one structured commit trailer accepted
+	// at the automatic review-fix boundary. Its value is a single JSON object.
+	ReviewFixInvariantTrailer = "AO-Review-Fix-Invariant"
 	// projectionOwnershipVersion is embedded in every AO-owned projection.
 	// Together with the target-bound digest and exact structural prefix, it
 	// lets a later daemon refresh only files created by this projection writer.
@@ -42,7 +47,120 @@ var (
 	// ErrContractCapacityExceeded means an append would exceed the canonical
 	// one-MiB UTF-8 byte limit.
 	ErrContractCapacityExceeded = errors.New("canonical design contract capacity exceeded")
+	// ErrReviewFixDeclarationMissing means the head commit did not end with the
+	// required structured trailer.
+	ErrReviewFixDeclarationMissing = errors.New("review-fix invariant declaration is missing")
+	// ErrReviewFixDeclarationMalformed means the trailer was present but did
+	// not satisfy its strict, single-line JSON contract.
+	ErrReviewFixDeclarationMalformed = errors.New("review-fix invariant declaration is malformed")
+	// ErrReviewFixDeclarationStale means the declaration does not name the
+	// exact normalized PR or the store no longer has the observed head.
+	ErrReviewFixDeclarationStale = errors.New("review-fix invariant declaration has stale provenance")
+	// ErrReviewFixInvariantUnknown means a preserve declaration did not match
+	// one exact canonical contract list item.
+	ErrReviewFixInvariantUnknown = errors.New("preserved invariant is not an exact canonical contract line")
 )
+
+// ReviewFixInvariantDeclaration is the JSON value carried by the
+// AO-Review-Fix-Invariant commit trailer. Mode is either "preserve" for an
+// existing canonical line or "add" for a newly proposed invariant.
+type ReviewFixInvariantDeclaration struct {
+	PR        string `json:"pr"`
+	Mode      string `json:"mode"`
+	Invariant string `json:"invariant"`
+}
+
+// ParseReviewFixInvariantDeclaration reads exactly one trailer from the final
+// non-empty line of a commit message. Merely mentioning the token in the
+// subject/body is not a declaration, and duplicates fail closed.
+func ParseReviewFixInvariantDeclaration(message string) (ReviewFixInvariantDeclaration, error) {
+	if !utf8.ValidString(message) {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: commit message must be valid UTF-8", ErrReviewFixDeclarationMalformed)
+	}
+	message = strings.ReplaceAll(message, "\r\n", "\n")
+	if strings.ContainsRune(message, '\r') {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: commit message contains a bare carriage return", ErrReviewFixDeclarationMalformed)
+	}
+	lines := strings.Split(message, "\n")
+	last := len(lines) - 1
+	for last >= 0 && lines[last] == "" {
+		last--
+	}
+	prefix := ReviewFixInvariantTrailer + ": "
+	count := 0
+	for _, line := range lines {
+		if strings.HasPrefix(line, ReviewFixInvariantTrailer+":") {
+			count++
+		}
+	}
+	if count == 0 {
+		return ReviewFixInvariantDeclaration{}, ErrReviewFixDeclarationMissing
+	}
+	if count != 1 || last < 0 || !strings.HasPrefix(lines[last], prefix) {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: trailer must appear exactly once as the final non-empty line", ErrReviewFixDeclarationMalformed)
+	}
+	value := strings.TrimPrefix(lines[last], prefix)
+	decoder := json.NewDecoder(bytes.NewBufferString(value))
+	start, err := decoder.Token()
+	if err != nil {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %w", ErrReviewFixDeclarationMalformed, err)
+	}
+	if start != json.Delim('{') {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: JSON value must be an object", ErrReviewFixDeclarationMalformed)
+	}
+	fields := make(map[string]json.RawMessage, 3)
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %w", ErrReviewFixDeclarationMalformed, err)
+		}
+		name, ok := key.(string)
+		if !ok {
+			return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: JSON object key is not a string", ErrReviewFixDeclarationMalformed)
+		}
+		if _, duplicate := fields[name]; duplicate {
+			return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: duplicate JSON key %q", ErrReviewFixDeclarationMalformed, name)
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON field %q: %w", ErrReviewFixDeclarationMalformed, name, err)
+		}
+		fields[name] = raw
+	}
+	if _, err := decoder.Token(); err != nil {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %w", ErrReviewFixDeclarationMalformed, err)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: trailer must contain one JSON object", ErrReviewFixDeclarationMalformed)
+	}
+	canonical, err := json.Marshal(fields)
+	if err != nil {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: encode parsed JSON: %w", ErrReviewFixDeclarationMalformed, err)
+	}
+	strict := json.NewDecoder(bytes.NewReader(canonical))
+	strict.DisallowUnknownFields()
+	var declaration ReviewFixInvariantDeclaration
+	if err := strict.Decode(&declaration); err != nil {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: invalid JSON: %w", ErrReviewFixDeclarationMalformed, err)
+	}
+	if declaration.PR == "" || declaration.Invariant == "" {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: pr, mode, and invariant are required", ErrReviewFixDeclarationMalformed)
+	}
+	if declaration.Mode != "preserve" && declaration.Mode != "add" {
+		return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: mode must be %q or %q", ErrReviewFixDeclarationMalformed, "preserve", "add")
+	}
+	for name, value := range map[string]string{"pr": declaration.PR, "invariant": declaration.Invariant} {
+		if strings.ContainsAny(value, "\r\n") {
+			return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: %s must be one line", ErrReviewFixDeclarationMalformed, name)
+		}
+		for _, r := range value {
+			if unicode.IsControl(r) {
+				return ReviewFixInvariantDeclaration{}, fmt.Errorf("%w: %s must not contain control characters", ErrReviewFixDeclarationMalformed, name)
+			}
+		}
+	}
+	return declaration, nil
+}
 
 // NormalizeInvariant validates one explicit agent-authored invariant proposal.
 func NormalizeInvariant(value string) (string, error) {
@@ -173,6 +291,22 @@ func HasInvariant(contract, invariant string) bool {
 	for line := range strings.SplitSeq(contract, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "- ") && strings.TrimSpace(strings.TrimPrefix(line, "- ")) == invariant {
+			return true
+		}
+	}
+	return false
+}
+
+// HasExactInvariant reports whether invariant is the exact text of one
+// canonical Markdown list item. Unlike HasInvariant it performs no trimming;
+// the review-fix declaration boundary must not silently canonicalize a near
+// match into a preserved design guarantee.
+func HasExactInvariant(contract, invariant string) bool {
+	if invariant == "" {
+		return false
+	}
+	for line := range strings.SplitSeq(contract, "\n") {
+		if line == "- "+invariant {
 			return true
 		}
 	}

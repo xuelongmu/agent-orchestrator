@@ -2,7 +2,11 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	sqlitedb "github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	sqlite "github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
@@ -64,6 +69,260 @@ func TestOwnedPRDesignContractReadFencesTakeoverAndPreservesInheritance(t *testi
 	}
 	if got, found, err := s.GetOwnedPRDesignContract(ctx, replacement.ID, prURL); err != nil || !found || got != want {
 		t.Fatalf("replacement inherited read = %q found=%v err=%v", got, found, err)
+	}
+}
+
+func reviewFixMessage(t *testing.T, pr, mode, invariant string) string {
+	t.Helper()
+	value, err := json.Marshal(designcontract.ReviewFixInvariantDeclaration{PR: pr, Mode: mode, Invariant: invariant})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "fix: address review\n\n" + designcontract.ReviewFixInvariantTrailer + ": " + string(value)
+}
+
+func setupPendingReviewFix(t *testing.T) (*sqlite.Store, domain.SessionRecord, domain.SessionRecord, string, string, string) {
+	t.Helper()
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	owner := createContractSession(t, s, "mer")
+	replacement := createContractSession(t, s, "mer")
+	pr1 := "https://github.com/acme/repo/pull/31"
+	pr2 := "https://github.com/acme/repo/pull/32"
+	seed := designcontract.BuildSeed("148", "## Invariants\n- Exact provenance is checked atomically.")
+	if err := s.SaveSessionDesignContractSeed(ctx, owner.ID, seed, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	for i, pr := range []string{pr1, pr2} {
+		if err := s.WriteSCMObservation(ctx, domain.PullRequest{URL: pr, SessionID: owner.ID, Number: 31 + i, HeadSHA: fmt.Sprintf("head-%d", 31+i), UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	if err := s.UpsertReview(ctx, domain.Review{ID: "review-31", SessionID: owner.ID, ProjectID: owner.ProjectID, Harness: domain.ReviewerCodex, PRURL: pr1, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertReviewRun(ctx, domain.ReviewRun{ID: "run-31", ReviewID: "review-31", SessionID: owner.ID, Harness: domain.ReviewerCodex, PRURL: pr1, TargetSHA: "reviewed-head", Status: domain.ReviewRunRunning, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	finding := domain.ReviewFinding{ID: "run-31:1", RunID: "run-31", SessionID: owner.ID, PRURL: pr1, Round: 1, ClassTag: "ownership", RootCauseNote: "fix ownership", CreatedAt: now}
+	if ok, err := s.CompleteReviewRunWithFindings(ctx, "run-31", domain.VerdictChangesRequested, "[P1] fix ownership", "", "", []domain.ReviewFinding{finding}); err != nil || !ok {
+		t.Fatalf("complete review = %v, %v", ok, err)
+	}
+	return s, owner, replacement, pr1, pr2, seed
+}
+
+func TestAcceptReviewFixCommitFencesExactPRHeadOwnerAndUpdatesOnlyTarget(t *testing.T) {
+	t.Run("no pending actionable findings bypass declaration", func(t *testing.T) {
+		s, owner, _, _, pr2, seed := setupPendingReviewFix(t)
+		required, bound, err := s.AcceptReviewFixCommit(context.Background(), owner.ID, pr2, "head-32", "no trailer", false, time.Now().UTC())
+		if err != nil || required || bound != 0 {
+			t.Fatalf("bypass = required %v bound %d err %v", required, bound, err)
+		}
+		if got, _, _ := s.GetPRDesignContract(context.Background(), pr2); got != seed {
+			t.Fatal("bypass changed sibling contract")
+		}
+	})
+
+	t.Run("historical blocking run can force declaration without finding rows", func(t *testing.T) {
+		s, owner, _, _, pr2, seed := setupPendingReviewFix(t)
+		if _, _, err := s.AcceptReviewFixCommit(context.Background(), owner.ID, pr2, "head-32", "missing trailer", true, time.Now().UTC()); !errors.Is(err, designcontract.ErrReviewFixDeclarationMissing) {
+			t.Fatalf("forced missing trailer error = %v", err)
+		}
+		if got, _, _ := s.GetPRDesignContract(context.Background(), pr2); got != seed {
+			t.Fatal("forced validation failure changed contract")
+		}
+		added := "Historical blocking reviews still require invariant declarations."
+		message := reviewFixMessage(t, pr2, "add", added)
+		required, bound, err := s.AcceptReviewFixCommit(context.Background(), owner.ID, pr2, "head-32", message, true, time.Now().UTC())
+		if err != nil || !required || bound != 0 {
+			t.Fatalf("forced declaration = required %v bound %d err %v", required, bound, err)
+		}
+		after, _, _ := s.GetPRDesignContract(context.Background(), pr2)
+		if !designcontract.HasExactInvariant(after, added) {
+			t.Fatalf("forced add missing: %q", after)
+		}
+		if _, _, err := s.AcceptReviewFixCommit(context.Background(), owner.ID, pr2, "head-32", message, true, time.Now().UTC()); err != nil {
+			t.Fatalf("forced restart replay: %v", err)
+		}
+		if replay, _, _ := s.GetPRDesignContract(context.Background(), pr2); replay != after {
+			t.Fatal("forced restart replay duplicated invariant")
+		}
+	})
+
+	t.Run("exact preserve binds pending finding", func(t *testing.T) {
+		s, owner, _, pr1, _, seed := setupPendingReviewFix(t)
+		required, bound, err := s.AcceptReviewFixCommit(context.Background(), owner.ID, pr1, "head-31", reviewFixMessage(t, pr1, "preserve", "Exact provenance is checked atomically."), false, time.Now().UTC())
+		if err != nil || !required || bound != 1 {
+			t.Fatalf("accept = required %v bound %d err %v", required, bound, err)
+		}
+		if got, _, _ := s.GetPRDesignContract(context.Background(), pr1); got != seed {
+			t.Fatal("preserve changed canonical contract")
+		}
+		findings, _ := s.ListReviewFindingsByRun(context.Background(), "run-31")
+		if len(findings) != 1 || findings[0].FixCommit != "head-31" {
+			t.Fatalf("finding binding = %+v", findings)
+		}
+	})
+
+	t.Run("manual current-head run cannot bypass and its own finding is excluded", func(t *testing.T) {
+		s, owner, _, pr1, _, seed := setupPendingReviewFix(t)
+		now := time.Now().UTC().Add(time.Second)
+		if err := s.InsertReviewRun(context.Background(), domain.ReviewRun{ID: "run-current", ReviewID: "review-31", SessionID: owner.ID, Harness: domain.ReviewerCodex, PRURL: pr1, TargetSHA: "head-31", Status: domain.ReviewRunRunning, CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		current := domain.ReviewFinding{ID: "run-current:1", RunID: "run-current", SessionID: owner.ID, PRURL: pr1, Round: 2, ClassTag: "current", CreatedAt: now}
+		if ok, err := s.CompleteReviewRunWithFindings(context.Background(), "run-current", domain.VerdictChangesRequested, "[P1] current finding", "", "", []domain.ReviewFinding{current}); err != nil || !ok {
+			t.Fatalf("complete current run = %v, %v", ok, err)
+		}
+		if _, _, err := s.AcceptReviewFixCommit(context.Background(), owner.ID, pr1, "head-31", "missing trailer", false, now); !errors.Is(err, designcontract.ErrReviewFixDeclarationMissing) {
+			t.Fatalf("manual-trigger bypass error = %v", err)
+		}
+		if got, _, _ := s.GetPRDesignContract(context.Background(), pr1); got != seed {
+			t.Fatal("failed manual-trigger gate changed contract")
+		}
+		required, bound, err := s.AcceptReviewFixCommit(context.Background(), owner.ID, pr1, "head-31", reviewFixMessage(t, pr1, "preserve", "Exact provenance is checked atomically."), false, now)
+		if err != nil || !required || bound != 1 {
+			t.Fatalf("valid manual-trigger gate = required %v bound %d err %v", required, bound, err)
+		}
+		oldFindings, _ := s.ListReviewFindingsByRun(context.Background(), "run-31")
+		currentFindings, _ := s.ListReviewFindingsByRun(context.Background(), "run-current")
+		if oldFindings[0].FixCommit != "head-31" || currentFindings[0].FixCommit != "" {
+			t.Fatalf("head-scoped bindings old=%+v current=%+v", oldFindings, currentFindings)
+		}
+	})
+
+	badCases := []struct {
+		name     string
+		message  func(*testing.T, string, string) string
+		session  func(domain.SessionRecord, domain.SessionRecord) domain.SessionID
+		expected string
+		want     error
+	}{
+		{"missing", func(*testing.T, string, string) string { return "fix without trailer" }, func(o, _ domain.SessionRecord) domain.SessionID { return o.ID }, "head-31", designcontract.ErrReviewFixDeclarationMissing},
+		{"malformed", func(*testing.T, string, string) string { return "x\n\nAO-Review-Fix-Invariant: {}" }, func(o, _ domain.SessionRecord) domain.SessionID { return o.ID }, "head-31", designcontract.ErrReviewFixDeclarationMalformed},
+		{"normalized identity is exact", func(t *testing.T, pr, _ string) string {
+			return reviewFixMessage(t, pr+"/", "preserve", "Exact provenance is checked atomically.")
+		}, func(o, _ domain.SessionRecord) domain.SessionID { return o.ID }, "head-31", designcontract.ErrReviewFixDeclarationStale},
+		{"sibling declaration", func(t *testing.T, _, sibling string) string {
+			return reviewFixMessage(t, sibling, "preserve", "Exact provenance is checked atomically.")
+		}, func(o, _ domain.SessionRecord) domain.SessionID { return o.ID }, "head-31", designcontract.ErrReviewFixDeclarationStale},
+		{"stale observed head", func(t *testing.T, pr, _ string) string {
+			return reviewFixMessage(t, pr, "preserve", "Exact provenance is checked atomically.")
+		}, func(o, _ domain.SessionRecord) domain.SessionID { return o.ID }, "old-head", designcontract.ErrReviewFixDeclarationStale},
+		{"near invariant", func(t *testing.T, pr, _ string) string {
+			return reviewFixMessage(t, pr, "preserve", "exact provenance is checked atomically.")
+		}, func(o, _ domain.SessionRecord) domain.SessionID { return o.ID }, "head-31", designcontract.ErrReviewFixInvariantUnknown},
+		{"unowned PR", func(t *testing.T, pr, _ string) string {
+			return reviewFixMessage(t, pr, "preserve", "Exact provenance is checked atomically.")
+		}, func(_, r domain.SessionRecord) domain.SessionID { return r.ID }, "head-31", designcontract.ErrPRNotOwned},
+	}
+	for _, tc := range badCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, owner, replacement, pr1, pr2, seed := setupPendingReviewFix(t)
+			_, _, err := s.AcceptReviewFixCommit(context.Background(), tc.session(owner, replacement), pr1, tc.expected, tc.message(t, pr1, pr2), false, time.Now().UTC())
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("error = %v, want %v", err, tc.want)
+			}
+			if got, _, _ := s.GetPRDesignContract(context.Background(), pr1); got != seed {
+				t.Fatal("failed declaration changed target contract")
+			}
+			findings, _ := s.ListReviewFindingsByRun(context.Background(), "run-31")
+			if len(findings) != 1 || findings[0].FixCommit != "" {
+				t.Fatalf("failed declaration bound finding: %+v", findings)
+			}
+		})
+	}
+
+	t.Run("add is target scoped and restart replay is idempotent", func(t *testing.T) {
+		s, owner, _, pr1, pr2, siblingSeed := setupPendingReviewFix(t)
+		added := "Each review fix binds its declaration to one observed head."
+		message := reviewFixMessage(t, pr1, "add", added)
+		required, bound, err := s.AcceptReviewFixCommit(context.Background(), owner.ID, pr1, "head-31", message, false, time.Now().UTC())
+		if err != nil || !required || bound != 1 {
+			t.Fatalf("add = required %v bound %d err %v", required, bound, err)
+		}
+		after, _, _ := s.GetPRDesignContract(context.Background(), pr1)
+		if !designcontract.HasExactInvariant(after, added) {
+			t.Fatalf("added invariant missing: %q", after)
+		}
+		if sibling, _, _ := s.GetPRDesignContract(context.Background(), pr2); sibling != siblingSeed {
+			t.Fatal("add leaked to sibling PR")
+		}
+		required, bound, err = s.AcceptReviewFixCommit(context.Background(), owner.ID, pr1, "head-31", message, false, time.Now().UTC())
+		if err != nil || required || bound != 0 {
+			t.Fatalf("restart replay = required %v bound %d err %v", required, bound, err)
+		}
+		if replay, _, _ := s.GetPRDesignContract(context.Background(), pr1); replay != after {
+			t.Fatal("restart replay duplicated invariant")
+		}
+	})
+
+	t.Run("replacement is the only accepted owner", func(t *testing.T) {
+		s, owner, replacement, pr1, _, _ := setupPendingReviewFix(t)
+		if _, err := s.ClaimPR(context.Background(), domain.PullRequest{URL: pr1, SessionID: replacement.ID, Number: 31, HeadSHA: "head-31", UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		message := reviewFixMessage(t, pr1, "preserve", "Exact provenance is checked atomically.")
+		if _, _, err := s.AcceptReviewFixCommit(context.Background(), owner.ID, pr1, "head-31", message, false, time.Now().UTC()); !errors.Is(err, designcontract.ErrPRNotOwned) {
+			t.Fatalf("predecessor error = %v", err)
+		}
+		if required, bound, err := s.AcceptReviewFixCommit(context.Background(), replacement.ID, pr1, "head-31", message, false, time.Now().UTC()); err != nil || !required || bound != 1 {
+			t.Fatalf("replacement = required %v bound %d err %v", required, bound, err)
+		}
+	})
+}
+
+func TestAcceptReviewFixCommitRollsBackContractWhenFindingBindingFails(t *testing.T) {
+	dir := t.TempDir()
+	s, err := sqlitedb.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	owner := createContractSession(t, s, "mer")
+	prURL := "https://github.com/acme/repo/pull/41"
+	seed := designcontract.BuildSeed("148", "## Invariants\n- Existing invariant.")
+	if err := s.SaveSessionDesignContractSeed(ctx, owner.ID, seed, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteSCMObservation(ctx, domain.PullRequest{URL: prURL, SessionID: owner.ID, Number: 41, HeadSHA: "head-41", UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.UpsertReview(ctx, domain.Review{ID: "review-41", SessionID: owner.ID, ProjectID: owner.ProjectID, Harness: domain.ReviewerCodex, PRURL: prURL, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertReviewRun(ctx, domain.ReviewRun{ID: "run-41", ReviewID: "review-41", SessionID: owner.ID, Harness: domain.ReviewerCodex, PRURL: prURL, TargetSHA: "reviewed", Status: domain.ReviewRunRunning, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	finding := domain.ReviewFinding{ID: "run-41:1", RunID: "run-41", SessionID: owner.ID, PRURL: prURL, Round: 1, ClassTag: "atomicity", CreatedAt: now}
+	if ok, err := s.CompleteReviewRunWithFindings(ctx, "run-41", domain.VerdictChangesRequested, "[P1] fix", "", "", []domain.ReviewFinding{finding}); err != nil || !ok {
+		t.Fatalf("complete review = %v, %v", ok, err)
+	}
+
+	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "ao.db")+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	if _, err := raw.ExecContext(ctx, `CREATE TRIGGER reject_fix_binding BEFORE UPDATE OF fix_commit ON review_finding WHEN NEW.fix_commit != '' BEGIN SELECT RAISE(ABORT, 'binding rejected'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	added := "The contract append and finding binding commit together."
+	if _, _, err := s.AcceptReviewFixCommit(ctx, owner.ID, prURL, "head-41", reviewFixMessage(t, prURL, "add", added), false, time.Now().UTC()); err == nil {
+		t.Fatal("binding failure unexpectedly accepted")
+	}
+	contract, _, _ := s.GetPRDesignContract(ctx, prURL)
+	if contract != seed || strings.Contains(contract, added) {
+		t.Fatalf("binding failure committed contract mutation: %q", contract)
+	}
+	findings, _ := s.ListReviewFindingsByRun(ctx, "run-41")
+	if len(findings) != 1 || findings[0].FixCommit != "" {
+		t.Fatalf("binding failure changed finding: %+v", findings)
 	}
 }
 

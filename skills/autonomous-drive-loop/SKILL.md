@@ -311,7 +311,11 @@ After the retry limit, surface non-convergence instead of scheduling more retrie
 - **Design contract:** require each fix to state which invariant it preserves or
   which missing invariant it reveals and where that invariant should be
   enforced. Read an existing contract from its configured versioned or AO
-  data-directory location; do not create worktree-local runtime state.
+  data-directory location; do not create worktree-local runtime state. End the
+  review-fix head commit with exactly one
+  `AO-Review-Fix-Invariant: {"pr":"<exact normalized PR URL>","mode":"preserve|add","invariant":"<one-line guarantee>"}`
+  trailer. `preserve` must name exact canonical list-item text; `add` is
+  grammar-checked and appended atomically with the pending-finding binding.
 - **Out-of-scope deflection:** when a finding belongs to another subsystem and is
   not required for this PR's correctness, first verify operator authority to file
   issues. If authorized, file a linked issue with the evidence and record the

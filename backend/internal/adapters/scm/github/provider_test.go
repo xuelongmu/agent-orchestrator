@@ -269,7 +269,8 @@ func basePRFixture() *prFixture {
 						"headRefOid":       "deadbeef",
 						"commits": map[string]any{"nodes": []any{
 							map[string]any{"commit": map[string]any{
-								"oid": "deadbeef",
+								"oid":     "deadbeef",
+								"message": "fix: declare invariant\n\nAO-Review-Fix-Invariant: {\"pr\":\"https://github.com/octocat/hello/pull/42\",\"mode\":\"preserve\",\"invariant\":\"One owner.\"}",
 								"statusCheckRollup": map[string]any{
 									"state": "SUCCESS",
 									"contexts": map[string]any{
@@ -1376,9 +1377,55 @@ func TestSCMObservationUsesRollupStateWhenContextsPaginated(t *testing.T) {
 		}
 		ctxs["pageInfo"] = map[string]any{"hasNextPage": true}
 	})
-	obs := scmObservationFromGraphQL(ports.SCMPRRef{Repo: ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "octocat", Name: "hello", Repo: "octocat/hello"}, Number: 42}, pr)
+	obs, err := scmObservationFromGraphQL(ports.SCMPRRef{Repo: ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "octocat", Name: "hello", Repo: "octocat/hello"}, Number: 42}, pr)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if obs.CI.Summary != string(domain.CIFailing) {
 		t.Fatalf("observer CI summary = %q, want failing from aggregate rollup state", obs.CI.Summary)
+	}
+}
+
+func TestFetchPullRequestsBindsHeadMessageToExactLatestCommitOID(t *testing.T) {
+	ref := ports.SCMPRRef{Repo: ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "octocat", Name: "hello", Repo: "octocat/hello"}, Number: 42}
+	for _, tc := range []struct {
+		name        string
+		head        string
+		commit      string
+		message     string
+		wantErr     bool
+		wantMessage string
+	}{
+		{name: "exact observed head", head: "head-new", commit: "head-new", message: "fix\n\nAO-Review-Fix-Invariant: {\"pr\":\"https://github.com/octocat/hello/pull/42\",\"mode\":\"preserve\",\"invariant\":\"One owner.\"}", wantMessage: "AO-Review-Fix-Invariant:"},
+		{name: "force push leaves stale commit message", head: "head-new", commit: "head-old", message: "stale declaration", wantErr: true},
+		{name: "merge commit exact head", head: "merge-head", commit: "merge-head", message: "Merge main\n\nAO-Review-Fix-Invariant: {\"pr\":\"https://github.com/octocat/hello/pull/42\",\"mode\":\"add\",\"invariant\":\"Merge fixes preserve ownership.\"}", wantMessage: "Merge main"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeGH(t)
+			fx := basePRFixture()
+			var pr map[string]any
+			fx.prData(func(m map[string]any) {
+				pr = m
+				m["headRefOid"] = tc.head
+				commit := m["commits"].(map[string]any)["nodes"].([]any)[0].(map[string]any)["commit"].(map[string]any)
+				commit["oid"] = tc.commit
+				commit["message"] = tc.message
+			})
+			fake.on(http.MethodPost, "/graphql", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"pr0": map[string]any{"pullRequest": pr}}})
+			})
+			got, err := newProviderForTest(t, fake).FetchPullRequests(ctx(), []ports.SCMPRRef{ref})
+			if tc.wantErr {
+				if err == nil || len(got) != 0 {
+					t.Fatalf("FetchPullRequests = %+v, %v; want fail closed", got, err)
+				}
+				return
+			}
+			if err != nil || len(got) != 1 || got[0].PR.HeadSHA != tc.head || !strings.Contains(got[0].PR.HeadCommitMessage, tc.wantMessage) {
+				t.Fatalf("FetchPullRequests = %+v, %v", got, err)
+			}
+		})
 	}
 }
 
@@ -1433,6 +1480,9 @@ func TestFetchPullRequestsDoesNotFallbackWhenContextPageComplete(t *testing.T) {
 	}
 	if len(obs) != 1 || len(obs[0].CI.Checks) != 1 || obs[0].CI.Summary != string(domain.CIPassing) {
 		t.Fatalf("observation = %#v", obs)
+	}
+	if !strings.Contains(obs[0].PR.HeadCommitMessage, "AO-Review-Fix-Invariant:") {
+		t.Fatalf("head commit message = %q, want structured trailer", obs[0].PR.HeadCommitMessage)
 	}
 }
 
@@ -1549,6 +1599,7 @@ func TestFetchReviewThreadsUsesLatestWindowWithoutFallbackWhenOldestResolved(t *
 			"data": map[string]any{"repo": map[string]any{"pullRequest": map[string]any{
 				"reviewDecision": "CHANGES_REQUESTED",
 				"headRefOid":     "head-2",
+				"commits":        map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"oid": "head-2", "message": "fix\n\nAO-Review-Fix-Invariant: {}"}}}},
 				"reviewSummaries": map[string]any{"nodes": []any{map[string]any{
 					"id":          "review-1",
 					"state":       "CHANGES_REQUESTED",
@@ -1580,6 +1631,9 @@ func TestFetchReviewThreadsUsesLatestWindowWithoutFallbackWhenOldestResolved(t *
 	if review.HeadSHA != "head-2" {
 		t.Fatalf("review HeadSHA = %q, want head-2", review.HeadSHA)
 	}
+	if !strings.Contains(review.HeadCommitMessage, "AO-Review-Fix-Invariant") {
+		t.Fatalf("review head message = %q", review.HeadCommitMessage)
+	}
 	if len(review.Threads) != 1 || review.Threads[0].ID != "latest-resolved" {
 		t.Fatalf("threads = %#v", review.Threads)
 	}
@@ -1605,6 +1659,8 @@ func TestFetchReviewThreadsFetchesOneOlderPageWhenOldestUnresolved(t *testing.T)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{"repo": map[string]any{"pullRequest": map[string]any{
 					"reviewDecision": "CHANGES_REQUESTED",
+					"headRefOid":     "head-2",
+					"commits":        map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"oid": "head-2", "message": "fix message"}}}},
 					"reviewThreads": map[string]any{
 						"nodes":    []any{map[string]any{"id": "latest-unresolved", "path": "main.go", "line": 2, "isResolved": false, "comments": map[string]any{"nodes": []any{}}}},
 						"pageInfo": map[string]any{"hasPreviousPage": true, "startCursor": "latest-start"},
@@ -1618,6 +1674,8 @@ func TestFetchReviewThreadsFetchesOneOlderPageWhenOldestUnresolved(t *testing.T)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{"repo": map[string]any{"pullRequest": map[string]any{
 					"reviewDecision": "CHANGES_REQUESTED",
+					"headRefOid":     "head-2",
+					"commits":        map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"oid": "head-2", "message": "fix message"}}}},
 					"reviewThreads": map[string]any{
 						"nodes":    []any{map[string]any{"id": "older", "path": "old.go", "line": 1, "isResolved": false, "comments": map[string]any{"nodes": []any{}}}},
 						"pageInfo": map[string]any{"hasPreviousPage": true, "startCursor": "older-start"},
@@ -1641,5 +1699,26 @@ func TestFetchReviewThreadsFetchesOneOlderPageWhenOldestUnresolved(t *testing.T)
 	}
 	if len(review.Threads) != 2 || review.Threads[0].ID != "older" || review.Threads[1].ID != "latest-unresolved" {
 		t.Fatalf("threads order = %#v", review.Threads)
+	}
+}
+
+func TestFetchReviewThreadsRejectsMessageFromCommitOtherThanObservedHead(t *testing.T) {
+	fake := newFakeGH(t)
+	fake.on(http.MethodPost, "/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"repo": map[string]any{"pullRequest": map[string]any{
+				"headRefOid": "force-pushed-head",
+				"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{
+					"oid": "stale-head", "message": "stale review-fix declaration",
+				}}}},
+				"reviewThreads": map[string]any{"nodes": []any{}, "pageInfo": map[string]any{"hasPreviousPage": false}},
+			}}},
+		})
+	})
+	provider := newProviderForTest(t, fake)
+	got, err := provider.FetchReviewThreads(ctx(), ports.SCMPRRef{Repo: ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "o", Name: "r", Repo: "o/r"}, Number: 1})
+	if err == nil || got.HeadCommitMessage != "" {
+		t.Fatalf("FetchReviewThreads = %+v, %v; want fail closed without stale message", got, err)
 	}
 }

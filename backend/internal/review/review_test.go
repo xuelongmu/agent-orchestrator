@@ -24,15 +24,36 @@ type fakeStore struct {
 	// writer that already recorded a run for this commit: it records that
 	// winner (so a follow-up GetReviewRunBySessionAndSHA finds it) and returns
 	// insertErr instead of recording the caller's run.
-	insertErr error
+	insertErr       error
+	acceptRequired  bool
+	acceptBound     int64
+	acceptErr       error
+	acceptCalls     int
+	acceptedPR      string
+	acceptedHead    string
+	acceptedMessage string
+	acceptedRequire bool
 }
 
 func (f *fakeStore) ListReviewFindingsBySession(context.Context, domain.SessionID) ([]domain.ReviewFinding, error) {
 	return append([]domain.ReviewFinding(nil), f.findings...), nil
 }
 
-func (f *fakeStore) SetPendingReviewFindingFixCommit(context.Context, domain.SessionID, string, string) (int64, error) {
-	return 0, nil
+func (f *fakeStore) ListReviewFindingsByRun(_ context.Context, runID string) ([]domain.ReviewFinding, error) {
+	var out []domain.ReviewFinding
+	for _, finding := range f.findings {
+		if finding.RunID == runID {
+			out = append(out, finding)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) AcceptReviewFixCommit(_ context.Context, _ domain.SessionID, prURL, head, message string, require bool, _ time.Time) (bool, int64, error) {
+	f.acceptCalls++
+	f.acceptedPR, f.acceptedHead, f.acceptedMessage = prURL, head, message
+	f.acceptedRequire = require
+	return f.acceptRequired, f.acceptBound, f.acceptErr
 }
 
 func (f *fakeStore) UpsertReview(_ context.Context, r domain.Review) error {
@@ -124,6 +145,15 @@ func (f *fakeStore) GetReviewRunBySessionPRAndSHA(_ context.Context, sessionID d
 func (f *fakeStore) ListReviewRunsBySession(_ context.Context, _ domain.SessionID) ([]domain.ReviewRun, error) {
 	f.listAllReviewRunHits++
 	return f.runs, nil
+}
+func (f *fakeStore) ListReviewRunsByPR(_ context.Context, prURL string) ([]domain.ReviewRun, error) {
+	out := make([]domain.ReviewRun, 0)
+	for _, run := range f.runs {
+		if run.PRURL == prURL {
+			out = append(out, run)
+		}
+	}
+	return out, nil
 }
 func (f *fakeStore) ListRunningReviewRunsBySession(_ context.Context, sessionID domain.SessionID) ([]domain.ReviewRun, error) {
 	out := make([]domain.ReviewRun, 0)
