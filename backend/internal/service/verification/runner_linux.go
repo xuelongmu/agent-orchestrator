@@ -38,6 +38,10 @@ func newVerificationDescendantOwner() (*linuxVerificationDescendantOwner, error)
 	if err != nil {
 		return nil, fmt.Errorf("open pidfd capability: %w", err)
 	}
+	if err := unix.PidfdSendSignal(fd, 0, nil, 0); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("probe pidfd signal capability: %w", err)
+	}
 	_ = unix.Close(fd)
 	return &linuxVerificationDescendantOwner{}, nil
 }
@@ -45,12 +49,8 @@ func newVerificationDescendantOwner() (*linuxVerificationDescendantOwner, error)
 func (*linuxVerificationDescendantOwner) Close() error { return nil }
 
 func (*linuxVerificationDescendantOwner) Terminate(targetPID int) error {
-	// Ensure ordinary in-group descendants are stopped as well. The pidfd
-	// cleanup below handles descendants which escaped with setsid.
-	killVerificationProcessGroup(targetPID)
-	// Give the kernel a scheduling/reparenting turn before observing adopted
-	// children; procfs can legitimately lag the group leader's exit.
-	time.Sleep(50 * time.Millisecond)
+	// The target leader has already been reaped by the caller. Never issue a
+	// numeric process-group signal here: the PGID may have been reused.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := reapExitedLinuxChildren(); err != nil {
@@ -64,11 +64,10 @@ func (*linuxVerificationDescendantOwner) Terminate(targetPID int) error {
 			// Wait4/ECHILD is the kernel-backed completion barrier. Do not rely
 			// on repeated procfs observations, which can race delayed reparenting.
 			return nil
-		} else {
-			for _, pid := range children {
-				if err := killLinuxPID(pid); err != nil && !errors.Is(err, syscall.ESRCH) {
-					return fmt.Errorf("kill adopted verifier descendant %d: %w", pid, err)
-				}
+		}
+		for _, pid := range children {
+			if err := killLinuxPID(pid); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return fmt.Errorf("kill adopted verifier descendant %d: %w", pid, err)
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
