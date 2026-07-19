@@ -216,7 +216,10 @@ var deliveryLocks sync.Map
 // token, which protects acknowledgement across restart and stale retries.
 func LockDelivery(prURL string) func() {
 	value, _ := deliveryLocks.LoadOrStore(prURL, &sync.Mutex{})
-	lock := value.(*sync.Mutex)
+	lock, ok := value.(*sync.Mutex)
+	if !ok {
+		panic("design contract delivery lock has unexpected type")
+	}
 	lock.Lock()
 	return lock.Unlock
 }

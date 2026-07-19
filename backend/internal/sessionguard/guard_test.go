@@ -70,11 +70,12 @@ func TestGuard_OutcomeByState(t *testing.T) {
 				g := New(&fakeStore{rec: tc.rec, ok: tc.ok}, msgr, nil)
 				var got Outcome
 				var err error
-				if method == "Deliver" {
+				switch method {
+				case "Deliver":
 					got, err = g.Deliver(context.Background(), "s1", "hello")
-				} else if method == "DeliverAutomated" {
+				case "DeliverAutomated":
 					got, err = g.DeliverAutomated(context.Background(), "s1", "hello")
-				} else {
+				default:
 					got, err = g.Nudge(context.Background(), "s1", "hello")
 				}
 				if err != nil {

@@ -449,21 +449,25 @@ type ClaimPRResponse struct {
 	ContractReady bool               `json:"contractReady" description:"True only after the exact PR's canonical contract was delivered and the durable claim barrier cleared."`
 }
 
+// AddDesignContractInvariantRequest is the body for appending one invariant.
 type AddDesignContractInvariantRequest struct {
 	PR        string `json:"pr" minLength:"1"`
 	Invariant string `json:"invariant" minLength:"1" maxLength:"512"`
 }
 
+// AddDesignContractInvariantResponse confirms the exact updated PR contract.
 type AddDesignContractInvariantResponse struct {
 	OK        bool             `json:"ok"`
 	SessionID domain.SessionID `json:"sessionId"`
 	PR        string           `json:"pr"`
 }
 
+// DesignContractQuery selects an exact owned PR design contract.
 type DesignContractQuery struct {
 	PR string `query:"pr" description:"Exact owned PR URL or unambiguous positive PR number."`
 }
 
+// GetDesignContractResponse returns the full canonical design contract.
 type GetDesignContractResponse struct {
 	OK        bool             `json:"ok"`
 	SessionID domain.SessionID `json:"sessionId"`

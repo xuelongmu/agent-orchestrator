@@ -91,11 +91,9 @@ func (s *Service) AddDesignContractInvariant(ctx context.Context, id domain.Sess
 	if err != nil {
 		return "", err
 	}
-	if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, contract); err != nil {
-		// Canonical success must not be reported as failure because the
-		// checkout projection is optional and untrusted.
-		return contract, nil
-	}
+	// Canonical success must not be reported as failure because the checkout
+	// projection is optional and untrusted.
+	_ = designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, contract)
 	return contract, nil
 }
 
