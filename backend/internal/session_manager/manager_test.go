@@ -1586,7 +1586,7 @@ func TestCleanupRetry_DoesNotTearDownReplacement(t *testing.T) {
 
 func TestCleanupRetry_NewLeaseSupersedesOldTimer(t *testing.T) {
 	m, st, _, ws := newManager()
-	m.cleanupRetryDelay = 20 * time.Millisecond
+	m.cleanupRetryDelay = 100 * time.Millisecond
 	rec := mkLive("mer-1")
 	rec.IsTerminated = true
 	rec.Activity = domain.Activity{State: domain.ActivityExited}
