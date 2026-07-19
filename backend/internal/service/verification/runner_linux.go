@@ -38,7 +38,7 @@ func newVerificationDescendantOwner() (*linuxVerificationDescendantOwner, error)
 	if err != nil {
 		return nil, fmt.Errorf("open pidfd capability: %w", err)
 	}
-	unix.Close(fd)
+	_ = unix.Close(fd)
 	return &linuxVerificationDescendantOwner{}, nil
 }
 
