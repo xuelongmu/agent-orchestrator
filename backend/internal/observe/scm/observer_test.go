@@ -669,13 +669,13 @@ func TestPollGitHubAuthClassificationIsActionableAndRedacted(t *testing.T) {
 		t.Fatalf("notifications = %d, want 1", len(notifications.intents))
 	}
 	intent := notifications.intents[0]
-	copy := intent.TitleOverride + "\n" + intent.BodyOverride
-	if !strings.Contains(copy, "gh auth login") || !strings.Contains(strings.ToLower(copy), "github authentication") {
-		t.Fatalf("auth notification is not actionable: %q", copy)
+	messageCopy := intent.TitleOverride + "\n" + intent.BodyOverride
+	if !strings.Contains(messageCopy, "gh auth login") || !strings.Contains(strings.ToLower(messageCopy), "github authentication") {
+		t.Fatalf("auth notification is not actionable: %q", messageCopy)
 	}
 	for _, forbidden := range []string{secret, "oauth2", "Bad credentials", authErr.Error()} {
-		if strings.Contains(copy, forbidden) {
-			t.Fatalf("auth notification leaked %q: %q", forbidden, copy)
+		if strings.Contains(messageCopy, forbidden) {
+			t.Fatalf("auth notification leaked %q: %q", forbidden, messageCopy)
 		}
 	}
 	if got := safePollError(authErr); got != ports.ErrSCMAuthentication.Error() || strings.Contains(got, secret) {
