@@ -233,7 +233,7 @@ func (s *Store) ReleaseTrackerIntakeIssue(ctx context.Context, claim ports.Track
 				if matchErr != nil {
 					return matchErr
 				}
-				if matches && (existing.Status == trackerIntakeSpawning || !bound.IsTerminated) {
+				if matches && !bound.IsTerminated {
 					return reconcileTrackerIntakeSessionAt(ctx, q, claim, boundID, releasedAt)
 				}
 				if !bound.IsTerminated {

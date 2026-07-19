@@ -30,7 +30,7 @@ CREATE INDEX idx_sessions_project_issue
     ON sessions (project_id, issue_id);
 
 CREATE INDEX idx_sessions_project_issue_nocase
-    ON sessions (project_id, issue_id COLLATE NOCASE);
+    ON sessions (project_id, issue_id COLLATE NOCASE, num);
 
 -- Intake claims are internal control-plane state and intentionally do not emit
 -- change_log events.

@@ -491,6 +491,7 @@ SELECT EXISTS(
           issue_id = ?3
           OR (CAST(?4 AS TEXT) = 'github' AND issue_id = ?3 COLLATE NOCASE)
       )
+      AND is_terminated = FALSE
       AND (workspace_path <> '' OR runtime_handle_id <> '' OR agent_session_id <> '' OR prompt <> '')
 ) AS matches
 `

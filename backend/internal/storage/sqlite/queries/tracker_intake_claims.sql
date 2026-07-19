@@ -26,6 +26,7 @@ SELECT EXISTS(
           issue_id = sqlc.arg(canonical_issue_id)
           OR (CAST(sqlc.arg(provider) AS TEXT) = 'github' AND issue_id = sqlc.arg(canonical_issue_id) COLLATE NOCASE)
       )
+      AND is_terminated = FALSE
       AND (workspace_path <> '' OR runtime_handle_id <> '' OR agent_session_id <> '' OR prompt <> '')
 ) AS matches;
 

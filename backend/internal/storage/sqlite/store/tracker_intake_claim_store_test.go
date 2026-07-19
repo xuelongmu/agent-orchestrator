@@ -482,6 +482,9 @@ func TestTrackerIntakeTerminatedFailedAdmissionCanBeReleasedAndRetried(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	if started, err := store.MarkTrackerIntakeSpawnStarted(ctx, original, failed.ID, now.Add(1500*time.Millisecond)); err != nil || !started {
+		t.Fatalf("spawn started=%v err=%v", started, err)
+	}
 	// Prompt delivery after runtime start can leave admission metadata behind,
 	// but termination proves this worker was not successfully admitted.
 	failed.IsTerminated = true
