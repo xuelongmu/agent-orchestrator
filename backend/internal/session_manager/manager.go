@@ -635,7 +635,8 @@ func (m *Manager) RollbackSpawn(ctx context.Context, id domain.SessionID) (delet
 // Kill tears down the runtime and workspace, then records terminal intent with
 // the LCM. A workspace teardown refused by the worktree-remove safety
 // (uncommitted work) is never forced: Kill succeeds with freed=false,
-// signalling the workspace was preserved and the session is left retryable.
+// signalling the workspace was preserved for later inspection/cleanup while
+// the session itself is still marked terminated.
 //
 // A session whose runtime handle or workspace path is missing (e.g. spawn
 // failed partway, handle lost after a crash) is still terminated after the
@@ -679,6 +680,12 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 		cleaned, err := m.destroyWorkspaceProjectRows(ctx, workspaceProjectRows)
 		if err != nil {
 			if errors.Is(err, ports.ErrWorkspaceDirty) {
+				if markTerminated {
+					if err := m.lcm.MarkTerminated(ctx, id); err != nil {
+						return false, fmt.Errorf("kill %s: %w", id, err)
+					}
+				}
+				m.cleanupSystemPromptDir(id)
 				return false, nil
 			}
 			return false, fmt.Errorf("kill %s: workspace: %w", id, err)
@@ -690,6 +697,15 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 	} else if ws.Path != "" {
 		if err := m.workspace.Destroy(ctx, ws); err != nil {
 			if errors.Is(err, ports.ErrWorkspaceDirty) {
+				if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
+					m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
+				}
+				if markTerminated {
+					if err := m.lcm.MarkTerminated(ctx, id); err != nil {
+						return false, fmt.Errorf("kill %s: %w", id, err)
+					}
+				}
+				m.cleanupSystemPromptDir(id)
 				return false, nil
 			}
 			return false, fmt.Errorf("kill %s: workspace: %w", id, err)
