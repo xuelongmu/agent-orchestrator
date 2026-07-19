@@ -34,6 +34,9 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 	go func() { wait <- cmd.Wait() }()
 	select {
 	case <-ctx.Done():
+		// INVARIANT: NEVER SIGKILL the guardian PGID from outer runProcessTree;
+		// the guardian owns cancellation cleanup via EOF. Reintroducing an
+		// outer group kill breaks macOS/Linux cancellation and setsid cleanup.
 		_ = ownerWrite.Close()
 		err = <-wait
 	case err = <-wait:
