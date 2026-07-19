@@ -27,6 +27,7 @@ type fakeStore struct {
 	workspaceRepo map[string][]domain.WorkspaceRepoRecord
 	num           int
 	deleteErr     error
+	deleteWTErr   error
 	upsertWTErr   error
 	// worktrees maps session ID to its saved worktree rows (shutdown-saved marker).
 	worktrees map[domain.SessionID][]domain.SessionWorktreeRecord
@@ -158,6 +159,9 @@ func (f *fakeStore) ListSessionWorktrees(_ context.Context, id domain.SessionID)
 func (f *fakeStore) DeleteSessionWorktrees(_ context.Context, id domain.SessionID) error {
 	if f.sharedLog != nil {
 		*f.sharedLog = append(*f.sharedLog, "DeleteSessionWorktrees:"+string(id))
+	}
+	if f.deleteWTErr != nil {
+		return f.deleteWTErr
 	}
 	delete(f.worktrees, id)
 	return nil
@@ -1490,6 +1494,7 @@ func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) 
 	rec.Metadata.WorkspaceKind = domain.WorkspaceKindScratch
 	st.sessions[rec.ID] = rec
 	ws.destroyErr = errors.New("workspace busy")
+	m.cleanupRetryDelay = time.Millisecond
 
 	if err := m.CleanupCompletedSession(ctx, rec.ID); err == nil || !strings.Contains(err.Error(), "workspace busy") {
 		t.Fatalf("first cleanup error = %v, want workspace busy", err)
@@ -1499,8 +1504,12 @@ func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) 
 	}
 
 	ws.destroyErr = nil
-	if err := m.CleanupCompletedSession(ctx, rec.ID); err != nil {
-		t.Fatalf("retry completed cleanup: %v", err)
+	deadline := time.Now().Add(time.Second)
+	for st.sessions[rec.ID].Metadata.RuntimeHandleID != "" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if st.sessions[rec.ID].Metadata.RuntimeHandleID != "" {
+		t.Fatal("same-daemon cleanup retry retained runtime marker")
 	}
 	if rt.destroyed != 2 || ws.destroyed != 2 {
 		t.Fatalf("cleanup attempts runtime/workspace = %d/%d, want 2/2", rt.destroyed, ws.destroyed)
@@ -1510,6 +1519,63 @@ func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) 
 	}
 	if got := m.lcm.(*fakeLCM).terminated[rec.ID]; got != 0 {
 		t.Fatalf("completed cleanup re-entered lifecycle %d times", got)
+	}
+}
+
+func TestCleanupCompletedSession_MarkerFailureRetainsDirLease(t *testing.T) {
+	m, st, _, _ := newManager()
+	rec := mkLive("mer-1")
+	rec.IsTerminated = true
+	rec.Activity = domain.Activity{State: domain.ActivityExited}
+	rec.Metadata.WorkspaceKind = domain.WorkspaceKindDir
+	st.sessions[rec.ID] = rec
+	st.deleteWTErr = errors.New("marker busy")
+	if err := m.CleanupCompletedSession(ctx, rec.ID); err == nil {
+		t.Fatal("marker deletion failure returned nil")
+	}
+	if st.sessions[rec.ID].Metadata.RuntimeHandleID == "" {
+		t.Fatal("marker failure released durable dir lease")
+	}
+	st.deleteWTErr = nil
+	if err := m.CleanupCompletedSession(ctx, rec.ID); err != nil {
+		t.Fatalf("retry cleanup: %v", err)
+	}
+	if st.sessions[rec.ID].Metadata.RuntimeHandleID != "" {
+		t.Fatal("successful retry retained dir lease")
+	}
+}
+
+func TestRestore_RejectsLiveScratchBeforePreparation(t *testing.T) {
+	m, st, _, _ := newManager()
+	rec := mkLive("mer-1")
+	rec.Metadata.WorkspaceKind = domain.WorkspaceKindScratch
+	rec.Metadata.WorkspacePath = "/scratch/mer-1"
+	rec.Metadata.RuntimeHandleID = "live"
+	st.sessions[rec.ID] = rec
+	if _, err := m.Restore(ctx, rec.ID); !errors.Is(err, ErrNotRestorable) {
+		t.Fatalf("live scratch restore error = %v, want ErrNotRestorable", err)
+	}
+}
+
+func TestCleanupRetry_DoesNotTearDownReplacement(t *testing.T) {
+	m, st, rt, _ := newManager()
+	rec := mkLive("mer-1")
+	rec.IsTerminated = true
+	rec.Metadata.WorkspaceKind = domain.WorkspaceKindScratch
+	rec.Metadata.WorkspacePath = "/scratch/old"
+	rec.Metadata.RuntimeHandleID = "old"
+	st.sessions[rec.ID] = rec
+	// A replacement/restore claims the row and installs a new live handle before
+	// the old cleanup timer fires.
+	rec.IsTerminated = false
+	rec.Metadata.RuntimeHandleID = "new"
+	rec.Metadata.WorkspacePath = "/scratch/new"
+	st.sessions[rec.ID] = rec
+	if err := m.cleanupCompletedSessionOwned(ctx, rec.ID, "old"); err != nil {
+		t.Fatal(err)
+	}
+	if rt.destroyed != 0 || st.sessions[rec.ID].Metadata.RuntimeHandleID != "new" {
+		t.Fatalf("replacement was torn down: destroys=%d record=%+v", rt.destroyed, st.sessions[rec.ID])
 	}
 }
 
@@ -1929,6 +1995,11 @@ func TestSpawn_DirRequiresCleanupAndSerializesSharedHooks(t *testing.T) {
 	}
 	if len(st.sessions) != 0 {
 		t.Fatalf("unsupported dir spawn created durable sessions: %#v", st.sessions)
+	}
+	st.sessions["restore-dir"] = domain.SessionRecord{ID: "restore-dir", ProjectID: "mer", IsTerminated: true, Harness: domain.HarnessClaudeCode,
+		Metadata: domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindDir, WorkspacePath: "/repo/mer"}}
+	if _, err := unsupported.Restore(ctx, "restore-dir"); !errors.Is(err, ErrSharedDirUnsupported) {
+		t.Fatalf("unsupported dir restore error = %v, want ErrSharedDirUnsupported", err)
 	}
 
 	agent := &cleaningAgent{}

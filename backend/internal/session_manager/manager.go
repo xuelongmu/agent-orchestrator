@@ -894,15 +894,22 @@ func (m *Manager) CleanupMergedSession(ctx context.Context, id domain.SessionID)
 // completion for non-git sessions. Git worktrees retain their historical
 // post-exit lifecycle and are cleaned only by explicit or SCM-owned paths.
 func (m *Manager) CleanupCompletedSession(ctx context.Context, id domain.SessionID) error {
+	return m.cleanupCompletedSessionOwned(ctx, id, "")
+}
+
+func (m *Manager) cleanupCompletedSessionOwned(ctx context.Context, id domain.SessionID, expectedLease string) error {
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return fmt.Errorf("cleanup completed session %s: %w", id, err)
 	}
-	if !ok || rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree || rec.Metadata.RuntimeHandleID == "" {
+	if !ok || !rec.IsTerminated || rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree || rec.Metadata.RuntimeHandleID == "" {
+		return nil
+	}
+	if expectedLease != "" && rec.Metadata.RuntimeHandleID != expectedLease {
 		return nil
 	}
 	if _, err := m.kill(ctx, id, false); err != nil {
-		m.scheduleCleanupRetry(id)
+		m.scheduleCleanupRetry(id, rec.Metadata.RuntimeHandleID)
 		return fmt.Errorf("cleanup completed session %s: %w", id, err)
 	}
 	return nil
@@ -911,7 +918,7 @@ func (m *Manager) CleanupCompletedSession(ctx context.Context, id domain.Session
 // scheduleCleanupRetry keeps a failed natural non-git teardown live in the
 // daemon until its durable lease can be released, without requiring another
 // activity-exit callback or a daemon restart.
-func (m *Manager) scheduleCleanupRetry(id domain.SessionID) {
+func (m *Manager) scheduleCleanupRetry(id domain.SessionID, lease string) {
 	m.cleanupRetryMu.Lock()
 	if _, ok := m.cleanupRetries[id]; ok {
 		m.cleanupRetryMu.Unlock()
@@ -920,12 +927,12 @@ func (m *Manager) scheduleCleanupRetry(id domain.SessionID) {
 	m.cleanupRetries[id] = struct{}{}
 	m.cleanupRetryMu.Unlock()
 	time.AfterFunc(m.cleanupRetryDelay, func() {
-		err := m.CleanupCompletedSession(context.Background(), id)
+		err := m.cleanupCompletedSessionOwned(context.Background(), id, lease)
 		m.cleanupRetryMu.Lock()
 		delete(m.cleanupRetries, id)
 		m.cleanupRetryMu.Unlock()
 		if err != nil {
-			m.scheduleCleanupRetry(id)
+			m.scheduleCleanupRetry(id, lease)
 		}
 	})
 }
