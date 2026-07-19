@@ -35,6 +35,11 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 	select {
 	case err = <-wait:
 		_ = ownerWrite.Close()
+		// Cancellation may race a short-lived leader's exit. Preserve the
+		// cancellation ownership guarantee by cleaning its dedicated group.
+		if ctx.Err() != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
 	case <-ctx.Done():
 		_ = ownerWrite.Close()
 		// Kill while the leader is still retained by os/exec. Sending a
