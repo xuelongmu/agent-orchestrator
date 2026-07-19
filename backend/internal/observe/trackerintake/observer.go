@@ -215,12 +215,13 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 	})
 	if err != nil {
 		o.logger.Error("tracker intake: list issues failed", "project", project.ID, "repo", repo.Native, "err", err)
+		//nolint:nilerr // Poll records provider failures through the failed/backoff aggregate.
 		return true, nil
 	}
 	var spawnFailed bool
 	for _, issue := range issues {
 		if ctx.Err() != nil {
-			return true, nil
+			return true, ctx.Err()
 		}
 		if issue.State != domain.IssueOpen {
 			continue

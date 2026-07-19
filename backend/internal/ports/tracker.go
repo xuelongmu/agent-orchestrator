@@ -24,6 +24,7 @@ type TrackerIntakeClaim struct {
 // proceed to the external spawn side effect.
 type TrackerIntakeClaimResult uint8
 
+// TrackerIntakeClaimAcquired and its sibling values describe the atomic claim outcome.
 const (
 	TrackerIntakeClaimAcquired TrackerIntakeClaimResult = iota + 1
 	TrackerIntakeClaimAlreadyProcessed
