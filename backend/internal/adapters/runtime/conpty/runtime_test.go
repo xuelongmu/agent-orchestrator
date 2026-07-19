@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -99,13 +100,17 @@ func fakeSpawnerFor(t *testing.T, hosts map[string]*inProcHost, fakePID int) hos
 }
 
 // ---------------------------------------------------------------------------
-// Redirect ptyregistry to a temp HOME so tests don't pollute ~/.ao
+// Redirect ptyregistry to a temp data dir so tests don't pollute ~/.ao.
 // ---------------------------------------------------------------------------
 
 func isolateRegistry(t *testing.T) {
 	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
+	home := t.TempDir()
+	dataDir := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_DATA_DIR", dataDir)
+	t.Setenv("AO_RUN_FILE", filepath.Join(dataDir, "running.json"))
 }
 
 // ---------------------------------------------------------------------------
