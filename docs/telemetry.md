@@ -12,7 +12,7 @@ telemetry is enabled.
 - Project/task/session UI actions, with project identifiers SHA-256 hashed
 - Renderer exceptions, reduced to error name and coarse context
 - Daemon operational events: CLI invocation, session spawn/failure, waiting-input
-  transitions, HTTP 5xx, and daemon panics
+  transitions, lifecycle poll duration/overruns, HTTP 5xx, and daemon panics
 - AO version context (`app_version` / `ao_version`), platform, and build mode
 
 PostHog session recording is enabled for the renderer. Network request names are

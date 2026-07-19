@@ -135,7 +135,7 @@ func Run() error {
 	// Start SCM polling only after the review engine exists. The observer can
 	// then hand each durable, lifecycle-applied head observation to
 	// the automatic review coordinator during its immediate first poll.
-	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, reviewSvc, log)
+	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, reviewSvc, telemetrySink, log)
 	lcStack.trackerDone = startTrackerIntake(ctx, store, sessionSvc, log)
 	previewDone := preview.NewPoller(store, sessionSvc, "http://"+cfg.Addr(), preview.PollerConfig{Logger: log}).Start(ctx)
 	agentSvc := agentsvc.New()
