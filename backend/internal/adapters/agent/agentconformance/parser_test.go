@@ -46,23 +46,36 @@ func TestHookCommandsRetainsUnknownExecutableEvents(t *testing.T) {
 	text := `
 // ao hooks ignored comment-typo
 /* ao hooks ignored block-typo */
-{"command":"ao hooks literal event-typo"}
+{"commands":[
+  "ao hooks literal stop_failure",
+  "ao hooks literal stop.failure",
+  "ao hooks literal Stop"
+]}
 function hookCmd(hookName: string) {
   return ` + "`exec ao hooks template ${hookName}`" + `
 }
-callHookSync("another-typo", {})
+callHookSync("stop_failure", {})
+callHookSync("stop.failure", {})
+callHookSync("Stop", {})
 callHookSync("stop", {})
 `
 	want := []HookCommand{
-		{Token: "literal", Event: "event-typo"},
-		{Token: "template", Event: "another-typo"},
+		{Token: "literal", Event: "stop_failure"},
+		{Token: "literal", Event: "stop.failure"},
+		{Token: "literal", Event: "Stop"},
+		{Token: "template", Event: "stop_failure"},
+		{Token: "template", Event: "stop.failure"},
+		{Token: "template", Event: "Stop"},
 		{Token: "template", Event: "stop"},
 	}
 	got, err := hookCommands(text)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("hookCommands = %#v, want %#v", got, want)
 	}
-	for _, unknown := range []string{"literal/event-typo", "template/another-typo"} {
+	for _, unknown := range []string{
+		"literal/stop_failure", "literal/stop.failure", "literal/Stop",
+		"template/stop_failure", "template/stop.failure", "template/Stop",
+	} {
 		if err == nil || !strings.Contains(err.Error(), unknown) {
 			t.Errorf("hookCommands error = %v, want unknown event %q", err, unknown)
 		}

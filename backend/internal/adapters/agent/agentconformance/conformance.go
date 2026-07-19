@@ -23,9 +23,9 @@ import (
 )
 
 var (
-	hookCommandPattern    = regexp.MustCompile(`\bao hooks ([a-z0-9-]+) ([a-z0-9-]+)`)
+	hookCommandPattern    = regexp.MustCompile("\\bao hooks ([a-z0-9-]+) ([^\\s\\\"'`]+)")
 	hookTemplatePattern   = regexp.MustCompile(`\bao hooks ([a-z0-9-]+) \$\{hookName\}`)
-	hookInvocationPattern = regexp.MustCompile(`\bcallHookSync\("([a-z0-9-]+)"`)
+	hookInvocationPattern = regexp.MustCompile(`\bcallHookSync\("([^"]+)"`)
 )
 
 var normalizedHookEvents = map[string]bool{
@@ -541,6 +541,9 @@ func hookCommands(text string) ([]HookCommand, error) {
 		}
 	}
 	for _, match := range hookCommandPattern.FindAllStringSubmatch(uncommented, -1) {
+		if match[2] == "${hookName}" {
+			continue // correlated with concrete callHookSync invocations below
+		}
 		add(HookCommand{Token: match[1], Event: match[2]})
 	}
 	// Embedded JS/TS plugins build `ao hooks <token> ${hookName}` and call a
