@@ -5,12 +5,43 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/activitydispatch"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentconformance"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/hookutil"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
+
+func TestRegisteredAgentConformance(t *testing.T) {
+	binaries := map[domain.AgentHarness][]string{}
+	for _, harness := range domain.AllHarnesses {
+		binaries[harness] = []string{string(harness)}
+	}
+	binaries[domain.HarnessClaudeCode] = []string{"claude"}
+	binaries[domain.HarnessContinue] = []string{"cn"}
+	binaries[domain.HarnessCursor] = []string{"cursor-agent", "agent"}
+	binaries[domain.HarnessKiro] = []string{"kiro-cli"}
+
+	hookTokens := make([]string, 0, len(activitydispatch.Derivers))
+	for token := range activitydispatch.Derivers {
+		hookTokens = append(hookTokens, token)
+	}
+	slices.Sort(hookTokens)
+
+	agentconformance.RunRegistry(t, Constructors(), agentconformance.RegistryOptions{
+		KnownHarnesses:  domain.AllHarnesses,
+		BinaryNames:     binaries,
+		KnownHookTokens: hookTokens,
+		SupportsHookToken: func(token string) bool {
+			_, ok := activitydispatch.Derivers[token]
+			return ok
+		},
+	})
+}
 
 // TestGetAgentHooksFootprintIsGitignored enforces a contract every shipped
 // (and future) adapter must hold: any file GetAgentHooks writes into a session
