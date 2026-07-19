@@ -201,7 +201,10 @@ type Manager struct {
 	logger      *slog.Logger
 	// sharedDirMu serializes the durable lease check with dir spawn/restore so
 	// concurrent requests cannot both observe the project directory as free.
-	sharedDirMu sync.Mutex
+	sharedDirMu       sync.Mutex
+	cleanupRetryMu    sync.Mutex
+	cleanupRetries    map[domain.SessionID]struct{}
+	cleanupRetryDelay time.Duration
 }
 
 // sendConfirmConfig bounds the best-effort activity-confirmation loop run after
@@ -273,7 +276,7 @@ func New(d Deps) *Manager {
 			attemptDeadline: sendConfirmAttemptDeadline,
 			maxAttempts:     sendConfirmMaxAttempts,
 		},
-		logger: d.Logger,
+		logger: d.Logger, cleanupRetries: make(map[domain.SessionID]struct{}), cleanupRetryDelay: time.Second,
 	}
 	if m.clock == nil {
 		// UTC so spawn-stamped CreatedAt/UpdatedAt match every other session
@@ -843,6 +846,9 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 	// non-restorable inventory.
 	if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
 		m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
+		if dirWorkspace {
+			return false, fmt.Errorf("kill %s: delete restore marker: %w", id, err)
+		}
 	}
 	if markTerminated {
 		if err := m.lcm.MarkTerminated(ctx, id); err != nil {
@@ -896,9 +902,32 @@ func (m *Manager) CleanupCompletedSession(ctx context.Context, id domain.Session
 		return nil
 	}
 	if _, err := m.kill(ctx, id, false); err != nil {
+		m.scheduleCleanupRetry(id)
 		return fmt.Errorf("cleanup completed session %s: %w", id, err)
 	}
 	return nil
+}
+
+// scheduleCleanupRetry keeps a failed natural non-git teardown live in the
+// daemon until its durable lease can be released, without requiring another
+// activity-exit callback or a daemon restart.
+func (m *Manager) scheduleCleanupRetry(id domain.SessionID) {
+	m.cleanupRetryMu.Lock()
+	if _, ok := m.cleanupRetries[id]; ok {
+		m.cleanupRetryMu.Unlock()
+		return
+	}
+	m.cleanupRetries[id] = struct{}{}
+	m.cleanupRetryMu.Unlock()
+	time.AfterFunc(m.cleanupRetryDelay, func() {
+		err := m.CleanupCompletedSession(context.Background(), id)
+		m.cleanupRetryMu.Lock()
+		delete(m.cleanupRetries, id)
+		m.cleanupRetryMu.Unlock()
+		if err != nil {
+			m.scheduleCleanupRetry(id)
+		}
+	})
 }
 
 func (m *Manager) clearCompletedRuntimeHandle(ctx context.Context, id domain.SessionID) error {
@@ -1052,7 +1081,7 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	if !ok {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotFound)
 	}
-	if !rec.IsTerminated && rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindScratch {
+	if !rec.IsTerminated {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
 	}
 	meta := rec.Metadata
@@ -1087,6 +1116,9 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 		}
 		if _, ok := agent.(workspaceHookUninstaller); !ok {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w: %s", id, ErrSharedDirUnsupported, rec.Harness)
+		}
+		if scope, ok := agent.(sharedDirHookScope); ok && !scope.SupportsSharedDirHooks() {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w: %s uses global hooks", id, ErrSharedDirUnsupported, rec.Harness)
 		}
 		m.sharedDirMu.Lock()
 		defer m.sharedDirMu.Unlock()
@@ -1369,6 +1401,12 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 		// the agent directly against it rather than forcing git-only save logic.
 		if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
 			return fmt.Errorf("reconcile %s: mark branchless session terminated: %w", rec.ID, err)
+		}
+		if latest, ok, readErr := m.store.GetSession(ctx, rec.ID); readErr == nil && ok && !latest.IsTerminated {
+			latest.IsTerminated = true
+			if updateErr := m.store.UpdateSession(ctx, latest); updateErr != nil {
+				return fmt.Errorf("reconcile %s: persist branchless termination: %w", rec.ID, updateErr)
+			}
 		}
 		if _, err := m.Restore(ctx, rec.ID); err != nil {
 			return fmt.Errorf("reconcile %s: restore branchless session: %w", rec.ID, err)
