@@ -32,12 +32,22 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 	_ = ownerRead.Close()
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
+	// Prefer cancellation whenever it is already observable, ensuring group
+	// termination happens while the guardian leader identity is retained.
 	select {
-	case err = <-wait:
-		_ = ownerWrite.Close()
 	case <-ctx.Done():
 		_ = ownerWrite.Close()
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		err = <-wait
+	default:
+		select {
+		case <-ctx.Done():
+			_ = ownerWrite.Close()
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			err = <-wait
+		case err = <-wait:
+			_ = ownerWrite.Close()
+		}
 	}
 	if ctx.Err() != nil {
 		return RunResult{ExitCode: -1}, ctx.Err()
