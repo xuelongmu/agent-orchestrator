@@ -1108,6 +1108,33 @@ paths:
       summary: Report an agent activity-state signal for a session
       tags:
       - sessions
+  /api/v1/sessions/{sessionId}/design-contract/invariants:
+    post:
+      operationId: addSessionDesignContractInvariant
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddDesignContractInvariantRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddDesignContractInvariantResponse'
+          description: OK
+      summary: Append an explicit invariant to one owned PR design contract
+      tags:
+      - sessions
   /api/v1/sessions/{sessionId}/kill:
     post:
       operationId: killSession
@@ -1929,6 +1956,32 @@ components:
       - error
       - code
       - message
+      type: object
+    AddDesignContractInvariantRequest:
+      properties:
+        invariant:
+          maxLength: 512
+          minLength: 1
+          type: string
+        pr:
+          minLength: 1
+          type: string
+      required:
+      - pr
+      - invariant
+      type: object
+    AddDesignContractInvariantResponse:
+      properties:
+        ok:
+          type: boolean
+        pr:
+          type: string
+        sessionId:
+          type: string
+      required:
+      - ok
+      - sessionId
+      - pr
       type: object
     AddProjectInput:
       properties:
@@ -2752,6 +2805,8 @@ components:
           type: boolean
         prUrl:
           type: string
+        proposedInvariant:
+          type: string
         rootCauseNote:
           type: string
         round:
@@ -3285,8 +3340,12 @@ components:
         outOfScope:
           description: Finding belongs to a subsystem outside this PR's core scope.
           type: boolean
+        proposedInvariant:
+          description: Explicit durable invariant for this exact PR; omit for site
+            symptoms and out-of-scope findings.
+          type: string
         rootCauseNote:
-          description: One-line invariant or root-cause explanation.
+          description: One-line root-cause explanation.
           type: string
         threadId:
           description: Provider review-thread node id.

@@ -268,29 +268,30 @@ func (q *Queries) GetReviewRunBySessionPRAndSHA(ctx context.Context, arg GetRevi
 
 const insertReviewFinding = `-- name: InsertReviewFinding :exec
 INSERT INTO review_finding (
-    id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
+    id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note, proposed_invariant,
     fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
     thread_resolved, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (id) DO NOTHING
 `
 
 type InsertReviewFindingParams struct {
-	ID               string
-	RunID            string
-	SessionID        domain.SessionID
-	PRURL            string
-	Round            int64
-	File             string
-	ClassTag         string
-	RootCauseNote    string
-	FixCommit        string
-	ThreadID         string
-	Body             string
-	OutOfScope       int64
-	DeferredIssueURL string
-	ThreadResolved   int64
-	CreatedAt        time.Time
+	ID                string
+	RunID             string
+	SessionID         domain.SessionID
+	PRURL             string
+	Round             int64
+	File              string
+	ClassTag          string
+	RootCauseNote     string
+	ProposedInvariant string
+	FixCommit         string
+	ThreadID          string
+	Body              string
+	OutOfScope        int64
+	DeferredIssueURL  string
+	ThreadResolved    int64
+	CreatedAt         time.Time
 }
 
 func (q *Queries) InsertReviewFinding(ctx context.Context, arg InsertReviewFindingParams) error {
@@ -303,6 +304,7 @@ func (q *Queries) InsertReviewFinding(ctx context.Context, arg InsertReviewFindi
 		arg.File,
 		arg.ClassTag,
 		arg.RootCauseNote,
+		arg.ProposedInvariant,
 		arg.FixCommit,
 		arg.ThreadID,
 		arg.Body,
@@ -316,29 +318,30 @@ func (q *Queries) InsertReviewFinding(ctx context.Context, arg InsertReviewFindi
 
 const insertReviewFindingStrict = `-- name: InsertReviewFindingStrict :exec
 INSERT INTO review_finding (
-    id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
+    id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note, proposed_invariant,
     fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
     thread_resolved, thread_reply_id, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 type InsertReviewFindingStrictParams struct {
-	ID               string
-	RunID            string
-	SessionID        domain.SessionID
-	PRURL            string
-	Round            int64
-	File             string
-	ClassTag         string
-	RootCauseNote    string
-	FixCommit        string
-	ThreadID         string
-	Body             string
-	OutOfScope       int64
-	DeferredIssueURL string
-	ThreadResolved   int64
-	ThreadReplyID    string
-	CreatedAt        time.Time
+	ID                string
+	RunID             string
+	SessionID         domain.SessionID
+	PRURL             string
+	Round             int64
+	File              string
+	ClassTag          string
+	RootCauseNote     string
+	ProposedInvariant string
+	FixCommit         string
+	ThreadID          string
+	Body              string
+	OutOfScope        int64
+	DeferredIssueURL  string
+	ThreadResolved    int64
+	ThreadReplyID     string
+	CreatedAt         time.Time
 }
 
 func (q *Queries) InsertReviewFindingStrict(ctx context.Context, arg InsertReviewFindingStrictParams) error {
@@ -351,6 +354,7 @@ func (q *Queries) InsertReviewFindingStrict(ctx context.Context, arg InsertRevie
 		arg.File,
 		arg.ClassTag,
 		arg.RootCauseNote,
+		arg.ProposedInvariant,
 		arg.FixCommit,
 		arg.ThreadID,
 		arg.Body,
@@ -405,7 +409,7 @@ const listReviewFindingsByRun = `-- name: ListReviewFindingsByRun :many
 SELECT id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
        fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
        thread_resolved, thread_reply_id, issue_action_token,
-       issue_action_lease_until, thread_action_token, thread_action_lease_until, created_at
+       issue_action_lease_until, thread_action_token, thread_action_lease_until, created_at, proposed_invariant
 FROM review_finding
 WHERE run_id = ?
 ORDER BY created_at ASC, id ASC
@@ -441,6 +445,7 @@ func (q *Queries) ListReviewFindingsByRun(ctx context.Context, runID string) ([]
 			&i.ThreadActionToken,
 			&i.ThreadActionLeaseUntil,
 			&i.CreatedAt,
+			&i.ProposedInvariant,
 		); err != nil {
 			return nil, err
 		}
@@ -459,7 +464,7 @@ const listReviewFindingsBySession = `-- name: ListReviewFindingsBySession :many
 SELECT id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
        fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
        thread_resolved, thread_reply_id, issue_action_token,
-       issue_action_lease_until, thread_action_token, thread_action_lease_until, created_at
+       issue_action_lease_until, thread_action_token, thread_action_lease_until, created_at, proposed_invariant
 FROM review_finding
 WHERE session_id = ?
 ORDER BY round ASC, created_at ASC, id ASC
@@ -495,6 +500,7 @@ func (q *Queries) ListReviewFindingsBySession(ctx context.Context, sessionID dom
 			&i.ThreadActionToken,
 			&i.ThreadActionLeaseUntil,
 			&i.CreatedAt,
+			&i.ProposedInvariant,
 		); err != nil {
 			return nil, err
 		}

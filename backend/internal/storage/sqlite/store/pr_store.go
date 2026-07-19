@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
@@ -74,6 +75,16 @@ func (s *Store) ClaimPR(ctx context.Context, pr domain.PullRequest, checks []dom
 		}); err != nil {
 			return err
 		}
+		if err := q.EnsurePRDesignContract(ctx, gen.EnsurePRDesignContractParams{
+			PRURL: pr.URL, SessionID: string(pr.SessionID),
+			FallbackMarkdown: designcontract.BuildSeed("", ""), UpdatedAt: pr.UpdatedAt,
+		}); err != nil {
+			return err
+		}
+		outcome.DesignContract, err = q.GetPRDesignContract(ctx, pr.URL)
+		if err != nil {
+			return err
+		}
 		if err := writePRRows(ctx, q, pr, checks, reviews, threads, comments, reviewMode, false, false); err != nil {
 			return err
 		}
@@ -131,6 +142,12 @@ func writePRRows(ctx context.Context, q *gen.Queries, pr domain.PullRequest, che
 		if err := q.UpsertPR(ctx, genPRParams(pr)); err != nil {
 			return err
 		}
+	}
+	if err := q.EnsurePRDesignContract(ctx, gen.EnsurePRDesignContractParams{
+		PRURL: pr.URL, SessionID: string(pr.SessionID),
+		FallbackMarkdown: designcontract.BuildSeed("", ""), UpdatedAt: pr.UpdatedAt,
+	}); err != nil {
+		return fmt.Errorf("ensure PR design contract: %w", err)
 	}
 	for _, c := range checks {
 		if err := q.UpsertPRCheck(ctx, genCheckParams(pr.URL, c)); err != nil {

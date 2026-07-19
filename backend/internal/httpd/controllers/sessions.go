@@ -79,6 +79,7 @@ func (c *SessionsController) Register(r chi.Router) {
 	r.Get("/sessions/{sessionId}/workspace/file", c.getWorkspaceFile)
 	r.Get("/sessions/{sessionId}/pr", c.listPRs)
 	r.Post("/sessions/{sessionId}/pr/claim", c.claimPR)
+	r.Post("/sessions/{sessionId}/design-contract/invariants", c.addDesignContractInvariant)
 	r.Patch("/sessions/{sessionId}", c.rename)
 	r.Post("/sessions/{sessionId}/restore", c.restore)
 	r.Post("/sessions/{sessionId}/kill", c.kill)
@@ -367,6 +368,30 @@ func (c *SessionsController) claimPR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	envelope.WriteJSON(w, http.StatusOK, ClaimPRResponse{OK: true, SessionID: sessionID(r), PRs: sessionPRFacts(res.PRs), BranchChanged: res.BranchChanged, TakenOverFrom: nonNilSessionIDs(res.TakenOverFrom)})
+}
+
+func (c *SessionsController) addDesignContractInvariant(w http.ResponseWriter, r *http.Request) {
+	writer, ok := c.Svc.(interface {
+		AddDesignContractInvariant(context.Context, domain.SessionID, string, string) (string, error)
+	})
+	if !ok {
+		apispec.NotImplemented(w, r, "POST", "/api/v1/sessions/{sessionId}/design-contract/invariants")
+		return
+	}
+	var in AddDesignContractInvariantRequest
+	if err := decodeJSON(r, &in); err != nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Invalid JSON body", nil)
+		return
+	}
+	if strings.TrimSpace(in.PR) == "" || strings.TrimSpace(in.Invariant) == "" {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "CONTRACT_INVARIANT_REQUIRED", "pr and invariant are required", nil)
+		return
+	}
+	if _, err := writer.AddDesignContractInvariant(r.Context(), sessionID(r), in.PR, in.Invariant); err != nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_CONTRACT_INVARIANT", err.Error(), nil)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, AddDesignContractInvariantResponse{OK: true, SessionID: sessionID(r), PR: in.PR})
 }
 
 func (c *SessionsController) rename(w http.ResponseWriter, r *http.Request) {

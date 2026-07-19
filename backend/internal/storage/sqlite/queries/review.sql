@@ -95,24 +95,24 @@ FROM review_run WHERE session_id = ? AND batch_id = ? ORDER BY created_at ASC, i
 
 -- name: InsertReviewFinding :exec
 INSERT INTO review_finding (
-    id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
+    id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note, proposed_invariant,
     fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
     thread_resolved, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (id) DO NOTHING;
 
 -- name: InsertReviewFindingStrict :exec
 INSERT INTO review_finding (
-    id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
+    id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note, proposed_invariant,
     fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
     thread_resolved, thread_reply_id, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 -- name: ListReviewFindingsBySession :many
 SELECT id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
        fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
        thread_resolved, thread_reply_id, issue_action_token,
-       issue_action_lease_until, thread_action_token, thread_action_lease_until, created_at
+       issue_action_lease_until, thread_action_token, thread_action_lease_until, created_at, proposed_invariant
 FROM review_finding
 WHERE session_id = ?
 ORDER BY round ASC, created_at ASC, id ASC;
@@ -121,7 +121,7 @@ ORDER BY round ASC, created_at ASC, id ASC;
 SELECT id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
        fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
        thread_resolved, thread_reply_id, issue_action_token,
-       issue_action_lease_until, thread_action_token, thread_action_lease_until, created_at
+       issue_action_lease_until, thread_action_token, thread_action_lease_until, created_at, proposed_invariant
 FROM review_finding
 WHERE run_id = ?
 ORDER BY created_at ASC, id ASC;

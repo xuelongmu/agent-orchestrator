@@ -14,12 +14,13 @@ import (
 )
 
 type fakeStore struct {
-	run        domain.ReviewRun
-	ok         bool
-	batchRuns  []domain.ReviewRun
-	prs        []domain.PullRequest
-	sessions   map[domain.SessionID]domain.SessionRecord
-	signatures map[string]string
+	run             domain.ReviewRun
+	ok              bool
+	batchRuns       []domain.ReviewRun
+	prs             []domain.PullRequest
+	sessions        map[domain.SessionID]domain.SessionRecord
+	signatures      map[string]string
+	designContracts map[string]string
 
 	updateCalls     int
 	markCalls       int
@@ -59,6 +60,11 @@ func (f *fakeStore) UpdatePRLastNudgeSignature(_ context.Context, prURL, payload
 	}
 	f.signatures[prURL] = payload
 	return nil
+}
+
+func (f *fakeStore) GetPRDesignContract(_ context.Context, prURL string) (string, bool, error) {
+	contract, ok := f.designContracts[prURL]
+	return contract, ok, nil
 }
 
 type fakeMessenger struct{ msgs []string }

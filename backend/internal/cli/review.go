@@ -47,12 +47,13 @@ type submitReviewItem struct {
 }
 
 type submitFindingItem struct {
-	File          string `json:"file,omitempty"`
-	ClassTag      string `json:"classTag"`
-	RootCauseNote string `json:"rootCauseNote"`
-	ThreadID      string `json:"threadId,omitempty"`
-	Body          string `json:"body,omitempty"`
-	OutOfScope    bool   `json:"outOfScope,omitempty"`
+	File              string `json:"file,omitempty"`
+	ClassTag          string `json:"classTag"`
+	RootCauseNote     string `json:"rootCauseNote"`
+	ProposedInvariant string `json:"proposedInvariant,omitempty"`
+	ThreadID          string `json:"threadId,omitempty"`
+	Body              string `json:"body,omitempty"`
+	OutOfScope        bool   `json:"outOfScope,omitempty"`
 }
 
 // submitReviewRequest mirrors controllers.SubmitReviewInput.

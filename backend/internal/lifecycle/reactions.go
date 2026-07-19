@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/scmready"
@@ -106,6 +107,7 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 	var sigParts []string
 	for i, r := range results {
 		fmt.Fprintf(&msg, "\nReview %d\nPR: %s\nVerdict: %s", i+1, domain.SanitizeControlChars(r.PRURL), domain.SanitizeControlChars(string(r.Verdict)))
+		m.writeDesignContractDispatch(ctx, &msg, rec.Metadata.WorkspacePath, r.PRURL)
 		if r.TargetSHA != "" {
 			fmt.Fprintf(&msg, "\nHead commit: %s", domain.SanitizeControlChars(r.TargetSHA))
 		}
@@ -149,6 +151,20 @@ func writeReviewDispatchPolicy(msg *strings.Builder, r ReviewResult) {
 		fmt.Fprintf(msg, "\nKIND: SIMPLIFICATION ROUND\nThe class %q has recurred at least 3 times. Identify the invariant this class violates and enforce it at ONE chokepoint; delete the per-site predicates. Treat the individual findings as symptoms and test cases, not as a patch list.\n", domain.SanitizeControlChars(r.SimplificationClass))
 	}
 	msg.WriteString("\nAfter addressing each finding, enumerate every sibling code path with the same shape and apply the same guarantee before pushing.\n")
+}
+
+func (m *Manager) writeDesignContractDispatch(ctx context.Context, msg *strings.Builder, workspacePath, prURL string) {
+	contract, _, err := m.store.GetPRDesignContract(ctx, prURL)
+	if err != nil {
+		slog.Warn("review dispatch: design contract unavailable", "prURL", prURL, "error", err)
+	}
+	if contract != "" {
+		if err := designcontract.MaterializePR(ctx, workspacePath, prURL, contract); err != nil {
+			slog.Debug("review dispatch: design contract projection skipped", "prURL", prURL, "error", err)
+		}
+		fmt.Fprintf(msg, "\nDesign contract (canonical AO state; .ao/CONTRACT.md is a read-only projection):\n%s\n", domain.SanitizeControlChars(designcontract.ForDispatch(contract)))
+	}
+	fmt.Fprintf(msg, "\nFor each fix, state which invariant it preserves. If a finding reveals a missing invariant, enforce it at one chokepoint and record the plain one-line guarantee durably with `ao contract add --pr %s --invariant \"<guarantee>\"`; never edit the workspace projection directly. AO also persists explicit reviewer invariant proposals through the finding ledger. Record the preserved or added invariant in the review-fix commit body.\n", domain.SanitizeControlChars(prURL))
 }
 
 func findingLedgerSummary(ledger domain.FindingLedgerSummary) string {
@@ -428,6 +444,9 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 	if o.Review == domain.ReviewChangesRequest || hasUnresolvedComments(o.Comments) {
 		comments := unresolvedReviewComments(o.Comments)
 		msg := formatReviewCommentsMessage(comments)
+		var contract strings.Builder
+		m.writeDesignContractDispatch(ctx, &contract, rec.Metadata.WorkspacePath, o.URL)
+		msg += contract.String()
 		if ident != "your PR" {
 			msg = strings.Replace(msg, "your PR", ident, 1)
 		}
@@ -651,6 +670,9 @@ func (m *Manager) ApplyIdleReviewSnapshot(ctx context.Context, id domain.Session
 	}
 	msg := fmt.Sprintf("You still have %d unresolved review comment(s) on %s and appear to be idle. Address them now, push fixes, and resolve each addressed thread.\n\n%s",
 		len(actionable), prIdentity(prObs), formatReviewCommentsMessage(actionable))
+	var contract strings.Builder
+	m.writeDesignContractDispatch(ctx, &contract, rec.Metadata.WorkspacePath, prURL)
+	msg += contract.String()
 	outcome, sendErr := m.guard.NudgeIdleEpisode(ctx, id, msg, rec.Activity.LastActivityAt)
 	if outcome == sessionguard.SuppressedStaleEpisode || outcome == sessionguard.SuppressedRateLimited {
 		return m.clearIdleReviewEpisodeIdentityLocked(ctx, prURL, rec.Activity.LastActivityAt)
@@ -956,6 +978,9 @@ func (m *Manager) ApplyReviewResult(ctx context.Context, workerID domain.Session
 		return ReviewDeliveryNoop, nil
 	}
 	msg := fmt.Sprintf("[AO reviewer] AO's internal code reviewer submitted a review.\n\nPR: %s\nVerdict: %s", domain.SanitizeControlChars(r.PRURL), domain.SanitizeControlChars(string(r.Verdict)))
+	var contract strings.Builder
+	m.writeDesignContractDispatch(ctx, &contract, rec.Metadata.WorkspacePath, r.PRURL)
+	msg += contract.String()
 	var policy strings.Builder
 	writeReviewDispatchPolicy(&policy, r)
 	msg += policy.String()

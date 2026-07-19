@@ -70,6 +70,9 @@ func (e PRClaimedByActiveSessionError) Unwrap() error { return ErrPRClaimedByAct
 type ClaimOutcome struct {
 	PreviousOwner   domain.SessionID
 	OwnerTerminated bool
+	// DesignContract is the canonical per-PR contract read in the same
+	// transaction that finalized ownership.
+	DesignContract string
 }
 
 // PRCheckoutErrorKind identifies a claim checkout failure that the caller can

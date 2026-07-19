@@ -388,6 +388,7 @@ type fakeCommander struct {
 	killed          []domain.SessionID
 	retired         []domain.SessionID
 	sent            []domain.SessionID
+	sentMessages    []string
 	cleanupProjects []domain.ProjectID
 	killErr         error
 	retireErr       error
@@ -429,11 +430,12 @@ func (f *fakeCommander) RetireForReplacement(_ context.Context, id domain.Sessio
 	f.retired = append(f.retired, id)
 	return nil
 }
-func (f *fakeCommander) Send(_ context.Context, id domain.SessionID, _ string) error {
+func (f *fakeCommander) Send(_ context.Context, id domain.SessionID, message string) error {
 	if f.sendErr != nil {
 		return f.sendErr
 	}
 	f.sent = append(f.sent, id)
+	f.sentMessages = append(f.sentMessages, message)
 	return nil
 }
 func (f *fakeCommander) Cleanup(_ context.Context, project domain.ProjectID) (sessionmanager.CleanupResult, error) {
@@ -995,6 +997,7 @@ func TestSpawnOrchestratorVerifiesReplacementHarness(t *testing.T) {
 
 type fakePRClaimer struct {
 	out             errorFreeClaimOutcome
+	preflightOut    *ports.ClaimOutcome
 	preflightErr    error
 	err             error
 	preflightCalled *bool
@@ -1009,6 +1012,9 @@ type errorFreeClaimOutcome struct {
 func (f fakePRClaimer) CheckPRClaim(context.Context, string, domain.SessionID, bool) (ports.ClaimOutcome, error) {
 	if f.preflightCalled != nil {
 		*f.preflightCalled = true
+	}
+	if f.preflightOut != nil {
+		return *f.preflightOut, f.preflightErr
 	}
 	return f.out.ClaimOutcome, f.preflightErr
 }
@@ -1149,6 +1155,39 @@ func TestClaimPRUsesAndPersistsSessionPrivateBranch(t *testing.T) {
 	}
 	if checkoutBranch != "ao/claim/mer-1/pr-7/root" || persistedBranch != checkoutBranch {
 		t.Fatalf("checkout branch = %q, persisted branch = %q", checkoutBranch, persistedBranch)
+	}
+}
+
+func TestClaimPRReplacementUsesFinalAtomicOwnerAndNudgesCanonicalContract(t *testing.T) {
+	replacementWorkspace := t.TempDir()
+	want := "# Design Contract\n\n## Invariants\n- Preserve the final owner's rounds.\x1b[31m\x00\u0085\n"
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: replacementWorkspace}}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+	preflight := ports.ClaimOutcome{PreviousOwner: "mer-A", OwnerTerminated: true}
+	outcome := ports.ClaimOutcome{PreviousOwner: "mer-B", OwnerTerminated: true, DesignContract: want}
+	commander := &fakeCommander{}
+	svc := NewWithDeps(Deps{
+		Manager:   commander,
+		Store:     st,
+		PRClaimer: fakePRClaimer{out: errorFreeClaimOutcome{outcome}, preflightOut: &preflight},
+		SCM:       fakeSCM{obs: ports.SCMObservation{Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/repo", PR: ports.SCMPRObservation{URL: "https://github.com/acme/repo/pull/7", Number: 7}}},
+	})
+
+	res, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.TakenOverFrom) != 1 || res.TakenOverFrom[0] != "mer-B" {
+		t.Fatalf("takeover donor = %v, want final atomic mer-B", res.TakenOverFrom)
+	}
+	if len(commander.sentMessages) != 1 || !strings.Contains(commander.sentMessages[0], "Preserve the final owner's rounds") || strings.Contains(commander.sentMessages[0], "mer-A") {
+		t.Fatalf("claim-time contract nudge = %v", commander.sentMessages)
+	}
+	for _, forbidden := range []string{"\x1b", "\x00", "\u0085"} {
+		if strings.Contains(commander.sentMessages[0], forbidden) {
+			t.Fatalf("claim-time contract nudge retained control %q: %q", forbidden, commander.sentMessages[0])
+		}
 	}
 }
 

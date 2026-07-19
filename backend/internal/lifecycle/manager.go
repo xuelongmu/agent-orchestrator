@@ -30,6 +30,7 @@ type sessionStore interface {
 	// reaction-dedup map so nudges survive a daemon restart.
 	GetPRLastNudgeSignature(ctx context.Context, prURL string) (string, error)
 	UpdatePRLastNudgeSignature(ctx context.Context, prURL, payload string) error
+	GetPRDesignContract(ctx context.Context, prURL string) (string, bool, error)
 }
 
 // simplificationEventStore is the transactional local telemetry boundary for

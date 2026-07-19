@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"sort"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -107,7 +109,8 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 		return ClaimPRResult{}, err
 	}
 	refSpec := ports.SCMPRRef{Repo: repo, Number: number, URL: prURL}
-	if _, err := s.prClaimer.CheckPRClaim(ctx, prURL, id, opts.AllowTakeover); err != nil {
+	_, err = s.prClaimer.CheckPRClaim(ctx, prURL, id, opts.AllowTakeover)
+	if err != nil {
 		return ClaimPRResult{}, err
 	}
 	obs, err := s.fetchClaimObservation(ctx, refSpec)
@@ -137,6 +140,20 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	outcome, err := s.prClaimer.ClaimPR(ctx, pr, checks, reviews, threads, comments, reviewMode, opts.AllowTakeover, workspaceBranch)
 	if err != nil {
 		return ClaimPRResult{}, err
+	}
+	// The canonical contract and final owner were read/written by ClaimPR in
+	// one SQLite transaction. Workspace projection is best effort: an unsafe or
+	// non-ignored checkout must never roll back durable ownership.
+	if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, outcome.DesignContract); err != nil {
+		slog.Debug("claim PR: design contract projection skipped", "prURL", prURL, "error", err)
+	}
+	if outcome.PreviousOwner != "" && outcome.PreviousOwner != id && s.manager != nil {
+		message := "[AO design contract] PR ownership changed after this worker started. Read the final per-PR contract below before making further changes; .ao/CONTRACT.md, when present, is a read-only projection.\n\n" + domain.SanitizeControlChars(designcontract.ForDispatch(outcome.DesignContract))
+		if err := s.manager.Send(ctx, id, message); err != nil {
+			// Ownership is already durable. Never surface a post-commit failure as
+			// a failed claim (spawn would roll back the worker but not the PR row).
+			slog.Warn("claim PR: replacement contract nudge failed", "sessionId", id, "prURL", prURL, "error", err)
+		}
 	}
 	prs, err := s.listPRFacts(ctx, id)
 	if err != nil {

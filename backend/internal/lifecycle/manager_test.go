@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +24,7 @@ type fakeStore struct {
 	signatures             map[string]string
 	simplificationReceipts map[string]time.Time
 	telemetryEvents        map[string]ports.TelemetryEvent
+	designContracts        map[string]string
 	// afterSessionRead deterministically models a concurrent reducer committing
 	// new activity immediately after a caller's store snapshot.
 	afterSessionRead func(domain.SessionID, int)
@@ -33,7 +37,7 @@ type fakeStore struct {
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		sessions: map[domain.SessionID]domain.SessionRecord{}, prs: map[domain.SessionID][]domain.PullRequest{},
-		signatures: map[string]string{}, simplificationReceipts: map[string]time.Time{}, telemetryEvents: map[string]ports.TelemetryEvent{},
+		signatures: map[string]string{}, simplificationReceipts: map[string]time.Time{}, telemetryEvents: map[string]ports.TelemetryEvent{}, designContracts: map[string]string{},
 	}
 }
 
@@ -73,6 +77,11 @@ func (f *fakeStore) UpdatePRLastNudgeSignature(_ context.Context, prURL, payload
 	f.signatures[prURL] = payload
 	f.signatureWrites++
 	return nil
+}
+
+func (f *fakeStore) GetPRDesignContract(_ context.Context, prURL string) (string, bool, error) {
+	contract, ok := f.designContracts[prURL]
+	return contract, ok, nil
 }
 
 func (f *fakeStore) EnsureReviewRunSimplificationEvent(_ context.Context, id, targetSHA string, event ports.TelemetryEvent) (ports.TelemetryEvent, bool, error) {
@@ -1708,6 +1717,95 @@ func TestApplyReviewResultReplaysDurableSimplificationEventAfterSinkDropAndResta
 	}
 	if len(drained.events) != 1 || len(st.telemetryEvents) != 1 {
 		t.Fatalf("repeat events/local rows = %d/%d, want 1/1", len(drained.events), len(st.telemetryEvents))
+	}
+}
+
+func TestApplyReviewResultIncludesCanonicalPRDesignContract(t *testing.T) {
+	st := newFakeStore()
+	rec := working("mer-1")
+	st.sessions[rec.ID] = rec
+	st.designContracts["https://github.com/o/r/pull/1"] = "# Design Contract\n\n## Invariants\n- Every idle backlog poll notifies or exits with a reason.\x1b[31m\x00\u0085\n"
+	msg := &fakeMessenger{}
+	m := New(st, msg)
+	result := ReviewResult{RunID: "run-1", WorkerID: rec.ID, PRURL: "https://github.com/o/r/pull/1", Verdict: domain.VerdictChangesRequested, Body: "fix the missed path"}
+
+	outcome, err := m.ApplyReviewResult(ctx, rec.ID, result)
+	if err != nil || outcome != ReviewDeliverySent {
+		t.Fatalf("ApplyReviewResult = %q, %v", outcome, err)
+	}
+	got := msg.msgs[0]
+	for _, want := range []string{"canonical AO state", "Every idle backlog poll notifies or exits with a reason", "state which invariant it preserves", "never edit the workspace projection", "review-fix commit body"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("review dispatch missing %q:\n%s", want, got)
+		}
+	}
+	for _, forbidden := range []string{"\x1b", "\x00", "\u0085"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("review dispatch retained control %q: %q", forbidden, got)
+		}
+	}
+}
+
+func TestPRObservationReviewDispatchIncludesMatchingCanonicalContract(t *testing.T) {
+	st := newFakeStore()
+	rec := working("mer-1")
+	st.sessions[rec.ID] = rec
+	st.designContracts["https://github.com/o/r/pull/1"] = "# Design Contract\n\n## Invariants\n- Resolve feedback by enforcing one ownership boundary.\n"
+	msg := &fakeMessenger{}
+	m := New(st, msg)
+	o := ports.PRObservation{
+		Fetched: true, URL: "https://github.com/o/r/pull/1", Review: domain.ReviewChangesRequest,
+		Comments: []ports.PRCommentObservation{{ID: "c1", Body: "fix ownership", Author: "reviewer"}},
+	}
+
+	if err := m.ApplyPRObservation(ctx, rec.ID, o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 || !strings.Contains(msg.msgs[0], "Resolve feedback by enforcing one ownership boundary") || !strings.Contains(msg.msgs[0], "commit body") {
+		t.Fatalf("review observation dispatch missing design contract policy: %v", msg.msgs)
+	}
+}
+
+func TestDesignContractProjectionSelectsExactPRAcrossDispatchAndRestart(t *testing.T) {
+	workspace := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", workspace).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	prA, prB := "https://github.com/o/r/pull/1", "https://github.com/o/r/pull/2"
+	st := newFakeStore()
+	st.designContracts[prA] = "# Design Contract\n\n## Invariants\n- invariant-A\n"
+	st.designContracts[prB] = "# Design Contract\n\n## Invariants\n- invariant-B\n"
+	m := New(st, &fakeMessenger{})
+	for _, item := range []struct{ pr, invariant string }{{prA, "invariant-A"}, {prB, "invariant-B"}} {
+		var msg strings.Builder
+		m.writeDesignContractDispatch(ctx, &msg, workspace, item.pr)
+		if !strings.Contains(msg.String(), item.invariant) {
+			t.Fatalf("dispatch for %s = %s", item.pr, msg.String())
+		}
+	}
+	current, err := os.ReadFile(filepath.Join(workspace, ".ao", "CONTRACT.md"))
+	if err != nil || !strings.Contains(string(current), "Scope: Pull request: "+prB) || strings.Contains(string(current), "invariant-A") {
+		t.Fatalf("current projection after PR B = %q, %v", current, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(workspace, ".ao", "contracts"))
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("per-PR projections = %d, %v", len(entries), err)
+	}
+
+	// A review submission has atomically added a new explicit invariant before
+	// lifecycle delivery. A restarted manager refreshes the exact PR projection
+	// immediately, without overwriting the sibling's per-PR file.
+	st.designContracts[prA] += "\n## Review-discovered invariants\n\n- invariant-A-new\n"
+	restarted := New(st, &fakeMessenger{})
+	var msg strings.Builder
+	restarted.writeDesignContractDispatch(ctx, &msg, workspace, prA)
+	current, err = os.ReadFile(filepath.Join(workspace, ".ao", "CONTRACT.md"))
+	if err != nil || !strings.Contains(string(current), "Scope: Pull request: "+prA) || !strings.Contains(string(current), "invariant-A-new") || strings.Contains(string(current), "invariant-B") {
+		t.Fatalf("current projection after restart/PR A = %q, %v", current, err)
+	}
+	entries, err = os.ReadDir(filepath.Join(workspace, ".ao", "contracts"))
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("per-PR projections after refresh = %d, %v", len(entries), err)
 	}
 }
 

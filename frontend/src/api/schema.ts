@@ -435,6 +435,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sessions/{sessionId}/design-contract/invariants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Append an explicit invariant to one owned PR design contract */
+        post: operations["addSessionDesignContractInvariant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sessions/{sessionId}/pr": {
         parameters: {
             query?: never;
@@ -711,6 +728,15 @@ export interface components {
             name?: null | string;
             path: string;
             projectId?: null | string;
+        };
+        AddDesignContractInvariantRequest: {
+            invariant: string;
+            pr: string;
+        };
+        AddDesignContractInvariantResponse: {
+            ok: boolean;
+            pr: string;
+            sessionId: string;
         };
         AgentConfig: {
             model?: string;
@@ -1015,6 +1041,7 @@ export interface components {
             id: string;
             outOfScope?: boolean;
             prUrl: string;
+            proposedInvariant?: string;
             rootCauseNote: string;
             round: number;
             runId: string;
@@ -1215,7 +1242,9 @@ export interface components {
             file?: string;
             /** @description Finding belongs to a subsystem outside this PR's core scope. */
             outOfScope?: boolean;
-            /** @description One-line invariant or root-cause explanation. */
+            /** @description Explicit durable invariant for this exact PR; omit for site symptoms and out-of-scope findings. */
+            proposedInvariant?: string;
+            /** @description One-line root-cause explanation. */
             rootCauseNote: string;
             /** @description Provider review-thread node id. */
             threadId?: string;
@@ -2748,6 +2777,33 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    addSessionDesignContractInvariant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddDesignContractInvariantRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddDesignContractInvariantResponse"];
                 };
             };
         };

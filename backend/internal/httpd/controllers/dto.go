@@ -447,6 +447,17 @@ type ClaimPRResponse struct {
 	TakenOverFrom []domain.SessionID `json:"takenOverFrom"`
 }
 
+type AddDesignContractInvariantRequest struct {
+	PR        string `json:"pr" minLength:"1"`
+	Invariant string `json:"invariant" minLength:"1" maxLength:"512"`
+}
+
+type AddDesignContractInvariantResponse struct {
+	OK        bool             `json:"ok"`
+	SessionID domain.SessionID `json:"sessionId"`
+	PR        string           `json:"pr"`
+}
+
 // SetActivityRequest is the body of POST /api/v1/sessions/{sessionId}/activity.
 // Event/ToolName/ToolUseID are optional correlation facts: which AO hook
 // sub-command produced the state and, for tool-use hooks, which tool call it

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/pathenv"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -148,6 +149,7 @@ type Store interface {
 	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
 	CreateSession(ctx context.Context, rec domain.SessionRecord) (domain.SessionRecord, error)
+	SaveSessionDesignContractSeed(ctx context.Context, sessionID domain.SessionID, markdown string, updatedAt time.Time) error
 	UpdateSession(ctx context.Context, rec domain.SessionRecord) error
 	SetPendingSubmit(ctx context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error)
 	ClaimPendingSubmitRecovery(ctx context.Context, id domain.SessionID, fingerprint string, updatedAt time.Time) (bool, error)
@@ -368,6 +370,12 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn: create: %w", err)
 	}
 	id := rec.ID
+	if cfg.Kind == domain.KindWorker && (cfg.IssueID != "" || strings.TrimSpace(cfg.IssueContext) != "") {
+		if err := m.store.SaveSessionDesignContractSeed(ctx, id, designcontract.BuildSeed(string(cfg.IssueID), cfg.IssueContext), m.clock()); err != nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+			return domain.SessionRecord{}, fmt.Errorf("spawn %s: save design contract seed: %w", id, err)
+		}
+	}
 	systemPromptFile, err := m.prepareSystemPromptFile(id, cfg.Harness, systemPrompt)
 	if err != nil {
 		m.rollbackSpawnSeedRow(ctx, id)
@@ -393,6 +401,13 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
 		m.rollbackSpawnSeedRow(ctx, id)
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: provision: %w", id, err)
+	}
+	if cfg.Kind == domain.KindWorker && (cfg.IssueID != "" || strings.TrimSpace(cfg.IssueContext) != "") {
+		if err := designcontract.Materialize(ctx, ws.Path, designcontract.BuildSeed(string(cfg.IssueID), cfg.IssueContext)); err != nil {
+			// SQLite already holds the draft. A checkout-controlled link or Git
+			// metadata failure may suppress the projection but cannot veto spawn.
+			slog.Warn("spawn: design contract projection skipped", "sessionId", id, "error", err)
+		}
 	}
 
 	agentConfig := effectiveAgentConfig(cfg.Kind, project.Config)
