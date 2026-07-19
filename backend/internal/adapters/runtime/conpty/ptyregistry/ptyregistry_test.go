@@ -61,6 +61,74 @@ func TestRegistryUsesAODataDir(t *testing.T) {
 	}
 }
 
+func TestListMigratesLegacyRegistryIntoAODataDir(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(t.TempDir(), "isolated", "data")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_DATA_DIR", dataDir)
+	withFakePidAlive(t, func(int) bool { return true })
+
+	legacyPath := filepath.Join(home, ".ao", "windows-pty-hosts.json")
+	configuredPath := filepath.Join(dataDir, "windows-pty-hosts.json")
+	legacy := []Entry{
+		{SessionID: "legacy", PtyHostPID: 111, PipePath: `\\.\pipe\ao-legacy`, RegisteredAt: nowRFC3339()},
+		{SessionID: "duplicate", PtyHostPID: 222, PipePath: `\\.\pipe\ao-old`, RegisteredAt: nowRFC3339()},
+	}
+	configured := []Entry{
+		{SessionID: "duplicate", PtyHostPID: 333, PipePath: `\\.\pipe\ao-new`, RegisteredAt: nowRFC3339()},
+	}
+	writeRegistryFixture(t, legacyPath, legacy)
+	writeRegistryFixture(t, configuredPath, configured)
+
+	got, err := List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected two migrated entries, got %v", got)
+	}
+	byID := make(map[string]Entry, len(got))
+	for _, entry := range got {
+		byID[entry.SessionID] = entry
+	}
+	if byID["legacy"].PtyHostPID != 111 {
+		t.Fatalf("legacy entry was not adopted: %v", got)
+	}
+	if byID["duplicate"].PtyHostPID != 333 {
+		t.Fatalf("configured entry should win duplicate: %v", got)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy registry was not removed after migration: %v", err)
+	}
+
+	data, err := os.ReadFile(configuredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var migrated []Entry
+	if err := json.Unmarshal(data, &migrated); err != nil {
+		t.Fatal(err)
+	}
+	if len(migrated) != 2 {
+		t.Fatalf("configured registry did not receive legacy entries: %v", migrated)
+	}
+}
+
+func writeRegistryFixture(t *testing.T, path string, entries []Entry) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRegisterThenList(t *testing.T) {
 	setupHome(t)
 	withFakePidAlive(t, func(int) bool { return true })

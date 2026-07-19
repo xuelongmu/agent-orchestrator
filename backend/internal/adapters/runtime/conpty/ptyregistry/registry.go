@@ -38,13 +38,17 @@ func registryFile() (string, error) {
 	return filepath.Join(home, ".ao", "windows-pty-hosts.json"), nil
 }
 
+func legacyRegistryFile() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".ao", "windows-pty-hosts.json"), nil
+}
+
 // readRaw reads and defensively parses the registry. Missing file or malformed
 // JSON both return an empty slice (mirrors readRaw in the TS source).
-func readRaw() []Entry {
-	path, err := registryFile()
-	if err != nil {
-		return nil
-	}
+func readRawFile(path string) []Entry {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		// Missing file is fine.
@@ -67,6 +71,40 @@ func readRaw() []Entry {
 		out = append(out, e)
 	}
 	return out
+}
+
+// readRaw also reads the pre-AO_DATA_DIR registry while upgrading an existing
+// install. Entries in the configured registry win on duplicate session IDs.
+// The caller removes the legacy file only after the merged list is safely
+// written to the configured location.
+func readRaw() (entries []Entry, legacyPath string, migrateLegacy bool) {
+	path, err := registryFile()
+	if err != nil {
+		return nil, "", false
+	}
+	entries = readRawFile(path)
+
+	legacyPath, err = legacyRegistryFile()
+	if err != nil || filepath.Clean(legacyPath) == filepath.Clean(path) {
+		return entries, "", false
+	}
+	legacy := readRawFile(legacyPath)
+	if len(legacy) == 0 {
+		return entries, "", false
+	}
+
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		seen[entry.SessionID] = struct{}{}
+	}
+	for _, entry := range legacy {
+		if _, ok := seen[entry.SessionID]; ok {
+			continue
+		}
+		seen[entry.SessionID] = struct{}{}
+		entries = append(entries, entry)
+	}
+	return entries, legacyPath, true
 }
 
 // writeRaw atomically writes entries to the registry file. When entries is
@@ -116,46 +154,60 @@ func writeRaw(entries []Entry) error {
 	return os.Rename(tmpName, path)
 }
 
+func writeMigrated(entries []Entry, legacyPath string, migrateLegacy bool) error {
+	if err := writeRaw(entries); err != nil {
+		return err
+	}
+	if !migrateLegacy {
+		return nil
+	}
+	if err := os.Remove(legacyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // Register adds or replaces the entry for entry.SessionID. registeredAt must
 // be set by the caller (e.g. time.Now().UTC().Format(time.RFC3339)).
 func Register(entry Entry) error {
+	all, legacyPath, migrateLegacy := readRaw()
 	next := make([]Entry, 0)
-	for _, e := range readRaw() {
+	for _, e := range all {
 		if e.SessionID != entry.SessionID {
 			next = append(next, e)
 		}
 	}
 	next = append(next, entry)
-	return writeRaw(next)
+	return writeMigrated(next, legacyPath, migrateLegacy)
 }
 
 // Unregister removes the entry for sessionID. No-op if absent.
 func Unregister(sessionID string) error {
-	all := readRaw()
+	all, legacyPath, migrateLegacy := readRaw()
 	next := make([]Entry, 0, len(all))
 	for _, e := range all {
 		if e.SessionID != sessionID {
 			next = append(next, e)
 		}
 	}
-	if len(next) == len(all) {
+	if len(next) == len(all) && !migrateLegacy {
 		return nil // absent, no-op
 	}
-	return writeRaw(next)
+	return writeMigrated(next, legacyPath, migrateLegacy)
 }
 
 // List returns all entries whose PtyHostPID is still alive, auto-pruning dead
 // ones. The file is rewritten if any entries were pruned.
 func List() ([]Entry, error) {
-	all := readRaw()
+	all, legacyPath, migrateLegacy := readRaw()
 	live := make([]Entry, 0, len(all))
 	for _, e := range all {
 		if pidAlive(e.PtyHostPID) {
 			live = append(live, e)
 		}
 	}
-	if len(live) != len(all) {
-		if err := writeRaw(live); err != nil {
+	if len(live) != len(all) || migrateLegacy {
+		if err := writeMigrated(live, legacyPath, migrateLegacy); err != nil {
 			return live, err
 		}
 	}
@@ -164,5 +216,16 @@ func List() ([]Entry, error) {
 
 // Clear deletes the registry file. Best-effort; used by tests and recovery.
 func Clear() error {
-	return writeRaw(nil)
+	if err := writeRaw(nil); err != nil {
+		return err
+	}
+	configured, configuredErr := registryFile()
+	legacy, legacyErr := legacyRegistryFile()
+	if configuredErr != nil || legacyErr != nil || filepath.Clean(configured) == filepath.Clean(legacy) {
+		return nil
+	}
+	if err := os.Remove(legacy); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
