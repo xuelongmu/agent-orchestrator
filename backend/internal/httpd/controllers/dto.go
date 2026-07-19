@@ -173,6 +173,23 @@ type SessionResponse struct {
 	Session SessionView `json:"session"`
 }
 
+// SubmitSessionHandoffRequest is the immutable structured completion summary
+// explicitly submitted by a session's agent.
+type SubmitSessionHandoffRequest struct {
+	ChangedFiles         []string `json:"changedFiles" maxItems:"128" description:"Changed paths; each item is bounded by the server to 1024 UTF-8 bytes."`
+	VerificationCommands []string `json:"verificationCommands" maxItems:"32" description:"Commands run; each item is bounded by the server to 4096 UTF-8 bytes."`
+	ResidualRisk         string   `json:"residualRisk" description:"Remaining risk, bounded by the server to 8192 UTF-8 bytes."`
+}
+
+// SubmitSessionHandoffResponse confirms whether the immutable handoff was
+// created or was an exact idempotent replay.
+type SubmitSessionHandoffResponse struct {
+	OK        bool                `json:"ok"`
+	SessionID domain.SessionID    `json:"sessionId"`
+	Created   bool                `json:"created"`
+	Handoff   domain.AgentHandoff `json:"handoff"`
+}
+
 // ListWorkspaceFilesResponse is the body of GET /api/v1/sessions/{sessionId}/workspace/files.
 type ListWorkspaceFilesResponse struct {
 	SessionID domain.SessionID       `json:"sessionId"`

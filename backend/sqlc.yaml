@@ -118,6 +118,10 @@ sql:
             go_type:
               import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"
               type: "SessionID"
+          - column: "agent_handoffs.session_id"
+            go_type:
+              import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"
+              type: "SessionID"
           - column: "review.session_id"
             go_type:
               import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"

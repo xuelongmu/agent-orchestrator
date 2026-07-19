@@ -102,6 +102,9 @@ type Session struct {
 	SessionRecord
 	Status           SessionStatus `json:"status" enum:"working,pr_open,draft,ci_failed,review_pending,changes_requested,approved,mergeable,merged,needs_input,rate_limited,idle,terminated,no_signal"`
 	TerminalHandleID string        `json:"terminalHandleId,omitempty"`
+	// Handoff is the immutable structured completion summary explicitly
+	// submitted by this session's agent. It has no lifecycle semantics.
+	Handoff *AgentHandoff `json:"handoff,omitempty"`
 	// DependsOn is the deduplicated, declared prerequisite graph for this
 	// session. Part 1 is read-only metadata: it does not gate launch or status;
 	// scheduling enforcement follows in Part 2.
