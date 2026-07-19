@@ -1122,6 +1122,7 @@ paths:
       - description: Exact owned PR URL or unambiguous positive PR number.
         in: query
         name: pr
+        required: true
         schema:
           description: Exact owned PR URL or unambiguous positive PR number.
           type: string

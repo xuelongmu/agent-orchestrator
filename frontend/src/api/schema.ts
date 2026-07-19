@@ -2811,9 +2811,9 @@ export interface operations {
     };
     getSessionDesignContract: {
         parameters: {
-            query?: {
+            query: {
                 /** @description Exact owned PR URL or unambiguous positive PR number. */
-                pr?: string;
+                pr: string;
             };
             header?: never;
             path: {

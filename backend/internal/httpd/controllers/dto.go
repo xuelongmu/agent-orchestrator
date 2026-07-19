@@ -464,7 +464,7 @@ type AddDesignContractInvariantResponse struct {
 
 // DesignContractQuery selects an exact owned PR design contract.
 type DesignContractQuery struct {
-	PR string `query:"pr" description:"Exact owned PR URL or unambiguous positive PR number."`
+	PR string `query:"pr" required:"true" description:"Exact owned PR URL or unambiguous positive PR number."`
 }
 
 // GetDesignContractResponse returns the full canonical design contract.
