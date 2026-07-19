@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -104,8 +105,12 @@ func fakeSpawnerFor(t *testing.T, hosts map[string]*inProcHost, fakePID int) hos
 
 func isolateRegistry(t *testing.T) {
 	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("AO_DATA_DIR", dir)
+	home := t.TempDir()
+	dataDir := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_DATA_DIR", dataDir)
+	t.Setenv("AO_RUN_FILE", filepath.Join(dataDir, "running.json"))
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@ func setupHome(t *testing.T) string {
 	t.Setenv("HOME", dir)
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("AO_DATA_DIR", "")
+	t.Setenv("AO_RUN_FILE", "")
 	return filepath.Join(dir, ".ao", "windows-pty-hosts.json")
 }
 
@@ -36,6 +37,7 @@ func TestRegistryUsesAODataDir(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("AO_DATA_DIR", dataDir)
+	t.Setenv("AO_RUN_FILE", filepath.Join(dataDir, "running.json"))
 	withFakePidAlive(t, func(int) bool { return true })
 
 	e := Entry{SessionID: "s1", PtyHostPID: 1234, PipePath: `\\.\pipe\ao-s1`, RegisteredAt: nowRFC3339()}
@@ -67,36 +69,22 @@ func TestListMigratesLegacyRegistryIntoAODataDir(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("AO_DATA_DIR", dataDir)
+	t.Setenv("AO_RUN_FILE", "")
 	withFakePidAlive(t, func(int) bool { return true })
 
 	legacyPath := filepath.Join(home, ".ao", "windows-pty-hosts.json")
 	configuredPath := filepath.Join(dataDir, "windows-pty-hosts.json")
 	legacy := []Entry{
 		{SessionID: "legacy", PtyHostPID: 111, PipePath: `\\.\pipe\ao-legacy`, RegisteredAt: nowRFC3339()},
-		{SessionID: "duplicate", PtyHostPID: 222, PipePath: `\\.\pipe\ao-old`, RegisteredAt: nowRFC3339()},
-	}
-	configured := []Entry{
-		{SessionID: "duplicate", PtyHostPID: 333, PipePath: `\\.\pipe\ao-new`, RegisteredAt: nowRFC3339()},
 	}
 	writeRegistryFixture(t, legacyPath, legacy)
-	writeRegistryFixture(t, configuredPath, configured)
 
 	got, err := List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("expected two migrated entries, got %v", got)
-	}
-	byID := make(map[string]Entry, len(got))
-	for _, entry := range got {
-		byID[entry.SessionID] = entry
-	}
-	if byID["legacy"].PtyHostPID != 111 {
+	if len(got) != 1 || got[0].SessionID != "legacy" || got[0].PtyHostPID != 111 {
 		t.Fatalf("legacy entry was not adopted: %v", got)
-	}
-	if byID["duplicate"].PtyHostPID != 333 {
-		t.Fatalf("configured entry should win duplicate: %v", got)
 	}
 	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
 		t.Fatalf("legacy registry was not removed after migration: %v", err)
@@ -110,8 +98,93 @@ func TestListMigratesLegacyRegistryIntoAODataDir(t *testing.T) {
 	if err := json.Unmarshal(data, &migrated); err != nil {
 		t.Fatal(err)
 	}
-	if len(migrated) != 2 {
+	if len(migrated) != 1 || migrated[0].SessionID != "legacy" {
 		t.Fatalf("configured registry did not receive legacy entries: %v", migrated)
+	}
+}
+
+func TestInitializedRegistryDoesNotImportLegacyEntries(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(t.TempDir(), "initialized", "data")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_DATA_DIR", dataDir)
+	t.Setenv("AO_RUN_FILE", "")
+	withFakePidAlive(t, func(int) bool { return true })
+
+	legacyPath := filepath.Join(home, ".ao", "windows-pty-hosts.json")
+	configuredPath := filepath.Join(dataDir, "windows-pty-hosts.json")
+	writeRegistryFixture(t, legacyPath, []Entry{
+		{SessionID: "default-store", PtyHostPID: 111, PipePath: `\\.\pipe\ao-default`, RegisteredAt: nowRFC3339()},
+	})
+	writeRegistryFixture(t, configuredPath, []Entry{
+		{SessionID: "configured-store", PtyHostPID: 222, PipePath: `\\.\pipe\ao-configured`, RegisteredAt: nowRFC3339()},
+	})
+
+	got, err := List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SessionID != "configured-store" {
+		t.Fatalf("initialized registry imported default entries: %v", got)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("initialized registry removed default registry: %v", err)
+	}
+}
+
+func TestIsolatedRegistryDoesNotImportLegacyEntries(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(t.TempDir(), "isolated", "data")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_DATA_DIR", dataDir)
+	t.Setenv("AO_RUN_FILE", filepath.Join(t.TempDir(), "isolated", "running.json"))
+	withFakePidAlive(t, func(int) bool { return true })
+
+	legacyPath := filepath.Join(home, ".ao", "windows-pty-hosts.json")
+	writeRegistryFixture(t, legacyPath, []Entry{
+		{SessionID: "default-store", PtyHostPID: 111, PipePath: `\\.\pipe\ao-default`, RegisteredAt: nowRFC3339()},
+	})
+
+	got, err := List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("isolated registry imported default entries: %v", got)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("isolated registry removed default registry: %v", err)
+	}
+}
+
+func TestListIgnoresLegacyCleanupFailure(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(t.TempDir(), "migrated", "data")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_DATA_DIR", dataDir)
+	t.Setenv("AO_RUN_FILE", "")
+	withFakePidAlive(t, func(int) bool { return true })
+
+	legacyPath := filepath.Join(home, ".ao", "windows-pty-hosts.json")
+	writeRegistryFixture(t, legacyPath, []Entry{
+		{SessionID: "legacy", PtyHostPID: 111, PipePath: `\\.\pipe\ao-legacy`, RegisteredAt: nowRFC3339()},
+	})
+	originalRemove := removeLegacyFile
+	removeLegacyFile = func(string) error { return os.ErrPermission }
+	t.Cleanup(func() { removeLegacyFile = originalRemove })
+
+	got, err := List()
+	if err != nil {
+		t.Fatalf("List returned cleanup error: %v", err)
+	}
+	if len(got) != 1 || got[0].SessionID != "legacy" {
+		t.Fatalf("List lost readable legacy entries: %v", got)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "windows-pty-hosts.json")); err != nil {
+		t.Fatalf("configured registry was not written before cleanup: %v", err)
 	}
 }
 

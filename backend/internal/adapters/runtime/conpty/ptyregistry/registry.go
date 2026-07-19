@@ -23,6 +23,10 @@ type Entry struct {
 // pidalive_windows.go).
 var pidAlive = defaultPidAlive
 
+// removeLegacyFile is replaceable in tests so cleanup failures can be covered
+// without depending on platform-specific file-lock semantics.
+var removeLegacyFile = os.Remove
+
 // registryFile resolves windows-pty-hosts.json under AO_DATA_DIR when set so
 // isolated daemon stores also have isolated crash-recovery registries. The
 // default remains ~/.ao/windows-pty-hosts.json for compatibility with existing
@@ -44,6 +48,22 @@ func legacyRegistryFile() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".ao", "windows-pty-hosts.json"), nil
+}
+
+// shouldMigrateLegacy distinguishes moving the default daemon's data store
+// from running a second isolated daemon. A custom AO_RUN_FILE identifies a
+// separate daemon namespace, whose registry must never read or remove entries
+// owned by the default ~/.ao/running.json instance.
+func shouldMigrateLegacy(configuredPath, legacyPath string) bool {
+	if filepath.Clean(configuredPath) == filepath.Clean(legacyPath) {
+		return false
+	}
+	runFile, customRunFile := os.LookupEnv("AO_RUN_FILE")
+	if !customRunFile || runFile == "" {
+		return true
+	}
+	defaultRunFile := filepath.Join(filepath.Dir(legacyPath), "running.json")
+	return filepath.Clean(runFile) == filepath.Clean(defaultRunFile)
 }
 
 // readRaw reads and defensively parses the registry. Missing file or malformed
@@ -83,9 +103,15 @@ func readRaw() (entries []Entry, legacyPath string, migrateLegacy bool) {
 		return nil, "", false
 	}
 	entries = readRawFile(path)
+	// A configured registry means this store has already initialized under the
+	// new layout. Legacy import is a one-time upgrade path, not an ongoing merge
+	// between independently scoped stores.
+	if _, err := os.Stat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return entries, "", false
+	}
 
 	legacyPath, err = legacyRegistryFile()
-	if err != nil || filepath.Clean(legacyPath) == filepath.Clean(path) {
+	if err != nil || !shouldMigrateLegacy(path, legacyPath) {
 		return entries, "", false
 	}
 	legacy := readRawFile(legacyPath)
@@ -161,9 +187,10 @@ func writeMigrated(entries []Entry, legacyPath string, migrateLegacy bool) error
 	if !migrateLegacy {
 		return nil
 	}
-	if err := os.Remove(legacyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
+	// The configured registry is now authoritative. Cleanup is deliberately
+	// best-effort: callers must retain the readable entries even if Windows has
+	// the old file locked or its ACL prevents removal.
+	_ = removeLegacyFile(legacyPath)
 	return nil
 }
 
@@ -227,7 +254,7 @@ func Clear() error {
 	if err != nil {
 		return err
 	}
-	if filepath.Clean(configured) == filepath.Clean(legacy) {
+	if !shouldMigrateLegacy(configured, legacy) {
 		return nil
 	}
 	if err := os.Remove(legacy); err != nil && !errors.Is(err, os.ErrNotExist) {
