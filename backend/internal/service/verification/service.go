@@ -56,6 +56,7 @@ type Runner interface {
 type Outcome string
 
 const (
+	// OutcomePassed indicates the verification command succeeded.
 	OutcomePassed   Outcome = "passed"
 	OutcomeFailed   Outcome = "failed"
 	OutcomeCanceled Outcome = "canceled"
@@ -440,7 +441,7 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 	if _, err = w.file.Write(p); err != nil {
 		return 0, err
 	}
-	if err = w.file.Truncate(w.limit); err != nil {
+	if err := w.file.Truncate(w.limit); err != nil {
 		return 0, err
 	}
 	w.truncated = true
