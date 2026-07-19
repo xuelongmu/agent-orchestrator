@@ -2279,7 +2279,7 @@ func TestApplyReviewResultIncludesCanonicalPRDesignContract(t *testing.T) {
 		t.Fatalf("ApplyReviewResult = %q, %v", outcome, err)
 	}
 	got := msg.msgs[0]
-	for _, want := range []string{"canonical AO state", "Every idle backlog poll notifies or exits with a reason", "state which invariant it preserves", "never edit the workspace projection", "review-fix commit body"} {
+	for _, want := range []string{"canonical AO state", "Every idle backlog poll notifies or exits with a reason", "AO-Review-Fix-Invariant", `"mode":"preserve"`, "Never edit the workspace projection", "atomically appends"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("review dispatch missing %q:\n%s", want, got)
 		}
@@ -2306,7 +2306,7 @@ func TestPRObservationReviewDispatchIncludesMatchingCanonicalContract(t *testing
 	if err := m.ApplyPRObservation(ctx, rec.ID, o); err != nil {
 		t.Fatal(err)
 	}
-	if len(msg.msgs) != 1 || !strings.Contains(msg.msgs[0], "Resolve feedback by enforcing one ownership boundary") || !strings.Contains(msg.msgs[0], "commit body") {
+	if len(msg.msgs) != 1 || !strings.Contains(msg.msgs[0], "Resolve feedback by enforcing one ownership boundary") || !strings.Contains(msg.msgs[0], "AO-Review-Fix-Invariant") {
 		t.Fatalf("review observation dispatch missing design contract policy: %v", msg.msgs)
 	}
 }

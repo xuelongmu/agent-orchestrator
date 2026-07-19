@@ -117,6 +117,10 @@ type SCMPRObservation struct {
 	TargetBranch string
 	// HeadSHA is the current head commit SHA for the PR.
 	HeadSHA string
+	// HeadCommitMessage is the provider-observed full message for HeadSHA. It is
+	// intentionally an observation-only fact used to validate structured
+	// review-fix trailers and is not rendered or persisted as PR metadata.
+	HeadCommitMessage string
 	// Title is the provider PR title.
 	Title string
 	// Additions is the provider-reported added line count.
@@ -219,6 +223,9 @@ type SCMReviewObservation struct {
 	// HeadSHA is the PR head commit the review snapshot was fetched for.
 	// Merge-readiness consumers must match it to SCMPRObservation.HeadSHA.
 	HeadSHA string
+	// HeadCommitMessage is exposed only when the provider proves the selected
+	// latest commit OID equals HeadSHA.
+	HeadCommitMessage string
 	// Reviews contains submitted review summaries fetched on the slower review cadence.
 	Reviews []SCMReviewSummaryObservation
 	// Threads contains normalized review threads fetched on the slower review cadence.

@@ -59,13 +59,23 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 		return CoordinateResult{Outcome: CoordinateIneligible}, nil
 	}
 
-	runs, err := e.store.ListReviewRunsBySession(ctx, workerID)
+	prURL := firstNonEmpty(obs.PR.URL, obs.PR.HTMLURL)
+	runs, err := e.store.ListReviewRunsByPR(ctx, prURL)
 	if err != nil {
 		return CoordinateResult{}, err
 	}
-	prURL := firstNonEmpty(obs.PR.URL, obs.PR.HTMLURL)
 	head := obs.PR.HeadSHA
 	current, hasCurrent, round := coordinateRunState(runs, prURL, head)
+	legacyRequired, err := e.legacyReviewFixDeclarationRequired(ctx, runs, prURL, head)
+	if err != nil {
+		return CoordinateResult{}, err
+	}
+	// Run the idempotent store gate even when a manual trigger already created
+	// a current-head run. The atomic query excludes findings originating at this
+	// head, so only older pending work can require and consume the trailer.
+	if _, _, err := e.store.AcceptReviewFixCommit(ctx, workerID, prURL, head, obs.PR.HeadCommitMessage, legacyRequired, e.clock()); err != nil {
+		return CoordinateResult{}, err
+	}
 	if reviewpolicy.HasCurrentHeadHumanApproval(obs.Review.Reviews, head) {
 		return CoordinateResult{Outcome: CoordinateSatisfied, Round: round, Run: current}, nil
 	}
@@ -77,7 +87,7 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 			}
 		} else {
 			outcome := CoordinateWaiting
-			findings, err := e.store.ListReviewFindingsBySession(ctx, workerID)
+			findings, err := e.store.ListReviewFindingsByRun(ctx, current.ID)
 			if err != nil {
 				return CoordinateResult{}, err
 			}
@@ -86,7 +96,7 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 				outcome = CoordinateSatisfied
 			} else if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictChangesRequested && allDeflected && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
 				outcome = CoordinateSatisfied
-			} else if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictChangesRequested && !reviewBodyHasBlockingFindings(current.Body) && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
+			} else if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictChangesRequested && !BodyHasBlockingFindings(current.Body) && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
 				outcome = CoordinateSatisfied
 			}
 			return CoordinateResult{Outcome: outcome, Round: round, Run: current}, nil
@@ -100,15 +110,6 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 		}
 		return CoordinateResult{Outcome: CoordinateExhausted, Round: round}, nil
 	}
-	// A newly eligible head is the worker's attempted fix for every still-open
-	// finding from earlier rounds. Persist that relationship before launching so
-	// it survives reviewer failures and daemon restarts.
-	if !hasCurrent {
-		if _, err := e.store.SetPendingReviewFindingFixCommit(ctx, workerID, prURL, head); err != nil {
-			return CoordinateResult{}, err
-		}
-	}
-
 	triggered, err := e.trigger(ctx, workerID, prURL)
 	if err != nil {
 		return CoordinateResult{}, err
@@ -126,6 +127,27 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 		round++
 	}
 	return CoordinateResult{Outcome: CoordinateStarted, Round: round, Run: triggered.Run}, nil
+}
+
+func (e *Engine) legacyReviewFixDeclarationRequired(ctx stdctx.Context, runs []domain.ReviewRun, prURL, head string) (bool, error) {
+	var latest domain.ReviewRun
+	found := false
+	for _, run := range runs {
+		if run.PRURL != prURL || run.TargetSHA == "" || run.TargetSHA == head || run.Verdict == domain.VerdictNone {
+			continue
+		}
+		if !found || run.CreatedAt.After(latest.CreatedAt) {
+			latest, found = run, true
+		}
+	}
+	if !found || latest.Verdict != domain.VerdictChangesRequested || !BodyHasBlockingFindings(latest.Body) {
+		return false, nil
+	}
+	findings, err := e.store.ListReviewFindingsByRun(ctx, latest.ID)
+	if err != nil {
+		return false, err
+	}
+	return len(findings) == 0, nil
 }
 
 func currentRunFindingsDeflected(findings []domain.ReviewFinding, runID string) bool {
@@ -195,10 +217,11 @@ func automaticReviewRetryDelay(attempts int) time.Duration {
 	return delay
 }
 
-// A changes-requested result from an older reviewer may predate the priority
-// contract. Untagged findings therefore fail closed. Once the reviewer uses the
-// required tags, P2/P3-only feedback is explicitly non-blocking.
-func reviewBodyHasBlockingFindings(body string) bool {
+// BodyHasBlockingFindings applies the durable priority policy used by both
+// coordination and fallback finding persistence. An older changes-requested
+// result may predate priority tags, so untagged feedback fails closed while
+// explicitly P2/P3-only feedback is non-blocking.
+func BodyHasBlockingFindings(body string) bool {
 	body = strings.ToLower(body)
 	if reviewpolicy.HasP0OrP1(body) {
 		return true

@@ -179,6 +179,29 @@ func (q *Queries) CompleteReviewRunResult(ctx context.Context, arg CompleteRevie
 	return result.RowsAffected()
 }
 
+const countPendingActionableReviewFindingsByPR = `-- name: CountPendingActionableReviewFindingsByPR :one
+SELECT COUNT(*) FROM review_finding AS finding
+JOIN review_run AS run ON run.id = finding.run_id
+WHERE finding.pr_url = ?1
+  AND run.target_sha != ?2
+  AND finding.fix_commit = ''
+  AND NOT (
+    finding.out_of_scope = 1 AND finding.deferred_issue_url != '' AND finding.thread_id != '' AND finding.thread_resolved = 1
+  )
+`
+
+type CountPendingActionableReviewFindingsByPRParams struct {
+	PRURL   string
+	HeadSha string
+}
+
+func (q *Queries) CountPendingActionableReviewFindingsByPR(ctx context.Context, arg CountPendingActionableReviewFindingsByPRParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countPendingActionableReviewFindingsByPR, arg.PRURL, arg.HeadSha)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const getReviewBySession = `-- name: GetReviewBySession :one
 SELECT id, session_id, project_id, harness, pr_url, reviewer_handle_id, created_at, updated_at
 FROM review WHERE session_id = ?
@@ -566,6 +589,52 @@ func (q *Queries) ListReviewRunsByBatch(ctx context.Context, arg ListReviewRunsB
 	return items, nil
 }
 
+const listReviewRunsByPR = `-- name: ListReviewRunsByPR :many
+SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at, simplification_event_id
+FROM review_run WHERE pr_url = ? ORDER BY created_at DESC
+`
+
+func (q *Queries) ListReviewRunsByPR(ctx context.Context, prUrl string) ([]ReviewRun, error) {
+	rows, err := q.db.QueryContext(ctx, listReviewRunsByPR, prUrl)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ReviewRun{}
+	for rows.Next() {
+		var i ReviewRun
+		if err := rows.Scan(
+			&i.ID,
+			&i.ReviewID,
+			&i.SessionID,
+			&i.Harness,
+			&i.PRURL,
+			&i.TargetSha,
+			&i.Status,
+			&i.Verdict,
+			&i.Body,
+			&i.CreatedAt,
+			&i.GithubReviewID,
+			&i.DeliveredAt,
+			&i.BatchID,
+			&i.SimplificationClass,
+			&i.SimplificationDispatchedAt,
+			&i.DeflectedReviewClearedAt,
+			&i.SimplificationEventID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listReviewRunsBySession = `-- name: ListReviewRunsBySession :many
 SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at, simplification_event_id
 FROM review_run WHERE session_id = ? ORDER BY created_at DESC
@@ -788,6 +857,35 @@ type SetPendingReviewFindingFixCommitParams struct {
 
 func (q *Queries) SetPendingReviewFindingFixCommit(ctx context.Context, arg SetPendingReviewFindingFixCommitParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, setPendingReviewFindingFixCommit, arg.FixCommit, arg.SessionID, arg.PRURL)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const setPendingReviewFindingFixCommitByPR = `-- name: SetPendingReviewFindingFixCommitByPR :execrows
+UPDATE review_finding
+SET fix_commit = ?1
+WHERE id IN (
+  SELECT finding.id FROM review_finding AS finding
+  JOIN review_run AS run ON run.id = finding.run_id
+  WHERE finding.pr_url = ?2
+    AND run.target_sha != ?3
+    AND finding.fix_commit = ''
+    AND NOT (
+      finding.out_of_scope = 1 AND finding.deferred_issue_url != '' AND finding.thread_id != '' AND finding.thread_resolved = 1
+    )
+  )
+`
+
+type SetPendingReviewFindingFixCommitByPRParams struct {
+	FixCommit string
+	PRURL     string
+	HeadSha   string
+}
+
+func (q *Queries) SetPendingReviewFindingFixCommitByPR(ctx context.Context, arg SetPendingReviewFindingFixCommitByPRParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setPendingReviewFindingFixCommitByPR, arg.FixCommit, arg.PRURL, arg.HeadSha)
 	if err != nil {
 		return 0, err
 	}

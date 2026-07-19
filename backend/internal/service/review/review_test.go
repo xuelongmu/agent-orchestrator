@@ -272,6 +272,15 @@ func (f *fakeStore) GetReviewRunBySessionPRAndSHA(_ context.Context, id domain.S
 func (f *fakeStore) ListReviewRunsBySession(context.Context, domain.SessionID) ([]domain.ReviewRun, error) {
 	return f.reviewRuns(), nil
 }
+func (f *fakeStore) ListReviewRunsByPR(_ context.Context, prURL string) ([]domain.ReviewRun, error) {
+	var out []domain.ReviewRun
+	for _, run := range f.reviewRuns() {
+		if run.PRURL == prURL {
+			out = append(out, run)
+		}
+	}
+	return out, nil
+}
 func (f *fakeStore) ListReviewFindingsByRun(_ context.Context, runID string) ([]domain.ReviewFinding, error) {
 	var out []domain.ReviewFinding
 	for _, finding := range f.findings {
@@ -290,8 +299,8 @@ func (f *fakeStore) ListReviewFindingsBySession(_ context.Context, id domain.Ses
 	}
 	return out, nil
 }
-func (f *fakeStore) SetPendingReviewFindingFixCommit(context.Context, domain.SessionID, string, string) (int64, error) {
-	return 0, nil
+func (f *fakeStore) AcceptReviewFixCommit(context.Context, domain.SessionID, string, string, string, bool, time.Time) (bool, int64, error) {
+	return false, 0, nil
 }
 func (f *fakeStore) ClaimReviewFindingIssueAction(_ context.Context, id, token string, _, _ time.Time) (bool, error) {
 	if f.issueClaims == nil {
@@ -432,8 +441,30 @@ func TestSubmitPersistsThenAppliesThenStampsDelivered(t *testing.T) {
 	if reducer.got.Verdict != domain.VerdictChangesRequested || reducer.got.Body != "fix it" || reducer.got.GithubReviewID != "987" {
 		t.Fatalf("reducer saw wrong result: %+v", reducer.got)
 	}
+	if len(st.findings) != 1 || st.findings[0].ClassTag != "unclassified-blocking" || st.findings[0].RootCauseNote != "fix it" {
+		t.Fatalf("untagged blocking fallback finding = %+v", st.findings)
+	}
 	if run.Status != domain.ReviewRunDelivered || run.DeliveredAt == nil || !run.DeliveredAt.Equal(now) {
 		t.Fatalf("run not stamped delivered: %+v", run)
+	}
+}
+
+func TestSubmitFindingRoundUsesPRHistoryAcrossReplacementSessions(t *testing.T) {
+	prURL := "https://github.com/o/r/pull/1"
+	st := &fakeStore{batchRuns: []domain.ReviewRun{
+		{ID: "old-run", SessionID: "old-worker", PRURL: prURL, TargetSHA: "sha1", Status: domain.ReviewRunDelivered, Verdict: domain.VerdictChangesRequested},
+		{ID: "new-run", SessionID: "mer-1", PRURL: prURL, TargetSHA: "sha2", Status: domain.ReviewRunRunning},
+	}}
+	svc := New(nil, st)
+	_, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{{
+		RunID: "new-run", Verdict: domain.VerdictChangesRequested, Body: "[P1] replacement finding",
+		Findings: []SubmittedFinding{{ClassTag: "replacement-history", RootCauseNote: "preserve PR round"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.findings) != 1 || st.findings[0].Round != 2 {
+		t.Fatalf("replacement finding round = %+v, want round 2", st.findings)
 	}
 }
 

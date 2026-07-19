@@ -109,12 +109,126 @@ func TestCoordinateWaitsForFixThenReviewsNewHead(t *testing.T) {
 	}
 
 	eng.prs = prAt("sha2")
-	got, err = eng.Coordinate(context.Background(), "mer-1", reviewObservation("sha2"))
+	fix := reviewObservation("sha2")
+	fix.PR.HeadCommitMessage = "fix body with structured trailer"
+	got, err = eng.Coordinate(context.Background(), "mer-1", fix)
 	if err != nil {
 		t.Fatalf("Coordinate new head: %v", err)
 	}
 	if got.Outcome != CoordinateStarted || got.Round != 2 || len(store.runs) != 2 {
 		t.Fatalf("new head = %+v runs=%+v", got, store.runs)
+	}
+	if store.acceptCalls != 2 || store.acceptedPR != fix.PR.URL || store.acceptedHead != "sha2" || store.acceptedMessage != fix.PR.HeadCommitMessage {
+		t.Fatalf("review-fix acceptance call = %d %q %q %q", store.acceptCalls, store.acceptedPR, store.acceptedHead, store.acceptedMessage)
+	}
+}
+
+func TestCoordinateManualCurrentRunCannotBypassReviewFixAcceptance(t *testing.T) {
+	store := &fakeStore{
+		runs: []domain.ReviewRun{
+			reviewRun("old", "sha1", domain.ReviewRunDelivered, domain.VerdictChangesRequested, "[P1] lost update"),
+			reviewRun("manual", "sha2", domain.ReviewRunRunning, domain.VerdictNone, ""),
+		},
+		acceptRequired: true,
+		acceptErr:      errors.New("review-fix invariant declaration is missing"),
+	}
+	launcher := &fakeLauncher{handle: "review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha2"), fakeProjects{}, launcher)
+	if _, err := eng.Coordinate(context.Background(), "mer-1", reviewObservation("sha2")); !errors.Is(err, store.acceptErr) {
+		t.Fatalf("missing trailer error = %v", err)
+	}
+	if launcher.spawnCount != 0 || len(store.runs) != 2 {
+		t.Fatalf("failed acceptance changed manual run: spawns=%d runs=%+v", launcher.spawnCount, store.runs)
+	}
+	store.acceptErr = nil
+	store.acceptBound = 1
+	obs := reviewObservation("sha2")
+	obs.PR.HeadCommitMessage = "valid structured trailer"
+	got, err := eng.Coordinate(context.Background(), "mer-1", obs)
+	if err != nil || got.Outcome != CoordinateWaiting || got.Round != 2 {
+		t.Fatalf("valid acceptance = %+v, %v", got, err)
+	}
+}
+
+func TestCoordinateReplacementUsesPRGlobalHistoryForCurrentHeadRoundAndCap(t *testing.T) {
+	prURL := "https://github.com/o/r/pull/1"
+	predecessor := reviewRun("predecessor", "sha1", domain.ReviewRunDelivered, domain.VerdictChangesRequested, "[P1] fix")
+	predecessor.SessionID = "old-worker"
+	store := &fakeStore{runs: []domain.ReviewRun{predecessor}}
+	launcher := &fakeLauncher{handle: "review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, launcher)
+	got, err := eng.Coordinate(context.Background(), "mer-1", reviewObservation("sha1"))
+	if err != nil || got.Outcome != CoordinateWaiting || got.Round != 1 || launcher.spawnCount != 0 {
+		t.Fatalf("replacement same head = %+v spawns=%d err=%v", got, launcher.spawnCount, err)
+	}
+
+	for i := 2; i <= MaxAutomaticReviewRounds; i++ {
+		run := reviewRun(fmt.Sprintf("old-%d", i), fmt.Sprintf("sha%d", i), domain.ReviewRunDelivered, domain.VerdictChangesRequested, "[P1] fix")
+		run.SessionID = "old-worker"
+		store.runs = append(store.runs, run)
+	}
+	eng.prs = prAt("sha7")
+	obs := reviewObservation("sha7")
+	obs.PR.URL = prURL
+	got, err = eng.Coordinate(context.Background(), "mer-1", obs)
+	if err != nil || got.Outcome != CoordinateExhausted || got.Round != MaxAutomaticReviewRounds || launcher.spawnCount != 0 {
+		t.Fatalf("replacement round cap = %+v spawns=%d err=%v", got, launcher.spawnCount, err)
+	}
+}
+
+func TestCoordinateReplacementSatisfiesPredecessorCurrentRunWhenAllFindingsDeflected(t *testing.T) {
+	run := reviewRun("predecessor", "sha1", domain.ReviewRunDelivered, domain.VerdictChangesRequested, "[P1] deferred")
+	run.SessionID = "old-worker"
+	store := &fakeStore{
+		runs: []domain.ReviewRun{run},
+		findings: []domain.ReviewFinding{{
+			ID: "predecessor:1", RunID: run.ID, SessionID: "old-worker", PRURL: run.PRURL,
+			OutOfScope: true, DeferredIssueURL: "https://github.com/o/r/issues/9", ThreadID: "thread-1", ThreadResolved: true,
+		}},
+	}
+	launcher := &fakeLauncher{handle: "review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha1"), fakeProjects{}, launcher)
+	got, err := eng.Coordinate(context.Background(), "mer-1", reviewObservation("sha1"))
+	if err != nil || got.Outcome != CoordinateSatisfied || got.Round != 1 || launcher.spawnCount != 0 {
+		t.Fatalf("replacement deflected run = %+v spawns=%d err=%v", got, launcher.spawnCount, err)
+	}
+}
+
+func TestCoordinateFailsBeforeReviewLaunchWhenReviewFixAcceptanceFails(t *testing.T) {
+	store := &fakeStore{
+		runs:           []domain.ReviewRun{reviewRun("run-1", "sha1", domain.ReviewRunDelivered, domain.VerdictChangesRequested, "[P1] lost update")},
+		acceptRequired: true,
+		acceptErr:      errors.New("review-fix invariant declaration is missing"),
+	}
+	launcher := &fakeLauncher{handle: "review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha2"), fakeProjects{}, launcher)
+	if _, err := eng.Coordinate(context.Background(), "mer-1", reviewObservation("sha2")); !errors.Is(err, store.acceptErr) {
+		t.Fatalf("Coordinate error = %v, want %v", err, store.acceptErr)
+	}
+	if store.acceptCalls != 1 || launcher.spawnCount != 0 || len(store.runs) != 1 {
+		t.Fatalf("failed boundary mutated round: accepts=%d spawns=%d runs=%+v", store.acceptCalls, launcher.spawnCount, store.runs)
+	}
+}
+
+func TestCoordinateRequiresTrailerForHistoricalBlockingRunWithoutFindingRows(t *testing.T) {
+	store := &fakeStore{
+		runs:      []domain.ReviewRun{reviewRun("legacy", "sha1", domain.ReviewRunDelivered, domain.VerdictChangesRequested, "historical untagged blocker")},
+		acceptErr: errors.New("review-fix invariant declaration is missing"),
+	}
+	launcher := &fakeLauncher{handle: "review-mer-1"}
+	eng := newEngineForTest(store, fakeSessions{rec: liveWorker(), ok: true}, prAt("sha2"), fakeProjects{}, launcher)
+	if _, err := eng.Coordinate(context.Background(), "mer-1", reviewObservation("sha2")); !errors.Is(err, store.acceptErr) {
+		t.Fatalf("legacy missing trailer error = %v", err)
+	}
+	if !store.acceptedRequire || launcher.spawnCount != 0 || len(store.runs) != 1 {
+		t.Fatalf("legacy gate = require %v spawns %d runs %+v", store.acceptedRequire, launcher.spawnCount, store.runs)
+	}
+	store.acceptErr = nil
+	obs := reviewObservation("sha2")
+	obs.PR.HeadCommitMessage = "valid trailer"
+	got, err := eng.Coordinate(context.Background(), "mer-1", obs)
+	if err != nil || got.Outcome != CoordinateStarted || got.Round != 2 || launcher.spawnCount != 1 {
+		t.Fatalf("legacy valid trailer = %+v spawns=%d err=%v", got, launcher.spawnCount, err)
 	}
 }
 

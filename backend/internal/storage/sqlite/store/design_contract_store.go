@@ -12,6 +12,101 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
+// AcceptReviewFixCommit is the single review-fix acceptance transaction. When
+// the exact PR has no pending actionable findings it normally bypasses
+// declaration parsing; requireDeclaration closes the upgrade gap for a legacy
+// blocking run that predates structured finding rows. Otherwise it validates
+// the exact owner/head and head-bound commit trailer, updates the canonical
+// contract if requested, and binds every pending finding to headSHA in one
+// transaction.
+func (s *Store) AcceptReviewFixCommit(ctx context.Context, sessionID domain.SessionID, prURL, headSHA, commitMessage string, requireDeclaration bool, updatedAt time.Time) (required bool, bound int64, err error) {
+	unlockDelivery := designcontract.LockDelivery(prURL)
+	defer unlockDelivery()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	err = s.inTx(ctx, "accept review-fix commit", func(q *gen.Queries) error {
+		pr, err := q.GetPR(ctx, prURL)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: PR %s no longer exists", designcontract.ErrPRNotOwned, prURL)
+		}
+		if err != nil {
+			return err
+		}
+		if pr.SessionID != sessionID {
+			return fmt.Errorf("%w: PR %s is owned by session %s", designcontract.ErrPRNotOwned, prURL, pr.SessionID)
+		}
+		if pr.HeadSha != headSHA {
+			return fmt.Errorf("%w: stored head %q does not equal observed head %q", designcontract.ErrReviewFixDeclarationStale, pr.HeadSha, headSHA)
+		}
+		pending, err := q.CountPendingActionableReviewFindingsByPR(ctx, gen.CountPendingActionableReviewFindingsByPRParams{PRURL: prURL, HeadSha: headSHA})
+		if err != nil {
+			return err
+		}
+		if pending == 0 && !requireDeclaration {
+			return nil
+		}
+		required = true
+		declaration, err := designcontract.ParseReviewFixInvariantDeclaration(commitMessage)
+		if err != nil {
+			return err
+		}
+		if declaration.PR != prURL {
+			return fmt.Errorf("%w: declaration PR %q does not equal normalized observed PR %q", designcontract.ErrReviewFixDeclarationStale, declaration.PR, prURL)
+		}
+		invariant := declaration.Invariant
+		switch declaration.Mode {
+		case "preserve":
+		case "add":
+			invariant, err = designcontract.NormalizeInvariant(invariant)
+			if err != nil {
+				return fmt.Errorf("%w: %w", designcontract.ErrReviewFixDeclarationMalformed, err)
+			}
+		default:
+			return fmt.Errorf("%w: mode must be %q or %q", designcontract.ErrReviewFixDeclarationMalformed, "preserve", "add")
+		}
+		if err := q.EnsurePRDesignContract(ctx, gen.EnsurePRDesignContractParams{
+			PRURL: prURL, SessionID: string(sessionID), FallbackMarkdown: designcontract.BuildSeed("", ""), UpdatedAt: updatedAt,
+		}); err != nil {
+			return err
+		}
+		contract, err := q.GetPRDesignContract(ctx, prURL)
+		if err != nil {
+			return err
+		}
+		if declaration.Mode == "preserve" {
+			if !designcontract.HasExactInvariant(contract, invariant) {
+				return fmt.Errorf("%w: %q", designcontract.ErrReviewFixInvariantUnknown, invariant)
+			}
+		} else if !designcontract.HasInvariant(contract, invariant) {
+			addition := designcontract.AppendInvariant("", invariant)
+			if len(contract)+len(addition) > designcontract.MaxCanonicalBytes {
+				return designcontract.ErrContractCapacityExceeded
+			}
+			n, err := q.AppendPRDesignContractInvariant(ctx, gen.AppendPRDesignContractInvariantParams{
+				Addition: addition, UpdatedAt: updatedAt, PRURL: prURL,
+			})
+			if err != nil {
+				return err
+			}
+			if n != 1 {
+				return fmt.Errorf("updated %d contracts, want 1", n)
+			}
+		}
+		bound, err = q.SetPendingReviewFindingFixCommitByPR(ctx, gen.SetPendingReviewFindingFixCommitByPRParams{FixCommit: headSHA, PRURL: prURL, HeadSha: headSHA})
+		if err != nil {
+			return err
+		}
+		if bound != pending {
+			return fmt.Errorf("bound %d pending review findings, want %d", bound, pending)
+		}
+		return nil
+	})
+	if err != nil {
+		return false, 0, err
+	}
+	return required, bound, nil
+}
+
 // SaveSessionDesignContractSeed durably records tracker-derived seed knowledge
 // before a worker is launched. ClaimPR later consumes it inside the ownership
 // transaction; deleting a failed spawn cascades the seed row.
