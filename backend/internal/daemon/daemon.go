@@ -52,10 +52,13 @@ func Run() error {
 	// PID for unrelated processes. So a "live" PID is verified against an actual
 	// /healthz probe; a run-file left by a crashed/hard-killed/reused-PID
 	// predecessor is treated as stale and overwritten when the new server starts.
+	verifiedStalePID := 0
 	if live, err := runfile.CheckStale(cfg.RunFilePath); err != nil {
 		return fmt.Errorf("inspect run-file: %w", err)
 	} else if live != nil && runFileOwnerServing(&http.Client{Timeout: staleProbeTimeout}, config.LoopbackHost, live) {
 		return fmt.Errorf("daemon already running (pid %d, port %d); refusing to start", live.PID, live.Port)
+	} else if live != nil {
+		verifiedStalePID = live.PID
 	}
 
 	// Open the durable store and bring up the CDC substrate: DB triggers capture
@@ -66,6 +69,15 @@ func Run() error {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	releaseCoordination, err := acquireDaemonCoordination(context.Background(), store, os.Getpid(), verifiedStalePID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := releaseCoordination(context.Background()); err != nil {
+			log.Warn("release daemon coordination claim", "err", err)
+		}
+	}()
 
 	// Refresh the embedded using-ao skill into the data dir so worker sessions
 	// in any project can read the ao CLI catalog from a stable absolute path.

@@ -30,6 +30,12 @@ type ChangeLog struct {
 	CreatedAt time.Time
 }
 
+type CoordinationClaim struct {
+	ClaimKey  string
+	OwnerPid  int64
+	ClaimedAt time.Time
+}
+
 type Notification struct {
 	ID        string
 	SessionID *domain.SessionID
