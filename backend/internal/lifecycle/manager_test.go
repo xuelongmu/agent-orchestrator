@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -2329,7 +2330,11 @@ func TestDesignContractProjectionSelectsExactPRAcrossDispatchAndRestart(t *testi
 		}
 	}
 	current, err := os.ReadFile(filepath.Join(workspace, ".ao", "CONTRACT.md"))
-	if err != nil || !strings.Contains(string(current), "Scope: Pull request: "+prB) || strings.Contains(string(current), "invariant-A") {
+	wantCurrent, rejectCurrent := prB, "invariant-A"
+	if runtime.GOOS != "windows" {
+		wantCurrent, rejectCurrent = prA, "invariant-B"
+	}
+	if err != nil || !strings.Contains(string(current), "Scope: Pull request: "+wantCurrent) || strings.Contains(string(current), rejectCurrent) {
 		t.Fatalf("current projection after PR B = %q, %v", current, err)
 	}
 	entries, err := os.ReadDir(filepath.Join(workspace, ".ao", "contracts"))
@@ -2345,8 +2350,15 @@ func TestDesignContractProjectionSelectsExactPRAcrossDispatchAndRestart(t *testi
 	var msg strings.Builder
 	restarted.writeDesignContractDispatch(ctx, &msg, workspace, prA)
 	current, err = os.ReadFile(filepath.Join(workspace, ".ao", "CONTRACT.md"))
-	if err != nil || !strings.Contains(string(current), "Scope: Pull request: "+prA) || !strings.Contains(string(current), "invariant-A-new") || strings.Contains(string(current), "invariant-B") {
+	wantProjectionInvariant := "invariant-A-new"
+	if runtime.GOOS != "windows" {
+		wantProjectionInvariant = "invariant-A\n"
+	}
+	if err != nil || !strings.Contains(string(current), "Scope: Pull request: "+prA) || !strings.Contains(string(current), wantProjectionInvariant) || strings.Contains(string(current), "invariant-B") {
 		t.Fatalf("current projection after restart/PR A = %q, %v", current, err)
+	}
+	if !strings.Contains(msg.String(), "invariant-A-new") {
+		t.Fatalf("canonical dispatch unavailable after fail-closed projection refresh: %s", msg.String())
 	}
 	entries, err = os.ReadDir(filepath.Join(workspace, ".ao", "contracts"))
 	if err != nil || len(entries) != 2 {
