@@ -40,6 +40,10 @@ func TestRegisteredAgentConformance(t *testing.T) {
 			_, ok := activitydispatch.Derivers[token]
 			return ok
 		},
+		DispatchHook: activitydispatch.Derive,
+		AllowsMetadataOnlyHook: func(token, event string) bool {
+			return event == "session-start" && slices.Contains([]string{"claude-code", "codex", "droid", "agy", "devin"}, token)
+		},
 	})
 }
 

@@ -22,9 +22,16 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
-var hookCommandPattern = regexp.MustCompile(`\bao hooks ([a-z0-9-]+) ([a-z0-9-]+)`)
+var (
+	hookCommandPattern    = regexp.MustCompile(`\bao hooks ([a-z0-9-]+) ([a-z0-9-]+)`)
+	hookTemplatePattern   = regexp.MustCompile(`\bao hooks ([a-z0-9-]+) \$\{hookName\}`)
+	hookInvocationPattern = regexp.MustCompile(`\bcallHookSync\("([a-z0-9-]+)"`)
+)
 
 var normalizedHookEvents = map[string]bool{
+	"after-agent":           true,
+	"after-tool":            true,
+	"before-agent":          true,
 	"session-start":         true,
 	"user-prompt-submit":    true,
 	"pre-tool-use":          true,
@@ -41,10 +48,12 @@ var normalizedHookEvents = map[string]bool{
 // BinaryNames are test-only executable names placed on an isolated PATH; they
 // let GetLaunchCommand be exercised without depending on or invoking real CLIs.
 type RegistryOptions struct {
-	KnownHarnesses    []domain.AgentHarness
-	BinaryNames       map[domain.AgentHarness][]string
-	KnownHookTokens   []string
-	SupportsHookToken func(token string) bool
+	KnownHarnesses         []domain.AgentHarness
+	BinaryNames            map[domain.AgentHarness][]string
+	KnownHookTokens        []string
+	SupportsHookToken      func(token string) bool
+	DispatchHook           func(token, event string, payload []byte) (domain.ActivityState, bool)
+	AllowsMetadataOnlyHook func(token, event string) bool
 }
 
 // RunRegistry exercises every constructor result without filtering non-Agent
@@ -89,9 +98,9 @@ func RunRegistry(t *testing.T, registered []adapters.Adapter, opts RegistryOptio
 		}
 
 		t.Run(string(harness), func(t *testing.T) {
-			tokens := runAdapter(t, harness, manifest, agent, opts)
-			for _, token := range tokens {
-				foundHookTokens[token] = struct{}{}
+			hooks := runAdapter(t, harness, manifest, agent, opts)
+			for _, hook := range hooks {
+				foundHookTokens[hook.Token] = struct{}{}
 			}
 		})
 	}
@@ -108,7 +117,7 @@ func RunRegistry(t *testing.T, registered []adapters.Adapter, opts RegistryOptio
 	}
 }
 
-func runAdapter(t *testing.T, harness domain.AgentHarness, manifest adapters.Manifest, agent ports.Agent, opts RegistryOptions) []string {
+func runAdapter(t *testing.T, harness domain.AgentHarness, manifest adapters.Manifest, agent ports.Agent, opts RegistryOptions) []HookCommand {
 	t.Helper()
 	validateManifest(t, manifest)
 	validateCancellation(t, agent)
@@ -118,26 +127,6 @@ func runAdapter(t *testing.T, harness domain.AgentHarness, manifest adapters.Man
 		t.Fatalf("GetConfigSpec: %v", err)
 	}
 	validateConfigSpec(t, spec)
-
-	for _, cfg := range []ports.LaunchConfig{
-		{},
-		{Kind: domain.KindWorker, Prompt: "test prompt"},
-		{Kind: domain.KindOrchestrator},
-		{Kind: domain.KindOrchestrator, Prompt: "test prompt"},
-	} {
-		strategy, err := agent.GetPromptDeliveryStrategy(context.Background(), cfg)
-		if err != nil {
-			t.Errorf("GetPromptDeliveryStrategy(%s, prompt=%t): %v", cfg.Kind, cfg.Prompt != "", err)
-			continue
-		}
-		if !slices.Contains([]ports.PromptDeliveryStrategy{
-			ports.PromptDeliveryInCommand,
-			ports.PromptDeliveryAfterStart,
-			ports.PromptDeliveryCustomAgent,
-		}, strategy) {
-			t.Errorf("GetPromptDeliveryStrategy(%s, prompt=%t) = %q", cfg.Kind, cfg.Prompt != "", strategy)
-		}
-	}
 
 	sandbox := t.TempDir()
 	isolateUserEnvironment(t, sandbox)
@@ -160,28 +149,116 @@ func runAdapter(t *testing.T, harness domain.AgentHarness, manifest adapters.Man
 		t.Fatalf("GetAgentHooks in sandbox: %v", err)
 	}
 
-	launch, err := agent.GetLaunchCommand(context.Background(), ports.LaunchConfig{
-		DataDir:       dataDir,
-		Kind:          domain.KindWorker,
-		Prompt:        "test prompt",
-		SessionID:     "conformance-session",
-		WorkspacePath: workspace,
-	})
-	if err != nil {
-		t.Fatalf("GetLaunchCommand with fake CLI: %v", err)
-	}
-	if len(launch) == 0 || strings.TrimSpace(launch[0]) == "" {
-		t.Error("GetLaunchCommand returned an empty command")
+	var launchText strings.Builder
+	for _, cfg := range []ports.LaunchConfig{
+		{Kind: domain.KindWorker},
+		{Kind: domain.KindWorker, Prompt: "ao-conformance-worker-prompt"},
+		{Kind: domain.KindOrchestrator},
+		{Kind: domain.KindOrchestrator, Prompt: "ao-conformance-orchestrator-prompt"},
+	} {
+		cfg.DataDir = dataDir
+		cfg.SessionID = "conformance-session"
+		cfg.WorkspacePath = workspace
+		strategy, err := agent.GetPromptDeliveryStrategy(context.Background(), cfg)
+		if err != nil {
+			t.Errorf("GetPromptDeliveryStrategy(%s, prompt=%t): %v", cfg.Kind, cfg.Prompt != "", err)
+			continue
+		}
+		launch, err := agent.GetLaunchCommand(context.Background(), cfg)
+		if err != nil {
+			t.Errorf("GetLaunchCommand(%s, prompt=%t) with fake CLI: %v", cfg.Kind, cfg.Prompt != "", err)
+			continue
+		}
+		if len(launch) == 0 || strings.TrimSpace(launch[0]) == "" {
+			t.Errorf("GetLaunchCommand(%s, prompt=%t) returned an empty command", cfg.Kind, cfg.Prompt != "")
+			continue
+		}
+		validatePromptDelivery(t, strategy, cfg.Prompt, launch)
+		launchText.WriteString(strings.Join(launch, "\n"))
+		launchText.WriteByte('\n')
 	}
 
-	hookText := strings.Join(launch, "\n") + "\n" + readSandboxFiles(t, sandbox)
-	tokens := hookTokens(hookText)
-	for _, token := range tokens {
-		if opts.SupportsHookToken == nil || !opts.SupportsHookToken(token) {
-			t.Errorf("hook token %q has no activity dispatcher", token)
+	hookText := launchText.String() + readSandboxFiles(t, sandbox)
+	hooks := hookCommands(hookText)
+	validateHookDispatch(t, hooks, opts)
+	return hooks
+}
+
+func validatePromptDelivery(t *testing.T, strategy ports.PromptDeliveryStrategy, prompt string, launch []string) {
+	t.Helper()
+	legal := slices.Contains([]ports.PromptDeliveryStrategy{
+		ports.PromptDeliveryInCommand,
+		ports.PromptDeliveryAfterStart,
+		ports.PromptDeliveryCustomAgent,
+	}, strategy)
+	if !legal {
+		t.Errorf("prompt delivery strategy = %q", strategy)
+		return
+	}
+	if prompt == "" {
+		return
+	}
+	containsPrompt := strings.Contains(strings.Join(launch, "\x00"), prompt)
+	switch strategy {
+	case ports.PromptDeliveryInCommand:
+		if !containsPrompt {
+			t.Errorf("in-command prompt %q is absent from launch argv %q", prompt, launch)
+		}
+	case ports.PromptDeliveryAfterStart:
+		if containsPrompt {
+			t.Errorf("after-start prompt %q leaked into launch argv %q", prompt, launch)
+		}
+	case ports.PromptDeliveryCustomAgent:
+		t.Errorf("custom-agent delivery cannot carry a separate prompt %q", prompt)
+	}
+}
+
+func validateHookDispatch(t *testing.T, hooks []HookCommand, opts RegistryOptions) {
+	t.Helper()
+	signaled := map[string]bool{}
+	seenToken := map[string]bool{}
+	for _, hook := range hooks {
+		seenToken[hook.Token] = true
+		if opts.SupportsHookToken == nil || !opts.SupportsHookToken(hook.Token) {
+			t.Errorf("hook token %q has no activity dispatcher", hook.Token)
+			continue
+		}
+		if opts.DispatchHook == nil {
+			t.Errorf("hook token %q cannot be behaviorally dispatched", hook.Token)
+			continue
+		}
+		state, ok := opts.DispatchHook(hook.Token, hook.Event, hookPayload(hook.Event))
+		if ok {
+			if !legalActivityState(state) {
+				t.Errorf("dispatch %s/%s returned invalid activity state %q", hook.Token, hook.Event, state)
+			}
+			signaled[hook.Token] = true
+		} else if opts.AllowsMetadataOnlyHook == nil || !opts.AllowsMetadataOnlyHook(hook.Token, hook.Event) {
+			t.Errorf("generated hook %s/%s has no activity dispatch result", hook.Token, hook.Event)
 		}
 	}
-	return tokens
+	for token := range seenToken {
+		if !signaled[token] {
+			t.Errorf("hook token %q has no generated event that produces activity", token)
+		}
+		if _, ok := opts.DispatchHook(token, "agentconformance-unknown", nil); ok {
+			t.Errorf("hook token %q accepts an unknown event", token)
+		}
+	}
+}
+
+func hookPayload(event string) []byte {
+	if event == "notification" {
+		return []byte(`{"notification_type":"agent_needs_input"}`)
+	}
+	return []byte(`{}`)
+}
+
+func legalActivityState(state domain.ActivityState) bool {
+	return slices.Contains([]domain.ActivityState{
+		domain.ActivityActive, domain.ActivityIdle, domain.ActivityWaitingInput,
+		domain.ActivityBlocked, domain.ActivityRateLimited, domain.ActivityExited,
+	}, state)
 }
 
 func validateManifest(t *testing.T, manifest adapters.Manifest) {
@@ -369,21 +446,52 @@ func readSandboxFiles(t *testing.T, root string) string {
 	return out.String()
 }
 
-func hookTokens(text string) []string {
-	seen := map[string]bool{}
-	var tokens []string
-	for _, match := range hookCommandPattern.FindAllStringSubmatch(text, -1) {
-		// Comments can discuss "ao hooks must never ...". Only normalized hook
-		// event names establish an executable callback edge.
+// HookCommand is one generated callback edge from an agent hook into AO's
+// activity dispatcher.
+type HookCommand struct {
+	Token string
+	Event string
+}
+
+func hookCommands(text string) []HookCommand {
+	seen := map[HookCommand]bool{}
+	var hooks []HookCommand
+	uncommented := withoutSlashComments(text)
+	add := func(hook HookCommand) {
+		if !seen[hook] {
+			hooks = append(hooks, hook)
+			seen[hook] = true
+		}
+	}
+	for _, match := range hookCommandPattern.FindAllStringSubmatch(uncommented, -1) {
 		if !normalizedHookEvents[match[2]] {
 			continue
 		}
-		if !seen[match[1]] {
-			tokens = append(tokens, match[1])
-			seen[match[1]] = true
+		add(HookCommand{Token: match[1], Event: match[2]})
+	}
+	// Embedded JS/TS plugins build `ao hooks <token> ${hookName}` and call a
+	// local dispatcher with concrete normalized event names. Correlate those
+	// executable pieces instead of accepting examples written only in comments.
+	for _, template := range hookTemplatePattern.FindAllStringSubmatch(uncommented, -1) {
+		for _, invocation := range hookInvocationPattern.FindAllStringSubmatch(uncommented, -1) {
+			if normalizedHookEvents[invocation[1]] {
+				add(HookCommand{Token: template[1], Event: invocation[1]})
+			}
 		}
 	}
-	return tokens
+	return hooks
+}
+
+func withoutSlashComments(text string) string {
+	var out strings.Builder
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		out.WriteString(line)
+		out.WriteByte('\n')
+	}
+	return out.String()
 }
 
 func isNil(value any) bool {
