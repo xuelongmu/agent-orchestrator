@@ -82,7 +82,7 @@ func (*linuxVerificationDescendantOwner) Terminate(targetPID int) error {
 	if len(children) != 0 {
 		return fmt.Errorf("adopted verifier descendants did not exit: %v", children)
 	}
-	return nil
+	return fmt.Errorf("adopted verifier cleanup did not observe ECHILD")
 }
 
 // killLinuxPID binds the signal to the kernel process identity. Numeric PIDs
