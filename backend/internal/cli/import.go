@@ -103,9 +103,9 @@ func (c *commandContext) runImport(cmd *cobra.Command, opts importOptions) error
 // executeImport opens the rewrite store, runs the import, and closes the store.
 // It is the one CLI path that opens the database directly: the import is a
 // one-time bootstrap that cannot go through the daemon's loopback API. A
-// non-dry-run import takes the same renewable exclusive-writer lease as the
-// daemon immediately after opening SQLite and before its first write, closing
-// the confirmation-prompt/startup TOCTOU left by the preliminary run-file check.
+// non-dry-run import takes the same OS + renewable exclusive-writer lease as
+// the daemon before opening or migrating SQLite, closing the
+// confirmation-prompt/startup TOCTOU left by the preliminary run-file check.
 func (c *commandContext) executeImport(ctx context.Context, cfg config.Config, opts legacyimport.Options) (rep legacyimport.Report, err error) {
 	if opts.DryRun {
 		store, err := c.deps.OpenStore(cfg.DataDir)
