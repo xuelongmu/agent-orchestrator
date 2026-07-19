@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -152,14 +153,68 @@ func (s *Store) MarkReviewRunDelivered(ctx context.Context, id string, delivered
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	n, err := s.qw.MarkReviewRunDelivered(ctx, gen.MarkReviewRunDeliveredParams{
-		DeliveredAt:                sql.NullTime{Time: deliveredAt, Valid: true},
-		SimplificationDispatchedAt: sql.NullTime{Time: deliveredAt, Valid: true},
-		ID:                         id,
+		DeliveredAt: sql.NullTime{Time: deliveredAt, Valid: true},
+		ID:          id,
 	})
 	if err != nil {
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// EnsureReviewRunSimplificationEvent atomically persists the local telemetry
+// event and its review-run receipt. An undelivered review run replays the same
+// stable event ID to fanout after a crash; this method returns created=false
+// once the durable local row already exists.
+func (s *Store) EnsureReviewRunSimplificationEvent(ctx context.Context, id, targetSHA string, event ports.TelemetryEvent) (ensured ports.TelemetryEvent, created bool, err error) {
+	if event.ID == "" {
+		return ports.TelemetryEvent{}, false, errors.New("simplification telemetry event id is required")
+	}
+	rec, err := telemetryEventRecord(event)
+	if err != nil {
+		return ports.TelemetryEvent{}, false, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	err = s.inTx(ctx, "ensure review simplification event", func(q *gen.Queries) error {
+		n, claimErr := q.ClaimReviewRunSimplificationDispatch(ctx, gen.ClaimReviewRunSimplificationDispatchParams{
+			SimplificationDispatchedAt: sql.NullTime{Time: event.OccurredAt, Valid: true},
+			SimplificationEventID:      event.ID,
+			ID:                         id,
+			TargetSha:                  targetSHA,
+		})
+		if claimErr != nil {
+			return claimErr
+		}
+		if n == 0 {
+			run, runErr := q.GetReviewRun(ctx, id)
+			if runErr != nil {
+				return runErr
+			}
+			if run.TargetSha != targetSHA || run.SimplificationEventID != event.ID {
+				return fmt.Errorf("review run %q exact-head simplification receipt does not match event %q", id, event.ID)
+			}
+			row, getErr := q.GetTelemetryEvent(ctx, event.ID)
+			if getErr != nil {
+				if errors.Is(getErr, sql.ErrNoRows) {
+					return fmt.Errorf("review run %q simplification event %q is missing", id, event.ID)
+				}
+				return getErr
+			}
+			ensured, getErr = telemetryEventFromRow(row)
+			return getErr
+		}
+		created = true
+		if insertErr := q.InsertTelemetryEventStrict(ctx, gen.InsertTelemetryEventStrictParams(createTelemetryEventParams(rec))); insertErr != nil {
+			return insertErr
+		}
+		ensured = event
+		return nil
+	})
+	if err != nil {
+		return ports.TelemetryEvent{}, false, err
+	}
+	return ensured, created, nil
 }
 
 // MarkReviewRunDeflectedReviewCleared records provider-confirmed clearing of a
@@ -393,6 +448,7 @@ func reviewRunFromRow(r gen.ReviewRun) domain.ReviewRun {
 		DeliveredAt:                deliveredAt,
 		SimplificationClass:        r.SimplificationClass,
 		SimplificationDispatchedAt: simplificationDispatchedAt,
+		SimplificationEventID:      r.SimplificationEventID,
 		DeflectedReviewClearedAt:   deflectedReviewClearedAt,
 	}
 }

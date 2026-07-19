@@ -56,10 +56,14 @@ type ReviewRun struct {
 	// SimplificationClass is initially selected atomically with the finding set,
 	// then atomically refreshed from the actionable ledger after deflection. It
 	// is empty unless an actionable class in this run crossed the repetition
-	// threshold. SimplificationDispatchedAt records durable delivery of that mode.
+	// threshold. SimplificationDispatchedAt is the receipt written atomically
+	// with that run's durable local simplification telemetry event.
 	SimplificationClass        string     `json:"-"`
 	SimplificationDispatchedAt *time.Time `json:"-"`
-	DeflectedReviewClearedAt   *time.Time `json:"-"`
+	// SimplificationEventID links the receipt to its stable local telemetry row.
+	// Retention protects this row until DeliveredAt is set.
+	SimplificationEventID    string     `json:"-"`
+	DeflectedReviewClearedAt *time.Time `json:"-"`
 }
 
 // ReviewFinding is one durable entry in a PR's finding-class ledger. Round is

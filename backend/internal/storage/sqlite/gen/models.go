@@ -193,6 +193,7 @@ type ReviewRun struct {
 	SimplificationClass        string
 	SimplificationDispatchedAt sql.NullTime
 	DeflectedReviewClearedAt   sql.NullTime
+	SimplificationEventID      string
 }
 
 type Session struct {

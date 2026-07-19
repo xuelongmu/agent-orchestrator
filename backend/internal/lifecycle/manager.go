@@ -32,6 +32,13 @@ type sessionStore interface {
 	UpdatePRLastNudgeSignature(ctx context.Context, prURL, payload string) error
 }
 
+// simplificationEventStore is the transactional local telemetry boundary for
+// simplification activity. It is kept separate from sessionStore because only
+// review delivery needs to mutate review_run state.
+type simplificationEventStore interface {
+	EnsureReviewRunSimplificationEvent(ctx context.Context, id, targetSHA string, event ports.TelemetryEvent) (ports.TelemetryEvent, bool, error)
+}
+
 // notificationSink is the optional lifecycle-to-notification-producer boundary.
 type notificationSink interface {
 	Notify(ctx context.Context, intent ports.NotificationIntent) error

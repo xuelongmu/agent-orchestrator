@@ -12,6 +12,17 @@ type FanoutSink struct {
 	sinks []ports.EventSink
 }
 
+// DurableLocalTelemetry reports whether any child provides durable local
+// storage. Production fanout always includes LocalSQLiteSink when enabled.
+func (s *FanoutSink) DurableLocalTelemetry() bool {
+	for _, sink := range s.sinks {
+		if durable, ok := sink.(ports.DurableLocalEventSink); ok && durable.DurableLocalTelemetry() {
+			return true
+		}
+	}
+	return false
+}
+
 // NewFanoutSink builds a sink that forwards each event to every non-nil sink.
 func NewFanoutSink(sinks ...ports.EventSink) *FanoutSink {
 	filtered := make([]ports.EventSink, 0, len(sinks))

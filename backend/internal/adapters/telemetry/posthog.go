@@ -130,6 +130,10 @@ type PostHogSink struct {
 	closeOnce  sync.Once
 }
 
+// DurableLocalTelemetry reports that PostHog alone is not a durable local
+// sink. Production fanout pairs it with LocalSQLiteSink.
+func (*PostHogSink) DurableLocalTelemetry() bool { return false }
+
 // NewPostHogSink starts a buffered PostHog exporter with a stable install ID.
 func NewPostHogSink(dataDir, apiKey, host string, client postHogClient, log *slog.Logger) (*PostHogSink, error) {
 	if strings.TrimSpace(apiKey) == "" {
@@ -226,6 +230,11 @@ func (s *PostHogSink) properties(ev ports.TelemetryEvent) map[string]any {
 	props := map[string]any{
 		"source": ev.Source,
 		"level":  string(ev.Level),
+	}
+	if ev.ID != "" {
+		// PostHog deduplicates capture retries by $insert_id. AO's durable
+		// simplification events therefore reuse their SQLite event ID here.
+		props["$insert_id"] = ev.ID
 	}
 	if ev.RequestID != "" {
 		props["request_id"] = ev.RequestID

@@ -9,6 +9,9 @@ import (
 // NoopSink discards every event.
 type NoopSink struct{}
 
+// DurableLocalTelemetry reports that telemetry is disabled.
+func (NoopSink) DurableLocalTelemetry() bool { return false }
+
 // Emit discards the event.
 func (NoopSink) Emit(context.Context, ports.TelemetryEvent) {}
 

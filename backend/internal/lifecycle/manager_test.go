@@ -16,9 +16,11 @@ import (
 var ctx = context.Background()
 
 type fakeStore struct {
-	sessions   map[domain.SessionID]domain.SessionRecord
-	prs        map[domain.SessionID][]domain.PullRequest
-	signatures map[string]string
+	sessions               map[domain.SessionID]domain.SessionRecord
+	prs                    map[domain.SessionID][]domain.PullRequest
+	signatures             map[string]string
+	simplificationReceipts map[string]time.Time
+	telemetryEvents        map[string]ports.TelemetryEvent
 	// afterSessionRead deterministically models a concurrent reducer committing
 	// new activity immediately after a caller's store snapshot.
 	afterSessionRead func(domain.SessionID, int)
@@ -29,7 +31,10 @@ type fakeStore struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{sessions: map[domain.SessionID]domain.SessionRecord{}, prs: map[domain.SessionID][]domain.PullRequest{}, signatures: map[string]string{}}
+	return &fakeStore{
+		sessions: map[domain.SessionID]domain.SessionRecord{}, prs: map[domain.SessionID][]domain.PullRequest{},
+		signatures: map[string]string{}, simplificationReceipts: map[string]time.Time{}, telemetryEvents: map[string]ports.TelemetryEvent{},
+	}
 }
 
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
@@ -68,6 +73,20 @@ func (f *fakeStore) UpdatePRLastNudgeSignature(_ context.Context, prURL, payload
 	f.signatures[prURL] = payload
 	f.signatureWrites++
 	return nil
+}
+
+func (f *fakeStore) EnsureReviewRunSimplificationEvent(_ context.Context, id, targetSHA string, event ports.TelemetryEvent) (ports.TelemetryEvent, bool, error) {
+	key := id + "\x00" + targetSHA
+	if _, ok := f.simplificationReceipts[key]; ok {
+		persisted, eventOK := f.telemetryEvents[event.ID]
+		if !eventOK {
+			return ports.TelemetryEvent{}, false, errors.New("receipt exists without telemetry event")
+		}
+		return persisted, false, nil
+	}
+	f.simplificationReceipts[key] = event.OccurredAt
+	f.telemetryEvents[event.ID] = event
+	return event, true, nil
 }
 
 type fakeMessenger struct {
@@ -133,11 +152,26 @@ type telemetrySink struct {
 	events []ports.TelemetryEvent
 }
 
+type droppingTelemetrySink struct{}
+
+func (droppingTelemetrySink) Emit(context.Context, ports.TelemetryEvent) {}
+func (droppingTelemetrySink) Close(context.Context) error                { return nil }
+func (droppingTelemetrySink) DurableLocalTelemetry() bool                { return true }
+
 func (s *telemetrySink) Emit(_ context.Context, ev ports.TelemetryEvent) {
+	if ev.ID != "" {
+		for _, existing := range s.events {
+			if existing.ID == ev.ID {
+				return
+			}
+		}
+	}
 	s.events = append(s.events, ev)
 }
 
 func (*telemetrySink) Close(context.Context) error { return nil }
+
+func (*telemetrySink) DurableLocalTelemetry() bool { return true }
 
 func (f *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) error {
 	if f.err != nil {
@@ -1630,6 +1664,50 @@ func TestApplyReviewResultThirdClassOccurrenceUsesSimplificationRound(t *testing
 	}
 	if len(telemetry.events) != 1 || telemetry.events[0].Name != "review_simplification_round" {
 		t.Fatalf("telemetry = %+v", telemetry.events)
+	}
+}
+
+func TestApplyReviewResultReplaysDurableSimplificationEventAfterSinkDropAndRestart(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	msg := &fakeMessenger{}
+	result := ReviewResult{
+		RunID: "run-3", WorkerID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha3",
+		Verdict: domain.VerdictChangesRequested, SimplificationClass: "missing-notify",
+	}
+
+	first := New(st, msg, WithTelemetry(droppingTelemetrySink{}))
+	firstAt := time.Unix(100, 0).UTC()
+	first.clock = func() time.Time { return firstAt }
+	if outcome, err := first.ApplyReviewResult(ctx, "mer-1", result); err != nil || outcome != ReviewDeliverySent {
+		t.Fatalf("first ApplyReviewResult = %q, %v", outcome, err)
+	}
+	if len(st.telemetryEvents) != 1 || len(msg.msgs) != 1 {
+		t.Fatalf("durable events/messages = %d/%d, want 1/1", len(st.telemetryEvents), len(msg.msgs))
+	}
+
+	// The first sink dropped the fanout after the atomic local write. A fresh
+	// manager replays the still-undelivered run using the same stable event ID.
+	drained := &telemetrySink{}
+	restarted := New(st, msg, WithTelemetry(drained))
+	restarted.clock = func() time.Time { return firstAt.Add(time.Hour) }
+	if outcome, err := restarted.ApplyReviewResult(ctx, "mer-1", result); err != nil || outcome != ReviewDeliverySent {
+		t.Fatalf("restart ApplyReviewResult = %q, %v", outcome, err)
+	}
+	if len(drained.events) != 1 || len(msg.msgs) != 1 {
+		t.Fatalf("restart events/messages = %d/%d, want 1/1", len(drained.events), len(msg.msgs))
+	}
+	if drained.events[0].ID == "" || len(st.telemetryEvents) != 1 {
+		t.Fatalf("stable event/local rows = %q/%d", drained.events[0].ID, len(st.telemetryEvents))
+	}
+	if !drained.events[0].OccurredAt.Equal(firstAt) {
+		t.Fatalf("replayed occurredAt = %s, want persisted %s", drained.events[0].OccurredAt, firstAt)
+	}
+	if _, err := restarted.ApplyReviewResult(ctx, "mer-1", result); err != nil {
+		t.Fatalf("repeat ApplyReviewResult: %v", err)
+	}
+	if len(drained.events) != 1 || len(st.telemetryEvents) != 1 {
+		t.Fatalf("repeat events/local rows = %d/%d, want 1/1", len(drained.events), len(st.telemetryEvents))
 	}
 }
 
