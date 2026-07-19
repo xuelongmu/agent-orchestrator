@@ -453,6 +453,7 @@ type missingAgents struct{}
 func (missingAgents) Agent(domain.AgentHarness) (ports.Agent, bool) { return nil, false }
 
 type fakeWorkspace struct {
+	mu                sync.RWMutex
 	createErr         error
 	destroyErr        error
 	destroyed         int
@@ -538,7 +539,15 @@ func (w *fakeWorkspace) Destroy(_ context.Context, info ports.WorkspaceInfo) err
 		}
 	}
 	w.destroyed++
-	return w.destroyErr
+	w.mu.RLock()
+	err := w.destroyErr
+	w.mu.RUnlock()
+	return err
+}
+func (w *fakeWorkspace) setDestroyErr(err error) {
+	w.mu.Lock()
+	w.destroyErr = err
+	w.mu.Unlock()
 }
 func (w *fakeWorkspace) DestroyWorkspaceProject(context.Context, ports.WorkspaceProjectInfo) error {
 	w.projectDestroyed++
@@ -1505,7 +1514,7 @@ func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) 
 	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
 	rec.Metadata.WorkspaceKind = domain.WorkspaceKindScratch
 	st.setSession(rec)
-	ws.destroyErr = errors.New("workspace busy")
+	ws.setDestroyErr(errors.New("workspace busy"))
 	m.cleanupRetryDelay = time.Millisecond
 
 	if err := m.CleanupCompletedSession(ctx, rec.ID); err == nil || !strings.Contains(err.Error(), "workspace busy") {
@@ -1515,7 +1524,7 @@ func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) 
 		t.Fatal("failed cleanup did not retain a retry owner")
 	}
 
-	ws.destroyErr = nil
+	ws.setDestroyErr(nil)
 	deadline := time.Now().Add(time.Second)
 	for retryPending(m, rec.ID) && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
@@ -1612,11 +1621,11 @@ func TestCleanupRetry_NewLeaseSupersedesOldTimer(t *testing.T) {
 	rec.Metadata.RuntimeHandleID = "lease-b"
 	rec.Metadata.WorkspacePath = "/scratch/b"
 	st.setSession(rec)
-	ws.destroyErr = errors.New("busy")
+	ws.setDestroyErr(errors.New("busy"))
 	if err := m.CleanupCompletedSession(ctx, rec.ID); err == nil {
 		t.Fatal("lease B cleanup unexpectedly succeeded")
 	}
-	ws.destroyErr = nil
+	ws.setDestroyErr(nil)
 	deadline := time.Now().Add(time.Second)
 	for retryPending(m, rec.ID) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
