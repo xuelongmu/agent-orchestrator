@@ -5,7 +5,6 @@ package terminal
 import (
 	"context"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,15 +13,15 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/tmux"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/testenv"
 )
 
 // TestAttachmentStreamsRealTmuxPane attaches a real PTY to a real tmux session
 // and asserts output streams back, then that killing the session stops the
-// attachment without a re-attach storm. Skipped when tmux is unavailable.
+// attachment without a re-attach storm. It skips without tmux locally; trusted
+// CI requires the prerequisite so a skip cannot produce a green check.
 func TestAttachmentStreamsRealTmuxPane(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux unavailable")
-	}
+	testenv.RequireExecutable(t, "tmux")
 	// See TestAttachmentReattachAdoptsNewSize: tmux needs a usable TERM to attach.
 	t.Setenv("TERM", "xterm-256color")
 
@@ -60,9 +59,7 @@ func TestAttachmentStreamsRealTmuxPane(t *testing.T) {
 // client B immediately attaches at a different grid (the frontend's
 // remount/reconnect flow). B's tmux client must adopt B's size, not A's.
 func TestAttachmentReattachAdoptsNewSize(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux unavailable")
-	}
+	testenv.RequireExecutable(t, "tmux")
 	// tmux refuses to attach a client without a usable TERM, printing
 	// "open terminal failed: terminal does not support clear". The daemon sets a
 	// default TERM in production (Finder-launched attach fix); CI runners have
