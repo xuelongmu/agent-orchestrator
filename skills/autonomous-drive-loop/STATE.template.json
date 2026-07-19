@@ -1,5 +1,5 @@
 {
-	"schemaVersion": 1,
+	"schemaVersion": 2,
 	"loop": {
 		"id": "",
 		"repository": "",
@@ -23,6 +23,7 @@
 			"contentSha256": ""
 		}
 	},
+	"nextAttemptSequence": 1,
 	"decisions": [],
 	"dispatchLog": [],
 	"mutationLog": [],
