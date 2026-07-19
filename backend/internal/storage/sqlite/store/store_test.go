@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sync"
 	"testing"
@@ -43,6 +44,15 @@ func sampleRecord(project string) domain.SessionRecord {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+}
+
+func decodeDependencyIDs(t *testing.T, encoded string) []domain.SessionID {
+	t.Helper()
+	ids, err := domain.DecodeSessionDependencyIDs(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ids
 }
 
 func TestProjectCRUDAndArchive(t *testing.T) {
@@ -187,6 +197,182 @@ func TestSessionCreateAssignsPerProjectID(t *testing.T) {
 	}
 	if all, _ := s.ListAllSessions(ctx); len(all) != 3 {
 		t.Fatalf("list all = %d, want 3", len(all))
+	}
+}
+
+func TestSessionDependenciesRoundTripDeduped(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ao")
+	parent, err := s.CreateSession(ctx, sampleRecord("ao"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	childRecord := sampleRecord("ao")
+	childRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID, parent.ID})
+	child, err := s.CreateSession(ctx, childRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := s.GetSession(ctx, child.ID)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if gotIDs, want := decodeDependencyIDs(t, got.DependencyIDs), []domain.SessionID{parent.ID}; !reflect.DeepEqual(gotIDs, want) {
+		t.Fatalf("dependsOn = %#v, want %#v", gotIDs, want)
+	}
+	listed, err := s.ListSessions(ctx, "ao")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotIDs := decodeDependencyIDs(t, listed[1].DependencyIDs); !reflect.DeepEqual(gotIDs, []domain.SessionID{parent.ID}) {
+		t.Fatalf("listed dependsOn = %#v", gotIDs)
+	}
+}
+
+func TestSessionDependenciesRejectInvalidEdges(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ao")
+	seedProject(t, s, "other")
+	_, err := s.CreateSession(ctx, sampleRecord("ao"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	selfRecord := sampleRecord("ao")
+	selfRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{"ao-2"})
+	if _, err := s.CreateSession(ctx, selfRecord); !errors.Is(err, ports.ErrDependencySelf) {
+		t.Fatalf("spawn self edge error = %v, want ErrDependencySelf", err)
+	}
+	b, err := s.CreateSession(ctx, sampleRecord("ao"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.ID != "ao-2" {
+		t.Fatalf("rejected dependency consumed session id: got %s", b.ID)
+	}
+
+	missing := sampleRecord("ao")
+	missing.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{"ao-999"})
+	if _, err := s.CreateSession(ctx, missing); !errors.Is(err, ports.ErrDependencyNotFound) {
+		t.Fatalf("missing edge error = %v, want ErrDependencyNotFound", err)
+	}
+	other, err := s.CreateSession(ctx, sampleRecord("other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	crossProject := sampleRecord("ao")
+	crossProject.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{other.ID})
+	if _, err := s.CreateSession(ctx, crossProject); !errors.Is(err, ports.ErrDependencyProject) {
+		t.Fatalf("cross-project edge error = %v, want ErrDependencyProject", err)
+	}
+	invalid := sampleRecord("ao")
+	invalid.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{"ao 1"})
+	if _, err := s.CreateSession(ctx, invalid); !errors.Is(err, ports.ErrDependencyInvalid) {
+		t.Fatalf("invalid id error = %v, want ErrDependencyInvalid", err)
+	}
+	embeddedNUL := sampleRecord("ao")
+	embeddedNUL.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{"ao-1\x00ao-2"})
+	if _, err := s.CreateSession(ctx, embeddedNUL); !errors.Is(err, ports.ErrDependencyInvalid) {
+		t.Fatalf("embedded NUL id error = %v, want ErrDependencyInvalid", err)
+	}
+	tooMany := sampleRecord("ao")
+	tooMany.DependencyIDs = domain.EncodeSessionDependencyIDs(make([]domain.SessionID, domain.MaxSessionDependencies+1))
+	if _, err := s.CreateSession(ctx, tooMany); !errors.Is(err, ports.ErrDependencyLimit) {
+		t.Fatalf("dependency limit error = %v, want ErrDependencyLimit", err)
+	}
+	sessions, err := s.ListSessions(ctx, "ao")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("sessions after rejected edges = %d, want 2", len(sessions))
+	}
+	for _, session := range sessions {
+		if ids := decodeDependencyIDs(t, session.DependencyIDs); len(ids) != 0 {
+			t.Fatalf("rejected embedded NUL created edges for %s: %#v", session.ID, ids)
+		}
+	}
+}
+
+func TestReferencedSeedParentIsRestrictedAndEdgesSurviveRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedProject(t, s, "ao")
+	parentRecord := sampleRecord("ao")
+	parentRecord.Metadata = domain.SessionMetadata{}
+	parent, err := s.CreateSession(ctx, parentRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childRecord := sampleRecord("ao")
+	childRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID})
+	child, err := s.CreateSession(ctx, childRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := s.DeleteSession(ctx, parent.ID); err == nil || deleted {
+		t.Fatalf("referenced seed delete = deleted:%v err:%v, want FK restriction", deleted, err)
+	}
+	parent, ok, err := s.GetSession(ctx, parent.ID)
+	if err != nil || !ok {
+		t.Fatalf("parent after restricted delete: ok=%v err=%v", ok, err)
+	}
+	parent.IsTerminated = true // manager rollback fallback parks the failed seed.
+	if err := s.UpdateSession(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	parent, ok, err = s.GetSession(ctx, parent.ID)
+	if err != nil || !ok || !parent.IsTerminated {
+		t.Fatalf("parked parent after reopen = %#v ok=%v err=%v", parent, ok, err)
+	}
+	gotChild, ok, err := s.GetSession(ctx, child.ID)
+	if err != nil || !ok {
+		t.Fatalf("child after reopen: ok=%v err=%v", ok, err)
+	}
+	if gotIDs := decodeDependencyIDs(t, gotChild.DependencyIDs); !reflect.DeepEqual(gotIDs, []domain.SessionID{parent.ID}) {
+		t.Fatalf("child edge after parent rollback/reopen = %#v", gotIDs)
+	}
+}
+
+func TestDeletingSeedChildCascadesOutgoingDependencyEdge(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ao")
+
+	parentRecord := sampleRecord("ao")
+	parentRecord.Metadata = domain.SessionMetadata{}
+	parent, err := s.CreateSession(ctx, parentRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childRecord := sampleRecord("ao")
+	childRecord.Metadata = domain.SessionMetadata{}
+	childRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID})
+	child, err := s.CreateSession(ctx, childRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if deleted, err := s.DeleteSession(ctx, child.ID); err != nil || !deleted {
+		t.Fatalf("delete child = %v, %v; want true, nil", deleted, err)
+	}
+	if deleted, err := s.DeleteSession(ctx, parent.ID); err != nil || !deleted {
+		t.Fatalf("delete former parent after child cascade = %v, %v; want true, nil", deleted, err)
 	}
 }
 

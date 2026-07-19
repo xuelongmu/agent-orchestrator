@@ -581,6 +581,18 @@ func toAPIError(err error) error {
 		return apierr.Invalid("SHARED_DIRECTORY_UNSUPPORTED", err.Error(), nil)
 	case errors.Is(err, sessionmanager.ErrSharedDirInUse):
 		return apierr.Conflict("SHARED_DIRECTORY_IN_USE", err.Error(), nil)
+	case errors.Is(err, ports.ErrDependencySelf):
+		return apierr.Invalid("DEPENDENCY_SELF_EDGE", err.Error(), nil)
+	case errors.Is(err, ports.ErrDependencyCycle):
+		return apierr.Invalid("DEPENDENCY_CYCLE", err.Error(), nil)
+	case errors.Is(err, ports.ErrDependencyNotFound):
+		return apierr.Invalid("DEPENDENCY_NOT_FOUND", err.Error(), nil)
+	case errors.Is(err, ports.ErrDependencyProject):
+		return apierr.Invalid("DEPENDENCY_PROJECT_MISMATCH", err.Error(), nil)
+	case errors.Is(err, ports.ErrDependencyInvalid):
+		return apierr.Invalid("DEPENDENCY_ID_INVALID", err.Error(), nil)
+	case errors.Is(err, ports.ErrDependencyLimit):
+		return apierr.Invalid("DEPENDENCY_LIMIT_EXCEEDED", err.Error(), nil)
 	case errors.Is(err, ports.ErrWorkspaceBranchCheckedOutElsewhere):
 		return apierr.Conflict("BRANCH_CHECKED_OUT_ELSEWHERE", err.Error(), nil)
 	case errors.Is(err, ports.ErrWorkspaceBranchNotFetched):
@@ -601,7 +613,11 @@ func (s *Service) toSession(ctx context.Context, rec domain.SessionRecord) (doma
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("pr facts %s: %w", rec.ID, err)
 	}
-	return domain.Session{SessionRecord: rec, Status: deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness)), TerminalHandleID: rec.Metadata.RuntimeHandleID, PRs: prs}, nil
+	dependsOn, err := domain.DecodeSessionDependencyIDs(rec.DependencyIDs)
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("dependency ids %s: %w", rec.ID, err)
+	}
+	return domain.Session{SessionRecord: rec, Status: deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness)), TerminalHandleID: rec.Metadata.RuntimeHandleID, DependsOn: dependsOn, PRs: prs}, nil
 }
 
 // now tolerates a zero-value Service (tests construct the struct literally

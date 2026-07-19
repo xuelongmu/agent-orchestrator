@@ -264,6 +264,11 @@ type Session struct {
 	WorkspaceKind                  string
 }
 
+type SessionDependency struct {
+	SessionID          domain.SessionID
+	DependsOnSessionID domain.SessionID
+}
+
 type SessionDesignContractSeed struct {
 	SessionID string
 	Markdown  string

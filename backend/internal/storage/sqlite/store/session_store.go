@@ -5,9 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -21,15 +25,99 @@ func (s *Store) CreateSession(ctx context.Context, rec domain.SessionRecord) (do
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	num, err := s.qw.NextSessionNum(ctx, rec.ProjectID)
+	rawDeps, err := domain.DecodeSessionDependencyIDs(rec.DependencyIDs)
+	if err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("create session dependencies: %w", err)
+	}
+	deps, err := normalizeDependencies(rawDeps)
+	if err != nil {
+		return domain.SessionRecord{}, err
+	}
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("begin create session: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := s.qw.WithTx(tx)
+	num, err := q.NextSessionNum(ctx, rec.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("next session num for %s: %w", rec.ProjectID, err)
 	}
 	rec.ID = domain.SessionID(fmt.Sprintf("%s-%d", rec.ProjectID, num))
-	if err := s.qw.InsertSession(ctx, recordToInsert(rec, num)); err != nil {
+	if err := validateDependencies(ctx, tx, rec.ID, rec.ProjectID, deps); err != nil {
+		return domain.SessionRecord{}, err
+	}
+	if err := q.InsertSession(ctx, recordToInsert(rec, num)); err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("insert session %s: %w", rec.ID, err)
 	}
+	for _, dependencyID := range deps {
+		if err := q.InsertSessionDependency(ctx, gen.InsertSessionDependencyParams{SessionID: rec.ID, DependsOnSessionID: dependencyID}); err != nil {
+			return domain.SessionRecord{}, fmt.Errorf("insert dependency %s -> %s: %w", rec.ID, dependencyID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("commit create session: %w", err)
+	}
+	rec.DependencyIDs = domain.EncodeSessionDependencyIDs(deps)
 	return rec, nil
+}
+
+type dependencyQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func validateDependencies(ctx context.Context, db dependencyQueryer, id domain.SessionID, projectID domain.ProjectID, deps []domain.SessionID) error {
+	for _, dependencyID := range deps {
+		if dependencyID == id {
+			return fmt.Errorf("%w: session %s", ports.ErrDependencySelf, id)
+		}
+		var dependencyProject domain.ProjectID
+		if err := db.QueryRowContext(ctx, `SELECT project_id FROM sessions WHERE id = ?`, dependencyID).Scan(&dependencyProject); errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: session %s depends on unknown session %s", ports.ErrDependencyNotFound, id, dependencyID)
+		} else if err != nil {
+			return fmt.Errorf("check dependency %s: %w", dependencyID, err)
+		}
+		if dependencyProject != projectID {
+			return fmt.Errorf("%w: session %s in project %s depends on %s in project %s", ports.ErrDependencyProject, id, projectID, dependencyID, dependencyProject)
+		}
+		var createsCycle bool
+		if err := db.QueryRowContext(ctx, `
+WITH RECURSIVE ancestors(ancestor_id) AS (
+    SELECT depends_on_session_id FROM session_dependencies WHERE session_id = ?
+    UNION
+    SELECT dependency.depends_on_session_id
+    FROM session_dependencies dependency
+    JOIN ancestors ON dependency.session_id = ancestors.ancestor_id
+)
+SELECT EXISTS(SELECT 1 FROM ancestors WHERE ancestor_id = ?)`, dependencyID, id).Scan(&createsCycle); err != nil {
+			return fmt.Errorf("check dependency cycle %s -> %s: %w", id, dependencyID, err)
+		}
+		if createsCycle {
+			return fmt.Errorf("%w: adding %s -> %s", ports.ErrDependencyCycle, id, dependencyID)
+		}
+	}
+	return nil
+}
+
+func normalizeDependencies(deps []domain.SessionID) ([]domain.SessionID, error) {
+	if len(deps) > domain.MaxSessionDependencies {
+		return nil, fmt.Errorf("%w: got %d, maximum is %d", ports.ErrDependencyLimit, len(deps), domain.MaxSessionDependencies)
+	}
+	seen := make(map[domain.SessionID]struct{}, len(deps))
+	out := make([]domain.SessionID, 0, len(deps))
+	for _, id := range deps {
+		id = domain.SessionID(strings.TrimSpace(string(id)))
+		if id == "" || strings.ContainsRune(string(id), '\x00') || strings.IndexFunc(string(id), unicode.IsSpace) >= 0 {
+			return nil, fmt.Errorf("%w: %q", ports.ErrDependencyInvalid, id)
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 
 // UpdateSession writes the full mutable state of an existing session. The
@@ -244,10 +332,13 @@ func (s *Store) ClearPendingSubmit(ctx context.Context, id domain.SessionID, fin
 // destroyed when callers (e.g. RollbackSpawn's delete-then-kill fallback)
 // invoke DeleteSession on a fully-spawned row.
 //
-// Returns deleted=true when a seed row was removed; deleted=false when the
-// session id did not match a seed row (either it never existed, or it had
-// already progressed past seed state). The latter case is benign — the caller
-// should fall back to MarkTerminated.
+// A seed referenced as another session's dependency parent is protected by the
+// parent-side RESTRICT FK. That delete returns an error so spawn rollback parks
+// the parent terminal, preserving both the parent fact and the committed edge.
+// Returns deleted=true when an unreferenced seed row was removed; deleted=false
+// when the session id did not match a seed row (either it never existed, or it
+// had already progressed past seed state). The latter case is benign — the
+// caller should fall back to MarkTerminated.
 func (s *Store) DeleteSession(ctx context.Context, id domain.SessionID) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -312,7 +403,13 @@ func (s *Store) GetSession(ctx context.Context, id domain.SessionID) (domain.Ses
 	if err != nil {
 		return domain.SessionRecord{}, false, fmt.Errorf("get session %s: %w", id, err)
 	}
-	return rowToRecord(row), true, nil
+	rec := rowToRecord(row)
+	deps, err := s.qr.ListSessionDependencies(ctx, id)
+	if err != nil {
+		return domain.SessionRecord{}, false, fmt.Errorf("list dependencies for %s: %w", id, err)
+	}
+	rec.DependencyIDs = domain.EncodeSessionDependencyIDs(deps)
+	return rec, true, nil
 }
 
 // ListSessions returns every session in a project, ordered by num.
@@ -321,7 +418,7 @@ func (s *Store) ListSessions(ctx context.Context, project domain.ProjectID) ([]d
 	if err != nil {
 		return nil, fmt.Errorf("list sessions for %s: %w", project, err)
 	}
-	return mapSessionRows(rows), nil
+	return s.withDependencies(ctx, mapSessionRows(rows))
 }
 
 // ListAllSessions returns every session across all projects.
@@ -330,7 +427,22 @@ func (s *Store) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, er
 	if err != nil {
 		return nil, fmt.Errorf("list all sessions: %w", err)
 	}
-	return mapSessionRows(rows), nil
+	return s.withDependencies(ctx, mapSessionRows(rows))
+}
+
+func (s *Store) withDependencies(ctx context.Context, records []domain.SessionRecord) ([]domain.SessionRecord, error) {
+	edges, err := s.qr.ListAllSessionDependencies(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list session dependencies: %w", err)
+	}
+	bySession := make(map[domain.SessionID][]domain.SessionID)
+	for _, edge := range edges {
+		bySession[edge.SessionID] = append(bySession[edge.SessionID], edge.DependsOnSessionID)
+	}
+	for i := range records {
+		records[i].DependencyIDs = domain.EncodeSessionDependencyIDs(bySession[records[i].ID])
+	}
+	return records, nil
 }
 
 func mapSessionRows(rows []gen.Session) []domain.SessionRecord {

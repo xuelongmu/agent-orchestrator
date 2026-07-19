@@ -2208,6 +2208,10 @@ components:
         createdAt:
           format: date-time
           type: string
+        dependsOn:
+          items:
+            type: string
+          type: array
         diagnostic:
           $ref: '#/components/schemas/LifecycleDiagnostic'
         displayName:
@@ -3393,6 +3397,11 @@ components:
       properties:
         branch:
           type: string
+        dependsOn:
+          items:
+            type: string
+          maxItems: 32
+          type: array
         displayName:
           maxLength: 20
           type: string

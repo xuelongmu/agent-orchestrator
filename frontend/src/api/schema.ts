@@ -801,6 +801,7 @@ export interface components {
             branch?: string;
             /** Format: date-time */
             createdAt: string;
+            dependsOn?: string[];
             diagnostic?: components["schemas"]["LifecycleDiagnostic"];
             displayName?: string;
             harness?: string;
@@ -1252,6 +1253,7 @@ export interface components {
         };
         SpawnSessionRequest: {
             branch?: string;
+            dependsOn?: string[];
             displayName?: string;
             /** @enum {string} */
             harness?: "claude-code" | "codex" | "aider" | "opencode" | "grok" | "droid" | "amp" | "agy" | "crush" | "cursor" | "qwen" | "copilot" | "goose" | "auggie" | "continue" | "devin" | "cline" | "kimi" | "kiro" | "kilocode" | "vibe" | "pi" | "autohand";

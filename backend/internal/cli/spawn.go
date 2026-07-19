@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -24,6 +25,10 @@ import (
 const (
 	maxDisplayNameLen = 20
 	maxPromptLen      = 4096
+	// maxSpawnDependencies mirrors domain.MaxSessionDependencies without
+	// importing daemon domain types across the CLI's deliberately hand-mirrored
+	// DTO boundary.
+	maxSpawnDependencies = 32
 )
 
 type spawnOptions struct {
@@ -37,18 +42,20 @@ type spawnOptions struct {
 	claimPR        string
 	noTakeover     bool
 	skipAgentCheck bool
+	dependsOn      []string
 }
 
 // spawnRequest mirrors the daemon's SpawnSessionRequest body for
 // POST /api/v1/sessions. The CLI keeps its own copy so it need not import httpd.
 type spawnRequest struct {
-	ProjectID     string `json:"projectId"`
-	IssueID       string `json:"issueId,omitempty"`
-	Harness       string `json:"harness,omitempty"`
-	Branch        string `json:"branch,omitempty"`
-	WorkspaceKind string `json:"workspaceKind,omitempty"`
-	Prompt        string `json:"prompt,omitempty"`
-	DisplayName   string `json:"displayName,omitempty"`
+	ProjectID     string   `json:"projectId"`
+	IssueID       string   `json:"issueId,omitempty"`
+	Harness       string   `json:"harness,omitempty"`
+	Branch        string   `json:"branch,omitempty"`
+	WorkspaceKind string   `json:"workspaceKind,omitempty"`
+	Prompt        string   `json:"prompt,omitempty"`
+	DisplayName   string   `json:"displayName,omitempty"`
+	DependsOn     []string `json:"dependsOn,omitempty"`
 }
 
 type spawnResult struct {
@@ -72,7 +79,8 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 		Long: "Spawn a worker agent session in a registered project.\n\n" +
 			"The session runs the chosen agent in a\n" +
 			"git worktree, ephemeral scratch directory, or shared project directory. " +
-			"Register the project first with `ao project add`.",
+			"Register the project first with `ao project add`. " +
+			"--depends-on declares read-only prerequisite graph metadata; it does not delay launch.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !validWorkspaceKind(opts.workspaceKind) {
@@ -89,6 +97,10 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			}
 			if explicitName := strings.TrimSpace(opts.name); utf8.RuneCountInString(explicitName) > maxDisplayNameLen {
 				return usageError{fmt.Errorf("--name must be %d characters or fewer", maxDisplayNameLen)}
+			}
+			dependsOn, err := normalizeSpawnDependencies(opts.dependsOn)
+			if err != nil {
+				return usageError{err}
 			}
 
 			project, err := ctx.resolveSpawnProject(cmd.Context(), opts.project)
@@ -128,6 +140,7 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 				WorkspaceKind: opts.workspaceKind,
 				Prompt:        spawnPrompt,
 				DisplayName:   name,
+				DependsOn:     dependsOn,
 			}
 			var res spawnResult
 			if err := ctx.postJSON(cmd.Context(), "sessions", req, &res); err != nil {
@@ -186,6 +199,7 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 	f.StringVar(&opts.prompt, "prompt", "", "Initial prompt for the agent")
 	f.StringVar(&opts.issue, "issue", "", "Issue id to associate with the session")
 	f.StringVar(&opts.name, "name", "", "Display name shown in the sidebar (default: derived from --prompt, max 20 characters)")
+	f.StringSliceVar(&opts.dependsOn, "depends-on", nil, "Declare a read-only prerequisite session id (repeat or comma-separate; maximum 32)")
 	f.StringVar(&opts.claimPR, "claim-pr", "", "Immediately claim an existing PR for the spawned session")
 	f.BoolVar(&opts.noTakeover, "no-takeover", false, "Refuse if another active session owns the claimed PR (requires --claim-pr)")
 	f.BoolVar(&opts.skipAgentCheck, "skip-agent-check", false, "Skip advisory agent catalog install/auth preflight before spawning")
@@ -194,6 +208,26 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 
 func claimBarrierPrompt(prRef, _ string) string {
 	return "[AO PR CLAIM BARRIER]\nAO has withheld the actionable task until the claim ownership transaction completes and the exact canonical design contract is safely delivered. Do not inspect, edit, run, commit, or otherwise act on the claimed PR. Wait for a later `[AO PR claim ready]` message; never infer readiness from checkout state.\nClaim target: " + prRef
+}
+
+func normalizeSpawnDependencies(ids []string) ([]string, error) {
+	if len(ids) > maxSpawnDependencies {
+		return nil, fmt.Errorf("--depends-on accepts at most %d session ids", maxSpawnDependencies)
+	}
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || strings.IndexFunc(id, unicode.IsSpace) >= 0 {
+			return nil, fmt.Errorf("--depends-on requires non-empty session ids without whitespace")
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out, nil
 }
 
 func validWorkspaceKind(kind string) bool {

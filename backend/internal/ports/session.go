@@ -9,6 +9,17 @@ import (
 // ErrSessionNotFound reports an observation for an unknown session id.
 var ErrSessionNotFound = errors.New("session not found")
 
+// Dependency graph validation errors. Persistence owns the atomic graph check;
+// service layers map these sentinels to stable API errors.
+var (
+	ErrDependencySelf     = errors.New("session dependency cannot reference itself")
+	ErrDependencyCycle    = errors.New("session dependency would create a cycle")
+	ErrDependencyNotFound = errors.New("session dependency not found")
+	ErrDependencyProject  = errors.New("session dependency must belong to the same project")
+	ErrDependencyInvalid  = errors.New("invalid session dependency id")
+	ErrDependencyLimit    = errors.New("too many session dependencies")
+)
+
 // SpawnConfig is the request to start a new session: which project/issue, which
 // agent harness, and the branch/prompt the agent launches with.
 type SpawnConfig struct {
@@ -22,6 +33,7 @@ type SpawnConfig struct {
 	WorkspaceKind domain.WorkspaceKind
 	Branch        string
 	Prompt        string
+	DependsOn     []domain.SessionID
 
 	// DisplayName is the user-facing sidebar label. Empty falls back to the
 	// session id in the read model (e.g. orchestrator sessions).

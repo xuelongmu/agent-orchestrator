@@ -191,6 +191,64 @@ func TestSpawnClaimPRRejectsOversizedTaskPromptBeforeNetwork(t *testing.T) {
 	}
 }
 
+func TestSpawnDependsOnWiring(t *testing.T) {
+	cfg := setConfigEnv(t)
+	var req spawnRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/demo":
+			_, _ = io.WriteString(w, `{"status":"ok","project":{"id":"demo","name":"Demo","path":"/repo/demo"}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agents/refresh":
+			_, _ = io.WriteString(w, authorizedAgentsJSON("codex"))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions":
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.WriteString(w, `{"session":{"id":"demo-3","status":"idle"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	_, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "spawn", "--project", "demo", "--agent", "codex", "--name", "child", "--depends-on", "demo-1,demo-2", "--depends-on", "demo-1")
+	if err != nil {
+		t.Fatalf("spawn failed: %v stderr=%s", err, errOut)
+	}
+	if want := []string{"demo-1", "demo-2"}; !reflect.DeepEqual(req.DependsOn, want) {
+		t.Fatalf("dependsOn = %#v, want %#v", req.DependsOn, want)
+	}
+}
+
+func TestNormalizeSpawnDependencies(t *testing.T) {
+	got, err := normalizeSpawnDependencies([]string{" demo-2 ", "demo-1", "demo-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"demo-2", "demo-1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized = %#v, want %#v", got, want)
+	}
+	if _, err := normalizeSpawnDependencies([]string{"bad id"}); err == nil {
+		t.Fatal("whitespace dependency id accepted")
+	}
+	if _, err := normalizeSpawnDependencies(make([]string, maxSpawnDependencies+1)); err == nil {
+		t.Fatal("over-limit dependency list accepted")
+	}
+}
+
+func TestSpawnHelpDescribesDependenciesAsReadOnly(t *testing.T) {
+	cmd := newSpawnCommand(&commandContext{})
+	flag := cmd.Flags().Lookup("depends-on")
+	if flag == nil || !strings.Contains(flag.Usage, "read-only prerequisite") {
+		t.Fatalf("--depends-on help = %#v", flag)
+	}
+	if !strings.Contains(cmd.Long, "does not delay launch") {
+		t.Fatalf("spawn long help promises scheduling semantics: %q", cmd.Long)
+	}
+}
+
 // TestSpawnCommand_RejectsOverlongName asserts `ao spawn` rejects a --name
 // longer than 20 characters without contacting the daemon.
 func TestSpawnCommand_RejectsOverlongName(t *testing.T) {

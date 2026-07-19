@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -226,6 +227,7 @@ func TestE2E_SpawnAndProjectAddDTORoundTrip(t *testing.T) {
 			"--prompt", "hi",
 			"--issue", "ISS-1",
 			"--name", "my worker",
+			"--depends-on", "mer-parent,mer-api",
 		})
 		if err := root.Execute(); err != nil {
 			t.Fatalf("spawn execute: %v\noutput: %s", err, out.String())
@@ -249,6 +251,9 @@ func TestE2E_SpawnAndProjectAddDTORoundTrip(t *testing.T) {
 		}
 		if got.DisplayName != "my worker" {
 			t.Errorf("DisplayName = %q, want %q (CLI json:\"displayName\" vs SpawnSessionRequest)", got.DisplayName, "my worker")
+		}
+		if want := []domain.SessionID{"mer-parent", "mer-api"}; !reflect.DeepEqual(got.DependsOn, want) {
+			t.Errorf("DependsOn = %#v, want %#v (CLI json:\"dependsOn\" vs SpawnSessionRequest)", got.DependsOn, want)
 		}
 		if !bytes.Contains(out.Bytes(), []byte("spawned session")) {
 			t.Errorf("output missing %q; got: %s", "spawned session", out.String())

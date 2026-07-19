@@ -2516,15 +2516,16 @@ func (m *Manager) cleanupRecords(ctx context.Context, project domain.ProjectID) 
 
 func seedRecord(cfg ports.SpawnConfig, now time.Time) domain.SessionRecord {
 	return domain.SessionRecord{
-		ProjectID:   cfg.ProjectID,
-		IssueID:     cfg.IssueID,
-		Kind:        cfg.Kind,
-		CreatedAt:   now,
-		UpdatedAt:   now,
-		Harness:     cfg.Harness,
-		DisplayName: cfg.DisplayName,
-		Metadata:    domain.SessionMetadata{WorkspaceKind: cfg.WorkspaceKind.WithDefault()},
-		Activity:    domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
+		ProjectID:     cfg.ProjectID,
+		IssueID:       cfg.IssueID,
+		Kind:          cfg.Kind,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+		Harness:       cfg.Harness,
+		DisplayName:   cfg.DisplayName,
+		DependencyIDs: domain.EncodeSessionDependencyIDs(cfg.DependsOn),
+		Metadata:      domain.SessionMetadata{WorkspaceKind: cfg.WorkspaceKind.WithDefault()},
+		Activity:      domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
 	}
 }
 

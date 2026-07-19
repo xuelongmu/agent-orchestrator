@@ -1108,6 +1108,12 @@ func TestToAPIErrorMapsWorkspaceBranchSentinels(t *testing.T) {
 		{"missing harness", fmt.Errorf("spawn: %w: configure project worker.agent or pass --harness", sessionmanager.ErrMissingHarness), apierr.KindInvalid, "AGENT_REQUIRED"},
 		{"shared directory unsupported", fmt.Errorf("spawn: %w", sessionmanager.ErrSharedDirUnsupported), apierr.KindInvalid, "SHARED_DIRECTORY_UNSUPPORTED"},
 		{"shared directory in use", fmt.Errorf("spawn: %w", sessionmanager.ErrSharedDirInUse), apierr.KindConflict, "SHARED_DIRECTORY_IN_USE"},
+		{"dependency self edge", fmt.Errorf("spawn: create: %w", ports.ErrDependencySelf), apierr.KindInvalid, "DEPENDENCY_SELF_EDGE"},
+		{"dependency cycle", fmt.Errorf("spawn: create: %w", ports.ErrDependencyCycle), apierr.KindInvalid, "DEPENDENCY_CYCLE"},
+		{"dependency not found", fmt.Errorf("spawn: create: %w", ports.ErrDependencyNotFound), apierr.KindInvalid, "DEPENDENCY_NOT_FOUND"},
+		{"dependency project mismatch", fmt.Errorf("spawn: create: %w", ports.ErrDependencyProject), apierr.KindInvalid, "DEPENDENCY_PROJECT_MISMATCH"},
+		{"dependency id invalid", fmt.Errorf("spawn: create: %w", ports.ErrDependencyInvalid), apierr.KindInvalid, "DEPENDENCY_ID_INVALID"},
+		{"dependency limit", fmt.Errorf("spawn: create: %w", ports.ErrDependencyLimit), apierr.KindInvalid, "DEPENDENCY_LIMIT_EXCEEDED"},
 		{"awaiting decision", fmt.Errorf("send mer-1: %w", sessionmanager.ErrAwaitingDecision), apierr.KindConflict, "SESSION_AWAITING_DECISION"},
 	}
 	for _, tc := range cases {

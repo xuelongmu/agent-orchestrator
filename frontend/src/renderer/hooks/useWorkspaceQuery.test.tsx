@@ -74,6 +74,7 @@ describe("useWorkspaceQuery", () => {
 							issueId: "github:acme/project-one#42",
 							harness: "claude-code",
 							branch: "qa/modal-worker",
+							dependsOn: ["sess-parent"],
 							status: "mergeable",
 							isTerminated: false,
 							activity: { state: "idle", lastActivityAt: "2026-06-10T15:30:00Z" },
@@ -130,6 +131,7 @@ describe("useWorkspaceQuery", () => {
 			issueId: "github:acme/project-one#42",
 			provider: "claude-code",
 			branch: "qa/modal-worker",
+			dependsOn: ["sess-parent"],
 			status: "mergeable",
 			activity: { state: "idle", lastActivityAt: "2026-06-10T15:30:00Z" },
 			diagnostic: {
