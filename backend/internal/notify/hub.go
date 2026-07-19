@@ -56,8 +56,9 @@ func (h *Hub) Publish(_ context.Context, rec domain.NotificationRecord) error {
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	broadcast := rec.Type.ControlPlane()
 	for _, sub := range h.subs {
-		if sub.projectID != "" && sub.projectID != rec.ProjectID {
+		if !broadcast && sub.projectID != "" && sub.projectID != rec.ProjectID {
 			continue
 		}
 		select {

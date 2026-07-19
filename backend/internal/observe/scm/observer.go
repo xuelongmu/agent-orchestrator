@@ -43,6 +43,7 @@ const (
 	// for an incident. Notifications fire on failure 1, failure 3, and recovery;
 	// later failures stay quiet so a 30-second poll cannot create an alert storm.
 	controlPlaneEscalationFailureCount = 3
+	githubAuthRecoveryAction           = "Environment variables AO_GITHUB_TOKEN and GITHUB_TOKEN take precedence over gh CLI credentials; update or remove them if set, or run `gh auth login`, then restart AO."
 )
 
 // Provider is the normalized SCM provider contract used by the observer.
@@ -387,7 +388,7 @@ func (o *Observer) routeControlPlaneHealth(ctx context.Context, occurredAt time.
 		intent.Type = domain.NotificationControlPlaneFailed
 		if o.failureWasAuth {
 			intent.TitleOverride = "GitHub authentication needs attention"
-			intent.BodyOverride = "AO cannot refresh GitHub state. Run `gh auth login` and restart AO."
+			intent.BodyOverride = "AO cannot refresh GitHub state. " + githubAuthRecoveryAction
 		} else {
 			intent.TitleOverride = "AO control plane poll failed"
 			intent.BodyOverride = "AO could not refresh GitHub state. It will retry automatically."
@@ -396,7 +397,7 @@ func (o *Observer) routeControlPlaneHealth(ctx context.Context, occurredAt time.
 		intent.Type = domain.NotificationControlPlaneEscalated
 		if o.failureWasAuth {
 			intent.TitleOverride = "GitHub authentication is still blocking AO"
-			intent.BodyOverride = fmt.Sprintf("AO has failed to refresh GitHub state %d polls in a row. Run `gh auth login` and restart AO.", o.consecutiveFailures)
+			intent.BodyOverride = fmt.Sprintf("AO has failed to refresh GitHub state %d polls in a row. %s", o.consecutiveFailures, githubAuthRecoveryAction)
 		} else {
 			intent.TitleOverride = "AO control plane poll is still failing"
 			intent.BodyOverride = fmt.Sprintf("AO has failed to refresh GitHub state %d polls in a row. Check GitHub connectivity and AO logs.", o.consecutiveFailures)
@@ -484,7 +485,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 	return o.runPoll(ctx, o.poll)
 }
 
-func (o *Observer) poll(ctx context.Context) error {
+func (o *Observer) poll(ctx context.Context) (pollErr error) {
 	now := o.clock().UTC()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -512,6 +513,17 @@ func (o *Observer) poll(ctx context.Context) error {
 	if !proceed || o.disabled {
 		return o.applyUnavailableSCMFallbacks(ctx, now, subjects)
 	}
+	// Any provider API authentication failure after the credential gate must
+	// still feed durable local PR facts through the unavailable-SCM lane. Keep
+	// the provider error intact so the outer health router can classify it.
+	defer func() {
+		if !errors.Is(pollErr, ports.ErrSCMAuthentication) {
+			return
+		}
+		if err := o.applyUnavailableSCMFallbacks(ctx, now, subjects); err != nil {
+			o.logger.Error("scm observer: authentication fallback failed", "err", err)
+		}
+	}()
 
 	repoGuards := o.guardRepos(ctx, sessionRepos)
 	if err := repoGuardAuthFailure(repoGuards); err != nil {
@@ -800,12 +812,17 @@ func dispatchOrder(observations map[string]ports.SCMObservation, subjectsByPR ma
 }
 func (o *Observer) checkCredentials(ctx context.Context) (bool, error) {
 	var probe observe.CredentialProbe
+	probeFailed := false
 	if checker, ok := o.provider.(credentialChecker); ok {
-		probe = checker.SCMCredentialsAvailable
+		probe = func(ctx context.Context) (bool, error) {
+			available, err := checker.SCMCredentialsAvailable(ctx)
+			probeFailed = err != nil
+			return available, err
+		}
 	}
 	proceed, err := observe.CheckCredentialsOnce(ctx, probe, &o.credentialsChecked, &o.disabled, o.logger, "scm observer")
-	if err == nil && !proceed && o.disabled {
-		o.credentialFailure = true
+	if err == nil {
+		o.credentialFailure = !proceed && (o.disabled || probeFailed)
 	}
 	return proceed, err
 }

@@ -134,3 +134,39 @@ func TestHubProjectFilter(t *testing.T) {
 		t.Fatal("expected filtered notification")
 	}
 }
+
+func TestHubBroadcastsControlPlaneNotificationsWithoutWeakeningProjectIsolation(t *testing.T) {
+	hub := NewHub()
+	merCh, unsubscribeMer := hub.Subscribe("mer")
+	defer unsubscribeMer()
+	aoCh, unsubscribeAO := hub.Subscribe("ao")
+	defer unsubscribeAO()
+
+	_ = hub.Publish(context.Background(), domain.NotificationRecord{ID: "mer-only", Type: domain.NotificationNeedsInput, ProjectID: "mer"})
+	select {
+	case got := <-merCh:
+		if got.ID != "mer-only" {
+			t.Fatalf("project notification = %+v", got)
+		}
+	default:
+		t.Fatal("matching project subscriber did not receive ordinary notification")
+	}
+	select {
+	case got := <-aoCh:
+		t.Fatalf("other project subscriber received ordinary notification: %+v", got)
+	default:
+	}
+
+	control := domain.NotificationRecord{ID: "control", Type: domain.NotificationControlPlaneFailed}
+	_ = hub.Publish(context.Background(), control)
+	for project, ch := range map[string]<-chan domain.NotificationRecord{"mer": merCh, "ao": aoCh} {
+		select {
+		case got := <-ch:
+			if got.ID != control.ID {
+				t.Fatalf("%s control notification = %+v", project, got)
+			}
+		default:
+			t.Fatalf("%s project subscriber did not receive daemon control notification", project)
+		}
+	}
+}
