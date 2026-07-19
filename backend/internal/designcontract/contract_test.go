@@ -807,11 +807,8 @@ func TestConcurrentMaterializePRWritesCompleteSerializedProjections(t *testing.T
 	wg.Wait()
 	close(errs)
 	for err := range errs {
-		if err != nil && runtime.GOOS == "windows" {
+		if err != nil {
 			t.Fatalf("concurrent materialize: %v", err)
-		}
-		if err != nil && !strings.Contains(err.Error(), "refresh is unavailable") {
-			t.Fatalf("unexpected fail-closed materialize error: %v", err)
 		}
 	}
 
