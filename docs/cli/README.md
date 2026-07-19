@@ -96,6 +96,11 @@ check is owned by the daemon rather than the agent terminal process tree. It
 prints the bounded log path under session-scoped `AO_DATA_DIR` storage; see
 [workspace verification](../verification.md).
 
+The opaque capability prevents blind or accidental cross-session requests; it
+is not an OS-identity boundary against hostile same-UID workers. AO itself does
+not provide that isolation; hardening is tracked in
+[#150](https://github.com/xuelongmu/agent-orchestrator/issues/150).
+
 `go run .` in `backend/` remains a compatibility wrapper around the daemon.
 
 PR and review actions (merge, resolve-comments, review execute/send) are

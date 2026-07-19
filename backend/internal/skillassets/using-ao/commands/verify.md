@@ -5,6 +5,10 @@ terminal/ConPTY process tree. This command must run inside an AO session because
 it resolves the workspace from `AO_SESSION_ID` and authenticates with the
 session-scoped `AO_VERIFY_CAPABILITY` injected by AO.
 
+This opaque value binds normal CLI requests and prevents blind or accidental
+cross-session use. AO itself does not provide an OS-identity boundary between
+same-user workers; hostile same-UID isolation is tracked in #150.
+
 ```text
 ao verify <profile>
 ```

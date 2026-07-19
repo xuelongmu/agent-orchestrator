@@ -60,10 +60,14 @@ is validated. Configure a native executable instead.
 AO injects an opaque `AO_VERIFY_CAPABILITY` into each managed session. `ao
 verify` sends it as the required `X-AO-Verification-Capability` request header.
 The daemon verifies the capability against both the requested session and its
-project before returning session-, workspace-, or project-specific state. A
-capability from one session therefore cannot request verification for another
-session, even when its identifier is known. Do not copy capabilities between
-sessions or put them in logs.
+project before returning session-, workspace-, or project-specific state. This
+binds normal CLI requests and prevents blind or accidental cross-session calls.
+Workers run as the same OS user, and AO itself does not provide an OS-identity
+isolation boundary between them. A hostile same-UID worker that reads another
+session's process environment or `AO_DATA_DIR` is therefore outside this
+authorization boundary. OS-isolated authorization hardening is tracked in
+[#150](https://github.com/xuelongmu/agent-orchestrator/issues/150). Do not copy
+capabilities between sessions or put them in logs.
 
 The route is `POST /api/v1/sessions/{sessionId}/verify`. It intentionally
 bypasses the ordinary short REST timeout, enforces its own profile timeout, and
