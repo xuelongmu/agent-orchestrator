@@ -30,6 +30,7 @@ import (
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
+	verifysvc "github.com/aoagents/agent-orchestrator/backend/internal/service/verification"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
 )
@@ -187,6 +188,7 @@ func Run() error {
 		Activity:           lcStack.LCM,
 		Telemetry:          telemetrySink,
 		Mobile:             mc,
+		Verification:       verifysvc.New(verifysvc.Deps{Store: store, Root: ctx}),
 	})
 	if err != nil {
 		stop()

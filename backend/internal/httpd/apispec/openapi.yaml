@@ -1713,6 +1713,64 @@ paths:
       summary: Send a message to a running session's agent
       tags:
       - sessions
+  /api/v1/sessions/{sessionId}/verify:
+    post:
+      operationId: runVerification
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Run an allowed verification profile outside the worker terminal process
+        tree
+      tags:
+      - verification
   /api/v1/sessions/{sessionId}/workspace/file:
     get:
       operationId: getSessionWorkspaceFile
@@ -2535,6 +2593,10 @@ components:
           type: array
         trackerIntake:
           $ref: '#/components/schemas/TrackerIntakeConfig'
+        verification:
+          additionalProperties:
+            $ref: '#/components/schemas/VerificationCommand'
+          type: object
         worker:
           $ref: '#/components/schemas/RoleOverride'
         workspaceKind:
@@ -3296,6 +3358,62 @@ components:
       - reviewerHandleId
       - reviews
       type: object
+    VerificationCommand:
+      properties:
+        argv:
+          items:
+            type: string
+          type: array
+        timeoutSeconds:
+          maximum: 3600
+          minimum: 0
+          type: integer
+        workingDirectory:
+          type: string
+      required:
+      - argv
+      type: object
+    VerifyRequest:
+      properties:
+        profile:
+          minLength: 1
+          type: string
+      required:
+      - profile
+      type: object
+    VerifyResponse:
+      properties:
+        durationMs:
+          format: int64
+          type: integer
+        error:
+          type: string
+        exitCode:
+          type: integer
+        logPath:
+          type: string
+        outcome:
+          enum:
+          - passed
+          - failed
+          - canceled
+          - timed_out
+          type: string
+        profile:
+          type: string
+        sessionId:
+          type: string
+        truncated:
+          type: boolean
+      required:
+      - sessionId
+      - profile
+      - outcome
+      - exitCode
+      - logPath
+      - truncated
+      - durationMs
+      type: object
     WorkspaceFileResponse:
       properties:
         additions:
@@ -3404,3 +3522,5 @@ tags:
   name: import
 - description: Connect Mobile LAN bridge control (loopback/desktop only)
   name: mobile
+- description: Loopback-only out-of-band workspace verification
+  name: verification

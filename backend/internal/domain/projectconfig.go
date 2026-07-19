@@ -14,9 +14,10 @@ import (
 //
 // Only fields with a live consumer are modeled: DefaultBranch, Env, Symlinks,
 // PostCreate, AgentConfig, prompt rules, and the role overrides are consumed at
-// spawn; SessionPrefix feeds the display prefix. Settings whose consumers do not
-// yet exist (tracker/SCM per-project config) are intentionally absent and land in
-// focused follow-up PRs alongside the code that reads them.
+// spawn; SessionPrefix feeds the display prefix; Verification is consumed by
+// the daemon verification service. Settings whose consumers do not yet exist
+// (tracker/SCM per-project config) are intentionally absent and land in focused
+// follow-up PRs alongside the code that reads them.
 type ProjectConfig struct {
 	// WorkspaceKind is the default filesystem shape for new sessions. Empty is
 	// the backwards-compatible git worktree default.
@@ -61,6 +62,19 @@ type ProjectConfig struct {
 	// read-only toward the tracker in v1: matching issues spawn sessions, but the
 	// tracker is not commented on or transitioned.
 	TrackerIntake TrackerIntakeConfig `json:"trackerIntake,omitempty"`
+
+	// Verification is the allowlist of out-of-band checks agents may request.
+	// The CLI selects a key; it never sends an executable or shell text.
+	Verification map[string]VerificationCommand `json:"verification,omitempty"`
+}
+
+// VerificationCommand is one configured, argv-based verification profile.
+// WorkingDirectory is relative to the session workspace. Commands are executed
+// directly (never through a shell), preserving argument boundaries.
+type VerificationCommand struct {
+	Argv             []string `json:"argv"`
+	WorkingDirectory string   `json:"workingDirectory,omitempty"`
+	TimeoutSeconds   int      `json:"timeoutSeconds,omitempty" minimum:"0" maximum:"3600"`
 }
 
 // ReviewPolicyConfig contains opt-in automation that mutates provider state.
@@ -169,6 +183,38 @@ func (c ProjectConfig) Validate() error {
 	}
 	if err := c.TrackerIntake.Validate(); err != nil {
 		return err
+	}
+	for name, command := range c.Verification {
+		if err := validateVerificationName(name); err != nil {
+			return err
+		}
+		if len(command.Argv) == 0 || strings.TrimSpace(command.Argv[0]) == "" {
+			return fmt.Errorf("verification.%s.argv: must contain an executable", name)
+		}
+		for i, arg := range command.Argv {
+			if strings.ContainsRune(arg, '\x00') {
+				return fmt.Errorf("verification.%s.argv[%d]: must not contain NUL", name, i)
+			}
+		}
+		if err := validateRepoRelative(command.WorkingDirectory); err != nil {
+			return fmt.Errorf("verification.%s.workingDirectory: %w", name, err)
+		}
+		if command.TimeoutSeconds < 0 || command.TimeoutSeconds > 3600 {
+			return fmt.Errorf("verification.%s.timeoutSeconds: must be between 0 and 3600", name)
+		}
+	}
+	return nil
+}
+
+func validateVerificationName(name string) error {
+	if name == "" || len(name) > 64 {
+		return fmt.Errorf("verification profile name %q: must be 1-64 characters", name)
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return fmt.Errorf("verification profile name %q: use lowercase letters, numbers, '.', '-', or '_'", name)
 	}
 	return nil
 }

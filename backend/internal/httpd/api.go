@@ -32,6 +32,7 @@ type APIDeps struct {
 	Events             cdcSubscriber
 	Telemetry          ports.EventSink
 	Mobile             *controllers.MobileController
+	Verification       controllers.VerificationService
 }
 
 // API owns one controller per resource and is the single Register call the
@@ -45,6 +46,7 @@ type API struct {
 	reviews       *controllers.ReviewsController
 	notifications *controllers.NotificationsController
 	imports       *controllers.ImportController
+	verification  *controllers.VerificationController
 	events        *EventsController
 }
 
@@ -68,6 +70,7 @@ func NewAPI(cfg config.Config, deps APIDeps) *API {
 		reviews:       &controllers.ReviewsController{Svc: deps.Reviews},
 		notifications: &controllers.NotificationsController{Svc: deps.Notifications, Stream: deps.NotificationStream},
 		imports:       &controllers.ImportController{Svc: deps.Import},
+		verification:  &controllers.VerificationController{Svc: deps.Verification},
 		events:        &EventsController{Source: deps.CDC, Live: deps.Events},
 	}
 }
@@ -94,6 +97,21 @@ func (a *API) Register(root chi.Router) {
 			a.notifications.Register(r)
 			a.imports.Register(r)
 			// Sibling REST controllers plug in here.
+		})
+		// Verification can run longer than the ordinary REST timeout. It is
+		// request-cancelable and has its own configured timeout in the service.
+		// Keep this process-launching surface loopback-only.
+		r.Group(func(r chi.Router) {
+			r.Use(func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					if !localControlRequest(req) {
+						notFoundJSON(w, req)
+						return
+					}
+					next.ServeHTTP(w, req)
+				})
+			})
+			a.verification.Register(r)
 		})
 		// Long-lived streams intentionally bypass the REST timeout middleware.
 		a.notifications.RegisterStream(r)

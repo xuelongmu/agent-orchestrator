@@ -1,7 +1,7 @@
 ---
 name: using-ao
-description: Catalog of the AO (Agent Orchestrator) `ao` CLI: spawning workers, managing sessions and projects, sending messages, previewing pages, and daemon control. Use when using the ao CLI, spawning workers, or managing AO sessions in an AO workspace.
-trigger: Using the ao CLI in an AO workspace: spawning workers, managing sessions/projects, sending messages, previewing pages.
+description: Catalog of the AO (Agent Orchestrator) `ao` CLI: spawning workers, managing sessions and projects, sending messages, previewing pages, running verification, and daemon control. Use when using the ao CLI, spawning workers, or managing AO sessions in an AO workspace.
+trigger: Using the ao CLI in an AO workspace: spawning workers, managing sessions/projects, sending messages, previewing pages, or running verification.
 ---
 
 # AO CLI Catalog
@@ -17,6 +17,7 @@ trigger: Using the ao CLI in an AO workspace: spawning workers, managing session
 | `review` | Submit a reviewer result for a worker's PR | Completing a code review loop | [commands/review.md](commands/review.md) |
 | `send` | Send a message to a running agent session | Correcting or directing a live agent | [commands/send.md](commands/send.md) |
 | `preview` | Open a URL in the desktop browser panel | Demoing a local server or file from inside a session | [commands/preview.md](commands/preview.md) |
+| `verify` | Run an allowed check outside the agent terminal tree | Checking focused backend/frontend work without loading the ConPTY | [commands/verify.md](commands/verify.md) |
 | `start` | Fetch (if needed) and open the AO desktop app | Launching the app | [commands/start.md](commands/start.md) |
 | `stop` | Stop the AO daemon | Shutting down AO | [commands/stop.md](commands/stop.md) |
 | `status` | Show daemon status | Verifying the daemon is up and healthy | [commands/status.md](commands/status.md) |

@@ -56,6 +56,7 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 | `ao orchestrator ls`                | `GET /api/v1/orchestrators`                    |
 | `ao send`                           | `POST /api/v1/sessions/{id}/send`              |
 | `ao preview [url]`                  | `POST /api/v1/sessions/{id}/preview`           |
+| `ao verify <profile>`                | `POST /api/v1/sessions/{id}/verify`            |
 | `ao hooks <agent> <event>`          | `POST /api/v1/sessions/{id}/activity` (hidden) |
 
 `ao agent ls` prints the daemon-supported agent catalog with local install/auth
@@ -87,6 +88,11 @@ path and never removes that shared directory. Set the per-project default with
 (it is meant to run inside a session), not a flag. With no argument it
 autodetects an `index.html` in the session workspace; with a URL argument it
 opens that URL verbatim (`file://`, `http`, `https`).
+
+`ao verify` resolves its session from `AO_SESSION_ID` and runs only a named,
+daemon-resolved verification profile. The check is owned by the daemon rather
+than the agent terminal process tree. It prints the bounded
+`.ao/verify-<n>.log` path; see [workspace verification](../verification.md).
 
 `go run .` in `backend/` remains a compatibility wrapper around the daemon.
 
