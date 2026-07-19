@@ -925,18 +925,25 @@ func (m *Manager) scheduleCleanupRetry(id domain.SessionID, lease string) {
 		return
 	}
 	m.cleanupRetries[id] = lease
+	m.armCleanupRetryLocked(id, lease)
 	m.cleanupRetryMu.Unlock()
+}
+
+func (m *Manager) armCleanupRetryLocked(id domain.SessionID, lease string) {
 	time.AfterFunc(m.cleanupRetryDelay, func() {
 		err := m.cleanupCompletedSessionOwned(context.Background(), id, lease)
 		m.cleanupRetryMu.Lock()
 		current, ownsGeneration := m.cleanupRetries[id]
 		if ownsGeneration && current == lease {
-			delete(m.cleanupRetries, id)
+			if err != nil {
+				// Retain ownership while arming the next timer under the same lock;
+				// a newer lease cannot be overwritten in the rearm gap.
+				m.armCleanupRetryLocked(id, lease)
+			} else {
+				delete(m.cleanupRetries, id)
+			}
 		}
 		m.cleanupRetryMu.Unlock()
-		if err != nil && ownsGeneration && current == lease {
-			m.scheduleCleanupRetry(id, lease)
-		}
 	})
 }
 

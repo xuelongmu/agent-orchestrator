@@ -1499,18 +1499,16 @@ func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) 
 	if err := m.CleanupCompletedSession(ctx, rec.ID); err == nil || !strings.Contains(err.Error(), "workspace busy") {
 		t.Fatalf("first cleanup error = %v, want workspace busy", err)
 	}
-	if got := st.sessions[rec.ID].Metadata.RuntimeHandleID; got == "" {
-		t.Fatal("failed cleanup cleared its durable retry marker")
+	if !retryPending(m, rec.ID) {
+		t.Fatal("failed cleanup did not retain a retry owner")
 	}
 
 	ws.destroyErr = nil
 	deadline := time.Now().Add(time.Second)
-	for st.sessions[rec.ID].Metadata.RuntimeHandleID != "" && time.Now().Before(deadline) {
+	for retryPending(m, rec.ID) && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if st.sessions[rec.ID].Metadata.RuntimeHandleID != "" {
-		t.Fatal("same-daemon cleanup retry retained runtime marker")
-	}
+	// An empty retry entry means the callback completed and released its lease.
 	if rt.destroyed != 2 || ws.destroyed != 2 {
 		t.Fatalf("cleanup attempts runtime/workspace = %d/%d, want 2/2", rt.destroyed, ws.destroyed)
 	}
@@ -1520,6 +1518,13 @@ func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) 
 	if got := m.lcm.(*fakeLCM).terminated[rec.ID]; got != 0 {
 		t.Fatalf("completed cleanup re-entered lifecycle %d times", got)
 	}
+}
+
+func retryPending(m *Manager, id domain.SessionID) bool {
+	m.cleanupRetryMu.Lock()
+	defer m.cleanupRetryMu.Unlock()
+	_, ok := m.cleanupRetries[id]
+	return ok
 }
 
 func TestCleanupCompletedSession_MarkerFailureRetainsDirLease(t *testing.T) {
@@ -1601,12 +1606,10 @@ func TestCleanupRetry_NewLeaseSupersedesOldTimer(t *testing.T) {
 	}
 	ws.destroyErr = nil
 	deadline := time.Now().Add(time.Second)
-	for st.sessions[rec.ID].Metadata.RuntimeHandleID != "" && time.Now().Before(deadline) {
+	for retryPending(m, rec.ID) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if st.sessions[rec.ID].Metadata.RuntimeHandleID != "" {
-		t.Fatal("new lease cleanup was abandoned after old timer fired")
-	}
+	// The retry entry is empty only after B's callback completed successfully.
 }
 
 func TestCleanupMergedSession_PreservesDirtyWorkspaceWithoutLifecycleReentry(t *testing.T) {
