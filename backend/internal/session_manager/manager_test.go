@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 var ctx = context.Background()
 
 type fakeStore struct {
+	mu            sync.RWMutex
 	sessions      map[domain.SessionID]domain.SessionRecord
 	pr            map[domain.SessionID]domain.PRFacts
 	projects      map[string]domain.ProjectRecord
@@ -59,6 +61,8 @@ func (f *fakeStore) CreateSession(_ context.Context, rec domain.SessionRecord) (
 	return rec, nil
 }
 func (f *fakeStore) UpdateSession(_ context.Context, rec domain.SessionRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.sessions[rec.ID] = rec
 	return nil
 }
@@ -95,8 +99,16 @@ func (f *fakeStore) ClearPendingSubmit(_ context.Context, id domain.SessionID, f
 	return true, nil
 }
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	r, ok := f.sessions[id]
 	return r, ok, nil
+}
+
+func (f *fakeStore) setSession(rec domain.SessionRecord) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessions[rec.ID] = rec
 }
 func (f *fakeStore) ListSessions(_ context.Context, p domain.ProjectID) ([]domain.SessionRecord, error) {
 	var out []domain.SessionRecord
@@ -1492,7 +1504,7 @@ func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) 
 	rec.IsTerminated = true
 	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
 	rec.Metadata.WorkspaceKind = domain.WorkspaceKindScratch
-	st.sessions[rec.ID] = rec
+	st.setSession(rec)
 	ws.destroyErr = errors.New("workspace busy")
 	m.cleanupRetryDelay = time.Millisecond
 
@@ -1533,7 +1545,7 @@ func TestCleanupCompletedSession_MarkerFailureRetainsDirLease(t *testing.T) {
 	rec.IsTerminated = true
 	rec.Activity = domain.Activity{State: domain.ActivityExited}
 	rec.Metadata.WorkspaceKind = domain.WorkspaceKindDir
-	st.sessions[rec.ID] = rec
+	st.setSession(rec)
 	st.deleteWTErr = errors.New("marker busy")
 	if err := m.CleanupCompletedSession(ctx, rec.ID); err == nil {
 		t.Fatal("marker deletion failure returned nil")
@@ -1593,13 +1605,13 @@ func TestCleanupRetry_NewLeaseSupersedesOldTimer(t *testing.T) {
 	rec.Metadata.WorkspaceKind = domain.WorkspaceKindScratch
 	rec.Metadata.WorkspacePath = "/scratch/a"
 	rec.Metadata.RuntimeHandleID = "lease-a"
-	st.sessions[rec.ID] = rec
+	st.setSession(rec)
 	m.scheduleCleanupRetry(rec.ID, "lease-a")
 	// Before A fires, a replacement gets a new durable lease and its cleanup
 	// fails. Scheduling B must supersede A rather than being suppressed by ID.
 	rec.Metadata.RuntimeHandleID = "lease-b"
 	rec.Metadata.WorkspacePath = "/scratch/b"
-	st.sessions[rec.ID] = rec
+	st.setSession(rec)
 	ws.destroyErr = errors.New("busy")
 	if err := m.CleanupCompletedSession(ctx, rec.ID); err == nil {
 		t.Fatal("lease B cleanup unexpectedly succeeded")
