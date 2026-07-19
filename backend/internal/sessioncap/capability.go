@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -30,17 +31,36 @@ func Open(dataDir string) (*Manager, error) {
 		return nil, fmt.Errorf("open capability root: %w", err)
 	}
 	defer func() { _ = root.Close() }()
-	file, err := root.OpenFile(keyFileName, os.O_RDONLY, 0)
+	manager, err := load(root)
 	if os.IsNotExist(err) {
 		return create(root)
 	}
+	if errors.Is(err, errPartialKey) {
+		if removeErr := root.Remove(keyFileName); removeErr != nil {
+			return nil, fmt.Errorf("remove incomplete capability key: %w", removeErr)
+		}
+		return create(root)
+	}
+	return manager, err
+}
+
+var errPartialKey = errors.New("incomplete capability key")
+
+func load(root *os.Root) (*Manager, error) {
+	file, err := root.OpenFile(keyFileName, os.O_RDONLY, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open capability key: %w", err)
+		return nil, err
 	}
 	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() != keyBytes {
-		return nil, fmt.Errorf("capability key must be a %d-byte regular file", keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("stat capability key: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("capability key must be a regular file")
+	}
+	if info.Size() != keyBytes {
+		return nil, errPartialKey
 	}
 	manager := &Manager{}
 	if _, err := io.ReadFull(file, manager.key[:]); err != nil {
@@ -63,16 +83,39 @@ func create(root *os.Root) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	file, err := root.OpenFile(keyFileName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("create capability key: %w", err)
+	tempEntropy := make([]byte, 12)
+	if _, err := rand.Read(tempEntropy); err != nil {
+		return nil, fmt.Errorf("name capability key temporary file: %w", err)
 	}
-	if _, err := file.Write(manager.key[:]); err != nil {
+	tempName := fmt.Sprintf(".%s.tmp-%x", keyFileName, tempEntropy)
+	file, err := root.OpenFile(tempName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("create capability key temporary file: %w", err)
+	}
+	defer func() { _ = root.Remove(tempName) }()
+	if n, err := file.Write(manager.key[:]); err != nil || n != keyBytes {
 		_ = file.Close()
-		return nil, fmt.Errorf("write capability key: %w", err)
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		return nil, fmt.Errorf("write capability key: wrote %d bytes: %w", n, err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("sync capability key: %w", err)
 	}
 	if err := file.Close(); err != nil {
 		return nil, fmt.Errorf("close capability key: %w", err)
+	}
+	if err := root.Link(tempName, keyFileName); err != nil {
+		if os.IsExist(err) {
+			return load(root)
+		}
+		return nil, fmt.Errorf("publish capability key: %w", err)
+	}
+	if dir, err := root.Open("."); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 	return manager, nil
 }

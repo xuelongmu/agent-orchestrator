@@ -74,6 +74,27 @@ jobs:
             exit 1
           fi
 
+  verification-runner:
+    name: Verification runner (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+
+      - name: Test out-of-band verification lifecycle
+        run: go test -count=1 ./internal/service/verification
+
   lint:
     runs-on: ubuntu-latest
     steps:

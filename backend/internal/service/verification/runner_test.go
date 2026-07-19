@@ -160,6 +160,18 @@ func TestVerificationProcessHelper(t *testing.T) {
 			os.Exit(92)
 		}
 		os.Exit(0)
+	case "inherited-output-parent":
+		cmd := exec.Command(os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "child")
+		cmd.Env = os.Environ()
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		configureDetachedChild(cmd)
+		if err := cmd.Start(); err != nil {
+			os.Exit(91)
+		}
+		if err := os.WriteFile(os.Args[idx+2], []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+			os.Exit(92)
+		}
+		os.Exit(0)
 	case "outer-runner":
 		_, _ = testOSRunner().Run(context.Background(), RunSpec{
 			Argv:   []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "parent", os.Args[idx+2]},

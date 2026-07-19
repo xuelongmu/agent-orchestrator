@@ -171,6 +171,9 @@ func validateCommand(command Command) error {
 	if _, shell := map[string]struct{}{"sh": {}, "bash": {}, "dash": {}, "zsh": {}, "fish": {}, "ksh": {}, "cmd": {}, "powershell": {}, "pwsh": {}, "wscript": {}, "cscript": {}, "mshta": {}, "osascript": {}}[executable]; shell {
 		return fmt.Errorf("shell executable %q is not allowed", command.Argv[0])
 	}
+	if err := validatePlatformExecutable(command.Argv[0]); err != nil {
+		return err
+	}
 	if err := validateRelativeDirectory(command.WorkingDirectory); err != nil {
 		return err
 	}

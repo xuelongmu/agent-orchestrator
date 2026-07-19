@@ -50,6 +50,11 @@ Configured commands preserve argument boundaries and known shell executables
 are rejected. Working directories are resolved through symlinks and must stay
 under the owning session's workspace.
 
+On Windows, the built-in `npm` profile is translated internally to
+`node.exe <npm-cli.js> ...`; AO never invokes `cmd.exe`. Other executables that
+resolve through `PATHEXT` to `.cmd` or `.bat` are rejected when startup policy
+is validated. Configure a native executable instead.
+
 ## Session authorization
 
 AO injects an opaque `AO_VERIFY_CAPABILITY` into each managed session. `ao
@@ -91,6 +96,8 @@ it allocates the next log number and applies the same retention cleanup.
 
 Unix process groups contain ordinary child and grandchild processes, including
 when the daemon exits unexpectedly. A deliberately hostile verifier descendant
-can call `setsid(2)` to leave that process group; portable Darwin job-style
-containment is not available, so operator policy must approve only trusted
-verification tools. Windows Job Object containment does not have this gap.
+can call `setsid(2)` to leave that process group and is not yet covered;
+portable Darwin job-style containment is not available. This limitation is
+tracked in [#149](https://github.com/xuelongmu/agent-orchestrator/issues/149),
+so operator policy must approve only trusted verification tools. Windows Job
+Object containment does not have this gap.
