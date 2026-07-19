@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -57,4 +58,33 @@ func (s *Store) inTx(ctx context.Context, what string, fn func(*gen.Queries) err
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	return tx.Commit()
+}
+
+// inImmediateTx acquires SQLite's writer lock before fn performs its first
+// read. Use it for compare-and-swap workflows shared by independent Store
+// instances; a deferred transaction could otherwise read a snapshot and fail
+// to upgrade after a competing writer commits.
+//
+// The caller must already hold writeMu.
+func (s *Store) inImmediateTx(ctx context.Context, what string, fn func(*gen.Queries) error) (retErr error) {
+	conn, err := s.writeDB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("open %s connection: %w", what, err)
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close %s connection: %w", what, err))
+		}
+	}()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin %s: %w", what, err)
+	}
+	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
+	if err := fn(gen.New(conn)); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit %s: %w", what, err)
+	}
+	return nil
 }

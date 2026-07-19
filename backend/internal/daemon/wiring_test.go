@@ -426,6 +426,12 @@ func TestWiring_StartLifecycleThreadsMessengerIntoLCM(t *testing.T) {
 			FailedChecks: []ports.SCMCheckObservation{{Name: "build", Status: string(domain.PRCheckFailed), LogTail: "boom"}},
 		},
 	}
+	if err := store.WriteSCMObservation(ctx, domain.PullRequest{
+		URL: obs.PR.URL, SessionID: rec.ID, Number: obs.PR.Number,
+		HeadSHA: obs.PR.HeadSHA, UpdatedAt: time.Now(),
+	}, nil, nil, nil, nil, ports.ReviewWritePreserve); err != nil {
+		t.Fatalf("persist authoritative PR head: %v", err)
+	}
 	if err := stack.LCM.ApplySCMObservation(ctx, rec.ID, obs); err != nil {
 		t.Fatalf("ApplySCMObservation: %v", err)
 	}

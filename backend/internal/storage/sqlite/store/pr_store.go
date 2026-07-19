@@ -449,6 +449,7 @@ func genLegacyPRParams(r domain.PullRequest) gen.UpsertLegacyPRParams {
 		CIState:        ciOrDefault(r.CI),
 		Mergeability:   mergeabilityOrDefault(r.Mergeability),
 		UpdatedAt:      r.UpdatedAt,
+		HeadSha:        r.HeadSHA,
 		IsDraft:        boolInt(r.Draft),
 		IsMerged:       boolInt(r.Merged),
 		IsClosed:       boolInt(r.Closed),

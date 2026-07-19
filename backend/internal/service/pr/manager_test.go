@@ -51,14 +51,14 @@ func newPRManager() (*Manager, *fakeWriter, *fakeLifecycle) {
 func TestApplyObservation_WritesPRChecksAndComments(t *testing.T) {
 	m, fw, fl := newPRManager()
 	o := ports.PRObservation{
-		Fetched: true, URL: "https://example/pr/1", Number: 1, CI: domain.CIFailing,
+		Fetched: true, URL: "https://example/pr/1", Number: 1, HeadSHA: "c1", CI: domain.CIFailing,
 		Checks:   []ports.PRCheckObservation{{Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed, LogTail: "boom"}},
 		Comments: []ports.PRCommentObservation{{ID: "1", Author: "greptileai", Body: "use a constant here"}},
 	}
 	if err := m.ApplyObservation(context.Background(), "mer-1", o); err != nil {
 		t.Fatal(err)
 	}
-	if got := fw.pr["mer-1"]; got.URL != o.URL || got.CI != domain.CIFailing {
+	if got := fw.pr["mer-1"]; got.URL != o.URL || got.CI != domain.CIFailing || got.HeadSHA != "c1" {
 		t.Fatalf("pr not written: %+v", got)
 	}
 	if len(fw.checks) != 1 || fw.checks[0].CreatedAt.IsZero() {

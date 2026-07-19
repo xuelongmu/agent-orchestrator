@@ -11,6 +11,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -45,6 +46,22 @@ type scmMessengerSpy struct {
 type scmCapturedNudge struct {
 	session domain.SessionID
 	body    string
+}
+
+type scmRetryNotificationSink struct {
+	calls         int
+	failRemaining int
+	intents       []ports.NotificationIntent
+}
+
+func (s *scmRetryNotificationSink) Notify(_ context.Context, intent ports.NotificationIntent) error {
+	s.calls++
+	s.intents = append(s.intents, intent)
+	if s.failRemaining > 0 {
+		s.failRemaining--
+		return errors.New("notification unavailable")
+	}
+	return nil
 }
 
 type scmMergedCleaner struct {
@@ -394,6 +411,78 @@ func TestSCMObserverEndToEnd(t *testing.T) {
 		}
 		if sigAfterSecondPoll != sigBeforeSecondPoll {
 			t.Fatalf("idempotent re-poll mutated last_nudge_signature: before=%q after=%q", sigBeforeSecondPoll, sigAfterSecondPoll)
+		}
+	})
+
+	t.Run("uncertain reaction retries failed operator handoff before semantic acknowledgement", func(t *testing.T) {
+		ctx := context.Background()
+		f := newSCMFixture(t, "feat/x")
+		const (
+			prURL   = "https://github.com/octocat/hello/pull/43"
+			headSHA = "uncertain-head"
+		)
+		f.provider.detected["feat/x"] = ports.SCMPRObservation{
+			URL: prURL, Number: 43, SourceBranch: "feat/x", HeadRepo: scmTestRepo.Repo, TargetBranch: "main", HeadSHA: headSHA,
+		}
+		f.provider.observations[43] = failingSCMObservation(prURL, 43, headSHA, "FAILED: uncertain delivery\n")
+
+		// Seed the authoritative PR row and model a daemon crash after Start but
+		// before Commit. The pane outcome is permanently unknown and must never
+		// be retried automatically.
+		if err := f.store.WriteSCMObservation(ctx, domain.PullRequest{
+			URL: prURL, SessionID: f.session.ID, Number: 43, SourceBranch: "feat/x",
+			TargetBranch: "main", HeadSHA: headSHA, UpdatedAt: f.now,
+		}, nil, nil, nil, nil, ports.ReviewWritePreserve); err != nil {
+			t.Fatalf("seed PR: %v", err)
+		}
+		key := "ci:" + prURL
+		fences := []ports.PRReactionFence{{PRURL: prURL, SessionID: f.session.ID, HeadSHA: headSHA}}
+		reserved, err := f.store.ReservePRReaction(ctx, prURL, key, "crashed-signature", 0, "crashed-owner", fences, f.now, f.now.Add(time.Minute))
+		if err != nil || reserved.Status != ports.PRReactionReserved {
+			t.Fatalf("reserve crashed reaction = %+v, err=%v", reserved, err)
+		}
+		started, err := f.store.StartPRReaction(ctx, prURL, key, "crashed-owner", f.now, f.now.Add(time.Minute))
+		if err != nil || started.Status != ports.PRReactionReserved {
+			t.Fatalf("start crashed reaction = %+v, err=%v", started, err)
+		}
+
+		sink := &scmRetryNotificationSink{failRemaining: 1}
+		f.lcm = lifecycle.New(f.store, f.spy, lifecycle.WithNotificationSink(sink))
+		f.observer = scmobserve.New(f.provider, f.store, f.lcm, scmobserve.Config{
+			Tick: time.Hour, Clock: func() time.Time { return f.now },
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+
+		if err := f.observer.Poll(ctx); err != nil {
+			t.Fatalf("first Poll: %v", err)
+		}
+		pr, ok, err := f.store.GetPR(ctx, prURL)
+		if err != nil || !ok {
+			t.Fatalf("GetPR after failed handoff: ok=%v err=%v", ok, err)
+		}
+		if pr.CIHash != "" {
+			t.Fatalf("failed handoff acknowledged CI semantic hash %q", pr.CIHash)
+		}
+		if sink.calls != 1 || f.spy.count() != 0 {
+			t.Fatalf("first poll calls=%d pane writes=%d, want failed alert and no resend", sink.calls, f.spy.count())
+		}
+
+		if err := f.observer.Poll(ctx); err != nil {
+			t.Fatalf("retry Poll: %v", err)
+		}
+		pr, ok, err = f.store.GetPR(ctx, prURL)
+		if err != nil || !ok || pr.CIHash == "" {
+			t.Fatalf("successful handoff did not acknowledge CI semantics: pr=%+v ok=%v err=%v", pr, ok, err)
+		}
+		if sink.calls != 2 || f.spy.count() != 0 {
+			t.Fatalf("retry calls=%d pane writes=%d, want one successful alert and no resend", sink.calls, f.spy.count())
+		}
+
+		if err := f.observer.Poll(ctx); err != nil {
+			t.Fatalf("settled Poll: %v", err)
+		}
+		if sink.calls != 2 || f.spy.count() != 0 {
+			t.Fatalf("settled poll duplicated alert or pane write: calls=%d writes=%d", sink.calls, f.spy.count())
 		}
 	})
 

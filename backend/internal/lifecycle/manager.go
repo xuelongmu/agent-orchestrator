@@ -39,6 +39,16 @@ type designContractDeliveryStore interface {
 	CompletePRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error)
 }
 
+// reactionReservationStore is the atomic pre-send boundary implemented by the
+// SQLite store. Keeping it optional preserves the reducer's existing in-memory
+// fallback for tests and non-SQLite embeddings.
+type reactionReservationStore interface {
+	ReservePRReaction(ctx context.Context, prURL, key, signature string, maxAttempts int, ownerToken string, fences []ports.PRReactionFence, now, leaseExpiresAt time.Time) (ports.PRReactionReservation, error)
+	StartPRReaction(ctx context.Context, prURL, key, ownerToken string, now, leaseExpiresAt time.Time) (ports.PRReactionReservation, error)
+	CommitPRReaction(ctx context.Context, prURL, key, ownerToken string) (bool, error)
+	ReleasePRReaction(ctx context.Context, prURL, key, ownerToken string) (bool, error)
+}
+
 // simplificationEventStore is the transactional local telemetry boundary for
 // simplification activity. It is kept separate from sessionStore because only
 // review delivery needs to mutate review_run state.

@@ -129,6 +129,22 @@ type PRDesignContract struct {
 	UpdatedAt                 time.Time
 }
 
+type PRReactionReservation struct {
+	PRURL                    string
+	ReactionKey              string
+	OwnerToken               string
+	Phase                    string
+	Signature                string
+	ExpectedFences           string
+	PreviousSignaturePresent bool
+	PreviousSignature        string
+	PreviousAttemptsPresent  bool
+	PreviousAttempts         int64
+	ReservedAttempts         int64
+	ReservedAt               time.Time
+	LeaseExpiresAt           time.Time
+}
+
 type PRReview struct {
 	PRURL       string
 	ReviewID    string
