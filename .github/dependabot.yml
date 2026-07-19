@@ -41,3 +41,12 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  - package-ecosystem: github-actions
+    directory: "/.github/actions/macos-signing-setup"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
