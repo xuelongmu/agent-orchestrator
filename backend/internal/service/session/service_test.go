@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -302,6 +303,45 @@ func TestGetWorkspaceFileReturnsContentAndDiff(t *testing.T) {
 	}
 	if !strings.Contains(got.Diff, "-hello") || !strings.Contains(got.Diff, "+updated") {
 		t.Fatalf("diff did not include expected old/new lines:\n%s", got.Diff)
+	}
+}
+
+func TestWorkspaceFilesSupportNonGitScratchDirectories(t *testing.T) {
+	root := t.TempDir()
+	writeWorkspaceFile(t, root, "notes/research.md", "findings\n")
+	st := newFakeStore()
+	st.sessions["ao-1"] = domain.SessionRecord{ID: "ao-1", Metadata: domain.SessionMetadata{
+		WorkspaceKind: domain.WorkspaceKindScratch,
+		WorkspacePath: root,
+	}}
+	svc := &Service{store: st}
+	files, err := svc.ListWorkspaceFiles(context.Background(), "ao-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files.Files) != 1 || files.Files[0].Path != "notes/research.md" || files.Files[0].Status != WorkspaceFileAdded {
+		t.Fatalf("files = %#v", files.Files)
+	}
+	detail, err := svc.GetWorkspaceFile(context.Background(), "ao-1", "notes/research.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Content != "findings\n" || detail.Diff != "" || detail.Status != WorkspaceFileAdded {
+		t.Fatalf("detail = %#v", detail)
+	}
+}
+
+func TestPlainWorkspaceFilesStopsAtLimit(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		writeWorkspaceFile(t, root, name, name)
+	}
+	files, truncated, err := plainWorkspaceFilesLimit(root, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated || !reflect.DeepEqual(files, []string{"a.txt", "b.txt"}) {
+		t.Fatalf("files=%#v truncated=%v, want first two and truncated", files, truncated)
 	}
 }
 
@@ -844,6 +884,8 @@ func TestToAPIErrorMapsWorkspaceBranchSentinels(t *testing.T) {
 		{"runtime prerequisite missing", fmt.Errorf("spawn: %w: tmux required on macOS/Linux but not in PATH", ports.ErrRuntimePrerequisite), apierr.KindInvalid, "RUNTIME_PREREQUISITE_MISSING"},
 		{"unknown harness", fmt.Errorf("spawn: %w: %q", sessionmanager.ErrUnknownHarness, "bogus"), apierr.KindInvalid, "UNKNOWN_HARNESS"},
 		{"missing harness", fmt.Errorf("spawn: %w: configure project worker.agent or pass --harness", sessionmanager.ErrMissingHarness), apierr.KindInvalid, "AGENT_REQUIRED"},
+		{"shared directory unsupported", fmt.Errorf("spawn: %w", sessionmanager.ErrSharedDirUnsupported), apierr.KindInvalid, "SHARED_DIRECTORY_UNSUPPORTED"},
+		{"shared directory in use", fmt.Errorf("spawn: %w", sessionmanager.ErrSharedDirInUse), apierr.KindConflict, "SHARED_DIRECTORY_IN_USE"},
 		{"awaiting decision", fmt.Errorf("send mer-1: %w", sessionmanager.ErrAwaitingDecision), apierr.KindConflict, "SESSION_AWAITING_DECISION"},
 	}
 	for _, tc := range cases {
@@ -1022,6 +1064,20 @@ func (f fakeSCM) CheckoutPullRequest(_ context.Context, _ ports.SCMPRRef, _ port
 		*f.checkoutBranch = workspaceBranch
 	}
 	return f.checkoutChanged, f.checkoutErr
+}
+
+func TestClaimPRRejectsNonGitWorkspace(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{
+		WorkspaceKind: domain.WorkspaceKindScratch,
+		WorkspacePath: t.TempDir(),
+	}}
+	svc := NewWithDeps(Deps{Store: st})
+
+	_, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{})
+	if !errors.Is(err, ErrSessionWorkspaceNotGit) {
+		t.Fatalf("err = %v, want ErrSessionWorkspaceNotGit", err)
+	}
 }
 
 func TestClaimPRPreflightsActiveOwnerBeforeCheckout(t *testing.T) {

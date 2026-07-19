@@ -31,7 +31,7 @@ AI coding agents become much more useful when they can work in parallel, but par
 Agent Orchestrator is built to keep that loop visible and manageable. It helps you:
 
 - Start multiple agents from the same project without mixing their work
-- Keep every session in a separate git worktree
+- Keep coding sessions in separate git worktrees by default, with scratch and shared-directory workspaces for research, ops, and other non-git workloads
 - See which agents are working, waiting, finished, or blocked
 - Route CI failures, review comments, and merge conflicts back to the right session
 - Use different agent CLIs through one common supervisor
@@ -42,7 +42,7 @@ At a high level, Agent Orchestrator follows a simple loop:
 
 1. Add a project you want agents to work on.
 2. Start one or more sessions from the desktop app or CLI.
-3. AO creates an isolated git worktree for each session.
+3. AO creates the session workspace: an isolated git worktree by default, an ephemeral scratch directory, or the project's shared directory.
 4. AO launches the selected coding agent in that session's terminal runtime.
 5. The local daemon watches session state, terminal activity, pull requests, CI, and review feedback.
 6. The desktop app and CLI show the current state and let you send follow-up instructions to the right session.

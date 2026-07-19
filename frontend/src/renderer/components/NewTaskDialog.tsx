@@ -5,11 +5,12 @@ import { type FormEvent, useEffect, useId, useState } from "react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { RequiredAgentField } from "./CreateProjectAgentSheet";
 import type { components } from "../../api/schema";
 import { apiClient, apiErrorMessage } from "../lib/api-client";
 import { captureRendererEvent } from "../lib/telemetry";
-import type { AgentProvider } from "../types/workspace";
+import type { AgentProvider, WorkspaceKind } from "../types/workspace";
 import { agentsQueryKey, agentsQueryOptions, refreshAgents } from "../hooks/useAgentsQuery";
 
 type Project = components["schemas"]["Project"];
@@ -26,10 +27,12 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 	const titleId = useId();
 	const promptId = useId();
 	const branchId = useId();
+	const workspaceKindId = useId();
 	const agentId = useId();
 	const [title, setTitle] = useState("");
 	const [prompt, setPrompt] = useState("");
 	const [branch, setBranch] = useState("");
+	const [workspaceKind, setWorkspaceKind] = useState<WorkspaceKind | "">("");
 	const [agent, setAgent] = useState("");
 	const [agentTouched, setAgentTouched] = useState(false);
 	const [isSubmitting, setIsSubmitting] = useState(false);
@@ -56,6 +59,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 		onSuccess: (next) => queryClient.setQueryData(agentsQueryKey, next),
 	});
 	const defaultWorkerAgent = projectQuery.data?.config?.worker?.agent ?? "";
+	const effectiveWorkspaceKind = workspaceKind || projectQuery.data?.config?.workspaceKind || "worktree";
 	const agentCatalog = agentsQuery.data;
 
 	useEffect(() => {
@@ -63,6 +67,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 			setTitle("");
 			setPrompt("");
 			setBranch("");
+			setWorkspaceKind("");
 			setAgent("");
 			setAgentTouched(false);
 			setError(undefined);
@@ -99,7 +104,11 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 					harness: agentTouched && agent ? (agent as AgentProvider) : undefined,
 					issueId: cleanTitle,
 					prompt: cleanPrompt,
-					branch: cleanBranch || undefined,
+					// Omit the kind until the user explicitly overrides it. The daemon
+					// then resolves the durable project default even if this dialog was
+					// submitted before the project query finished loading.
+					workspaceKind: workspaceKind || undefined,
+					branch: effectiveWorkspaceKind === "worktree" ? cleanBranch || undefined : undefined,
 				},
 			});
 			if (apiError) throw new Error(apiErrorMessage(apiError, "Unable to start task"));
@@ -166,7 +175,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 							/>
 						</div>
 
-						<div className="grid gap-3 sm:grid-cols-[1fr_1fr]">
+						<div className="grid gap-3 sm:grid-cols-3">
 							<div className="space-y-1.5">
 								<RequiredAgentField
 									id={agentId}
@@ -192,6 +201,24 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 								</button>
 							</div>
 							<div className="space-y-1.5">
+								<Label className="text-xs font-medium text-muted-foreground" htmlFor={workspaceKindId}>
+									Workspace
+								</Label>
+								<Select
+									value={effectiveWorkspaceKind}
+									onValueChange={(value) => setWorkspaceKind(value as WorkspaceKind)}
+								>
+									<SelectTrigger id={workspaceKindId} size="sm" aria-label="Workspace">
+										<SelectValue />
+									</SelectTrigger>
+									<SelectContent>
+										<SelectItem value="worktree">Git worktree</SelectItem>
+										<SelectItem value="scratch">Scratch</SelectItem>
+										<SelectItem value="dir">Project directory</SelectItem>
+									</SelectContent>
+								</Select>
+							</div>
+							<div className="space-y-1.5">
 								<Label className="text-xs font-medium text-muted-foreground" htmlFor={branchId}>
 									Branch
 								</Label>
@@ -199,6 +226,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 									id={branchId}
 									placeholder="optional"
 									value={branch}
+									disabled={effectiveWorkspaceKind !== "worktree"}
 									onChange={(event) => setBranch(event.target.value)}
 								/>
 							</div>

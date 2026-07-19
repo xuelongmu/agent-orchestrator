@@ -2031,6 +2031,12 @@ components:
         updatedAt:
           format: date-time
           type: string
+        workspaceKind:
+          enum:
+          - worktree
+          - scratch
+          - dir
+          type: string
       required:
       - id
       - projectId
@@ -2040,6 +2046,7 @@ components:
       - createdAt
       - updatedAt
       - status
+      - workspaceKind
       - prs
       type: object
     DegradedProject:
@@ -2530,6 +2537,12 @@ components:
           $ref: '#/components/schemas/TrackerIntakeConfig'
         worker:
           $ref: '#/components/schemas/RoleOverride'
+        workspaceKind:
+          enum:
+          - worktree
+          - scratch
+          - dir
+          type: string
       type: object
     ProjectGetResponse:
       properties:
@@ -3177,6 +3190,12 @@ components:
           type: string
         prompt:
           maxLength: 4096
+          type: string
+        workspaceKind:
+          enum:
+          - worktree
+          - scratch
+          - dir
           type: string
       required:
       - projectId

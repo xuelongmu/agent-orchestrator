@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -41,6 +42,15 @@ var (
 	// ErrMissingHarness means neither the spawn request nor the project's role
 	// config selected an agent. Worker/orchestrator spawns must be explicit.
 	ErrMissingHarness = errors.New("session: agent harness required")
+	// ErrWorkspaceKindInvalid reports an unsupported workspace kind or a git
+	// branch supplied for a branchless workspace.
+	ErrWorkspaceKindInvalid = errors.New("session: invalid workspace kind")
+	// ErrSharedDirUnsupported means the selected agent cannot safely undo its
+	// workspace-local hook installation in the canonical project directory.
+	ErrSharedDirUnsupported = errors.New("session: agent does not support shared directory cleanup")
+	// ErrSharedDirInUse prevents concurrent sessions from installing different
+	// session hook configuration into one canonical project directory.
+	ErrSharedDirInUse = errors.New("session: shared directory already in use")
 	// ErrNotResumable means a terminated session cannot be relaunched: its adapter
 	// cannot natively resume it AND it has no prompt to fresh-launch from, and it is
 	// not an orchestrator (orchestrators are promptless by design and relaunch fresh
@@ -84,6 +94,10 @@ const (
 	EnvIssueID   = "AO_ISSUE_ID"
 	// EnvDataDir tells a spawned agent's AO hook commands where the store lives.
 	EnvDataDir = "AO_DATA_DIR"
+	// sharedDirCleanupPendingHandle is a durable lease marker used when a dir
+	// spawn installed hooks but failed before a runtime handle existed and hook
+	// rollback also failed. It is never passed to the runtime adapter.
+	sharedDirCleanupPendingHandle = "__ao_shared_dir_cleanup_pending__"
 )
 
 // hookBinaryName is the executable name the workspace hook commands invoke:
@@ -112,6 +126,13 @@ type runtimeController interface {
 // needs the contract.
 type inputPendingDetector interface {
 	IsInputPending(terminalOutput string) bool
+}
+
+// sharedDirHookScope lets adapters whose hooks are global explicitly reject
+// shared-directory sessions. Those hooks cannot be removed for one directory
+// owner without affecting unrelated sessions using the same global config.
+type sharedDirHookScope interface {
+	SupportsSharedDirHooks() bool
 }
 
 // Store is the persistence surface needed by the internal session Manager.
@@ -178,6 +199,12 @@ type Manager struct {
 	// sendConfirm* defaults; tests in this package shrink the timings directly.
 	sendConfirm sendConfirmConfig
 	logger      *slog.Logger
+	// sharedDirMu serializes the durable lease check with dir spawn/restore so
+	// concurrent requests cannot both observe the project directory as free.
+	sharedDirMu       sync.Mutex
+	cleanupRetryMu    sync.Mutex
+	cleanupRetries    map[domain.SessionID]string
+	cleanupRetryDelay time.Duration
 }
 
 // sendConfirmConfig bounds the best-effort activity-confirmation loop run after
@@ -249,7 +276,7 @@ func New(d Deps) *Manager {
 			attemptDeadline: sendConfirmAttemptDeadline,
 			maxAttempts:     sendConfirmMaxAttempts,
 		},
-		logger: d.Logger,
+		logger: d.Logger, cleanupRetries: make(map[domain.SessionID]string), cleanupRetryDelay: time.Second,
 	}
 	if m.clock == nil {
 		// UTC so spawn-stamped CreatedAt/UpdatedAt match every other session
@@ -281,6 +308,13 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: %w", err)
 	}
+	cfg.WorkspaceKind = effectiveWorkspaceKind(cfg.WorkspaceKind, project.Config.WorkspaceKind)
+	if !cfg.WorkspaceKind.IsKnown() {
+		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: %q", ErrWorkspaceKindInvalid, cfg.WorkspaceKind)
+	}
+	if cfg.WorkspaceKind != domain.WorkspaceKindWorktree && strings.TrimSpace(cfg.Branch) != "" {
+		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: branch is only valid for worktree sessions", ErrWorkspaceKindInvalid)
+	}
 	// A per-project role override picks the harness when the spawn names none,
 	// so a project can default workers to one agent and orchestrators to another.
 	cfg.Harness = effectiveHarness(cfg.Harness, cfg.Kind, project.Config)
@@ -291,8 +325,22 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// Reject an unknown harness before any durable state is created. Doing this
 	// after CreateSession would leave a terminated orphan row and waste a
 	// worktree on a spawn that can never launch.
-	if _, ok := m.agents.Agent(cfg.Harness); !ok {
+	agent, ok := m.agents.Agent(cfg.Harness)
+	if !ok {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: %q", ErrUnknownHarness, cfg.Harness)
+	}
+	if cfg.WorkspaceKind == domain.WorkspaceKindDir {
+		if _, ok := agent.(workspaceHookUninstaller); !ok {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: %w: %s", ErrSharedDirUnsupported, cfg.Harness)
+		}
+		if scope, ok := agent.(sharedDirHookScope); ok && !scope.SupportsSharedDirHooks() {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: %w: %s uses global hooks", ErrSharedDirUnsupported, cfg.Harness)
+		}
+		m.sharedDirMu.Lock()
+		defer m.sharedDirMu.Unlock()
+		if err := m.ensureSharedDirAvailable(ctx, cfg.ProjectID, ""); err != nil {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: %w", err)
+		}
 	}
 
 	if err := m.validateRuntimePrerequisites(); err != nil {
@@ -316,7 +364,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	}
 
 	branch := cfg.Branch
-	if branch == "" {
+	if cfg.WorkspaceKind == domain.WorkspaceKindWorktree && branch == "" {
 		branch = defaultSpawnBranch(id, cfg.Kind, sessionPrefix(project), project.Kind.WithDefault())
 	}
 	ws, workspaceProject, err := m.createSessionWorkspace(ctx, project, cfg, id, branch)
@@ -336,19 +384,15 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: provision: %w", id, err)
 	}
 
-	agent, ok := m.agents.Agent(cfg.Harness)
-	if !ok {
-		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: no agent adapter for harness %q", id, cfg.Harness)
-	}
 	agentConfig := effectiveAgentConfig(cfg.Kind, project.Config)
 	env := m.runtimeEnv(id, cfg.ProjectID, cfg.IssueID, project.Config.Env)
 	m.augmentAgentRuntimeEnv(agent, env)
 	if err := m.prepareWorkspace(ctx, agent, id, ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
-		m.destroySpawnWorkspace(ctx, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: %w", id, err), cleanupErr)
 	}
 	launchCfg := ports.LaunchConfig{
 		DataDir:          m.dataDir,
@@ -364,27 +408,33 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	}
 	delivery, err := agent.GetPromptDeliveryStrategy(ctx, launchCfg)
 	if err != nil {
-		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: prompt delivery: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: prompt delivery: %w", id, err), cleanupErr)
 	}
 	if delivery == ports.PromptDeliveryAfterStart {
 		launchCfg.Prompt = ""
 	}
 	argv, err := agent.GetLaunchCommand(ctx, launchCfg)
 	if err != nil {
-		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: launch command: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: launch command: %w", id, err), cleanupErr)
 	}
 	// Pre-flight: confirm argv[0] actually exists on PATH (or as an absolute
 	// path the adapter returned) BEFORE handing the launch to the runtime.
 	// tmux happily creates a session+pane around a missing command, so an
 	// unresolved binary would leak through as a "live" session that never ran.
 	if err := m.validateAgentBinary(argv); err != nil {
-		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: %w", id, err), cleanupErr)
 	}
 	handle, err := m.runtime.Create(ctx, ports.RuntimeConfig{
 		SessionID:     id,
@@ -393,24 +443,30 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		Env:           env,
 	})
 	if err != nil {
-		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-		m.rollbackSpawnSeedRow(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: runtime: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: runtime: %w", id, err), cleanupErr)
 	}
 
-	metadata := domain.SessionMetadata{Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, Prompt: prompt}
+	metadata := domain.SessionMetadata{WorkspaceKind: ws.WorkspaceKind.WithDefault(), Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, Prompt: prompt}
 	if err := m.lcm.MarkSpawned(ctx, id, metadata); err != nil {
 		_ = m.runtime.Destroy(ctx, handle)
-		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-		m.markSpawnFailedTerminated(ctx, id)
-		return domain.SessionRecord{}, fmt.Errorf("spawn %s: completed: %w", id, err)
+		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+		if cleanupErr == nil {
+			m.markSpawnFailedTerminated(ctx, id)
+		}
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: completed: %w", id, err), cleanupErr)
 	}
 	if delivery == ports.PromptDeliveryAfterStart && prompt != "" {
 		if err := m.deliverAfterStartPrompt(ctx, agent, launchCfg, handle, id, prompt); err != nil {
 			_ = m.runtime.Destroy(ctx, handle)
-			m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
-			m.markSpawnFailedTerminatedWithoutWorkspace(ctx, id)
-			return domain.SessionRecord{}, fmt.Errorf("spawn %s: deliver prompt: %w", id, err)
+			cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
+			if cleanupErr == nil {
+				m.markSpawnFailedTerminatedWithoutWorkspace(ctx, id)
+			}
+			return domain.SessionRecord{}, errors.Join(fmt.Errorf("spawn %s: deliver prompt: %w", id, err), cleanupErr)
 		}
 	}
 	return m.getRecord(ctx, id)
@@ -433,15 +489,20 @@ func (m *Manager) loadProject(ctx context.Context, projectID domain.ProjectID) (
 }
 
 func (m *Manager) createSessionWorkspace(ctx context.Context, project domain.ProjectRecord, cfg ports.SpawnConfig, id domain.SessionID, branch string) (ports.WorkspaceInfo, *ports.WorkspaceProjectInfo, error) {
-	if project.Kind.WithDefault() != domain.ProjectKindWorkspace {
+	if cfg.WorkspaceKind != domain.WorkspaceKindWorktree || project.Kind.WithDefault() != domain.ProjectKindWorkspace {
 		ws, err := m.workspace.Create(ctx, ports.WorkspaceConfig{
 			ProjectID:     cfg.ProjectID,
 			SessionID:     id,
 			Kind:          cfg.Kind,
+			WorkspaceKind: cfg.WorkspaceKind,
 			SessionPrefix: sessionPrefix(project),
 			Branch:        branch,
 			BaseBranch:    project.Config.WithDefaults().DefaultBranch,
+			RepoPath:      project.Path,
 		})
+		if ws.WorkspaceKind == "" {
+			ws.WorkspaceKind = cfg.WorkspaceKind
+		}
 		return ws, nil, err
 	}
 	workspaceProject, ok := m.workspace.(ports.WorkspaceProject)
@@ -502,10 +563,41 @@ func (m *Manager) destroySpawnWorkspace(ctx context.Context, ws ports.WorkspaceI
 	return err == nil
 }
 
-func (m *Manager) rollbackPreparedSpawnWorkspace(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo) {
-	if m.destroySpawnWorkspace(ctx, ws, workspaceProject) {
-		m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+func (m *Manager) rollbackPreparedSpawnWorkspace(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo) error {
+	if !m.destroySpawnWorkspace(ctx, ws, workspaceProject) {
+		return errors.New("spawn rollback: workspace teardown failed")
 	}
+	if err := m.cleanupAgentWorkspace(ctx, rec, ws.Path); err != nil {
+		if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+			return errors.Join(fmt.Errorf("spawn rollback: shared directory cleanup: %w", err), m.persistSharedDirCleanupPending(ctx, rec, ws.Path))
+		}
+		m.logger.Warn("spawn rollback: agent workspace cleanup failed", "sessionID", rec.ID, "workspacePath", ws.Path, "error", err)
+	}
+	return nil
+}
+
+func (m *Manager) persistSharedDirCleanupPending(ctx context.Context, rec domain.SessionRecord, workspacePath string) error {
+	latest, ok, err := m.store.GetSession(ctx, rec.ID)
+	if err != nil {
+		return fmt.Errorf("persist shared directory cleanup: load: %w", err)
+	}
+	if ok {
+		rec = latest
+	}
+	rec.Metadata.WorkspaceKind = domain.WorkspaceKindDir
+	rec.Metadata.WorkspacePath = workspacePath
+	if rec.Metadata.RuntimeHandleID == "" {
+		rec.Metadata.RuntimeHandleID = sharedDirCleanupPendingHandle
+	}
+	if err := m.store.UpdateSession(ctx, rec); err != nil {
+		return fmt.Errorf("persist shared directory cleanup: update: %w", err)
+	}
+	if !rec.IsTerminated {
+		if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
+			return fmt.Errorf("persist shared directory cleanup: mark terminated: %w", err)
+		}
+	}
+	return nil
 }
 
 // effectiveHarness resolves the harness for a spawn: an explicit harness wins;
@@ -658,8 +750,34 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 	if !ok {
 		return false, nil // already gone: benign race
 	}
+	dirWorkspace := rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir
+	expectedHandleID := rec.Metadata.RuntimeHandleID
+	if dirWorkspace {
+		// Serialize teardown with the spawn/restore lease check. A new shared-dir
+		// session must not install hooks until the previous session has fully
+		// uninstalled its workspace-local configuration and released its durable
+		// runtime-handle marker.
+		m.sharedDirMu.Lock()
+		defer m.sharedDirMu.Unlock()
+		latest, exists, readErr := m.store.GetSession(ctx, id)
+		if readErr != nil {
+			return false, fmt.Errorf("kill %s: claim shared directory cleanup: %w", id, readErr)
+		}
+		if !exists {
+			return false, nil
+		}
+		// The durable runtime handle is the cleanup ownership token. A duplicate
+		// teardown that waited behind the prior owner must not touch hooks a
+		// replacement session may already have installed in the shared path.
+		if expectedHandleID != latest.Metadata.RuntimeHandleID || latest.Metadata.RuntimeHandleID == "" && (latest.IsTerminated || !markTerminated) {
+			return false, nil
+		}
+		rec = latest
+	}
 	handle := runtimeHandle(rec.Metadata)
 	ws := workspaceInfo(rec)
+	completedNonGit := !markTerminated && rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree
+	var completedCleanupErrs []error
 
 	var workspaceProjectRows []ports.WorkspaceRepoInfo
 	workspaceProject := false
@@ -670,9 +788,12 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 		workspaceProject = true
 	}
 
-	if handle.ID != "" {
+	if handle.ID != "" && handle.ID != sharedDirCleanupPendingHandle {
 		if err := m.runtime.Destroy(ctx, handle); err != nil {
-			return false, fmt.Errorf("kill %s: runtime: %w", id, err)
+			if !completedNonGit || dirWorkspace {
+				return false, fmt.Errorf("kill %s: runtime: %w", id, err)
+			}
+			completedCleanupErrs = append(completedCleanupErrs, fmt.Errorf("runtime: %w", err))
 		}
 	}
 	freed := false
@@ -692,7 +813,7 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 		}
 		freed = cleaned
 		if cleaned {
-			m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+			m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
 		}
 	} else if ws.Path != "" {
 		if err := m.workspace.Destroy(ctx, ws); err != nil {
@@ -708,10 +829,16 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 				m.cleanupSystemPromptDir(id)
 				return false, nil
 			}
-			return false, fmt.Errorf("kill %s: workspace: %w", id, err)
+			if !completedNonGit {
+				return false, fmt.Errorf("kill %s: workspace: %w", id, err)
+			}
+			completedCleanupErrs = append(completedCleanupErrs, fmt.Errorf("workspace: %w", err))
+		} else {
+			freed = true
+			if cleanupErr := m.cleanupAgentWorkspace(ctx, rec, ws.Path); cleanupErr != nil && dirWorkspace {
+				return false, fmt.Errorf("kill %s: shared directory cleanup: %w", id, cleanupErr)
+			}
 		}
-		freed = true
-		m.cleanupAgentWorkspace(ctx, rec, ws.Path)
 	}
 	// Clear the restore marker so the next boot's RestoreAll cannot resurrect a
 	// killed session (#2319). For workspace projects this must happen after
@@ -719,14 +846,37 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 	// non-restorable inventory.
 	if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
 		m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
+		if dirWorkspace {
+			return false, fmt.Errorf("kill %s: delete restore marker: %w", id, err)
+		}
 	}
 	if markTerminated {
 		if err := m.lcm.MarkTerminated(ctx, id); err != nil {
 			return false, fmt.Errorf("kill %s: %w", id, err)
 		}
 	}
+	if len(completedCleanupErrs) != 0 {
+		return false, fmt.Errorf("kill %s: %w", id, errors.Join(completedCleanupErrs...))
+	}
+	if rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
+		if err := m.clearCompletedRuntimeHandleIfOwned(ctx, rec.ID, handle.ID); err != nil {
+			return false, fmt.Errorf("kill %s: clear completed runtime handle: %w", id, err)
+		}
+	}
 	m.cleanupSystemPromptDir(id)
 	return freed, nil
+}
+
+func (m *Manager) clearCompletedRuntimeHandleIfOwned(ctx context.Context, id domain.SessionID, expected string) error {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return err
+	}
+	if rec.Metadata.RuntimeHandleID != expected {
+		return nil
+	}
+	rec.Metadata.RuntimeHandleID = ""
+	return m.store.UpdateSession(ctx, rec)
 }
 
 // CleanupMergedSession tears down only the resources of a merge-complete
@@ -736,6 +886,95 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 func (m *Manager) CleanupMergedSession(ctx context.Context, id domain.SessionID) error {
 	if _, err := m.kill(ctx, id, false); err != nil {
 		return fmt.Errorf("cleanup merged session %s: %w", id, err)
+	}
+	return nil
+}
+
+// CleanupCompletedSession tears down resources that must not survive natural
+// completion for non-git sessions. Git worktrees retain their historical
+// post-exit lifecycle and are cleaned only by explicit or SCM-owned paths.
+func (m *Manager) CleanupCompletedSession(ctx context.Context, id domain.SessionID) error {
+	return m.cleanupCompletedSessionOwned(ctx, id, "")
+}
+
+func (m *Manager) cleanupCompletedSessionOwned(ctx context.Context, id domain.SessionID, expectedLease string) error {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return fmt.Errorf("cleanup completed session %s: %w", id, err)
+	}
+	if !ok || !rec.IsTerminated || rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree || rec.Metadata.RuntimeHandleID == "" {
+		return nil
+	}
+	if expectedLease != "" && rec.Metadata.RuntimeHandleID != expectedLease {
+		return nil
+	}
+	if _, err := m.kill(ctx, id, false); err != nil {
+		m.scheduleCleanupRetry(id, rec.Metadata.RuntimeHandleID)
+		return fmt.Errorf("cleanup completed session %s: %w", id, err)
+	}
+	return nil
+}
+
+// scheduleCleanupRetry keeps a failed natural non-git teardown live in the
+// daemon until its durable lease can be released, without requiring another
+// activity-exit callback or a daemon restart.
+func (m *Manager) scheduleCleanupRetry(id domain.SessionID, lease string) {
+	m.cleanupRetryMu.Lock()
+	if current, ok := m.cleanupRetries[id]; ok && current == lease {
+		m.cleanupRetryMu.Unlock()
+		return
+	}
+	m.cleanupRetries[id] = lease
+	m.armCleanupRetryLocked(id, lease)
+	m.cleanupRetryMu.Unlock()
+}
+
+func (m *Manager) armCleanupRetryLocked(id domain.SessionID, lease string) {
+	time.AfterFunc(m.cleanupRetryDelay, func() {
+		err := m.cleanupCompletedSessionOwned(context.Background(), id, lease)
+		m.cleanupRetryMu.Lock()
+		current, ownsGeneration := m.cleanupRetries[id]
+		if ownsGeneration && current == lease {
+			if err != nil {
+				// Retain ownership while arming the next timer under the same lock;
+				// a newer lease cannot be overwritten in the rearm gap.
+				m.armCleanupRetryLocked(id, lease)
+			} else {
+				delete(m.cleanupRetries, id)
+			}
+		}
+		m.cleanupRetryMu.Unlock()
+	})
+}
+
+func (m *Manager) clearCompletedRuntimeHandle(ctx context.Context, id domain.SessionID) error {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return err
+	}
+	rec.Metadata.RuntimeHandleID = ""
+	return m.store.UpdateSession(ctx, rec)
+}
+
+func (m *Manager) ensureSharedDirAvailable(ctx context.Context, projectID domain.ProjectID, exclude domain.SessionID) error {
+	recs, err := m.store.ListSessions(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	for _, rec := range recs {
+		if rec.ID == exclude || rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindDir {
+			continue
+		}
+		if !rec.IsTerminated || rec.Metadata.RuntimeHandleID != "" {
+			return fmt.Errorf("%w: project %s session %s", ErrSharedDirInUse, projectID, rec.ID)
+		}
+		rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
+		if err != nil {
+			return err
+		}
+		if len(restorableWorktreeRows(rows)) != 0 {
+			return fmt.Errorf("%w: project %s session %s is pending restart", ErrSharedDirInUse, projectID, rec.ID)
+		}
 	}
 	return nil
 }
@@ -755,7 +994,13 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 	if !ok || rec.IsTerminated {
 		return nil
 	}
-	if rec.Metadata.WorkspacePath == "" || rec.Metadata.Branch == "" {
+	if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+		if _, err := m.kill(ctx, id, true); err != nil {
+			return fmt.Errorf("retire replacement %s: shared directory teardown: %w", id, err)
+		}
+		return nil
+	}
+	if rec.Metadata.WorkspacePath == "" || (rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree && rec.Metadata.Branch == "") {
 		if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
 			return fmt.Errorf("retire replacement %s: clear restore markers: %w", id, err)
 		}
@@ -797,7 +1042,7 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 		}
 		return fmt.Errorf("retire replacement %s: force destroy: %w", id, err)
 	}
-	m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+	m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
 	if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
 		return fmt.Errorf("retire replacement %s: clear restore markers: %w", id, err)
 	}
@@ -832,7 +1077,7 @@ func (m *Manager) retireWorkspaceProjectForReplacement(ctx context.Context, rec 
 			return fmt.Errorf("retire replacement %s repo %s: force destroy: %w", rec.ID, rows[i].RepoName, err)
 		}
 	}
-	m.cleanupAgentWorkspace(ctx, rec, rec.Metadata.WorkspacePath)
+	m.cleanupAgentWorkspaceBestEffort(ctx, rec, rec.Metadata.WorkspacePath)
 	if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
 		return fmt.Errorf("retire replacement %s: clear restore markers: %w", rec.ID, err)
 	}
@@ -857,11 +1102,18 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
 	}
 	meta := rec.Metadata
-	// Mirror Kill's incomplete-handle guard: a session whose spawn failed before
-	// the workspace landed has neither WorkspacePath nor Branch, and there is
-	// nothing meaningful to restore from. Surface this as a typed 409 instead of
-	// letting workspace.Restore fail with an opaque wrapped error.
-	if meta.WorkspacePath == "" || meta.Branch == "" {
+	if meta.WorkspaceKind.WithDefault() == domain.WorkspaceKindScratch {
+		rows, rowErr := m.store.ListSessionWorktrees(ctx, id)
+		if rowErr != nil {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: restore marker: %w", id, rowErr)
+		}
+		if len(restorableWorktreeRows(rows)) == 0 && rec.Activity.State == domain.ActivityExited && rec.Metadata.RuntimeHandleID == "" {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
+		}
+	}
+	// Mirror Kill's incomplete-handle guard. Git worktrees require both path and
+	// branch; scratch and dir sessions are intentionally branchless.
+	if meta.WorkspacePath == "" || (meta.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree && meta.Branch == "") {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrIncompleteHandle)
 	}
 	// Resumability is decided inside restoreArgv, not here. A promptless session
@@ -873,6 +1125,23 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	project, err := m.loadProject(ctx, rec.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, err)
+	}
+	if meta.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+		agent, ok := m.agents.Agent(rec.Harness)
+		if !ok {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: no agent adapter for harness %q", id, rec.Harness)
+		}
+		if _, ok := agent.(workspaceHookUninstaller); !ok {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w: %s", id, ErrSharedDirUnsupported, rec.Harness)
+		}
+		if scope, ok := agent.(sharedDirHookScope); ok && !scope.SupportsSharedDirHooks() {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w: %s uses global hooks", id, ErrSharedDirUnsupported, rec.Harness)
+		}
+		m.sharedDirMu.Lock()
+		defer m.sharedDirMu.Unlock()
+		if err := m.ensureSharedDirAvailable(ctx, rec.ProjectID, rec.ID); err != nil {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, err)
+		}
 	}
 	ws, err := m.restoreSessionWorkspace(ctx, project, rec)
 	if err != nil {
@@ -904,12 +1173,14 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 	env := m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
 	m.augmentAgentRuntimeEnv(agent, env)
 	if err := m.prepareWorkspace(ctx, agent, rec.ID, ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", rec.ID, err)
+		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
 	}
 	argv, delivery, err := restoreArgv(ctx, agent, rec.ID, ws.Path, rec.Metadata, systemPrompt, systemPromptFile, agentConfig, rec.Kind, rec.Harness, m.dataDir)
 	if err != nil {
+		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", rec.ID, err)
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
 	}
 	handle, err := m.runtime.Create(ctx, ports.RuntimeConfig{
 		SessionID:     rec.ID,
@@ -918,14 +1189,16 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 		Env:           env,
 	})
 	if err != nil {
+		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: runtime: %w", rec.ID, err)
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: runtime: %w", rec.ID, err), cleanupErr)
 	}
-	metadata := domain.SessionMetadata{Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, AgentSessionID: rec.Metadata.AgentSessionID, Prompt: rec.Metadata.Prompt}
+	metadata := domain.SessionMetadata{WorkspaceKind: ws.WorkspaceKind.WithDefault(), Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, AgentSessionID: rec.Metadata.AgentSessionID, Prompt: rec.Metadata.Prompt}
 	if err := m.lcm.MarkSpawned(ctx, rec.ID, metadata); err != nil {
 		_ = m.runtime.Destroy(ctx, handle)
+		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: completed: %w", rec.ID, err)
+		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: completed: %w", rec.ID, err), cleanupErr)
 	}
 	if delivery == ports.PromptDeliveryAfterStart && rec.Metadata.Prompt != "" {
 		launchCfg := ports.LaunchConfig{
@@ -941,12 +1214,23 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 		}
 		if err := m.deliverAfterStartPrompt(ctx, agent, launchCfg, handle, rec.ID, rec.Metadata.Prompt); err != nil {
 			_ = m.runtime.Destroy(ctx, handle)
-			_ = m.lcm.MarkTerminated(ctx, rec.ID)
+			cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+			if cleanupErr == nil {
+				_ = m.lcm.MarkTerminated(ctx, rec.ID)
+			}
 			m.cleanupSystemPromptDir(rec.ID)
-			return domain.SessionRecord{}, fmt.Errorf("restore %s: deliver prompt: %w", rec.ID, err)
+			return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: deliver prompt: %w", rec.ID, err), cleanupErr)
 		}
 	}
 	return m.getRecord(ctx, rec.ID)
+}
+
+func (m *Manager) cleanupRestoredPreparation(ctx context.Context, rec domain.SessionRecord, agent ports.Agent, ws ports.WorkspaceInfo, env map[string]string) error {
+	cleanupErr := m.cleanupPreparedAgentWorkspace(ctx, agent, rec.ID, ws.WorkspaceKind.WithDefault(), ws.Path, env)
+	if cleanupErr == nil || ws.WorkspaceKind.WithDefault() != domain.WorkspaceKindDir {
+		return cleanupErr
+	}
+	return errors.Join(cleanupErr, m.persistSharedDirCleanupPending(ctx, rec, ws.Path))
 }
 
 func (m *Manager) getRecord(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error) {
@@ -960,13 +1244,11 @@ func (m *Manager) getRecord(ctx context.Context, id domain.SessionID) (domain.Se
 	return rec, nil
 }
 
-// SaveAndTeardownAll captures uncommitted work and tears down every live
-// session that has a workspace path. It is the shutdown path for the daemon:
-// each session's uncommitted work is stashed into a preserve ref, the ref is
-// written to session_worktrees (the "shutdown-saved" marker) BEFORE the
-// worktree is force-removed. The DB write is committed before the worktree is
-// destroyed so a crash between the two leaves the ref in place and the row
-// present; RestoreAll will replay both.
+// SaveAndTeardownAll prepares every live session for daemon restart. Git
+// sessions capture uncommitted work before removing the worktree. Non-git
+// sessions retain their directory while AO tears down the runtime and hooks.
+// Both paths write a session_worktrees row as the durable shutdown-saved marker
+// before external teardown, and RestoreAll consumes that marker on restart.
 //
 // Failures on individual sessions are logged and do not abort the loop.
 // ForceDestroy is never called if capture or the DB write did not succeed.
@@ -979,6 +1261,12 @@ func (m *Manager) SaveAndTeardownAll(ctx context.Context) error {
 		if rec.IsTerminated {
 			continue
 		}
+		if rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
+			if err := m.saveAndTeardownNonGit(ctx, rec); err != nil {
+				m.logger.Error("save-teardown-all: branchless session failed, skipping", "sessionID", rec.ID, "error", err)
+			}
+			continue
+		}
 		if rec.Metadata.WorkspacePath == "" || rec.Metadata.Branch == "" {
 			continue
 		}
@@ -986,6 +1274,51 @@ func (m *Manager) SaveAndTeardownAll(ctx context.Context) error {
 			m.logger.Error("save-teardown-all: session failed, skipping", "sessionID", rec.ID, "error", err)
 		}
 	}
+	return nil
+}
+
+func (m *Manager) saveAndTeardownNonGit(ctx context.Context, rec domain.SessionRecord) error {
+	if rec.Metadata.WorkspacePath == "" {
+		return nil
+	}
+	// session_worktrees rows are the existing durable shutdown-restore marker.
+	// For non-git workspaces the branch and preserve ref are intentionally empty;
+	// the stored path lets Restore reattach the retained scratch/shared directory.
+	if err := m.store.UpsertSessionWorktree(ctx, domain.SessionWorktreeRecord{
+		SessionID:    rec.ID,
+		RepoName:     domain.RootWorkspaceRepoName,
+		WorktreePath: rec.Metadata.WorkspacePath,
+		State:        "removed",
+	}); err != nil {
+		return fmt.Errorf("save %s: write non-git restore marker: %w", rec.ID, err)
+	}
+	if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
+		return fmt.Errorf("save %s: mark non-git session terminated: %w", rec.ID, err)
+	}
+	return m.cleanupNonGitShutdownResources(ctx, rec)
+}
+
+func (m *Manager) cleanupNonGitShutdownResources(ctx context.Context, rec domain.SessionRecord) error {
+	if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+		m.sharedDirMu.Lock()
+		defer m.sharedDirMu.Unlock()
+	}
+	var cleanupErrs []error
+	if handle := runtimeHandle(rec.Metadata); handle.ID != "" {
+		if err := m.runtime.Destroy(ctx, handle); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("runtime: %w", err))
+		}
+	}
+	if err := m.cleanupAgentWorkspace(ctx, rec, rec.Metadata.WorkspacePath); err != nil {
+		cleanupErrs = append(cleanupErrs, err)
+	}
+	if len(cleanupErrs) != 0 {
+		return errors.Join(cleanupErrs...)
+	}
+	if err := m.clearCompletedRuntimeHandle(ctx, rec.ID); err != nil {
+		return fmt.Errorf("clear runtime handle: %w", err)
+	}
+	m.cleanupSystemPromptDir(rec.ID)
 	return nil
 }
 
@@ -1040,7 +1373,7 @@ func (m *Manager) saveAndTeardownOne(ctx context.Context, rec domain.SessionReco
 	if err := m.workspace.ForceDestroy(ctx, ws); err != nil {
 		m.logger.Warn("save-teardown-all: force destroy failed", "sessionID", rec.ID, "error", err)
 	} else {
-		m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+		m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
 	}
 	return nil
 }
@@ -1065,7 +1398,7 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 	if rec.Activity.State == domain.ActivityRateLimited {
 		return nil
 	}
-	if rec.Metadata.WorkspacePath == "" || rec.Metadata.Branch == "" {
+	if rec.Metadata.WorkspacePath == "" {
 		return nil
 	}
 	handle := runtimeHandle(rec.Metadata)
@@ -1078,6 +1411,27 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 		if alive {
 			return nil // adopt: the session survived the crash.
 		}
+	}
+	if rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
+		// Non-git workspaces have no preserve ref or worktree marker. Their
+		// filesystem location remains in place across a daemon crash, so restart
+		// the agent directly against it rather than forcing git-only save logic.
+		if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
+			return fmt.Errorf("reconcile %s: mark branchless session terminated: %w", rec.ID, err)
+		}
+		if latest, ok, readErr := m.store.GetSession(ctx, rec.ID); readErr == nil && ok && !latest.IsTerminated {
+			latest.IsTerminated = true
+			if updateErr := m.store.UpdateSession(ctx, latest); updateErr != nil {
+				return fmt.Errorf("reconcile %s: persist branchless termination: %w", rec.ID, updateErr)
+			}
+		}
+		if _, err := m.Restore(ctx, rec.ID); err != nil {
+			return fmt.Errorf("reconcile %s: restore branchless session: %w", rec.ID, err)
+		}
+		return nil
+	}
+	if rec.Metadata.Branch == "" {
+		return nil
 	}
 	if err := m.saveAndTeardownOne(ctx, rec, false); err != nil {
 		m.logger.Warn("reconcile: save-and-teardown failed; terminating without restore marker", "sessionID", rec.ID, "error", err)
@@ -1096,6 +1450,18 @@ func (m *Manager) reconcileReap(ctx context.Context, rec domain.SessionRecord) e
 	handle := runtimeHandle(rec.Metadata)
 	if handle.ID == "" {
 		return nil
+	}
+	if rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
+		rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
+		if err != nil {
+			return fmt.Errorf("reconcile reap %s: list restore markers: %w", rec.ID, err)
+		}
+		if len(restorableWorktreeRows(rows)) != 0 {
+			// A graceful-shutdown marker retains the non-git workspace for restart;
+			// reap only the leaked runtime and workspace-local agent configuration.
+			return m.cleanupNonGitShutdownResources(ctx, rec)
+		}
+		return m.CleanupCompletedSession(ctx, rec.ID)
 	}
 	alive, err := m.runtime.IsAlive(ctx, handle)
 	if err != nil {
@@ -1198,6 +1564,16 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 		}
 		rows = restorableWorktreeRows(rows)
 		if len(rows) == 0 {
+			continue
+		}
+		if rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
+			if _, err := m.Restore(ctx, rec.ID); err != nil {
+				m.logger.Error("restore-all: non-git session restore failed", "sessionID", rec.ID, "error", err)
+				continue
+			}
+			if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
+				m.logger.Warn("restore-all: delete non-git restore marker failed", "sessionID", rec.ID, "error", err)
+			}
 			continue
 		}
 
@@ -1326,14 +1702,22 @@ func (m *Manager) markSessionWorktreesActive(ctx context.Context, rows []domain.
 }
 
 func (m *Manager) restoreSessionWorkspace(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord) (ports.WorkspaceInfo, error) {
-	if project.Kind.WithDefault() != domain.ProjectKindWorkspace {
-		return m.workspace.Restore(ctx, ports.WorkspaceConfig{
+	workspaceKind := rec.Metadata.WorkspaceKind.WithDefault()
+	if workspaceKind != domain.WorkspaceKindWorktree || project.Kind.WithDefault() != domain.ProjectKindWorkspace {
+		ws, err := m.workspace.Restore(ctx, ports.WorkspaceConfig{
 			ProjectID:     rec.ProjectID,
 			SessionID:     rec.ID,
 			Kind:          rec.Kind,
+			WorkspaceKind: workspaceKind,
 			SessionPrefix: sessionPrefix(project),
 			Branch:        rec.Metadata.Branch,
+			RepoPath:      project.Path,
+			Path:          rec.Metadata.WorkspacePath,
 		})
+		if ws.WorkspaceKind == "" {
+			ws.WorkspaceKind = workspaceKind
+		}
+		return ws, err
 	}
 	rows, err := m.workspaceProjectRestoreRows(ctx, project, rec)
 	if err != nil {
@@ -1488,7 +1872,7 @@ func (m *Manager) saveAndTeardownWorkspaceProject(ctx context.Context, rec domai
 		}
 	}
 	if rootDestroyed {
-		m.cleanupAgentWorkspace(ctx, rec, rec.Metadata.WorkspacePath)
+		m.cleanupAgentWorkspaceBestEffort(ctx, rec, rec.Metadata.WorkspacePath)
 	}
 	return nil
 }
@@ -2012,6 +2396,15 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 		if !rec.IsTerminated {
 			continue
 		}
+		if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+			if _, err := m.kill(ctx, rec.ID, false); err != nil {
+				m.logger.Warn("cleanup: shared directory teardown failed", "sessionID", rec.ID, "error", err)
+				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "shared directory teardown failed"})
+				continue
+			}
+			result.Cleaned = append(result.Cleaned, rec.ID)
+			continue
+		}
 		ws := workspaceInfo(rec)
 		if ws.Path == "" {
 			m.cleanupSystemPromptDir(rec.ID)
@@ -2032,7 +2425,7 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: cleanupSkipReason(err)})
 				continue
 			}
-			m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+			m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
 		} else if err := m.workspace.Destroy(ctx, ws); err != nil {
 			if !errors.Is(err, ports.ErrWorkspaceDirty) {
 				// The public reason stays a fixed string (the raw error carries
@@ -2042,7 +2435,11 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: cleanupSkipReason(err)})
 			continue
 		} else {
-			m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+			if err := m.cleanupAgentWorkspace(ctx, rec, ws.Path); err != nil {
+				m.logger.Warn("cleanup: agent workspace cleanup failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
+				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "agent workspace cleanup failed"})
+				continue
+			}
 		}
 		m.cleanupSystemPromptDir(rec.ID)
 		result.Cleaned = append(result.Cleaned, rec.ID)
@@ -2079,8 +2476,16 @@ func seedRecord(cfg ports.SpawnConfig, now time.Time) domain.SessionRecord {
 		UpdatedAt:   now,
 		Harness:     cfg.Harness,
 		DisplayName: cfg.DisplayName,
+		Metadata:    domain.SessionMetadata{WorkspaceKind: cfg.WorkspaceKind.WithDefault()},
 		Activity:    domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
 	}
+}
+
+func effectiveWorkspaceKind(explicit, configured domain.WorkspaceKind) domain.WorkspaceKind {
+	if explicit != "" {
+		return explicit.WithDefault()
+	}
+	return configured.WithDefault()
 }
 
 func defaultSessionBranch(id domain.SessionID, kind domain.SessionKind, prefix string) string {
@@ -2506,6 +2911,13 @@ type workspaceCleaner interface {
 	CleanupWorkspace(ctx context.Context, cfg ports.WorkspaceHookConfig) error
 }
 
+// workspaceHookUninstaller is required for shared-directory sessions. Unlike
+// disposable worktrees, their workspace-local hook files survive teardown and
+// must be removed without touching user-owned configuration.
+type workspaceHookUninstaller interface {
+	UninstallHooks(ctx context.Context, workspacePath string) error
+}
+
 type runtimeEnvAugmenter interface {
 	AugmentRuntimeEnv(env map[string]string, dataDir string)
 }
@@ -2530,22 +2942,28 @@ func (m *Manager) prepareWorkspace(ctx context.Context, agent ports.Agent, id do
 		SystemPromptFile: systemPromptFile,
 		Config:           agentConfig,
 	}); err != nil {
-		m.cleanupPreparedAgentWorkspace(ctx, agent, id, workspacePath, env)
 		return fmt.Errorf("install hooks: %w", err)
 	}
 	if pl, ok := agent.(preLauncher); ok {
 		if err := pl.PreLaunch(ctx, ports.LaunchConfig{DataDir: m.dataDir, SessionID: string(id), WorkspacePath: workspacePath}); err != nil {
-			m.cleanupPreparedAgentWorkspace(ctx, agent, id, workspacePath, env)
 			return fmt.Errorf("pre-launch: %w", err)
 		}
 	}
 	return nil
 }
 
-func (m *Manager) cleanupPreparedAgentWorkspace(ctx context.Context, agent ports.Agent, id domain.SessionID, workspacePath string, env map[string]string) {
+func (m *Manager) cleanupPreparedAgentWorkspace(ctx context.Context, agent ports.Agent, id domain.SessionID, workspaceKind domain.WorkspaceKind, workspacePath string, env map[string]string) error {
+	var cleanupErr error
+	if workspaceKind.WithDefault() == domain.WorkspaceKindDir {
+		if uninstaller, ok := agent.(workspaceHookUninstaller); ok {
+			if err := uninstaller.UninstallHooks(ctx, workspacePath); err != nil {
+				cleanupErr = fmt.Errorf("uninstall shared-directory hooks: %w", err)
+			}
+		}
+	}
 	cleaner, ok := agent.(workspaceCleaner)
 	if !ok {
-		return
+		return cleanupErr
 	}
 	if err := cleaner.CleanupWorkspace(ctx, ports.WorkspaceHookConfig{
 		SessionID:     string(id),
@@ -2555,20 +2973,33 @@ func (m *Manager) cleanupPreparedAgentWorkspace(ctx context.Context, agent ports
 	}); err != nil {
 		m.logger.Warn("session prepare rollback: failed to clean agent workspace state",
 			"session", id, "workspacePath", workspacePath, "error", err)
+		if cleanupErr == nil {
+			cleanupErr = fmt.Errorf("clean agent workspace state: %w", err)
+		}
 	}
+	return cleanupErr
 }
 
-func (m *Manager) cleanupAgentWorkspace(ctx context.Context, rec domain.SessionRecord, workspacePath string) {
+func (m *Manager) cleanupAgentWorkspace(ctx context.Context, rec domain.SessionRecord, workspacePath string) error {
 	if strings.TrimSpace(workspacePath) == "" {
-		return
+		return nil
 	}
 	agent, ok := m.agents.Agent(rec.Harness)
 	if !ok {
-		return
+		return nil
+	}
+	var cleanupErr error
+	if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+		uninstaller, ok := agent.(workspaceHookUninstaller)
+		if !ok {
+			cleanupErr = fmt.Errorf("%w: %s", ErrSharedDirUnsupported, rec.Harness)
+		} else if err := uninstaller.UninstallHooks(ctx, workspacePath); err != nil {
+			cleanupErr = fmt.Errorf("uninstall shared-directory hooks: %w", err)
+		}
 	}
 	cleaner, ok := agent.(workspaceCleaner)
 	if !ok {
-		return
+		return cleanupErr
 	}
 	env := spawnEnv(rec.ID, rec.ProjectID, rec.IssueID, m.dataDir, nil)
 	if project, err := m.loadProject(ctx, rec.ProjectID); err == nil {
@@ -2583,6 +3014,16 @@ func (m *Manager) cleanupAgentWorkspace(ctx context.Context, rec domain.SessionR
 		SessionID:     string(rec.ID),
 		WorkspacePath: workspacePath,
 	}); err != nil {
+		m.logger.Warn("workspace cleanup: agent cleanup failed", "sessionID", rec.ID, "workspacePath", workspacePath, "error", err)
+		if cleanupErr == nil {
+			cleanupErr = err
+		}
+	}
+	return cleanupErr
+}
+
+func (m *Manager) cleanupAgentWorkspaceBestEffort(ctx context.Context, rec domain.SessionRecord, workspacePath string) {
+	if err := m.cleanupAgentWorkspace(ctx, rec, workspacePath); err != nil {
 		m.logger.Warn("workspace cleanup: agent cleanup failed", "sessionID", rec.ID, "workspacePath", workspacePath, "error", err)
 	}
 }
@@ -2795,20 +3236,22 @@ func runtimeHandle(meta domain.SessionMetadata) ports.RuntimeHandle {
 
 func workspaceInfo(rec domain.SessionRecord) ports.WorkspaceInfo {
 	return ports.WorkspaceInfo{
-		Path:      rec.Metadata.WorkspacePath,
-		Branch:    rec.Metadata.Branch,
-		SessionID: rec.ID,
-		ProjectID: rec.ProjectID,
+		Path:          rec.Metadata.WorkspacePath,
+		Branch:        rec.Metadata.Branch,
+		WorkspaceKind: rec.Metadata.WorkspaceKind.WithDefault(),
+		SessionID:     rec.ID,
+		ProjectID:     rec.ProjectID,
 	}
 }
 
 func workspaceInfoFromRepoInfo(info ports.WorkspaceRepoInfo) ports.WorkspaceInfo {
 	return ports.WorkspaceInfo{
-		Path:      info.Path,
-		Branch:    info.Branch,
-		SessionID: info.SessionID,
-		ProjectID: info.ProjectID,
-		RepoPath:  info.RepoPath,
+		Path:          info.Path,
+		Branch:        info.Branch,
+		WorkspaceKind: domain.WorkspaceKindWorktree,
+		SessionID:     info.SessionID,
+		ProjectID:     info.ProjectID,
+		RepoPath:      info.RepoPath,
 	}
 }
 

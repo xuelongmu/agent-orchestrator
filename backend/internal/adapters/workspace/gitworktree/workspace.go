@@ -141,7 +141,7 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 	if err := w.addWorktree(ctx, repo, path, cfg.Branch, cfg.BaseBranch); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
-	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}, nil
+	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, WorkspaceKind: domain.WorkspaceKindWorktree, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}, nil
 }
 
 // CreateWorkspaceProject materialises a root-as-repo workspace session: the
@@ -222,7 +222,7 @@ func (w *Workspace) CreateWorkspaceProject(ctx context.Context, cfg ports.Worksp
 		}
 		out.Worktrees = append(out.Worktrees, info)
 		if repo.name == domain.RootWorkspaceRepoName {
-			out.Root = ports.WorkspaceInfo{Path: repo.outputPath, Branch: branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}
+			out.Root = ports.WorkspaceInfo{Path: repo.outputPath, Branch: branch, WorkspaceKind: domain.WorkspaceKindWorktree, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}
 		}
 	}
 	return out, nil
@@ -566,7 +566,7 @@ func (w *Workspace) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (por
 		if branch == "" {
 			branch = cfg.Branch
 		}
-		return ports.WorkspaceInfo{Path: path, Branch: branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}, nil
+		return ports.WorkspaceInfo{Path: path, Branch: branch, WorkspaceKind: domain.WorkspaceKindWorktree, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}, nil
 	}
 	if nonEmpty, err := pathExistsNonEmpty(path); err != nil {
 		return ports.WorkspaceInfo{}, err
@@ -584,7 +584,7 @@ func (w *Workspace) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (por
 	if err := w.addWorktree(ctx, repo, path, cfg.Branch, cfg.BaseBranch); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
-	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}, nil
+	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, WorkspaceKind: domain.WorkspaceKindWorktree, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}, nil
 }
 
 func (w *Workspace) existingWorktree(ctx context.Context, repo, path string, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, bool, error) {
@@ -597,7 +597,7 @@ func (w *Workspace) existingWorktree(ctx context.Context, repo, path string, cfg
 		if branch == "" {
 			branch = cfg.Branch
 		}
-		return ports.WorkspaceInfo{Path: path, Branch: branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}, true, nil
+		return ports.WorkspaceInfo{Path: path, Branch: branch, WorkspaceKind: domain.WorkspaceKindWorktree, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}, true, nil
 	}
 	return ports.WorkspaceInfo{}, false, nil
 }

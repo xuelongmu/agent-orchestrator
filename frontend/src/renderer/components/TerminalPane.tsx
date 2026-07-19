@@ -35,7 +35,7 @@ export function TerminalPane({ session, theme, daemonReady, terminalTarget, font
 				style={{ fontSize }}
 			>
 				<span className="text-terminal-dim">~/{session?.workspaceName ?? "reverbcode"}</span>{" "}
-				<span className="text-accent">{session?.branch || "main"}</span> $ {provider}
+				<span className="text-accent">{session?.branch || session?.workspaceKind || "worktree"}</span> $ {provider}
 				{"\n"}
 				{lines.map((line, index) => (
 					<span

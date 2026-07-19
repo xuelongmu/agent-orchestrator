@@ -224,6 +224,7 @@ type Session struct {
 	DiagnosticTerminalTail         string
 	DiagnosticHookErrorType        string
 	DiagnosticCapturedAt           sql.NullTime
+	WorkspaceKind                  string
 }
 
 type SessionWorktree struct {

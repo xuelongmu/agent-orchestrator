@@ -89,8 +89,18 @@ describe("useWorkspaceQuery", () => {
 							// to codex / unknown / the session id.
 							id: "sess-2",
 							projectId: "proj-1",
+							workspaceKind: "worktree",
 							harness: "mystery-agent",
 							status: "bogus",
+							isTerminated: false,
+							updatedAt: "2026-06-10T16:15:04Z",
+						},
+						{
+							id: "sess-scratch",
+							projectId: "proj-1",
+							workspaceKind: "scratch",
+							harness: "codex",
+							status: "idle",
 							isTerminated: false,
 							updatedAt: "2026-06-10T16:15:04Z",
 						},
@@ -112,7 +122,7 @@ describe("useWorkspaceQuery", () => {
 			path: "/home/me/my-app",
 			orchestratorAgent: "codex",
 		});
-		expect(workspace.sessions).toHaveLength(2);
+		expect(workspace.sessions).toHaveLength(3);
 		expect(workspace.sessions[0]).toMatchObject({
 			id: "sess-1",
 			terminalHandleId: "term-1",
@@ -134,6 +144,11 @@ describe("useWorkspaceQuery", () => {
 			provider: "codex",
 			status: "unknown",
 			branch: "session/sess-2",
+		});
+		expect(workspace.sessions[2]).toMatchObject({
+			id: "sess-scratch",
+			workspaceKind: "scratch",
+			branch: "",
 		});
 	});
 

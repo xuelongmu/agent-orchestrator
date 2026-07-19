@@ -110,6 +110,7 @@ export type ChangedFile = {
 };
 
 export type SessionKind = "worker" | "orchestrator";
+export type WorkspaceKind = "worktree" | "scratch" | "dir";
 
 /** Lifecycle state of a single pull request, mirrors the daemon's enum. */
 export type PRState = "open" | "draft" | "merged" | "closed";
@@ -141,6 +142,7 @@ export type WorkspaceSession = {
 	issueId?: string;
 	provider: AgentProvider;
 	kind?: SessionKind;
+	workspaceKind?: WorkspaceKind;
 	branch: string;
 	status: SessionStatus;
 	/** ISO timestamp from the daemon — used for relative time in the inspector. */

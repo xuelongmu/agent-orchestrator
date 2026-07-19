@@ -20,7 +20,9 @@ app-data location. `frontend/src/main.ts` pins Electron's `userData` to
 
 Storage is hybrid: durable daemon state, including sessions and activity events,
 is stored in SQLite under `AO_DATA_DIR` (default `~/.ao/data`). Managed worktrees
-live under `<AO_DATA_DIR>/worktrees` (default `~/.ao/data/worktrees`). `running.json`
+live under `<AO_DATA_DIR>/worktrees`; ephemeral scratch workspaces live under
+`<AO_DATA_DIR>/workspaces/scratch`. Directory workspaces reuse the registered
+project path and are never removed by AO. `running.json`
 and Electron profile data remain files under `~/.ao` by default; transient runtime
 state stays in memory.
 
