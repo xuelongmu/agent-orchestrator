@@ -177,6 +177,12 @@ func copilotAgentProfile(agentName, sessionID, systemPrompt string) string {
 }
 
 func ignoreCopilotPath(workspacePath, pattern string) error {
+	return ignoreCopilotPathWithLockContention(workspacePath, pattern, nil)
+}
+
+// ignoreCopilotPathWithLockContention exposes only the confirmed-contention
+// boundary needed to synchronize the concurrency regression test.
+func ignoreCopilotPathWithLockContention(workspacePath, pattern string, onLockContention func()) error {
 	gitDir, err := workspaceGitCommonDir(workspacePath)
 	if err != nil {
 		return err
@@ -185,18 +191,24 @@ func ignoreCopilotPath(workspacePath, pattern string) error {
 		return nil
 	}
 	excludePath := filepath.Join(gitDir, "info", "exclude")
+	if err := os.MkdirAll(filepath.Dir(excludePath), 0o750); err != nil {
+		return fmt.Errorf("create %s: %w", filepath.Dir(excludePath), err)
+	}
+	unlock, err := lockCopilotExclude(excludePath+".ao.lock", onLockContention)
+	if err != nil {
+		return fmt.Errorf("lock %s: %w", excludePath, err)
+	}
+	defer unlock()
+
 	data, err := os.ReadFile(excludePath) //nolint:gosec // path derived from the workspace .git metadata
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read %s: %w", excludePath, err)
 	}
 	pattern = strings.TrimSpace(pattern)
-	if pattern == "" || strings.Contains(string(data), pattern) {
+	if pattern == "" || excludeContainsPattern(data, pattern) {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(excludePath), 0o750); err != nil {
-		return fmt.Errorf("create %s: %w", filepath.Dir(excludePath), err)
-	}
-	body := strings.TrimRight(string(data), "\n")
+	body := strings.TrimRight(string(data), "\r\n")
 	if body != "" {
 		body += "\n"
 	}
@@ -205,6 +217,15 @@ func ignoreCopilotPath(workspacePath, pattern string) error {
 		return fmt.Errorf("write %s: %w", excludePath, err)
 	}
 	return nil
+}
+
+func excludeContainsPattern(data []byte, pattern string) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(strings.TrimSuffix(line, "\r")) == pattern {
+			return true
+		}
+	}
+	return false
 }
 
 func workspaceGitCommonDir(workspacePath string) (string, error) {
