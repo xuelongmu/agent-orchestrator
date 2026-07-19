@@ -30,6 +30,7 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 	if err != nil {
 		return RunResult{ExitCode: -1}, err
 	}
+	defer func() { _ = ownerWrite.Close() }()
 	outputRead, outputWrite, err := os.Pipe()
 	if err != nil {
 		_ = ownerRead.Close()
@@ -63,6 +64,7 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 	}()
 	process, openErr := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|0x0800, false, uint32(cmd.Process.Pid)) // PROCESS_SUSPEND_RESUME
 	if openErr != nil {
+		_ = ownerWrite.Close()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		_ = outputRead.Close()
@@ -77,6 +79,7 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 		}
 	}
 	if err != nil {
+		_ = ownerWrite.Close()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		_ = outputRead.Close()
