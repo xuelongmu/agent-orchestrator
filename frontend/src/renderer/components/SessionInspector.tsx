@@ -21,6 +21,8 @@ import { StatusPill } from "./StatusPill";
 type ProjectConfig = components["schemas"]["ProjectConfig"];
 type PRReviewState = components["schemas"]["PRReviewState"];
 type ReviewsResponse = components["schemas"]["ListReviewsResponse"];
+type ReviewFinding = components["schemas"]["ReviewFinding"];
+type FindingLedgerSummary = components["schemas"]["FindingLedgerSummary"];
 type OpenReviewerTerminal = (target: { handleId: string; harness: string }) => void;
 
 export type InspectorView = "summary" | "reviews" | "browser" | "files";
@@ -495,7 +497,15 @@ function ReviewsView({
 				params: { path: { sessionId: session.id } },
 			});
 			if (error) throw new Error(apiErrorMessage(error, "Unable to load reviews"));
-			return data ?? ({ reviewerHandleId: "", reviews: [] } satisfies ReviewsResponse);
+			return (
+				data ??
+				({
+					reviewerHandleId: "",
+					reviews: [],
+					findings: [],
+					ledger: { totalFindings: 0, rounds: 0, classes: [] },
+				} satisfies ReviewsResponse)
+			);
 		},
 	});
 	const projectConfigQuery = useQuery({
@@ -555,6 +565,8 @@ function ReviewsView({
 			<Section title="Reviews">
 				<ReviewPanel
 					config={projectConfigQuery.data}
+					findings={reviewsQuery.data?.findings ?? []}
+					ledger={reviewsQuery.data?.ledger}
 					error={reviewsQuery.error ?? triggerReview.error ?? cancelReview.error}
 					isLoading={reviewsQuery.isLoading}
 					isCancelling={cancelReview.isPending}
@@ -588,6 +600,8 @@ function mockProjectConfig(): ProjectConfig {
 function mockReviewsResponse(session: WorkspaceSession): ReviewsResponse {
 	return {
 		reviewerHandleId: `${session.id}-reviewer`,
+		findings: [],
+		ledger: { totalFindings: 0, rounds: 0, classes: [] },
 		reviews: sortedPRs(session).map((pr, index) => {
 			const targetSha = `demo${pr.number}${index}`;
 			const reviewedAt = new Date(Date.now() - (index + 1) * 11 * 60 * 1000).toISOString();
@@ -660,6 +674,8 @@ function ReviewPanel({
 	onTrigger,
 	onCancel,
 	onOpenTerminal,
+	findings,
+	ledger,
 }: {
 	session: WorkspaceSession;
 	config?: ProjectConfig;
@@ -673,6 +689,8 @@ function ReviewPanel({
 	onTrigger: () => void;
 	onCancel: () => void;
 	onOpenTerminal?: OpenReviewerTerminal;
+	findings: ReviewFinding[];
+	ledger?: FindingLedgerSummary;
 }) {
 	if (sortedPRs(session).length === 0) {
 		return <p className={inspectorEmptyClass}>No pull request opened yet.</p>;
@@ -764,6 +782,51 @@ function ReviewPanel({
 						Open terminal
 					</button>
 				</div>
+			</div>
+			{ledger && ledger.totalFindings > 0 ? <FindingLedger ledger={ledger} findings={findings} /> : null}
+		</div>
+	);
+}
+
+function FindingLedger({ ledger, findings }: { ledger: FindingLedgerSummary; findings: ReviewFinding[] }) {
+	return (
+		<div
+			className="flex flex-col gap-3 overflow-hidden rounded-lg border border-border bg-surface p-3"
+			data-testid="finding-ledger"
+		>
+			<div className="flex items-center justify-between gap-2">
+				<span className="text-xs font-semibold text-foreground">Finding-class ledger</span>
+				<span className="text-2xs text-passive">
+					{ledger.totalFindings} findings · {ledger.rounds} rounds
+				</span>
+			</div>
+			<div className="flex flex-wrap gap-1.5">
+				{ledger.classes.map((entry) => (
+					<Badge key={entry.classTag} variant="outline" className="h-5 px-1.5 font-mono text-micro">
+						{entry.classTag} ×{entry.count}
+					</Badge>
+				))}
+			</div>
+			<div className="flex max-h-52 flex-col overflow-y-auto rounded-md border border-border">
+				{findings.map((finding) => (
+					<div key={finding.id} className="border-b border-border p-2.5 text-caption last:border-b-0">
+						<div className="flex items-center gap-2 font-mono text-2xs text-passive">
+							<span>Round {finding.round}</span>
+							<span className="truncate">{finding.file || finding.classTag}</span>
+						</div>
+						<p className="mt-1 text-xs leading-normal text-muted-foreground">{finding.rootCauseNote}</p>
+						{finding.deferredIssueUrl ? (
+							<a
+								className="mt-1 inline-flex text-accent hover:underline"
+								href={finding.deferredIssueUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+							>
+								Deferred issue
+							</a>
+						) : null}
+					</div>
+				))}
 			</div>
 		</div>
 	);

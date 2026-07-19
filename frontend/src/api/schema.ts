@@ -770,6 +770,15 @@ export interface components {
         DomainReviewerConfig: {
             harness: string;
         };
+        FindingClassCount: {
+            classTag: string;
+            count: number;
+        };
+        FindingLedgerSummary: {
+            classes: components["schemas"]["FindingClassCount"][];
+            rounds: number;
+            totalFindings: number;
+        };
         ImportReport: {
             dryRun: boolean;
             notes?: string[];
@@ -816,6 +825,8 @@ export interface components {
             projects: components["schemas"]["ProjectSummary"][];
         };
         ListReviewsResponse: {
+            findings: components["schemas"]["ReviewFinding"][];
+            ledger: components["schemas"]["FindingLedgerSummary"];
             reviewerHandleId: string;
             reviews: components["schemas"]["PRReviewState"][];
         };
@@ -922,6 +933,7 @@ export interface components {
             orchestrator?: components["schemas"]["RoleOverride"];
             orchestratorRules?: string;
             postCreate?: string[];
+            reviewPolicy?: components["schemas"]["ReviewPolicyConfig"];
             reviewers?: components["schemas"]["DomainReviewerConfig"][];
             sessionPrefix?: string;
             symlinks?: string[];
@@ -970,6 +982,27 @@ export interface components {
             ok: boolean;
             session: components["schemas"]["ControllersSessionView"];
             sessionId: string;
+        };
+        ReviewFinding: {
+            body?: string;
+            classTag: string;
+            /** Format: date-time */
+            createdAt: string;
+            deferredIssueUrl?: string;
+            file: string;
+            fixCommit?: string;
+            id: string;
+            outOfScope?: boolean;
+            prUrl: string;
+            rootCauseNote: string;
+            round: number;
+            runId: string;
+            sessionId: string;
+            threadId?: string;
+            threadResolved?: boolean;
+        };
+        ReviewPolicyConfig: {
+            outOfScopeDeflection?: boolean;
         };
         ReviewRun: {
             batchId: string;
@@ -1152,9 +1185,22 @@ export interface components {
             projectId: string;
             prompt?: string;
         };
+        SubmitFindingItem: {
+            body?: string;
+            /** @description Stable kebab-case root-cause class. */
+            classTag: string;
+            file?: string;
+            /** @description Finding belongs to a subsystem outside this PR's core scope. */
+            outOfScope?: boolean;
+            /** @description One-line invariant or root-cause explanation. */
+            rootCauseNote: string;
+            /** @description Provider review-thread node id. */
+            threadId?: string;
+        };
         SubmitReviewInput: {
             /** @description Review body recorded by AO. Required for changes_requested. */
             body?: string;
+            findings?: components["schemas"]["SubmitFindingItem"][];
             /** @description Id of the GitHub PR review the reviewer posted, if any. */
             githubReviewId?: string;
             /** @description Batched review results recorded by one reviewer CLI command. */
@@ -1167,6 +1213,8 @@ export interface components {
         SubmitReviewItem: {
             /** @description Review body recorded by AO. Required for changes_requested. */
             body?: string;
+            /** @description Structured blocking findings for the finding-class ledger. */
+            findings?: components["schemas"]["SubmitFindingItem"][];
             /** @description Id of the GitHub PR review the reviewer posted, if any. */
             githubReviewId?: string;
             /** @description Review run id being completed. */

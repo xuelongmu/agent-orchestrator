@@ -44,6 +44,7 @@ type SCMMerger interface {
 // response confirms the thread's resolved state.
 type SCMReviewThreadResolution struct {
 	ThreadID string
+	ReplyID  string
 	Resolved bool
 }
 
@@ -52,4 +53,64 @@ type SCMReviewThreadResolution struct {
 // a successful confirmation, not an error.
 type SCMReviewThreadResolver interface {
 	ResolveReviewThread(ctx context.Context, threadID string) (SCMReviewThreadResolution, error)
+}
+
+// SCMDeferredIssueRequest describes a review finding that belongs in the
+// backlog instead of the current PR.
+type SCMDeferredIssueRequest struct {
+	PRURL string
+	Title string
+	Body  string
+	// ActionKey is a stable, provider-visible idempotency marker for the finding.
+	ActionKey string
+}
+
+// SCMDeferredIssue is the provider-confirmed backlog item.
+type SCMDeferredIssue struct {
+	URL string
+}
+
+// SCMIssueFiler ensures one provider issue exists in the repository owning a
+// PR. Implementations must search for ActionKey before creating a new issue.
+type SCMIssueFiler interface {
+	FileDeferredIssue(ctx context.Context, request SCMDeferredIssueRequest) (SCMDeferredIssue, error)
+}
+
+// SCMReviewDismissalRequest identifies the provider review that must no longer
+// block mergeability after all of its findings have been deferred.
+type SCMReviewDismissalRequest struct {
+	PRURL    string
+	ReviewID string
+	Message  string
+}
+
+// SCMReviewDismissal is the provider-confirmed review clearing outcome.
+type SCMReviewDismissal struct {
+	Cleared bool
+}
+
+// SCMReviewDismisser idempotently clears a provider changes-requested review.
+type SCMReviewDismisser interface {
+	DismissReview(ctx context.Context, request SCMReviewDismissalRequest) (SCMReviewDismissal, error)
+}
+
+// SCMReviewThreadBinding pins a provider thread mutation to the originating
+// PR, submitted review, and finding location.
+type SCMReviewThreadBinding struct {
+	PRURL     string
+	ReviewID  string
+	ThreadID  string
+	File      string
+	Body      string
+	ActionKey string
+	IssueURL  string
+}
+
+// SCMFindingThreadDeflector links a review thread to its backlog issue and
+// resolves it. Binding validation is read-only and must happen before any
+// mutation. Deflection must be idempotent by ActionKey and must not report
+// success unless resolution is provider-confirmed.
+type SCMFindingThreadDeflector interface {
+	ReviewThreadBound(ctx context.Context, binding SCMReviewThreadBinding) (bool, error)
+	DeflectReviewThread(ctx context.Context, binding SCMReviewThreadBinding) (SCMReviewThreadResolution, error)
 }

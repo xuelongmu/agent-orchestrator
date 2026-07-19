@@ -594,6 +594,42 @@ describe("SessionInspector reviews tab", () => {
 		expect(screen.getAllByText("Changes requested")).not.toHaveLength(0);
 	});
 
+	it("shows the durable finding-class ledger", async () => {
+		getMock.mockImplementation(async (path: string) => {
+			if (path === "/api/v1/sessions/{sessionId}/reviews") {
+				return {
+					data: {
+						reviewerHandleId: "reviewer-pane",
+						reviews: [reviewState(3, "changes_requested", "abc123")],
+						ledger: { totalFindings: 3, rounds: 3, classes: [{ classTag: "missing-notify", count: 3 }] },
+						findings: [
+							{
+								id: "f-1",
+								runId: "run-1",
+								sessionId: "sess-1",
+								prUrl: pr(3, "open").url,
+								round: 3,
+								file: "notify.go",
+								classTag: "missing-notify",
+								rootCauseNote: "Every broken path must notify.",
+								createdAt: "2026-06-15T00:00:00Z",
+							},
+						],
+					},
+				};
+			}
+			if (path === "/api/v1/projects/{id}") return { data: undefined };
+			return { data: undefined };
+		});
+
+		renderWithQuery(<SessionInspector session={session([pr(3, "open")])} />);
+		await openReviewsTab();
+
+		expect(await screen.findByTestId("finding-ledger")).toHaveTextContent("3 findings · 3 rounds");
+		expect(screen.getByText("missing-notify ×3")).toBeInTheDocument();
+		expect(screen.getByText("Every broken path must notify.")).toBeInTheDocument();
+	});
+
 	it("shows failed latest runs as failed and still allows rerun", async () => {
 		mockCommonGets([failedReview], "reviewer-pane", [
 			{ ...reviewState(3, "needs_review", "abc123"), latestRun: failedReview },
