@@ -35,6 +35,9 @@ func deriveStatus(rec domain.SessionRecord, prs []domain.PRFacts, now time.Time,
 	if rec.Activity.State.NeedsInput() {
 		return domain.StatusNeedsInput
 	}
+	if rec.Activity.State == domain.ActivityRateLimited {
+		return domain.StatusRateLimited
+	}
 
 	open := openPRs(prs)
 	if len(open) > 0 {

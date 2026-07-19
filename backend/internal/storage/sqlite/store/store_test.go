@@ -462,13 +462,14 @@ func TestSessionPendingSubmitLatchRoundTripAndAtomicClaim(t *testing.T) {
 	}
 }
 
-func TestSessionTerminalOrBlockedUpdateClearsPendingSubmitLatch(t *testing.T) {
+func TestSessionTerminalOrAutomationBlockedUpdateClearsPendingSubmitLatch(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		activity   domain.ActivityState
 		terminated bool
 	}{
 		{name: "blocked", activity: domain.ActivityBlocked},
+		{name: "rate limited", activity: domain.ActivityRateLimited},
 		{name: "terminated", activity: domain.ActivityExited, terminated: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

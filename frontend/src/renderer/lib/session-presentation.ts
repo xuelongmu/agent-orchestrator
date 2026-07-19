@@ -12,6 +12,7 @@ const agentActivityViews: Record<SessionActivityState, AgentActivityView> = {
 	idle: { state: "idle", label: "Idle", tone: "var(--color-text-muted)", breathe: false },
 	waiting_input: { state: "waiting_input", label: "Input Needed", tone: "var(--color-warning)", breathe: false },
 	blocked: { state: "blocked", label: "Awaiting Decision", tone: "var(--color-warning)", breathe: false },
+	rate_limited: { state: "rate_limited", label: "Usage Limit Reached", tone: "var(--color-warning)", breathe: false },
 	exited: { state: "exited", label: "Exited", tone: "var(--color-text-muted)", breathe: false },
 	unknown: { state: "unknown", label: "Unknown", tone: "var(--color-text-muted)", breathe: false },
 };
@@ -34,6 +35,7 @@ const sessionStatusViews: Record<SessionStatus, SessionStatusView> = {
 	working: { label: "Working", className: "text-working" },
 	idle: { label: "Idle", className: "text-passive" },
 	needs_input: { label: "Input needed", className: "text-warning" },
+	rate_limited: { label: "Usage limit reached", className: "text-warning" },
 	no_signal: { label: "No signal", className: "text-warning" },
 	ci_failed: { label: "CI failed", className: "text-error" },
 	changes_requested: { label: "Changes requested", className: "text-warning" },
@@ -132,6 +134,7 @@ export function attentionZone(input: SessionStatus | Pick<WorkspaceSession, "sta
 		case "mergeable":
 			return "merge";
 		case "needs_input":
+		case "rate_limited":
 		case "no_signal":
 		case "ci_failed":
 		case "changes_requested":

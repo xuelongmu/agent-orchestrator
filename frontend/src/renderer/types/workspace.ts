@@ -11,6 +11,7 @@ export type SessionStatus =
 	| "mergeable"
 	| "merged"
 	| "needs_input"
+	| "rate_limited"
 	| "no_signal"
 	| "idle"
 	| "terminated"
@@ -27,6 +28,7 @@ const sessionStatuses = new Set<SessionStatus>([
 	"mergeable",
 	"merged",
 	"needs_input",
+	"rate_limited",
 	"no_signal",
 	"idle",
 	"terminated",
@@ -37,9 +39,23 @@ export function toSessionStatus(status?: string, isTerminated = false): SessionS
 	return isTerminated ? "terminated" : "unknown";
 }
 
-export type SessionActivityState = "active" | "idle" | "waiting_input" | "blocked" | "exited" | "unknown";
+export type SessionActivityState =
+	| "active"
+	| "idle"
+	| "waiting_input"
+	| "blocked"
+	| "rate_limited"
+	| "exited"
+	| "unknown";
 
-const sessionActivityStates = new Set<SessionActivityState>(["active", "idle", "waiting_input", "blocked", "exited"]);
+const sessionActivityStates = new Set<SessionActivityState>([
+	"active",
+	"idle",
+	"waiting_input",
+	"blocked",
+	"rate_limited",
+	"exited",
+]);
 
 export type SessionActivity = {
 	state: SessionActivityState;
@@ -201,6 +217,7 @@ export function workerDisplayStatus(session: WorkspaceSession): WorkerDisplaySta
 	if (session.displayStatus) return session.displayStatus;
 	switch (session.status) {
 		case "needs_input":
+		case "rate_limited":
 		case "changes_requested":
 		case "review_pending":
 			return "needs_you";

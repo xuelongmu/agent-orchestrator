@@ -4888,6 +4888,21 @@ func TestSend_BlockedSessionRejectsDelivery(t *testing.T) {
 	}
 }
 
+func TestSend_RateLimitedSessionAllowsExplicitRetryWithoutAutomatedNudge(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = domain.SessionRecord{ID: "s1", Harness: "claude-code",
+		Activity: domain.Activity{State: domain.ActivityRateLimited}}
+	msg := &fakeMessenger{}
+	m := newSendTestManager(t, signalingAgent{}, msg, st)
+
+	if err := m.Send(context.Background(), "s1", "retry after the usage window reset"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(msg.msgs) != 1 || msg.msgs[0] != "retry after the usage window reset" {
+		t.Fatalf("Send calls = %#v, want exactly the explicit retry and no automated Enter nudge", msg.msgs)
+	}
+}
+
 func TestSend_NoNudgeWhenBlockedAppearsMidWait(t *testing.T) {
 	// The permission dialog can appear between polls (e.g. the delivered prompt
 	// itself triggered a tool approval). The confirm loop must abort on the

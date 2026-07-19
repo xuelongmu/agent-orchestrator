@@ -61,6 +61,7 @@ describe("toSessionStatus", () => {
 	it("passes through a known status", () => {
 		expect(toSessionStatus("mergeable")).toBe("mergeable");
 		expect(toSessionStatus("no_signal")).toBe("no_signal");
+		expect(toSessionStatus("rate_limited")).toBe("rate_limited");
 	});
 
 	it("keeps a backend merged status even when the session is terminated", () => {
@@ -78,7 +79,7 @@ describe("toSessionStatus", () => {
 });
 
 describe("toSessionActivity", () => {
-	it.each(["active", "idle", "waiting_input", "blocked", "exited"] as const)(
+	it.each(["active", "idle", "waiting_input", "blocked", "rate_limited", "exited"] as const)(
 		"passes through the known state %s",
 		(state) => {
 			expect(toSessionActivity({ state })?.state).toBe(state);

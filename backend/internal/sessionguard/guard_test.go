@@ -53,6 +53,9 @@ func TestGuard_OutcomeByState(t *testing.T) {
 		// automated nudge does not.
 		{"waiting_input", record(domain.ActivityWaitingInput, false), true, Sent, SuppressedAwaitingUser},
 		{"blocked", record(domain.ActivityBlocked, false), true, SuppressedAwaitingUser, SuppressedAwaitingUser},
+		// Explicit user/API delivery is the intentional retry path after the
+		// provider window resets; unattended AO nudges remain parked.
+		{"rate limited", record(domain.ActivityRateLimited, false), true, Sent, SuppressedRateLimited},
 		// exited is refused even without IsTerminated: the pane holds an
 		// interactive shell after agent exit, so a paste would execute there.
 		{"exited", record(domain.ActivityExited, false), true, SuppressedTerminated, SuppressedTerminated},

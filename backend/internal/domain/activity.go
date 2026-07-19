@@ -6,7 +6,8 @@ import "time"
 // callbacks, not inferred from transcript/JSONL
 type ActivityState string
 
-// Activity states. WaitingInput and Blocked are sticky (see IsSticky).
+// Activity states. WaitingInput, Blocked, and RateLimited are sticky (see
+// IsSticky).
 //
 // WaitingInput and Blocked both mean "paused on the user" but demand opposite
 // automation: waiting_input is an agent at an empty prompt awaiting its next
@@ -22,13 +23,18 @@ const (
 	ActivityIdle         ActivityState = "idle"
 	ActivityWaitingInput ActivityState = "waiting_input"
 	ActivityBlocked      ActivityState = "blocked"
-	ActivityExited       ActivityState = "exited"
+	// ActivityRateLimited means the harness reported that the provider refused
+	// the turn because the account/model usage limit was reached. The live
+	// runtime stays parked: AO must neither inject input nor infer death from
+	// age until a newer authoritative hook signal reports recovery.
+	ActivityRateLimited ActivityState = "rate_limited"
+	ActivityExited      ActivityState = "exited"
 )
 
 // IsSticky reports whether an activity state must NOT be aged/demoted by the
 // passage of time (a paused agent is still paused until a new signal says so).
 func (a ActivityState) IsSticky() bool {
-	return a == ActivityWaitingInput || a == ActivityBlocked
+	return a == ActivityWaitingInput || a == ActivityBlocked || a == ActivityRateLimited
 }
 
 // NeedsInput reports whether the agent is paused on the user — waiting for the
@@ -37,6 +43,20 @@ func (a ActivityState) IsSticky() bool {
 // is about time-demotion, NeedsInput about the user being the unblocker.
 func (a ActivityState) NeedsInput() bool {
 	return a == ActivityWaitingInput || a == ActivityBlocked
+}
+
+// PausesAutomation reports whether AO must stop unsolicited session writes.
+// Unlike NeedsInput, it includes provider-side pauses where waiting—not the
+// user—is the safe action.
+func (a ActivityState) PausesAutomation() bool {
+	return a.NeedsInput() || a == ActivityRateLimited
+}
+
+// BlocksAutomatedDelivery reports whether unattended input is unsafe. An
+// explicit user/API send may retry a rate-limited session after the reset;
+// AO's own nudges and editor-recovery Enter presses must remain parked.
+func (a ActivityState) BlocksAutomatedDelivery() bool {
+	return a == ActivityBlocked || a == ActivityRateLimited
 }
 
 // Activity captures the persisted activity reading: the state and when it was

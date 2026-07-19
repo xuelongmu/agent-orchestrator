@@ -50,6 +50,10 @@ const (
 	// SuppressedStaleEpisode means a call-specific activity episode predicate
 	// no longer matched at the guard's final pre-write store read.
 	SuppressedStaleEpisode
+	// SuppressedRateLimited means the provider parked the live harness on a
+	// usage-limit failure. Automated input is withheld; an explicit Deliver is
+	// still the intentional retry path after the provider window resets.
+	SuppressedRateLimited
 )
 
 // String names the outcome for logs.
@@ -65,6 +69,8 @@ func (o Outcome) String() string {
 		return "suppressed_awaiting_user"
 	case SuppressedStaleEpisode:
 		return "suppressed_stale_episode"
+	case SuppressedRateLimited:
+		return "suppressed_rate_limited"
 	default:
 		return "suppressed_unknown"
 	}
@@ -112,8 +118,13 @@ func (g *Guard) Send(ctx context.Context, id domain.SessionID, msg string) error
 // sitting at an idle prompt is exactly where a user message (or the Enter that
 // submits its unsent draft) belongs.
 func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
-	return g.send(ctx, id, msg, func(rec domain.SessionRecord) bool {
-		return rec.Activity.State == domain.ActivityBlocked
+	return g.send(ctx, id, msg, func(rec domain.SessionRecord) Outcome {
+		switch rec.Activity.State {
+		case domain.ActivityBlocked:
+			return SuppressedAwaitingUser
+		default:
+			return Sent
+		}
 	}, nil)
 }
 
@@ -123,19 +134,25 @@ func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (O
 // latched as pending in the editor. An automated paste+Enter in those states
 // could answer a dialog or stack text behind a draft that has not submitted.
 func (g *Guard) Nudge(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
-	return g.send(ctx, id, msg, func(rec domain.SessionRecord) bool {
-		return rec.Activity.State.NeedsInput() || rec.Metadata.PendingSubmitFingerprint != ""
-	}, nil)
+	return g.send(ctx, id, msg, nudgeRefusal, nil)
 }
 
 // NudgeIdleEpisode writes an idle-review reminder only when the guard's final
 // pre-write read still belongs to the exact idle episode that authorized it.
 func (g *Guard) NudgeIdleEpisode(ctx context.Context, id domain.SessionID, msg string, idleSince time.Time) (Outcome, error) {
-	return g.send(ctx, id, msg, func(rec domain.SessionRecord) bool {
-		return rec.Activity.State.NeedsInput() || rec.Metadata.PendingSubmitFingerprint != ""
-	}, func(rec domain.SessionRecord) bool {
+	return g.send(ctx, id, msg, nudgeRefusal, func(rec domain.SessionRecord) bool {
 		return rec.Activity.State == domain.ActivityIdle && rec.Activity.LastActivityAt.Equal(idleSince)
 	})
+}
+
+func nudgeRefusal(rec domain.SessionRecord) Outcome {
+	if rec.Activity.State == domain.ActivityRateLimited {
+		return SuppressedRateLimited
+	}
+	if rec.Activity.State.NeedsInput() || rec.Metadata.PendingSubmitFingerprint != "" {
+		return SuppressedAwaitingUser
+	}
+	return Sent
 }
 
 // send re-reads the session immediately before pasting so the window between
@@ -144,7 +161,7 @@ func (g *Guard) NudgeIdleEpisode(ctx context.Context, id domain.SessionID, msg s
 // appear mid-paste — but the just-in-time read is the strongest guarantee
 // available without scraping the terminal. Fail closed: a store error
 // suppresses the write rather than pressing Enter on an unknown state.
-func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refuse, require func(domain.SessionRecord) bool) (Outcome, error) {
+func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refuse func(domain.SessionRecord) Outcome, require func(domain.SessionRecord) bool) (Outcome, error) {
 	rec, ok, err := g.store.GetSession(ctx, id)
 	if err != nil {
 		return SuppressedUnknown, fmt.Errorf("guard %s: read session: %w", id, err)
@@ -162,13 +179,15 @@ func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refus
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "terminated")
 		return SuppressedTerminated, nil
 	}
-	if refuse(rec) {
+	if outcome := refuse(rec); outcome != Sent {
 		reason := "awaiting_user"
-		if rec.Metadata.PendingSubmitFingerprint != "" && !rec.Activity.State.NeedsInput() {
+		if outcome == SuppressedRateLimited {
+			reason = "rate_limited"
+		} else if rec.Metadata.PendingSubmitFingerprint != "" && !rec.Activity.State.NeedsInput() {
 			reason = "pending_submit"
 		}
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", reason, "state", string(rec.Activity.State))
-		return SuppressedAwaitingUser, nil
+		return outcome, nil
 	}
 	if require != nil && !require(rec) {
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "stale_episode", "state", string(rec.Activity.State))

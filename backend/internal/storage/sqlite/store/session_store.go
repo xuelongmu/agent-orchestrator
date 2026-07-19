@@ -358,11 +358,11 @@ func diagnosticFields(diagnostic *domain.LifecycleDiagnostic) (string, string, s
 	return string(diagnostic.Trigger), diagnostic.TerminalTail, diagnostic.HookErrorType, timeToNullTime(diagnostic.CapturedAt)
 }
 
-// A terminal or blocked session is definitive evidence that an editor draft
+// A terminal or delivery-blocked session is definitive evidence that an editor draft
 // can no longer be safely submitted. Clear the latch on every full-row write
 // of either fact, regardless of which lifecycle path produced it.
 func pendingSubmitFields(rec domain.SessionRecord, activity domain.ActivityState) (string, bool) {
-	if rec.IsTerminated || activity == domain.ActivityBlocked {
+	if rec.IsTerminated || activity.BlocksAutomatedDelivery() {
 		return "", false
 	}
 	return rec.Metadata.PendingSubmitFingerprint, rec.Metadata.PendingSubmitRecoveryAttempted

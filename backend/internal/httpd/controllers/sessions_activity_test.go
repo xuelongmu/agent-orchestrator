@@ -80,6 +80,19 @@ func TestSessionsAPI_ActivityAcceptsBlocked(t *testing.T) {
 	}
 }
 
+func TestSessionsAPI_ActivityAcceptsRateLimited(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity", `{"state":"rate_limited"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	if !rec.gotSignal.Valid || rec.gotSignal.State != domain.ActivityRateLimited {
+		t.Fatalf("recorder signal = %#v", rec.gotSignal)
+	}
+}
+
 func TestSessionsAPI_ActivityThreadsCorrelationFields(t *testing.T) {
 	// The optional correlation fields ride into the signal (sanitized); a
 	// body without them (old CLIs) keeps producing a plain state-only signal,

@@ -43,6 +43,7 @@ describe("session presentation", () => {
 		["idle", "Idle", false],
 		["waiting_input", "Input Needed", false],
 		["blocked", "Awaiting Decision", false],
+		["rate_limited", "Usage Limit Reached", false],
 		["exited", "Exited", false],
 		["unknown", "Unknown", false],
 	] as const)("maps %s agent activity to %s", (state, label, breathe) => {
@@ -59,6 +60,7 @@ describe("session presentation", () => {
 		["working", "Working"],
 		["idle", "Idle"],
 		["needs_input", "Input needed"],
+		["rate_limited", "Usage limit reached"],
 		["no_signal", "No signal"],
 		["ci_failed", "CI failed"],
 		["changes_requested", "Changes requested"],
@@ -77,6 +79,7 @@ describe("session presentation", () => {
 	it("uses distinct session-card tones for idle, no signal, and PR waiting states", () => {
 		expect(getSessionStatusView("idle").className).toBe("text-passive");
 		expect(getSessionStatusView("no_signal").className).toBe("text-warning");
+		expect(getSessionStatusView("rate_limited").className).toBe("text-warning");
 		expect(getSessionStatusView("draft").className).toBe("text-accent");
 		expect(getSessionStatusView("pr_open").className).toBe("text-accent");
 		expect(getSessionStatusView("review_pending").className).toBe("text-accent");

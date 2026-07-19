@@ -203,6 +203,13 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 // existing activity and first-signal facts untouched.
 func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, s ports.ActivitySignal) error {
 	s.AgentSessionID = strings.TrimSpace(s.AgentSessionID)
+	// The hook receiver already parses Claude's documented StopFailure `error`
+	// field into ErrorType for diagnostics. Promote only the provider-neutral
+	// rate_limit category into a parked lifecycle state; other stop failures
+	// retain the normal idle diagnostic path.
+	if s.Valid && s.Event == "stop-failure" && s.ErrorType == "rate_limit" {
+		s.State = domain.ActivityRateLimited
+	}
 	if !s.Valid && s.AgentSessionID == "" {
 		return nil
 	}
@@ -305,10 +312,25 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 		m.mu.Unlock()
 		return err
 	}
+	// A provider usage-limit transition is a durable park, not a request for
+	// user input. Reuse the persisted needs-input notification channel with
+	// explicit copy so the condition is prominent without inventing a second
+	// storage enum. Same-state repeats do not re-notify.
+	if rec.Activity.State != domain.ActivityRateLimited && next.Activity.State == domain.ActivityRateLimited && !next.IsTerminated {
+		intent = &ports.NotificationIntent{
+			Type:               domain.NotificationNeedsInput,
+			SessionID:          next.ID,
+			ProjectID:          next.ProjectID,
+			CreatedAt:          next.Activity.LastActivityAt,
+			SessionDisplayName: next.DisplayName,
+			TitleOverride:      "Agent usage limit reached",
+			BodyOverride:       "The live session is parked and its worktree is preserved. Wait for the provider limit to reset, then send an explicit retry.",
+		}
+	}
 	// Transition into the needs-input family (waiting_input or blocked) pings
 	// the user; an in-family escalation (waiting_input -> blocked) does not
 	// re-notify — the user was already pinged once for this pause.
-	if !rec.Activity.State.NeedsInput() && next.Activity.State.NeedsInput() && !next.IsTerminated {
+	if intent == nil && !rec.Activity.State.NeedsInput() && next.Activity.State.NeedsInput() && !next.IsTerminated {
 		intent = &ports.NotificationIntent{
 			Type:               domain.NotificationNeedsInput,
 			SessionID:          next.ID,

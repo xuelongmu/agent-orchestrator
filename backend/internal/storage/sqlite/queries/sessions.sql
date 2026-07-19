@@ -65,7 +65,7 @@ WHERE id = ?
   AND pending_submit_fingerprint = ?
   AND pending_submit_recovery_attempted = FALSE
   AND is_terminated = FALSE
-  AND activity_state <> 'blocked';
+  AND activity_state NOT IN ('blocked', 'rate_limited');
 
 -- name: ClearPendingSubmit :execrows
 UPDATE sessions SET

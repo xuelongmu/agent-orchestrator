@@ -1719,7 +1719,7 @@ func (m *Manager) confirmInputSubmitted(ctx context.Context, guard *sessionguard
 		if recoveryErr != nil {
 			m.logger.Warn("send: pending-input Enter recovery failed", "sessionID", rec.ID, "error", recoveryErr)
 		}
-		if outcome == sessionguard.SuppressedAwaitingUser || outcome == sessionguard.SuppressedTerminated {
+		if outcome == sessionguard.SuppressedAwaitingUser || outcome == sessionguard.SuppressedRateLimited || outcome == sessionguard.SuppressedTerminated {
 			_, _ = m.store.ClearPendingSubmit(ctx, rec.ID, fingerprint, m.clock())
 		}
 		if outcome != sessionguard.Sent {
@@ -1741,7 +1741,7 @@ func (m *Manager) recoverPendingSubmit(ctx context.Context, rec domain.SessionRe
 	if fingerprint == "" {
 		return false, false, nil
 	}
-	if rec.IsTerminated || rec.Activity.State == domain.ActivityBlocked {
+	if rec.IsTerminated || rec.Activity.State.BlocksAutomatedDelivery() {
 		_, err := m.store.ClearPendingSubmit(ctx, rec.ID, fingerprint, m.clock())
 		return false, rec.Metadata.PendingSubmitRecoveryAttempted, err
 	}
@@ -1791,7 +1791,7 @@ func (m *Manager) recoverPendingSubmit(ctx context.Context, rec domain.SessionRe
 			if readErr != nil {
 				return true, recoveryAttempted, readErr
 			}
-			if !found || fresh.IsTerminated || fresh.Activity.State == domain.ActivityBlocked {
+			if !found || fresh.IsTerminated || fresh.Activity.State.BlocksAutomatedDelivery() {
 				_, clearErr := m.store.ClearPendingSubmit(ctx, rec.ID, fingerprint, m.clock())
 				return false, recoveryAttempted, clearErr
 			}
@@ -1803,7 +1803,7 @@ func (m *Manager) recoverPendingSubmit(ctx context.Context, rec domain.SessionRe
 		if sendErr != nil {
 			m.logger.Warn("send: pending-input Enter recovery failed", "sessionID", rec.ID, "error", sendErr)
 		}
-		if outcome == sessionguard.SuppressedAwaitingUser || outcome == sessionguard.SuppressedTerminated {
+		if outcome == sessionguard.SuppressedAwaitingUser || outcome == sessionguard.SuppressedRateLimited || outcome == sessionguard.SuppressedTerminated {
 			_, clearErr := m.store.ClearPendingSubmit(ctx, rec.ID, fingerprint, m.clock())
 			return false, recoveryAttempted, clearErr
 		}
@@ -1950,7 +1950,7 @@ func (m *Manager) waitForActive(ctx context.Context, id domain.SessionID) (waitO
 		switch rec.Activity.State {
 		case domain.ActivityActive:
 			return waitActive, nil
-		case domain.ActivityBlocked:
+		case domain.ActivityBlocked, domain.ActivityRateLimited:
 			return waitBlocked, nil
 		}
 		if !m.clock().Before(deadlineAt) {

@@ -141,6 +141,21 @@ func TestRuntimeObservation_InferredDeathSetsTerminated(t *testing.T) {
 	}
 }
 
+func TestRuntimeObservation_DeadRuntimeDoesNotTerminateRateLimitedSession(t *testing.T) {
+	m, st, _ := newManager()
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityRateLimited, LastActivityAt: time.Now().Add(-24 * time.Hour)}
+	st.sessions[rec.ID] = rec
+
+	if err := m.ApplyRuntimeObservation(ctx, rec.ID, ports.RuntimeFacts{Probe: ports.ProbeDead}); err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions[rec.ID]
+	if got.IsTerminated || got.Activity.State != domain.ActivityRateLimited {
+		t.Fatalf("rate-limited session must remain parked, got %+v", got)
+	}
+}
+
 func TestRuntimeObservation_FailedProbeDoesNotMutate(t *testing.T) {
 	m, st, _ := newManager()
 	st.sessions["mer-1"] = working("mer-1")
@@ -1011,6 +1026,44 @@ func TestPRObservation_MergedCleanupFailureRetriesFromDurableLatch(t *testing.T)
 	}
 }
 
+func TestPRObservation_MergedCleanupWaitsWhileRateLimited(t *testing.T) {
+	m, st, _ := newManager()
+	rec := working("mer-1")
+	rec.Activity.State = domain.ActivityRateLimited
+	st.sessions[rec.ID] = rec
+	st.prs[rec.ID] = []domain.PullRequest{{URL: "pr1", Merged: true}}
+	cleaner := &retryMergedCleaner{lcm: m}
+	m.SetMergedSessionCleaner(cleaner)
+
+	if err := m.ApplyPRObservation(ctx, rec.ID, ports.PRObservation{Fetched: true, URL: "pr1", Merged: true}); err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions[rec.ID]
+	if cleaner.calls != 0 || got.IsTerminated || got.Metadata.MergedCleanupPending || got.Activity.State != domain.ActivityRateLimited {
+		t.Fatalf("rate-limited merged cleanup mutated session: rec=%+v cleaner calls=%d", got, cleaner.calls)
+	}
+}
+
+func TestRetryMergedCleanupWaitsWhileRateLimited(t *testing.T) {
+	m, st, _ := newManager()
+	rec := working("mer-1")
+	rec.Activity.State = domain.ActivityRateLimited
+	rec.Metadata.MergedCleanupPending = true
+	rec.Metadata.MergedCleanupPRURL = "pr1"
+	st.sessions[rec.ID] = rec
+	st.prs[rec.ID] = []domain.PullRequest{{URL: "pr1", Merged: true}}
+	cleaner := &retryMergedCleaner{lcm: m}
+	m.SetMergedSessionCleaner(cleaner)
+
+	if err := m.RetryMergedCleanup(ctx, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions[rec.ID]
+	if cleaner.calls != 0 || got.IsTerminated || !got.Metadata.MergedCleanupPending || got.Activity.State != domain.ActivityRateLimited {
+		t.Fatalf("rate-limited cleanup retry mutated session: rec=%+v cleaner calls=%d", got, cleaner.calls)
+	}
+}
+
 func TestPRObservation_MergedCleanupRetryResumesTerminalNotification(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -1837,6 +1890,40 @@ func TestActivity_WaitingInputTransitionEmitsNotification(t *testing.T) {
 	intent := sink.intents[0]
 	if intent.Type != domain.NotificationNeedsInput || intent.SessionID != "mer-1" || intent.ProjectID != "mer" || intent.SessionDisplayName != "checkout-flow" {
 		t.Fatalf("intent = %+v", intent)
+	}
+}
+
+func TestActivity_RateLimitedPersistsNotifiesOnceAndResumesOnActivity(t *testing.T) {
+	st := newFakeStore()
+	sink := &fakeNotificationSink{}
+	m := New(st, nil, WithNotificationSink(sink))
+	now := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+	m.clock = func() time.Time { return now }
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", DisplayName: "checkout-flow", Activity: domain.Activity{State: domain.ActivityActive, LastActivityAt: now.Add(-time.Minute)}, FirstSignalAt: now.Add(-time.Minute)}
+
+	if err := m.ApplyActivitySignal(ctx, "mer-1", ports.ActivitySignal{Valid: true, State: domain.ActivityIdle, Event: "stop-failure", ErrorType: "rate_limit"}); err != nil {
+		t.Fatal(err)
+	}
+	parked := st.sessions["mer-1"]
+	if parked.IsTerminated || parked.Activity.State != domain.ActivityRateLimited {
+		t.Fatalf("parked session = %+v", parked)
+	}
+	if len(sink.intents) != 1 || sink.intents[0].TitleOverride != "Agent usage limit reached" || !strings.Contains(sink.intents[0].BodyOverride, "worktree is preserved") {
+		t.Fatalf("rate-limit notification = %+v", sink.intents)
+	}
+	// A reconstructed manager proves the persisted state survives daemon
+	// restart; an authoritative active hook is the safe resume signal.
+	m = New(st, nil, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now.Add(time.Hour) }
+	if err := m.ApplyActivitySignal(ctx, "mer-1", ports.ActivitySignal{Valid: true, State: domain.ActivityActive}); err != nil {
+		t.Fatal(err)
+	}
+	resumed := st.sessions["mer-1"]
+	if resumed.IsTerminated || resumed.Activity.State != domain.ActivityActive {
+		t.Fatalf("resumed session = %+v", resumed)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("resume emitted duplicate notifications: %+v", sink.intents)
 	}
 }
 
@@ -2702,6 +2789,21 @@ func TestPRObservation_NudgesSuppressedWhileBlocked(t *testing.T) {
 	}
 	if len(msg.msgs) != 0 {
 		t.Fatalf("blocked session got nudged: %v", msg.msgs)
+	}
+}
+
+func TestPRObservation_NudgesSuppressedWhileRateLimited(t *testing.T) {
+	m, st, msg := newManager()
+	rec := working("mer-1")
+	rec.Activity.State = domain.ActivityRateLimited
+	st.sessions[rec.ID] = rec
+	o := ports.PRObservation{Fetched: true, URL: "pr1", CI: domain.CIFailing, Checks: []ports.PRCheckObservation{{Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed, LogTail: "boom"}}}
+
+	if err := m.ApplyPRObservation(ctx, rec.ID, o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 {
+		t.Fatalf("rate-limited session got an automated nudge: %v", msg.msgs)
 	}
 }
 
