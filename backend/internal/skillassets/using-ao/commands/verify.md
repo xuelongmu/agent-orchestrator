@@ -7,7 +7,8 @@ session-scoped `AO_VERIFY_CAPABILITY` injected by AO.
 
 This opaque value binds normal CLI requests and prevents blind or accidental
 cross-session use. AO itself does not provide an OS-identity boundary between
-same-user workers; hostile same-UID isolation is tracked in #150.
+same-user workers; hostile same-UID isolation is outside AO's current threat
+model.
 
 ```text
 ao verify <profile>

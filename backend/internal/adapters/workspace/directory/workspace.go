@@ -1,5 +1,5 @@
-// Package directory exposes an existing project directory as a shared,
-// non-git-isolated session workspace.
+// Package directory exposes an existing project directory as a shared session
+// workspace without per-session worktree separation.
 package directory
 
 import (
@@ -14,8 +14,8 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
-// Workspace exposes the registered project directory without filesystem
-// isolation and never removes that shared directory.
+// Workspace exposes the registered project directory without per-session path
+// separation and never removes that shared directory.
 type Workspace struct{}
 
 var _ ports.Workspace = (*Workspace)(nil)

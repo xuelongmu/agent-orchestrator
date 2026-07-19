@@ -136,7 +136,7 @@ func (s *Service) Run(ctx context.Context, sessionID domain.SessionID, profile, 
 		return Result{}, apierr.Internal("SESSION_LOAD_FAILED", "Failed to load session")
 	}
 	if !ok || s.auth == nil || !s.auth.Verify(session.ID, session.ProjectID, capability) {
-		return Result{}, apierr.Forbidden("VERIFY_CAPABILITY_INVALID", "Verification capability does not own this session")
+		return Result{}, apierr.Forbidden("VERIFY_CAPABILITY_INVALID", "Verification capability is missing or invalid for this session")
 	}
 	if session.IsTerminated {
 		return Result{}, apierr.Conflict("SESSION_TERMINATED", "Cannot verify a terminated session", nil)

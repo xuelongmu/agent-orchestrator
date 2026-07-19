@@ -3840,7 +3840,7 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
-                /** @description Session-scoped verification capability issued by the daemon. */
+                /** @description Opaque capability for accidental cross-session request isolation; not a same-user security boundary. */
                 "X-AO-Verification-Capability": string;
             };
             path: {

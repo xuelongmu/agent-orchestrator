@@ -396,7 +396,7 @@ export function LandingFeaturesScroll() {
 			onWorkerChange={setWorkerId}
 			onOrchestratorChange={setOrchestratorId}
 		/>,
-		<WorkspaceIsolationDemo key="workspace" activeId={workspaceId} onSelect={setWorkspaceId} workspace={workspace} />,
+		<WorkspaceSeparationDemo key="workspace" activeId={workspaceId} onSelect={setWorkspaceId} workspace={workspace} />,
 		<FeedbackRoutingDemo key="feedback" activeId={feedbackId} onSelect={setFeedbackId} feedback={feedback} />,
 		<DaemonControlDemo key="daemon" />,
 	];
@@ -732,7 +732,7 @@ function TerminalPrompt() {
 	);
 }
 
-function WorkspaceIsolationDemo({
+function WorkspaceSeparationDemo({
 	activeId,
 	onSelect,
 	workspace,

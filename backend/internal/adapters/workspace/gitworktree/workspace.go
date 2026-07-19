@@ -980,8 +980,8 @@ func validateWorkspaceProjectConfig(cfg ports.WorkspaceProjectConfig) error {
 // validatePathComponent rejects id values that could escape the managed root
 // once joined into a path. filepath.Join cleans `..` before validateManagedPath
 // runs, so a session id of "../other" would otherwise resolve back inside
-// managedRoot while breaking per-project isolation. Reject any path separator
-// or the special `.`/`..` components at the source.
+// managedRoot while breaking per-project path separation. Reject any path
+// separator or the special `.`/`..` components at the source.
 func validatePathComponent(name, value string) error {
 	if strings.ContainsAny(value, `/\`) {
 		return fmt.Errorf("%w: %s %q must not contain path separators", ErrUnsafePath, name, value)

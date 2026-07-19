@@ -254,7 +254,7 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 								<SelectValue />
 							</SelectTrigger>
 							<SelectContent>
-								<SelectItem value="worktree">Git worktree (isolated)</SelectItem>
+								<SelectItem value="worktree">Git worktree (per session)</SelectItem>
 								<SelectItem value="scratch">Scratch (ephemeral)</SelectItem>
 								<SelectItem value="dir">Project directory (shared)</SelectItem>
 							</SelectContent>

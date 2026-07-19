@@ -4,7 +4,7 @@ const rows = [
 	{ feature: "Multi-agent (Claude, Codex, Aider, OpenCode)", others: "Single agent" },
 	{ feature: "Auto CI failure recovery", others: "Manual" },
 	{ feature: "Plugin architecture (7 slots)", others: "Fixed integrations" },
-	{ feature: "Git worktree isolation", others: "Shared workspace" },
+	{ feature: "Per-session Git worktrees", others: "Shared workspace" },
 ];
 
 export function LandingDifferentiators() {

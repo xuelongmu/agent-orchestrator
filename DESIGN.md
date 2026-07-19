@@ -77,7 +77,7 @@ ReverbCode is **orchestrator-led**, which is the one thing that differs from emd
   workers (`ao spawn`), messages them (`ao send`), tracks progress, and synthesizes
   results. It avoids implementing unless necessary.
 - A **Worker is a normal agent session** — nothing special-cased. It runs one focused
-  task in an isolated git worktree + branch, with the agent CLI in a terminal as the
+  task in a dedicated git worktree + branch, with the agent CLI in a terminal as the
   conversation, producing a diff → commit/push → PR. It escalates to the orchestrator
   only for true blockers or cross-session coordination.
 - The daemon **observes** runtime + PR/CI/review facts and **derives** display status

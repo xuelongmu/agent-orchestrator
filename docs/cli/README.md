@@ -103,8 +103,8 @@ prints the bounded log path under session-scoped `AO_DATA_DIR` storage; see
 
 The opaque capability prevents blind or accidental cross-session requests; it
 is not an OS-identity boundary against hostile same-UID workers. AO itself does
-not provide that isolation; hardening is tracked in
-[#150](https://github.com/xuelongmu/agent-orchestrator/issues/150).
+not provide that isolation, and hostile-worker isolation is out of scope. See
+the [worker/daemon threat model](../worker-daemon-threat-model.md).
 
 `go run .` in `backend/` remains a compatibility wrapper around the daemon.
 

@@ -18,7 +18,7 @@ export function BoardWelcome() {
 					Welcome to Agent Orchestrator
 				</h2>
 				<p className="mt-1.5 max-w-[320px] text-[12.5px] leading-[1.65] text-muted-foreground">
-					Add a repository and describe the work. AO runs agents on isolated branches, from start to merge.
+					Add a repository and describe the work. AO runs agents on separate branches, from start to merge.
 				</p>
 
 				<CreateProjectFlow

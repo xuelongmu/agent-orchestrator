@@ -35,16 +35,16 @@ ao spawn 42 --agent codex
 
 AO creates two distinct sessions. Compare the PRs side by side.
 
-## Isolation guarantees
+## Workspace separation
 
-| What's isolated | How                                                                                                                                                                                                                        |
+| What's separate | How                                                                                                                                                                                                                        |
 | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | File edits      | Each session has its own worktree under `~/.worktrees/{projectId}/{sessionId}/`. Session metadata lives under `~/.agent-orchestrator/{hash}-{projectId}/sessions/{sessionId}` — the worktree itself is in `~/.worktrees/`. |
 | Branch name     | AO names the branch after the session ID, avoiding collisions                                                                                                                                                              |
 | Agent state     | Each agent's native session files (Claude JSONL, Codex session, etc.) are session-scoped                                                                                                                                   |
 | Terminal        | Each session owns its own tmux window (or child process)                                                                                                                                                                   |
 
-## What isn't isolated
+## What remains shared
 
 - **Your project's node_modules.** Workspaces clone/share the repo; if your agent runs `npm install` it updates the worktree's `node_modules`, which is fine. If your agent runs `pnpm install` with a shared store, the store is shared.
 - **External side effects.** If an agent opens a PR, triggers CI, or posts to a notifier, those effects are visible to you and everyone else immediately.

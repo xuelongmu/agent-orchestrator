@@ -1,6 +1,12 @@
 # Agent Orchestrator Architecture
 
-Agent Orchestrator is a long-running Go daemon that supervises multiple parallel agent sessions. Sessions use an isolated git worktree by default, but can instead use an ephemeral scratch directory or the registered project's shared directory for non-git workloads. Each session has its own runtime while the daemon coordinates lifecycle, observes external state, and routes feedback.
+Agent Orchestrator is a long-running Go daemon that supervises multiple parallel agent sessions. Sessions use a dedicated git worktree by default, but can instead use an ephemeral scratch directory or the registered project's shared directory for non-git workloads. Each session has its own runtime while the daemon coordinates lifecycle, observes external state, and routes feedback.
+
+AO is a single-user supervisor, not a sandbox: the daemon and managed workers
+normally share one OS account and trust boundary. See the
+[worker/daemon threat model](worker-daemon-threat-model.md) for the
+cross-platform access assumptions and the explicit decision that hostile
+same-user workers are out of scope.
 
 ## Table of Contents
 
@@ -859,7 +865,7 @@ Agent Orchestrator's architecture is designed around:
 - **Port-based design** — Core code depends on interfaces, not implementations
 - **Durable minimalism** — Store only facts, compute everything else
 - **Event-driven updates** — CDC broadcasts changes to all subscribers
-- **Isolation by default** — Worktree and scratch sessions have separate filesystems; `dir` is explicitly shared and opts out of filesystem isolation
+- **Workspace separation by default** — Worktree and scratch sessions use separate paths; this reduces accidental conflicts but is not a security boundary. `dir` is explicitly shared and opts out of that separation.
 - **Safety** — Conservative termination, path validation, gitignored hooks
 
 This architecture enables parallel AI agents to work safely while maintaining complete visibility and control.

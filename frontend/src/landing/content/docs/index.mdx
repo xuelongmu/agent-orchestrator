@@ -5,7 +5,7 @@ description: Learn what Agent Orchestrator does, when to use it, and where to st
 
 import { Callout } from "fumadocs-ui/components/callout";
 
-Agent Orchestrator (**AO**) runs AI coding agents in isolated git worktrees and tracks each one until it becomes a pull request.
+Agent Orchestrator (**AO**) runs AI coding agents in dedicated git worktrees and tracks each one until it becomes a pull request.
 
 Use it when you have several well-scoped issues and want agents working on them in parallel — each in its own checkout, terminal, and branch, all visible from one dashboard.
 
@@ -32,7 +32,7 @@ AO does not replace review. It helps agents keep working, but you still decide w
 
 | AO handles                         | You still handle                             |
 | ---------------------------------- | -------------------------------------------- |
-| Creating isolated workspaces       | Choosing good issues                         |
+| Creating separate workspaces       | Choosing good issues                         |
 | Launching and monitoring agents    | Reviewing code and behavior                  |
 | Tracking PR, CI, and review status | Deciding when to merge                       |
 | Cleaning up merged sessions        | Setting repo-specific rules and expectations |
