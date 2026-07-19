@@ -24,7 +24,7 @@ func TestSubmitSessionHandoffAcceptsTypedPayload(t *testing.T) {
 		OK      bool `json:"ok"`
 		Created bool `json:"created"`
 	}
-	if err := json.Unmarshal([]byte(body), &response); err != nil || !response.OK || !response.Created {
+	if err := json.Unmarshal(body, &response); err != nil || !response.OK || !response.Created {
 		t.Fatalf("response = %#v err=%v", response, err)
 	}
 }
