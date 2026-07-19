@@ -40,6 +40,42 @@ func (s *Store) UpdateSession(ctx context.Context, rec domain.SessionRecord) err
 	return s.qw.UpdateSession(ctx, recordToUpdate(rec))
 }
 
+// UpdateSessionLifecycle writes only the facts owned by lifecycle. Lifecycle
+// reducers read a snapshot before applying agent-hook and runtime signals; a
+// full-row write here could replay stale operational metadata over a targeted
+// concurrent update such as SetSessionPreviewURL or SetClaimedPRBranch.
+func (s *Store) UpdateSessionLifecycle(ctx context.Context, rec domain.SessionRecord) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	current, err := s.qw.GetSession(ctx, rec.ID)
+	if err != nil {
+		return fmt.Errorf("get session %s before lifecycle update: %w", rec.ID, err)
+	}
+	if current.UpdatedAt.After(rec.UpdatedAt) {
+		rec.UpdatedAt = current.UpdatedAt
+	}
+	activity := normalActivity(rec.Activity, rec.UpdatedAt)
+	pendingFingerprint, pendingAttempted := pendingSubmitFields(rec, activity.State)
+	diagnosticTrigger, diagnosticTail, diagnosticErrorType, diagnosticAt := diagnosticFields(rec.Diagnostic)
+	return s.qw.UpdateSessionLifecycle(ctx, gen.UpdateSessionLifecycleParams{
+		ActivityState:                  activity.State,
+		ActivityLastAt:                 activity.LastActivityAt,
+		FirstSignalAt:                  timeToNullTime(rec.FirstSignalAt),
+		IsTerminated:                   rec.IsTerminated,
+		AgentSessionID:                 rec.Metadata.AgentSessionID,
+		PendingSubmitFingerprint:       pendingFingerprint,
+		PendingSubmitRecoveryAttempted: pendingAttempted,
+		DiagnosticTrigger:              diagnosticTrigger,
+		DiagnosticTerminalTail:         diagnosticTail,
+		DiagnosticHookErrorType:        diagnosticErrorType,
+		DiagnosticCapturedAt:           diagnosticAt,
+		MergedCleanupPending:           rec.Metadata.MergedCleanupPending,
+		MergedCleanupPRURL:             rec.Metadata.MergedCleanupPRURL,
+		UpdatedAt:                      rec.UpdatedAt,
+		ID:                             rec.ID,
+	})
+}
+
 // RenameSession updates only the user-facing display name for an existing
 // session. It returns ok=false when the session id does not exist.
 func (s *Store) RenameSession(ctx context.Context, id domain.SessionID, displayName string, updatedAt time.Time) (bool, error) {

@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,6 +122,21 @@ type stack struct {
 	msg   *captureMessenger
 }
 
+type blockingLifecycleWriteStore struct {
+	*sqlite.Store
+	ready   chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingLifecycleWriteStore) UpdateSessionLifecycle(ctx context.Context, rec domain.SessionRecord) error {
+	s.once.Do(func() {
+		close(s.ready)
+		<-s.release
+	})
+	return s.Store.UpdateSessionLifecycle(ctx, rec)
+}
+
 func newStack(t *testing.T) *stack {
 	t.Helper()
 	ctx := context.Background()
@@ -205,6 +221,71 @@ func TestRestoreRoundTripPreservesMetadata(t *testing.T) {
 	}
 	if restored.IsTerminated || restored.Metadata.AgentSessionID != "agent-x" {
 		t.Fatalf("restored wrong: %+v", restored)
+	}
+}
+
+func TestClaudeCodeActivityHookDoesNotLoseConcurrentSessionMetadataUpdate(t *testing.T) {
+	ctx := context.Background()
+	st := newStack(t)
+	sess, err := st.sm.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Branch: "b", Prompt: "prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocking := &blockingLifecycleWriteStore{
+		Store:   st.store,
+		ready:   make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(blocking.release)
+		}
+	}()
+	lcm := lifecycle.New(blocking, nil)
+	done := make(chan error, 1)
+	go func() {
+		done <- lcm.ApplyActivitySignal(ctx, sess.ID, ports.ActivitySignal{
+			Valid:          true,
+			State:          domain.ActivityActive,
+			AgentSessionID: "claude-native-1",
+		})
+	}()
+
+	select {
+	case <-blocking.ready:
+	case <-time.After(time.Second):
+		t.Fatal("activity hook did not reach its lifecycle write")
+	}
+	previewURL := "http://127.0.0.1:4173/"
+	previewAt := time.Now().UTC().Add(time.Hour)
+	if updated, updateErr := st.store.SetSessionPreviewURL(ctx, sess.ID, previewURL, previewAt); updateErr != nil || !updated {
+		t.Fatalf("SetSessionPreviewURL = %v, %v; want true, nil", updated, updateErr)
+	}
+	close(blocking.release)
+	released = true
+	select {
+	case hookErr := <-done:
+		if hookErr != nil {
+			t.Fatal(hookErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("activity hook did not finish")
+	}
+
+	got, ok, err := st.store.GetSession(ctx, sess.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetSession = found %v, err %v", ok, err)
+	}
+	if got.Metadata.AgentSessionID != "claude-native-1" || got.Activity.State != domain.ActivityActive {
+		t.Fatalf("hook facts not stored: %+v", got)
+	}
+	if got.Metadata.PreviewURL != previewURL || got.Metadata.PreviewRevision != 1 {
+		t.Fatalf("concurrent preview metadata lost: %+v", got.Metadata)
+	}
+	if !got.UpdatedAt.Equal(previewAt) {
+		t.Fatalf("UpdatedAt = %v, want concurrent metadata timestamp %v", got.UpdatedAt, previewAt)
 	}
 }
 

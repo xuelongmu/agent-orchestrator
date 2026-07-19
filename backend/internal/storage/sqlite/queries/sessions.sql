@@ -23,6 +23,20 @@ UPDATE sessions SET
     diagnostic_captured_at = ?, merged_cleanup_pending = ?, merged_cleanup_pr_url = ?, updated_at = ?
 WHERE id = ?;
 
+-- name: UpdateSessionLifecycle :exec
+-- Lifecycle reads a session snapshot before reducing a hook/runtime signal.
+-- Limit that write-back to lifecycle-owned facts so a concurrent targeted
+-- metadata update (for example preview_url or a claimed branch) is not
+-- overwritten by the older snapshot.
+UPDATE sessions SET
+    activity_state = ?, activity_last_at = ?, first_signal_at = ?, is_terminated = ?,
+    agent_session_id = ?, pending_submit_fingerprint = ?,
+    pending_submit_recovery_attempted = ?, diagnostic_trigger = ?,
+    diagnostic_terminal_tail = ?, diagnostic_hook_error_type = ?,
+    diagnostic_captured_at = ?, merged_cleanup_pending = ?, merged_cleanup_pr_url = ?,
+    updated_at = ?
+WHERE id = ?;
+
 -- name: GetSession :one
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
