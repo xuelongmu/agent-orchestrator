@@ -58,6 +58,14 @@ func publishProjectionFile(sourceRoot, targetRoot *os.Root, _ *os.File, stageIde
 		if err := beforePublish(); err != nil {
 			return err
 		}
+		// Revalidate both namespace bindings after the publish hook while the
+		// delete-denying handles still lock the exact identities.
+		if err := ensureOpenedFileStillBound(sourceRoot, stageName, stageIdentity); err != nil {
+			return err
+		}
+		if err := ensureOpenedFileStillBound(targetRoot, targetName, targetIdentity); err != nil {
+			return err
+		}
 		if err := target.Close(); err != nil {
 			return fmt.Errorf("close exact design contract target lock: %w", err)
 		}

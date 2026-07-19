@@ -792,8 +792,7 @@ func ensureProjectionGitignore(root *os.Root, initialized bool, ownershipTarget 
 func openOrCreateGitignoreStage(root *os.Root, allowLegacyFinal bool) (*os.Root, error) {
 	info, err := root.Lstat(gitignoreStageDirectory)
 	if err == nil {
-		stageRoot, _, authErr := openAuthenticatedGitignoreStage(root, info, allowLegacyFinal)
-		return stageRoot, authErr
+		return openAuthenticatedGitignoreStage(root, info, allowLegacyFinal)
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect design contract gitignore staging directory: %w", err)
@@ -872,35 +871,34 @@ func openPublishedGitignoreStage(root *os.Root, allowLegacyFinal bool) (*os.Root
 	if err != nil {
 		return nil, err
 	}
-	stageRoot, _, err := openAuthenticatedGitignoreStage(root, info, allowLegacyFinal)
-	return stageRoot, err
+	return openAuthenticatedGitignoreStage(root, info, allowLegacyFinal)
 }
 
-func openAuthenticatedGitignoreStage(root *os.Root, info os.FileInfo, allowLegacyFinal bool) (*os.Root, os.FileInfo, error) {
+func openAuthenticatedGitignoreStage(root *os.Root, info os.FileInfo, allowLegacyFinal bool) (*os.Root, error) {
 	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, nil, errors.New("foreign .ao/.git staging path prevents safe projection initialization")
+		return nil, errors.New("foreign .ao/.git staging path prevents safe projection initialization")
 	}
-	stageRoot, identity, err := openVerifiedSubroot(root, gitignoreStageDirectory, info)
+	stageRoot, _, err := openVerifiedSubroot(root, gitignoreStageDirectory, info)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	marker, exists, err := readUnlinkedRegularFile(stageRoot, gitignoreStageMarker)
 	if err != nil || !exists || !validGitignoreStageMarker(marker, allowLegacyFinal) {
 		_ = stageRoot.Close()
-		return nil, nil, errors.New("unauthenticated .ao/.git staging directory prevents safe projection initialization")
+		return nil, errors.New("unauthenticated .ao/.git staging directory prevents safe projection initialization")
 	}
 	entries, err := readRootEntries(stageRoot)
 	if err != nil {
 		_ = stageRoot.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	for _, entry := range entries {
 		if entry.Name() != gitignoreStageMarker && !isGitignoreStagePayload(entry.Name()) && !isProjectionStage(entry.Name()) {
 			_ = stageRoot.Close()
-			return nil, nil, errors.New("foreign entry in design contract gitignore staging directory")
+			return nil, errors.New("foreign entry in design contract gitignore staging directory")
 		}
 	}
-	return stageRoot, identity, nil
+	return stageRoot, nil
 }
 
 func gitignoreStageMarkerContent(stageName string) []byte {
