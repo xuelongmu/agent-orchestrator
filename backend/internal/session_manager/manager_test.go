@@ -195,6 +195,7 @@ type fakeRuntime struct {
 	createErr          error
 	destroyErr         error
 	created, destroyed int
+	aliveCalls         int
 	lastCfg            ports.RuntimeConfig
 	outputs            []string
 	outputCalls        int
@@ -219,6 +220,7 @@ func (r *fakeRuntime) Destroy(_ context.Context, handle ports.RuntimeHandle) err
 	return r.destroyErr
 }
 func (r *fakeRuntime) IsAlive(_ context.Context, handle ports.RuntimeHandle) (bool, error) {
+	r.aliveCalls++
 	if r.aliveErr != nil {
 		return false, r.aliveErr
 	}
@@ -1428,10 +1430,11 @@ func TestKill_DirtyWorkspacePreservesAndRemainsRetryable(t *testing.T) {
 	}
 }
 
-func TestCleanupMergedSession_TearsDownWaitingSession(t *testing.T) {
+func TestCleanupMergedSession_TearsDownReservedSessionWithoutLifecycleReentry(t *testing.T) {
 	m, st, rt, ws := newManager()
 	rec := mkLive("mer-1")
-	rec.Activity = domain.Activity{State: domain.ActivityWaitingInput, LastActivityAt: time.Now()}
+	rec.IsTerminated = true
+	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
 	st.sessions["mer-1"] = rec
 
 	if err := m.CleanupMergedSession(ctx, "mer-1"); err != nil {
@@ -1440,14 +1443,20 @@ func TestCleanupMergedSession_TearsDownWaitingSession(t *testing.T) {
 	if rt.destroyed != 1 || ws.destroyed != 1 {
 		t.Fatalf("cleanup destroyed runtime/workspace = %d/%d, want 1/1", rt.destroyed, ws.destroyed)
 	}
-	if !st.sessions["mer-1"].IsTerminated {
-		t.Fatal("merged waiting_input session must reach terminal state")
+	if !st.sessions["mer-1"].IsTerminated || st.sessions["mer-1"].Activity.State != domain.ActivityExited {
+		t.Fatal("resource cleanup must preserve lifecycle's terminal reservation")
+	}
+	if got := m.lcm.(*fakeLCM).terminated["mer-1"]; got != 0 {
+		t.Fatalf("resource-only cleanup called MarkTerminated %d times, want 0", got)
 	}
 }
 
-func TestCleanupMergedSession_PreservesDirtyWorkspaceAndTerminates(t *testing.T) {
+func TestCleanupMergedSession_PreservesDirtyWorkspaceWithoutLifecycleReentry(t *testing.T) {
 	m, st, rt, ws := newManager()
-	st.sessions["mer-1"] = mkLive("mer-1")
+	rec := mkLive("mer-1")
+	rec.IsTerminated = true
+	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
+	st.sessions["mer-1"] = rec
 	ws.destroyErr = fmt.Errorf("gitworktree: refusing to remove: %w", ports.ErrWorkspaceDirty)
 
 	if err := m.CleanupMergedSession(ctx, "mer-1"); err != nil {
@@ -1457,7 +1466,10 @@ func TestCleanupMergedSession_PreservesDirtyWorkspaceAndTerminates(t *testing.T)
 		t.Fatalf("cleanup attempts runtime/workspace = %d/%d, want 1/1", rt.destroyed, ws.destroyed)
 	}
 	if !st.sessions["mer-1"].IsTerminated {
-		t.Fatal("dirty worktree preservation must not leave a merged runtime zombie")
+		t.Fatal("dirty worktree preservation must retain lifecycle's terminal reservation")
+	}
+	if got := m.lcm.(*fakeLCM).terminated["mer-1"]; got != 0 {
+		t.Fatalf("resource-only cleanup called MarkTerminated %d times, want 0", got)
 	}
 }
 
@@ -4402,6 +4414,36 @@ func TestReconcileLive_AliveSessionAdoptedNoop(t *testing.T) {
 	}
 }
 
+func TestReconcileLive_RateLimitedSessionIsParkedWithoutProbeOrTeardown(t *testing.T) {
+	st := newFakeStore()
+	rt := &fakeRuntime{aliveErr: errors.New("must not probe parked session")}
+	ws := &fakeWorkspace{}
+	lcm := &fakeLCM{store: st}
+	lookPath := func(string) (string, error) { return "/bin/true", nil }
+	m := New(Deps{Runtime: rt, Agents: fakeAgents{}, Workspace: ws, Store: st, Messenger: &fakeMessenger{}, Lifecycle: lcm, LookPath: lookPath})
+
+	rec := domain.SessionRecord{
+		ID: "s-rate", ProjectID: "p1", IsTerminated: false,
+		Activity: domain.Activity{State: domain.ActivityRateLimited, LastActivityAt: time.Now().Add(-24 * time.Hour)},
+		Metadata: domain.SessionMetadata{Branch: "ao/s-rate/root", WorkspacePath: "/wt/s-rate", RuntimeHandleID: "s-rate"},
+	}
+	st.sessions[rec.ID] = rec
+	st.worktrees[rec.ID] = []domain.SessionWorktreeRecord{{SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, WorktreePath: "/wt/s-rate"}}
+
+	if err := m.reconcileLive(context.Background(), rec); err != nil {
+		t.Fatalf("reconcileLive: %v", err)
+	}
+	if rt.aliveCalls != 0 || rt.destroyed != 0 || ws.stashCalls != 0 || len(ws.calls) != 0 || lcm.terminated[rec.ID] != 0 {
+		t.Fatalf("parked reconcile performed work: alive=%d destroy=%d stash=%d workspace=%v terminate=%d", rt.aliveCalls, rt.destroyed, ws.stashCalls, ws.calls, lcm.terminated[rec.ID])
+	}
+	if got := st.sessions[rec.ID]; got.IsTerminated || got.Activity.State != domain.ActivityRateLimited {
+		t.Fatalf("parked session mutated: %+v", got)
+	}
+	if rows := st.worktrees[rec.ID]; len(rows) != 1 || rows[0].WorktreePath != "/wt/s-rate" {
+		t.Fatalf("restore marker mutated: %+v", rows)
+	}
+}
+
 // TestReconcileLive_ProbeErrorIsNotDeath locks the invariant that a failed
 // IsAlive probe is NOT treated as proof that the session is dead. reconcileLive
 // must propagate the error and must NOT stash, terminate, or destroy.
@@ -4888,6 +4930,21 @@ func TestSend_BlockedSessionRejectsDelivery(t *testing.T) {
 	}
 }
 
+func TestSend_RateLimitedSessionAllowsExplicitRetryWithoutAutomatedNudge(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = domain.SessionRecord{ID: "s1", Harness: "claude-code",
+		Activity: domain.Activity{State: domain.ActivityRateLimited}}
+	msg := &fakeMessenger{}
+	m := newSendTestManager(t, signalingAgent{}, msg, st)
+
+	if err := m.Send(context.Background(), "s1", "retry after the usage window reset"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(msg.msgs) != 1 || msg.msgs[0] != "retry after the usage window reset" {
+		t.Fatalf("Send calls = %#v, want exactly the explicit retry and no automated Enter nudge", msg.msgs)
+	}
+}
+
 func TestSend_NoNudgeWhenBlockedAppearsMidWait(t *testing.T) {
 	// The permission dialog can appear between polls (e.g. the delivered prompt
 	// itself triggered a tool approval). The confirm loop must abort on the
@@ -4979,6 +5036,33 @@ func TestSend_NoNudgeWhenBlockedAppearsBeforeNudge(t *testing.T) {
 	}
 }
 
+func TestSend_NoNudgeWhenRateLimitAppearsBeforeNudge(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = domain.SessionRecord{ID: "s1", Harness: "claude-code",
+		Activity: domain.Activity{State: domain.ActivityIdle}}
+	// The provider limit lands only at confirmActive's final guard read, after
+	// the preceding poll still observed idle. The Enter-only Deliver must fail
+	// closed while preserving the already-sent explicit prompt.
+	rst := &rateLimitBeforeNudgeStore{fakeStore: st, id: "s1"}
+	msg := &fakeMessenger{}
+	m := New(Deps{
+		Runtime: &fakeRuntime{}, Agents: singleAgent{signalingAgent{}}, Workspace: &fakeWorkspace{},
+		Store: rst, Messenger: msg, Lifecycle: &fakeLCM{store: st},
+		LookPath: func(string) (string, error) { return "/bin/true", nil },
+	})
+	m.sendConfirm = sendConfirmConfig{pollInterval: time.Millisecond, attemptDeadline: 0, maxAttempts: 3}
+
+	if err := m.Send(context.Background(), "s1", "run the migration"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(msg.msgs) != 1 || msg.msgs[0] != "run the migration" {
+		t.Fatalf("Send calls = %#v, want explicit message only", msg.msgs)
+	}
+	if got := st.sessions["s1"].Activity.State; got != domain.ActivityRateLimited {
+		t.Fatalf("Activity.State = %s, want rate_limited", got)
+	}
+}
+
 func TestSend_SkipsConfirmForSubmitOnlyHarness(t *testing.T) {
 	// A harness that submits but cannot report blocked (goose/opencode/agy) is
 	// NOT nudge-safe: confirmActive must be skipped entirely, so an Enter can
@@ -5025,6 +5109,23 @@ type blockAfterFirstReadStore struct {
 	*fakeStore
 	id    domain.SessionID
 	reads int
+}
+
+type rateLimitBeforeNudgeStore struct {
+	*fakeStore
+	id    domain.SessionID
+	reads int
+}
+
+func (s *rateLimitBeforeNudgeStore) GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
+	s.reads++
+	if s.reads >= 4 {
+		if rec, ok := s.sessions[s.id]; ok {
+			rec.Activity.State = domain.ActivityRateLimited
+			s.sessions[s.id] = rec
+		}
+	}
+	return s.fakeStore.GetSession(ctx, id)
 }
 
 func (s *blockAfterFirstReadStore) GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {

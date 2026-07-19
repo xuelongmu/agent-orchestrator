@@ -2021,6 +2021,7 @@ components:
           - mergeable
           - merged
           - needs_input
+          - rate_limited
           - idle
           - terminated
           - no_signal
@@ -2991,6 +2992,7 @@ components:
           - idle
           - waiting_input
           - blocked
+          - rate_limited
           - exited
           type: string
         toolName:

@@ -3,22 +3,56 @@ package review
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	reviewcore "github.com/aoagents/agent-orchestrator/backend/internal/review"
 )
 
 type fakeStore struct {
-	run       domain.ReviewRun
-	ok        bool
-	batchRuns []domain.ReviewRun
-	prs       []domain.PullRequest
+	run        domain.ReviewRun
+	ok         bool
+	batchRuns  []domain.ReviewRun
+	prs        []domain.PullRequest
+	sessions   map[domain.SessionID]domain.SessionRecord
+	signatures map[string]string
 
 	updateCalls int
 	markCalls   int
 	markedIDs   []string
+}
+
+func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
+	rec, ok := f.sessions[id]
+	return rec, ok, nil
+}
+func (f *fakeStore) UpdateSession(_ context.Context, rec domain.SessionRecord) error {
+	if f.sessions == nil {
+		f.sessions = map[domain.SessionID]domain.SessionRecord{}
+	}
+	f.sessions[rec.ID] = rec
+	return nil
+}
+func (f *fakeStore) GetPRLastNudgeSignature(_ context.Context, prURL string) (string, error) {
+	return f.signatures[prURL], nil
+}
+func (f *fakeStore) UpdatePRLastNudgeSignature(_ context.Context, prURL, payload string) error {
+	if f.signatures == nil {
+		f.signatures = map[string]string{}
+	}
+	f.signatures[prURL] = payload
+	return nil
+}
+
+type fakeMessenger struct{ msgs []string }
+
+func (f *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) error {
+	f.msgs = append(f.msgs, msg)
+	return nil
 }
 
 func (f *fakeStore) GetReviewRun(_ context.Context, id string) (domain.ReviewRun, bool, error) {
@@ -91,6 +125,50 @@ func (f *fakeStore) ListPRsBySession(context.Context, domain.SessionID) ([]domai
 	return out, nil
 }
 
+func (f *fakeStore) UpsertReview(context.Context, domain.Review) error { return nil }
+func (f *fakeStore) GetReviewBySession(context.Context, domain.SessionID) (domain.Review, bool, error) {
+	return domain.Review{}, false, nil
+}
+func (f *fakeStore) InsertReviewRun(_ context.Context, run domain.ReviewRun) error {
+	f.batchRuns = append(f.batchRuns, run)
+	return nil
+}
+func (f *fakeStore) SupersedeStaleRunningReviewRuns(context.Context, domain.SessionID, string, string, string) (int64, error) {
+	return 0, nil
+}
+func (f *fakeStore) CancelRunningReviewRunsBySession(context.Context, domain.SessionID, string) (int64, error) {
+	return 0, nil
+}
+func (f *fakeStore) GetReviewRunBySessionPRAndSHA(_ context.Context, id domain.SessionID, prURL, targetSHA string) (domain.ReviewRun, bool, error) {
+	for _, run := range f.reviewRuns() {
+		if run.SessionID == id && run.PRURL == prURL && run.TargetSHA == targetSHA {
+			return run, true, nil
+		}
+	}
+	return domain.ReviewRun{}, false, nil
+}
+func (f *fakeStore) ListReviewRunsBySession(context.Context, domain.SessionID) ([]domain.ReviewRun, error) {
+	return f.reviewRuns(), nil
+}
+func (f *fakeStore) ListRunningReviewRunsBySession(context.Context, domain.SessionID) ([]domain.ReviewRun, error) {
+	var runs []domain.ReviewRun
+	for _, run := range f.reviewRuns() {
+		if run.Status == domain.ReviewRunRunning {
+			runs = append(runs, run)
+		}
+	}
+	return runs, nil
+}
+func (f *fakeStore) reviewRuns() []domain.ReviewRun {
+	if len(f.batchRuns) > 0 {
+		return append([]domain.ReviewRun(nil), f.batchRuns...)
+	}
+	if f.ok || f.run.ID != "" {
+		return []domain.ReviewRun{f.run}
+	}
+	return nil
+}
+
 type fakeReducer struct {
 	outcome    lifecycle.ReviewDeliveryOutcome
 	err        error
@@ -132,6 +210,74 @@ func TestSubmitPersistsThenAppliesThenStampsDelivered(t *testing.T) {
 	}
 	if run.Status != domain.ReviewRunDelivered || run.DeliveredAt == nil || !run.DeliveredAt.Equal(now) {
 		t.Fatalf("run not stamped delivered: %+v", run)
+	}
+}
+
+func TestCoordinateReplaysParkedCompletedReviewAfterRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		batchID  string
+		wantRuns int
+	}{
+		{name: "single run", wantRuns: 1},
+		{name: "full batch", batchID: "batch-1", wantRuns: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run1 := domain.ReviewRun{
+				ID: "run-1", SessionID: "mer-1", BatchID: tc.batchID,
+				PRURL: "pr1", TargetSHA: "sha1", Status: domain.ReviewRunComplete,
+				Verdict: domain.VerdictChangesRequested, Body: "fix pr1", CreatedAt: time.Unix(1, 0).UTC(),
+			}
+			st := &fakeStore{
+				ok: true, run: run1,
+				prs: []domain.PullRequest{{URL: "pr1", HeadSHA: "sha1"}},
+				sessions: map[domain.SessionID]domain.SessionRecord{
+					"mer-1": {ID: "mer-1", Activity: domain.Activity{State: domain.ActivityRateLimited}},
+				},
+			}
+			if tc.batchID != "" {
+				run2 := domain.ReviewRun{
+					ID: "run-2", SessionID: "mer-1", BatchID: tc.batchID,
+					PRURL: "pr2", TargetSHA: "sha2", Status: domain.ReviewRunComplete,
+					Verdict: domain.VerdictChangesRequested, Body: "fix pr2", CreatedAt: time.Unix(1, 0).UTC(),
+				}
+				st.batchRuns = []domain.ReviewRun{run1, run2}
+				st.prs = append(st.prs, domain.PullRequest{URL: "pr2", HeadSHA: "sha2"})
+			}
+			messenger := &fakeMessenger{}
+			reducer := lifecycle.New(st, messenger)
+			engine := reviewcore.New(reviewcore.Deps{Store: st})
+			now := time.Unix(100, 0).UTC()
+			svc := New(engine, st, WithLifecycleReducer(reducer), WithClock(func() time.Time { return now }))
+			obs := ports.SCMObservation{
+				Fetched: true,
+				PR:      ports.SCMPRObservation{URL: "pr1", HeadSHA: "sha1"},
+				CI:      ports.SCMCIObservation{Summary: string(domain.CIPassing), HeadSHA: "sha1"},
+				Review:  ports.SCMReviewObservation{HeadSHA: "sha1"},
+			}
+
+			first, err := svc.Coordinate(context.Background(), "mer-1", obs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.Run.Status != domain.ReviewRunComplete || st.markCalls != 0 || len(messenger.msgs) != 0 {
+				t.Fatalf("parked poll delivered feedback: result=%+v marks=%d messages=%v", first, st.markCalls, messenger.msgs)
+			}
+
+			recovered := st.sessions["mer-1"]
+			recovered.Activity.State = domain.ActivityActive
+			st.sessions["mer-1"] = recovered
+			second, err := svc.Coordinate(context.Background(), "mer-1", obs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.markCalls != tc.wantRuns || len(messenger.msgs) != 1 || second.Run.Status != domain.ReviewRunDelivered || second.Run.DeliveredAt == nil {
+				t.Fatalf("recovered poll did not deliver once: result=%+v marks=%d/%d messages=%v", second, st.markCalls, tc.wantRuns, messenger.msgs)
+			}
+			if tc.batchID != "" && (!strings.Contains(messenger.msgs[0], "PR: pr1") || !strings.Contains(messenger.msgs[0], "PR: pr2")) {
+				t.Fatalf("batch replay did not preserve full group: %q", messenger.msgs[0])
+			}
+		})
 	}
 }
 

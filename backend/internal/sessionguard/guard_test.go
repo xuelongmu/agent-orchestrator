@@ -53,6 +53,9 @@ func TestGuard_OutcomeByState(t *testing.T) {
 		// automated nudge does not.
 		{"waiting_input", record(domain.ActivityWaitingInput, false), true, Sent, SuppressedAwaitingUser},
 		{"blocked", record(domain.ActivityBlocked, false), true, SuppressedAwaitingUser, SuppressedAwaitingUser},
+		// Explicit user/API delivery is the intentional retry path after the
+		// provider window resets; unattended AO nudges remain parked.
+		{"rate limited", record(domain.ActivityRateLimited, false), true, Sent, SuppressedRateLimited},
 		// exited is refused even without IsTerminated: the pane holds an
 		// interactive shell after agent exit, so a paste would execute there.
 		{"exited", record(domain.ActivityExited, false), true, SuppressedTerminated, SuppressedTerminated},
@@ -117,6 +120,29 @@ func TestGuard_MessengerErrorIsSentPlusError(t *testing.T) {
 	}
 }
 
+func TestGuard_RateLimitedDeliverDistinguishesExplicitRetryFromAutomatedEnter(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  string
+		want Outcome
+	}{
+		{name: "explicit retry", msg: "retry after reset", want: Sent},
+		{name: "automated Enter", msg: "", want: SuppressedRateLimited},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			messenger := &fakeMessenger{}
+			g := New(&fakeStore{rec: record(domain.ActivityRateLimited, false), ok: true}, messenger, nil)
+			got, err := g.Deliver(context.Background(), "s1", tc.msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want || (len(messenger.sent) == 1) != (tc.want == Sent) {
+				t.Fatalf("outcome=%v sends=%d, want outcome=%v", got, len(messenger.sent), tc.want)
+			}
+		})
+	}
+}
+
 func TestGuard_NudgeIdleEpisodeRequiresExactFinalState(t *testing.T) {
 	idleSince := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
@@ -127,6 +153,7 @@ func TestGuard_NudgeIdleEpisodeRequiresExactFinalState(t *testing.T) {
 		{name: "same episode", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: idleSince}}, want: Sent},
 		{name: "recovered active", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityActive, LastActivityAt: idleSince.Add(time.Second)}}, want: SuppressedStaleEpisode},
 		{name: "new idle episode", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: idleSince.Add(time.Second)}}, want: SuppressedStaleEpisode},
+		{name: "rate limited", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityRateLimited, LastActivityAt: idleSince.Add(time.Second)}}, want: SuppressedRateLimited},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			msg := &fakeMessenger{}

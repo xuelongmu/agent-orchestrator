@@ -30,6 +30,8 @@ const idleReviewUndeliverable = "idle-review-undeliverable"
 const idleReviewNudgeFailed = "idle-review-nudge-failed"
 const idleReviewNudgeExhausted = "idle-review-nudge-exhausted"
 
+var errMergedCleanupRateLimited = errors.New("merged cleanup parked by agent usage limit")
+
 type humanHandoffOutcomeKind string
 
 const (
@@ -84,7 +86,7 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 	if err != nil || !ok {
 		return ReviewDeliveryNoop, err
 	}
-	if rec.IsTerminated || rec.Activity.State.NeedsInput() {
+	if rec.IsTerminated || rec.Activity.State.PausesAutomation() {
 		return ReviewDeliveryNoop, nil
 	}
 	if m.guard == nil {
@@ -174,7 +176,7 @@ func (m *Manager) ApplyReviewRoundCapHandoff(ctx context.Context, id domain.Sess
 	}
 	// Preserve the pending-input suppression invariant: another user decision
 	// already owns this session, so do not stack a review-cap handoff on it.
-	if rec.IsTerminated || rec.Activity.State.NeedsInput() {
+	if rec.IsTerminated || rec.Activity.State.PausesAutomation() {
 		return nil
 	}
 
@@ -235,7 +237,7 @@ func (m *Manager) deliverHumanHandoffLocked(ctx context.Context, prURL, key, rea
 
 func (m *Manager) parkReviewRoundCapSession(ctx context.Context, id domain.SessionID) error {
 	return m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
-		if cur.IsTerminated || cur.Activity.State.NeedsInput() {
+		if cur.IsTerminated || cur.Activity.State.PausesAutomation() {
 			return cur, false
 		}
 		cur.Activity = domain.Activity{State: domain.ActivityWaitingInput, LastActivityAt: now}
@@ -289,7 +291,7 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 	if err != nil || !ok {
 		return err
 	}
-	if rec.IsTerminated || rec.Activity.State.NeedsInput() {
+	if rec.IsTerminated || rec.Activity.State.PausesAutomation() {
 		return nil
 	}
 	// A single PR can trip several actionable conditions at once (failing CI,
@@ -542,7 +544,7 @@ func (m *Manager) ApplyIdleReviewSnapshot(ctx context.Context, id domain.Session
 	msg := fmt.Sprintf("You still have %d unresolved review comment(s) on %s and appear to be idle. Address them now, push fixes, and resolve each addressed thread.\n\n%s",
 		len(actionable), prIdentity(prObs), formatReviewCommentsMessage(actionable))
 	outcome, sendErr := m.guard.NudgeIdleEpisode(ctx, id, msg, rec.Activity.LastActivityAt)
-	if outcome == sessionguard.SuppressedStaleEpisode {
+	if outcome == sessionguard.SuppressedStaleEpisode || outcome == sessionguard.SuppressedRateLimited {
 		return m.clearIdleReviewEpisodeIdentityLocked(ctx, prURL, rec.Activity.LastActivityAt)
 	}
 	if sendErr != nil || outcome != sessionguard.Sent {
@@ -729,9 +731,11 @@ func (m *Manager) cleanupMergedSession(ctx context.Context, id domain.SessionID,
 		if cur.IsTerminated || cur.Metadata.MergedCleanupPending {
 			return cur, false
 		}
-		shouldClean = true
 		cur.Metadata.MergedCleanupPending = true
 		cur.Metadata.MergedCleanupPRURL = prURL
+		if cur.Activity.State != domain.ActivityRateLimited {
+			shouldClean = true
+		}
 		return cur, true
 	}); err != nil {
 		return err
@@ -739,10 +743,22 @@ func (m *Manager) cleanupMergedSession(ctx context.Context, id domain.SessionID,
 	if !shouldClean {
 		return nil
 	}
-	return m.runMergedCleanup(ctx, id)
+	err := m.runMergedCleanup(ctx, id)
+	if errors.Is(err, errMergedCleanupRateLimited) {
+		return nil
+	}
+	return err
 }
 
 func (m *Manager) runMergedCleanup(ctx context.Context, id domain.SessionID) error {
+	// Persist the terminal reservation before external I/O. A concurrent
+	// rate-limit hook therefore has a deterministic winner: if it lands first,
+	// reservation refuses cleanup; if reservation lands first, the hook sees a
+	// terminal row and cannot rewrite it. The durable pending latch remains set
+	// until resource cleanup succeeds, so a daemon restart can replay failures.
+	if err := m.reserveMergedCleanup(ctx, id); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	cleaner := m.mergedCleaner
 	m.mu.Unlock()
@@ -763,11 +779,17 @@ func (m *Manager) RetryMergedCleanup(ctx context.Context, id domain.SessionID) e
 	if err != nil || !ok || !rec.Metadata.MergedCleanupPending {
 		return err
 	}
+	if rec.Activity.State == domain.ActivityRateLimited {
+		return nil
+	}
 	intent, err := m.mergedCleanupNotificationIntent(ctx, rec)
 	if err != nil {
 		return err
 	}
 	if err := m.runMergedCleanup(ctx, id); err != nil {
+		if errors.Is(err, errMergedCleanupRateLimited) {
+			return nil
+		}
 		return err
 	}
 	m.emitNotification(ctx, intent)
@@ -818,7 +840,7 @@ func (m *Manager) ApplyReviewResult(ctx context.Context, workerID domain.Session
 	if err != nil || !ok {
 		return ReviewDeliveryNoop, err
 	}
-	if rec.IsTerminated || rec.Activity.State.NeedsInput() {
+	if rec.IsTerminated || rec.Activity.State.PausesAutomation() {
 		return ReviewDeliveryNoop, nil
 	}
 	if m.guard == nil {
@@ -1055,14 +1077,17 @@ func (m *Manager) ApplyTrackerFacts(ctx context.Context, id domain.SessionID, o 
 	if !o.Fetched {
 		return nil
 	}
-	if isTerminalTrackerState(o.Issue.State) {
-		return m.MarkTerminated(ctx, id)
-	}
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil || !ok {
 		return err
 	}
-	if rec.IsTerminated || rec.Activity.State.NeedsInput() {
+	if isTerminalTrackerState(o.Issue.State) {
+		if rec.Activity.State == domain.ActivityRateLimited {
+			return nil
+		}
+		return m.markTerminatedUnlessRateLimited(ctx, id)
+	}
+	if rec.IsTerminated || rec.Activity.State.PausesAutomation() {
 		return nil
 	}
 	if o.Changed.Assignee {

@@ -37,10 +37,10 @@ type notificationSink interface {
 }
 
 // MergedSessionCleaner tears down the external resources owned by a session
-// whose pull requests reached the lifecycle completion bar. The session
-// manager implements this boundary so lifecycle keeps exclusive authority over
-// the completion decision while runtime/workspace cleanup stays in the service
-// that owns those resources.
+// whose pull requests reached the lifecycle completion bar. It is a
+// resource-only callback: implementations must not call back into lifecycle.
+// Lifecycle durably reserves the terminal state before invoking it and clears
+// the replay latch only after it succeeds.
 type MergedSessionCleaner interface {
 	CleanupMergedSession(ctx context.Context, id domain.SessionID) error
 }
@@ -203,6 +203,13 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 // existing activity and first-signal facts untouched.
 func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, s ports.ActivitySignal) error {
 	s.AgentSessionID = strings.TrimSpace(s.AgentSessionID)
+	// The hook receiver already parses Claude's documented StopFailure `error`
+	// field into ErrorType for diagnostics. Promote only the provider-neutral
+	// rate_limit category into a parked lifecycle state; other stop failures
+	// retain the normal idle diagnostic path.
+	if s.Valid && s.Event == "stop-failure" && s.ErrorType == "rate_limit" {
+		s.State = domain.ActivityRateLimited
+	}
 	if !s.Valid && s.AgentSessionID == "" {
 		return nil
 	}
@@ -305,10 +312,25 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 		m.mu.Unlock()
 		return err
 	}
+	// A provider usage-limit transition is a durable park, not a request for
+	// user input. Reuse the persisted needs-input notification channel with
+	// explicit copy so the condition is prominent without inventing a second
+	// storage enum. Same-state repeats do not re-notify.
+	if rec.Activity.State != domain.ActivityRateLimited && next.Activity.State == domain.ActivityRateLimited && !next.IsTerminated {
+		intent = &ports.NotificationIntent{
+			Type:               domain.NotificationNeedsInput,
+			SessionID:          next.ID,
+			ProjectID:          next.ProjectID,
+			CreatedAt:          next.Activity.LastActivityAt,
+			SessionDisplayName: next.DisplayName,
+			TitleOverride:      "Agent usage limit reached",
+			BodyOverride:       "The live session is parked and its worktree is preserved. Wait for the provider limit to reset, then send an explicit retry.",
+		}
+	}
 	// Transition into the needs-input family (waiting_input or blocked) pings
 	// the user; an in-family escalation (waiting_input -> blocked) does not
 	// re-notify — the user was already pinged once for this pause.
-	if !rec.Activity.State.NeedsInput() && next.Activity.State.NeedsInput() && !next.IsTerminated {
+	if intent == nil && !rec.Activity.State.NeedsInput() && next.Activity.State.NeedsInput() && !next.IsTerminated {
 		intent = &ports.NotificationIntent{
 			Type:               domain.NotificationNeedsInput,
 			SessionID:          next.ID,
@@ -581,20 +603,65 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 	})
 }
 
-// markMergedCleanupComplete is the only terminal write that clears the durable
-// merged-cleanup replay state. Runtime/activity termination alone says nothing
-// about whether the worktree and restore markers were released.
-func (m *Manager) markMergedCleanupComplete(ctx context.Context, id domain.SessionID) error {
+// markTerminatedUnlessRateLimited atomically applies an automated terminal
+// transition only when the session is not parked on a provider usage limit.
+// Explicit user-owned teardown continues to use MarkTerminated.
+func (m *Manager) markTerminatedUnlessRateLimited(ctx context.Context, id domain.SessionID) error {
+	diagnostic := m.captureDiagnostic(ctx, id, domain.DiagnosticTerminated, "")
 	return m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
-		changed := !cur.IsTerminated || cur.Metadata.MergedCleanupPending || cur.Metadata.MergedCleanupPRURL != ""
-		if !changed {
+		if cur.IsTerminated || cur.Activity.State == domain.ActivityRateLimited {
 			return cur, false
 		}
 		cur.IsTerminated = true
+		cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
+		if diagnostic != nil {
+			cur.Diagnostic = diagnostic
+		}
+		delete(m.flights, id)
+		return cur, true
+	})
+}
+
+// reserveMergedCleanup atomically linearizes automated cleanup against a
+// provider usage-limit park. It intentionally keeps MergedCleanupPending set:
+// external teardown happens after this write and may need replay after a
+// failure or daemon restart.
+func (m *Manager) reserveMergedCleanup(ctx context.Context, id domain.SessionID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: %s", ports.ErrSessionNotFound, id)
+	}
+	if cur.Activity.State == domain.ActivityRateLimited {
+		return errMergedCleanupRateLimited
+	}
+	if !cur.Metadata.MergedCleanupPending {
+		return nil
+	}
+	if cur.IsTerminated && cur.Activity.State == domain.ActivityExited {
+		return nil
+	}
+	now := m.clock()
+	cur.IsTerminated = true
+	cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
+	cur.UpdatedAt = now
+	delete(m.flights, id)
+	return m.store.UpdateSession(ctx, cur)
+}
+
+// markMergedCleanupComplete is the only write that clears the durable replay
+// latch. The terminal reservation remains intact.
+func (m *Manager) markMergedCleanupComplete(ctx context.Context, id domain.SessionID) error {
+	return m.mutate(ctx, id, func(cur domain.SessionRecord, _ time.Time) (domain.SessionRecord, bool) {
+		if !cur.Metadata.MergedCleanupPending && cur.Metadata.MergedCleanupPRURL == "" {
+			return cur, false
+		}
 		cur.Metadata.MergedCleanupPending = false
 		cur.Metadata.MergedCleanupPRURL = ""
-		cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
-		delete(m.flights, id)
 		return cur, true
 	})
 }

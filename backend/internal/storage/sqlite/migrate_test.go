@@ -66,3 +66,22 @@ func TestMigrateAllowsEveryShippedHarness(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrateAllowsRateLimitedActivity(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "ao.db")+pragmas)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	var schema string
+	if err := db.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'").Scan(&schema); err != nil {
+		t.Fatalf("read sessions schema: %v", err)
+	}
+	if !strings.Contains(schema, "'rate_limited'") {
+		t.Fatalf("sessions.activity_state CHECK was not widened: %s", schema)
+	}
+}
