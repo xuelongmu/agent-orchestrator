@@ -2,6 +2,13 @@
 
 Read and follow [`AGENTS.md`](AGENTS.md) for repository layout, commands, coding conventions, and hard rules.
 
+## Repository skills
+
+| Skill                                                            | Use for                                                                                |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| [`bug-triage`](skills/bug-triage/SKILL.md)                       | Investigating bug reports, checking duplicates, filing issues, and preparing fixes     |
+| [`autonomous-drive-loop`](skills/autonomous-drive-loop/SKILL.md) | Operating or recovering durable PR review/fix/merge loops without prompt-carried state |
+
 ## App state lives under `~/.ao` only
 
 All app state, the daemon's data dir, `running.json`, worktrees, and the Electron
