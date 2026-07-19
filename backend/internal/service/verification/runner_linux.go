@@ -34,6 +34,11 @@ func newVerificationDescendantOwner() (*linuxVerificationDescendantOwner, error)
 	if _, err := linuxDirectChildren(); err != nil {
 		return nil, fmt.Errorf("read guardian children from procfs: %w", err)
 	}
+	fd, err := unix.PidfdOpen(os.Getpid(), 0)
+	if err != nil {
+		return nil, fmt.Errorf("open pidfd capability: %w", err)
+	}
+	unix.Close(fd)
 	return &linuxVerificationDescendantOwner{}, nil
 }
 
