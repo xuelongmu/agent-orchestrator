@@ -497,6 +497,13 @@ func (m *Manager) ApplyIdleReviewSnapshot(ctx context.Context, id domain.Session
 	deliveredSig := m.react.seen["review:"+prURL]
 
 	handoff := func(reason string) error {
+		current, err := m.idleReviewEpisodeCurrent(ctx, id, rec.Activity.LastActivityAt)
+		if err != nil {
+			return err
+		}
+		if !current {
+			return m.clearIdleReviewEpisodeIdentityLocked(ctx, prURL, rec.Activity.LastActivityAt)
+		}
 		body := "The idle agent could not be safely reminded about its pull request review backlog. Open the pull request and review the outstanding feedback."
 		if reason == idleReviewNudgeExhausted {
 			body = fmt.Sprintf("The agent remains idle with unresolved pull request feedback after %d automated reminder(s). Human review is needed.", idleReviewMaxNudges)
@@ -534,7 +541,10 @@ func (m *Manager) ApplyIdleReviewSnapshot(ctx context.Context, id domain.Session
 	}
 	msg := fmt.Sprintf("You still have %d unresolved review comment(s) on %s and appear to be idle. Address them now, push fixes, and resolve each addressed thread.\n\n%s",
 		len(actionable), prIdentity(prObs), formatReviewCommentsMessage(actionable))
-	outcome, sendErr := m.guard.Nudge(ctx, id, msg)
+	outcome, sendErr := m.guard.NudgeIdleEpisode(ctx, id, msg, rec.Activity.LastActivityAt)
+	if outcome == sessionguard.SuppressedStaleEpisode {
+		return m.clearIdleReviewEpisodeIdentityLocked(ctx, prURL, rec.Activity.LastActivityAt)
+	}
 	if sendErr != nil || outcome != sessionguard.Sent {
 		handoffErr := handoff(idleReviewNudgeFailed)
 		if sendErr != nil {
@@ -544,6 +554,22 @@ func (m *Manager) ApplyIdleReviewSnapshot(ctx context.Context, id domain.Session
 	}
 	m.react.attempts[episodeKey] = attempts + 1
 	return m.persistPRSignaturesLocked(ctx, prURL)
+}
+
+// idleReviewEpisodeCurrent closes the gap between the snapshot's initial
+// eligibility read and its eventual side effect. Activity recovery persists
+// before its durable idle-review cleanup acquires react.mu, so a reducer can be
+// waiting behind this decision while the store already says the worker is
+// active. Requiring the same idle timestamp immediately before each nudge or
+// handoff prevents stale positive-idle evidence from driving either action.
+func (m *Manager) idleReviewEpisodeCurrent(ctx context.Context, id domain.SessionID, idleSince time.Time) (bool, error) {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return false, err
+	}
+	return !rec.IsTerminated && rec.Activity.State == domain.ActivityIdle &&
+		rec.Activity.LastActivityAt.Equal(idleSince) &&
+		m.clock().Sub(rec.Activity.LastActivityAt) >= m.window, nil
 }
 
 func unresolvedSCMReviewThreads(threads []ports.SCMReviewThreadObservation) int {
@@ -596,6 +622,27 @@ func idleReviewHandoffKey(prURL string, idleSince time.Time) string {
 
 func (m *Manager) clearIdleReviewEpisodeLocked(ctx context.Context, prURL string) error {
 	if !m.clearIdleReviewPRStateLocked(prURL) {
+		return nil
+	}
+	return m.persistPRSignaturesLocked(ctx, prURL)
+}
+
+// clearIdleReviewEpisodeIdentityLocked removes only the stale decision's
+// episode. A newer idle episode may already have persisted its own budget or
+// handoff while this caller was waiting for react.mu; those keys must survive.
+func (m *Manager) clearIdleReviewEpisodeIdentityLocked(ctx context.Context, prURL string, idleSince time.Time) error {
+	changed := false
+	attemptKey := idleReviewEpisodeKey(prURL, idleSince)
+	if _, ok := m.react.attempts[attemptKey]; ok {
+		delete(m.react.attempts, attemptKey)
+		changed = true
+	}
+	handoffKey := idleReviewHandoffKey(prURL, idleSince)
+	if _, ok := m.react.handoffs[handoffKey]; ok {
+		delete(m.react.handoffs, handoffKey)
+		changed = true
+	}
+	if !changed {
 		return nil
 	}
 	return m.persistPRSignaturesLocked(ctx, prURL)
@@ -1356,6 +1403,13 @@ func (m *Manager) idleReviewFailureSession(ctx context.Context, id domain.Sessio
 
 func (m *Manager) deliverReviewFailureHandoffLocked(ctx context.Context, rec domain.SessionRecord, o ports.SCMObservation, reason string) error {
 	prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
+	current, err := m.idleReviewEpisodeCurrent(ctx, rec.ID, rec.Activity.LastActivityAt)
+	if err != nil {
+		return err
+	}
+	if !current {
+		return m.clearIdleReviewEpisodeIdentityLocked(ctx, prURL, rec.Activity.LastActivityAt)
+	}
 	handoffKey, err := m.canonicalIdleReviewHandoffLocked(ctx, prURL, rec.Activity.LastActivityAt)
 	if err != nil {
 		return err

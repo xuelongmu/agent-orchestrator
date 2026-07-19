@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -46,6 +47,9 @@ const (
 	// permission decision (Deliver and Nudge), or waiting at the prompt for
 	// the next instruction (Nudge only).
 	SuppressedAwaitingUser
+	// SuppressedStaleEpisode means a call-specific activity episode predicate
+	// no longer matched at the guard's final pre-write store read.
+	SuppressedStaleEpisode
 )
 
 // String names the outcome for logs.
@@ -59,6 +63,8 @@ func (o Outcome) String() string {
 		return "suppressed_terminated"
 	case SuppressedAwaitingUser:
 		return "suppressed_awaiting_user"
+	case SuppressedStaleEpisode:
+		return "suppressed_stale_episode"
 	default:
 		return "suppressed_unknown"
 	}
@@ -108,7 +114,7 @@ func (g *Guard) Send(ctx context.Context, id domain.SessionID, msg string) error
 func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
 	return g.send(ctx, id, msg, func(rec domain.SessionRecord) bool {
 		return rec.Activity.State == domain.ActivityBlocked
-	})
+	}, nil)
 }
 
 // Nudge writes an AO-initiated (unsolicited) message into the session. It
@@ -119,6 +125,16 @@ func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (O
 func (g *Guard) Nudge(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
 	return g.send(ctx, id, msg, func(rec domain.SessionRecord) bool {
 		return rec.Activity.State.NeedsInput() || rec.Metadata.PendingSubmitFingerprint != ""
+	}, nil)
+}
+
+// NudgeIdleEpisode writes an idle-review reminder only when the guard's final
+// pre-write read still belongs to the exact idle episode that authorized it.
+func (g *Guard) NudgeIdleEpisode(ctx context.Context, id domain.SessionID, msg string, idleSince time.Time) (Outcome, error) {
+	return g.send(ctx, id, msg, func(rec domain.SessionRecord) bool {
+		return rec.Activity.State.NeedsInput() || rec.Metadata.PendingSubmitFingerprint != ""
+	}, func(rec domain.SessionRecord) bool {
+		return rec.Activity.State == domain.ActivityIdle && rec.Activity.LastActivityAt.Equal(idleSince)
 	})
 }
 
@@ -128,7 +144,7 @@ func (g *Guard) Nudge(ctx context.Context, id domain.SessionID, msg string) (Out
 // appear mid-paste — but the just-in-time read is the strongest guarantee
 // available without scraping the terminal. Fail closed: a store error
 // suppresses the write rather than pressing Enter on an unknown state.
-func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refuse func(domain.SessionRecord) bool) (Outcome, error) {
+func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refuse, require func(domain.SessionRecord) bool) (Outcome, error) {
 	rec, ok, err := g.store.GetSession(ctx, id)
 	if err != nil {
 		return SuppressedUnknown, fmt.Errorf("guard %s: read session: %w", id, err)
@@ -153,6 +169,10 @@ func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refus
 		}
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", reason, "state", string(rec.Activity.State))
 		return SuppressedAwaitingUser, nil
+	}
+	if require != nil && !require(rec) {
+		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "stale_episode", "state", string(rec.Activity.State))
+		return SuppressedStaleEpisode, nil
 	}
 	if err := g.messenger.Send(ctx, id, msg); err != nil {
 		return Sent, fmt.Errorf("guard %s: send: %w", id, err)
