@@ -1353,6 +1353,14 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 		return sendOnceAccounted, nil
 	}
 	attempts := m.react.attempts[key]
+	// A bounded attempt budget belongs to one reaction fingerprint, not to the
+	// PR for the rest of its lifetime. In particular, an idle worker may have
+	// exhausted the review budget for an earlier round; new comment content must
+	// still wake it. Keep the reset local until the new nudge is actually sent so
+	// a suppressed or failed write cannot consume/alter durable delivery state.
+	if prior, ok := m.react.seen[key]; ok && prior != sig {
+		attempts = 0
+	}
 	if maxAttempts > 0 && attempts >= maxAttempts {
 		return sendOnceAccounted, nil
 	}

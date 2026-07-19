@@ -1391,6 +1391,99 @@ func TestPRObservation_EditedReviewCommentRenudgesAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestPRObservation_NewReviewRoundResetsExhaustedBudgetForIdleSession(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	prURL := "https://github.com/o/r/pull/39"
+
+	first := &fakeMessenger{}
+	m1 := New(st, first)
+	for round := 1; round <= reviewMaxNudge; round++ {
+		o := ports.PRObservation{
+			Fetched: true,
+			URL:     prURL,
+			Review:  domain.ReviewChangesRequest,
+			Comments: []ports.PRCommentObservation{{
+				ID: fmt.Sprintf("comment-%d", round), Body: fmt.Sprintf("round %d feedback", round),
+			}},
+		}
+		if err := m1.ApplyPRObservation(ctx, "mer-1", o); err != nil {
+			t.Fatalf("round %d ApplyPRObservation: %v", round, err)
+		}
+	}
+	if len(first.msgs) != reviewMaxNudge {
+		t.Fatalf("initial review nudges = %d, want %d", len(first.msgs), reviewMaxNudge)
+	}
+
+	// Simulate the stalled production state: the prior review budget is durable,
+	// the daemon restarts, and the worker remains idle while a new round arrives.
+	rec := st.sessions["mer-1"]
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now().Add(-2 * time.Minute)}
+	st.sessions["mer-1"] = rec
+	second := &fakeMessenger{}
+	m2 := New(st, second)
+	roundTwo := ports.PRObservation{
+		Fetched: true,
+		URL:     prURL,
+		Review:  domain.ReviewChangesRequest,
+		Comments: []ports.PRCommentObservation{{
+			ID: "comment-new", Body: "new review round feedback",
+		}},
+	}
+	if err := m2.ApplyPRObservation(ctx, "mer-1", roundTwo); err != nil {
+		t.Fatalf("new idle review round: %v", err)
+	}
+	if len(second.msgs) != 1 || !strings.Contains(second.msgs[0], "new review round feedback") {
+		t.Fatalf("new review round did not reach idle worker: %v", second.msgs)
+	}
+
+	if err := m2.ApplyPRObservation(ctx, "mer-1", roundTwo); err != nil {
+		t.Fatalf("repeat new review round: %v", err)
+	}
+	if len(second.msgs) != 1 {
+		t.Fatalf("identical review fingerprint re-nudged: %v", second.msgs)
+	}
+}
+
+func TestPRObservation_NewCIFailureReachesIdleSessionAndDedups(t *testing.T) {
+	st := newFakeStore()
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now().Add(-2 * time.Minute)}
+	st.sessions[rec.ID] = rec
+	msg := &fakeMessenger{}
+	m := New(st, msg)
+	prURL := "https://github.com/o/r/pull/39"
+
+	observation := func(commit, tail string) ports.PRObservation {
+		return ports.PRObservation{
+			Fetched: true,
+			URL:     prURL,
+			CI:      domain.CIFailing,
+			Checks: []ports.PRCheckObservation{{
+				Name: "build", CommitHash: commit, Status: domain.PRCheckFailed, LogTail: tail,
+			}},
+		}
+	}
+	first := observation("commit-1", "first failure")
+	if err := m.ApplyPRObservation(ctx, rec.ID, first); err != nil {
+		t.Fatalf("first CI failure: %v", err)
+	}
+	if err := m.ApplyPRObservation(ctx, rec.ID, first); err != nil {
+		t.Fatalf("repeat CI failure: %v", err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("identical CI fingerprint nudges = %d, want 1", len(msg.msgs))
+	}
+
+	second := observation("commit-2", "new failure")
+	if err := m.ApplyPRObservation(ctx, rec.ID, second); err != nil {
+		t.Fatalf("new CI failure: %v", err)
+	}
+	if len(msg.msgs) != 2 || !strings.Contains(msg.msgs[1], "new failure") {
+		t.Fatalf("new CI failure did not reach idle worker: %v", msg.msgs)
+	}
+}
+
 func TestPRObservation_DedupPersistsAcrossPRs(t *testing.T) {
 	st := newFakeStore()
 	st.sessions["mer-1"] = working("mer-1")
