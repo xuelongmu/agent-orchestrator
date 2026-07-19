@@ -109,13 +109,35 @@ describe("NewTaskDialog", () => {
 				harness: undefined,
 				issueId: "Fix fallback renderer",
 				prompt: "Restore the fallback renderer after WebGL init fails.",
-				workspaceKind: "worktree",
+				workspaceKind: undefined,
 				branch: undefined,
 			},
 		});
 		expect(onCreated).toHaveBeenCalledWith("task-1");
 		expect(onOpenChange).toHaveBeenCalledWith(false);
 	}, 20_000);
+
+	it("does not override the project workspace default while project config is loading", async () => {
+		const originalImplementation = getMock.getMockImplementation();
+		getMock.mockImplementation((path: string) => {
+			if (path === "/api/v1/projects/{id}") {
+				return new Promise(() => {});
+			}
+			return originalImplementation?.(path);
+		});
+
+		renderDialog();
+		const user = userEvent.setup();
+		await waitForAgentCatalog();
+		await user.click(screen.getByRole("combobox", { name: "Agent" }));
+		await user.click(await screen.findByRole("option", { name: "Claude Code" }));
+		await user.type(screen.getByLabelText("Title"), "Research");
+		await user.type(screen.getByLabelText("Brief"), "Use the configured scratch default.");
+		await user.click(screen.getByRole("button", { name: "Start task" }));
+
+		await waitFor(() => expect(postMock).toHaveBeenCalledTimes(1));
+		expect(spawnBody().workspaceKind).toBeUndefined();
+	});
 
 	it("spawns a branchless scratch task", async () => {
 		renderDialog();

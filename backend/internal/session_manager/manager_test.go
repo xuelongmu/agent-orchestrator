@@ -253,6 +253,7 @@ func (fakeAgent) GetPromptDeliveryStrategy(context.Context, ports.LaunchConfig) 
 	return ports.PromptDeliveryInCommand, nil
 }
 func (fakeAgent) GetAgentHooks(context.Context, ports.WorkspaceHookConfig) error { return nil }
+func (fakeAgent) UninstallHooks(context.Context, string) error                   { return nil }
 func (fakeAgent) GetRestoreCommand(_ context.Context, cfg ports.RestoreConfig) ([]string, bool, error) {
 	if id := cfg.Session.Metadata[ports.MetadataKeyAgentSessionID]; id != "" {
 		return []string{"resume", id}, true, nil
@@ -260,6 +261,27 @@ func (fakeAgent) GetRestoreCommand(_ context.Context, cfg ports.RestoreConfig) (
 	return nil, false, nil
 }
 func (fakeAgent) SessionInfo(context.Context, ports.SessionRef) (ports.SessionInfo, bool, error) {
+	return ports.SessionInfo{}, false, nil
+}
+
+type nonUninstallingAgent struct{}
+
+func (nonUninstallingAgent) GetConfigSpec(context.Context) (ports.ConfigSpec, error) {
+	return ports.ConfigSpec{}, nil
+}
+func (nonUninstallingAgent) GetLaunchCommand(context.Context, ports.LaunchConfig) ([]string, error) {
+	return []string{"launch"}, nil
+}
+func (nonUninstallingAgent) GetPromptDeliveryStrategy(context.Context, ports.LaunchConfig) (ports.PromptDeliveryStrategy, error) {
+	return ports.PromptDeliveryInCommand, nil
+}
+func (nonUninstallingAgent) GetAgentHooks(context.Context, ports.WorkspaceHookConfig) error {
+	return nil
+}
+func (nonUninstallingAgent) GetRestoreCommand(context.Context, ports.RestoreConfig) ([]string, bool, error) {
+	return nil, false, nil
+}
+func (nonUninstallingAgent) SessionInfo(context.Context, ports.SessionRef) (ports.SessionInfo, bool, error) {
 	return ports.SessionInfo{}, false, nil
 }
 
@@ -341,7 +363,16 @@ type cleaningAgent struct {
 	fakeAgent
 	cleanupCalls   int
 	cleanupConfigs []ports.WorkspaceHookConfig
+	uninstallCalls int
 	sharedLog      *[]string
+}
+
+func (a *cleaningAgent) UninstallHooks(_ context.Context, workspacePath string) error {
+	a.uninstallCalls++
+	if a.sharedLog != nil {
+		*a.sharedLog = append(*a.sharedLog, "UninstallHooks:"+workspacePath)
+	}
+	return nil
 }
 
 func (a *cleaningAgent) CleanupWorkspace(_ context.Context, cfg ports.WorkspaceHookConfig) error {
@@ -1451,6 +1482,37 @@ func TestCleanupMergedSession_TearsDownReservedSessionWithoutLifecycleReentry(t 
 	}
 }
 
+func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) {
+	m, st, rt, ws := newManager()
+	rec := mkLive("mer-1")
+	rec.IsTerminated = true
+	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
+	rec.Metadata.WorkspaceKind = domain.WorkspaceKindScratch
+	st.sessions[rec.ID] = rec
+	ws.destroyErr = errors.New("workspace busy")
+
+	if err := m.CleanupCompletedSession(ctx, rec.ID); err == nil || !strings.Contains(err.Error(), "workspace busy") {
+		t.Fatalf("first cleanup error = %v, want workspace busy", err)
+	}
+	if got := st.sessions[rec.ID].Metadata.RuntimeHandleID; got == "" {
+		t.Fatal("failed cleanup cleared its durable retry marker")
+	}
+
+	ws.destroyErr = nil
+	if err := m.CleanupCompletedSession(ctx, rec.ID); err != nil {
+		t.Fatalf("retry completed cleanup: %v", err)
+	}
+	if rt.destroyed != 2 || ws.destroyed != 2 {
+		t.Fatalf("cleanup attempts runtime/workspace = %d/%d, want 2/2", rt.destroyed, ws.destroyed)
+	}
+	if got := st.sessions[rec.ID].Metadata.RuntimeHandleID; got != "" {
+		t.Fatalf("successful cleanup retained runtime marker %q", got)
+	}
+	if got := m.lcm.(*fakeLCM).terminated[rec.ID]; got != 0 {
+		t.Fatalf("completed cleanup re-entered lifecycle %d times", got)
+	}
+}
+
 func TestCleanupMergedSession_PreservesDirtyWorkspaceWithoutLifecycleReentry(t *testing.T) {
 	m, st, rt, ws := newManager()
 	rec := mkLive("mer-1")
@@ -1850,6 +1912,80 @@ func TestSpawn_BranchlessWorkspaceKindsSkipBranchDerivation(t *testing.T) {
 				t.Fatalf("metadata = %#v, want branchless %s", meta, kind)
 			}
 		})
+	}
+}
+
+func TestSpawn_DirRequiresCleanupAndSerializesSharedHooks(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/repo/mer", Config: testRoleAgents()}
+	lookPath := func(string) (string, error) { return "/bin/true", nil }
+
+	unsupported := New(Deps{
+		Runtime: &fakeRuntime{}, Agents: singleAgent{agent: nonUninstallingAgent{}}, Workspace: &fakeWorkspace{}, Store: st,
+		Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}, LookPath: lookPath,
+	})
+	if _, err := unsupported.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, WorkspaceKind: domain.WorkspaceKindDir}); !errors.Is(err, ErrSharedDirUnsupported) {
+		t.Fatalf("unsupported dir spawn error = %v, want ErrSharedDirUnsupported", err)
+	}
+	if len(st.sessions) != 0 {
+		t.Fatalf("unsupported dir spawn created durable sessions: %#v", st.sessions)
+	}
+
+	agent := &cleaningAgent{}
+	rt := &fakeRuntime{}
+	ws := &fakeWorkspace{path: "/repo/mer"}
+	m := New(Deps{
+		Runtime: rt, Agents: singleAgent{agent: agent}, Workspace: ws, Store: st,
+		Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}, LookPath: lookPath,
+	})
+	type spawnResult struct {
+		rec domain.SessionRecord
+		err error
+	}
+	start := make(chan struct{})
+	results := make(chan spawnResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			rec, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, WorkspaceKind: domain.WorkspaceKindDir})
+			results <- spawnResult{rec: rec, err: err}
+		}()
+	}
+	close(start)
+	var first domain.SessionRecord
+	var inUseErrors int
+	for range 2 {
+		result := <-results
+		if result.err == nil {
+			first = result.rec
+		} else if errors.Is(result.err, ErrSharedDirInUse) {
+			inUseErrors++
+		} else {
+			t.Fatalf("concurrent dir spawn: %v", result.err)
+		}
+	}
+	if first.ID == "" || inUseErrors != 1 {
+		t.Fatalf("concurrent dir results = success %q, in-use errors %d; want one each", first.ID, inUseErrors)
+	}
+	if _, err := m.Kill(ctx, first.ID); err != nil {
+		t.Fatalf("kill first dir session: %v", err)
+	}
+	if agent.uninstallCalls != 1 {
+		t.Fatalf("shared-directory uninstall calls = %d, want 1", agent.uninstallCalls)
+	}
+	next, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, WorkspaceKind: domain.WorkspaceKindDir})
+	if err != nil {
+		t.Fatalf("dir spawn after cleanup: %v", err)
+	}
+	naturallyExited := st.sessions[next.ID]
+	naturallyExited.IsTerminated = true
+	naturallyExited.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
+	st.sessions[next.ID] = naturallyExited
+	if err := m.CleanupCompletedSession(ctx, next.ID); err != nil {
+		t.Fatalf("natural dir completion cleanup: %v", err)
+	}
+	if agent.uninstallCalls != 2 || st.sessions[next.ID].Metadata.RuntimeHandleID != "" {
+		t.Fatalf("natural dir cleanup uninstall/handle = %d/%q, want 2/empty", agent.uninstallCalls, st.sessions[next.ID].Metadata.RuntimeHandleID)
 	}
 }
 
@@ -3854,6 +3990,51 @@ func TestSaveAndTeardownAll_CleanWorktreeWritesEmptyRef(t *testing.T) {
 	}
 	if rows[0].PreservedRef != "" {
 		t.Fatalf("preserved_ref = %q, want empty for clean worktree", rows[0].PreservedRef)
+	}
+}
+
+func TestSaveAndTeardownAll_TerminatesAndCleansBranchlessSession(t *testing.T) {
+	m, st, rt, ws := newLifecycleManager()
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID:        "mer-1",
+		ProjectID: "mer",
+		Kind:      domain.KindWorker,
+		Harness:   domain.HarnessClaudeCode,
+		Metadata: domain.SessionMetadata{
+			WorkspaceKind:   domain.WorkspaceKindScratch,
+			WorkspacePath:   "/ws/mer-1",
+			RuntimeHandleID: "h1",
+			Prompt:          "continue research",
+		},
+		Activity: domain.Activity{State: domain.ActivityActive},
+	}
+
+	if err := m.SaveAndTeardownAll(ctx); err != nil {
+		t.Fatalf("SaveAndTeardownAll err = %v", err)
+	}
+	got := st.sessions["mer-1"]
+	if !got.IsTerminated || got.Activity.State != domain.ActivityExited {
+		t.Fatalf("branchless shutdown record = %+v, want terminated/exited", got)
+	}
+	if got.Metadata.RuntimeHandleID != "" {
+		t.Fatalf("branchless shutdown retained runtime handle %q", got.Metadata.RuntimeHandleID)
+	}
+	if rt.destroyed != 1 || ws.destroyed != 0 {
+		t.Fatalf("branchless shutdown destroyed runtime/workspace = %d/%d, want 1/0", rt.destroyed, ws.destroyed)
+	}
+	markers := st.worktrees["mer-1"]
+	if len(markers) != 1 || markers[0].Branch != "" || markers[0].WorktreePath != "/ws/mer-1" {
+		t.Fatalf("branchless shutdown restore marker = %+v", markers)
+	}
+
+	if err := m.RestoreAll(ctx); err != nil {
+		t.Fatalf("RestoreAll err = %v", err)
+	}
+	if got := st.sessions["mer-1"]; got.IsTerminated || got.Metadata.WorkspaceKind != domain.WorkspaceKindScratch || got.Metadata.Branch != "" {
+		t.Fatalf("restored branchless session = %+v", got)
+	}
+	if rt.created != 1 || len(st.worktrees["mer-1"]) != 0 {
+		t.Fatalf("branchless restore runtime/markers = %d/%+v, want 1/none", rt.created, st.worktrees["mer-1"])
 	}
 }
 

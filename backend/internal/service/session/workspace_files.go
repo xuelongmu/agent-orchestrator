@@ -98,7 +98,13 @@ func (s *Service) ListWorkspaceFiles(ctx context.Context, id domain.SessionID) (
 	for _, rel := range paths {
 		status := statuses[rel]
 		if status == "" {
-			status = WorkspaceFileUnmodified
+			if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree {
+				status = WorkspaceFileUnmodified
+			} else {
+				// Non-git workspaces have no baseline. Treat every present file as
+				// added so the changed-files UI does not filter their output away.
+				status = WorkspaceFileAdded
+			}
 		}
 		additions, deletions := counts[rel][0], counts[rel][1]
 		size, binary := workspaceFileSizeAndBinary(rec.Metadata.WorkspacePath, rel, status)
@@ -136,7 +142,11 @@ func (s *Service) GetWorkspaceFile(ctx context.Context, id domain.SessionID, raw
 	}
 	status := statuses[rel]
 	if status == "" {
-		status = WorkspaceFileUnmodified
+		if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree {
+			status = WorkspaceFileUnmodified
+		} else {
+			status = WorkspaceFileAdded
+		}
 	}
 	additions, deletions := counts[rel][0], counts[rel][1]
 	detail := WorkspaceFileDetail{
@@ -175,6 +185,10 @@ func (s *Service) GetWorkspaceFile(ctx context.Context, id domain.SessionID, raw
 }
 
 func plainWorkspaceFiles(root string) ([]string, bool, error) {
+	return plainWorkspaceFilesLimit(root, maxWorkspaceFiles)
+}
+
+func plainWorkspaceFilesLimit(root string, limit int) ([]string, bool, error) {
 	paths := make([]string, 0)
 	truncated := false
 	err := filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
@@ -197,11 +211,11 @@ func plainWorkspaceFiles(root string) ([]string, bool, error) {
 		if err != nil {
 			return err
 		}
-		if len(paths) >= maxWorkspaceFiles {
-			truncated = true
-			return nil
-		}
 		paths = append(paths, filepath.ToSlash(rel))
+		if len(paths) >= limit {
+			truncated = true
+			return filepath.SkipAll
+		}
 		return nil
 	})
 	return paths, truncated, err

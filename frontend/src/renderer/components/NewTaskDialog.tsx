@@ -104,7 +104,10 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 					harness: agentTouched && agent ? (agent as AgentProvider) : undefined,
 					issueId: cleanTitle,
 					prompt: cleanPrompt,
-					workspaceKind: effectiveWorkspaceKind,
+					// Omit the kind until the user explicitly overrides it. The daemon
+					// then resolves the durable project default even if this dialog was
+					// submitted before the project query finished loading.
+					workspaceKind: workspaceKind || undefined,
 					branch: effectiveWorkspaceKind === "worktree" ? cleanBranch || undefined : undefined,
 				},
 			});

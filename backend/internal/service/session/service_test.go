@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -318,15 +319,29 @@ func TestWorkspaceFilesSupportNonGitScratchDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files.Files) != 1 || files.Files[0].Path != "notes/research.md" || files.Files[0].Status != WorkspaceFileUnmodified {
+	if len(files.Files) != 1 || files.Files[0].Path != "notes/research.md" || files.Files[0].Status != WorkspaceFileAdded {
 		t.Fatalf("files = %#v", files.Files)
 	}
 	detail, err := svc.GetWorkspaceFile(context.Background(), "ao-1", "notes/research.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail.Content != "findings\n" || detail.Diff != "" {
+	if detail.Content != "findings\n" || detail.Diff != "" || detail.Status != WorkspaceFileAdded {
 		t.Fatalf("detail = %#v", detail)
+	}
+}
+
+func TestPlainWorkspaceFilesStopsAtLimit(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		writeWorkspaceFile(t, root, name, name)
+	}
+	files, truncated, err := plainWorkspaceFilesLimit(root, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated || !reflect.DeepEqual(files, []string{"a.txt", "b.txt"}) {
+		t.Fatalf("files=%#v truncated=%v, want first two and truncated", files, truncated)
 	}
 }
 
@@ -869,6 +884,8 @@ func TestToAPIErrorMapsWorkspaceBranchSentinels(t *testing.T) {
 		{"runtime prerequisite missing", fmt.Errorf("spawn: %w: tmux required on macOS/Linux but not in PATH", ports.ErrRuntimePrerequisite), apierr.KindInvalid, "RUNTIME_PREREQUISITE_MISSING"},
 		{"unknown harness", fmt.Errorf("spawn: %w: %q", sessionmanager.ErrUnknownHarness, "bogus"), apierr.KindInvalid, "UNKNOWN_HARNESS"},
 		{"missing harness", fmt.Errorf("spawn: %w: configure project worker.agent or pass --harness", sessionmanager.ErrMissingHarness), apierr.KindInvalid, "AGENT_REQUIRED"},
+		{"shared directory unsupported", fmt.Errorf("spawn: %w", sessionmanager.ErrSharedDirUnsupported), apierr.KindInvalid, "SHARED_DIRECTORY_UNSUPPORTED"},
+		{"shared directory in use", fmt.Errorf("spawn: %w", sessionmanager.ErrSharedDirInUse), apierr.KindConflict, "SHARED_DIRECTORY_IN_USE"},
 		{"awaiting decision", fmt.Errorf("send mer-1: %w", sessionmanager.ErrAwaitingDecision), apierr.KindConflict, "SESSION_AWAITING_DECISION"},
 	}
 	for _, tc := range cases {
