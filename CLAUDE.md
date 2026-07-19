@@ -18,6 +18,12 @@ Never write to or read from `~/Library/Application Support` or any other OS-defa
 app-data location. `frontend/src/main.ts` pins Electron's `userData` to
 `~/.ao/electron`; do not remove that override. See the hard rule in `AGENTS.md`.
 
+Storage is hybrid: durable daemon state, including sessions and activity events,
+is stored in SQLite under `AO_DATA_DIR` (default `~/.ao/data`). Managed worktrees
+live under `<AO_DATA_DIR>/worktrees` (default `~/.ao/data/worktrees`). `running.json`
+and Electron profile data remain files under `~/.ao` by default; transient runtime
+state stays in memory.
+
 ## Design System
 
 Always read [`DESIGN.md`](DESIGN.md) before making any visual or UI decision —

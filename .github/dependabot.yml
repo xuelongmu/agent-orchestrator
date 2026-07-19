@@ -1,0 +1,57 @@
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      development-dependencies:
+        dependency-type: development
+
+  - package-ecosystem: npm
+    directory: "/frontend"
+    schedule:
+      interval: weekly
+    groups:
+      development-dependencies:
+        dependency-type: development
+
+  - package-ecosystem: npm
+    directory: "/frontend/src/landing"
+    schedule:
+      interval: weekly
+    groups:
+      development-dependencies:
+        dependency-type: development
+
+  - package-ecosystem: npm
+    directory: "/packages/mobile"
+    schedule:
+      interval: weekly
+    groups:
+      development-dependencies:
+        dependency-type: development
+
+  - package-ecosystem: gomod
+    directory: "/backend"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directory: "/.github/actions/macos-signing-setup"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
