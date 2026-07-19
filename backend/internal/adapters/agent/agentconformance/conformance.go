@@ -120,13 +120,6 @@ func RunRegistry(t *testing.T, registered []adapters.Adapter, opts RegistryOptio
 func runAdapter(t *testing.T, harness domain.AgentHarness, manifest adapters.Manifest, agent ports.Agent, opts RegistryOptions) []HookCommand {
 	t.Helper()
 	validateManifest(t, manifest)
-	validateCancellation(t, agent)
-
-	spec, err := agent.GetConfigSpec(context.Background())
-	if err != nil {
-		t.Fatalf("GetConfigSpec: %v", err)
-	}
-	validateConfigSpec(t, spec)
 
 	sandbox := t.TempDir()
 	isolateUserEnvironment(t, sandbox)
@@ -145,6 +138,24 @@ func runAdapter(t *testing.T, harness domain.AgentHarness, manifest adapters.Man
 		SessionID:     "conformance-session",
 		WorkspacePath: workspace,
 	}
+	launchCfg := ports.LaunchConfig{
+		DataDir:       dataDir,
+		SessionID:     "conformance-session",
+		WorkspacePath: workspace,
+	}
+	sessionRef := ports.SessionRef{
+		ID:            "conformance-session",
+		Metadata:      map[string]string{},
+		WorkspacePath: workspace,
+	}
+	validateCancellation(t, agent, launchCfg, hookCfg, ports.RestoreConfig{Session: sessionRef}, sessionRef)
+
+	spec, err := agent.GetConfigSpec(context.Background())
+	if err != nil {
+		t.Fatalf("GetConfigSpec: %v", err)
+	}
+	validateConfigSpec(t, spec)
+
 	if err := agent.GetAgentHooks(context.Background(), hookCfg); err != nil {
 		t.Fatalf("GetAgentHooks in sandbox: %v", err)
 	}
@@ -358,16 +369,23 @@ func defaultMatchesType(value any, typ ports.ConfigFieldType) bool {
 	}
 }
 
-func validateCancellation(t *testing.T, agent ports.Agent) {
+func validateCancellation(
+	t *testing.T,
+	agent ports.Agent,
+	launchCfg ports.LaunchConfig,
+	hookCfg ports.WorkspaceHookConfig,
+	restoreCfg ports.RestoreConfig,
+	session ports.SessionRef,
+) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	assertCanceled(t, "GetConfigSpec", func() error { _, err := agent.GetConfigSpec(ctx); return err })
-	assertCanceled(t, "GetLaunchCommand", func() error { _, err := agent.GetLaunchCommand(ctx, ports.LaunchConfig{}); return err })
-	assertCanceled(t, "GetPromptDeliveryStrategy", func() error { _, err := agent.GetPromptDeliveryStrategy(ctx, ports.LaunchConfig{}); return err })
-	assertCanceled(t, "GetAgentHooks", func() error { return agent.GetAgentHooks(ctx, ports.WorkspaceHookConfig{}) })
-	assertCanceled(t, "GetRestoreCommand", func() error { _, _, err := agent.GetRestoreCommand(ctx, ports.RestoreConfig{}); return err })
-	assertCanceled(t, "SessionInfo", func() error { _, _, err := agent.SessionInfo(ctx, ports.SessionRef{}); return err })
+	assertCanceled(t, "GetLaunchCommand", func() error { _, err := agent.GetLaunchCommand(ctx, launchCfg); return err })
+	assertCanceled(t, "GetPromptDeliveryStrategy", func() error { _, err := agent.GetPromptDeliveryStrategy(ctx, launchCfg); return err })
+	assertCanceled(t, "GetAgentHooks", func() error { return agent.GetAgentHooks(ctx, hookCfg) })
+	assertCanceled(t, "GetRestoreCommand", func() error { _, _, err := agent.GetRestoreCommand(ctx, restoreCfg); return err })
+	assertCanceled(t, "SessionInfo", func() error { _, _, err := agent.SessionInfo(ctx, session); return err })
 }
 
 func assertCanceled(t *testing.T, method string, call func() error) {
@@ -393,6 +411,7 @@ func isolateUserEnvironment(t *testing.T, root string) {
 		"APPDATA": appData, "LOCALAPPDATA": localAppData,
 		"TMP": tempDir, "TEMP": tempDir, "TMPDIR": tempDir,
 		"AUTOHAND_CONFIG": filepath.Join(root, "autohand", "config.json"),
+		"KIMI_CODE_HOME":  filepath.Join(root, "kimi-code-home"),
 	} {
 		t.Setenv(key, value)
 	}
@@ -456,7 +475,7 @@ type HookCommand struct {
 func hookCommands(text string) []HookCommand {
 	seen := map[HookCommand]bool{}
 	var hooks []HookCommand
-	uncommented := withoutSlashComments(text)
+	uncommented := withoutSourceComments(text)
 	add := func(hook HookCommand) {
 		if !seen[hook] {
 			hooks = append(hooks, hook)
@@ -482,14 +501,63 @@ func hookCommands(text string) []HookCommand {
 	return hooks
 }
 
-func withoutSlashComments(text string) string {
+// withoutSourceComments removes JavaScript/TypeScript line and block comments
+// while preserving quoted command values and template literals. Hook assets
+// include documentation examples, which must not count as executable callback
+// edges in the conformance contract.
+func withoutSourceComments(text string) string {
 	var out strings.Builder
-	for line := range strings.SplitSeq(text, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+	var quote byte
+	escaped := false
+	lineComment := false
+	blockComment := false
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		if lineComment {
+			if ch == '\n' {
+				lineComment = false
+				out.WriteByte(ch)
+			}
 			continue
 		}
-		out.WriteString(line)
-		out.WriteByte('\n')
+		if blockComment {
+			if ch == '*' && i+1 < len(text) && text[i+1] == '/' {
+				blockComment = false
+				i++
+			} else if ch == '\n' {
+				out.WriteByte(ch)
+			}
+			continue
+		}
+		if quote != 0 {
+			out.WriteByte(ch)
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			quote = ch
+			out.WriteByte(ch)
+			continue
+		}
+		if ch == '/' && i+1 < len(text) {
+			switch text[i+1] {
+			case '/':
+				lineComment = true
+				i++
+				continue
+			case '*':
+				blockComment = true
+				i++
+				continue
+			}
+		}
+		out.WriteByte(ch)
 	}
 	return out.String()
 }
