@@ -22,6 +22,9 @@ var (
 	ErrDependencyProject  = errors.New("session dependency must belong to the same project")
 	ErrDependencyInvalid  = errors.New("invalid session dependency id")
 	ErrDependencyLimit    = errors.New("too many session dependencies")
+	// ErrTrackerIntakeClaimLost rejects a tracker-intake session seed when
+	// its token-fenced lease is no longer current. No session row is inserted.
+	ErrTrackerIntakeClaimLost = errors.New("tracker intake claim lost")
 )
 
 // SpawnConfig is the request to start a new session: which project/issue, which
@@ -42,4 +45,9 @@ type SpawnConfig struct {
 	// DisplayName is the user-facing sidebar label. Empty falls back to the
 	// session id in the read model (e.g. orchestrator sessions).
 	DisplayName string
+
+	// IntakeClaim is an internal admission fence set only by tracker intake.
+	// The session store verifies its exact live owner token atomically with seed
+	// creation; ordinary CLI/API spawns leave it nil and follow the existing path.
+	IntakeClaim *TrackerIntakeClaim
 }

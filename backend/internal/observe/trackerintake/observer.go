@@ -5,11 +5,14 @@ package trackerintake
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/observe"
@@ -23,6 +26,10 @@ const (
 	// DefaultFailureBackoff suppresses repeated polls for a project after an
 	// intake failure. The observer retries automatically after this window.
 	DefaultFailureBackoff = 5 * time.Minute
+	// DefaultClaimLease bounds a claim that crashes before session creation.
+	// Once Spawn creates its durable seed row, claim acquisition reconciles that
+	// row and never retries the issue even if the daemon dies before completion.
+	DefaultClaimLease = 5 * time.Minute
 	// maxIntakePromptLen mirrors the session HTTP prompt limit. Intake uses the
 	// session service directly, so it must enforce the same boundary itself.
 	maxIntakePromptLen = 4096
@@ -31,10 +38,14 @@ const (
 	intakePromptFooter           = "\nImplement the requested change in this repository, run the relevant checks, and open or update a pull request when ready."
 )
 
-// Store is the durable read surface the observer needs.
+// Store is the durable discovery and atomic-claim surface the observer needs.
 type Store interface {
 	ListProjects(ctx context.Context) ([]domain.ProjectRecord, error)
-	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	TrackerIntakeHasCapacity(ctx context.Context, projectID domain.ProjectID, maxConcurrent int, now time.Time) (bool, error)
+	ClaimTrackerIntakeIssue(ctx context.Context, claim ports.TrackerIntakeClaim, maxConcurrent int) (ports.TrackerIntakeClaimResult, error)
+	RenewTrackerIntakeIssue(ctx context.Context, claim ports.TrackerIntakeClaim, now, leaseExpiresAt time.Time) (bool, error)
+	CompleteTrackerIntakeIssue(ctx context.Context, claim ports.TrackerIntakeClaim, sessionID domain.SessionID, completedAt time.Time) (bool, error)
+	ReleaseTrackerIntakeIssue(ctx context.Context, claim ports.TrackerIntakeClaim, releasedAt time.Time) (bool, error)
 }
 
 // Spawner is the session creation surface used by intake.
@@ -72,7 +83,9 @@ func (s SingleTrackerResolver) Resolve(provider domain.TrackerProvider) (ports.T
 type Config struct {
 	Tick           time.Duration
 	FailureBackoff time.Duration
+	ClaimLease     time.Duration
 	Clock          func() time.Time
+	Token          func() string
 	Logger         *slog.Logger
 }
 
@@ -83,22 +96,30 @@ type Observer struct {
 	spawner        Spawner
 	tick           time.Duration
 	failureBackoff time.Duration
+	claimLease     time.Duration
 	clock          func() time.Time
+	token          func() string
 	logger         *slog.Logger
 	backoffUntil   map[string]time.Time
 }
 
 // New constructs an Observer with safe defaults.
 func New(resolver TrackerResolver, store Store, spawner Spawner, cfg Config) *Observer {
-	o := &Observer{resolver: resolver, store: store, spawner: spawner, tick: cfg.Tick, failureBackoff: cfg.FailureBackoff, clock: cfg.Clock, logger: cfg.Logger, backoffUntil: map[string]time.Time{}}
+	o := &Observer{resolver: resolver, store: store, spawner: spawner, tick: cfg.Tick, failureBackoff: cfg.FailureBackoff, claimLease: cfg.ClaimLease, clock: cfg.Clock, token: cfg.Token, logger: cfg.Logger, backoffUntil: map[string]time.Time{}}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
 	if o.failureBackoff <= 0 {
 		o.failureBackoff = DefaultFailureBackoff
 	}
+	if o.claimLease <= 0 {
+		o.claimLease = DefaultClaimLease
+	}
 	if o.clock == nil {
 		o.clock = time.Now
+	}
+	if o.token == nil {
+		o.token = uuid.NewString
 	}
 	if o.logger == nil {
 		o.logger = slog.Default()
@@ -137,12 +158,6 @@ func (o *Observer) Poll(ctx context.Context) error {
 	if len(enabledProjects) == 0 {
 		return nil
 	}
-	sessions, err := o.store.ListAllSessions(ctx)
-	if err != nil {
-		return err
-	}
-	seen := seenIssueIDs(sessions)
-	activeWorkers := activeWorkerCounts(sessions)
 	for _, project := range enabledProjects {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -151,7 +166,11 @@ func (o *Observer) Poll(ctx context.Context) error {
 			o.logger.Debug("tracker intake: project in failure backoff", "project", project.ID, "until", until)
 			continue
 		}
-		if failed := o.pollProject(ctx, project, seen, activeWorkers[domain.ProjectID(project.ID)]); failed {
+		failed, err := o.pollProject(ctx, project)
+		if err != nil {
+			return err
+		}
+		if failed {
 			o.backoffUntil[project.ID] = now.Add(o.failureBackoff)
 		} else {
 			delete(o.backoffUntil, project.ID)
@@ -162,29 +181,33 @@ func (o *Observer) Poll(ctx context.Context) error {
 
 // pollProject returns failed=true for conditions that should be retried after a
 // backoff window rather than logged on every poll.
-func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord, seen map[domain.IssueID]bool, activeWorkers int) (failed bool) {
+func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord) (failed bool, retErr error) {
 	cfg := project.Config.TrackerIntake.WithDefaults()
 	if !cfg.Enabled {
-		return false
+		return false, nil
 	}
 	if err := cfg.Validate(); err != nil {
 		o.logger.Warn("tracker intake: skipping project with invalid config", "project", project.ID, "err", err)
-		return true
+		return true, nil
 	}
-	available := cfg.MaxConcurrent - activeWorkers
-	if available <= 0 {
-		o.logger.Debug("tracker intake: project at concurrency limit", "project", project.ID, "active", activeWorkers, "limit", cfg.MaxConcurrent)
-		return false
+	capacityNow := o.clock().UTC()
+	hasCapacity, err := o.store.TrackerIntakeHasCapacity(ctx, domain.ProjectID(project.ID), cfg.MaxConcurrent, capacityNow)
+	if err != nil {
+		return false, err
+	}
+	if !hasCapacity {
+		o.logger.Debug("tracker intake: project at concurrency limit", "project", project.ID, "limit", cfg.MaxConcurrent)
+		return false, nil
 	}
 	repo, ok := trackerRepo(project, cfg)
 	if !ok {
 		o.logger.Warn("tracker intake: skipping project without tracker scope", "project", project.ID, "provider", cfg.Provider, "origin", project.RepoOriginURL)
-		return true
+		return true, nil
 	}
 	tracker, err := o.resolver.Resolve(cfg.Provider)
 	if err != nil {
 		o.logger.Warn("tracker intake: no adapter for provider", "project", project.ID, "provider", cfg.Provider, "err", err)
-		return true
+		return true, nil
 	}
 	issues, err := tracker.List(ctx, repo, domain.ListFilter{
 		State:    domain.ListOpen,
@@ -192,16 +215,13 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 	})
 	if err != nil {
 		o.logger.Error("tracker intake: list issues failed", "project", project.ID, "repo", repo.Native, "err", err)
-		return true
+		//nolint:nilerr // Poll records provider failures through the failed/backoff aggregate.
+		return true, nil
 	}
 	var spawnFailed bool
-	spawned := 0
 	for _, issue := range issues {
-		if spawned >= available {
-			break
-		}
 		if ctx.Err() != nil {
-			return true
+			return true, ctx.Err()
 		}
 		if issue.State != domain.IssueOpen {
 			continue
@@ -210,33 +230,117 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 			continue
 		}
 		issueID := CanonicalIssueID(issue.ID)
-		if issueID == "" || seen[issueID] {
+		if issueID == "" {
 			continue
 		}
-		if _, err := o.spawner.Spawn(ctx, ports.SpawnConfig{
-			ProjectID: domain.ProjectID(project.ID),
-			IssueID:   issueID,
-			Kind:      domain.KindWorker,
-			Prompt:    BuildIssuePrompt(issue),
-		}); err != nil {
+		provider := issue.ID.Provider
+		if provider == "" {
+			provider = repo.Provider
+		}
+		nativeIssueID := normalizedTrackerNativeID(provider, issue.ID.Native)
+		claimNow := o.clock().UTC()
+		claim := ports.TrackerIntakeClaim{
+			ProjectID: domain.ProjectID(project.ID), Provider: provider, Repo: repo.Native,
+			IssueID: nativeIssueID, OwnerToken: o.token(),
+			ClaimedAt: claimNow, LeaseExpiresAt: claimNow.Add(o.claimLease),
+		}
+		claimResult, err := o.store.ClaimTrackerIntakeIssue(ctx, claim, cfg.MaxConcurrent)
+		if err != nil {
+			return false, err
+		}
+		switch claimResult {
+		case ports.TrackerIntakeClaimAlreadyProcessed, ports.TrackerIntakeClaimBusy:
+			continue
+		case ports.TrackerIntakeClaimCapacityReached:
+			return spawnFailed, nil
+		case ports.TrackerIntakeClaimAcquired:
+		default:
+			return false, fmt.Errorf("tracker intake: unknown claim result %d", claimResult)
+		}
+		spawnCtx, stopRenewal := o.maintainClaim(ctx, claim)
+		session, err := o.spawner.Spawn(spawnCtx, ports.SpawnConfig{
+			ProjectID:   domain.ProjectID(project.ID),
+			IssueID:     issueID,
+			Kind:        domain.KindWorker,
+			Prompt:      BuildIssuePrompt(issue),
+			IntakeClaim: &claim,
+		})
+		renewalErr := stopRenewal()
+		if renewalErr != nil && err == nil {
+			err = renewalErr
+		}
+		if err == nil {
+			finalNow := o.clock().UTC()
+			retained, finalErr := o.store.RenewTrackerIntakeIssue(ctx, claim, finalNow, finalNow.Add(o.claimLease))
+			if finalErr != nil {
+				err = finalErr
+			} else if !retained {
+				err = errors.New("tracker intake claim ownership lost before completion")
+			}
+		}
+		if err != nil {
 			o.logger.Error("tracker intake: spawn issue session failed", "project", project.ID, "issue", issueID, "err", err)
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+			_, releaseErr := o.store.ReleaseTrackerIntakeIssue(releaseCtx, claim, o.clock().UTC())
+			cancel()
+			if releaseErr != nil {
+				o.logger.Error("tracker intake: release failed spawn claim", "project", project.ID, "issue", issueID, "err", releaseErr)
+			}
 			spawnFailed = true
 			continue
 		}
-		seen[issueID] = true
-		spawned++
-	}
-	return spawnFailed
-}
-
-func activeWorkerCounts(sessions []domain.SessionRecord) map[domain.ProjectID]int {
-	counts := make(map[domain.ProjectID]int)
-	for _, sess := range sessions {
-		if sess.Kind == domain.KindWorker && !sess.IsTerminated {
-			counts[sess.ProjectID]++
+		completed, err := o.store.CompleteTrackerIntakeIssue(ctx, claim, session.ID, o.clock().UTC())
+		if err != nil || !completed {
+			o.logger.Error("tracker intake: complete issue claim failed", "project", project.ID, "issue", issueID, "completed", completed, "err", err)
+			spawnFailed = true
 		}
 	}
-	return counts
+	return spawnFailed, nil
+}
+
+// maintainClaim renews the pending lease while Spawn is live. Spawn creates a
+// durable session row before external workspace/runtime side effects; after
+// that row exists a concurrent poll may reconcile the claim to completed, which
+// RenewTrackerIntakeIssue deliberately also treats as retained ownership.
+func (o *Observer) maintainClaim(ctx context.Context, claim ports.TrackerIntakeClaim) (context.Context, func() error) {
+	spawnCtx, cancelSpawn := context.WithCancel(ctx)
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	interval := o.claimLease / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			case <-spawnCtx.Done():
+				done <- spawnCtx.Err()
+				return
+			case <-ticker.C:
+				now := o.clock().UTC()
+				retained, err := o.store.RenewTrackerIntakeIssue(spawnCtx, claim, now, now.Add(o.claimLease))
+				if err != nil || !retained {
+					if err == nil {
+						err = errors.New("tracker intake claim ownership lost during spawn")
+					}
+					cancelSpawn()
+					done <- err
+					return
+				}
+			}
+		}
+	}()
+	return spawnCtx, func() error {
+		close(stop)
+		err := <-done
+		cancelSpawn()
+		return err
+	}
 }
 
 func issueMatchesConfig(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool {
@@ -262,16 +366,6 @@ func containsFold(values []string, needle string) bool {
 	return false
 }
 
-func seenIssueIDs(sessions []domain.SessionRecord) map[domain.IssueID]bool {
-	seen := make(map[domain.IssueID]bool, len(sessions))
-	for _, sess := range sessions {
-		if sess.IssueID != "" {
-			seen[sess.IssueID] = true
-		}
-	}
-	return seen
-}
-
 // CanonicalIssueID stores tracker issue ids in sessions.issue_id with the
 // provider included, so future providers cannot collide on native ids.
 func CanonicalIssueID(id domain.TrackerID) domain.IssueID {
@@ -279,11 +373,24 @@ func CanonicalIssueID(id domain.TrackerID) domain.IssueID {
 	if provider == "" {
 		provider = domain.TrackerProviderGitHub
 	}
-	native := strings.TrimSpace(id.Native)
+	native := normalizedTrackerNativeID(provider, id.Native)
 	if native == "" {
 		return ""
 	}
 	return domain.IssueID(string(provider) + ":" + native)
+}
+
+// normalizedTrackerNativeID applies provider identity rules before either the
+// durable claim key or sessions.issue_id is written. GitHub owner/repository
+// names are case-insensitive, and its native issue id is owner/repo#number, so
+// lower-casing prevents configuration/API response casing drift from creating
+// a second intake lane for the same issue.
+func normalizedTrackerNativeID(provider domain.TrackerProvider, native string) string {
+	native = strings.TrimSpace(native)
+	if provider == domain.TrackerProviderGitHub {
+		return strings.ToLower(native)
+	}
+	return native
 }
 
 // BuildIssuePrompt turns normalized issue facts into the worker's initial task.
@@ -350,6 +457,9 @@ func trackerRepo(project domain.ProjectRecord, cfg domain.TrackerIntakeConfig) (
 	}
 	if native == "" {
 		return domain.TrackerRepo{}, false
+	}
+	if provider == domain.TrackerProviderGitHub {
+		native = strings.ToLower(native)
 	}
 	return domain.TrackerRepo{Provider: provider, Native: native}, true
 }

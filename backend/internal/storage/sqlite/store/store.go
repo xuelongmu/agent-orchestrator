@@ -67,6 +67,13 @@ func (s *Store) inTx(ctx context.Context, what string, fn func(*gen.Queries) err
 //
 // The caller must already hold writeMu.
 func (s *Store) inImmediateTx(ctx context.Context, what string, fn func(*gen.Queries) error) (retErr error) {
+	return s.inImmediateConnTx(ctx, what, func(_ *sql.Conn, q *gen.Queries) error { return fn(q) })
+}
+
+// inImmediateConnTx is inImmediateTx with access to the pinned connection for
+// the rare statement that sqlc cannot generate correctly (currently guarded
+// seed/change-log deletion). The caller must already hold writeMu.
+func (s *Store) inImmediateConnTx(ctx context.Context, what string, fn func(*sql.Conn, *gen.Queries) error) (retErr error) {
 	conn, err := s.writeDB.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("open %s connection: %w", what, err)
@@ -80,7 +87,7 @@ func (s *Store) inImmediateTx(ctx context.Context, what string, fn func(*gen.Que
 		return fmt.Errorf("begin %s: %w", what, err)
 	}
 	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
-	if err := fn(gen.New(conn)); err != nil {
+	if err := fn(conn, gen.New(conn)); err != nil {
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
