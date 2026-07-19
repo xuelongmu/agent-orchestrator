@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/testenv"
 )
 
 func TestWorkspaceIntegrationCreateRestoreDestroy(t *testing.T) {
@@ -192,11 +193,7 @@ func TestWorkspaceIntegrationCreateInRemotelessRepo(t *testing.T) {
 
 func requireGit(t *testing.T) string {
 	t.Helper()
-	git, err := exec.LookPath("git")
-	if err != nil {
-		t.Skip("git not found")
-	}
-	return git
+	return testenv.RequireExecutable(t, "git")
 }
 
 func setupOriginClone(t *testing.T, git, tmp string) string {

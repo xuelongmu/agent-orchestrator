@@ -1,0 +1,4 @@
+# Minimum aggregate Go statement coverage. Raise this value as coverage grows;
+# lowering it requires an explicit review of the lost signal.
+# Baseline: 72.3% on the hosted Ubuntu race run for this change.
+72.0

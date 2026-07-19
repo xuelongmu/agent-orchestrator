@@ -2,7 +2,6 @@ package tmux
 
 import (
 	"context"
-	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
@@ -10,15 +9,14 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/testenv"
 )
 
 func TestRuntimeIntegration(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the Windows runtime uses ConPTY; psmux is not tmux-compatible for this integration test")
 	}
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux unavailable")
-	}
+	testenv.RequireExecutable(t, "tmux")
 
 	ctx := context.Background()
 	id := strings.ReplaceAll(t.Name(), "/", "_")
@@ -88,9 +86,7 @@ func TestRuntimeIntegrationExactSessionParsing(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the Windows runtime uses ConPTY; psmux is not tmux-compatible for this integration test")
 	}
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux unavailable")
-	}
+	testenv.RequireExecutable(t, "tmux")
 
 	ctx := context.Background()
 	base := strings.ReplaceAll(t.Name(), "/", "_")

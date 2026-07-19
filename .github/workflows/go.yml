@@ -44,8 +44,35 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test -race ./...
+      # The current Go integration tests need only host-provided git and tmux,
+      # so every hosted Ubuntu run is a trusted context. Do not let a missing
+      # runner prerequisite turn this blocking check into a false-green skip.
+      - name: Test with trusted integrations and coverage
+        env:
+          AO_REQUIRE_INTEGRATION: "1"
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Enforce coverage ratchet
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t floors < <(sed -E 's/#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' coverage-baseline.txt | grep -v '^$')
+          if (( ${#floors[@]} != 1 )) || [[ ! ${floors[0]} =~ ^(100(\.0{1,2})?|[0-9]{1,2}(\.[0-9]{1,2})?)$ ]]; then
+            echo "::error::coverage-baseline.txt must contain exactly one percentage from 0 through 100"
+            exit 1
+          fi
+
+          floor=${floors[0]}
+          actual=$(go tool cover -func=coverage.out | awk '$1 == "total:" { gsub("%", "", $3); print $3 }')
+          if [[ -z $actual ]]; then
+            echo "::error::coverage.out did not contain a total statement percentage"
+            exit 1
+          fi
+          echo "Go statement coverage: ${actual}% (ratchet floor: ${floor}%)"
+          if ! awk -v actual="$actual" -v floor="$floor" 'BEGIN { exit !(actual + 0 >= floor + 0) }'; then
+            echo "::error::Go statement coverage fell below the ratchet floor"
+            exit 1
+          fi
 
   lint:
     runs-on: ubuntu-latest
