@@ -1,13 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -311,6 +312,7 @@ func TestExecuteImportDryRunJoinsRunAndSnapshotCleanupErrors(t *testing.T) {
 	if leakedSnapshot == "" {
 		t.Fatal("snapshot cleanup was not attempted")
 	}
+	assertPathWithin(t, cfg.dataDir, leakedSnapshot)
 }
 
 func storedAlphaProject() domain.ProjectRecord {
@@ -367,8 +369,10 @@ func captureDirectoryState(t *testing.T, root string) sourceDirectoryState {
 		if err != nil {
 			return err
 		}
-		entry := sourceEntryState{Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime()}
+		entry := sourceEntryState{Mode: info.Mode()}
 		if info.Mode().IsRegular() {
+			entry.Size = info.Size()
+			entry.ModTime = info.ModTime()
 			entry.Bytes, err = os.ReadFile(path)
 			if err != nil {
 				return err
@@ -386,7 +390,40 @@ func captureDirectoryState(t *testing.T, root string) sourceDirectoryState {
 func assertDirectoryStateUnchanged(t *testing.T, root string, before sourceDirectoryState) {
 	t.Helper()
 	after := captureDirectoryState(t, root)
-	if !reflect.DeepEqual(after, before) {
-		t.Fatalf("source directory changed during dry-run\nbefore: %#v\nafter:  %#v", before, after)
+	var differences []string
+	if before.Exists != after.Exists {
+		differences = append(differences, fmt.Sprintf("exists: %v -> %v", before.Exists, after.Exists))
+	}
+	for path, want := range before.Files {
+		got, ok := after.Files[path]
+		if !ok {
+			differences = append(differences, path+": removed")
+			continue
+		}
+		if want.Mode != got.Mode || want.Size != got.Size || !want.ModTime.Equal(got.ModTime) || !bytes.Equal(want.Bytes, got.Bytes) {
+			differences = append(differences, fmt.Sprintf(
+				"%s: mode %v/%v size %d/%d modtime %s/%s bytesEqual=%v",
+				path, want.Mode, got.Mode, want.Size, got.Size, want.ModTime, got.ModTime, bytes.Equal(want.Bytes, got.Bytes),
+			))
+		}
+	}
+	for path := range after.Files {
+		if _, ok := before.Files[path]; !ok {
+			differences = append(differences, path+": created")
+		}
+	}
+	if len(differences) > 0 {
+		t.Fatalf("source directory changed during dry-run:\n  %s", strings.Join(differences, "\n  "))
+	}
+}
+
+func assertPathWithin(t *testing.T, root, path string) {
+	t.Helper()
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		t.Fatalf("relate snapshot %q to data dir %q: %v", path, root, err)
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		t.Fatalf("snapshot %q is outside data dir %q", path, root)
 	}
 }

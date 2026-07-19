@@ -159,12 +159,28 @@ func (c *commandContext) openImportPlanningStore(dataDir string) (legacyimport.S
 	} else if err != nil {
 		return nil, nil, fmt.Errorf("inspect source database: %w", err)
 	}
+	dataDirInfo, err := os.Stat(dataDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("inspect source data directory: %w", err)
+	}
 
-	snapshotDir, err := os.MkdirTemp("", "ao-import-plan-")
+	// Keep even a crash-leaked snapshot inside AO's configured state boundary;
+	// MkdirTemp makes the directory private (0700) before any database bytes are
+	// copied into it. A missing source database returns above without creating
+	// dataDir or any snapshot directory.
+	snapshotDir, err := os.MkdirTemp(dataDir, ".ao-import-plan-")
 	if err != nil {
 		return nil, nil, fmt.Errorf("create private database snapshot directory: %w", err)
 	}
-	removeSnapshot := func() error { return c.deps.RemoveAll(snapshotDir) }
+	removeSnapshot := func() error {
+		if err := c.deps.RemoveAll(snapshotDir); err != nil {
+			return err
+		}
+		// Creating/removing the private child changes the parent timestamp on
+		// Windows and POSIX. Restore it so a completed dry run leaves the source
+		// directory inventory and stable metadata byte-for-byte unchanged.
+		return os.Chtimes(dataDir, dataDirInfo.ModTime(), dataDirInfo.ModTime())
+	}
 
 	for _, name := range []string{"ao.db", "ao.db-wal"} {
 		err := copyImportSnapshotFile(filepath.Join(dataDir, name), filepath.Join(snapshotDir, name))
