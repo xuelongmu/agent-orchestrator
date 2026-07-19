@@ -431,6 +431,15 @@ func TestMaterializeDoesNotClaimForeignGitignoreStagingPath(t *testing.T) {
 			},
 		},
 		{
+			name: "empty directory",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o750); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
 			name: "directory",
 			prepare: func(t *testing.T, path string) {
 				t.Helper()
@@ -452,20 +461,100 @@ func TestMaterializeDoesNotClaimForeignGitignoreStagingPath(t *testing.T) {
 			stage := filepath.Join(dir, ".git")
 			tc.prepare(t, stage)
 			foreignPath := filepath.Join(stage, "foreign")
-			if tc.name != "directory" {
+			if tc.name != "directory" && tc.name != "empty directory" {
 				foreignPath = stage
 			}
 			before, err := os.ReadFile(foreignPath)
-			if err != nil {
+			if tc.name == "empty directory" {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("empty foreign directory was not empty: %v", err)
+				}
+			} else if err != nil {
 				t.Fatal(err)
 			}
 			if err := Materialize(context.Background(), workspace, "canonical"); err == nil {
 				t.Fatal("foreign .ao/.git unexpectedly claimed as AO staging")
 			}
 			after, err := os.ReadFile(foreignPath)
-			if err != nil || string(after) != string(before) {
+			if tc.name == "empty directory" {
+				entries, readErr := os.ReadDir(stage)
+				if readErr != nil || len(entries) != 0 {
+					t.Fatalf("empty foreign final .ao/.git was mutated: %+v, %v", entries, readErr)
+				}
+			} else if err != nil || string(after) != string(before) {
 				t.Fatalf("foreign staging state changed: %q, %v", after, err)
 			}
+		})
+	}
+}
+
+func TestGitignoreBootstrapCrashRecoveryMatrix(t *testing.T) {
+	const stagedName = ".git-0123456789abcdef0123456789abcdef.stage"
+	for _, tc := range []struct {
+		name          string
+		prepare       func(*testing.T, string)
+		stageSurvives bool
+	}{
+		{
+			name: "crash after random container mkdir before authentication",
+			prepare: func(t *testing.T, aoDir string) {
+				t.Helper()
+				if err := os.Mkdir(filepath.Join(aoDir, stagedName), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			stageSurvives: true,
+		},
+		{
+			name: "crash after authenticated marker sync before no-replace rename",
+			prepare: func(t *testing.T, aoDir string) {
+				t.Helper()
+				stage := filepath.Join(aoDir, stagedName)
+				if err := os.Mkdir(stage, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(stage, gitignoreStageMarker), gitignoreStageMarkerContent(stagedName), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "crash after no-replace rename before payload creation",
+			prepare: func(t *testing.T, aoDir string) {
+				t.Helper()
+				final := filepath.Join(aoDir, gitignoreStageDirectory)
+				if err := os.Mkdir(final, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(final, gitignoreStageMarker), gitignoreStageMarkerContent(stagedName), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := initRepo(t)
+			aoDir := filepath.Join(workspace, directory)
+			if err := os.Mkdir(aoDir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			tc.prepare(t, aoDir)
+			if err := Materialize(context.Background(), workspace, "recovered complete contract"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(Path(workspace))
+			if err != nil || !strings.Contains(string(got), "recovered complete contract") {
+				t.Fatalf("recovered projection = %q, %v", got, err)
+			}
+			_, stageErr := os.Stat(filepath.Join(aoDir, stagedName))
+			if tc.stageSurvives {
+				if stageErr != nil {
+					t.Fatalf("unauthenticated foreign crash residue was mutated: %v", stageErr)
+				}
+			} else if !errors.Is(stageErr, os.ErrNotExist) {
+				t.Fatalf("authenticated crash stage was not consumed: %v", stageErr)
+			}
+			assertCleanGitStatus(t, workspace)
 		})
 	}
 }
@@ -772,7 +861,6 @@ func TestMaterializeProjectionFailuresAreCrashAtomicAndRecoverable(t *testing.T)
 		target     func(string) string
 		initialize func(*testing.T, string)
 		write      func(string, string, *projectionIO) error
-		refresh    bool
 		restart    func(string, string) error
 	}{
 		{
@@ -796,9 +884,8 @@ func TestMaterializeProjectionFailuresAreCrashAtomicAndRecoverable(t *testing.T)
 			restart: func(workspace, contract string) error { return Materialize(context.Background(), workspace, contract) },
 		},
 		{
-			name:    "refresh current projection",
-			refresh: true,
-			target:  func(string) string { return filepath.ToSlash(filepath.Join(directory, filename)) },
+			name:   "refresh current projection",
+			target: func(string) string { return filepath.ToSlash(filepath.Join(directory, filename)) },
 			initialize: func(t *testing.T, workspace string) {
 				t.Helper()
 				if err := Materialize(context.Background(), workspace, "previous complete contract"); err != nil {
@@ -825,9 +912,8 @@ func TestMaterializeProjectionFailuresAreCrashAtomicAndRecoverable(t *testing.T)
 			},
 		},
 		{
-			name:    "refresh keyed per-PR projection",
-			refresh: true,
-			target:  func(string) string { return testKeyedProjectionRelative(prURL) },
+			name:   "refresh keyed per-PR projection",
+			target: func(string) string { return testKeyedProjectionRelative(prURL) },
 			initialize: func(t *testing.T, workspace string) {
 				t.Helper()
 				if err := MaterializePR(context.Background(), workspace, prURL, "previous complete contract"); err != nil {
@@ -871,13 +957,6 @@ func TestMaterializeProjectionFailuresAreCrashAtomicAndRecoverable(t *testing.T)
 				assertCleanGitStatus(t, workspace)
 
 				restartErr := tc.restart(workspace, contract)
-				if tc.refresh && runtime.GOOS != "windows" {
-					if restartErr == nil {
-						t.Fatal("refresh unexpectedly succeeded without an identity-conditional platform primitive")
-					}
-					assertCleanGitStatus(t, workspace)
-					return
-				}
 				if restartErr != nil {
 					t.Fatalf("restart recovery: %v", restartErr)
 				}
@@ -917,7 +996,7 @@ func TestProjectionReplaceBoundaryRevalidatesTargetIdentity(t *testing.T) {
 		}
 		return os.WriteFile(targetPath, foreign, 0o600)
 	}
-	err := materializeWithFailureHook(context.Background(), workspace, "Session draft (no PR identity yet)", "", "replacement contract", hook)
+	err := materializeWithFailureHook(context.Background(), workspace, "", "replacement contract", hook)
 	if err == nil {
 		t.Fatal("foreign replace-boundary swap unexpectedly allowed refresh")
 	}
@@ -952,7 +1031,7 @@ func TestFreshProjectionPublishIsBoundToValidatedStageHandle(t *testing.T) {
 		}
 		return os.WriteFile(stage, foreign, 0o600)
 	}
-	err := materializeWithFailureHook(context.Background(), workspace, "Session draft (no PR identity yet)", "", "complete canonical", hook)
+	err := materializeWithFailureHook(context.Background(), workspace, "", "complete canonical", hook)
 	if !hookRan {
 		t.Fatal("post-validation publish seam was not reached")
 	}
@@ -1009,7 +1088,7 @@ func TestGitignoreBootstrapPublishIsBoundToValidatedStageHandle(t *testing.T) {
 		}
 		return errors.New("bootstrap payload not found")
 	}
-	err := materializeWithFailureHook(context.Background(), workspace, "Session draft (no PR identity yet)", "", "canonical", hook)
+	err := materializeWithFailureHook(context.Background(), workspace, "", "canonical", hook)
 	if !hookRan {
 		t.Fatal("bootstrap publish seam was not reached")
 	}
@@ -1022,8 +1101,8 @@ func TestGitignoreBootstrapPublishIsBoundToValidatedStageHandle(t *testing.T) {
 		}
 		return
 	}
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("post-validation foreign entry unexpectedly allowed the full materialization")
 	}
 	got, readErr := os.ReadFile(filepath.Join(workspace, directory, ".gitignore"))
 	if readErr != nil || string(got) != projectionGitignoreContent() {
@@ -1046,7 +1125,7 @@ func TestFreshProjectionPublishNeverReplacesAppearingTarget(t *testing.T) {
 		}
 		return nil
 	}
-	if err := materializeWithFailureHook(context.Background(), workspace, "Session draft (no PR identity yet)", "", "canonical", hook); err == nil {
+	if err := materializeWithFailureHook(context.Background(), workspace, "", "canonical", hook); err == nil {
 		t.Fatal("appearing foreign target unexpectedly replaced")
 	}
 	got, err := os.ReadFile(Path(workspace))
@@ -1074,19 +1153,20 @@ func TestRefreshPublishLocksExactTargetOrFailsClosed(t *testing.T) {
 		hookRan = true
 		return os.Rename(Path(workspace), filepath.Join(workspace, directory, "swapped-target"))
 	}
-	err := materializeWithFailureHook(context.Background(), workspace, "Session draft (no PR identity yet)", "", "replacement", hook)
+	err := materializeWithFailureHook(context.Background(), workspace, "", "replacement", hook)
 	if err == nil {
 		t.Fatal("refresh swap unexpectedly succeeded")
 	}
-	if runtime.GOOS == "windows" && !hookRan {
-		t.Fatal("Windows conditional refresh did not reach the locked publish seam")
+	if !hookRan {
+		t.Fatal("conditional refresh did not reach the final publish seam")
 	}
-	if runtime.GOOS != "windows" && hookRan {
-		t.Fatal("unsupported POSIX refresh reached a pathname publish seam")
+	oldPath := Path(workspace)
+	if runtime.GOOS != "windows" {
+		oldPath = filepath.Join(workspace, directory, "swapped-target")
 	}
-	got, readErr := os.ReadFile(Path(workspace))
+	got, readErr := os.ReadFile(oldPath)
 	if readErr != nil || !strings.Contains(string(got), "previous complete contract") {
-		t.Fatalf("fail-closed target changed: %q, %v", got, readErr)
+		t.Fatalf("validated old target changed: %q, %v", got, readErr)
 	}
 	got, readErr = os.ReadFile(foreignSource)
 	if readErr != nil || string(got) != string(foreign) {
@@ -1253,17 +1333,11 @@ func TestMaterializePRKeepsCollisionSafeSiblingSetAndCurrentScope(t *testing.T) 
 		t.Fatal(err)
 	}
 	secondErr := MaterializePR(context.Background(), workspace, prB, "invariant-B")
-	if runtime.GOOS == "windows" && secondErr != nil {
+	if secondErr != nil {
 		t.Fatal(secondErr)
-	}
-	if runtime.GOOS != "windows" && (secondErr == nil || !strings.Contains(secondErr.Error(), "refresh is unavailable")) {
-		t.Fatalf("second scoped projection did not fail closed: %v", secondErr)
 	}
 	current, err := os.ReadFile(Path(workspace))
 	wantCurrent, rejectCurrent := prB, "invariant-A"
-	if runtime.GOOS != "windows" {
-		wantCurrent, rejectCurrent = prA, "invariant-B"
-	}
 	if err != nil || !strings.Contains(string(current), "Scope: Pull request: "+wantCurrent) || strings.Contains(string(current), rejectCurrent) {
 		t.Fatalf("current projection = %q, %v", current, err)
 	}

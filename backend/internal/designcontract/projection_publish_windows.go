@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -15,17 +14,17 @@ import (
 var windowsProjectionAPI = struct {
 	createFile                 func(*uint16, uint32, uint32, *windows.SecurityAttributes, uint32, uint32, windows.Handle) (windows.Handle, error)
 	setFileInformationByHandle func(windows.Handle, uint32, *byte, uint32) error
-	ntSetInformationFile       func(windows.Handle, *windows.IO_STATUS_BLOCK, *byte, uint32, uint32) error
+	moveFileEx                 func(*uint16, *uint16, uint32) error
 	flushFileBuffers           func(windows.Handle) error
 }{
 	createFile:                 windows.CreateFile,
 	setFileInformationByHandle: windows.SetFileInformationByHandle,
-	ntSetInformationFile:       windows.NtSetInformationFile,
+	moveFileEx:                 windows.MoveFileEx,
 	flushFileBuffers:           windows.FlushFileBuffers,
 }
 
 func publishProjectionFile(sourceRoot, targetRoot *os.Root, _ *os.File, stageIdentity os.FileInfo, stageName, targetName string, targetIdentity os.FileInfo, beforePublish func() error) error {
-	stage, stageHandle, err := openLockedWindowsProjectionFile(sourceRoot, stageName, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.DELETE, stageIdentity)
+	stage, _, err := openLockedWindowsProjectionFile(sourceRoot, stageName, windows.GENERIC_READ, stageIdentity)
 	if err != nil {
 		return fmt.Errorf("lock design contract staging inode: %w", err)
 	}
@@ -45,8 +44,7 @@ func publishProjectionFile(sourceRoot, targetRoot *os.Root, _ *os.File, stageIde
 
 	var target *os.File
 	if targetIdentity != nil {
-		var targetHandle windows.Handle
-		target, targetHandle, err = openLockedWindowsProjectionFile(targetRoot, targetName, windows.GENERIC_READ|windows.DELETE, targetIdentity)
+		target, _, err = openLockedWindowsProjectionFile(targetRoot, targetName, windows.GENERIC_READ, targetIdentity)
 		if err != nil {
 			return fmt.Errorf("lock exact design contract target inode: %w", err)
 		}
@@ -60,12 +58,8 @@ func publishProjectionFile(sourceRoot, targetRoot *os.Root, _ *os.File, stageIde
 		if err := beforePublish(); err != nil {
 			return err
 		}
-		deleteOnClose := byte(1)
-		if err := windowsProjectionAPI.setFileInformationByHandle(targetHandle, windows.FileDispositionInfo, &deleteOnClose, 1); err != nil {
-			return fmt.Errorf("mark exact design contract target for deletion: %w", err)
-		}
 		if err := target.Close(); err != nil {
-			return fmt.Errorf("remove exact design contract target inode: %w", err)
+			return fmt.Errorf("close exact design contract target lock: %w", err)
 		}
 	} else {
 		if _, err := targetRoot.Lstat(targetName); !errors.Is(err, os.ErrNotExist) {
@@ -75,17 +69,73 @@ func publishProjectionFile(sourceRoot, targetRoot *os.Root, _ *os.File, stageIde
 			return err
 		}
 	}
-
-	if err := renameWindowsHandle(stageHandle, directoryHandle, targetName); err != nil {
-		return fmt.Errorf("handle-relative no-replace design contract publish: %w", err)
+	if err := stage.Close(); err != nil {
+		return fmt.Errorf("close exact design contract staging lock: %w", err)
 	}
-	if err := windowsProjectionAPI.flushFileBuffers(stageHandle); err != nil {
-		return fmt.Errorf("flush published design contract inode: %w", err)
+	sourcePath, err := windows.UTF16PtrFromString(filepath.Join(sourceRoot.Name(), filepath.FromSlash(stageName)))
+	if err != nil {
+		return err
+	}
+	targetPath, err := windows.UTF16PtrFromString(filepath.Join(targetRoot.Name(), filepath.FromSlash(targetName)))
+	if err != nil {
+		return err
+	}
+	flags := uint32(windows.MOVEFILE_WRITE_THROUGH)
+	if targetIdentity != nil {
+		flags |= windows.MOVEFILE_REPLACE_EXISTING
+	}
+	// MoveFileExW performs the only namespace mutation. With replacement it is
+	// an atomic old-or-new transition; the old target is never deleted first.
+	if err := windowsProjectionAPI.moveFileEx(sourcePath, targetPath, flags); err != nil {
+		return fmt.Errorf("atomic Windows design contract publish: %w", err)
 	}
 	if err := windowsProjectionAPI.flushFileBuffers(directoryHandle); err != nil {
 		return fmt.Errorf("flush published design contract directory entry: %w", err)
 	}
 	return nil
+}
+
+func publishProjectionDirectory(root *os.Root, stageName, targetName string, stageIdentity os.FileInfo) error {
+	stagePath := filepath.Join(root.Name(), filepath.FromSlash(stageName))
+	path, err := windows.UTF16PtrFromString(stagePath)
+	if err != nil {
+		return err
+	}
+	handle, err := windowsProjectionAPI.createFile(path, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return err
+	}
+	stage := os.NewFile(uintptr(handle), stagePath)
+	info, statErr := stage.Stat()
+	if statErr != nil || !info.IsDir() || !os.SameFile(info, stageIdentity) {
+		_ = stage.Close()
+		return errors.New("opened Windows staging directory does not match validated identity")
+	}
+	if current, err := root.Lstat(stageName); err != nil || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, info) {
+		_ = stage.Close()
+		return errors.New("Windows staging directory changed before no-replace publish")
+	}
+	directory, directoryHandle, err := openDurableWindowsDirectory(root)
+	if err != nil {
+		_ = stage.Close()
+		return err
+	}
+	defer func() { _ = directory.Close() }()
+	if err := windowsProjectionAPI.flushFileBuffers(directoryHandle); err != nil {
+		_ = stage.Close()
+		return err
+	}
+	if err := stage.Close(); err != nil {
+		return err
+	}
+	targetPath, err := windows.UTF16PtrFromString(filepath.Join(root.Name(), filepath.FromSlash(targetName)))
+	if err != nil {
+		return err
+	}
+	if err := windowsProjectionAPI.moveFileEx(path, targetPath, windows.MOVEFILE_WRITE_THROUGH); err != nil {
+		return err
+	}
+	return windowsProjectionAPI.flushFileBuffers(directoryHandle)
 }
 
 func openLockedWindowsProjectionFile(root *os.Root, name string, access uint32, expected os.FileInfo) (*os.File, windows.Handle, error) {
@@ -132,27 +182,4 @@ func openDurableWindowsDirectory(root *os.Root) (*os.File, windows.Handle, error
 		return nil, 0, errors.New("durable Windows directory handle does not match verified projection root")
 	}
 	return file, handle, nil
-}
-
-func renameWindowsHandle(source, targetDirectory windows.Handle, targetName string) error {
-	name, err := windows.UTF16FromString(targetName)
-	if err != nil {
-		return err
-	}
-	name = name[:len(name)-1]
-	type header struct {
-		ReplaceIfExists uint32
-		RootDirectory   windows.Handle
-		FileNameLength  uint32
-		FileName        uint16
-	}
-	offset := unsafe.Offsetof(header{}.FileName)
-	buffer := make([]byte, int(offset)+len(name)*2)
-	info := (*header)(unsafe.Pointer(&buffer[0]))
-	info.ReplaceIfExists = 0
-	info.RootDirectory = targetDirectory
-	info.FileNameLength = uint32(len(name) * 2)
-	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buffer[offset])), len(name)), name)
-	var status windows.IO_STATUS_BLOCK
-	return windowsProjectionAPI.ntSetInformationFile(source, &status, &buffer[0], uint32(len(buffer)), windows.FileRenameInformation)
 }

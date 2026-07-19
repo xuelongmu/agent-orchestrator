@@ -27,6 +27,32 @@ func TestDarwinCloneFailureLeavesFreshFinalAbsentAndStageRecoverable(t *testing.
 	}
 }
 
+func TestDarwinRefreshRenameFailurePreservesOldCompleteTarget(t *testing.T) {
+	root, stage, stageInfo := posixPublishFixture(t)
+	if err := root.WriteFile("target.md", []byte("previous complete bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	targetInfo, err := root.Lstat("target.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := darwinProjectionRenameat
+	darwinProjectionRenameat = func(int, string, int, string) error { return errors.New("injected renameat") }
+	t.Cleanup(func() { darwinProjectionRenameat = original })
+
+	if err := publishProjectionFile(root, root, stage, stageInfo, "stage.tmp", "target.md", targetInfo, func() error { return nil }); err == nil {
+		t.Fatal("renameat failure was not reported")
+	}
+	got, err := root.ReadFile("target.md")
+	if err != nil || string(got) != "previous complete bytes" {
+		t.Fatalf("old target changed: %q, %v", got, err)
+	}
+	got, err = root.ReadFile("stage.tmp")
+	if err != nil || string(got) != "complete staged bytes" {
+		t.Fatalf("staged new target changed: %q, %v", got, err)
+	}
+}
+
 func posixPublishFixture(t *testing.T) (*os.Root, *os.File, os.FileInfo) {
 	t.Helper()
 	dir := t.TempDir()

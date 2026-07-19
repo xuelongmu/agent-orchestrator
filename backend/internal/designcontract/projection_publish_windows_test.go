@@ -29,14 +29,14 @@ func TestWindowsPublishFailsBeforeMutationWithoutDirectoryDurability(t *testing.
 	}
 }
 
-func TestWindowsPublishReportsPostRenameFlushFailureWithCompleteFinal(t *testing.T) {
+func TestWindowsPublishReportsPostMoveDirectoryFlushFailureWithCompleteFinal(t *testing.T) {
 	root, stage, stageInfo := windowsPublishFixture(t, false)
 	original := windowsProjectionAPI.flushFileBuffers
 	calls := 0
 	windowsProjectionAPI.flushFileBuffers = func(handle windows.Handle) error {
 		calls++
 		if calls == 2 {
-			return errors.New("injected published-file flush")
+			return errors.New("injected published-directory flush")
 		}
 		return original(handle)
 	}
@@ -52,13 +52,13 @@ func TestWindowsPublishReportsPostRenameFlushFailureWithCompleteFinal(t *testing
 	}
 }
 
-func TestWindowsPublishSurfacesHandleRenameFailureWithoutTarget(t *testing.T) {
+func TestWindowsPublishSurfacesMoveFailureWithoutTarget(t *testing.T) {
 	root, stage, stageInfo := windowsPublishFixture(t, false)
-	original := windowsProjectionAPI.ntSetInformationFile
-	windowsProjectionAPI.ntSetInformationFile = func(windows.Handle, *windows.IO_STATUS_BLOCK, *byte, uint32, uint32) error {
-		return errors.New("injected handle rename")
+	original := windowsProjectionAPI.moveFileEx
+	windowsProjectionAPI.moveFileEx = func(*uint16, *uint16, uint32) error {
+		return errors.New("injected MoveFileExW")
 	}
-	t.Cleanup(func() { windowsProjectionAPI.ntSetInformationFile = original })
+	t.Cleanup(func() { windowsProjectionAPI.moveFileEx = original })
 
 	if err := publishProjectionFile(root, root, stage, stageInfo, "stage.tmp", "target.md", nil, func() error { return nil }); err == nil {
 		t.Fatal("handle rename failure was not reported")
@@ -71,17 +71,17 @@ func TestWindowsPublishSurfacesHandleRenameFailureWithoutTarget(t *testing.T) {
 	}
 }
 
-func TestWindowsRefreshDispositionFailurePreservesOldTarget(t *testing.T) {
+func TestWindowsRefreshMoveFailurePreservesOldTarget(t *testing.T) {
 	root, stage, stageInfo := windowsPublishFixture(t, true)
 	targetInfo, err := root.Lstat("target.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	original := windowsProjectionAPI.setFileInformationByHandle
-	windowsProjectionAPI.setFileInformationByHandle = func(windows.Handle, uint32, *byte, uint32) error {
-		return errors.New("injected exact-target disposition")
+	original := windowsProjectionAPI.moveFileEx
+	windowsProjectionAPI.moveFileEx = func(*uint16, *uint16, uint32) error {
+		return errors.New("injected replacement MoveFileExW")
 	}
-	t.Cleanup(func() { windowsProjectionAPI.setFileInformationByHandle = original })
+	t.Cleanup(func() { windowsProjectionAPI.moveFileEx = original })
 
 	if err := publishProjectionFile(root, root, stage, stageInfo, "stage.tmp", "target.md", targetInfo, func() error { return nil }); err == nil {
 		t.Fatal("target disposition failure was not reported")
@@ -92,45 +92,49 @@ func TestWindowsRefreshDispositionFailurePreservesOldTarget(t *testing.T) {
 	}
 }
 
-func TestWindowsRefreshRenameFailureLeavesNoPartialFinal(t *testing.T) {
+func TestWindowsRefreshFailureMatrixLeavesOldOrNewComplete(t *testing.T) {
 	root, stage, stageInfo := windowsPublishFixture(t, true)
 	targetInfo, err := root.Lstat("target.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	original := windowsProjectionAPI.ntSetInformationFile
-	windowsProjectionAPI.ntSetInformationFile = func(windows.Handle, *windows.IO_STATUS_BLOCK, *byte, uint32, uint32) error {
-		return errors.New("injected refresh handle rename")
+	original := windowsProjectionAPI.moveFileEx
+	windowsProjectionAPI.moveFileEx = func(*uint16, *uint16, uint32) error {
+		return errors.New("injected refresh MoveFileExW")
 	}
-	t.Cleanup(func() { windowsProjectionAPI.ntSetInformationFile = original })
+	t.Cleanup(func() { windowsProjectionAPI.moveFileEx = original })
 
 	if err := publishProjectionFile(root, root, stage, stageInfo, "stage.tmp", "target.md", targetInfo, func() error { return nil }); err == nil {
 		t.Fatal("refresh handle rename failure was not reported")
 	}
-	if _, err := root.Lstat("target.md"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("failed refresh left a partial final: %v", err)
+	got, err := root.ReadFile("target.md")
+	if err != nil || string(got) != "previous complete bytes" {
+		t.Fatalf("failed refresh did not preserve old complete target: %q, %v", got, err)
 	}
-	got, err := root.ReadFile("stage.tmp")
+	got, err = root.ReadFile("stage.tmp")
 	if err != nil || string(got) != "complete staged bytes" {
 		t.Fatalf("failed refresh changed recoverable stage: %q, %v", got, err)
 	}
 }
 
-func TestWindowsRefreshNoReplacePreservesTargetAppearingAtRenameSyscall(t *testing.T) {
+func TestWindowsRefreshInjectedTargetSwapPreservesForeignWhenMoveFails(t *testing.T) {
 	root, stage, stageInfo := windowsPublishFixture(t, true)
 	targetInfo, err := root.Lstat("target.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	foreign := []byte("foreign target appearing after exact target deletion")
-	original := windowsProjectionAPI.ntSetInformationFile
-	windowsProjectionAPI.ntSetInformationFile = func(source windows.Handle, status *windows.IO_STATUS_BLOCK, info *byte, size, class uint32) error {
+	foreign := []byte("foreign target appearing at MoveFileExW boundary")
+	original := windowsProjectionAPI.moveFileEx
+	windowsProjectionAPI.moveFileEx = func(_, _ *uint16, _ uint32) error {
+		if err := os.Rename(filepath.Join(root.Name(), "target.md"), filepath.Join(root.Name(), "validated-old.md")); err != nil {
+			return err
+		}
 		if err := root.WriteFile("target.md", foreign, 0o600); err != nil {
 			return err
 		}
-		return original(source, status, info, size, class)
+		return errors.New("injected target swap")
 	}
-	t.Cleanup(func() { windowsProjectionAPI.ntSetInformationFile = original })
+	t.Cleanup(func() { windowsProjectionAPI.moveFileEx = original })
 
 	if err := publishProjectionFile(root, root, stage, stageInfo, "stage.tmp", "target.md", targetInfo, func() error { return nil }); err == nil {
 		t.Fatal("appearing target unexpectedly replaced at handle-rename syscall")
@@ -139,6 +143,73 @@ func TestWindowsRefreshNoReplacePreservesTargetAppearingAtRenameSyscall(t *testi
 	if err != nil || string(got) != string(foreign) {
 		t.Fatalf("appearing foreign target changed: %q, %v", got, err)
 	}
+}
+
+func TestWindowsRefreshUsesOneWriteThroughReplacingMove(t *testing.T) {
+	root, stage, stageInfo := windowsPublishFixture(t, true)
+	targetInfo, err := root.Lstat("target.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := windowsProjectionAPI.moveFileEx
+	calls := 0
+	windowsProjectionAPI.moveFileEx = func(from, to *uint16, flags uint32) error {
+		calls++
+		want := uint32(windows.MOVEFILE_REPLACE_EXISTING | windows.MOVEFILE_WRITE_THROUGH)
+		if flags != want {
+			t.Fatalf("MoveFileExW flags = %#x, want %#x", flags, want)
+		}
+		return original(from, to, flags)
+	}
+	t.Cleanup(func() { windowsProjectionAPI.moveFileEx = original })
+
+	if err := publishProjectionFile(root, root, stage, stageInfo, "stage.tmp", "target.md", targetInfo, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("MoveFileExW calls = %d, want 1", calls)
+	}
+	got, err := root.ReadFile("target.md")
+	if err != nil || string(got) != "complete staged bytes" {
+		t.Fatalf("replacement target = %q, %v", got, err)
+	}
+}
+
+func TestWindowsNestedRootNameIsCumulativeAndUsable(t *testing.T) {
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, ".ao", ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, ".ao", ".git", "stage.tmp"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	aoRoot, err := root.OpenRoot(".ao")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = aoRoot.Close() }()
+	stageRoot, err := aoRoot.OpenRoot(".git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stageRoot.Close() }()
+	if got, want := stageRoot.Name(), filepath.Join(base, ".ao", ".git"); got != want {
+		t.Fatalf("nested Root.Name() = %q, want cumulative %q", got, want)
+	}
+	info, err := stageRoot.Lstat("stage.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, _, err := openLockedWindowsProjectionFile(stageRoot, "stage.tmp", windows.GENERIC_READ, info)
+	if err != nil {
+		t.Fatalf("open through nested Root.Name(): %v", err)
+	}
+	_ = file.Close()
 }
 
 func TestWindowsCleanupDeletesOnlyLockedOwnedStage(t *testing.T) {

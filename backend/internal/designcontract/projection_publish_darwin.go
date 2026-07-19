@@ -11,10 +11,37 @@ import (
 )
 
 var darwinProjectionClonefileat = unix.Fclonefileat
+var darwinProjectionRenameat = unix.Renameat
+var darwinProjectionRenameatxNp = unix.RenameatxNp
 
 func publishProjectionFile(sourceRoot, targetRoot *os.Root, stageFile *os.File, stageIdentity os.FileInfo, stageName, targetName string, targetIdentity os.FileInfo, beforePublish func() error) error {
 	if targetIdentity != nil {
-		return errors.New("atomic design contract projection refresh is unavailable on macOS; canonical SQLite state remains available")
+		sourceDir, err := sourceRoot.Open(".")
+		if err != nil {
+			return fmt.Errorf("open projection staging directory: %w", err)
+		}
+		defer func() { _ = sourceDir.Close() }()
+		targetDir, err := targetRoot.Open(".")
+		if err != nil {
+			return fmt.Errorf("open projection target directory: %w", err)
+		}
+		defer func() { _ = targetDir.Close() }()
+		if err := beforePublish(); err != nil {
+			return err
+		}
+		if err := ensureOpenedFileStillBound(sourceRoot, stageName, stageIdentity); err != nil {
+			return fmt.Errorf("final staging identity validation: %w", err)
+		}
+		if err := ensureOpenedFileStillBound(targetRoot, targetName, targetIdentity); err != nil {
+			return fmt.Errorf("final target identity validation: %w", err)
+		}
+		if err := darwinProjectionRenameat(int(sourceDir.Fd()), stageName, int(targetDir.Fd()), targetName); err != nil {
+			return fmt.Errorf("atomic design contract projection refresh: %w", err)
+		}
+		if err := stageFile.Sync(); err != nil {
+			return fmt.Errorf("sync refreshed design contract projection: %w", err)
+		}
+		return targetDir.Sync()
 	}
 	if err := ensureOpenedFileStillBound(sourceRoot, stageName, stageIdentity); err != nil {
 		return err
@@ -36,4 +63,20 @@ func publishProjectionFile(sourceRoot, targetRoot *os.Root, stageFile *os.File, 
 		return fmt.Errorf("handle-clone fresh design contract projection: %w", err)
 	}
 	return syncProjectionDirectory(targetRoot, targetName)
+}
+
+func publishProjectionDirectory(root *os.Root, stageName, targetName string, stageIdentity os.FileInfo) error {
+	dir, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+	current, err := root.Lstat(stageName)
+	if err != nil || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, stageIdentity) {
+		return errors.New("gitignore staging directory changed before no-replace publish")
+	}
+	if err := darwinProjectionRenameatxNp(int(dir.Fd()), stageName, int(dir.Fd()), targetName, unix.RENAME_EXCL); err != nil {
+		return err
+	}
+	return dir.Sync()
 }
