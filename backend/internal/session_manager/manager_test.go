@@ -1831,6 +1831,60 @@ func TestSpawn_DefaultsBranchFromSessionID(t *testing.T) {
 	}
 }
 
+func TestSpawn_BranchlessWorkspaceKindsSkipBranchDerivation(t *testing.T) {
+	for _, kind := range []domain.WorkspaceKind{domain.WorkspaceKindScratch, domain.WorkspaceKindDir} {
+		t.Run(string(kind), func(t *testing.T) {
+			m, st, _, ws := newManager()
+			s, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, WorkspaceKind: kind})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ws.lastCfg.Branch != "" {
+				t.Fatalf("workspace branch = %q, want empty", ws.lastCfg.Branch)
+			}
+			if ws.lastCfg.WorkspaceKind != kind {
+				t.Fatalf("workspace kind = %q, want %q", ws.lastCfg.WorkspaceKind, kind)
+			}
+			meta := st.sessions[s.ID].Metadata
+			if meta.Branch != "" || meta.WorkspaceKind != kind {
+				t.Fatalf("metadata = %#v, want branchless %s", meta, kind)
+			}
+		})
+	}
+}
+
+func TestSpawn_RejectsInvalidWorkspaceSelection(t *testing.T) {
+	for _, cfg := range []ports.SpawnConfig{
+		{ProjectID: "mer", Kind: domain.KindWorker, WorkspaceKind: "clone"},
+		{ProjectID: "mer", Kind: domain.KindWorker, WorkspaceKind: domain.WorkspaceKindScratch, Branch: "feat/not-applicable"},
+	} {
+		m, _, _, _ := newManager()
+		if _, err := m.Spawn(ctx, cfg); !errors.Is(err, ErrWorkspaceKindInvalid) {
+			t.Fatalf("Spawn(%#v) error = %v, want ErrWorkspaceKindInvalid", cfg, err)
+		}
+	}
+}
+
+func TestSpawn_ProjectWorkspaceKindIsDefaultAndRequestCanOverride(t *testing.T) {
+	m, st, _, ws := newManager()
+	project := st.projects["mer"]
+	project.Config.WorkspaceKind = domain.WorkspaceKindScratch
+	st.projects["mer"] = project
+
+	if _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker}); err != nil {
+		t.Fatal(err)
+	}
+	if ws.lastCfg.WorkspaceKind != domain.WorkspaceKindScratch || ws.lastCfg.Branch != "" {
+		t.Fatalf("project default workspace config = %#v", ws.lastCfg)
+	}
+	if _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, WorkspaceKind: domain.WorkspaceKindWorktree}); err != nil {
+		t.Fatal(err)
+	}
+	if ws.lastCfg.WorkspaceKind != domain.WorkspaceKindWorktree || ws.lastCfg.Branch == "" {
+		t.Fatalf("request override workspace config = %#v", ws.lastCfg)
+	}
+}
+
 func TestSpawn_ForwardsResolvedAgentConfigPermissions(t *testing.T) {
 	st := newFakeStore()
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{
@@ -4411,6 +4465,35 @@ func TestReconcileLive_AliveSessionAdoptedNoop(t *testing.T) {
 	}
 	if ws.stashCalls != 0 || lcm.terminated["s2"] != 0 || rt.destroyed != 0 {
 		t.Fatalf("adopt should be a no-op: stash=%d term=%d destroy=%d", ws.stashCalls, lcm.terminated["s2"], rt.destroyed)
+	}
+}
+
+func TestReconcileLive_DeadBranchlessSessionRestartsInPlace(t *testing.T) {
+	m, st, rt, ws := newManager()
+	rt.aliveByHandle = map[string]bool{}
+	rec := domain.SessionRecord{
+		ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		Activity: domain.Activity{State: domain.ActivityActive},
+		Metadata: domain.SessionMetadata{
+			WorkspaceKind:   domain.WorkspaceKindScratch,
+			WorkspacePath:   "/ws/mer-1",
+			RuntimeHandleID: "dead",
+			Prompt:          "continue research",
+		},
+	}
+	st.sessions[rec.ID] = rec
+	if err := m.reconcileLive(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions[rec.ID]
+	if got.IsTerminated || got.Metadata.WorkspaceKind != domain.WorkspaceKindScratch || got.Metadata.Branch != "" {
+		t.Fatalf("reconciled record = %#v", got)
+	}
+	if rt.created != 1 {
+		t.Fatalf("runtime create calls = %d, want 1", rt.created)
+	}
+	if ws.stashCalls != 0 || len(st.worktrees[rec.ID]) != 0 {
+		t.Fatalf("branchless reconcile used git preservation: stash=%d rows=%#v", ws.stashCalls, st.worktrees[rec.ID])
 	}
 }
 

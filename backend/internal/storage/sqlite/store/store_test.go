@@ -117,6 +117,7 @@ func TestProjectConfigRoundTrips(t *testing.T) {
 	// A config with mixed field kinds (scalar, map, list, nested) survives the
 	// JSON round trip.
 	cfg := domain.ProjectConfig{
+		WorkspaceKind:     domain.WorkspaceKindScratch,
 		DefaultBranch:     "develop",
 		Env:               map[string]string{"FOO": "bar"},
 		Symlinks:          []string{".env"},
@@ -186,6 +187,26 @@ func TestSessionCreateAssignsPerProjectID(t *testing.T) {
 	}
 	if all, _ := s.ListAllSessions(ctx); len(all) != 3 {
 		t.Fatalf("list all = %d, want 3", len(all))
+	}
+}
+
+func TestSessionWorkspaceKindRoundTrips(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec := sampleRecord("mer")
+	rec.Metadata.WorkspaceKind = domain.WorkspaceKindScratch
+	rec.Metadata.Branch = ""
+	created, err := s.CreateSession(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetSession(ctx, created.ID)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if got.Metadata.WorkspaceKind != domain.WorkspaceKindScratch || got.Metadata.Branch != "" {
+		t.Fatalf("metadata = %#v, want branchless scratch", got.Metadata)
 	}
 }
 

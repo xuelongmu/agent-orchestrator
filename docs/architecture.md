@@ -1,6 +1,6 @@
 # Agent Orchestrator Architecture
 
-Agent Orchestrator is a long-running Go daemon that supervises multiple parallel AI coding agent sessions. Each session runs in an isolated git worktree with its own runtime, while the daemon coordinates lifecycle, observes external state, and routes feedback.
+Agent Orchestrator is a long-running Go daemon that supervises multiple parallel agent sessions. Sessions use an isolated git worktree by default, but can instead use an ephemeral scratch directory or the registered project's shared directory for non-git workloads. Each session has its own runtime while the daemon coordinates lifecycle, observes external state, and routes feedback.
 
 ## Table of Contents
 
@@ -83,7 +83,7 @@ graph TB
     subgraph Adapters["Adapters"]
         AgentAdapter[Agent Adapters]
         RuntimeAdapter[Runtime tmux/conpty]
-        WorkspaceAdapter[Workspace git worktree]
+        WorkspaceAdapter[Workspace router<br/>worktree / scratch / dir]
         SCMAdapter[SCM GitHub]
     end
 
@@ -201,7 +201,7 @@ backend/internal/
 ├── adapters/            # Concrete adapter implementations
 │   ├── agent/           # 23+ agent harnesses
 │   ├── runtime/         # tmux/conpty runtimes
-│   ├── workspace/       # git worktree
+│   ├── workspace/       # worktree, scratch, dir, and per-kind router
 │   ├── scm/             # GitHub
 │   └── tracker/         # GitHub tracker
 ├── daemon/              # Production wiring
@@ -233,8 +233,8 @@ sequenceDiagram
     CDC->>UI: SSE session.created
 
     Note over Mgr: 2. Create workspace
-    Mgr->>WS: Create(project, branch)
-    WS->>WS: git worktree add
+    Mgr->>WS: Create(project, workspace kind)
+    WS->>WS: Materialize worktree, scratch, or shared dir
 
     Note over Mgr: 3. Launch runtime
     Mgr->>Runtime: Create(session)
@@ -266,7 +266,7 @@ sequenceDiagram
 flowchart TD
     Start([User spawns session]) --> Validate[Validate project config]
     Validate --> CreateRow[Create session row in SQLite]
-    CreateRow --> CreateWS[Create git worktree]
+    CreateRow --> CreateWS[Create selected workspace kind]
     CreateWS --> CreateRT[Launch runtime tmux/conpty]
     CreateRT --> GetCmd[Get agent launch command]
     GetCmd --> ExecAgent[Execute agent in runtime]
@@ -840,7 +840,7 @@ These rules are **load-bearing** — changing them breaks fundamental architectu
 
 1. **Never store display status** — Status is derived from durable facts at read time
 2. **Never treat failed probes as death** — A failed probe is a fact, not a termination signal
-3. **Never force-delete dirty worktrees** — User data safety over cleanup convenience
+3. **Never force-delete dirty worktrees** — User data safety over cleanup convenience. Scratch cleanup uses managed-path guards and retrying removal; `dir` cleanup never removes the shared project directory.
 4. **All app state under ~/.ao** — No OS-default app-data locations
 5. **Daemon binds to 127.0.0.1 only** — No network exposure, ever
 6. **CLI is thin** — All logic lives in the daemon, CLI is just an HTTP client
@@ -859,7 +859,7 @@ Agent Orchestrator's architecture is designed around:
 - **Port-based design** — Core code depends on interfaces, not implementations
 - **Durable minimalism** — Store only facts, compute everything else
 - **Event-driven updates** — CDC broadcasts changes to all subscribers
-- **Isolation** — Each session in its own worktree with its own runtime
+- **Isolation by default** — Worktree and scratch sessions have separate filesystems; `dir` is explicitly shared and opts out of filesystem isolation
 - **Safety** — Conservative termination, path validation, gitignored hooks
 
 This architecture enables parallel AI agents to work safely while maintaining complete visibility and control.

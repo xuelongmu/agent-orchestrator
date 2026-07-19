@@ -40,7 +40,13 @@ export function toSessionStatus(status?: string, isTerminated = false): SessionS
 }
 
 export type SessionActivityState =
-	"active" | "idle" | "waiting_input" | "blocked" | "rate_limited" | "exited" | "unknown";
+	| "active"
+	| "idle"
+	| "waiting_input"
+	| "blocked"
+	| "rate_limited"
+	| "exited"
+	| "unknown";
 
 const sessionActivityStates = new Set<SessionActivityState>([
 	"active",
@@ -110,6 +116,7 @@ export type ChangedFile = {
 };
 
 export type SessionKind = "worker" | "orchestrator";
+export type WorkspaceKind = "worktree" | "scratch" | "dir";
 
 /** Lifecycle state of a single pull request, mirrors the daemon's enum. */
 export type PRState = "open" | "draft" | "merged" | "closed";
@@ -141,6 +148,7 @@ export type WorkspaceSession = {
 	issueId?: string;
 	provider: AgentProvider;
 	kind?: SessionKind;
+	workspaceKind?: WorkspaceKind;
 	branch: string;
 	status: SessionStatus;
 	/** ISO timestamp from the daemon — used for relative time in the inspector. */
@@ -205,7 +213,13 @@ export type WorkspaceRepoSummary = {
 
 /** Glanceable worker status. Maps 1:1 to the accent colors in DESIGN.md. */
 export type WorkerDisplayStatus =
-	"working" | "needs_you" | "mergeable" | "ci_failed" | "no_signal" | "done" | "unknown";
+	| "working"
+	| "needs_you"
+	| "mergeable"
+	| "ci_failed"
+	| "no_signal"
+	| "done"
+	| "unknown";
 
 export function workerDisplayStatus(session: WorkspaceSession): WorkerDisplayStatus {
 	if (session.displayStatus) return session.displayStatus;

@@ -134,6 +134,7 @@ describe("ProjectSettingsForm", () => {
 
 		expect(await screen.findByText("git@github.com:acme/project-one.git")).toBeInTheDocument();
 		expect(screen.getByLabelText("Default branch")).toHaveValue("develop");
+		expect(screen.getByRole("combobox", { name: "Default workspace" })).toHaveTextContent("Git worktree");
 		expect(screen.getByLabelText("Session prefix")).toHaveValue("po");
 		expect(screen.getByLabelText("Model override")).toHaveValue("claude-opus-4-5");
 
@@ -163,6 +164,7 @@ describe("ProjectSettingsForm", () => {
 			params: { path: { id: "proj-1" } },
 			body: {
 				config: {
+					workspaceKind: "worktree",
 					defaultBranch: "release",
 					sessionPrefix: "rel",
 					env: { FOO: "bar" },

@@ -236,14 +236,18 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 	const query = useSessionScmSummary(session.id);
 	const prSummaries = sessionPRDisplaySummaries(session, query.data);
 	const prSectionTitle = prSummaries.length > 1 ? `Pull requests (${prSummaries.length})` : "Pull request";
-	const branchLabel = session.branch || `session/${session.id}`;
+	const workspaceKind = session.workspaceKind ?? "worktree";
 	const issueId = canonicalTrackerIssueId(session.issueId);
 
 	return (
 		<div role="tabpanel">
 			<Section title={prSectionTitle}>
 				{prSummaries.length === 0 ? (
-					<p className={inspectorEmptyClass}>No pull request opened yet.</p>
+					<p className={inspectorEmptyClass}>
+						{workspaceKind === "worktree"
+							? "No pull request opened yet."
+							: "Pull requests are unavailable for non-git workspaces."}
+					</p>
 				) : (
 					<div className="flex flex-col gap-2">
 						{prSummaries.map((pr) => (
@@ -263,7 +267,8 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 				<dl className="flex flex-col gap-1">
 					<Row k="Agent" v={session.provider} mono />
 					{issueId && <Row k="Issue" v={issueId} mono />}
-					<Row k="Branch" v={branchLabel} mono />
+					<Row k="Workspace" v={workspaceKind} mono />
+					{session.branch && <Row k="Branch" v={session.branch} mono />}
 					<Row k="Started" v={formatTimeCompact(session.createdAt ?? session.updatedAt)} mono />
 					<Row k="Session" v={session.id} mono />
 				</dl>
@@ -339,9 +344,16 @@ const timelineNodeTone: Record<TimelineTone, string> = {
 function ActivityTimeline({ session }: { session: WorkspaceSession }) {
 	const events: { tone: TimelineTone; node: ReactNode; ts: string | null }[] = [];
 
+	const workspaceKind = session.workspaceKind ?? "worktree";
+	const createdLabel =
+		workspaceKind === "worktree"
+			? "Created worktree & branch"
+			: workspaceKind === "scratch"
+				? "Created scratch workspace"
+				: "Attached project directory";
 	events.push({
 		tone: "neutral",
-		node: <>Created worktree &amp; branch</>,
+		node: <>{createdLabel}</>,
 		ts: formatTimeCompact(session.createdAt ?? session.updatedAt),
 	});
 
@@ -675,7 +687,13 @@ function ReviewPanel({
 	onOpenTerminal?: OpenReviewerTerminal;
 }) {
 	if (sortedPRs(session).length === 0) {
-		return <p className={inspectorEmptyClass}>No pull request opened yet.</p>;
+		return (
+			<p className={inspectorEmptyClass}>
+				{(session.workspaceKind ?? "worktree") === "worktree"
+					? "No pull request opened yet."
+					: "Reviews are unavailable for non-git workspaces."}
+			</p>
+		);
 	}
 	if (isLoading) {
 		return <p className={inspectorEmptyClass}>Loading reviews...</p>;

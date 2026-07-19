@@ -85,3 +85,31 @@ func TestMigrateAllowsRateLimitedActivity(t *testing.T) {
 		t.Fatalf("sessions.activity_state CHECK was not widened: %s", schema)
 	}
 }
+
+func TestMigrateAddsWorkspaceKindsWithWorktreeDefault(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "ao.db")+pragmas)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	var schema string
+	if err := db.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'").Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"worktree", "scratch", "dir"} {
+		if !strings.Contains(schema, "'"+kind+"'") {
+			t.Fatalf("sessions.workspace_kind CHECK missing %q: %s", kind, schema)
+		}
+	}
+	var defaultValue string
+	var notNull int
+	if err := db.QueryRow(`SELECT dflt_value, "notnull" FROM pragma_table_info('sessions') WHERE name = 'workspace_kind'`).Scan(&defaultValue, &notNull); err != nil {
+		t.Fatal(err)
+	}
+	if defaultValue != "'worktree'" || notNull != 1 {
+		t.Fatalf("workspace_kind default=%q notnull=%d, want 'worktree' and 1", defaultValue, notNull)
+	}
+}

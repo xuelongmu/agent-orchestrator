@@ -11,7 +11,10 @@ import (
 	agentregistry "github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/registry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/reviewer"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/runtimeselect"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/directory"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/gitworktree"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/scratch"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/workspacekind"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
@@ -76,7 +79,7 @@ type sessionLifecycle interface {
 }
 
 // startSession builds the controller-facing session service: a session manager
-// over the selected runtime, a per-session gitworktree workspace, the shared
+// over the selected runtime, a per-session workspace-kind router, the shared
 // store + LCM, the per-session agent resolver, and the agent messenger. The
 // returned service is mounted at httpd APIDeps.Sessions. It also returns the
 // manager so the caller can wire Reconcile into the boot sequence.
@@ -89,7 +92,7 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	ws, err := gitworktree.New(gitworktree.Options{
+	gitWorkspace, err := gitworktree.New(gitworktree.Options{
 		// Per-session worktrees live under the data dir, so a single AO_DATA_DIR
 		// override moves all durable per-user state together.
 		ManagedRoot: filepath.Join(cfg.DataDir, "worktrees"),
@@ -100,6 +103,14 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("session workspace: %w", err)
+	}
+	scratchWorkspace, err := scratch.New(filepath.Join(cfg.DataDir, "workspaces", "scratch"))
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("session scratch workspace: %w", err)
+	}
+	ws, err := workspacekind.New(gitWorkspace, scratchWorkspace, directory.New())
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("session workspace router: %w", err)
 	}
 	mgr := sessionmanager.New(sessionmanager.Deps{
 		Runtime:   runtime,

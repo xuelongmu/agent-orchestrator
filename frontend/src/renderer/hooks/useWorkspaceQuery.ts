@@ -8,6 +8,7 @@ import {
 	toAgentProvider,
 	toSessionActivity,
 	toSessionStatus,
+	type WorkspaceKind,
 	type WorkspaceSummary,
 } from "../types/workspace";
 
@@ -57,7 +58,8 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 				issueId: session.issueId,
 				provider: toAgentProvider(session.harness),
 				kind: session.kind === "orchestrator" ? "orchestrator" : session.kind === "worker" ? "worker" : undefined,
-				branch: session.branch ?? `session/${session.id}`,
+				workspaceKind: (session.workspaceKind ?? "worktree") as WorkspaceKind,
+				branch: session.branch ?? "",
 				status: toSessionStatus(session.status, session.isTerminated),
 				createdAt: session.createdAt,
 				updatedAt: session.updatedAt,

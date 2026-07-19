@@ -64,7 +64,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     pending_submit_fingerprint, pending_submit_recovery_attempted,
     merged_cleanup_pending, merged_cleanup_pr_url,
     diagnostic_trigger, diagnostic_terminal_tail, diagnostic_hook_error_type,
-    diagnostic_captured_at
+    diagnostic_captured_at, workspace_kind
 FROM sessions WHERE id = ?
 `
 
@@ -100,6 +100,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (Session,
 		&i.DiagnosticTerminalTail,
 		&i.DiagnosticHookErrorType,
 		&i.DiagnosticCapturedAt,
+		&i.WorkspaceKind,
 	)
 	return i, err
 }
@@ -108,12 +109,12 @@ const insertSession = `-- name: InsertSession :exec
 INSERT INTO sessions (
     id, project_id, num, issue_id, kind, harness, display_name,
     activity_state, activity_last_at, first_signal_at, is_terminated,
-    branch, workspace_path, runtime_handle_id, agent_session_id, prompt,
+    workspace_kind, branch, workspace_path, runtime_handle_id, agent_session_id, prompt,
     preview_url, preview_revision, pending_submit_fingerprint,
     pending_submit_recovery_attempted, diagnostic_trigger,
     diagnostic_terminal_tail, diagnostic_hook_error_type,
     diagnostic_captured_at, merged_cleanup_pending, merged_cleanup_pr_url, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 type InsertSessionParams struct {
@@ -128,6 +129,7 @@ type InsertSessionParams struct {
 	ActivityLastAt                 time.Time
 	FirstSignalAt                  sql.NullTime
 	IsTerminated                   bool
+	WorkspaceKind                  string
 	Branch                         string
 	WorkspacePath                  string
 	RuntimeHandleID                string
@@ -160,6 +162,7 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 		arg.ActivityLastAt,
 		arg.FirstSignalAt,
 		arg.IsTerminated,
+		arg.WorkspaceKind,
 		arg.Branch,
 		arg.WorkspacePath,
 		arg.RuntimeHandleID,
@@ -188,7 +191,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     pending_submit_fingerprint, pending_submit_recovery_attempted,
     merged_cleanup_pending, merged_cleanup_pr_url,
     diagnostic_trigger, diagnostic_terminal_tail, diagnostic_hook_error_type,
-    diagnostic_captured_at
+    diagnostic_captured_at, workspace_kind
 FROM sessions ORDER BY project_id, num
 `
 
@@ -230,6 +233,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]Session, error) {
 			&i.DiagnosticTerminalTail,
 			&i.DiagnosticHookErrorType,
 			&i.DiagnosticCapturedAt,
+			&i.WorkspaceKind,
 		); err != nil {
 			return nil, err
 		}
@@ -251,7 +255,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     pending_submit_fingerprint, pending_submit_recovery_attempted,
     merged_cleanup_pending, merged_cleanup_pr_url,
     diagnostic_trigger, diagnostic_terminal_tail, diagnostic_hook_error_type,
-    diagnostic_captured_at
+    diagnostic_captured_at, workspace_kind
 FROM sessions WHERE project_id = ? ORDER BY num
 `
 
@@ -293,6 +297,7 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID domain.Pr
 			&i.DiagnosticTerminalTail,
 			&i.DiagnosticHookErrorType,
 			&i.DiagnosticCapturedAt,
+			&i.WorkspaceKind,
 		); err != nil {
 			return nil, err
 		}
@@ -421,7 +426,7 @@ const updateSession = `-- name: UpdateSession :exec
 UPDATE sessions SET
     issue_id = ?, kind = ?, harness = ?, display_name = ?,
     activity_state = ?, activity_last_at = ?, first_signal_at = ?, is_terminated = ?,
-    branch = ?, workspace_path = ?, runtime_handle_id = ?, agent_session_id = ?, prompt = ?,
+    workspace_kind = ?, branch = ?, workspace_path = ?, runtime_handle_id = ?, agent_session_id = ?, prompt = ?,
     preview_url = ?, preview_revision = ?, pending_submit_fingerprint = ?,
     pending_submit_recovery_attempted = ?, diagnostic_trigger = ?,
     diagnostic_terminal_tail = ?, diagnostic_hook_error_type = ?,
@@ -438,6 +443,7 @@ type UpdateSessionParams struct {
 	ActivityLastAt                 time.Time
 	FirstSignalAt                  sql.NullTime
 	IsTerminated                   bool
+	WorkspaceKind                  string
 	Branch                         string
 	WorkspacePath                  string
 	RuntimeHandleID                string
@@ -467,6 +473,7 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) er
 		arg.ActivityLastAt,
 		arg.FirstSignalAt,
 		arg.IsTerminated,
+		arg.WorkspaceKind,
 		arg.Branch,
 		arg.WorkspacePath,
 		arg.RuntimeHandleID,

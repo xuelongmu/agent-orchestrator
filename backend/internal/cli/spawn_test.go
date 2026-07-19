@@ -47,6 +47,24 @@ func TestSpawnCommand_MissingProjectContext(t *testing.T) {
 	}
 }
 
+func TestSpawnCommandValidatesWorkspaceKindBeforeNetwork(t *testing.T) {
+	for _, args := range [][]string{
+		{"spawn", "--workspace", "clone"},
+		{"spawn", "--workspace", "scratch", "--branch", "feat/x"},
+	} {
+		var out, errOut bytes.Buffer
+		root := NewRootCommand(Deps{Out: &out, Err: &errOut})
+		root.SetArgs(args)
+		err := root.Execute()
+		if err == nil {
+			t.Fatalf("args %v: expected usage error", args)
+		}
+		if _, ok := err.(usageError); !ok {
+			t.Fatalf("args %v: error = %T %v, want usageError", args, err, err)
+		}
+	}
+}
+
 // TestProjectAddCommand_RequiresPath asserts `ao project add` rejects a missing
 // --path before touching the network.
 func TestProjectAddCommand_RequiresPath(t *testing.T) {

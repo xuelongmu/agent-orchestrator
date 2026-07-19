@@ -41,6 +41,9 @@ var (
 	// ErrMissingHarness means neither the spawn request nor the project's role
 	// config selected an agent. Worker/orchestrator spawns must be explicit.
 	ErrMissingHarness = errors.New("session: agent harness required")
+	// ErrWorkspaceKindInvalid reports an unsupported workspace kind or a git
+	// branch supplied for a branchless workspace.
+	ErrWorkspaceKindInvalid = errors.New("session: invalid workspace kind")
 	// ErrNotResumable means a terminated session cannot be relaunched: its adapter
 	// cannot natively resume it AND it has no prompt to fresh-launch from, and it is
 	// not an orchestrator (orchestrators are promptless by design and relaunch fresh
@@ -281,6 +284,13 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: %w", err)
 	}
+	cfg.WorkspaceKind = effectiveWorkspaceKind(cfg.WorkspaceKind, project.Config.WorkspaceKind)
+	if !cfg.WorkspaceKind.IsKnown() {
+		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: %q", ErrWorkspaceKindInvalid, cfg.WorkspaceKind)
+	}
+	if cfg.WorkspaceKind != domain.WorkspaceKindWorktree && strings.TrimSpace(cfg.Branch) != "" {
+		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: branch is only valid for worktree sessions", ErrWorkspaceKindInvalid)
+	}
 	// A per-project role override picks the harness when the spawn names none,
 	// so a project can default workers to one agent and orchestrators to another.
 	cfg.Harness = effectiveHarness(cfg.Harness, cfg.Kind, project.Config)
@@ -316,7 +326,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	}
 
 	branch := cfg.Branch
-	if branch == "" {
+	if cfg.WorkspaceKind == domain.WorkspaceKindWorktree && branch == "" {
 		branch = defaultSpawnBranch(id, cfg.Kind, sessionPrefix(project), project.Kind.WithDefault())
 	}
 	ws, workspaceProject, err := m.createSessionWorkspace(ctx, project, cfg, id, branch)
@@ -398,7 +408,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn %s: runtime: %w", id, err)
 	}
 
-	metadata := domain.SessionMetadata{Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, Prompt: prompt}
+	metadata := domain.SessionMetadata{WorkspaceKind: ws.WorkspaceKind.WithDefault(), Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, Prompt: prompt}
 	if err := m.lcm.MarkSpawned(ctx, id, metadata); err != nil {
 		_ = m.runtime.Destroy(ctx, handle)
 		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
@@ -433,15 +443,20 @@ func (m *Manager) loadProject(ctx context.Context, projectID domain.ProjectID) (
 }
 
 func (m *Manager) createSessionWorkspace(ctx context.Context, project domain.ProjectRecord, cfg ports.SpawnConfig, id domain.SessionID, branch string) (ports.WorkspaceInfo, *ports.WorkspaceProjectInfo, error) {
-	if project.Kind.WithDefault() != domain.ProjectKindWorkspace {
+	if cfg.WorkspaceKind != domain.WorkspaceKindWorktree || project.Kind.WithDefault() != domain.ProjectKindWorkspace {
 		ws, err := m.workspace.Create(ctx, ports.WorkspaceConfig{
 			ProjectID:     cfg.ProjectID,
 			SessionID:     id,
 			Kind:          cfg.Kind,
+			WorkspaceKind: cfg.WorkspaceKind,
 			SessionPrefix: sessionPrefix(project),
 			Branch:        branch,
 			BaseBranch:    project.Config.WithDefaults().DefaultBranch,
+			RepoPath:      project.Path,
 		})
+		if ws.WorkspaceKind == "" {
+			ws.WorkspaceKind = cfg.WorkspaceKind
+		}
 		return ws, nil, err
 	}
 	workspaceProject, ok := m.workspace.(ports.WorkspaceProject)
@@ -739,7 +754,7 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 	if !ok || rec.IsTerminated {
 		return nil
 	}
-	if rec.Metadata.WorkspacePath == "" || rec.Metadata.Branch == "" {
+	if rec.Metadata.WorkspacePath == "" || (rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree && rec.Metadata.Branch == "") {
 		if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
 			return fmt.Errorf("retire replacement %s: clear restore markers: %w", id, err)
 		}
@@ -841,11 +856,9 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
 	}
 	meta := rec.Metadata
-	// Mirror Kill's incomplete-handle guard: a session whose spawn failed before
-	// the workspace landed has neither WorkspacePath nor Branch, and there is
-	// nothing meaningful to restore from. Surface this as a typed 409 instead of
-	// letting workspace.Restore fail with an opaque wrapped error.
-	if meta.WorkspacePath == "" || meta.Branch == "" {
+	// Mirror Kill's incomplete-handle guard. Git worktrees require both path and
+	// branch; scratch and dir sessions are intentionally branchless.
+	if meta.WorkspacePath == "" || (meta.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree && meta.Branch == "") {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrIncompleteHandle)
 	}
 	// Resumability is decided inside restoreArgv, not here. A promptless session
@@ -905,7 +918,7 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 		m.cleanupSystemPromptDir(rec.ID)
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: runtime: %w", rec.ID, err)
 	}
-	metadata := domain.SessionMetadata{Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, AgentSessionID: rec.Metadata.AgentSessionID, Prompt: rec.Metadata.Prompt}
+	metadata := domain.SessionMetadata{WorkspaceKind: ws.WorkspaceKind.WithDefault(), Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, AgentSessionID: rec.Metadata.AgentSessionID, Prompt: rec.Metadata.Prompt}
 	if err := m.lcm.MarkSpawned(ctx, rec.ID, metadata); err != nil {
 		_ = m.runtime.Destroy(ctx, handle)
 		m.cleanupSystemPromptDir(rec.ID)
@@ -1049,7 +1062,7 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 	if rec.Activity.State == domain.ActivityRateLimited {
 		return nil
 	}
-	if rec.Metadata.WorkspacePath == "" || rec.Metadata.Branch == "" {
+	if rec.Metadata.WorkspacePath == "" {
 		return nil
 	}
 	handle := runtimeHandle(rec.Metadata)
@@ -1062,6 +1075,21 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 		if alive {
 			return nil // adopt: the session survived the crash.
 		}
+	}
+	if rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
+		// Non-git workspaces have no preserve ref or worktree marker. Their
+		// filesystem location remains in place across a daemon crash, so restart
+		// the agent directly against it rather than forcing git-only save logic.
+		if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
+			return fmt.Errorf("reconcile %s: mark branchless session terminated: %w", rec.ID, err)
+		}
+		if _, err := m.Restore(ctx, rec.ID); err != nil {
+			return fmt.Errorf("reconcile %s: restore branchless session: %w", rec.ID, err)
+		}
+		return nil
+	}
+	if rec.Metadata.Branch == "" {
+		return nil
 	}
 	if err := m.saveAndTeardownOne(ctx, rec, false); err != nil {
 		m.logger.Warn("reconcile: save-and-teardown failed; terminating without restore marker", "sessionID", rec.ID, "error", err)
@@ -1310,14 +1338,22 @@ func (m *Manager) markSessionWorktreesActive(ctx context.Context, rows []domain.
 }
 
 func (m *Manager) restoreSessionWorkspace(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord) (ports.WorkspaceInfo, error) {
-	if project.Kind.WithDefault() != domain.ProjectKindWorkspace {
-		return m.workspace.Restore(ctx, ports.WorkspaceConfig{
+	workspaceKind := rec.Metadata.WorkspaceKind.WithDefault()
+	if workspaceKind != domain.WorkspaceKindWorktree || project.Kind.WithDefault() != domain.ProjectKindWorkspace {
+		ws, err := m.workspace.Restore(ctx, ports.WorkspaceConfig{
 			ProjectID:     rec.ProjectID,
 			SessionID:     rec.ID,
 			Kind:          rec.Kind,
+			WorkspaceKind: workspaceKind,
 			SessionPrefix: sessionPrefix(project),
 			Branch:        rec.Metadata.Branch,
+			RepoPath:      project.Path,
+			Path:          rec.Metadata.WorkspacePath,
 		})
+		if ws.WorkspaceKind == "" {
+			ws.WorkspaceKind = workspaceKind
+		}
+		return ws, err
 	}
 	rows, err := m.workspaceProjectRestoreRows(ctx, project, rec)
 	if err != nil {
@@ -2063,8 +2099,16 @@ func seedRecord(cfg ports.SpawnConfig, now time.Time) domain.SessionRecord {
 		UpdatedAt:   now,
 		Harness:     cfg.Harness,
 		DisplayName: cfg.DisplayName,
+		Metadata:    domain.SessionMetadata{WorkspaceKind: cfg.WorkspaceKind.WithDefault()},
 		Activity:    domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
 	}
+}
+
+func effectiveWorkspaceKind(explicit, configured domain.WorkspaceKind) domain.WorkspaceKind {
+	if explicit != "" {
+		return explicit.WithDefault()
+	}
+	return configured.WithDefault()
 }
 
 func defaultSessionBranch(id domain.SessionID, kind domain.SessionKind, prefix string) string {
@@ -2779,20 +2823,22 @@ func runtimeHandle(meta domain.SessionMetadata) ports.RuntimeHandle {
 
 func workspaceInfo(rec domain.SessionRecord) ports.WorkspaceInfo {
 	return ports.WorkspaceInfo{
-		Path:      rec.Metadata.WorkspacePath,
-		Branch:    rec.Metadata.Branch,
-		SessionID: rec.ID,
-		ProjectID: rec.ProjectID,
+		Path:          rec.Metadata.WorkspacePath,
+		Branch:        rec.Metadata.Branch,
+		WorkspaceKind: rec.Metadata.WorkspaceKind.WithDefault(),
+		SessionID:     rec.ID,
+		ProjectID:     rec.ProjectID,
 	}
 }
 
 func workspaceInfoFromRepoInfo(info ports.WorkspaceRepoInfo) ports.WorkspaceInfo {
 	return ports.WorkspaceInfo{
-		Path:      info.Path,
-		Branch:    info.Branch,
-		SessionID: info.SessionID,
-		ProjectID: info.ProjectID,
-		RepoPath:  info.RepoPath,
+		Path:          info.Path,
+		Branch:        info.Branch,
+		WorkspaceKind: domain.WorkspaceKindWorktree,
+		SessionID:     info.SessionID,
+		ProjectID:     info.ProjectID,
+		RepoPath:      info.RepoPath,
 	}
 }
 

@@ -9,6 +9,10 @@ func TestProjectConfigValidate(t *testing.T) {
 		wantErr bool
 	}{
 		{"empty ok", ProjectConfig{}, false},
+		{"worktree workspace", ProjectConfig{WorkspaceKind: WorkspaceKindWorktree}, false},
+		{"scratch workspace", ProjectConfig{WorkspaceKind: WorkspaceKindScratch}, false},
+		{"dir workspace", ProjectConfig{WorkspaceKind: WorkspaceKindDir}, false},
+		{"unknown workspace", ProjectConfig{WorkspaceKind: "clone"}, true},
 		{"good agent config", ProjectConfig{AgentConfig: AgentConfig{Model: "m", Permissions: PermissionModeAuto}}, false},
 		{"bad permission", ProjectConfig{AgentConfig: AgentConfig{Permissions: "yolo"}}, true},
 		{"good session prefix", ProjectConfig{SessionPrefix: "ao"}, false},
@@ -54,14 +58,18 @@ func TestProjectConfigValidate(t *testing.T) {
 func TestDefaultProjectConfig(t *testing.T) {
 	def := DefaultProjectConfig()
 
-	// The one documented non-empty default.
+	// The documented non-empty defaults.
 	if def.DefaultBranch != "main" {
 		t.Fatalf("default DefaultBranch = %q, want main", def.DefaultBranch)
+	}
+	if def.WorkspaceKind != WorkspaceKindWorktree {
+		t.Fatalf("default WorkspaceKind = %q, want worktree", def.WorkspaceKind)
 	}
 
 	// Every other field defaults to its zero value: clearing the documented
 	// default must leave the config completely empty.
 	def.DefaultBranch = ""
+	def.WorkspaceKind = ""
 	if !def.IsZero() {
 		t.Fatalf("default config has unexpected non-zero fields: %#v", def)
 	}
@@ -72,6 +80,9 @@ func TestProjectConfigWithDefaults(t *testing.T) {
 	got := (ProjectConfig{}).WithDefaults()
 	if got.DefaultBranch != DefaultBranchName {
 		t.Fatalf("WithDefaults = %#v, want branch=main", got)
+	}
+	if got.WorkspaceKind != WorkspaceKindWorktree {
+		t.Fatalf("WithDefaults = %#v, want workspaceKind=worktree", got)
 	}
 
 	// Set fields are preserved, not overwritten.

@@ -35,6 +35,9 @@ surface (`npm run sqlc`, `npm run api`).
 - Full session lifecycle over HTTP: list, get, spawn, kill, restore, rename,
   rollback, cleanup, send, activity, PR claim/list. Orchestrator routes
   (list/spawn/get) are wired too.
+- Per-session workspace kinds: isolated git worktree (default), ephemeral
+  scratch directory, or the registered project's shared directory. Non-git
+  sessions are branchless and excluded from SCM/PR operations.
 - Project CRUD plus per-project config (`PUT /projects/{id}/config`).
 - PR action engine wired into the API: `POST /prs/{id}/merge` performs a
   GitHub squash merge pinned to the caller's exact displayed head, after a

@@ -305,6 +305,31 @@ func TestGetWorkspaceFileReturnsContentAndDiff(t *testing.T) {
 	}
 }
 
+func TestWorkspaceFilesSupportNonGitScratchDirectories(t *testing.T) {
+	root := t.TempDir()
+	writeWorkspaceFile(t, root, "notes/research.md", "findings\n")
+	st := newFakeStore()
+	st.sessions["ao-1"] = domain.SessionRecord{ID: "ao-1", Metadata: domain.SessionMetadata{
+		WorkspaceKind: domain.WorkspaceKindScratch,
+		WorkspacePath: root,
+	}}
+	svc := &Service{store: st}
+	files, err := svc.ListWorkspaceFiles(context.Background(), "ao-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files.Files) != 1 || files.Files[0].Path != "notes/research.md" || files.Files[0].Status != WorkspaceFileUnmodified {
+		t.Fatalf("files = %#v", files.Files)
+	}
+	detail, err := svc.GetWorkspaceFile(context.Background(), "ao-1", "notes/research.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Content != "findings\n" || detail.Diff != "" {
+		t.Fatalf("detail = %#v", detail)
+	}
+}
+
 func TestGetWorkspaceFileRejectsTraversal(t *testing.T) {
 	repo := newWorkspaceRepo(t)
 	st := newFakeStore()
@@ -1022,6 +1047,20 @@ func (f fakeSCM) CheckoutPullRequest(_ context.Context, _ ports.SCMPRRef, _ port
 		*f.checkoutBranch = workspaceBranch
 	}
 	return f.checkoutChanged, f.checkoutErr
+}
+
+func TestClaimPRRejectsNonGitWorkspace(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{
+		WorkspaceKind: domain.WorkspaceKindScratch,
+		WorkspacePath: t.TempDir(),
+	}}
+	svc := NewWithDeps(Deps{Store: st})
+
+	_, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{})
+	if !errors.Is(err, ErrSessionWorkspaceNotGit) {
+		t.Fatalf("err = %v, want ErrSessionWorkspaceNotGit", err)
+	}
 }
 
 func TestClaimPRPreflightsActiveOwnerBeforeCheckout(t *testing.T) {

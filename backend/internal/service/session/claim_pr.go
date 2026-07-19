@@ -31,6 +31,9 @@ var (
 	ErrSessionNotClaimable = errors.New("session: not claimable")
 	// ErrSessionNoWorkspace is returned when a session has no workspace path to associate with PR work.
 	ErrSessionNoWorkspace = errors.New("session: no workspace")
+	// ErrSessionWorkspaceNotGit reports that SCM branch operations are
+	// inapplicable to scratch and shared-directory sessions.
+	ErrSessionWorkspaceNotGit = errors.New("session: workspace is not git-backed")
 )
 
 // ClaimPROptions controls PR claim conflict behavior.
@@ -75,6 +78,9 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	}
 	if strings.TrimSpace(rec.Metadata.WorkspacePath) == "" {
 		return ClaimPRResult{}, ErrSessionNoWorkspace
+	}
+	if rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
+		return ClaimPRResult{}, ErrSessionWorkspaceNotGit
 	}
 	project, ok, err := s.store.GetProject(ctx, string(rec.ProjectID))
 	if err != nil {

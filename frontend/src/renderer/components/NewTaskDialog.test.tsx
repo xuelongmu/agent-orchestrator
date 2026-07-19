@@ -77,14 +77,16 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("NewTaskDialog", () => {
-	it("aligns the Agent and Branch fields with matching labels and compact controls", async () => {
+	it("aligns the Agent, Workspace, and Branch fields with matching labels and compact controls", async () => {
 		renderDialog();
 		await waitForAgentCatalog();
 
 		const agentLabel = screen.getByText("Agent", { selector: "label" });
 		const branchLabel = screen.getByText("Branch", { selector: "label" });
+		const workspaceLabel = screen.getByText("Workspace", { selector: "label" });
 		expect(agentLabel).toHaveAttribute("data-slot", "label");
 		expect(branchLabel).toHaveAttribute("data-slot", "label");
+		expect(workspaceLabel).toHaveAttribute("data-slot", "label");
 		expect(screen.getByRole("combobox", { name: "Agent" })).toHaveAttribute("data-size", "sm");
 		expect(screen.getByLabelText("Branch")).toHaveClass("h-control-form");
 	});
@@ -107,12 +109,30 @@ describe("NewTaskDialog", () => {
 				harness: undefined,
 				issueId: "Fix fallback renderer",
 				prompt: "Restore the fallback renderer after WebGL init fails.",
+				workspaceKind: "worktree",
 				branch: undefined,
 			},
 		});
 		expect(onCreated).toHaveBeenCalledWith("task-1");
 		expect(onOpenChange).toHaveBeenCalledWith(false);
 	}, 20_000);
+
+	it("spawns a branchless scratch task", async () => {
+		renderDialog();
+		const user = userEvent.setup();
+		await waitForAgentCatalog();
+
+		await user.click(screen.getByRole("combobox", { name: "Workspace" }));
+		await user.click(await screen.findByRole("option", { name: "Scratch" }));
+		expect(screen.getByLabelText("Branch")).toBeDisabled();
+		await user.type(screen.getByLabelText("Title"), "Research");
+		await user.type(screen.getByLabelText("Brief"), "Compare the available approaches.");
+		await user.click(screen.getByRole("button", { name: "Start task" }));
+
+		await waitFor(() => expect(postMock).toHaveBeenCalledTimes(1));
+		expect(spawnBody().workspaceKind).toBe("scratch");
+		expect(spawnBody().branch).toBeUndefined();
+	});
 
 	it("sends the chosen harness when the user overrides the default", async () => {
 		renderDialog();
