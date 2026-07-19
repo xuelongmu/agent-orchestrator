@@ -72,7 +72,6 @@ type fakeMessenger struct {
 }
 
 type retryMergedCleaner struct {
-	lcm   *Manager
 	err   error
 	calls int
 }
@@ -82,7 +81,24 @@ func (c *retryMergedCleaner) CleanupMergedSession(ctx context.Context, id domain
 	if c.err != nil {
 		return c.err
 	}
-	return c.lcm.MarkTerminated(ctx, id)
+	return nil
+}
+
+type blockingMergedCleaner struct {
+	entered chan struct{}
+	release chan struct{}
+	calls   int
+}
+
+func (c *blockingMergedCleaner) CleanupMergedSession(ctx context.Context, id domain.SessionID) error {
+	c.calls++
+	close(c.entered)
+	select {
+	case <-c.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type fakeDiagnosticRuntime struct {
@@ -176,7 +192,7 @@ func TestRuntimeObservation_DeadRuntimePreservesMergedCleanupForRetry(t *testing
 	rec.Metadata.MergedCleanupPRURL = "pr1"
 	st.sessions[rec.ID] = rec
 	st.prs[rec.ID] = []domain.PullRequest{{URL: "pr1", Merged: true}}
-	cleaner := &retryMergedCleaner{lcm: m}
+	cleaner := &retryMergedCleaner{}
 	m.SetMergedSessionCleaner(cleaner)
 
 	if err := m.ApplyRuntimeObservation(ctx, rec.ID, ports.RuntimeFacts{Probe: ports.ProbeDead}); err != nil {
@@ -202,7 +218,7 @@ func TestActivityExitedPreservesMergedCleanupForRetry(t *testing.T) {
 	rec.Metadata.MergedCleanupPRURL = "pr1"
 	st.sessions[rec.ID] = rec
 	st.prs[rec.ID] = []domain.PullRequest{{URL: "pr1", Merged: true}}
-	cleaner := &retryMergedCleaner{lcm: m}
+	cleaner := &retryMergedCleaner{}
 	m.SetMergedSessionCleaner(cleaner)
 
 	if err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityExited}); err != nil {
@@ -992,7 +1008,7 @@ func TestPRObservation_MergedCleanupFailureRetriesFromDurableLatch(t *testing.T)
 	m, st, _ := newManager()
 	st.sessions["mer-1"] = working("mer-1")
 	st.prs["mer-1"] = []domain.PullRequest{{URL: "pr1", Merged: true}}
-	cleaner := &retryMergedCleaner{lcm: m, err: errors.New("runtime busy")}
+	cleaner := &retryMergedCleaner{err: errors.New("runtime busy")}
 	m.SetMergedSessionCleaner(cleaner)
 
 	err := m.ApplyPRObservation(ctx, "mer-1", ports.PRObservation{Fetched: true, URL: "pr1", Merged: true})
@@ -1000,8 +1016,8 @@ func TestPRObservation_MergedCleanupFailureRetriesFromDurableLatch(t *testing.T)
 		t.Fatalf("ApplyPRObservation error = %v, want runtime busy", err)
 	}
 	failed := st.sessions["mer-1"]
-	if failed.IsTerminated || !failed.Metadata.MergedCleanupPending {
-		t.Fatalf("failed cleanup must stay live and durably pending: %+v", failed)
+	if !failed.IsTerminated || failed.Activity.State != domain.ActivityExited || !failed.Metadata.MergedCleanupPending {
+		t.Fatalf("failed cleanup must stay terminal and durably pending: %+v", failed)
 	}
 	if failed.Metadata.MergedCleanupPRURL != "pr1" {
 		t.Fatalf("failed cleanup trigger URL = %q, want pr1", failed.Metadata.MergedCleanupPRURL)
@@ -1032,7 +1048,7 @@ func TestPRObservation_MergedCleanupWaitsWhileRateLimited(t *testing.T) {
 	rec.Activity.State = domain.ActivityRateLimited
 	st.sessions[rec.ID] = rec
 	st.prs[rec.ID] = []domain.PullRequest{{URL: "pr1", Merged: true}}
-	cleaner := &retryMergedCleaner{lcm: m}
+	cleaner := &retryMergedCleaner{}
 	m.SetMergedSessionCleaner(cleaner)
 
 	if err := m.ApplyPRObservation(ctx, rec.ID, ports.PRObservation{Fetched: true, URL: "pr1", Merged: true}); err != nil {
@@ -1052,7 +1068,7 @@ func TestRetryMergedCleanupWaitsWhileRateLimited(t *testing.T) {
 	rec.Metadata.MergedCleanupPRURL = "pr1"
 	st.sessions[rec.ID] = rec
 	st.prs[rec.ID] = []domain.PullRequest{{URL: "pr1", Merged: true}}
-	cleaner := &retryMergedCleaner{lcm: m}
+	cleaner := &retryMergedCleaner{}
 	m.SetMergedSessionCleaner(cleaner)
 
 	if err := m.RetryMergedCleanup(ctx, rec.ID); err != nil {
@@ -1061,6 +1077,56 @@ func TestRetryMergedCleanupWaitsWhileRateLimited(t *testing.T) {
 	got := st.sessions[rec.ID]
 	if cleaner.calls != 0 || got.IsTerminated || !got.Metadata.MergedCleanupPending || got.Activity.State != domain.ActivityRateLimited {
 		t.Fatalf("rate-limited cleanup retry mutated session: rec=%+v cleaner calls=%d", got, cleaner.calls)
+	}
+}
+
+func TestMergedCleanupReservationWinsConcurrentRateLimitWithoutHoldingLifecycleLock(t *testing.T) {
+	m, st, _ := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	st.prs["mer-1"] = []domain.PullRequest{{URL: "pr1", Merged: true}}
+	cleaner := &blockingMergedCleaner{entered: make(chan struct{}), release: make(chan struct{})}
+	m.SetMergedSessionCleaner(cleaner)
+
+	cleanupDone := make(chan error, 1)
+	go func() {
+		cleanupDone <- m.ApplyPRObservation(ctx, "mer-1", ports.PRObservation{Fetched: true, URL: "pr1", Merged: true})
+	}()
+	select {
+	case <-cleaner.entered:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not reach resource callback")
+	}
+	reserved := st.sessions["mer-1"]
+	if !reserved.IsTerminated || reserved.Activity.State != domain.ActivityExited || !reserved.Metadata.MergedCleanupPending {
+		t.Fatalf("resource cleanup must start after durable terminal reservation: %+v", reserved)
+	}
+
+	// The cleaner is still blocked on external I/O. Activity delivery must not
+	// block behind it, and the already-terminal reservation must win without a
+	// rate-limited rewrite.
+	signalDone := make(chan error, 1)
+	go func() {
+		signalDone <- m.ApplyActivitySignal(ctx, "mer-1", ports.ActivitySignal{Valid: true, Event: "stop-failure", ErrorType: "rate_limit", State: domain.ActivityIdle})
+	}()
+	select {
+	case err := <-signalDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("activity signal blocked behind external cleanup")
+	}
+	if got := st.sessions["mer-1"]; !got.IsTerminated || got.Activity.State != domain.ActivityExited || !got.Metadata.MergedCleanupPending {
+		t.Fatalf("concurrent rate-limit rewrote terminal reservation: %+v", got)
+	}
+
+	close(cleaner.release)
+	if err := <-cleanupDone; err != nil {
+		t.Fatal(err)
+	}
+	got := st.sessions["mer-1"]
+	if !got.IsTerminated || got.Activity.State != domain.ActivityExited || got.Metadata.MergedCleanupPending || got.Metadata.MergedCleanupPRURL != "" || cleaner.calls != 1 {
+		t.Fatalf("completed cleanup = %+v, calls=%d", got, cleaner.calls)
 	}
 }
 
@@ -1097,7 +1163,7 @@ func TestPRObservation_MergedCleanupRetryResumesTerminalNotification(t *testing.
 			st.prs["mer-1"] = tc.prs
 			sink := &fakeNotificationSink{}
 			m := New(st, nil, WithNotificationSink(sink))
-			cleaner := &retryMergedCleaner{lcm: m, err: errors.New("workspace busy")}
+			cleaner := &retryMergedCleaner{err: errors.New("workspace busy")}
 			m.SetMergedSessionCleaner(cleaner)
 
 			if err := m.ApplySCMObservation(ctx, "mer-1", tc.obs); err == nil {
@@ -2635,6 +2701,59 @@ func TestIdleReviewSnapshot_JITRecheckSkipsActionsAfterConcurrentRecovery(t *tes
 				}
 			}
 		})
+	}
+}
+
+func TestIdleReviewSnapshot_FinalGuardRateLimitParksWithoutHandoff(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	prURL := "https://github.com/o/r/pull/1"
+	st := newFakeStore()
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{}
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	rec.FirstSignalAt = rec.Activity.LastActivityAt
+	st.sessions[rec.ID] = rec
+	obs := idleReviewSnapshot(prURL, false, ports.SCMReviewThreadObservation{
+		ID: "t1", Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix"}},
+	})
+	proof := reactionPayload{
+		Seen:     map[string]string{"review:" + prURL: idleReviewDeliverySignature(obs)},
+		Attempts: map[string]int{idleReviewEpisodeKey(prURL, rec.Activity.LastActivityAt): 1},
+	}
+	raw, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.signatures[prURL] = string(raw)
+	// The initial eligibility read returns the old idle episode. The provider
+	// limit then lands before the guard's final pre-write read, which must park
+	// silently rather than turn suppression into a false review-failure handoff.
+	st.afterSessionRead = func(id domain.SessionID, read int) {
+		if read != 1 {
+			return
+		}
+		parked := st.sessions[id]
+		parked.Activity = domain.Activity{State: domain.ActivityRateLimited, LastActivityAt: now}
+		st.sessions[id] = parked
+	}
+	m := New(st, msg, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 || len(sink.intents) != 0 {
+		t.Fatalf("rate-limit guard suppression acted as review failure: nudges=%d notifications=%d", len(msg.msgs), len(sink.intents))
+	}
+	if got := st.sessions[rec.ID]; got.IsTerminated || got.Activity.State != domain.ActivityRateLimited {
+		t.Fatalf("rate-limited session did not remain parked: %+v", got)
+	}
+	var persisted reactionPayload
+	if err := json.Unmarshal([]byte(st.signatures[prURL]), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := persisted.Attempts[idleReviewEpisodeKey(prURL, rec.Activity.LastActivityAt)]; ok {
+		t.Fatalf("old idle episode survived rate-limit cleanup: %+v", persisted.Attempts)
 	}
 }
 

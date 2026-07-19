@@ -642,6 +642,14 @@ func (m *Manager) RollbackSpawn(ctx context.Context, id domain.SessionID) (delet
 // available destroy steps are skipped so it can be cleaned up from the
 // dashboard.
 func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
+	return m.kill(ctx, id, true)
+}
+
+// kill owns external resource teardown. markTerminated is false only for the
+// merged-cleanup callback: lifecycle has already persisted a terminal
+// reservation and performs no callback from this resource-only path. That
+// durable reservation atomically excludes a later rate-limit transition.
+func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated bool) (bool, error) {
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return false, fmt.Errorf("kill %s: %w", id, err)
@@ -696,32 +704,22 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
 		m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
 	}
-	if err := m.lcm.MarkTerminated(ctx, id); err != nil {
-		return false, fmt.Errorf("kill %s: %w", id, err)
+	if markTerminated {
+		if err := m.lcm.MarkTerminated(ctx, id); err != nil {
+			return false, fmt.Errorf("kill %s: %w", id, err)
+		}
 	}
 	m.cleanupSystemPromptDir(id)
 	return freed, nil
 }
 
-// CleanupMergedSession applies the normal session teardown policy to a
-// merge-complete session. Kill owns runtime, worktree, restore-marker, agent
-// hook, and terminal-state ordering; this adapter only handles its deliberate
-// dirty-worktree deferral. In that case the runtime is already gone and the
-// worktree must remain preserved, so record the canonical terminal state and
-// leave the workspace for explicit cleanup.
+// CleanupMergedSession tears down only the resources of a merge-complete
+// session. Lifecycle durably reserves and owns the terminal state before this
+// callback, so this path must not call back into lifecycle. A dirty worktree is
+// deliberately preserved while the runtime and restore marker are removed.
 func (m *Manager) CleanupMergedSession(ctx context.Context, id domain.SessionID) error {
-	if _, err := m.Kill(ctx, id); err != nil {
+	if _, err := m.kill(ctx, id, false); err != nil {
 		return fmt.Errorf("cleanup merged session %s: %w", id, err)
-	}
-	rec, ok, err := m.store.GetSession(ctx, id)
-	if err != nil {
-		return fmt.Errorf("cleanup merged session %s: %w", id, err)
-	}
-	if !ok || rec.IsTerminated {
-		return nil
-	}
-	if err := m.lcm.MarkTerminated(ctx, id); err != nil {
-		return fmt.Errorf("cleanup merged session %s: mark terminated: %w", id, err)
 	}
 	return nil
 }
@@ -1045,6 +1043,12 @@ func (m *Manager) saveAndTeardownOne(ctx context.Context, rec domain.SessionReco
 // worktree intact: better to skip the relaunch than to tear down un-preserved
 // work or relaunch onto an inconsistent worktree.
 func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) error {
+	// A persisted usage-limit pause is intentionally stronger than a dead
+	// runtime probe: preserve the runtime handle, restore marker, and worktree
+	// exactly as-is until a later authoritative activity signal resumes it.
+	if rec.Activity.State == domain.ActivityRateLimited {
+		return nil
+	}
 	if rec.Metadata.WorkspacePath == "" || rec.Metadata.Branch == "" {
 		return nil
 	}

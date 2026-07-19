@@ -40,13 +40,7 @@ export function toSessionStatus(status?: string, isTerminated = false): SessionS
 }
 
 export type SessionActivityState =
-	| "active"
-	| "idle"
-	| "waiting_input"
-	| "blocked"
-	| "rate_limited"
-	| "exited"
-	| "unknown";
+	"active" | "idle" | "waiting_input" | "blocked" | "rate_limited" | "exited" | "unknown";
 
 const sessionActivityStates = new Set<SessionActivityState>([
 	"active",

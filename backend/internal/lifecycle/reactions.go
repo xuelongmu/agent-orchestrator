@@ -544,7 +544,7 @@ func (m *Manager) ApplyIdleReviewSnapshot(ctx context.Context, id domain.Session
 	msg := fmt.Sprintf("You still have %d unresolved review comment(s) on %s and appear to be idle. Address them now, push fixes, and resolve each addressed thread.\n\n%s",
 		len(actionable), prIdentity(prObs), formatReviewCommentsMessage(actionable))
 	outcome, sendErr := m.guard.NudgeIdleEpisode(ctx, id, msg, rec.Activity.LastActivityAt)
-	if outcome == sessionguard.SuppressedStaleEpisode {
+	if outcome == sessionguard.SuppressedStaleEpisode || outcome == sessionguard.SuppressedRateLimited {
 		return m.clearIdleReviewEpisodeIdentityLocked(ctx, prURL, rec.Activity.LastActivityAt)
 	}
 	if sendErr != nil || outcome != sessionguard.Sent {
@@ -749,19 +749,13 @@ func (m *Manager) cleanupMergedSession(ctx context.Context, id domain.SessionID,
 }
 
 func (m *Manager) runMergedCleanup(ctx context.Context, id domain.SessionID) error {
-	// Re-read immediately before the irreversible external cleanup. A usage
-	// limit may have landed after the PR observation or durable retry lookup;
-	// parking wins, and the merged PR will be retried after an authoritative
-	// activity signal resumes the session.
-	rec, ok, err := m.store.GetSession(ctx, id)
-	if err != nil {
+	// Persist the terminal reservation before external I/O. A concurrent
+	// rate-limit hook therefore has a deterministic winner: if it lands first,
+	// reservation refuses cleanup; if reservation lands first, the hook sees a
+	// terminal row and cannot rewrite it. The durable pending latch remains set
+	// until resource cleanup succeeds, so a daemon restart can replay failures.
+	if err := m.reserveMergedCleanup(ctx, id); err != nil {
 		return err
-	}
-	if !ok {
-		return fmt.Errorf("%w: %s", ports.ErrSessionNotFound, id)
-	}
-	if rec.Activity.State == domain.ActivityRateLimited {
-		return errMergedCleanupRateLimited
 	}
 	m.mu.Lock()
 	cleaner := m.mergedCleaner
@@ -1089,7 +1083,7 @@ func (m *Manager) ApplyTrackerFacts(ctx context.Context, id domain.SessionID, o 
 		if rec.Activity.State == domain.ActivityRateLimited {
 			return nil
 		}
-		return m.MarkTerminated(ctx, id)
+		return m.markTerminatedUnlessRateLimited(ctx, id)
 	}
 	if rec.IsTerminated || rec.Activity.State.PausesAutomation() {
 		return nil

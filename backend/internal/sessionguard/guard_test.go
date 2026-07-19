@@ -130,6 +130,7 @@ func TestGuard_NudgeIdleEpisodeRequiresExactFinalState(t *testing.T) {
 		{name: "same episode", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: idleSince}}, want: Sent},
 		{name: "recovered active", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityActive, LastActivityAt: idleSince.Add(time.Second)}}, want: SuppressedStaleEpisode},
 		{name: "new idle episode", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: idleSince.Add(time.Second)}}, want: SuppressedStaleEpisode},
+		{name: "rate limited", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityRateLimited, LastActivityAt: idleSince.Add(time.Second)}}, want: SuppressedRateLimited},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			msg := &fakeMessenger{}
