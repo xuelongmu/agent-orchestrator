@@ -5,6 +5,7 @@ import {
 	DaemonRestartController,
 	isCrashLikeDaemonExit,
 	resolveReachableDaemon,
+	stopAdoptedDaemon,
 	validatedDaemonOwner,
 } from "./daemon-restart";
 
@@ -66,7 +67,7 @@ describe("DaemonRestartController", () => {
 		expect(onExhausted).toHaveBeenCalledTimes(1);
 	});
 
-	it("restores the retry budget when fallback readiness stays stable", async () => {
+	it("restores the retry budget when confirmed readiness stays stable", async () => {
 		const { controller, restart } = createController({ maxRestarts: 1 });
 
 		controller.onUnexpectedExit();
@@ -77,6 +78,34 @@ describe("DaemonRestartController", () => {
 		await vi.advanceTimersByTimeAsync(100);
 
 		expect(restart).toHaveBeenCalledTimes(2);
+	});
+
+	it("does not restore the retry budget for port-unconfirmed renderer readiness", async () => {
+		const { controller, restart } = createController({ maxRestarts: 1 });
+
+		controller.onUnexpectedExit();
+		await vi.advanceTimersByTimeAsync(100);
+		controller.onReady(false);
+		await vi.advanceTimersByTimeAsync(1_000);
+		controller.onUnexpectedExit();
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(restart).toHaveBeenCalledTimes(1);
+	});
+
+	it("cancels a pending stability reset while an adopted PID is still running", async () => {
+		const { controller, restart } = createController({ maxRestarts: 1 });
+
+		controller.onUnexpectedExit();
+		await vi.advanceTimersByTimeAsync(100);
+		controller.onReady();
+		await vi.advanceTimersByTimeAsync(500);
+		controller.onAdoptedLoss("still-running");
+		await vi.advanceTimersByTimeAsync(500);
+		controller.onUnexpectedExit();
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(restart).toHaveBeenCalledTimes(1);
 	});
 
 	it("does not reset the retry budget when readiness is followed by another quick crash", async () => {
@@ -152,7 +181,7 @@ describe("DaemonRestartController", () => {
 		const ownership = new DaemonOwnershipController();
 		ownership.setAppOwned(true);
 		const { controller, restart } = createController();
-		const loss = ownership.classifyAdoptedLoss(null, 42, () => false);
+		const loss = ownership.classifyAdoptedLoss(null, 42, () => "dead");
 
 		controller.onAdoptedLoss(loss);
 		await vi.runAllTimersAsync();
@@ -165,7 +194,7 @@ describe("DaemonRestartController", () => {
 		const ownership = new DaemonOwnershipController();
 		ownership.setAppOwned(true);
 		const { controller, restart } = createController();
-		const loss = ownership.classifyAdoptedLoss({ pid: 42, owner: "app" }, 42, () => false);
+		const loss = ownership.classifyAdoptedLoss({ pid: 42, owner: "app" }, 42, () => "dead");
 
 		controller.onAdoptedLoss(loss);
 		await vi.advanceTimersByTimeAsync(100);
@@ -224,9 +253,76 @@ describe("daemon restart ownership and reachability", () => {
 		const ownership = new DaemonOwnershipController();
 		ownership.setAppOwned(true);
 
-		const loss = ownership.classifyAdoptedLoss({ pid: 42, owner: "app" }, 42, () => true);
+		const loss = ownership.classifyAdoptedLoss({ pid: 42, owner: "app" }, 42, () => "alive");
 
 		expect(loss).toBe("still-running");
+	});
+
+	it("does not guess that an indeterminate adopted PID probe is a crash", () => {
+		const ownership = new DaemonOwnershipController();
+		ownership.setAppOwned(true);
+
+		const loss = ownership.classifyAdoptedLoss({ pid: 42, owner: "app" }, 42, () => "unknown");
+
+		expect(loss).toBe("still-running");
+	});
+});
+
+describe("adopted daemon stop", () => {
+	it("falls back to the owned PID before clearing a disconnected supervisor link", async () => {
+		const events: string[] = [];
+		const stopped = await stopAdoptedDaemon({
+			appOwned: true,
+			alreadyStopped: false,
+			supervisorConnected: false,
+			pid: 42,
+			requestShutdown: async () => {
+				events.push("shutdown-request");
+				return false;
+			},
+			terminateProcess: async (pid) => {
+				events.push(`terminate-${pid}`);
+				return true;
+			},
+			clearOwnership: () => events.push("clear"),
+		});
+
+		expect(stopped).toBe(true);
+		expect(events).toEqual(["shutdown-request", "terminate-42", "clear"]);
+	});
+
+	it("does not report success or clear ownership without an effective stop path", async () => {
+		const clearOwnership = vi.fn();
+		const stopped = await stopAdoptedDaemon({
+			appOwned: true,
+			alreadyStopped: false,
+			supervisorConnected: false,
+			pid: 42,
+			requestShutdown: async () => false,
+			terminateProcess: async () => false,
+			clearOwnership,
+		});
+
+		expect(stopped).toBe(false);
+		expect(clearOwnership).not.toHaveBeenCalled();
+	});
+
+	it("releases a connected supervisor link after the HTTP path is unavailable", async () => {
+		const clearOwnership = vi.fn();
+		const terminateProcess = vi.fn();
+		const stopped = await stopAdoptedDaemon({
+			appOwned: true,
+			alreadyStopped: false,
+			supervisorConnected: true,
+			pid: 42,
+			requestShutdown: async () => false,
+			terminateProcess,
+			clearOwnership,
+		});
+
+		expect(stopped).toBe(true);
+		expect(clearOwnership).toHaveBeenCalledTimes(1);
+		expect(terminateProcess).not.toHaveBeenCalled();
 	});
 });
 
