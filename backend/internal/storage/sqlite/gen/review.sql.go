@@ -109,6 +109,54 @@ func (q *Queries) GetReviewRunBySessionPRAndSHA(ctx context.Context, arg GetRevi
 	return i, err
 }
 
+const insertReviewFinding = `-- name: InsertReviewFinding :exec
+INSERT INTO review_finding (
+    id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
+    fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
+    thread_resolved, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (id) DO NOTHING
+`
+
+type InsertReviewFindingParams struct {
+	ID               string
+	RunID            string
+	SessionID        domain.SessionID
+	PRURL            string
+	Round            int64
+	File             string
+	ClassTag         string
+	RootCauseNote    string
+	FixCommit        string
+	ThreadID         string
+	Body             string
+	OutOfScope       int64
+	DeferredIssueURL string
+	ThreadResolved   int64
+	CreatedAt        time.Time
+}
+
+func (q *Queries) InsertReviewFinding(ctx context.Context, arg InsertReviewFindingParams) error {
+	_, err := q.db.ExecContext(ctx, insertReviewFinding,
+		arg.ID,
+		arg.RunID,
+		arg.SessionID,
+		arg.PRURL,
+		arg.Round,
+		arg.File,
+		arg.ClassTag,
+		arg.RootCauseNote,
+		arg.FixCommit,
+		arg.ThreadID,
+		arg.Body,
+		arg.OutOfScope,
+		arg.DeferredIssueURL,
+		arg.ThreadResolved,
+		arg.CreatedAt,
+	)
+	return err
+}
+
 const insertReviewRun = `-- name: InsertReviewRun :exec
 INSERT INTO review_run (id, review_id, session_id, batch_id, harness, pr_url, target_sha, status, verdict, body, github_review_id, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -145,6 +193,102 @@ func (q *Queries) InsertReviewRun(ctx context.Context, arg InsertReviewRunParams
 		arg.CreatedAt,
 	)
 	return err
+}
+
+const listReviewFindingsByRun = `-- name: ListReviewFindingsByRun :many
+SELECT id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
+       fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
+       thread_resolved, created_at
+FROM review_finding
+WHERE run_id = ?
+ORDER BY created_at ASC, id ASC
+`
+
+func (q *Queries) ListReviewFindingsByRun(ctx context.Context, runID string) ([]ReviewFinding, error) {
+	rows, err := q.db.QueryContext(ctx, listReviewFindingsByRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ReviewFinding{}
+	for rows.Next() {
+		var i ReviewFinding
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.SessionID,
+			&i.PRURL,
+			&i.Round,
+			&i.File,
+			&i.ClassTag,
+			&i.RootCauseNote,
+			&i.FixCommit,
+			&i.ThreadID,
+			&i.Body,
+			&i.OutOfScope,
+			&i.DeferredIssueURL,
+			&i.ThreadResolved,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReviewFindingsBySession = `-- name: ListReviewFindingsBySession :many
+SELECT id, run_id, session_id, pr_url, round, file, class_tag, root_cause_note,
+       fix_commit, thread_id, body, out_of_scope, deferred_issue_url,
+       thread_resolved, created_at
+FROM review_finding
+WHERE session_id = ?
+ORDER BY round ASC, created_at ASC, id ASC
+`
+
+func (q *Queries) ListReviewFindingsBySession(ctx context.Context, sessionID domain.SessionID) ([]ReviewFinding, error) {
+	rows, err := q.db.QueryContext(ctx, listReviewFindingsBySession, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ReviewFinding{}
+	for rows.Next() {
+		var i ReviewFinding
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.SessionID,
+			&i.PRURL,
+			&i.Round,
+			&i.File,
+			&i.ClassTag,
+			&i.RootCauseNote,
+			&i.FixCommit,
+			&i.ThreadID,
+			&i.Body,
+			&i.OutOfScope,
+			&i.DeferredIssueURL,
+			&i.ThreadResolved,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listReviewRunsByBatch = `-- name: ListReviewRunsByBatch :many
@@ -278,6 +422,39 @@ func (q *Queries) ListRunningReviewRunsBySession(ctx context.Context, sessionID 
 	return items, nil
 }
 
+const markReviewFindingIssueFiled = `-- name: MarkReviewFindingIssueFiled :execrows
+UPDATE review_finding
+SET deferred_issue_url = ?
+WHERE id = ? AND deferred_issue_url = ''
+`
+
+type MarkReviewFindingIssueFiledParams struct {
+	DeferredIssueURL string
+	ID               string
+}
+
+func (q *Queries) MarkReviewFindingIssueFiled(ctx context.Context, arg MarkReviewFindingIssueFiledParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markReviewFindingIssueFiled, arg.DeferredIssueURL, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const markReviewFindingThreadResolved = `-- name: MarkReviewFindingThreadResolved :execrows
+UPDATE review_finding
+SET thread_resolved = 1
+WHERE id = ? AND thread_resolved = 0
+`
+
+func (q *Queries) MarkReviewFindingThreadResolved(ctx context.Context, id string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markReviewFindingThreadResolved, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const markReviewRunDelivered = `-- name: MarkReviewRunDelivered :execrows
 UPDATE review_run SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'complete' AND delivered_at IS NULL
 `
@@ -289,6 +466,26 @@ type MarkReviewRunDeliveredParams struct {
 
 func (q *Queries) MarkReviewRunDelivered(ctx context.Context, arg MarkReviewRunDeliveredParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, markReviewRunDelivered, arg.DeliveredAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const setPendingReviewFindingFixCommit = `-- name: SetPendingReviewFindingFixCommit :execrows
+UPDATE review_finding
+SET fix_commit = ?
+WHERE session_id = ? AND pr_url = ? AND fix_commit = ''
+`
+
+type SetPendingReviewFindingFixCommitParams struct {
+	FixCommit string
+	SessionID domain.SessionID
+	PRURL     string
+}
+
+func (q *Queries) SetPendingReviewFindingFixCommit(ctx context.Context, arg SetPendingReviewFindingFixCommitParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setPendingReviewFindingFixCommit, arg.FixCommit, arg.SessionID, arg.PRURL)
 	if err != nil {
 		return 0, err
 	}

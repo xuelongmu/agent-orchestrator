@@ -297,3 +297,40 @@ func TestReviewGettersMissing(t *testing.T) {
 		t.Fatalf("missing run by id: ok=%v err=%v", ok, err)
 	}
 }
+
+func TestReviewFindingLedgerRoundTripsAndBindsFixCommit(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.UpsertReview(ctx, domain.Review{ID: "rev-1", SessionID: rec.ID, ProjectID: rec.ProjectID, Harness: domain.ReviewerCodex, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertReviewRun(ctx, domain.ReviewRun{ID: "run-1", ReviewID: "rev-1", SessionID: rec.ID, Harness: domain.ReviewerCodex, PRURL: "pr1", TargetSHA: "sha1", Status: domain.ReviewRunRunning, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	finding := domain.ReviewFinding{ID: "run-1:1", RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: 1, File: "notify.go", ClassTag: "missing-notify", RootCauseNote: "every broken path notifies", ThreadID: "PRRT_1", CreatedAt: now}
+	if err := s.InsertReviewFinding(ctx, finding); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.SetPendingReviewFindingFixCommit(ctx, rec.ID, "pr1", "sha2"); err != nil || n != 1 {
+		t.Fatalf("bind fix commit = %d, %v", n, err)
+	}
+	if ok, err := s.MarkReviewFindingIssueFiled(ctx, finding.ID, "https://github.com/o/r/issues/60"); err != nil || !ok {
+		t.Fatalf("mark issue = %v, %v", ok, err)
+	}
+	if ok, err := s.MarkReviewFindingThreadResolved(ctx, finding.ID); err != nil || !ok {
+		t.Fatalf("mark thread = %v, %v", ok, err)
+	}
+	got, err := s.ListReviewFindingsBySession(ctx, rec.ID)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("findings = %+v, %v", got, err)
+	}
+	if got[0].FixCommit != "sha2" || got[0].DeferredIssueURL == "" || !got[0].ThreadResolved {
+		t.Fatalf("finding = %+v", got[0])
+	}
+}

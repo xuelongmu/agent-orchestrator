@@ -190,6 +190,62 @@ func (s *Store) ListReviewRunsByBatch(ctx context.Context, id domain.SessionID, 
 	return out, nil
 }
 
+// InsertReviewFinding adds one idempotent entry to the durable finding ledger.
+func (s *Store) InsertReviewFinding(ctx context.Context, finding domain.ReviewFinding) error {
+	return s.qw.InsertReviewFinding(ctx, gen.InsertReviewFindingParams{
+		ID: finding.ID, RunID: finding.RunID, SessionID: finding.SessionID,
+		PRURL: finding.PRURL, Round: int64(finding.Round), File: finding.File,
+		ClassTag: finding.ClassTag, RootCauseNote: finding.RootCauseNote,
+		FixCommit: finding.FixCommit, ThreadID: finding.ThreadID, Body: finding.Body,
+		OutOfScope: boolInt64(finding.OutOfScope), DeferredIssueURL: finding.DeferredIssueURL,
+		ThreadResolved: boolInt64(finding.ThreadResolved), CreatedAt: finding.CreatedAt,
+	})
+}
+
+// ListReviewFindingsBySession returns the full per-worker ledger oldest first.
+func (s *Store) ListReviewFindingsBySession(ctx context.Context, id domain.SessionID) ([]domain.ReviewFinding, error) {
+	rows, err := s.qr.ListReviewFindingsBySession(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("list review findings for session %s: %w", id, err)
+	}
+	out := make([]domain.ReviewFinding, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, reviewFindingFromRow(row))
+	}
+	return out, nil
+}
+
+// ListReviewFindingsByRun returns the findings recorded by one review pass.
+func (s *Store) ListReviewFindingsByRun(ctx context.Context, runID string) ([]domain.ReviewFinding, error) {
+	rows, err := s.qr.ListReviewFindingsByRun(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list review findings for run %s: %w", runID, err)
+	}
+	out := make([]domain.ReviewFinding, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, reviewFindingFromRow(row))
+	}
+	return out, nil
+}
+
+// SetPendingReviewFindingFixCommit binds unfixed findings to the next reviewed
+// head, documenting which commit attempted their fix.
+func (s *Store) SetPendingReviewFindingFixCommit(ctx context.Context, id domain.SessionID, prURL, commit string) (int64, error) {
+	return s.qw.SetPendingReviewFindingFixCommit(ctx, gen.SetPendingReviewFindingFixCommitParams{
+		FixCommit: commit, SessionID: id, PRURL: prURL,
+	})
+}
+
+func (s *Store) MarkReviewFindingIssueFiled(ctx context.Context, id, issueURL string) (bool, error) {
+	n, err := s.qw.MarkReviewFindingIssueFiled(ctx, gen.MarkReviewFindingIssueFiledParams{DeferredIssueURL: issueURL, ID: id})
+	return n > 0, err
+}
+
+func (s *Store) MarkReviewFindingThreadResolved(ctx context.Context, id string) (bool, error) {
+	n, err := s.qw.MarkReviewFindingThreadResolved(ctx, id)
+	return n > 0, err
+}
+
 func reviewFromRow(r gen.Review) domain.Review {
 	return domain.Review{
 		ID:               r.ID,
@@ -224,4 +280,22 @@ func reviewRunFromRow(r gen.ReviewRun) domain.ReviewRun {
 		CreatedAt:      r.CreatedAt,
 		DeliveredAt:    deliveredAt,
 	}
+}
+
+func reviewFindingFromRow(r gen.ReviewFinding) domain.ReviewFinding {
+	return domain.ReviewFinding{
+		ID: r.ID, RunID: r.RunID, SessionID: r.SessionID, PRURL: r.PRURL,
+		Round: int(r.Round), File: r.File, ClassTag: r.ClassTag,
+		RootCauseNote: r.RootCauseNote, FixCommit: r.FixCommit,
+		ThreadID: r.ThreadID, Body: r.Body, OutOfScope: r.OutOfScope != 0,
+		DeferredIssueURL: r.DeferredIssueURL, ThreadResolved: r.ThreadResolved != 0,
+		CreatedAt: r.CreatedAt,
+	}
+}
+
+func boolInt64(v bool) int64 {
+	if v {
+		return 1
+	}
+	return 0
 }

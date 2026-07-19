@@ -50,11 +50,21 @@ type ProjectConfig struct {
 	// triggered. It is configured independently of the Worker override; an empty
 	// list falls back to claude-code (see ResolveReviewerHarness).
 	Reviewers []ReviewerConfig `json:"reviewers,omitempty"`
+	// ReviewPolicy controls optional definition-of-done behavior in the
+	// automatic review/fix loop.
+	ReviewPolicy ReviewPolicyConfig `json:"reviewPolicy,omitempty"`
 
 	// TrackerIntake controls issue-driven worker spawning. It is opt-in and
 	// read-only toward the tracker in v1: matching issues spawn sessions, but the
 	// tracker is not commented on or transitioned.
 	TrackerIntake TrackerIntakeConfig `json:"trackerIntake,omitempty"`
+}
+
+// ReviewPolicyConfig contains opt-in automation that mutates provider state.
+// OutOfScopeDeflection files a follow-up issue and resolves the review thread
+// instead of consuming another fix round.
+type ReviewPolicyConfig struct {
+	OutOfScopeDeflection bool `json:"outOfScopeDeflection,omitempty"`
 }
 
 // ReviewerConfig names one reviewer agent by harness. The harness is drawn from

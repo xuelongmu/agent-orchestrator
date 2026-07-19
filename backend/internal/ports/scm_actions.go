@@ -53,3 +53,28 @@ type SCMReviewThreadResolution struct {
 type SCMReviewThreadResolver interface {
 	ResolveReviewThread(ctx context.Context, threadID string) (SCMReviewThreadResolution, error)
 }
+
+// SCMDeferredIssueRequest describes a review finding that belongs in the
+// backlog instead of the current PR.
+type SCMDeferredIssueRequest struct {
+	PRURL string
+	Title string
+	Body  string
+}
+
+// SCMDeferredIssue is the provider-confirmed backlog item.
+type SCMDeferredIssue struct {
+	URL string
+}
+
+// SCMIssueFiler creates a provider issue in the repository owning a PR.
+type SCMIssueFiler interface {
+	FileDeferredIssue(ctx context.Context, request SCMDeferredIssueRequest) (SCMDeferredIssue, error)
+}
+
+// SCMFindingThreadDeflector links a review thread to its backlog issue and
+// resolves it. Implementations must not report success unless resolution is
+// provider-confirmed.
+type SCMFindingThreadDeflector interface {
+	DeflectReviewThread(ctx context.Context, threadID, issueURL string) (SCMReviewThreadResolution, error)
+}

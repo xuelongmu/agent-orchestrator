@@ -153,6 +153,24 @@ type Review struct {
 	UpdatedAt        time.Time
 }
 
+type ReviewFinding struct {
+	ID               string
+	RunID            string
+	SessionID        domain.SessionID
+	PRURL            string
+	Round            int64
+	File             string
+	ClassTag         string
+	RootCauseNote    string
+	FixCommit        string
+	ThreadID         string
+	Body             string
+	OutOfScope       int64
+	DeferredIssueURL string
+	ThreadResolved   int64
+	CreatedAt        time.Time
+}
+
 type ReviewRun struct {
 	ID             string
 	ReviewID       string

@@ -18,8 +18,10 @@ import (
 // reviewerHandleId is the live reviewer pane's runtime handle, for the UI to
 // attach its terminal over /mux (empty when no reviewer has run).
 type ListReviewsResponse struct {
-	ReviewerHandleID string                     `json:"reviewerHandleId"`
-	Reviews          []reviewcore.PRReviewState `json:"reviews"`
+	ReviewerHandleID string                      `json:"reviewerHandleId"`
+	Reviews          []reviewcore.PRReviewState  `json:"reviews"`
+	Findings         []domain.ReviewFinding      `json:"findings"`
+	Ledger           domain.FindingLedgerSummary `json:"ledger"`
 }
 
 // ReviewRunResponse is the body of submit (200). It carries the run plus the
@@ -46,19 +48,31 @@ type CancelReviewResponse struct {
 
 // SubmitReviewItem is one review result in a batched submit request.
 type SubmitReviewItem struct {
-	RunID          string `json:"runId" description:"Review run id being completed."`
-	Verdict        string `json:"verdict" description:"Review verdict: approved or changes_requested."`
-	Body           string `json:"body,omitempty" description:"Review body recorded by AO. Required for changes_requested."`
-	GithubReviewID string `json:"githubReviewId,omitempty" description:"Id of the GitHub PR review the reviewer posted, if any."`
+	RunID          string              `json:"runId" description:"Review run id being completed."`
+	Verdict        string              `json:"verdict" description:"Review verdict: approved or changes_requested."`
+	Body           string              `json:"body,omitempty" description:"Review body recorded by AO. Required for changes_requested."`
+	GithubReviewID string              `json:"githubReviewId,omitempty" description:"Id of the GitHub PR review the reviewer posted, if any."`
+	Findings       []SubmitFindingItem `json:"findings,omitempty" description:"Structured blocking findings for the finding-class ledger."`
+}
+
+// SubmitFindingItem is one reviewer-classified blocking finding.
+type SubmitFindingItem struct {
+	File          string `json:"file,omitempty"`
+	ClassTag      string `json:"classTag" description:"Stable kebab-case root-cause class."`
+	RootCauseNote string `json:"rootCauseNote" description:"One-line invariant or root-cause explanation."`
+	ThreadID      string `json:"threadId,omitempty" description:"Provider review-thread node id."`
+	Body          string `json:"body,omitempty"`
+	OutOfScope    bool   `json:"outOfScope,omitempty" description:"Finding belongs to a subsystem outside this PR's core scope."`
 }
 
 // SubmitReviewInput is the body of POST /api/v1/sessions/{sessionId}/reviews/submit.
 type SubmitReviewInput struct {
-	RunID          string             `json:"runId,omitempty" description:"Review run id being completed."`
-	Verdict        string             `json:"verdict,omitempty" description:"Review verdict: approved or changes_requested."`
-	Body           string             `json:"body,omitempty" description:"Review body recorded by AO. Required for changes_requested."`
-	GithubReviewID string             `json:"githubReviewId,omitempty" description:"Id of the GitHub PR review the reviewer posted, if any."`
-	Reviews        []SubmitReviewItem `json:"reviews,omitempty" description:"Batched review results recorded by one reviewer CLI command."`
+	RunID          string              `json:"runId,omitempty" description:"Review run id being completed."`
+	Verdict        string              `json:"verdict,omitempty" description:"Review verdict: approved or changes_requested."`
+	Body           string              `json:"body,omitempty" description:"Review body recorded by AO. Required for changes_requested."`
+	GithubReviewID string              `json:"githubReviewId,omitempty" description:"Id of the GitHub PR review the reviewer posted, if any."`
+	Findings       []SubmitFindingItem `json:"findings,omitempty"`
+	Reviews        []SubmitReviewItem  `json:"reviews,omitempty" description:"Batched review results recorded by one reviewer CLI command."`
 }
 
 // ReviewsController owns the session-scoped /reviews routes. A nil Svc returns 501.
@@ -88,7 +102,11 @@ func (c *ReviewsController) list(w http.ResponseWriter, r *http.Request) {
 	if reviews == nil {
 		reviews = []reviewcore.PRReviewState{}
 	}
-	envelope.WriteJSON(w, http.StatusOK, ListReviewsResponse{ReviewerHandleID: res.ReviewerHandleID, Reviews: reviews})
+	findings := res.Findings
+	if findings == nil {
+		findings = []domain.ReviewFinding{}
+	}
+	envelope.WriteJSON(w, http.StatusOK, ListReviewsResponse{ReviewerHandleID: res.ReviewerHandleID, Reviews: reviews, Findings: findings, Ledger: res.Ledger})
 }
 
 func (c *ReviewsController) trigger(w http.ResponseWriter, r *http.Request) {
@@ -155,6 +173,7 @@ func (c *ReviewsController) submit(w http.ResponseWriter, r *http.Request) {
 				Verdict:        domain.ReviewVerdict(item.Verdict),
 				Body:           item.Body,
 				GithubReviewID: item.GithubReviewID,
+				Findings:       submittedFindings(item.Findings),
 			})
 		}
 	} else {
@@ -163,6 +182,7 @@ func (c *ReviewsController) submit(w http.ResponseWriter, r *http.Request) {
 			Verdict:        domain.ReviewVerdict(in.Verdict),
 			Body:           in.Body,
 			GithubReviewID: in.GithubReviewID,
+			Findings:       submittedFindings(in.Findings),
 		})
 	}
 	runs, err := c.Svc.SubmitMany(r.Context(), sessionID(r), reviews)
@@ -175,6 +195,14 @@ func (c *ReviewsController) submit(w http.ResponseWriter, r *http.Request) {
 		first = runs[0]
 	}
 	envelope.WriteJSON(w, http.StatusOK, ReviewRunResponse{Review: first, Reviews: runs})
+}
+
+func submittedFindings(items []SubmitFindingItem) []reviewsvc.SubmittedFinding {
+	out := make([]reviewsvc.SubmittedFinding, 0, len(items))
+	for _, item := range items {
+		out = append(out, reviewsvc.SubmittedFinding{File: item.File, ClassTag: item.ClassTag, RootCauseNote: item.RootCauseNote, ThreadID: item.ThreadID, Body: item.Body, OutOfScope: item.OutOfScope})
+	}
+	return out
 }
 
 func writeReviewError(w http.ResponseWriter, r *http.Request, err error) {

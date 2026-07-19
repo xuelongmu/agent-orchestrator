@@ -18,12 +18,21 @@ import (
 type fakeStore struct {
 	review               *domain.Review
 	runs                 []domain.ReviewRun
+	findings             []domain.ReviewFinding
 	listAllReviewRunHits int
 	// insertErr, when set, makes the next InsertReviewRun model a concurrent
 	// writer that already recorded a run for this commit: it records that
 	// winner (so a follow-up GetReviewRunBySessionAndSHA finds it) and returns
 	// insertErr instead of recording the caller's run.
 	insertErr error
+}
+
+func (f *fakeStore) ListReviewFindingsBySession(context.Context, domain.SessionID) ([]domain.ReviewFinding, error) {
+	return append([]domain.ReviewFinding(nil), f.findings...), nil
+}
+
+func (f *fakeStore) SetPendingReviewFindingFixCommit(context.Context, domain.SessionID, string, string) (int64, error) {
+	return 0, nil
 }
 
 func (f *fakeStore) UpsertReview(_ context.Context, r domain.Review) error {

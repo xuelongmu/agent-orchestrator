@@ -7,6 +7,7 @@ package review
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -37,6 +38,7 @@ type Service struct {
 	engine    *reviewcore.Engine
 	store     Store
 	lifecycle Reducer
+	deflector FindingDeflector
 	clock     func() time.Time
 }
 
@@ -49,6 +51,21 @@ type Store interface {
 	MarkReviewRunDelivered(ctx context.Context, id string, deliveredAt time.Time) (bool, error)
 	ListReviewRunsByBatch(ctx context.Context, sessionID domain.SessionID, batchID string) ([]domain.ReviewRun, error)
 	ListPRsBySession(ctx context.Context, id domain.SessionID) ([]domain.PullRequest, error)
+	ListReviewRunsBySession(ctx context.Context, id domain.SessionID) ([]domain.ReviewRun, error)
+	InsertReviewFinding(ctx context.Context, finding domain.ReviewFinding) error
+	ListReviewFindingsByRun(ctx context.Context, runID string) ([]domain.ReviewFinding, error)
+	ListReviewFindingsBySession(ctx context.Context, id domain.SessionID) ([]domain.ReviewFinding, error)
+	MarkReviewFindingIssueFiled(ctx context.Context, id, issueURL string) (bool, error)
+	MarkReviewFindingThreadResolved(ctx context.Context, id string) (bool, error)
+	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
+	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
+}
+
+// FindingDeflector is the provider mutation surface for opt-in out-of-scope
+// review deflection.
+type FindingDeflector interface {
+	ports.SCMIssueFiler
+	ports.SCMFindingThreadDeflector
 }
 
 // Reducer is the lifecycle reaction boundary used after a review result has
@@ -69,6 +86,12 @@ func WithLifecycleReducer(r Reducer) Option {
 // WithClock overrides the service clock for tests.
 func WithClock(clock func() time.Time) Option {
 	return func(s *Service) { s.clock = clock }
+}
+
+// WithFindingDeflector enables provider mutations when the project review
+// policy opts in.
+func WithFindingDeflector(deflector FindingDeflector) Option {
+	return func(s *Service) { s.deflector = deflector }
 }
 
 // New wraps a core review engine as the API-facing service.
@@ -139,6 +162,18 @@ type SubmittedReview struct {
 	Verdict        domain.ReviewVerdict
 	Body           string
 	GithubReviewID string
+	Findings       []SubmittedFinding
+}
+
+// SubmittedFinding is reviewer-authored structured taxonomy for one blocking
+// finding. ClassTag is a stable kebab-case root-cause category.
+type SubmittedFinding struct {
+	File          string
+	ClassTag      string
+	RootCauseNote string
+	ThreadID      string
+	Body          string
+	OutOfScope    bool
 }
 
 // Submit records a reviewer's result for a specific worker review pass.
@@ -251,10 +286,31 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 	default:
 		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q is not running", ErrInvalid, runID)
 	}
+	findings := review.Findings
+	if verdict == domain.VerdictChangesRequested && len(findings) == 0 {
+		findings = inferFindings(body)
+	}
+	if err := s.recordFindings(ctx, run, findings); err != nil {
+		return domain.ReviewRun{}, err
+	}
+	if err := s.deflectOutOfScope(ctx, run); err != nil {
+		return domain.ReviewRun{}, err
+	}
 	return run, nil
 }
 
 func (s *Service) deliverSubmitted(ctx context.Context, workerID domain.SessionID, runs []domain.ReviewRun) ([]domain.ReviewRun, error) {
+	// Retry partially-completed out-of-scope mutations before deciding which
+	// findings belong in the worker fix dispatch. This path is also used by the
+	// SCM coordinator after restart, so a transient provider failure cannot turn
+	// a deferred finding back into fix work.
+	for _, run := range runs {
+		if run.Status == domain.ReviewRunComplete && run.Verdict == domain.VerdictChangesRequested {
+			if err := s.deflectOutOfScope(ctx, run); err != nil {
+				return nil, err
+			}
+		}
+	}
 	deliverable, err := s.deliverableRuns(ctx, workerID, runs)
 	if err != nil {
 		return nil, err
@@ -262,7 +318,10 @@ func (s *Service) deliverSubmitted(ctx context.Context, workerID domain.SessionI
 	if len(deliverable) == 0 {
 		return nil, nil
 	}
-	results := reviewResults(workerID, deliverable)
+	results, err := s.reviewResults(ctx, workerID, deliverable)
+	if err != nil {
+		return nil, err
+	}
 	var outcome lifecycle.ReviewDeliveryOutcome
 	if len(results) == 1 && results[0].BatchID == "" {
 		outcome, err = s.lifecycle.ApplyReviewResult(ctx, workerID, results[0])
@@ -304,27 +363,197 @@ func (s *Service) deliverableRuns(ctx context.Context, workerID domain.SessionID
 		if run.BatchID != "" && currentHeads[run.PRURL] != run.TargetSHA {
 			continue
 		}
+		findings, err := s.store.ListReviewFindingsByRun(ctx, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(findings) > 0 && !hasActionableFinding(findings) {
+			continue
+		}
 		deliverable = append(deliverable, run)
 	}
 	return deliverable, nil
 }
 
-func reviewResults(workerID domain.SessionID, runs []domain.ReviewRun) []lifecycle.ReviewResult {
+func hasActionableFinding(findings []domain.ReviewFinding) bool {
+	for _, finding := range findings {
+		if !finding.OutOfScope || finding.DeferredIssueURL == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) recordFindings(ctx context.Context, run domain.ReviewRun, submitted []SubmittedFinding) error {
+	if len(submitted) == 0 {
+		return nil
+	}
+	runs, err := s.store.ListReviewRunsBySession(ctx, run.SessionID)
+	if err != nil {
+		return err
+	}
+	heads := map[string]struct{}{}
+	for _, candidate := range runs {
+		if candidate.PRURL == run.PRURL && candidate.TargetSHA != "" {
+			heads[candidate.TargetSHA] = struct{}{}
+		}
+	}
+	round := len(heads)
+	if round == 0 {
+		round = 1
+	}
+	for i, item := range submitted {
+		classTag := normalizeClassTag(item.ClassTag)
+		if classTag == "" {
+			return fmt.Errorf("%w: findings[%d].classTag is required", ErrInvalid, i)
+		}
+		finding := domain.ReviewFinding{
+			ID: fmt.Sprintf("%s:%d", run.ID, i+1), RunID: run.ID,
+			SessionID: run.SessionID, PRURL: run.PRURL, Round: round,
+			File: strings.TrimSpace(item.File), ClassTag: classTag,
+			RootCauseNote: strings.TrimSpace(item.RootCauseNote),
+			ThreadID:      strings.TrimSpace(item.ThreadID), Body: strings.TrimSpace(item.Body),
+			OutOfScope: item.OutOfScope, CreatedAt: s.clock(),
+		}
+		if finding.RootCauseNote == "" {
+			finding.RootCauseNote = finding.Body
+		}
+		if err := s.store.InsertReviewFinding(ctx, finding); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizeClassTag(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	dash := false
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+			dash = false
+		} else if b.Len() > 0 && !dash {
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func inferFindings(body string) []SubmittedFinding {
+	var findings []SubmittedFinding
+	for _, line := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
+		lower := strings.ToLower(line)
+		if !strings.Contains(lower, "[p0]") && !strings.Contains(lower, "[p1]") {
+			continue
+		}
+		classTag := "correctness-invariant"
+		switch {
+		case strings.Contains(lower, "notify") || strings.Contains(lower, "notification"):
+			classTag = "missing-notification-on-broken-path"
+		case strings.Contains(lower, "error") || strings.Contains(lower, "fail"):
+			classTag = "missing-error-handling"
+		case strings.Contains(lower, "race") || strings.Contains(lower, "concurr"):
+			classTag = "concurrency-safety"
+		case strings.Contains(lower, "nil") || strings.Contains(lower, "null"):
+			classTag = "nil-safety"
+		case strings.Contains(lower, "auth") || strings.Contains(lower, "permission"):
+			classTag = "authorization"
+		}
+		findings = append(findings, SubmittedFinding{ClassTag: classTag, RootCauseNote: strings.TrimSpace(line), Body: strings.TrimSpace(line)})
+	}
+	return findings
+}
+
+func (s *Service) deflectOutOfScope(ctx context.Context, run domain.ReviewRun) error {
+	if s.deflector == nil {
+		return nil
+	}
+	session, ok, err := s.store.GetSession(ctx, run.SessionID)
+	if err != nil || !ok {
+		return err
+	}
+	project, ok, err := s.store.GetProject(ctx, string(session.ProjectID))
+	if err != nil || !ok || !project.Config.ReviewPolicy.OutOfScopeDeflection {
+		return err
+	}
+	findings, err := s.store.ListReviewFindingsByRun(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	for _, finding := range findings {
+		if !finding.OutOfScope {
+			continue
+		}
+		issueURL := finding.DeferredIssueURL
+		if issueURL == "" {
+			title := fmt.Sprintf("review follow-up: %s", strings.ReplaceAll(finding.ClassTag, "-", " "))
+			body := fmt.Sprintf("Deferred from %s review round %d.\n\nFile: `%s`\n\nRoot cause: %s\n\n%s", run.PRURL, finding.Round, finding.File, finding.RootCauseNote, finding.Body)
+			filed, err := s.deflector.FileDeferredIssue(ctx, ports.SCMDeferredIssueRequest{PRURL: run.PRURL, Title: title, Body: body})
+			if err != nil {
+				return err
+			}
+			issueURL = filed.URL
+			if _, err := s.store.MarkReviewFindingIssueFiled(ctx, finding.ID, issueURL); err != nil {
+				return err
+			}
+		}
+		if finding.ThreadID != "" && !finding.ThreadResolved {
+			resolved, err := s.deflector.DeflectReviewThread(ctx, finding.ThreadID, issueURL)
+			if err != nil {
+				return err
+			}
+			if !resolved.Resolved {
+				return fmt.Errorf("review finding %s thread resolution was not confirmed", finding.ID)
+			}
+			if _, err := s.store.MarkReviewFindingThreadResolved(ctx, finding.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) reviewResults(ctx context.Context, workerID domain.SessionID, runs []domain.ReviewRun) ([]lifecycle.ReviewResult, error) {
+	ledgerFindings, err := s.store.ListReviewFindingsBySession(ctx, workerID)
+	if err != nil {
+		return nil, err
+	}
 	results := make([]lifecycle.ReviewResult, 0, len(runs))
 	for _, run := range runs {
+		prFindings := findingsForPR(ledgerFindings, run.PRURL)
+		ledger, simplificationClass := reviewcore.FindingLedger(prFindings)
+		findings, err := s.store.ListReviewFindingsByRun(ctx, run.ID)
+		if err != nil {
+			return nil, err
+		}
 		results = append(results, lifecycle.ReviewResult{
-			RunID:          run.ID,
-			BatchID:        run.BatchID,
-			WorkerID:       workerID,
-			PRURL:          run.PRURL,
-			TargetSHA:      run.TargetSHA,
-			Verdict:        run.Verdict,
-			Body:           run.Body,
-			GithubReviewID: run.GithubReviewID,
-			DeliveredAt:    run.DeliveredAt,
+			RunID:               run.ID,
+			BatchID:             run.BatchID,
+			WorkerID:            workerID,
+			PRURL:               run.PRURL,
+			TargetSHA:           run.TargetSHA,
+			Verdict:             run.Verdict,
+			Body:                run.Body,
+			GithubReviewID:      run.GithubReviewID,
+			DeliveredAt:         run.DeliveredAt,
+			Findings:            findings,
+			Ledger:              ledger,
+			SimplificationClass: simplificationClass,
 		})
 	}
-	return results
+	return results, nil
+}
+
+func findingsForPR(findings []domain.ReviewFinding, prURL string) []domain.ReviewFinding {
+	out := make([]domain.ReviewFinding, 0, len(findings))
+	for _, finding := range findings {
+		if finding.PRURL == prURL {
+			out = append(out, finding)
+		}
+	}
+	return out
 }
 
 func (s *Service) currentHeadsByPR(ctx context.Context, workerID domain.SessionID) (map[string]string, error) {

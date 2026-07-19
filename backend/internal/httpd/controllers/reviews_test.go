@@ -89,6 +89,8 @@ func TestReviewsListIncludesReviewStates(t *testing.T) {
 		ReviewerHandleID: "review-mer-1",
 		Runs:             []domain.ReviewRun{{ID: "run-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1"}},
 		Reviews:          []reviewcore.PRReviewState{{PRURL: "https://github.com/o/r/pull/1", PRNumber: 1, TargetSHA: "sha1", Status: reviewcore.ReviewStateUpToDate}},
+		Findings:         []domain.ReviewFinding{{ID: "f-1", ClassTag: "missing-notify", Round: 1}},
+		Ledger:           domain.FindingLedgerSummary{TotalFindings: 1, Rounds: 1, Classes: []domain.FindingClassCount{{ClassTag: "missing-notify", Count: 1}}},
 	}})
 
 	body, status, headers := doRequest(t, srv, "GET", "/api/v1/sessions/mer-1/reviews", "")
@@ -101,6 +103,9 @@ func TestReviewsListIncludesReviewStates(t *testing.T) {
 	}
 	if strings.Contains(string(body), `"items"`) || strings.Contains(string(body), `"reviewItems"`) || strings.Contains(string(body), `"reviewRuns"`) {
 		t.Fatalf("body contains deprecated review item aliases: %s", body)
+	}
+	if !strings.Contains(string(body), `"findings"`) || !strings.Contains(string(body), `"classTag":"missing-notify"`) {
+		t.Fatalf("body missing finding ledger: %s", body)
 	}
 }
 
@@ -159,13 +164,16 @@ func TestReviewsSubmitAcceptsBatchedReviews(t *testing.T) {
 	svc := &fakeReviewService{}
 	srv := newReviewTestServer(t, svc)
 
-	body, status, headers := doRequest(t, srv, "POST", "/api/v1/sessions/mer-1/reviews/submit", `{"reviews":[{"runId":"run-1","verdict":"changes_requested","body":"fix auth","githubReviewId":"101"},{"runId":"run-2","verdict":"approved"}]}`)
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/sessions/mer-1/reviews/submit", `{"reviews":[{"runId":"run-1","verdict":"changes_requested","body":"fix auth","githubReviewId":"101","findings":[{"file":"auth.go","classTag":"authorization","rootCauseNote":"all paths authorize","threadId":"PRRT_1"}]},{"runId":"run-2","verdict":"approved"}]}`)
 	assertJSON(t, headers)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d body=%s", status, body)
 	}
 	if len(svc.submitted) != 2 || svc.submitted[0].RunID != "run-1" || svc.submitted[1].Verdict != domain.VerdictApproved {
 		t.Fatalf("submitted = %+v", svc.submitted)
+	}
+	if len(svc.submitted[0].Findings) != 1 || svc.submitted[0].Findings[0].ClassTag != "authorization" || svc.submitted[0].Findings[0].ThreadID != "PRRT_1" {
+		t.Fatalf("submitted findings = %+v", svc.submitted[0].Findings)
 	}
 	for _, want := range []string{`"reviews"`, `"run-1"`, `"run-2"`} {
 		if !strings.Contains(string(body), want) {

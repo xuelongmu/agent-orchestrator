@@ -40,6 +40,8 @@ type Store interface {
 	GetReviewRunBySessionPRAndSHA(ctx stdctx.Context, id domain.SessionID, prURL, targetSHA string) (domain.ReviewRun, bool, error)
 	ListReviewRunsBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.ReviewRun, error)
 	ListRunningReviewRunsBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.ReviewRun, error)
+	ListReviewFindingsBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.ReviewFinding, error)
+	SetPendingReviewFindingFixCommit(ctx stdctx.Context, id domain.SessionID, prURL, commit string) (int64, error)
 }
 
 // Sessions resolves the worker session under review.
@@ -149,6 +151,8 @@ type SessionReviews struct {
 	ReviewerHandleID string
 	Runs             []domain.ReviewRun
 	Reviews          []PRReviewState
+	Findings         []domain.ReviewFinding
+	Ledger           domain.FindingLedgerSummary
 }
 
 // CancelResult is the review state after a reviewer pane cancellation.
@@ -387,7 +391,12 @@ func (e *Engine) List(ctx stdctx.Context, workerID domain.SessionID) (SessionRev
 	if err != nil {
 		return SessionReviews{}, err
 	}
-	return SessionReviews{ReviewerHandleID: handle, Runs: runs, Reviews: Plan(prs, runs)}, nil
+	findings, err := e.store.ListReviewFindingsBySession(ctx, workerID)
+	if err != nil {
+		return SessionReviews{}, err
+	}
+	ledger, _ := FindingLedger(findings)
+	return SessionReviews{ReviewerHandleID: handle, Runs: runs, Reviews: Plan(prs, runs), Findings: findings, Ledger: ledger}, nil
 }
 
 // Cancel interrupts the live reviewer pane for a worker and marks running
