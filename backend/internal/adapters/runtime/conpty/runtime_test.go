@@ -99,13 +99,13 @@ func fakeSpawnerFor(t *testing.T, hosts map[string]*inProcHost, fakePID int) hos
 }
 
 // ---------------------------------------------------------------------------
-// Redirect ptyregistry to a temp HOME so tests don't pollute ~/.ao
+// Redirect ptyregistry to a temp data dir so tests don't pollute ~/.ao.
 // ---------------------------------------------------------------------------
 
 func isolateRegistry(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("HOME", dir)
+	t.Setenv("AO_DATA_DIR", dir)
 }
 
 // ---------------------------------------------------------------------------

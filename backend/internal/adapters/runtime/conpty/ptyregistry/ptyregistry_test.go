@@ -22,11 +22,43 @@ func setupHome(t *testing.T) string {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 	t.Setenv("USERPROFILE", dir)
+	t.Setenv("AO_DATA_DIR", "")
 	return filepath.Join(dir, ".ao", "windows-pty-hosts.json")
 }
 
 func nowRFC3339() string {
 	return time.Now().UTC().Format(time.RFC3339)
+}
+
+func TestRegistryUsesAODataDir(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(t.TempDir(), "isolated", "data")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_DATA_DIR", dataDir)
+	withFakePidAlive(t, func(int) bool { return true })
+
+	e := Entry{SessionID: "s1", PtyHostPID: 1234, PipePath: `\\.\pipe\ao-s1`, RegisteredAt: nowRFC3339()}
+	if err := Register(e); err != nil {
+		t.Fatal(err)
+	}
+
+	registryPath := filepath.Join(dataDir, "windows-pty-hosts.json")
+	if _, err := os.Stat(registryPath); err != nil {
+		t.Fatalf("registry not written under AO_DATA_DIR: %v", err)
+	}
+	legacyPath := filepath.Join(home, ".ao", "windows-pty-hosts.json")
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("registry unexpectedly escaped isolated data dir: %v", err)
+	}
+
+	got, err := List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SessionID != "s1" {
+		t.Fatalf("expected isolated registry entry [s1], got %v", got)
+	}
 }
 
 func TestRegisterThenList(t *testing.T) {

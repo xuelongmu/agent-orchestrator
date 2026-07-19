@@ -23,10 +23,14 @@ type Entry struct {
 // pidalive_windows.go).
 var pidAlive = defaultPidAlive
 
-// registryFile resolves ~/.ao/windows-pty-hosts.json. Uses os.UserHomeDir()
-// so t.Setenv("HOME", dir) in tests redirects reads/writes to a temp dir.
-// ponytail: HOME-based resolution; no AO_DATA_DIR override needed here.
+// registryFile resolves windows-pty-hosts.json under AO_DATA_DIR when set so
+// isolated daemon stores also have isolated crash-recovery registries. The
+// default remains ~/.ao/windows-pty-hosts.json for compatibility with existing
+// installs. Uses os.UserHomeDir() so tests can redirect the default safely.
 func registryFile() (string, error) {
+	if dataDir, ok := os.LookupEnv("AO_DATA_DIR"); ok && dataDir != "" {
+		return filepath.Join(dataDir, "windows-pty-hosts.json"), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
