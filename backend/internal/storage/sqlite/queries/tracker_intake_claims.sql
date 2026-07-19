@@ -7,7 +7,12 @@ WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?;
 -- name: FindAdmittedTrackerIntakeSession :one
 SELECT id
 FROM sessions
-WHERE project_id = ? AND issue_id = ?
+WHERE project_id = sqlc.arg(project_id)
+  AND (
+      issue_id = sqlc.arg(canonical_issue_id)
+      OR (CAST(sqlc.arg(provider) AS TEXT) = 'github' AND lower(issue_id) = lower(sqlc.arg(canonical_issue_id)))
+  )
+  AND is_terminated = FALSE
   AND (workspace_path <> '' OR runtime_handle_id <> '' OR agent_session_id <> '' OR prompt <> '')
 ORDER BY num
 LIMIT 1;
@@ -15,7 +20,12 @@ LIMIT 1;
 -- name: TrackerIntakeSessionMatches :one
 SELECT EXISTS(
     SELECT 1 FROM sessions
-    WHERE id = ? AND project_id = ? AND issue_id = ?
+    WHERE id = sqlc.arg(id) AND project_id = sqlc.arg(project_id)
+      AND (
+          issue_id = sqlc.arg(canonical_issue_id)
+          OR (CAST(sqlc.arg(provider) AS TEXT) = 'github' AND lower(issue_id) = lower(sqlc.arg(canonical_issue_id)))
+      )
+      AND is_terminated = FALSE
       AND (workspace_path <> '' OR runtime_handle_id <> '' OR agent_session_id <> '' OR prompt <> '')
 ) AS matches;
 
@@ -42,7 +52,7 @@ SELECT
             OR NOT EXISTS (
                 SELECT 1 FROM tracker_intake_claims AS seed_claim
                 WHERE seed_claim.project_id = active_session.project_id
-                  AND seed_claim.status = 'pending'
+                  AND seed_claim.status = 'admitted'
                   AND seed_claim.session_id = active_session.id
             )
         ))
@@ -50,13 +60,28 @@ SELECT
     (SELECT COUNT(*)
        FROM tracker_intake_claims AS claim
       WHERE claim.project_id = ?
-        AND claim.status = 'pending'
-        AND claim.lease_expires_at > ?
+        AND (
+            (claim.status = 'pending' AND claim.lease_expires_at > ?)
+            OR (
+                claim.status = 'admitted'
+                AND (
+                    claim.lease_expires_at > ?
+                    OR EXISTS (SELECT 1 FROM sessions AS bound_session WHERE bound_session.id = claim.session_id)
+                )
+            )
+        )
         AND NOT EXISTS (
             SELECT 1
               FROM sessions
              WHERE sessions.project_id = claim.project_id
-               AND sessions.issue_id = claim.provider || ':' || claim.issue_id
+               AND (
+                   sessions.issue_id = claim.provider || ':' || claim.issue_id
+                   OR (
+                       claim.provider = 'github'
+                       AND lower(sessions.issue_id) = lower(claim.provider || ':' || claim.issue_id)
+                   )
+               )
+               AND sessions.is_terminated = FALSE
                AND (sessions.workspace_path <> '' OR sessions.runtime_handle_id <> '' OR sessions.agent_session_id <> '' OR sessions.prompt <> '')
         )) AS used;
 
@@ -72,13 +97,13 @@ UPDATE tracker_intake_claims
 SET owner_token = ?, status = 'pending', session_id = '', claimed_at = ?,
     lease_expires_at = ?, completed_at = NULL
 WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?
-  AND status = 'pending'
+  AND status IN ('pending', 'admitted')
   AND owner_token = ?
   AND lease_expires_at <= ?;
 
 -- name: AttachTrackerIntakeClaimSeed :execrows
 UPDATE tracker_intake_claims
-SET session_id = ?
+SET status = 'admitted', session_id = ?
 WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?
   AND status = 'pending' AND owner_token = ? AND lease_expires_at > ?
   AND session_id = '';
@@ -99,21 +124,21 @@ WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?;
 UPDATE tracker_intake_claims
 SET status = 'completed', session_id = ?, lease_expires_at = ?, completed_at = ?
 WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?
-  AND status = 'pending' AND owner_token = ?;
+  AND status = 'admitted' AND owner_token = ?;
 
 -- name: RenewTrackerIntakeClaim :execrows
 UPDATE tracker_intake_claims
 SET lease_expires_at = CASE
-    WHEN status = 'pending' AND lease_expires_at < ? THEN ?
+    WHEN status IN ('pending', 'admitted') AND lease_expires_at < ? THEN ?
     ELSE lease_expires_at
 END
 WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?
   AND (
       status = 'completed'
-      OR (status = 'pending' AND owner_token = ? AND lease_expires_at > ?)
+      OR (status IN ('pending', 'admitted') AND owner_token = ? AND lease_expires_at > ?)
   );
 
 -- name: ReleaseTrackerIntakeClaim :execrows
 DELETE FROM tracker_intake_claims
 WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?
-  AND status = 'pending' AND owner_token = ?;
+  AND status IN ('pending', 'admitted') AND owner_token = ?;

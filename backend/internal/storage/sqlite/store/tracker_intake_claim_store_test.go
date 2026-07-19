@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -258,7 +259,7 @@ func TestTrackerIntakeTransientSeedNeverCompletesClaimAndFailureRetriesAfterReop
 	}
 }
 
-func TestTrackerIntakeExpiredTakeoverDeletesSeedAndFencesLateOriginalAdmission(t *testing.T) {
+func TestTrackerIntakeExpiredAdmissionWithSurvivingSeedFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
 	seedProject(t, store, "demo")
@@ -276,14 +277,14 @@ func TestTrackerIntakeExpiredTakeoverDeletesSeedAndFencesLateOriginalAdmission(t
 	}
 
 	successor := intakeClaim("demo", "acme/demo#28", "owner-b", now.Add(6*time.Minute))
-	if hasCapacity, err := store.TrackerIntakeHasCapacity(ctx, "demo", 1, successor.ClaimedAt); err != nil || !hasCapacity {
-		t.Fatalf("expired claim plus stale seed capacity=%v err=%v, want retry slot available", hasCapacity, err)
+	if hasCapacity, err := store.TrackerIntakeHasCapacity(ctx, "demo", 1, successor.ClaimedAt); err != nil || hasCapacity {
+		t.Fatalf("expired admitted claim with a surviving seed capacity=%v err=%v, want reserved slot", hasCapacity, err)
 	}
-	if result, err := store.ClaimTrackerIntakeIssue(ctx, successor, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
-		t.Fatalf("takeover result=%v err=%v", result, err)
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, successor, 1); err != nil || result != ports.TrackerIntakeClaimBusy {
+		t.Fatalf("takeover result=%v err=%v, want fail-closed busy", result, err)
 	}
-	if _, ok, err := store.GetSession(ctx, seed.ID); err != nil || ok {
-		t.Fatalf("expired owner's seed survived takeover: ok=%v err=%v", ok, err)
+	if _, ok, err := store.GetSession(ctx, seed.ID); err != nil || !ok {
+		t.Fatalf("expired owner's seed was deleted: ok=%v err=%v", ok, err)
 	}
 	late := sampleRecord("demo")
 	late.Metadata = domain.SessionMetadata{}
@@ -291,12 +292,145 @@ func TestTrackerIntakeExpiredTakeoverDeletesSeedAndFencesLateOriginalAdmission(t
 	if _, err := store.CreateClaimedSession(ctx, late, original, successor.ClaimedAt); !errors.Is(err, ports.ErrTrackerIntakeClaimLost) {
 		t.Fatalf("late original admission err=%v, want ErrTrackerIntakeClaimLost", err)
 	}
-	if _, err := store.CreateClaimedSession(ctx, late, successor, successor.ClaimedAt.Add(time.Second)); err != nil {
-		t.Fatalf("successor admission: %v", err)
+	if _, err := store.CreateClaimedSession(ctx, late, successor, successor.ClaimedAt.Add(time.Second)); !errors.Is(err, ports.ErrTrackerIntakeClaimLost) {
+		t.Fatalf("unacquired successor admission err=%v, want ErrTrackerIntakeClaimLost", err)
 	}
 }
 
-func TestTrackerIntakeExpiredTakeoverDeletesOnlyItsBoundSeed(t *testing.T) {
+func TestTrackerIntakeExpiredTakeoverAllowsAlreadyDeletedBoundSeedAfterReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	first, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedProject(t, first, "demo")
+	original := intakeClaim("demo", "acme/demo#28", "owner-a", now)
+	if result, err := first.ClaimTrackerIntakeIssue(ctx, original, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
+		t.Fatalf("original claim result=%v err=%v", result, err)
+	}
+	seed := sampleRecord("demo")
+	seed.Metadata = domain.SessionMetadata{}
+	seed.IssueID = "github:acme/demo#28"
+	seed, err = first.CreateClaimedSession(ctx, seed, original, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := first.DeleteSession(ctx, seed.ID); err != nil || !deleted {
+		t.Fatalf("rollback seed deleted=%v err=%v", deleted, err)
+	}
+	// Deliberately omit ReleaseTrackerIntakeIssue, modeling a crash in the gap.
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	successor := intakeClaim("demo", "acme/demo#28", "owner-b", now.Add(6*time.Minute))
+	if result, err := second.ClaimTrackerIntakeIssue(ctx, successor, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
+		t.Fatalf("takeover after rollback/crash result=%v err=%v", result, err)
+	}
+}
+
+func TestTrackerIntakeExpiredTakeoverStillRejectsExistingBoundNonSeed(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	seedProject(t, store, "demo")
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	original := intakeClaim("demo", "acme/demo#28", "owner-a", now)
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, original, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
+		t.Fatalf("original claim result=%v err=%v", result, err)
+	}
+	bound := sampleRecord("demo")
+	bound.Metadata = domain.SessionMetadata{}
+	bound.IssueID = "github:acme/demo#28"
+	bound, err := store.CreateClaimedSession(ctx, bound, original, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Move the exact bound row out of the claim identity and out of seed state.
+	// It must neither reconcile as this issue nor be deleted by takeover.
+	bound.IssueID = "github:other/repo#99"
+	bound.Metadata.WorkspacePath = "/workspace"
+	bound.Metadata.Prompt = "running"
+	if err := store.UpdateSession(ctx, bound); err != nil {
+		t.Fatal(err)
+	}
+	successor := intakeClaim("demo", "acme/demo#28", "owner-b", now.Add(6*time.Minute))
+	if _, err := store.ClaimTrackerIntakeIssue(ctx, successor, 1); err == nil || !strings.Contains(err.Error(), "references non-seed session") {
+		t.Fatalf("takeover err=%v, want existing non-seed rejection", err)
+	}
+	if _, ok, err := store.GetSession(ctx, bound.ID); err != nil || !ok {
+		t.Fatalf("bound non-seed was removed: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestTrackerIntakeRecognizesLegacyMixedCaseGitHubSessionOnly(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	seedProject(t, store, "demo")
+	now := time.Now().UTC().Truncate(time.Second)
+	legacy := sampleRecord("demo")
+	legacy.IssueID = "github:Acme/Demo#12"
+	if _, err := store.CreateSession(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	githubClaim := intakeClaim("demo", "acme/demo#12", "github-owner", now)
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, githubClaim, 2); err != nil || result != ports.TrackerIntakeClaimAlreadyProcessed {
+		t.Fatalf("legacy GitHub reconciliation result=%v err=%v", result, err)
+	}
+
+	caseSensitive := intakeClaim("demo", "group/repo#12", "gitlab-owner", now)
+	caseSensitive.Provider = domain.TrackerProvider("gitlab")
+	caseSensitive.Repo = "group/repo"
+	legacyOther := sampleRecord("demo")
+	legacyOther.IssueID = "gitlab:Group/Repo#12"
+	legacyOther.IsTerminated = true // avoid consuming capacity; only identity matching is under test
+	if _, err := store.CreateSession(ctx, legacyOther); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, caseSensitive, 2); err != nil || result != ports.TrackerIntakeClaimAcquired {
+		t.Fatalf("case-sensitive provider result=%v err=%v, want distinct acquired claim", result, err)
+	}
+}
+
+func TestTrackerIntakeTerminatedFailedAdmissionCanBeReleasedAndRetried(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	seedProject(t, store, "demo")
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	original := intakeClaim("demo", "acme/demo#28", "owner-a", now)
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, original, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
+		t.Fatalf("original claim result=%v err=%v", result, err)
+	}
+	failed := sampleRecord("demo")
+	failed.Metadata = domain.SessionMetadata{}
+	failed.IssueID = "github:acme/demo#28"
+	failed, err := store.CreateClaimedSession(ctx, failed, original, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Prompt delivery after runtime start can leave admission metadata behind,
+	// but termination proves this worker was not successfully admitted.
+	failed.IsTerminated = true
+	failed.Metadata.Prompt = "failed prompt delivery"
+	if err := store.UpdateSession(ctx, failed); err != nil {
+		t.Fatal(err)
+	}
+	if released, err := store.ReleaseTrackerIntakeIssue(ctx, original, now.Add(2*time.Second)); err != nil || !released {
+		t.Fatalf("failed admission released=%v err=%v", released, err)
+	}
+	retry := intakeClaim("demo", "acme/demo#28", "owner-b", now.Add(3*time.Second))
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, retry, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
+		t.Fatalf("retry claim result=%v err=%v", result, err)
+	}
+}
+
+func TestTrackerIntakeExpiredAdmissionNeverDeletesAnySeed(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
 	seedProject(t, store, "demo")
@@ -333,15 +467,12 @@ func TestTrackerIntakeExpiredTakeoverDeletesOnlyItsBoundSeed(t *testing.T) {
 	}
 
 	successor := intakeClaim("demo", "acme/demo#28", "owner-b", now.Add(6*time.Minute))
-	if result, err := store.ClaimTrackerIntakeIssue(ctx, successor, 3); err != nil || result != ports.TrackerIntakeClaimAcquired {
-		t.Fatalf("takeover result=%v err=%v", result, err)
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, successor, 3); err != nil || result != ports.TrackerIntakeClaimBusy {
+		t.Fatalf("takeover result=%v err=%v, want fail-closed busy", result, err)
 	}
-	if _, ok, _ := store.GetSession(ctx, claimedSeed.ID); ok {
-		t.Fatalf("bound expired seed %s survived takeover", claimedSeed.ID)
-	}
-	for _, id := range []domain.SessionID{manualSeed.ID, otherSeed.ID} {
+	for _, id := range []domain.SessionID{claimedSeed.ID, manualSeed.ID, otherSeed.ID} {
 		if _, ok, err := store.GetSession(ctx, id); err != nil || !ok {
-			t.Fatalf("unrelated seed %s was deleted: ok=%v err=%v", id, ok, err)
+			t.Fatalf("seed %s was deleted: ok=%v err=%v", id, ok, err)
 		}
 	}
 }

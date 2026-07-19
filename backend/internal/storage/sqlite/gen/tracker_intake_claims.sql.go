@@ -15,7 +15,7 @@ import (
 
 const attachTrackerIntakeClaimSeed = `-- name: AttachTrackerIntakeClaimSeed :execrows
 UPDATE tracker_intake_claims
-SET session_id = ?
+SET status = 'admitted', session_id = ?
 WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?
   AND status = 'pending' AND owner_token = ? AND lease_expires_at > ?
   AND session_id = ''
@@ -51,7 +51,7 @@ const completeTrackerIntakeClaim = `-- name: CompleteTrackerIntakeClaim :execrow
 UPDATE tracker_intake_claims
 SET status = 'completed', session_id = ?, lease_expires_at = ?, completed_at = ?
 WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?
-  AND status = 'pending' AND owner_token = ?
+  AND status = 'admitted' AND owner_token = ?
 `
 
 type CompleteTrackerIntakeClaimParams struct {
@@ -98,7 +98,7 @@ SELECT
             OR NOT EXISTS (
                 SELECT 1 FROM tracker_intake_claims AS seed_claim
                 WHERE seed_claim.project_id = active_session.project_id
-                  AND seed_claim.status = 'pending'
+                  AND seed_claim.status = 'admitted'
                   AND seed_claim.session_id = active_session.id
             )
         ))
@@ -106,25 +106,46 @@ SELECT
     (SELECT COUNT(*)
        FROM tracker_intake_claims AS claim
       WHERE claim.project_id = ?
-        AND claim.status = 'pending'
-        AND claim.lease_expires_at > ?
+        AND (
+            (claim.status = 'pending' AND claim.lease_expires_at > ?)
+            OR (
+                claim.status = 'admitted'
+                AND (
+                    claim.lease_expires_at > ?
+                    OR EXISTS (SELECT 1 FROM sessions AS bound_session WHERE bound_session.id = claim.session_id)
+                )
+            )
+        )
         AND NOT EXISTS (
             SELECT 1
               FROM sessions
              WHERE sessions.project_id = claim.project_id
-               AND sessions.issue_id = claim.provider || ':' || claim.issue_id
+               AND (
+                   sessions.issue_id = claim.provider || ':' || claim.issue_id
+                   OR (
+                       claim.provider = 'github'
+                       AND lower(sessions.issue_id) = lower(claim.provider || ':' || claim.issue_id)
+                   )
+               )
+               AND sessions.is_terminated = FALSE
                AND (sessions.workspace_path <> '' OR sessions.runtime_handle_id <> '' OR sessions.agent_session_id <> '' OR sessions.prompt <> '')
         )) AS used
 `
 
 type CountTrackerIntakeCapacityUsedParams struct {
-	ProjectID      domain.ProjectID
-	ProjectID_2    string
-	LeaseExpiresAt time.Time
+	ProjectID        domain.ProjectID
+	ProjectID_2      string
+	LeaseExpiresAt   time.Time
+	LeaseExpiresAt_2 time.Time
 }
 
 func (q *Queries) CountTrackerIntakeCapacityUsed(ctx context.Context, arg CountTrackerIntakeCapacityUsedParams) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countTrackerIntakeCapacityUsed, arg.ProjectID, arg.ProjectID_2, arg.LeaseExpiresAt)
+	row := q.db.QueryRowContext(ctx, countTrackerIntakeCapacityUsed,
+		arg.ProjectID,
+		arg.ProjectID_2,
+		arg.LeaseExpiresAt,
+		arg.LeaseExpiresAt_2,
+	)
 	var used int64
 	err := row.Scan(&used)
 	return used, err
@@ -133,19 +154,25 @@ func (q *Queries) CountTrackerIntakeCapacityUsed(ctx context.Context, arg CountT
 const findAdmittedTrackerIntakeSession = `-- name: FindAdmittedTrackerIntakeSession :one
 SELECT id
 FROM sessions
-WHERE project_id = ? AND issue_id = ?
+WHERE project_id = ?1
+  AND (
+      issue_id = ?2
+      OR (CAST(?3 AS TEXT) = 'github' AND lower(issue_id) = lower(?2))
+  )
+  AND is_terminated = FALSE
   AND (workspace_path <> '' OR runtime_handle_id <> '' OR agent_session_id <> '' OR prompt <> '')
 ORDER BY num
 LIMIT 1
 `
 
 type FindAdmittedTrackerIntakeSessionParams struct {
-	ProjectID domain.ProjectID
-	IssueID   domain.IssueID
+	ProjectID        domain.ProjectID
+	CanonicalIssueID domain.IssueID
+	Provider         string
 }
 
 func (q *Queries) FindAdmittedTrackerIntakeSession(ctx context.Context, arg FindAdmittedTrackerIntakeSessionParams) (domain.SessionID, error) {
-	row := q.db.QueryRowContext(ctx, findAdmittedTrackerIntakeSession, arg.ProjectID, arg.IssueID)
+	row := q.db.QueryRowContext(ctx, findAdmittedTrackerIntakeSession, arg.ProjectID, arg.CanonicalIssueID, arg.Provider)
 	var id domain.SessionID
 	err := row.Scan(&id)
 	return id, err
@@ -295,7 +322,7 @@ func (q *Queries) ReconcileTrackerIntakeClaim(ctx context.Context, arg Reconcile
 const releaseTrackerIntakeClaim = `-- name: ReleaseTrackerIntakeClaim :execrows
 DELETE FROM tracker_intake_claims
 WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?
-  AND status = 'pending' AND owner_token = ?
+  AND status IN ('pending', 'admitted') AND owner_token = ?
 `
 
 type ReleaseTrackerIntakeClaimParams struct {
@@ -323,13 +350,13 @@ func (q *Queries) ReleaseTrackerIntakeClaim(ctx context.Context, arg ReleaseTrac
 const renewTrackerIntakeClaim = `-- name: RenewTrackerIntakeClaim :execrows
 UPDATE tracker_intake_claims
 SET lease_expires_at = CASE
-    WHEN status = 'pending' AND lease_expires_at < ? THEN ?
+    WHEN status IN ('pending', 'admitted') AND lease_expires_at < ? THEN ?
     ELSE lease_expires_at
 END
 WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?
   AND (
       status = 'completed'
-      OR (status = 'pending' AND owner_token = ? AND lease_expires_at > ?)
+      OR (status IN ('pending', 'admitted') AND owner_token = ? AND lease_expires_at > ?)
   )
 `
 
@@ -366,7 +393,7 @@ UPDATE tracker_intake_claims
 SET owner_token = ?, status = 'pending', session_id = '', claimed_at = ?,
     lease_expires_at = ?, completed_at = NULL
 WHERE project_id = ? AND provider = ? AND repo = ? AND issue_id = ?
-  AND status = 'pending'
+  AND status IN ('pending', 'admitted')
   AND owner_token = ?
   AND lease_expires_at <= ?
 `
@@ -435,19 +462,30 @@ func (q *Queries) TrackerIntakeClaimOwned(ctx context.Context, arg TrackerIntake
 const trackerIntakeSessionMatches = `-- name: TrackerIntakeSessionMatches :one
 SELECT EXISTS(
     SELECT 1 FROM sessions
-    WHERE id = ? AND project_id = ? AND issue_id = ?
+    WHERE id = ?1 AND project_id = ?2
+      AND (
+          issue_id = ?3
+          OR (CAST(?4 AS TEXT) = 'github' AND lower(issue_id) = lower(?3))
+      )
+      AND is_terminated = FALSE
       AND (workspace_path <> '' OR runtime_handle_id <> '' OR agent_session_id <> '' OR prompt <> '')
 ) AS matches
 `
 
 type TrackerIntakeSessionMatchesParams struct {
-	ID        domain.SessionID
-	ProjectID domain.ProjectID
-	IssueID   domain.IssueID
+	ID               domain.SessionID
+	ProjectID        domain.ProjectID
+	CanonicalIssueID domain.IssueID
+	Provider         string
 }
 
 func (q *Queries) TrackerIntakeSessionMatches(ctx context.Context, arg TrackerIntakeSessionMatchesParams) (bool, error) {
-	row := q.db.QueryRowContext(ctx, trackerIntakeSessionMatches, arg.ID, arg.ProjectID, arg.IssueID)
+	row := q.db.QueryRowContext(ctx, trackerIntakeSessionMatches,
+		arg.ID,
+		arg.ProjectID,
+		arg.CanonicalIssueID,
+		arg.Provider,
+	)
 	var matches bool
 	err := row.Scan(&matches)
 	return matches, err
