@@ -89,10 +89,12 @@ path and never removes that shared directory. Set the per-project default with
 autodetects an `index.html` in the session workspace; with a URL argument it
 opens that URL verbatim (`file://`, `http`, `https`).
 
-`ao verify` resolves its session from `AO_SESSION_ID` and runs only a named,
-daemon-resolved verification profile. The check is owned by the daemon rather
-than the agent terminal process tree. It prints the bounded
-`.ao/verify-<n>.log` path; see [workspace verification](../verification.md).
+`ao verify` resolves its session from `AO_SESSION_ID` and uses the owning
+session's injected `AO_VERIFY_CAPABILITY`. It runs only a named,
+daemon-resolved verification profile from the immutable startup policy. The
+check is owned by the daemon rather than the agent terminal process tree. It
+prints the bounded log path under session-scoped `AO_DATA_DIR` storage; see
+[workspace verification](../verification.md).
 
 `go run .` in `backend/` remains a compatibility wrapper around the daemon.
 
@@ -104,13 +106,14 @@ commands yet.
 
 The CLI and daemon share the same environment-driven config:
 
-| Var                   | Default              | Purpose                |
-| --------------------- | -------------------- | ---------------------- |
-| `AO_PORT`             | `3001`               | Loopback daemon port.  |
-| `AO_RUN_FILE`         | `~/.ao/running.json` | PID/port handshake.    |
-| `AO_DATA_DIR`         | `~/.ao/data`         | SQLite data directory. |
-| `AO_REQUEST_TIMEOUT`  | `60s`                | REST request timeout.  |
-| `AO_SHUTDOWN_TIMEOUT` | `10s`                | Graceful shutdown cap. |
+| Var                     | Default              | Purpose                                                               |
+| ----------------------- | -------------------- | --------------------------------------------------------------------- |
+| `AO_PORT`               | `3001`               | Loopback daemon port.                                                 |
+| `AO_RUN_FILE`           | `~/.ao/running.json` | PID/port handshake.                                                   |
+| `AO_DATA_DIR`           | `~/.ao/data`         | Daemon state, including SQLite and session-scoped verification logs.  |
+| `AO_REQUEST_TIMEOUT`    | `60s`                | REST request timeout.                                                 |
+| `AO_SHUTDOWN_TIMEOUT`   | `10s`                | Graceful shutdown cap.                                                |
+| `AO_VERIFY_CONFIG_FILE` | unset                | Absolute operator-owned verification policy loaded at daemon startup. |
 
 The daemon always binds `127.0.0.1`.
 

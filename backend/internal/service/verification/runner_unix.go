@@ -21,8 +21,9 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 	cmd.Dir, cmd.Env, cmd.Stdin, cmd.Stdout, cmd.Stderr = spec.Dir, spec.Env, ownerRead, spec.Output, spec.Output
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 5 * time.Second
-	// CommandContext owns cancellation; the explicit select below also closes
-	// the guardian pipe so hosted descendants observe ownership loss.
+	// Do not use CommandContext here: its default cancellation can kill the
+	// guardian before the owner pipe closes, allowing the target's independent
+	// process group to survive. Cancellation is owned by the select below.
 	if err := cmd.Start(); err != nil {
 		_ = ownerRead.Close()
 		_ = ownerWrite.Close()
@@ -48,6 +49,7 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 func runHostedProcess(argv []string, owner io.Reader, stdout, stderr io.Writer) int {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.Env = targetEnvironment()
 	cmd.SysProcAttr = verificationSysProcAttr()
 	if err := cmd.Start(); err != nil {
 		return 126

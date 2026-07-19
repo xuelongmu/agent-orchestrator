@@ -29,6 +29,18 @@ func TestOSRunnerPreservesArgumentBoundaries(t *testing.T) {
 	}
 }
 
+func TestOSRunnerDoesNotLeakGuardianMarkerToTarget(t *testing.T) {
+	res, err := testOSRunner().Run(context.Background(), RunSpec{
+		Argv:   []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "marker-absent"},
+		Dir:    t.TempDir(),
+		Env:    append(os.Environ(), "GO_WANT_VERIFY_HELPER=1"),
+		Output: io.Discard,
+	})
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("Run() = %#v, %v", res, err)
+	}
+}
+
 func TestOSRunnerCancellationKillsDescendant(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -65,6 +77,34 @@ func TestOSRunnerCancellationKillsDescendant(t *testing.T) {
 	}
 	if processalive.Alive(pid) {
 		t.Fatalf("descendant pid %d survived cancellation", pid)
+	}
+}
+
+func TestOSRunnerFastDetachedParentCannotEscapeContainment(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	res, err := testOSRunner().Run(context.Background(), RunSpec{
+		Argv:   []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "fast-parent", pidFile},
+		Dir:    t.TempDir(),
+		Env:    append(os.Environ(), "GO_WANT_VERIFY_HELPER=1"),
+		Output: io.Discard,
+	})
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("Run() = %#v, %v", res, err)
+	}
+	b, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for processalive.Alive(pid) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if processalive.Alive(pid) {
+		t.Fatalf("detached descendant pid %d survived fast parent exit", pid)
 	}
 }
 
@@ -108,6 +148,30 @@ func TestVerificationProcessHelper(t *testing.T) {
 			os.Exit(92)
 		}
 		_ = cmd.Wait()
+		os.Exit(0)
+	case "fast-parent":
+		cmd := exec.Command(os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "child")
+		cmd.Env = os.Environ()
+		configureDetachedChild(cmd)
+		if err := cmd.Start(); err != nil {
+			os.Exit(91)
+		}
+		if err := os.WriteFile(os.Args[idx+2], []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+			os.Exit(92)
+		}
+		os.Exit(0)
+	case "outer-runner":
+		_, _ = testOSRunner().Run(context.Background(), RunSpec{
+			Argv:   []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "parent", os.Args[idx+2]},
+			Dir:    os.TempDir(),
+			Env:    os.Environ(),
+			Output: io.Discard,
+		})
+		os.Exit(0)
+	case "marker-absent":
+		if _, ok := os.LookupEnv(verifyHostEnv); ok {
+			os.Exit(94)
+		}
 		os.Exit(0)
 	case "child":
 		for {

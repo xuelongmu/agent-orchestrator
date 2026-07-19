@@ -54,3 +54,19 @@ func TestBuild_UsesStableLifecycleDiagnosticSchemaName(t *testing.T) {
 		t.Fatal("generated API contract is missing the stable LifecycleDiagnostic schema")
 	}
 }
+
+func TestBuild_VerificationAuthorizationContract(t *testing.T) {
+	got, err := specgen.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range [][]byte{
+		[]byte("name: X-AO-Verification-Capability"),
+		[]byte(`"403":`),
+		[]byte("writeOnly: true"),
+	} {
+		if !bytes.Contains(got, want) {
+			t.Fatalf("generated verification contract is missing %q", want)
+		}
+	}
+}

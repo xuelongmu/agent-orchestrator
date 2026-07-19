@@ -26,7 +26,7 @@ func (f *fakeVerifier) Run(_ context.Context, session domain.SessionID, profile,
 	f.session = session
 	f.profile = profile
 	f.capability = capability
-	return verifysvc.Result{SessionID: session, Profile: profile, Outcome: verifysvc.OutcomePassed, LogPath: `C:\\workspace\\.ao\\verify-1.log`}, nil
+	return verifysvc.Result{SessionID: session, Profile: profile, Outcome: verifysvc.OutcomePassed, LogPath: `C:\\ao-data\\verification\\session\\verify-1.log`}, nil
 }
 
 func TestVerificationAPI(t *testing.T) {
@@ -58,6 +58,22 @@ func TestVerificationAPIRejectsUnknownFields(t *testing.T) {
 	router := httpd.NewRouterWithControl(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, httpd.APIDeps{Verification: fake}, httpd.ControlDeps{})
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/v1/sessions/ao-7/verify", strings.NewReader(`{"profile":"backend","argv":["evil"]}`))
 	req.Host = "127.0.0.1"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if fake.profile != "" {
+		t.Fatal("service called")
+	}
+}
+
+func TestVerificationAPIRejectsTrailingJSONValue(t *testing.T) {
+	fake := &fakeVerifier{}
+	router := httpd.NewRouterWithControl(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, httpd.APIDeps{Verification: fake}, httpd.ControlDeps{})
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/v1/sessions/ao-7/verify", strings.NewReader(`{"profile":"backend"}{"profile":"frontend"}`))
+	req.Host = "127.0.0.1"
+	req.Header.Set("X-AO-Verification-Capability", "secret")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {

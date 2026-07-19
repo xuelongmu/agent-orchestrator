@@ -141,7 +141,8 @@ func TestServerShutdownEndpoint(t *testing.T) {
 		RunFilePath:     runPath,
 	}
 
-	srv, err := NewWithDeps(cfg, discardLogger(), nil, APIDeps{})
+	verificationCanceled := make(chan struct{})
+	srv, err := NewWithDeps(cfg, discardLogger(), nil, APIDeps{CancelVerification: func() { close(verificationCanceled) }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -159,6 +160,11 @@ func TestServerShutdownEndpoint(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("POST /shutdown = %d, want 202", resp.StatusCode)
+	}
+	select {
+	case <-verificationCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("verification was not canceled before HTTP shutdown drain")
 	}
 
 	select {

@@ -360,6 +360,10 @@ func TestProjectsAPI_RejectsUnknownConfigKeys(t *testing.T) {
 	body, status, _ = doRequest(t, srv, "PUT", "/api/v1/projects/rej/config", `{"config":{"defaultBranch":"develop"},"surprise":"!"}`)
 	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
 
+	// A second JSON value must not be ignored after an otherwise valid config.
+	body, status, _ = doRequest(t, srv, "PUT", "/api/v1/projects/rej/config", `{"config":{"defaultBranch":"develop"}} {"config":{}}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
+
 	// Prompt rules are now modeled and accepted in project config.
 	body, status, _ = doRequest(t, srv, "PUT", "/api/v1/projects/rej/config", `{"config":{"agentRules":"x"}}`)
 	if status != http.StatusOK {

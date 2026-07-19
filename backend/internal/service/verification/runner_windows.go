@@ -92,6 +92,7 @@ func newKillJob() (windows.Handle, error) {
 func runHostedProcess(argv []string, owner io.Reader, stdout, stderr io.Writer) int {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.Env = targetEnvironment()
 	if err := cmd.Start(); err != nil {
 		return 126
 	}

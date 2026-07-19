@@ -54,13 +54,13 @@ func TestVerifyFailureReturnsRuntimeErrorAfterPrintingLog(t *testing.T) {
 	t.Setenv("AO_SESSION_ID", "ao-7")
 	t.Setenv("AO_VERIFY_CAPABILITY", "cap-7")
 	cfg := setConfigEnv(t)
-	srv, _ := verifyServer(t, http.StatusOK, `{"sessionId":"ao-7","profile":"frontend","outcome":"failed","exitCode":2,"logPath":"/work/.ao/verify-2.log","truncated":true,"durationMs":12}`)
+	srv, _ := verifyServer(t, http.StatusOK, `{"sessionId":"ao-7","profile":"frontend","outcome":"failed","exitCode":2,"logPath":"/data/verification/session/verify-2.log","truncated":true,"durationMs":12}`)
 	writeRunFileFor(t, cfg, srv)
 	out, _, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "verify", "frontend")
 	if err == nil || ExitCode(err) != 1 {
 		t.Fatalf("error=%v", err)
 	}
-	if !strings.Contains(out, "log: /work/.ao/verify-2.log") || !strings.Contains(out, "log truncated: true") {
+	if !strings.Contains(out, "log: /data/verification/session/verify-2.log") || !strings.Contains(out, "log truncated: true") {
 		t.Fatalf("output=%q", out)
 	}
 }

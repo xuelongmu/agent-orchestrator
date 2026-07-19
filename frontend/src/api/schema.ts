@@ -3525,7 +3525,10 @@ export interface operations {
     runVerification: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Session-scoped verification capability issued by the daemon. */
+                "X-AO-Verification-Capability": string;
+            };
             path: {
                 /** @description Session identifier, e.g. project-1. */
                 sessionId: string;
@@ -3549,6 +3552,15 @@ export interface operations {
             };
             /** @description Bad Request */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

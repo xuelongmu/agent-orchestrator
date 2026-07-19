@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 )
 
 const verifyHostEnv = "AO_INTERNAL_VERIFY_HOST"
@@ -63,4 +64,21 @@ func ownershipCanceled(owner io.Reader) <-chan struct{} {
 		close(done)
 	}()
 	return done
+}
+
+// targetEnvironment removes the daemon-to-guardian marker before the
+// guardian starts the configured verification target. Leaving the marker in
+// the environment would cause an ao executable used as a target to interpret
+// itself recursively as another guardian.
+func targetEnvironment() []string {
+	env := os.Environ()
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok && strings.EqualFold(name, verifyHostEnv) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }

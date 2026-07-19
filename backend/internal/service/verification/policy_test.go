@@ -45,3 +45,13 @@ func TestPolicyRejectsShellAndTraversal(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadPolicyRejectsTrailingJSONValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "verification.json")
+	if err := os.WriteFile(path, []byte(`{"profiles":{}} {"profiles":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPolicy(path); err == nil || !strings.Contains(err.Error(), "trailing JSON") {
+		t.Fatalf("error = %v", err)
+	}
+}

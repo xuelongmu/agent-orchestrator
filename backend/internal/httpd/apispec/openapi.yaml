@@ -1724,6 +1724,15 @@ paths:
         schema:
           description: Session identifier, e.g. project-1.
           type: string
+      - description: Session-scoped verification capability issued by the daemon.
+        in: header
+        name: X-AO-Verification-Capability
+        required: true
+        schema:
+          description: Session-scoped verification capability issued by the daemon.
+          minLength: 1
+          type: string
+          writeOnly: true
       requestBody:
         content:
           application/json:
@@ -1743,6 +1752,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/APIError'
           description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
         "404":
           content:
             application/json:

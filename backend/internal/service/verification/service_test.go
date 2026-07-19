@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -49,7 +48,7 @@ func serviceFixture(t *testing.T, command Command, runner Runner) (*Service, str
 		session: domain.SessionRecord{ID: "ao-1", ProjectID: "ao", Metadata: domain.SessionMetadata{WorkspacePath: workspace}},
 		project: domain.ProjectRecord{ID: "ao"},
 	}
-	return New(Deps{Store: store, Runner: runner, Policy: Policy{Profiles: map[string]Command{"unit": command}}, Auth: fakeAuthorizer{}}), workspace
+	return New(Deps{Store: store, Runner: runner, Policy: Policy{Profiles: map[string]Command{"unit": command}}, Auth: fakeAuthorizer{}, DataDir: t.TempDir()}), workspace
 }
 
 func TestRunPreservesArgvAndReportsFailure(t *testing.T) {
@@ -174,42 +173,19 @@ func TestRunBoundsLogAndRetainsTail(t *testing.T) {
 	}
 }
 
-func TestRunRejectsLogDirectorySymlink(t *testing.T) {
-	outside := t.TempDir()
-	svc, workspace := serviceFixture(t, Command{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) { return RunResult{}, nil }))
-	if err := os.Symlink(outside, filepath.Join(workspace, ".ao")); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
-	_, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
-	var ae *apierr.Error
-	if !errors.As(err, &ae) || ae.Code != "VERIFY_LOG_UNSAFE" {
-		t.Fatalf("error=%v", err)
-	}
-}
-
-func TestRunRejectsLogIgnoreSymlinkWithoutTouchingTarget(t *testing.T) {
+func TestRunDoesNotWriteWorkspaceState(t *testing.T) {
 	svc, workspace := serviceFixture(t, Command{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) {
-		t.Fatal("runner called")
 		return RunResult{}, nil
 	}))
-	if err := os.Mkdir(filepath.Join(workspace, ".ao"), 0o700); err != nil {
+	res, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
+	if err != nil {
 		t.Fatal(err)
 	}
-	target := filepath.Join(t.TempDir(), "target")
-	if err := os.WriteFile(target, []byte("do not touch"), 0o600); err != nil {
-		t.Fatal(err)
+	if pathWithin(workspace, res.LogPath) {
+		t.Fatalf("log path %q is inside workspace %q", res.LogPath, workspace)
 	}
-	if err := os.Symlink(target, filepath.Join(workspace, ".ao", ".gitignore")); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
-	_, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
-	var ae *apierr.Error
-	if !errors.As(err, &ae) || ae.Code != "VERIFY_LOG_UNSAFE" {
-		t.Fatalf("error=%v", err)
-	}
-	body, _ := os.ReadFile(target)
-	if string(body) != "do not touch" {
-		t.Fatalf("target was modified: %q", body)
+	if _, err := os.Stat(filepath.Join(workspace, ".ao")); !os.IsNotExist(err) {
+		t.Fatalf("workspace .ao was created: %v", err)
 	}
 }
 
@@ -228,6 +204,35 @@ func TestCapabilityCannotAuthorizeAnotherSession(t *testing.T) {
 		return RunResult{}, nil
 	}))
 	_, err := svc.Run(context.Background(), "ao-1", "unit", "cap-from-another-session")
+	var apiError *apierr.Error
+	if !errors.As(err, &apiError) || apiError.Code != "VERIFY_CAPABILITY_INVALID" || apiError.Kind != apierr.KindForbidden {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestCapabilityIsCheckedBeforeSessionState(t *testing.T) {
+	workspace := t.TempDir()
+	store := fakeStore{
+		session: domain.SessionRecord{ID: "ao-1", ProjectID: "ao", IsTerminated: true, Metadata: domain.SessionMetadata{WorkspacePath: workspace}},
+		project: domain.ProjectRecord{ID: "ao"},
+	}
+	svc := New(Deps{Store: store, Runner: runnerFunc(func(context.Context, RunSpec) (RunResult, error) {
+		t.Fatal("runner called")
+		return RunResult{}, nil
+	}), Auth: fakeAuthorizer{}, DataDir: t.TempDir()})
+	_, err := svc.Run(context.Background(), "ao-1", "backend", "wrong")
+	var apiError *apierr.Error
+	if !errors.As(err, &apiError) || apiError.Code != "VERIFY_CAPABILITY_INVALID" {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestUnknownSessionDoesNotExposeExistenceWithoutCapability(t *testing.T) {
+	svc := New(Deps{Store: fakeStore{}, Runner: runnerFunc(func(context.Context, RunSpec) (RunResult, error) {
+		t.Fatal("runner called")
+		return RunResult{}, nil
+	}), Auth: fakeAuthorizer{}, DataDir: t.TempDir()})
+	_, err := svc.Run(context.Background(), "enumerated-session", "backend", "wrong")
 	var apiError *apierr.Error
 	if !errors.As(err, &apiError) || apiError.Code != "VERIFY_CAPABILITY_INVALID" || apiError.Kind != apierr.KindForbidden {
 		t.Fatalf("error = %v", err)
@@ -272,7 +277,7 @@ func TestWorkingDirectoryCannotEscapeThroughSymlink(t *testing.T) {
 	svc := New(Deps{Store: store, Runner: runnerFunc(func(context.Context, RunSpec) (RunResult, error) {
 		t.Fatal("runner called")
 		return RunResult{}, nil
-	}), Policy: Policy{Profiles: map[string]Command{"unit": {Argv: []string{"tool"}, WorkingDirectory: "linked"}}}, Auth: fakeAuthorizer{}})
+	}), Policy: Policy{Profiles: map[string]Command{"unit": {Argv: []string{"tool"}, WorkingDirectory: "linked"}}}, Auth: fakeAuthorizer{}, DataDir: t.TempDir()})
 	if err := os.Symlink(outside, filepath.Join(workspace, "linked")); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
@@ -284,17 +289,17 @@ func TestWorkingDirectoryCannotEscapeThroughSymlink(t *testing.T) {
 }
 
 func TestLogRetentionKeepsNewestTenAndAdvancesNumber(t *testing.T) {
-	workspace := t.TempDir()
+	dataDir := t.TempDir()
 	var last string
 	for range retainedLogs + 2 {
-		f, path, err := newLog(workspace)
+		f, path, err := newLogAt(dataDir, "ao-1")
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = f.Close()
 		last = path
 	}
-	entries, err := os.ReadDir(filepath.Join(workspace, ".ao"))
+	entries, err := os.ReadDir(filepath.Dir(last))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,18 +314,48 @@ func TestLogRetentionKeepsNewestTenAndAdvancesNumber(t *testing.T) {
 	}
 }
 
-func TestVerificationLogsAreGitIgnored(t *testing.T) {
-	workspace := t.TempDir()
-	if out, err := exec.Command("git", "init", "-q", workspace).CombinedOutput(); err != nil {
-		t.Skipf("git unavailable: %v (%s)", err, out)
-	}
-	f, path, err := newLog(workspace)
+func TestVerificationLogsAreUnderDataRoot(t *testing.T) {
+	dataDir := t.TempDir()
+	f, path, err := newLogAt(dataDir, "ao-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = f.Close()
-	rel, _ := filepath.Rel(workspace, path)
-	if out, err := exec.Command("git", "-C", workspace, "check-ignore", rel).CombinedOutput(); err != nil {
-		t.Fatalf("log is not ignored: %v (%s)", err, out)
+	if !pathWithin(dataDir, path) {
+		t.Fatalf("log %q escaped data root %q", path, dataDir)
+	}
+}
+
+func TestNewLogCreatesFreshDataDirectoryHierarchy(t *testing.T) {
+	dataDir := t.TempDir()
+	if _, err := os.Stat(filepath.Join(dataDir, "verification")); !os.IsNotExist(err) {
+		t.Fatalf("verification hierarchy unexpectedly exists: %v", err)
+	}
+	f, path, err := newLogAt(dataDir, "ao-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("created log: %v", err)
+	}
+}
+
+func TestNewLogSanitizesUntrustedSessionScope(t *testing.T) {
+	parent := t.TempDir()
+	dataDir := filepath.Join(parent, "data")
+	if err := os.Mkdir(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f, path, err := newLogAt(dataDir, `../../outside\session`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if !pathWithin(dataDir, path) {
+		t.Fatalf("untrusted scope escaped data root: %q", path)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "outside")); !os.IsNotExist(err) {
+		t.Fatalf("scope created outside path: %v", err)
 	}
 }

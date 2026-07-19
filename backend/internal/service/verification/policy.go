@@ -3,6 +3,7 @@ package verification
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -50,6 +51,9 @@ func LoadPolicy(path string) (Policy, error) {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&configured); err != nil {
 		return Policy{}, fmt.Errorf("decode verification policy: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return Policy{}, fmt.Errorf("decode verification policy: trailing JSON value")
 	}
 	for name, command := range configured.Profiles {
 		policy.Profiles[name] = cloneCommand(command)

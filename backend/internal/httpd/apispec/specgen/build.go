@@ -325,11 +325,12 @@ func verificationOperations() []operation {
 	return []operation{{
 		method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/verify", id: "runVerification", tag: "verification",
 		summary:    "Run an allowed verification profile outside the worker terminal process tree",
-		pathParams: []any{controllers.SessionIDParam{}},
+		pathParams: []any{controllers.SessionIDParam{}, controllers.VerificationCapabilityHeader{}},
 		reqBody:    controllers.VerifyRequest{},
 		resps: []respUnit{
 			{http.StatusOK, controllers.VerifyResponse{}},
 			{http.StatusBadRequest, envelope.APIError{}},
+			{http.StatusForbidden, envelope.APIError{}},
 			{http.StatusNotFound, envelope.APIError{}},
 			{http.StatusConflict, envelope.APIError{}},
 			{http.StatusInternalServerError, envelope.APIError{}},

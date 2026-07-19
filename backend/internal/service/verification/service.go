@@ -2,6 +2,7 @@ package verification
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +26,7 @@ const (
 	retainedLogs   = 10
 )
 
-// Store supplies the session workspace and its project's verification config.
+// Store supplies the session workspace and owning project record.
 type Store interface {
 	GetSession(context.Context, domain.SessionID) (domain.SessionRecord, bool, error)
 	GetProject(context.Context, string) (domain.ProjectRecord, bool, error)
@@ -57,9 +58,12 @@ type Outcome string
 
 const (
 	// OutcomePassed indicates the verification command succeeded.
-	OutcomePassed   Outcome = "passed"
-	OutcomeFailed   Outcome = "failed"
+	OutcomePassed Outcome = "passed"
+	// OutcomeFailed indicates the verification command returned failure.
+	OutcomeFailed Outcome = "failed"
+	// OutcomeCanceled indicates the caller or daemon canceled verification.
 	OutcomeCanceled Outcome = "canceled"
+	// OutcomeTimedOut indicates verification exceeded its configured timeout.
 	OutcomeTimedOut Outcome = "timed_out"
 )
 
@@ -131,8 +135,8 @@ func (s *Service) Run(ctx context.Context, sessionID domain.SessionID, profile, 
 	if err != nil {
 		return Result{}, apierr.Internal("SESSION_LOAD_FAILED", "Failed to load session")
 	}
-	if !ok {
-		return Result{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	if !ok || s.auth == nil || !s.auth.Verify(session.ID, session.ProjectID, capability) {
+		return Result{}, apierr.Forbidden("VERIFY_CAPABILITY_INVALID", "Verification capability does not own this session")
 	}
 	if session.IsTerminated {
 		return Result{}, apierr.Conflict("SESSION_TERMINATED", "Cannot verify a terminated session", nil)
@@ -146,9 +150,6 @@ func (s *Service) Run(ctx context.Context, sessionID domain.SessionID, profile, 
 	}
 	if !ok || !project.ArchivedAt.IsZero() {
 		return Result{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
-	}
-	if s.auth == nil || !s.auth.Verify(session.ID, session.ProjectID, capability) {
-		return Result{}, apierr.Forbidden("VERIFY_CAPABILITY_INVALID", "Verification capability does not own this session")
 	}
 	command, ok := s.policy.Resolve(session.ProjectID, profile)
 	if !ok {
@@ -169,11 +170,10 @@ func (s *Service) Run(ctx context.Context, sessionID domain.SessionID, profile, 
 	}
 	defer s.release(workspace)
 
-	logRoot := s.dataDir
-	if logRoot == "" {
-		logRoot = workspace
+	if strings.TrimSpace(s.dataDir) == "" {
+		return Result{}, apierr.Internal("VERIFY_LOG_ROOT_UNAVAILABLE", "Verification log storage is unavailable")
 	}
-	logFile, logPath, err := newLogAt(logRoot, string(sessionID))
+	logFile, logPath, err := newLogAt(s.dataDir, string(sessionID))
 	if err != nil {
 		return Result{}, apierr.Conflict("VERIFY_LOG_UNSAFE", err.Error(), nil)
 	}
@@ -277,38 +277,34 @@ func pathWithin(root, path string) bool {
 
 var logNameRE = regexp.MustCompile(`^verify-(\d+)\.log$`)
 
-func newLog(workspace string) (*os.File, string, error) {
-	return newLogAt(workspace, "workspace")
-}
-
 func newLogAt(base, scope string) (*os.File, string, error) {
-	workspace := filepath.Join(base, "verification", scope)
-	root, err := os.OpenRoot(workspace)
+	base, err := filepath.Abs(base)
 	if err != nil {
-		return nil, "", fmt.Errorf("open workspace root: %w", err)
+		return nil, "", fmt.Errorf("resolve verification log root: %w", err)
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return nil, "", fmt.Errorf("open verification log root: %w", err)
 	}
 	defer func() { _ = root.Close() }()
-	dir := filepath.Join(workspace, ".ao")
-	if info, err := root.Lstat(".ao"); err == nil {
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || isReparsePoint(dir) {
-			return nil, "", fmt.Errorf("%s must be a real directory, not a link or reparse point", dir)
-		}
-	} else if !os.IsNotExist(err) {
-		return nil, "", fmt.Errorf("inspect log directory: %w", err)
+	if err := root.Mkdir("verification", 0o700); err != nil && !os.IsExist(err) {
+		return nil, "", fmt.Errorf("create verification root: %w", err)
 	}
-	if err := root.Mkdir(".ao", 0o700); err != nil && !os.IsExist(err) {
-		return nil, "", fmt.Errorf("create log directory: %w", err)
-	}
-	dirRoot, err := root.OpenRoot(".ao")
+	verificationRoot, err := root.OpenRoot("verification")
 	if err != nil {
-		return nil, "", fmt.Errorf("open verification log directory: %w", err)
+		return nil, "", fmt.Errorf("open verification root: %w", err)
+	}
+	defer func() { _ = verificationRoot.Close() }()
+	scopeHash := sha256.Sum256([]byte(scope))
+	scopeDir := fmt.Sprintf("session-%x", scopeHash[:12])
+	if err := verificationRoot.Mkdir(scopeDir, 0o700); err != nil && !os.IsExist(err) {
+		return nil, "", fmt.Errorf("create session verification root: %w", err)
+	}
+	dirRoot, err := verificationRoot.OpenRoot(scopeDir)
+	if err != nil {
+		return nil, "", fmt.Errorf("open session verification root: %w", err)
 	}
 	defer func() { _ = dirRoot.Close() }()
-	// A local ignore file ignores itself and every run log without editing the worktree's tracked files.
-	if err := ensureLogIgnore(dirRoot, dir); err != nil {
-		return nil, "", err
-	}
-
 	dirFile, err := dirRoot.Open(".")
 	if err != nil {
 		return nil, "", fmt.Errorf("open log directory: %w", err)
@@ -345,47 +341,12 @@ func newLogAt(base, scope string) (*os.File, string, error) {
 		logs = logs[1:]
 	}
 	name := fmt.Sprintf("verify-%d.log", highest+1)
-	path := filepath.Join(dir, name)
+	path := filepath.Join(base, "verification", scopeDir, name)
 	f, err := dirRoot.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, "", fmt.Errorf("create verification log: %w", err)
 	}
 	return f, path, nil
-}
-
-func ensureLogIgnore(root *os.Root, dir string) error {
-	info, err := root.Lstat(".gitignore")
-	if os.IsNotExist(err) {
-		ignore, createErr := root.OpenFile(".gitignore", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if createErr != nil {
-			return fmt.Errorf("create verification log ignore: %w", createErr)
-		}
-		if _, writeErr := ignore.WriteString("*\n"); writeErr != nil {
-			_ = ignore.Close()
-			return fmt.Errorf("write verification log ignore: %w", writeErr)
-		}
-		if closeErr := ignore.Close(); closeErr != nil {
-			return fmt.Errorf("close verification log ignore: %w", closeErr)
-		}
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inspect verification log ignore: %w", err)
-	}
-	path := filepath.Join(dir, ".gitignore")
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || isReparsePoint(path) {
-		return fmt.Errorf("%s must be a regular file, not a link or reparse point", path)
-	}
-	body, err := root.ReadFile(".gitignore")
-	if err != nil {
-		return fmt.Errorf("read verification log ignore: %w", err)
-	}
-	for line := range strings.SplitSeq(string(body), "\n") {
-		if strings.TrimSpace(line) == "*" {
-			return nil
-		}
-	}
-	return fmt.Errorf("%s must contain a '*' rule so verification logs stay ignored", path)
 }
 
 func formatArgv(argv []string) string {

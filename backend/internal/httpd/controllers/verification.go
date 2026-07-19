@@ -23,7 +23,15 @@ type VerifyRequest struct {
 	Profile string `json:"profile" minLength:"1"`
 }
 
-// VerifyResponse reports the completed run and its bounded workspace-local log.
+// VerificationCapabilityHeader carries the unforgeable, session-scoped
+// capability issued to the worker when its session starts. Keeping it out of
+// the JSON body makes the operation's authorization requirement explicit in
+// the generated API contract without exposing it as worker-controlled policy.
+type VerificationCapabilityHeader struct {
+	Capability string `header:"X-AO-Verification-Capability" required:"true" minLength:"1" writeOnly:"true" description:"Session-scoped verification capability issued by the daemon."`
+}
+
+// VerifyResponse reports the completed run and its bounded daemon-owned log.
 type VerifyResponse = verifysvc.Result
 
 // VerificationController owns the loopback-only session verification route.
