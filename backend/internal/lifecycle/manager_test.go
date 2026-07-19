@@ -19,6 +19,10 @@ type fakeStore struct {
 	sessions   map[domain.SessionID]domain.SessionRecord
 	prs        map[domain.SessionID][]domain.PullRequest
 	signatures map[string]string
+	// afterSessionRead deterministically models a concurrent reducer committing
+	// new activity immediately after a caller's store snapshot.
+	afterSessionRead func(domain.SessionID, int)
+	sessionReads     int
 
 	signatureWriteErr error
 	signatureWrites   int
@@ -30,6 +34,10 @@ func newFakeStore() *fakeStore {
 
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
 	r, ok := f.sessions[id]
+	f.sessionReads++
+	if f.afterSessionRead != nil {
+		f.afterSessionRead(id, f.sessionReads)
+	}
 	return r, ok, nil
 }
 
@@ -2098,6 +2106,70 @@ func TestPRObservation_IdleReviewSendFailureHandsOffOnceAcrossRestart(t *testing
 	}
 }
 
+func TestReviewFailureHandoffs_JITRecheckSkipsAfterConcurrentRecovery(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	prURL := "https://github.com/o/r/pull/1"
+	for _, tc := range []struct {
+		name            string
+		flipAfterRead   int
+		apply           func(*Manager, domain.SessionID) error
+		wantDeliveryErr bool
+	}{
+		{
+			name:          "fetch failure",
+			flipAfterRead: 1,
+			apply: func(m *Manager, id domain.SessionID) error {
+				return m.ApplySCMReviewFetchFailure(ctx, id, ports.SCMObservation{
+					Fetched: true,
+					PR:      ports.SCMPRObservation{URL: prURL, Number: 1},
+					Review:  ports.SCMReviewObservation{Decision: string(domain.ReviewChangesRequest)},
+				})
+			},
+		},
+		{
+			name:            "review send failure",
+			flipAfterRead:   3,
+			wantDeliveryErr: true,
+			apply: func(m *Manager, id domain.SessionID) error {
+				return m.ApplyPRObservation(ctx, id, ports.PRObservation{
+					Fetched:  true,
+					URL:      prURL,
+					Review:   domain.ReviewChangesRequest,
+					Comments: []ports.PRCommentObservation{{ID: "c1", ThreadID: "t1", Author: "reviewer", Body: "fix"}},
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			sink := &fakeNotificationSink{}
+			rec := working("mer-1")
+			rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+			st.sessions[rec.ID] = rec
+			st.afterSessionRead = func(id domain.SessionID, read int) {
+				if read != tc.flipAfterRead {
+					return
+				}
+				active := st.sessions[id]
+				active.Activity = domain.Activity{State: domain.ActivityActive, LastActivityAt: now}
+				st.sessions[id] = active
+			}
+			m := New(st, &fakeMessenger{err: errors.New("pane unavailable")}, WithNotificationSink(sink))
+			m.clock = func() time.Time { return now }
+			err := tc.apply(m, rec.ID)
+			if tc.wantDeliveryErr && err == nil {
+				t.Fatal("agent delivery error = nil")
+			}
+			if !tc.wantDeliveryErr && err != nil {
+				t.Fatal(err)
+			}
+			if len(sink.intents) != 0 {
+				t.Fatalf("recovered episode received stale failure handoff: %+v", sink.intents)
+			}
+		})
+	}
+}
+
 func TestSCMReviewFetchFailureHandsOffObservedOverlayWithoutMutatingDeliveryProof(t *testing.T) {
 	st := newFakeStore()
 	sink := &fakeNotificationSink{}
@@ -2386,6 +2458,96 @@ func TestIdleReviewSnapshot_DeliveredNudgesDeferUntilBudgetExhausted(t *testing.
 	}
 	if len(sink.intents) != 1 {
 		t.Fatalf("exhaustion notifications = %d, want exactly 1: %+v", len(sink.intents), sink.intents)
+	}
+}
+
+func TestIdleReviewSnapshot_JITRecheckSkipsActionsAfterConcurrentRecovery(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	prURL := "https://github.com/o/r/pull/1"
+	human := ports.SCMReviewThreadObservation{
+		ID: "t1", Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix"}},
+	}
+	for _, tc := range []struct {
+		name      string
+		partial   bool
+		seedProof bool
+		newIdle   bool
+	}{
+		{name: "nudge after active recovery", seedProof: true},
+		{name: "handoff after a new idle episode", partial: true, newIdle: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			msg := &fakeMessenger{}
+			sink := &fakeNotificationSink{}
+			rec := working("mer-1")
+			rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+			rec.FirstSignalAt = rec.Activity.LastActivityAt
+			st.sessions[rec.ID] = rec
+			obs := idleReviewSnapshot(prURL, tc.partial, human)
+			proof := reactionPayload{}
+			if tc.seedProof {
+				proof.Seen = map[string]string{"review:" + prURL: idleReviewDeliverySignature(obs)}
+			}
+			if tc.newIdle {
+				proof.Attempts = map[string]int{
+					idleReviewEpisodeKey(prURL, rec.Activity.LastActivityAt): 1,
+					idleReviewEpisodeKey(prURL, now):                         2,
+				}
+				proof.Handoffs = map[string]humanHandoffOutcome{
+					idleReviewHandoffKey(prURL, rec.Activity.LastActivityAt): {Outcome: humanHandoffBlocked, Reason: idleReviewUndeliverable},
+					idleReviewHandoffKey(prURL, now):                         {Outcome: humanHandoffNotified, Reason: idleReviewNudgeExhausted},
+				}
+			}
+			if len(proof.Seen) > 0 || len(proof.Attempts) > 0 || len(proof.Handoffs) > 0 {
+				raw, err := json.Marshal(proof)
+				if err != nil {
+					t.Fatal(err)
+				}
+				st.signatures[prURL] = string(raw)
+			}
+			// The first eligibility read returns idle, then a concurrent activity
+			// reducer commits recovery before this decision reaches its side effect.
+			st.afterSessionRead = func(id domain.SessionID, read int) {
+				if read != 1 {
+					return
+				}
+				active := st.sessions[id]
+				state := domain.ActivityActive
+				if tc.newIdle {
+					state = domain.ActivityIdle
+				}
+				active.Activity = domain.Activity{State: state, LastActivityAt: now}
+				st.sessions[id] = active
+			}
+			m := New(st, msg, WithNotificationSink(sink))
+			m.clock = func() time.Time { return now }
+			if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, obs); err != nil {
+				t.Fatal(err)
+			}
+			if len(msg.msgs) != 0 || len(sink.intents) != 0 {
+				t.Fatalf("recovered episode acted on stale idle evidence: nudges=%d notifications=%d", len(msg.msgs), len(sink.intents))
+			}
+			if tc.newIdle {
+				var got reactionPayload
+				if err := json.Unmarshal([]byte(st.signatures[prURL]), &got); err != nil {
+					t.Fatal(err)
+				}
+				oldAttempt := idleReviewEpisodeKey(prURL, rec.Activity.LastActivityAt)
+				oldHandoff := idleReviewHandoffKey(prURL, rec.Activity.LastActivityAt)
+				newAttempt := idleReviewEpisodeKey(prURL, now)
+				newHandoff := idleReviewHandoffKey(prURL, now)
+				if _, ok := got.Attempts[oldAttempt]; ok {
+					t.Fatalf("stale attempt survived episode cleanup: %+v", got.Attempts)
+				}
+				if _, ok := got.Handoffs[oldHandoff]; ok {
+					t.Fatalf("stale handoff survived episode cleanup: %+v", got.Handoffs)
+				}
+				if got.Attempts[newAttempt] != 2 || got.Handoffs[newHandoff].Outcome != humanHandoffNotified {
+					t.Fatalf("stale cleanup erased newer episode: attempts=%+v handoffs=%+v", got.Attempts, got.Handoffs)
+				}
+			}
+		})
 	}
 }
 

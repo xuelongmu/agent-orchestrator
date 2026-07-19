@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
@@ -113,5 +114,33 @@ func TestGuard_MessengerErrorIsSentPlusError(t *testing.T) {
 	}
 	if got != Sent {
 		t.Errorf("outcome = %v, want Sent (the write was attempted)", got)
+	}
+}
+
+func TestGuard_NudgeIdleEpisodeRequiresExactFinalState(t *testing.T) {
+	idleSince := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		rec  domain.SessionRecord
+		want Outcome
+	}{
+		{name: "same episode", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: idleSince}}, want: Sent},
+		{name: "recovered active", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityActive, LastActivityAt: idleSince.Add(time.Second)}}, want: SuppressedStaleEpisode},
+		{name: "new idle episode", rec: domain.SessionRecord{ID: "s1", Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: idleSince.Add(time.Second)}}, want: SuppressedStaleEpisode},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := &fakeMessenger{}
+			g := New(&fakeStore{rec: tc.rec, ok: true}, msg, nil)
+			got, err := g.NudgeIdleEpisode(context.Background(), "s1", "review", idleSince)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("outcome = %v, want %v", got, tc.want)
+			}
+			if sent := len(msg.sent); (sent == 1) != (tc.want == Sent) {
+				t.Fatalf("messenger sends = %d, outcome = %v", sent, tc.want)
+			}
+		})
 	}
 }
