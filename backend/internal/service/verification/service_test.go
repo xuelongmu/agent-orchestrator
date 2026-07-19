@@ -324,4 +324,3 @@ func TestVerificationLogsAreGitIgnored(t *testing.T) {
 		t.Fatalf("log is not ignored: %v (%s)", err, out)
 	}
 }
-

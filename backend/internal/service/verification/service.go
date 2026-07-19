@@ -394,7 +394,7 @@ type boundedWriter struct {
 func newBoundedWriter(f *os.File, limit int64) *boundedWriter {
 	return &boundedWriter{file: f, limit: limit}
 }
-func (w *boundedWriter) Truncated() bool                    { w.mu.Lock(); defer w.mu.Unlock(); return w.truncated }
+func (w *boundedWriter) Truncated() bool { w.mu.Lock(); defer w.mu.Unlock(); return w.truncated }
 func (w *boundedWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

@@ -2593,10 +2593,6 @@ components:
           type: array
         trackerIntake:
           $ref: '#/components/schemas/TrackerIntakeConfig'
-        verification:
-          additionalProperties:
-            $ref: '#/components/schemas/VerificationCommand'
-          type: object
         worker:
           $ref: '#/components/schemas/RoleOverride'
         workspaceKind:
@@ -3357,21 +3353,6 @@ components:
       required:
       - reviewerHandleId
       - reviews
-      type: object
-    VerificationCommand:
-      properties:
-        argv:
-          items:
-            type: string
-          type: array
-        timeoutSeconds:
-          maximum: 3600
-          minimum: 0
-          type: integer
-        workingDirectory:
-          type: string
-      required:
-      - argv
       type: object
     VerifyRequest:
       properties:

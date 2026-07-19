@@ -117,14 +117,14 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 		capabilityIssuer = capabilities[0]
 	}
 	mgr := sessionmanager.New(sessionmanager.Deps{
-		Runtime:   runtime,
-		Agents:    agents,
-		Workspace: ws,
-		Store:     store,
-		Messenger: messenger,
-		Lifecycle: lcm,
-		DataDir:   cfg.DataDir,
-		Logger:    log,
+		Runtime:                  runtime,
+		Agents:                   agents,
+		Workspace:                ws,
+		Store:                    store,
+		Messenger:                messenger,
+		Lifecycle:                lcm,
+		DataDir:                  cfg.DataDir,
+		Logger:                   log,
 		VerificationCapabilities: capabilityIssuer,
 	})
 	// Lifecycle decides when a session's PR set is complete; Session Manager

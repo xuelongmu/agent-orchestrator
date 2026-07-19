@@ -15,17 +15,17 @@ Projects can add or replace profiles in their typed project config:
 
 ```json
 {
-  "verification": {
-    "backend-storage": {
-      "argv": ["go", "test", "./internal/storage/sqlite/..."],
-      "workingDirectory": "backend",
-      "timeoutSeconds": 300
-    },
-    "frontend-session": {
-      "argv": ["npm", "test", "--", "--run", "src/session.test.ts"],
-      "workingDirectory": "frontend"
-    }
-  }
+	"verification": {
+		"backend-storage": {
+			"argv": ["go", "test", "./internal/storage/sqlite/..."],
+			"workingDirectory": "backend",
+			"timeoutSeconds": 300
+		},
+		"frontend-session": {
+			"argv": ["npm", "test", "--", "--run", "src/session.test.ts"],
+			"workingDirectory": "frontend"
+		}
+	}
 }
 ```
 

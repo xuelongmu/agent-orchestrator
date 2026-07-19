@@ -56,7 +56,7 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 | `ao orchestrator ls`                | `GET /api/v1/orchestrators`                    |
 | `ao send`                           | `POST /api/v1/sessions/{id}/send`              |
 | `ao preview [url]`                  | `POST /api/v1/sessions/{id}/preview`           |
-| `ao verify <profile>`                | `POST /api/v1/sessions/{id}/verify`            |
+| `ao verify <profile>`               | `POST /api/v1/sessions/{id}/verify`            |
 | `ao hooks <agent> <event>`          | `POST /api/v1/sessions/{id}/activity` (hidden) |
 
 `ao agent ls` prints the daemon-supported agent catalog with local install/auth

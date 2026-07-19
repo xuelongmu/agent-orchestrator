@@ -957,9 +957,6 @@ export interface components {
             sessionPrefix?: string;
             symlinks?: string[];
             trackerIntake?: components["schemas"]["TrackerIntakeConfig"];
-            verification?: {
-                [key: string]: components["schemas"]["VerificationCommand"];
-            };
             worker?: components["schemas"]["RoleOverride"];
             /** @enum {string} */
             workspaceKind?: "worktree" | "scratch" | "dir";
@@ -1259,11 +1256,6 @@ export interface components {
         TriggerReviewResponse: {
             reviewerHandleId: string;
             reviews: components["schemas"]["PRReviewState"][];
-        };
-        VerificationCommand: {
-            argv: string[];
-            timeoutSeconds?: number;
-            workingDirectory?: string;
         };
         VerifyRequest: {
             profile: string;

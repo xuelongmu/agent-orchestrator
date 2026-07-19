@@ -21,8 +21,8 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/pathenv"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
-	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessioncap"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
 )
 
@@ -203,8 +203,8 @@ type Manager struct {
 	// sendConfirm bounds the best-effort post-send confirmation that the session
 	// actually became active (the agent accepted the prompt). New fills in the
 	// sendConfirm* defaults; tests in this package shrink the timings directly.
-	sendConfirm sendConfirmConfig
-	logger      *slog.Logger
+	sendConfirm              sendConfirmConfig
+	logger                   *slog.Logger
 	verificationCapabilities VerificationCapabilityIssuer
 	// sharedDirMu serializes the durable lease check with dir spawn/restore so
 	// concurrent requests cannot both observe the project directory as free.
