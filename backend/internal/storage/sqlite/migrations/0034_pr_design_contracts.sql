@@ -1,5 +1,5 @@
--- Canonical per-PR design contracts. Workspace CONTRACT.md files are bounded
--- projections only; durable knowledge stays with the normalized PR URL across
+-- Canonical per-PR design contracts. Workspace CONTRACT.md files are optional
+-- full, read-only projections; durable knowledge stays with the normalized PR URL across
 -- session replacement and worktree teardown.
 
 -- +goose Up
@@ -12,7 +12,7 @@ CREATE TABLE session_design_contract_seed (
 
 CREATE TABLE pr_design_contract (
     pr_url                       TEXT PRIMARY KEY REFERENCES pr (url) ON DELETE CASCADE,
-    markdown                     TEXT NOT NULL CHECK (length(markdown) <= 1048576),
+    markdown                     TEXT NOT NULL CHECK (length(CAST(markdown AS BLOB)) <= 1048576),
     pending_delivery_session_id  TEXT REFERENCES sessions (id) ON DELETE SET NULL,
     pending_delivery_task_prompt TEXT NOT NULL DEFAULT '',
     pending_delivery_token       TEXT NOT NULL DEFAULT '',

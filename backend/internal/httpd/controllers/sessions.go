@@ -79,6 +79,7 @@ func (c *SessionsController) Register(r chi.Router) {
 	r.Get("/sessions/{sessionId}/workspace/file", c.getWorkspaceFile)
 	r.Get("/sessions/{sessionId}/pr", c.listPRs)
 	r.Post("/sessions/{sessionId}/pr/claim", c.claimPR)
+	r.Get("/sessions/{sessionId}/design-contract", c.getDesignContract)
 	r.Post("/sessions/{sessionId}/design-contract/invariants", c.addDesignContractInvariant)
 	r.Patch("/sessions/{sessionId}", c.rename)
 	r.Post("/sessions/{sessionId}/restore", c.restore)
@@ -392,6 +393,27 @@ func (c *SessionsController) addDesignContractInvariant(w http.ResponseWriter, r
 		return
 	}
 	envelope.WriteJSON(w, http.StatusOK, AddDesignContractInvariantResponse{OK: true, SessionID: sessionID(r), PR: in.PR})
+}
+
+func (c *SessionsController) getDesignContract(w http.ResponseWriter, r *http.Request) {
+	reader, ok := c.Svc.(interface {
+		GetDesignContract(context.Context, domain.SessionID, string) (string, error)
+	})
+	if !ok {
+		apispec.NotImplemented(w, r, "GET", "/api/v1/sessions/{sessionId}/design-contract")
+		return
+	}
+	pr := strings.TrimSpace(r.URL.Query().Get("pr"))
+	if pr == "" {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PR_REQUIRED", "pr is required", nil)
+		return
+	}
+	contract, err := reader.GetDesignContract(r.Context(), sessionID(r), pr)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, GetDesignContractResponse{OK: true, SessionID: sessionID(r), PR: pr, Contract: contract})
 }
 
 func (c *SessionsController) rename(w http.ResponseWriter, r *http.Request) {

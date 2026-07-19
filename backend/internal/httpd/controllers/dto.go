@@ -460,6 +460,17 @@ type AddDesignContractInvariantResponse struct {
 	PR        string           `json:"pr"`
 }
 
+type DesignContractQuery struct {
+	PR string `query:"pr" description:"Exact owned PR URL or unambiguous positive PR number."`
+}
+
+type GetDesignContractResponse struct {
+	OK        bool             `json:"ok"`
+	SessionID domain.SessionID `json:"sessionId"`
+	PR        string           `json:"pr"`
+	Contract  string           `json:"contract" description:"Full canonical untrusted design-contract Markdown."`
+}
+
 // SetActivityRequest is the body of POST /api/v1/sessions/{sessionId}/activity.
 // Event/ToolName/ToolUseID are optional correlation facts: which AO hook
 // sub-command produced the state and, for tool-use hooks, which tool call it

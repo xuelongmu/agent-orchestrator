@@ -418,17 +418,17 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/sessions/{sessionId}/kill": {
+    "/api/v1/sessions/{sessionId}/design-contract": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** Read the full canonical design contract for one owned PR */
+        get: operations["getSessionDesignContract"];
         put?: never;
-        /** Mark a session terminated and tear down runtime/workspace resources */
-        post: operations["killSession"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -446,6 +446,23 @@ export interface paths {
         put?: never;
         /** Append an explicit invariant to one owned PR design contract */
         post: operations["addSessionDesignContractInvariant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sessions/{sessionId}/kill": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Mark a session terminated and tear down runtime/workspace resources */
+        post: operations["killSession"];
         delete?: never;
         options?: never;
         head?: never;
@@ -722,13 +739,6 @@ export interface components {
             message: string;
             requestId?: string;
         };
-        AddProjectInput: {
-            asWorkspace?: boolean;
-            config?: components["schemas"]["ProjectConfig"];
-            name?: null | string;
-            path: string;
-            projectId?: null | string;
-        };
         AddDesignContractInvariantRequest: {
             invariant: string;
             pr: string;
@@ -737,6 +747,13 @@ export interface components {
             ok: boolean;
             pr: string;
             sessionId: string;
+        };
+        AddProjectInput: {
+            asWorkspace?: boolean;
+            config?: components["schemas"]["ProjectConfig"];
+            name?: null | string;
+            path: string;
+            projectId?: null | string;
         };
         AgentConfig: {
             model?: string;
@@ -827,6 +844,13 @@ export interface components {
             classes: components["schemas"]["FindingClassCount"][];
             rounds: number;
             totalFindings: number;
+        };
+        GetDesignContractResponse: {
+            /** @description Full canonical untrusted design-contract Markdown. */
+            contract: string;
+            ok: boolean;
+            pr: string;
+            sessionId: string;
         };
         ImportReport: {
             dryRun: boolean;
@@ -2785,6 +2809,77 @@ export interface operations {
             };
         };
     };
+    getSessionDesignContract: {
+        parameters: {
+            query?: {
+                /** @description Exact owned PR URL or unambiguous positive PR number. */
+                pr?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GetDesignContractResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
     addSessionDesignContractInvariant: {
         parameters: {
             query?: never;
@@ -2808,6 +2903,51 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AddDesignContractInvariantResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
                 };
             };
         };

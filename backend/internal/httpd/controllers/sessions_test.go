@@ -41,6 +41,7 @@ type fakeSessionService struct {
 	contractInvariant string
 	claimRef          string
 	claimOpts         sessionsvc.ClaimPROptions
+	contractReadPR    string
 }
 
 func newFakeSessionService() *fakeSessionService {
@@ -238,6 +239,17 @@ func (f *fakeSessionService) AddDesignContractInvariant(_ context.Context, id do
 	f.contractPR = pr
 	f.contractInvariant = invariant
 	return "# Design Contract\n", nil
+}
+
+func (f *fakeSessionService) GetDesignContract(_ context.Context, id domain.SessionID, pr string) (string, error) {
+	if f.contractErr != nil {
+		return "", f.contractErr
+	}
+	if _, ok := f.sessions[id]; !ok {
+		return "", apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	f.contractReadPR = pr
+	return "# Design Contract\n\nMIDDLE-INVARIANT\n", nil
 }
 
 func (f *fakeSessionService) ListWorkspaceFiles(_ context.Context, id domain.SessionID) (sessionsvc.WorkspaceFiles, error) {
@@ -1064,6 +1076,27 @@ func TestSessionsAPI_AddDesignContractInvariant(t *testing.T) {
 	if !got.OK || got.SessionID != "ao-1" || got.PR != pr || svc.contractPR != pr || svc.contractInvariant != "Every path has one ownership chokepoint." {
 		t.Fatalf("response/call = %#v, %q, %q", got, svc.contractPR, svc.contractInvariant)
 	}
+}
+
+func TestSessionsAPI_GetDesignContract(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+	body, status, _ := doRequest(t, srv, "GET", "/api/v1/sessions/ao-1/design-contract?pr=17", "")
+	if status != http.StatusOK {
+		t.Fatalf("contract get = %d body=%s", status, body)
+	}
+	var got struct {
+		OK        bool             `json:"ok"`
+		SessionID domain.SessionID `json:"sessionId"`
+		PR        string           `json:"pr"`
+		Contract  string           `json:"contract"`
+	}
+	mustJSON(t, body, &got)
+	if !got.OK || got.SessionID != "ao-1" || got.PR != "17" || svc.contractReadPR != "17" || !strings.Contains(got.Contract, "MIDDLE-INVARIANT") {
+		t.Fatalf("contract get response=%+v readPR=%q", got, svc.contractReadPR)
+	}
+	body, status, _ = doRequest(t, srv, "GET", "/api/v1/sessions/ao-1/design-contract", "")
+	assertErrorCode(t, body, status, http.StatusBadRequest, "PR_REQUIRED")
 }
 
 func TestSessionsAPI_AddDesignContractInvariantErrors(t *testing.T) {

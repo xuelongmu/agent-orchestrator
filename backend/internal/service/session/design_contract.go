@@ -17,6 +17,46 @@ type designContractWriter interface {
 	AddPRDesignContractInvariant(ctx context.Context, sessionID domain.SessionID, prURL, invariant string, updatedAt time.Time) (string, error)
 }
 
+type designContractReader interface {
+	GetPRDesignContract(ctx context.Context, prURL string) (string, bool, error)
+}
+
+// GetDesignContract returns the full canonical bytes for one exact owned PR.
+// HTTP JSON escapes control bytes; terminal clients must additionally sanitize
+// immediately before rendering.
+func (s *Service) GetDesignContract(ctx context.Context, id domain.SessionID, ref string) (string, error) {
+	rec, ok, err := s.store.GetSession(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	if rec.IsTerminated {
+		return "", apierr.Conflict("SESSION_TERMINATED", "Session is terminated", nil)
+	}
+	prs, err := s.store.ListPRsBySession(ctx, id)
+	if err != nil {
+		return "", fmt.Errorf("list PRs owned by %s: %w", id, err)
+	}
+	prURL, err := resolveOwnedPR(ref, prs)
+	if err != nil {
+		return "", err
+	}
+	reader, ok := s.store.(designContractReader)
+	if !ok {
+		return "", apierr.Internal("CONTRACT_STORAGE_UNAVAILABLE", "Design contract storage is unavailable")
+	}
+	contract, found, err := reader.GetPRDesignContract(ctx, prURL)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", apierr.NotFound("CONTRACT_NOT_FOUND", "Design contract is unavailable")
+	}
+	return contract, nil
+}
+
 // AddDesignContractInvariant is the trusted fixer/human write path for one
 // explicit invariant. PR normalization and ownership are verified before the
 // canonical SQLite append; the workspace projection is refreshed afterward.

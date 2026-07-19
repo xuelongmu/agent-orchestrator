@@ -1108,6 +1108,63 @@ paths:
       summary: Report an agent activity-state signal for a session
       tags:
       - sessions
+  /api/v1/sessions/{sessionId}/design-contract:
+    get:
+      operationId: getSessionDesignContract
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      - description: Exact owned PR URL or unambiguous positive PR number.
+        in: query
+        name: pr
+        schema:
+          description: Exact owned PR URL or unambiguous positive PR number.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetDesignContractResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Read the full canonical design contract for one owned PR
+      tags:
+      - sessions
   /api/v1/sessions/{sessionId}/design-contract/invariants:
     post:
       operationId: addSessionDesignContractInvariant
@@ -2276,6 +2333,23 @@ components:
       - totalFindings
       - rounds
       - classes
+      type: object
+    GetDesignContractResponse:
+      properties:
+        contract:
+          description: Full canonical untrusted design-contract Markdown.
+          type: string
+        ok:
+          type: boolean
+        pr:
+          type: string
+        sessionId:
+          type: string
+      required:
+      - ok
+      - sessionId
+      - pr
+      - contract
       type: object
     ImportReport:
       properties:

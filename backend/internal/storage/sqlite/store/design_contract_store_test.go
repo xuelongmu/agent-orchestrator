@@ -42,6 +42,26 @@ func TestPRDesignContractSurvivesTerminationAndReplacementWithoutWorkspaceState(
 	}
 }
 
+func TestPRDesignContractCanonicalCapCountsUTF8Bytes(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	owner := createContractSession(t, s, "mer")
+	// Fewer than one million Unicode characters, but more than one MiB once
+	// encoded as UTF-8. SQLite length(TEXT) would incorrectly admit this.
+	tooLarge := strings.Repeat("é", designcontract.MaxCanonicalBytes/2+1)
+	if len([]rune(tooLarge)) >= designcontract.MaxCanonicalBytes || len(tooLarge) <= designcontract.MaxCanonicalBytes {
+		t.Fatal("invalid multibyte test fixture")
+	}
+	if err := s.SaveSessionDesignContractSeed(ctx, owner.ID, tooLarge, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.ClaimPR(ctx, domain.PullRequest{URL: "https://github.com/acme/repo/pull/20", SessionID: owner.ID, Number: 20, UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "", "")
+	if err == nil {
+		t.Fatalf("multibyte contract over byte cap error = %v", err)
+	}
+}
+
 func TestClaimPRPersistsExactSessionContractDeliveryBarrier(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

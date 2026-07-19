@@ -49,3 +49,30 @@ func TestContractAddSurfacesDaemonOwnershipErrorAsRuntimeFailure(t *testing.T) {
 		t.Fatalf("daemon envelope not preserved: err=%v stderr=%q", err, errOut)
 	}
 }
+
+func TestContractShowPrintsFullCanonicalFallbackAndSanitizesControls(t *testing.T) {
+	t.Setenv("AO_SESSION_ID", "mer-1")
+	cfg := setConfigEnv(t)
+	canonical := strings.Repeat("head-", 4000) + "MIDDLE-INVARIANT\x1b[31m\u0085" + strings.Repeat("-tail", 4000)
+	payload, err := json.Marshal(map[string]any{"ok": true, "contract": canonical})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, capture := reviewServer(t, http.StatusOK, string(payload))
+	writeRunFileFor(t, cfg, srv)
+	out, errOut, err := executeCLI(t, aliveDeps(), "contract", "show", "--pr", "https://gitlab.example.com/g/r/-/merge_requests/17")
+	if err != nil {
+		t.Fatalf("contract show: %v stderr=%s", err, errOut)
+	}
+	if capture.method != http.MethodGet || capture.path != "/api/v1/sessions/mer-1/design-contract" {
+		t.Fatalf("request = %s %s", capture.method, capture.path)
+	}
+	if !strings.Contains(out, "MIDDLE-INVARIANT") || len(out) < len(canonical)-2 {
+		t.Fatalf("full canonical fallback was truncated: output=%d canonical=%d", len(out), len(canonical))
+	}
+	for _, control := range []string{"\x1b", "\u0085"} {
+		if strings.Contains(out, control) {
+			t.Fatalf("terminal output retained control %q", control)
+		}
+	}
+}

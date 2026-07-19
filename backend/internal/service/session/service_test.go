@@ -202,6 +202,11 @@ func (f *fakeStore) AddPRDesignContractInvariant(_ context.Context, sessionID do
 	return f.contracts[prURL], nil
 }
 
+func (f *fakeStore) GetPRDesignContract(_ context.Context, prURL string) (string, bool, error) {
+	contract, ok := f.contracts[prURL]
+	return contract, ok, nil
+}
+
 func (f *fakeStore) GetPendingPRDesignContractDelivery(_ context.Context, sessionID domain.SessionID, prURL string) (designcontract.PendingDelivery, bool, error) {
 	return designcontract.PendingDelivery{Contract: f.contracts[prURL], TaskPrompt: f.pendingContractTask[prURL], Token: f.pendingContractToken[prURL], Revision: f.pendingContractRevision[prURL]}, f.pendingContractDelivery[prURL] == sessionID, nil
 }
@@ -335,6 +340,26 @@ func TestAddDesignContractInvariantRejectsUnownedAmbiguousAndInvalidInputs(t *te
 	}
 	if len(st.contractWrites) != 0 {
 		t.Fatalf("rejected input wrote contracts: %+v", st.contractWrites)
+	}
+}
+
+func TestGetDesignContractReturnsFullProviderNeutralOwnedContract(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1"}
+	prURL := "https://gitlab.example.com/a/r/-/merge_requests/8"
+	st.ownedPRs["mer-1"] = []domain.PullRequest{{URL: prURL, SessionID: "mer-1", Number: 8}}
+	full := designcontract.BuildSeed("61", "## Invariants\n- "+strings.Repeat("middle", 4000))
+	st.contracts[prURL] = full
+	svc := NewWithDeps(Deps{Store: st})
+	got, err := svc.GetDesignContract(context.Background(), "mer-1", "8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != full || len(got) <= 16*1024 {
+		t.Fatalf("full canonical read = %d bytes, want %d", len(got), len(full))
+	}
+	if _, err := svc.GetDesignContract(context.Background(), "mer-1", "9"); err == nil {
+		t.Fatal("unowned PR contract read succeeded")
 	}
 }
 
