@@ -53,6 +53,12 @@ type ReviewRun struct {
 	GithubReviewID string     `json:"githubReviewId"`
 	CreatedAt      time.Time  `json:"createdAt"`
 	DeliveredAt    *time.Time `json:"deliveredAt,omitempty"`
+	// SimplificationClass is selected atomically with the finding set for this
+	// run. It is empty unless a class present in this run crossed the repetition
+	// threshold. SimplificationDispatchedAt records durable delivery of that mode.
+	SimplificationClass        string     `json:"-"`
+	SimplificationDispatchedAt *time.Time `json:"-"`
+	DeflectedReviewClearedAt   *time.Time `json:"-"`
 }
 
 // ReviewFinding is one durable entry in a PR's finding-class ledger. Round is
@@ -73,6 +79,7 @@ type ReviewFinding struct {
 	OutOfScope       bool      `json:"outOfScope,omitempty"`
 	DeferredIssueURL string    `json:"deferredIssueUrl,omitempty"`
 	ThreadResolved   bool      `json:"threadResolved,omitempty"`
+	ThreadReplyID    string    `json:"-"`
 	CreatedAt        time.Time `json:"createdAt"`
 }
 

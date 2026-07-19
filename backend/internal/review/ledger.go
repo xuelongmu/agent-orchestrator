@@ -9,8 +9,8 @@ import (
 
 // FindingLedger summarizes a durable finding history deterministically. Filed
 // out-of-scope findings remain visible in TotalFindings but do not participate
-// in repetition escalation because they no longer belong to the fix loop.
-func FindingLedger(findings []domain.ReviewFinding) (domain.FindingLedgerSummary, string) {
+// in class counts because they no longer belong to the fix loop.
+func FindingLedger(findings []domain.ReviewFinding) domain.FindingLedgerSummary {
 	rounds := map[int]struct{}{}
 	counts := map[string]int{}
 	for _, finding := range findings {
@@ -33,11 +33,26 @@ func FindingLedger(findings []domain.ReviewFinding) (domain.FindingLedgerSummary
 		}
 		return classes[i].ClassTag < classes[j].ClassTag
 	})
-	simplificationClass := ""
-	if len(classes) > 0 && classes[0].Count >= 3 {
-		simplificationClass = classes[0].ClassTag
-	}
 	return domain.FindingLedgerSummary{
 		TotalFindings: len(findings), Rounds: len(rounds), Classes: classes,
-	}, simplificationClass
+	}
+}
+
+// SimplificationClassForRun selects a repeated class only when it occurs in
+// the current run. This prevents an old threshold-crossing class from forcing
+// unrelated later findings into simplification mode.
+func SimplificationClassForRun(findings []domain.ReviewFinding, runID string) string {
+	current := map[string]bool{}
+	for _, finding := range findings {
+		if finding.RunID == runID && !(finding.OutOfScope && finding.DeferredIssueURL != "") {
+			current[strings.TrimSpace(finding.ClassTag)] = true
+		}
+	}
+	ledger := FindingLedger(findings)
+	for _, class := range ledger.Classes {
+		if class.Count >= 3 && current[class.ClassTag] {
+			return class.ClassTag
+		}
+	}
+	return ""
 }

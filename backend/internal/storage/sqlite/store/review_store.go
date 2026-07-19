@@ -84,6 +84,32 @@ func (s *Store) UpdateReviewRunResult(ctx context.Context, id string, status dom
 	return n > 0, nil
 }
 
+// CompleteReviewRunWithFindings atomically records a completed result and its
+// entire finding set. A failed finding insert rolls the run back to running so
+// a retry can never observe a permanently partial complete ledger.
+func (s *Store) CompleteReviewRunWithFindings(ctx context.Context, id string, verdict domain.ReviewVerdict, body, githubReviewID, simplificationClass string, findings []domain.ReviewFinding) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	updated := false
+	err := s.inTx(ctx, "complete review run with findings", func(q *gen.Queries) error {
+		n, err := q.CompleteReviewRunResult(ctx, gen.CompleteReviewRunResultParams{
+			Verdict: verdict, Body: body, GithubReviewID: githubReviewID,
+			SimplificationClass: simplificationClass, ID: id,
+		})
+		if err != nil || n == 0 {
+			return err
+		}
+		updated = true
+		for _, finding := range findings {
+			if err := q.InsertReviewFindingStrict(ctx, strictFindingParams(finding)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return updated && err == nil, err
+}
+
 // SupersedeStaleRunningReviewRuns marks older running unverdicted passes for a
 // worker failed before starting a review for a newer commit.
 func (s *Store) SupersedeStaleRunningReviewRuns(ctx context.Context, sessionID domain.SessionID, prURL, targetSHA, body string) (int64, error) {
@@ -114,13 +140,25 @@ func (s *Store) MarkReviewRunDelivered(ctx context.Context, id string, delivered
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	n, err := s.qw.MarkReviewRunDelivered(ctx, gen.MarkReviewRunDeliveredParams{
-		DeliveredAt: sql.NullTime{Time: deliveredAt, Valid: true},
-		ID:          id,
+		DeliveredAt:                sql.NullTime{Time: deliveredAt, Valid: true},
+		SimplificationDispatchedAt: sql.NullTime{Time: deliveredAt, Valid: true},
+		ID:                         id,
 	})
 	if err != nil {
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// MarkReviewRunDeflectedReviewCleared records provider-confirmed clearing of a
+// review whose complete finding set was deferred out of scope.
+func (s *Store) MarkReviewRunDeflectedReviewCleared(ctx context.Context, id string, clearedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	n, err := s.qw.MarkReviewRunDeflectedReviewCleared(ctx, gen.MarkReviewRunDeflectedReviewClearedParams{
+		DeflectedReviewClearedAt: sql.NullTime{Time: clearedAt, Valid: true}, ID: id,
+	})
+	return n > 0, err
 }
 
 // GetReviewRun returns one review pass by id.
@@ -202,6 +240,18 @@ func (s *Store) InsertReviewFinding(ctx context.Context, finding domain.ReviewFi
 	})
 }
 
+func strictFindingParams(finding domain.ReviewFinding) gen.InsertReviewFindingStrictParams {
+	return gen.InsertReviewFindingStrictParams{
+		ID: finding.ID, RunID: finding.RunID, SessionID: finding.SessionID,
+		PRURL: finding.PRURL, Round: int64(finding.Round), File: finding.File,
+		ClassTag: finding.ClassTag, RootCauseNote: finding.RootCauseNote,
+		FixCommit: finding.FixCommit, ThreadID: finding.ThreadID, Body: finding.Body,
+		OutOfScope: boolInt64(finding.OutOfScope), DeferredIssueURL: finding.DeferredIssueURL,
+		ThreadResolved: boolInt64(finding.ThreadResolved), ThreadReplyID: finding.ThreadReplyID,
+		CreatedAt: finding.CreatedAt,
+	}
+}
+
 // ListReviewFindingsBySession returns the full per-worker ledger oldest first.
 func (s *Store) ListReviewFindingsBySession(ctx context.Context, id domain.SessionID) ([]domain.ReviewFinding, error) {
 	rows, err := s.qr.ListReviewFindingsBySession(ctx, id)
@@ -236,16 +286,54 @@ func (s *Store) SetPendingReviewFindingFixCommit(ctx context.Context, id domain.
 	})
 }
 
-// MarkReviewFindingIssueFiled records the issue filed for a deferred review finding.
-func (s *Store) MarkReviewFindingIssueFiled(ctx context.Context, id, issueURL string) (bool, error) {
-	n, err := s.qw.MarkReviewFindingIssueFiled(ctx, gen.MarkReviewFindingIssueFiledParams{DeferredIssueURL: issueURL, ID: id})
+// ClaimReviewFindingIssueAction acquires or takes over an expired durable lease
+// for one finding's idempotent issue action.
+func (s *Store) ClaimReviewFindingIssueAction(ctx context.Context, id, token string, leaseUntil, staleBefore time.Time) (bool, error) {
+	n, err := s.qw.ClaimReviewFindingIssueAction(ctx, gen.ClaimReviewFindingIssueActionParams{
+		IssueActionToken: token, IssueActionLeaseUntil: sql.NullTime{Time: leaseUntil, Valid: true},
+		ID: id, IssueActionLeaseUntil_2: sql.NullTime{Time: staleBefore, Valid: true},
+	})
 	return n > 0, err
 }
 
-// MarkReviewFindingThreadResolved records that a review finding's thread was resolved.
-func (s *Store) MarkReviewFindingThreadResolved(ctx context.Context, id string) (bool, error) {
-	n, err := s.qw.MarkReviewFindingThreadResolved(ctx, id)
+// CompleteReviewFindingIssueAction stores the provider-confirmed issue receipt
+// only when the caller still owns the durable action lease.
+func (s *Store) CompleteReviewFindingIssueAction(ctx context.Context, id, token, issueURL string) (bool, error) {
+	n, err := s.qw.CompleteReviewFindingIssueAction(ctx, gen.CompleteReviewFindingIssueActionParams{
+		DeferredIssueURL: issueURL, ID: id, IssueActionToken: token,
+	})
 	return n > 0, err
+}
+
+// ReleaseReviewFindingIssueAction releases a failed issue action lease.
+func (s *Store) ReleaseReviewFindingIssueAction(ctx context.Context, id, token string) error {
+	_, err := s.qw.ReleaseReviewFindingIssueAction(ctx, gen.ReleaseReviewFindingIssueActionParams{ID: id, IssueActionToken: token})
+	return err
+}
+
+// ClaimReviewFindingThreadAction acquires or takes over an expired durable
+// lease for one finding's idempotent thread action.
+func (s *Store) ClaimReviewFindingThreadAction(ctx context.Context, id, token string, leaseUntil, staleBefore time.Time) (bool, error) {
+	n, err := s.qw.ClaimReviewFindingThreadAction(ctx, gen.ClaimReviewFindingThreadActionParams{
+		ThreadActionToken: token, ThreadActionLeaseUntil: sql.NullTime{Time: leaseUntil, Valid: true},
+		ID: id, ThreadActionLeaseUntil_2: sql.NullTime{Time: staleBefore, Valid: true},
+	})
+	return n > 0, err
+}
+
+// CompleteReviewFindingThreadAction stores the provider-confirmed reply and
+// resolution receipts only when the caller still owns the durable action lease.
+func (s *Store) CompleteReviewFindingThreadAction(ctx context.Context, id, token, replyID string) (bool, error) {
+	n, err := s.qw.CompleteReviewFindingThreadAction(ctx, gen.CompleteReviewFindingThreadActionParams{
+		ThreadReplyID: replyID, ID: id, ThreadActionToken: token,
+	})
+	return n > 0, err
+}
+
+// ReleaseReviewFindingThreadAction releases a failed thread action lease.
+func (s *Store) ReleaseReviewFindingThreadAction(ctx context.Context, id, token string) error {
+	_, err := s.qw.ReleaseReviewFindingThreadAction(ctx, gen.ReleaseReviewFindingThreadActionParams{ID: id, ThreadActionToken: token})
+	return err
 }
 
 func reviewFromRow(r gen.Review) domain.Review {
@@ -267,20 +355,33 @@ func reviewRunFromRow(r gen.ReviewRun) domain.ReviewRun {
 		t := r.DeliveredAt.Time
 		deliveredAt = &t
 	}
+	var simplificationDispatchedAt *time.Time
+	if r.SimplificationDispatchedAt.Valid {
+		t := r.SimplificationDispatchedAt.Time
+		simplificationDispatchedAt = &t
+	}
+	var deflectedReviewClearedAt *time.Time
+	if r.DeflectedReviewClearedAt.Valid {
+		t := r.DeflectedReviewClearedAt.Time
+		deflectedReviewClearedAt = &t
+	}
 	return domain.ReviewRun{
-		ID:             r.ID,
-		ReviewID:       r.ReviewID,
-		SessionID:      r.SessionID,
-		BatchID:        r.BatchID,
-		Harness:        r.Harness,
-		PRURL:          r.PRURL,
-		TargetSHA:      r.TargetSha,
-		Status:         r.Status,
-		Verdict:        r.Verdict,
-		Body:           r.Body,
-		GithubReviewID: r.GithubReviewID,
-		CreatedAt:      r.CreatedAt,
-		DeliveredAt:    deliveredAt,
+		ID:                         r.ID,
+		ReviewID:                   r.ReviewID,
+		SessionID:                  r.SessionID,
+		BatchID:                    r.BatchID,
+		Harness:                    r.Harness,
+		PRURL:                      r.PRURL,
+		TargetSHA:                  r.TargetSha,
+		Status:                     r.Status,
+		Verdict:                    r.Verdict,
+		Body:                       r.Body,
+		GithubReviewID:             r.GithubReviewID,
+		CreatedAt:                  r.CreatedAt,
+		DeliveredAt:                deliveredAt,
+		SimplificationClass:        r.SimplificationClass,
+		SimplificationDispatchedAt: simplificationDispatchedAt,
+		DeflectedReviewClearedAt:   deflectedReviewClearedAt,
 	}
 }
 
@@ -291,7 +392,8 @@ func reviewFindingFromRow(r gen.ReviewFinding) domain.ReviewFinding {
 		RootCauseNote: r.RootCauseNote, FixCommit: r.FixCommit,
 		ThreadID: r.ThreadID, Body: r.Body, OutOfScope: r.OutOfScope != 0,
 		DeferredIssueURL: r.DeferredIssueURL, ThreadResolved: r.ThreadResolved != 0,
-		CreatedAt: r.CreatedAt,
+		ThreadReplyID: r.ThreadReplyID,
+		CreatedAt:     r.CreatedAt,
 	}
 }
 

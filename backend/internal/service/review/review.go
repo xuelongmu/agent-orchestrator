@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -40,6 +42,7 @@ type Service struct {
 	lifecycle Reducer
 	deflector FindingDeflector
 	clock     func() time.Time
+	newID     func() string
 }
 
 var _ Manager = (*Service)(nil)
@@ -47,16 +50,20 @@ var _ Manager = (*Service)(nil)
 // Store is the review_run persistence surface owned by the service submit path.
 type Store interface {
 	GetReviewRun(ctx context.Context, id string) (domain.ReviewRun, bool, error)
-	UpdateReviewRunResult(ctx context.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string) (bool, error)
+	CompleteReviewRunWithFindings(ctx context.Context, id string, verdict domain.ReviewVerdict, body, githubReviewID, simplificationClass string, findings []domain.ReviewFinding) (bool, error)
 	MarkReviewRunDelivered(ctx context.Context, id string, deliveredAt time.Time) (bool, error)
+	MarkReviewRunDeflectedReviewCleared(ctx context.Context, id string, clearedAt time.Time) (bool, error)
 	ListReviewRunsByBatch(ctx context.Context, sessionID domain.SessionID, batchID string) ([]domain.ReviewRun, error)
 	ListPRsBySession(ctx context.Context, id domain.SessionID) ([]domain.PullRequest, error)
 	ListReviewRunsBySession(ctx context.Context, id domain.SessionID) ([]domain.ReviewRun, error)
-	InsertReviewFinding(ctx context.Context, finding domain.ReviewFinding) error
 	ListReviewFindingsByRun(ctx context.Context, runID string) ([]domain.ReviewFinding, error)
 	ListReviewFindingsBySession(ctx context.Context, id domain.SessionID) ([]domain.ReviewFinding, error)
-	MarkReviewFindingIssueFiled(ctx context.Context, id, issueURL string) (bool, error)
-	MarkReviewFindingThreadResolved(ctx context.Context, id string) (bool, error)
+	ClaimReviewFindingIssueAction(ctx context.Context, id, token string, leaseUntil, staleBefore time.Time) (bool, error)
+	CompleteReviewFindingIssueAction(ctx context.Context, id, token, issueURL string) (bool, error)
+	ReleaseReviewFindingIssueAction(ctx context.Context, id, token string) error
+	ClaimReviewFindingThreadAction(ctx context.Context, id, token string, leaseUntil, staleBefore time.Time) (bool, error)
+	CompleteReviewFindingThreadAction(ctx context.Context, id, token, replyID string) (bool, error)
+	ReleaseReviewFindingThreadAction(ctx context.Context, id, token string) error
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
 }
@@ -66,6 +73,7 @@ type Store interface {
 type FindingDeflector interface {
 	ports.SCMIssueFiler
 	ports.SCMFindingThreadDeflector
+	ports.SCMReviewDismisser
 }
 
 // Reducer is the lifecycle reaction boundary used after a review result has
@@ -88,6 +96,11 @@ func WithClock(clock func() time.Time) Option {
 	return func(s *Service) { s.clock = clock }
 }
 
+// WithIDSource overrides action lease token generation for tests.
+func WithIDSource(newID func() string) Option {
+	return func(s *Service) { s.newID = newID }
+}
+
 // WithFindingDeflector enables provider mutations when the project review
 // policy opts in.
 func WithFindingDeflector(deflector FindingDeflector) Option {
@@ -100,6 +113,7 @@ func New(engine *reviewcore.Engine, store Store, opts ...Option) *Service {
 		engine: engine,
 		store:  store,
 		clock:  func() time.Time { return time.Now().UTC() },
+		newID:  uuid.NewString,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -247,6 +261,9 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 	if verdict == domain.VerdictChangesRequested && body == "" {
 		return domain.ReviewRun{}, fmt.Errorf("%w: a changes_requested review requires a body", ErrInvalid)
 	}
+	if verdict != domain.VerdictChangesRequested && len(review.Findings) > 0 {
+		return domain.ReviewRun{}, fmt.Errorf("%w: findings require a changes_requested verdict", ErrInvalid)
+	}
 	run, ok, err := s.store.GetReviewRun(ctx, runID)
 	if err != nil {
 		return domain.ReviewRun{}, err
@@ -260,7 +277,20 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 
 	switch run.Status {
 	case domain.ReviewRunRunning:
-		updated, err := s.store.UpdateReviewRunResult(ctx, run.ID, domain.ReviewRunComplete, verdict, body, githubReviewID)
+		submitted := review.Findings
+		if verdict == domain.VerdictChangesRequested && len(submitted) == 0 {
+			submitted = inferFindings(body)
+		}
+		findings, err := s.buildFindings(ctx, run, submitted)
+		if err != nil {
+			return domain.ReviewRun{}, err
+		}
+		history, err := s.store.ListReviewFindingsBySession(ctx, run.SessionID)
+		if err != nil {
+			return domain.ReviewRun{}, err
+		}
+		simplificationClass := reviewcore.SimplificationClassForRun(append(history, findings...), run.ID)
+		updated, err := s.store.CompleteReviewRunWithFindings(ctx, run.ID, verdict, body, githubReviewID, simplificationClass, findings)
 		if err != nil {
 			return domain.ReviewRun{}, err
 		}
@@ -271,6 +301,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		run.Verdict = verdict
 		run.Body = body
 		run.GithubReviewID = githubReviewID
+		run.SimplificationClass = simplificationClass
 	case domain.ReviewRunComplete:
 		if run.Verdict != verdict {
 			return domain.ReviewRun{}, fmt.Errorf("%w: review run %q already recorded verdict %q", ErrInvalid, runID, run.Verdict)
@@ -285,13 +316,6 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		return run, nil
 	default:
 		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q is not running", ErrInvalid, runID)
-	}
-	findings := review.Findings
-	if verdict == domain.VerdictChangesRequested && len(findings) == 0 {
-		findings = inferFindings(body)
-	}
-	if err := s.recordFindings(ctx, run, findings); err != nil {
-		return domain.ReviewRun{}, err
 	}
 	if err := s.deflectOutOfScope(ctx, run); err != nil {
 		return domain.ReviewRun{}, err
@@ -344,6 +368,9 @@ func (s *Service) deliverSubmitted(ctx context.Context, workerID domain.SessionI
 		if updated {
 			run.Status = domain.ReviewRunDelivered
 			run.DeliveredAt = &deliveredAt
+			if run.SimplificationClass != "" {
+				run.SimplificationDispatchedAt = &deliveredAt
+			}
 			delivered = append(delivered, run)
 		}
 	}
@@ -377,20 +404,20 @@ func (s *Service) deliverableRuns(ctx context.Context, workerID domain.SessionID
 
 func hasActionableFinding(findings []domain.ReviewFinding) bool {
 	for _, finding := range findings {
-		if !finding.OutOfScope || finding.DeferredIssueURL == "" {
+		if !finding.OutOfScope || finding.DeferredIssueURL == "" || finding.ThreadID == "" || !finding.ThreadResolved {
 			return true
 		}
 	}
 	return false
 }
 
-func (s *Service) recordFindings(ctx context.Context, run domain.ReviewRun, submitted []SubmittedFinding) error {
+func (s *Service) buildFindings(ctx context.Context, run domain.ReviewRun, submitted []SubmittedFinding) ([]domain.ReviewFinding, error) {
 	if len(submitted) == 0 {
-		return nil
+		return nil, nil
 	}
 	runs, err := s.store.ListReviewRunsBySession(ctx, run.SessionID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	heads := map[string]struct{}{}
 	for _, candidate := range runs {
@@ -402,10 +429,11 @@ func (s *Service) recordFindings(ctx context.Context, run domain.ReviewRun, subm
 	if round == 0 {
 		round = 1
 	}
+	findings := make([]domain.ReviewFinding, 0, len(submitted))
 	for i, item := range submitted {
 		classTag := normalizeClassTag(item.ClassTag)
 		if classTag == "" {
-			return fmt.Errorf("%w: findings[%d].classTag is required", ErrInvalid, i)
+			return nil, fmt.Errorf("%w: findings[%d].classTag is required", ErrInvalid, i)
 		}
 		finding := domain.ReviewFinding{
 			ID: fmt.Sprintf("%s:%d", run.ID, i+1), RunID: run.ID,
@@ -418,11 +446,9 @@ func (s *Service) recordFindings(ctx context.Context, run domain.ReviewRun, subm
 		if finding.RootCauseNote == "" {
 			finding.RootCauseNote = finding.Body
 		}
-		if err := s.store.InsertReviewFinding(ctx, finding); err != nil {
-			return err
-		}
+		findings = append(findings, finding)
 	}
-	return nil
+	return findings, nil
 }
 
 func normalizeClassTag(value string) string {
@@ -486,31 +512,111 @@ func (s *Service) deflectOutOfScope(ctx context.Context, run domain.ReviewRun) e
 		if !finding.OutOfScope {
 			continue
 		}
+		if finding.DeferredIssueURL != "" && finding.ThreadID != "" && finding.ThreadResolved {
+			continue
+		}
+		binding := ports.SCMReviewThreadBinding{
+			PRURL: run.PRURL, ReviewID: run.GithubReviewID, ThreadID: finding.ThreadID,
+			File: finding.File, Body: finding.Body, ActionKey: finding.ID,
+		}
+		// Without a provider-confirmed binding there is no safe thread to mutate.
+		// Leave the finding actionable instead of silently suppressing it.
+		if binding.ThreadID == "" || binding.ReviewID == "" {
+			continue
+		}
+		bound, err := s.deflector.ReviewThreadBound(ctx, binding)
+		if err != nil {
+			return err
+		}
+		if !bound {
+			continue
+		}
 		issueURL := finding.DeferredIssueURL
 		if issueURL == "" {
+			token := s.newID()
+			now := s.clock()
+			claimed, err := s.store.ClaimReviewFindingIssueAction(ctx, finding.ID, token, now.Add(2*time.Minute), now)
+			if err != nil {
+				return err
+			}
+			if !claimed {
+				return fmt.Errorf("review finding %s issue action is already in progress", finding.ID)
+			}
 			title := fmt.Sprintf("review follow-up: %s", strings.ReplaceAll(finding.ClassTag, "-", " "))
 			body := fmt.Sprintf("Deferred from %s review round %d.\n\nFile: `%s`\n\nRoot cause: %s\n\n%s", run.PRURL, finding.Round, finding.File, finding.RootCauseNote, finding.Body)
-			filed, err := s.deflector.FileDeferredIssue(ctx, ports.SCMDeferredIssueRequest{PRURL: run.PRURL, Title: title, Body: body})
+			filed, err := s.deflector.FileDeferredIssue(ctx, ports.SCMDeferredIssueRequest{
+				PRURL: run.PRURL, Title: title, Body: body, ActionKey: finding.ID,
+			})
 			if err != nil {
+				_ = s.store.ReleaseReviewFindingIssueAction(ctx, finding.ID, token)
 				return err
 			}
 			issueURL = filed.URL
-			if _, err := s.store.MarkReviewFindingIssueFiled(ctx, finding.ID, issueURL); err != nil {
+			stored, err := s.store.CompleteReviewFindingIssueAction(ctx, finding.ID, token, issueURL)
+			if err != nil {
+				_ = s.store.ReleaseReviewFindingIssueAction(ctx, finding.ID, token)
 				return err
 			}
+			if !stored {
+				return fmt.Errorf("review finding %s lost its issue action lease", finding.ID)
+			}
 		}
-		if finding.ThreadID != "" && !finding.ThreadResolved {
-			resolved, err := s.deflector.DeflectReviewThread(ctx, finding.ThreadID, issueURL)
+		if !finding.ThreadResolved {
+			token := s.newID()
+			now := s.clock()
+			claimed, err := s.store.ClaimReviewFindingThreadAction(ctx, finding.ID, token, now.Add(2*time.Minute), now)
 			if err != nil {
 				return err
 			}
-			if !resolved.Resolved {
-				return fmt.Errorf("review finding %s thread resolution was not confirmed", finding.ID)
+			if !claimed {
+				return fmt.Errorf("review finding %s thread action is already in progress", finding.ID)
 			}
-			if _, err := s.store.MarkReviewFindingThreadResolved(ctx, finding.ID); err != nil {
+			binding.IssueURL = issueURL
+			resolved, err := s.deflector.DeflectReviewThread(ctx, binding)
+			if err != nil {
+				_ = s.store.ReleaseReviewFindingThreadAction(ctx, finding.ID, token)
 				return err
 			}
+			if !resolved.Resolved || resolved.ThreadID != finding.ThreadID || resolved.ReplyID == "" {
+				_ = s.store.ReleaseReviewFindingThreadAction(ctx, finding.ID, token)
+				return fmt.Errorf("review finding %s thread resolution was not confirmed", finding.ID)
+			}
+			stored, err := s.store.CompleteReviewFindingThreadAction(ctx, finding.ID, token, resolved.ReplyID)
+			if err != nil {
+				_ = s.store.ReleaseReviewFindingThreadAction(ctx, finding.ID, token)
+				return err
+			}
+			if !stored {
+				return fmt.Errorf("review finding %s lost its thread action lease", finding.ID)
+			}
 		}
+	}
+	findings, err = s.store.ListReviewFindingsByRun(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	if len(findings) == 0 || hasActionableFinding(findings) {
+		return nil
+	}
+	currentRun, ok, err := s.store.GetReviewRun(ctx, run.ID)
+	if err != nil || !ok {
+		return err
+	}
+	if currentRun.DeflectedReviewClearedAt != nil {
+		return nil
+	}
+	cleared, err := s.deflector.DismissReview(ctx, ports.SCMReviewDismissalRequest{
+		PRURL: run.PRURL, ReviewID: run.GithubReviewID,
+		Message: "All blocking findings were deferred to linked follow-up issues by AO.",
+	})
+	if err != nil {
+		return err
+	}
+	if !cleared.Cleared {
+		return fmt.Errorf("review run %s changes-requested review was not cleared", run.ID)
+	}
+	if _, err := s.store.MarkReviewRunDeflectedReviewCleared(ctx, run.ID, s.clock()); err != nil {
+		return err
 	}
 	return nil
 }
@@ -523,7 +629,7 @@ func (s *Service) reviewResults(ctx context.Context, workerID domain.SessionID, 
 	results := make([]lifecycle.ReviewResult, 0, len(runs))
 	for _, run := range runs {
 		prFindings := findingsForPR(ledgerFindings, run.PRURL)
-		ledger, simplificationClass := reviewcore.FindingLedger(prFindings)
+		ledger := reviewcore.FindingLedger(prFindings)
 		findings, err := s.store.ListReviewFindingsByRun(ctx, run.ID)
 		if err != nil {
 			return nil, err
@@ -540,7 +646,7 @@ func (s *Service) reviewResults(ctx context.Context, workerID domain.SessionID, 
 			DeliveredAt:         run.DeliveredAt,
 			Findings:            findings,
 			Ledger:              ledger,
-			SimplificationClass: simplificationClass,
+			SimplificationClass: run.SimplificationClass,
 		})
 	}
 	return results, nil

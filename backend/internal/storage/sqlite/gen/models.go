@@ -154,37 +154,45 @@ type Review struct {
 }
 
 type ReviewFinding struct {
-	ID               string
-	RunID            string
-	SessionID        domain.SessionID
-	PRURL            string
-	Round            int64
-	File             string
-	ClassTag         string
-	RootCauseNote    string
-	FixCommit        string
-	ThreadID         string
-	Body             string
-	OutOfScope       int64
-	DeferredIssueURL string
-	ThreadResolved   int64
-	CreatedAt        time.Time
+	ID                     string
+	RunID                  string
+	SessionID              domain.SessionID
+	PRURL                  string
+	Round                  int64
+	File                   string
+	ClassTag               string
+	RootCauseNote          string
+	FixCommit              string
+	ThreadID               string
+	Body                   string
+	OutOfScope             int64
+	DeferredIssueURL       string
+	ThreadResolved         int64
+	ThreadReplyID          string
+	IssueActionToken       string
+	IssueActionLeaseUntil  sql.NullTime
+	ThreadActionToken      string
+	ThreadActionLeaseUntil sql.NullTime
+	CreatedAt              time.Time
 }
 
 type ReviewRun struct {
-	ID             string
-	ReviewID       string
-	SessionID      domain.SessionID
-	Harness        domain.ReviewerHarness
-	PRURL          string
-	TargetSha      string
-	Status         domain.ReviewRunStatus
-	Verdict        domain.ReviewVerdict
-	Body           string
-	CreatedAt      time.Time
-	GithubReviewID string
-	DeliveredAt    sql.NullTime
-	BatchID        string
+	ID                         string
+	ReviewID                   string
+	SessionID                  domain.SessionID
+	Harness                    domain.ReviewerHarness
+	PRURL                      string
+	TargetSha                  string
+	Status                     domain.ReviewRunStatus
+	Verdict                    domain.ReviewVerdict
+	Body                       string
+	CreatedAt                  time.Time
+	GithubReviewID             string
+	DeliveredAt                sql.NullTime
+	BatchID                    string
+	SimplificationClass        string
+	SimplificationDispatchedAt sql.NullTime
+	DeflectedReviewClearedAt   sql.NullTime
 }
 
 type Session struct {

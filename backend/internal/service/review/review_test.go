@@ -21,11 +21,14 @@ type fakeStore struct {
 	sessions   map[domain.SessionID]domain.SessionRecord
 	signatures map[string]string
 
-	updateCalls int
-	markCalls   int
-	markedIDs   []string
-	findings    []domain.ReviewFinding
-	project     domain.ProjectRecord
+	updateCalls  int
+	markCalls    int
+	markedIDs    []string
+	findings     []domain.ReviewFinding
+	project      domain.ProjectRecord
+	completeErr  error
+	issueClaims  map[string]string
+	threadClaims map[string]string
 }
 
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
@@ -75,17 +78,22 @@ func (f *fakeStore) GetReviewRun(_ context.Context, id string) (domain.ReviewRun
 	return domain.ReviewRun{}, false, nil
 }
 
-func (f *fakeStore) UpdateReviewRunResult(_ context.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string) (bool, error) {
+func (f *fakeStore) CompleteReviewRunWithFindings(_ context.Context, id string, verdict domain.ReviewVerdict, body, githubReviewID, simplificationClass string, findings []domain.ReviewFinding) (bool, error) {
+	if f.completeErr != nil {
+		return false, f.completeErr
+	}
 	for i := range f.batchRuns {
 		if f.batchRuns[i].ID == id {
 			if f.batchRuns[i].Status != domain.ReviewRunRunning {
 				return false, nil
 			}
 			f.updateCalls++
-			f.batchRuns[i].Status = status
+			f.batchRuns[i].Status = domain.ReviewRunComplete
 			f.batchRuns[i].Verdict = verdict
 			f.batchRuns[i].Body = body
 			f.batchRuns[i].GithubReviewID = githubReviewID
+			f.batchRuns[i].SimplificationClass = simplificationClass
+			f.findings = append(f.findings, findings...)
 			if f.run.ID == id {
 				f.run = f.batchRuns[i]
 			}
@@ -96,10 +104,28 @@ func (f *fakeStore) UpdateReviewRunResult(_ context.Context, id string, status d
 		return false, nil
 	}
 	f.updateCalls++
-	f.run.Status = status
+	f.run.Status = domain.ReviewRunComplete
 	f.run.Verdict = verdict
 	f.run.Body = body
 	f.run.GithubReviewID = githubReviewID
+	f.run.SimplificationClass = simplificationClass
+	f.findings = append(f.findings, findings...)
+	return true, nil
+}
+
+func (f *fakeStore) UpdateReviewRunResult(_ context.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string) (bool, error) {
+	for i := range f.batchRuns {
+		if f.batchRuns[i].ID == id && f.batchRuns[i].Status == domain.ReviewRunRunning {
+			f.batchRuns[i].Status, f.batchRuns[i].Verdict = status, verdict
+			f.batchRuns[i].Body, f.batchRuns[i].GithubReviewID = body, githubReviewID
+			return true, nil
+		}
+	}
+	if f.run.ID != id || f.run.Status != domain.ReviewRunRunning {
+		return false, nil
+	}
+	f.run.Status, f.run.Verdict = status, verdict
+	f.run.Body, f.run.GithubReviewID = body, githubReviewID
 	return true, nil
 }
 
@@ -109,11 +135,17 @@ func (f *fakeStore) MarkReviewRunDelivered(_ context.Context, id string, deliver
 	if f.run.ID == id && f.run.Status == domain.ReviewRunComplete && f.run.DeliveredAt == nil {
 		f.run.Status = domain.ReviewRunDelivered
 		f.run.DeliveredAt = &deliveredAt
+		if f.run.SimplificationClass != "" {
+			f.run.SimplificationDispatchedAt = &deliveredAt
+		}
 	}
 	for i := range f.batchRuns {
 		if f.batchRuns[i].ID == id && f.batchRuns[i].Status == domain.ReviewRunComplete && f.batchRuns[i].DeliveredAt == nil {
 			f.batchRuns[i].Status = domain.ReviewRunDelivered
 			f.batchRuns[i].DeliveredAt = &deliveredAt
+			if f.batchRuns[i].SimplificationClass != "" {
+				f.batchRuns[i].SimplificationDispatchedAt = &deliveredAt
+			}
 			return true, nil
 		}
 	}
@@ -121,6 +153,20 @@ func (f *fakeStore) MarkReviewRunDelivered(_ context.Context, id string, deliver
 		return false, nil
 	}
 	return true, nil
+}
+
+func (f *fakeStore) MarkReviewRunDeflectedReviewCleared(_ context.Context, id string, clearedAt time.Time) (bool, error) {
+	if f.run.ID == id && f.run.DeflectedReviewClearedAt == nil {
+		f.run.DeflectedReviewClearedAt = &clearedAt
+		return true, nil
+	}
+	for i := range f.batchRuns {
+		if f.batchRuns[i].ID == id && f.batchRuns[i].DeflectedReviewClearedAt == nil {
+			f.batchRuns[i].DeflectedReviewClearedAt = &clearedAt
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (f *fakeStore) ListReviewRunsByBatch(context.Context, domain.SessionID, string) ([]domain.ReviewRun, error) {
@@ -158,15 +204,6 @@ func (f *fakeStore) GetReviewRunBySessionPRAndSHA(_ context.Context, id domain.S
 func (f *fakeStore) ListReviewRunsBySession(context.Context, domain.SessionID) ([]domain.ReviewRun, error) {
 	return f.reviewRuns(), nil
 }
-func (f *fakeStore) InsertReviewFinding(_ context.Context, finding domain.ReviewFinding) error {
-	for _, existing := range f.findings {
-		if existing.ID == finding.ID {
-			return nil
-		}
-	}
-	f.findings = append(f.findings, finding)
-	return nil
-}
 func (f *fakeStore) ListReviewFindingsByRun(_ context.Context, runID string) ([]domain.ReviewFinding, error) {
 	var out []domain.ReviewFinding
 	for _, finding := range f.findings {
@@ -188,23 +225,58 @@ func (f *fakeStore) ListReviewFindingsBySession(_ context.Context, id domain.Ses
 func (f *fakeStore) SetPendingReviewFindingFixCommit(context.Context, domain.SessionID, string, string) (int64, error) {
 	return 0, nil
 }
-func (f *fakeStore) MarkReviewFindingIssueFiled(_ context.Context, id, issueURL string) (bool, error) {
+func (f *fakeStore) ClaimReviewFindingIssueAction(_ context.Context, id, token string, _, _ time.Time) (bool, error) {
+	if f.issueClaims == nil {
+		f.issueClaims = map[string]string{}
+	}
+	if f.issueClaims[id] != "" {
+		return false, nil
+	}
+	f.issueClaims[id] = token
+	return true, nil
+}
+func (f *fakeStore) CompleteReviewFindingIssueAction(_ context.Context, id, token, issueURL string) (bool, error) {
 	for i := range f.findings {
-		if f.findings[i].ID == id && f.findings[i].DeferredIssueURL == "" {
+		if f.findings[i].ID == id && f.findings[i].DeferredIssueURL == "" && f.issueClaims[id] == token {
 			f.findings[i].DeferredIssueURL = issueURL
+			delete(f.issueClaims, id)
 			return true, nil
 		}
 	}
 	return false, nil
 }
-func (f *fakeStore) MarkReviewFindingThreadResolved(_ context.Context, id string) (bool, error) {
+func (f *fakeStore) ReleaseReviewFindingIssueAction(_ context.Context, id, token string) error {
+	if f.issueClaims[id] == token {
+		delete(f.issueClaims, id)
+	}
+	return nil
+}
+func (f *fakeStore) ClaimReviewFindingThreadAction(_ context.Context, id, token string, _, _ time.Time) (bool, error) {
+	if f.threadClaims == nil {
+		f.threadClaims = map[string]string{}
+	}
+	if f.threadClaims[id] != "" {
+		return false, nil
+	}
+	f.threadClaims[id] = token
+	return true, nil
+}
+func (f *fakeStore) CompleteReviewFindingThreadAction(_ context.Context, id, token, replyID string) (bool, error) {
 	for i := range f.findings {
-		if f.findings[i].ID == id && !f.findings[i].ThreadResolved {
+		if f.findings[i].ID == id && !f.findings[i].ThreadResolved && f.threadClaims[id] == token {
 			f.findings[i].ThreadResolved = true
+			f.findings[i].ThreadReplyID = replyID
+			delete(f.threadClaims, id)
 			return true, nil
 		}
 	}
 	return false, nil
+}
+func (f *fakeStore) ReleaseReviewFindingThreadAction(_ context.Context, id, token string) error {
+	if f.threadClaims[id] == token {
+		delete(f.threadClaims, id)
+	}
+	return nil
 }
 func (f *fakeStore) ListRunningReviewRunsBySession(context.Context, domain.SessionID) ([]domain.ReviewRun, error) {
 	var runs []domain.ReviewRun
@@ -236,8 +308,11 @@ type fakeReducer struct {
 }
 
 type fakeDeflector struct {
-	filed    []ports.SCMDeferredIssueRequest
-	resolved []string
+	filed      []ports.SCMDeferredIssueRequest
+	resolved   []string
+	unbound    bool
+	boundCalls int
+	dismissed  []ports.SCMReviewDismissalRequest
 }
 
 func (f *fakeDeflector) FileDeferredIssue(_ context.Context, request ports.SCMDeferredIssueRequest) (ports.SCMDeferredIssue, error) {
@@ -245,9 +320,19 @@ func (f *fakeDeflector) FileDeferredIssue(_ context.Context, request ports.SCMDe
 	return ports.SCMDeferredIssue{URL: "https://github.com/o/r/issues/60"}, nil
 }
 
-func (f *fakeDeflector) DeflectReviewThread(_ context.Context, threadID, _ string) (ports.SCMReviewThreadResolution, error) {
-	f.resolved = append(f.resolved, threadID)
-	return ports.SCMReviewThreadResolution{ThreadID: threadID, Resolved: true}, nil
+func (f *fakeDeflector) ReviewThreadBound(context.Context, ports.SCMReviewThreadBinding) (bool, error) {
+	f.boundCalls++
+	return !f.unbound, nil
+}
+
+func (f *fakeDeflector) DeflectReviewThread(_ context.Context, binding ports.SCMReviewThreadBinding) (ports.SCMReviewThreadResolution, error) {
+	f.resolved = append(f.resolved, binding.ThreadID)
+	return ports.SCMReviewThreadResolution{ThreadID: binding.ThreadID, ReplyID: "reply-1", Resolved: true}, nil
+}
+
+func (f *fakeDeflector) DismissReview(_ context.Context, request ports.SCMReviewDismissalRequest) (ports.SCMReviewDismissal, error) {
+	f.dismissed = append(f.dismissed, request)
+	return ports.SCMReviewDismissal{Cleared: true}, nil
 }
 
 func (f *fakeReducer) ApplyReviewResult(_ context.Context, _ domain.SessionID, result lifecycle.ReviewResult) (lifecycle.ReviewDeliveryOutcome, error) {
@@ -284,6 +369,36 @@ func TestSubmitPersistsThenAppliesThenStampsDelivered(t *testing.T) {
 	}
 }
 
+func TestSubmitRejectsFindingsOnApprovedReview(t *testing.T) {
+	st := &fakeStore{ok: true, run: domain.ReviewRun{ID: "run-1", SessionID: "mer-1", Status: domain.ReviewRunRunning}}
+	svc := New(nil, st)
+	_, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{{
+		RunID: "run-1", Verdict: domain.VerdictApproved,
+		Findings: []SubmittedFinding{{ClassTag: "should-not-persist"}},
+	}})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("err = %v, want ErrInvalid", err)
+	}
+	if st.updateCalls != 0 || len(st.findings) != 0 {
+		t.Fatalf("approved findings mutated state: updates=%d findings=%+v", st.updateCalls, st.findings)
+	}
+}
+
+func TestSubmitValidatesFindingsBeforeCompletingRun(t *testing.T) {
+	st := &fakeStore{ok: true, run: domain.ReviewRun{ID: "run-1", SessionID: "mer-1", Status: domain.ReviewRunRunning}}
+	svc := New(nil, st)
+	_, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{{
+		RunID: "run-1", Verdict: domain.VerdictChangesRequested, Body: "[P1] malformed",
+		Findings: []SubmittedFinding{{ClassTag: " -- "}},
+	}})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("err = %v, want ErrInvalid", err)
+	}
+	if st.run.Status != domain.ReviewRunRunning || st.updateCalls != 0 || len(st.findings) != 0 {
+		t.Fatalf("malformed finding mutated state: run=%+v updates=%d findings=%+v", st.run, st.updateCalls, st.findings)
+	}
+}
+
 func TestSubmitDeflectsOutOfScopeFindingInsteadOfFixDispatch(t *testing.T) {
 	st := &fakeStore{
 		ok:       true,
@@ -297,7 +412,7 @@ func TestSubmitDeflectsOutOfScopeFindingInsteadOfFixDispatch(t *testing.T) {
 	svc := New(nil, st, WithLifecycleReducer(reducer), WithFindingDeflector(deflector))
 
 	runs, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{{
-		RunID: "run-1", Verdict: domain.VerdictChangesRequested, Body: "[P1] persist state",
+		RunID: "run-1", Verdict: domain.VerdictChangesRequested, Body: "[P1] persist state", GithubReviewID: "123",
 		Findings: []SubmittedFinding{{File: "state.go", ClassTag: "state-persistence", RootCauseNote: "durable state belongs to the persistence subsystem", ThreadID: "PRRT_1", Body: "persist state", OutOfScope: true}},
 	}})
 	if err != nil {
@@ -305,6 +420,12 @@ func TestSubmitDeflectsOutOfScopeFindingInsteadOfFixDispatch(t *testing.T) {
 	}
 	if len(deflector.filed) != 1 || len(deflector.resolved) != 1 || deflector.resolved[0] != "PRRT_1" {
 		t.Fatalf("deflection calls filed=%+v resolved=%+v", deflector.filed, deflector.resolved)
+	}
+	if len(deflector.dismissed) != 1 || deflector.dismissed[0].ReviewID != "123" {
+		t.Fatalf("cleared reviews = %+v", deflector.dismissed)
+	}
+	if deflector.filed[0].ActionKey != "run-1:1" {
+		t.Fatalf("issue action key = %q", deflector.filed[0].ActionKey)
 	}
 	if reducer.calls != 0 || reducer.batchCalls != 0 {
 		t.Fatalf("out-of-scope finding entered fix dispatch: reducer=%+v", reducer)
@@ -314,6 +435,81 @@ func TestSubmitDeflectsOutOfScopeFindingInsteadOfFixDispatch(t *testing.T) {
 	}
 	if len(st.findings) != 1 || st.findings[0].DeferredIssueURL == "" || !st.findings[0].ThreadResolved {
 		t.Fatalf("durable finding = %+v", st.findings)
+	}
+}
+
+func TestSubmitKeepsUnboundOutOfScopeFindingActionable(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		threadID string
+		unbound  bool
+		wantBind int
+	}{
+		{name: "missing thread"},
+		{name: "unrelated thread", threadID: "PRRT_other", unbound: true, wantBind: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &fakeStore{
+				ok:       true,
+				run:      domain.ReviewRun{ID: "run-1", SessionID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Status: domain.ReviewRunRunning},
+				prs:      []domain.PullRequest{{URL: "https://github.com/o/r/pull/1", HeadSHA: "sha1"}},
+				sessions: map[domain.SessionID]domain.SessionRecord{"mer-1": {ID: "mer-1", ProjectID: "mer"}},
+				project:  domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{ReviewPolicy: domain.ReviewPolicyConfig{OutOfScopeDeflection: true}}},
+			}
+			reducer := &fakeReducer{outcome: lifecycle.ReviewDeliverySent}
+			deflector := &fakeDeflector{unbound: tc.unbound}
+			svc := New(nil, st, WithLifecycleReducer(reducer), WithFindingDeflector(deflector))
+			_, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{{
+				RunID: "run-1", Verdict: domain.VerdictChangesRequested, Body: "[P1] persist state", GithubReviewID: "123",
+				Findings: []SubmittedFinding{{File: "state.go", ClassTag: "state-persistence", ThreadID: tc.threadID, Body: "persist state", OutOfScope: true}},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(deflector.filed) != 0 || len(deflector.resolved) != 0 || deflector.boundCalls != tc.wantBind {
+				t.Fatalf("unsafe provider calls: bind=%d filed=%d resolved=%d", deflector.boundCalls, len(deflector.filed), len(deflector.resolved))
+			}
+			if reducer.calls != 1 {
+				t.Fatalf("unbound finding was suppressed: reducer calls=%d", reducer.calls)
+			}
+		})
+	}
+}
+
+func TestSubmitPersistsSimplificationOnlyForCurrentRepeatedClass(t *testing.T) {
+	st := &fakeStore{
+		batchRuns: []domain.ReviewRun{
+			{ID: "run-1", SessionID: "mer-1", PRURL: "pr1", TargetSHA: "sha1", Status: domain.ReviewRunDelivered},
+			{ID: "run-2", SessionID: "mer-1", PRURL: "pr1", TargetSHA: "sha2", Status: domain.ReviewRunDelivered},
+			{ID: "run-3", SessionID: "mer-1", PRURL: "pr1", TargetSHA: "sha3", Status: domain.ReviewRunRunning},
+		},
+		prs: []domain.PullRequest{{URL: "pr1", HeadSHA: "sha3"}},
+		findings: []domain.ReviewFinding{
+			{ID: "run-1:1", RunID: "run-1", SessionID: "mer-1", PRURL: "pr1", Round: 1, ClassTag: "missing-notify"},
+			{ID: "run-2:1", RunID: "run-2", SessionID: "mer-1", PRURL: "pr1", Round: 2, ClassTag: "missing-notify"},
+		},
+	}
+	reducer := &fakeReducer{outcome: lifecycle.ReviewDeliverySent}
+	svc := New(nil, st, WithLifecycleReducer(reducer))
+	_, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{{
+		RunID: "run-3", Verdict: domain.VerdictChangesRequested, Body: "[P1] notify", Findings: []SubmittedFinding{{ClassTag: "missing-notify", Body: "notify"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reducer.got.SimplificationClass != "missing-notify" || st.batchRuns[2].SimplificationClass != "missing-notify" {
+		t.Fatalf("simplification not durable: result=%q run=%q", reducer.got.SimplificationClass, st.batchRuns[2].SimplificationClass)
+	}
+	st.batchRuns = append(st.batchRuns, domain.ReviewRun{ID: "run-4", SessionID: "mer-1", PRURL: "pr1", TargetSHA: "sha4", Status: domain.ReviewRunRunning})
+	st.prs[0].HeadSHA = "sha4"
+	_, err = svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{{
+		RunID: "run-4", Verdict: domain.VerdictChangesRequested, Body: "[P1] nil", Findings: []SubmittedFinding{{ClassTag: "nil-safety", Body: "nil"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reducer.got.SimplificationClass != "" || st.batchRuns[3].SimplificationClass != "" {
+		t.Fatalf("historical class leaked into later run: result=%q run=%q", reducer.got.SimplificationClass, st.batchRuns[3].SimplificationClass)
 	}
 }
 

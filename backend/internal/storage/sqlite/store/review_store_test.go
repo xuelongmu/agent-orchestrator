@@ -298,7 +298,7 @@ func TestReviewGettersMissing(t *testing.T) {
 	}
 }
 
-func TestReviewFindingLedgerRoundTripsAndBindsFixCommit(t *testing.T) {
+func TestReviewFindingLedgerRoundTripsDeflectionReceipts(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	seedProject(t, s, "mer")
@@ -313,24 +313,134 @@ func TestReviewFindingLedgerRoundTripsAndBindsFixCommit(t *testing.T) {
 	if err := s.InsertReviewRun(ctx, domain.ReviewRun{ID: "run-1", ReviewID: "rev-1", SessionID: rec.ID, Harness: domain.ReviewerCodex, PRURL: "pr1", TargetSHA: "sha1", Status: domain.ReviewRunRunning, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	finding := domain.ReviewFinding{ID: "run-1:1", RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: 1, File: "notify.go", ClassTag: "missing-notify", RootCauseNote: "every broken path notifies", ThreadID: "PRRT_1", CreatedAt: now}
+	finding := domain.ReviewFinding{ID: "run-1:1", RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: 1, File: "notify.go", ClassTag: "missing-notify", RootCauseNote: "every broken path notifies", ThreadID: "PRRT_1", OutOfScope: true, CreatedAt: now}
+	before, err := s.LatestSeq(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.InsertReviewFinding(ctx, finding); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := s.SetPendingReviewFindingFixCommit(ctx, rec.ID, "pr1", "sha2"); err != nil || n != 1 {
+	events, err := s.EventsAfter(ctx, before, 10)
+	if err != nil || len(events) != 1 || events[0].Type != "session_updated" || events[0].SessionID != string(rec.ID) {
+		t.Fatalf("finding CDC = %+v, %v", events, err)
+	}
+	updateBefore, err := s.LatestSeq(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.SetPendingReviewFindingFixCommit(ctx, rec.ID, "pr1", "sha2"); err != nil || n != 0 {
 		t.Fatalf("bind fix commit = %d, %v", n, err)
 	}
-	if ok, err := s.MarkReviewFindingIssueFiled(ctx, finding.ID, "https://github.com/o/r/issues/60"); err != nil || !ok {
+	if ok, err := s.ClaimReviewFindingIssueAction(ctx, finding.ID, "issue-token", now.Add(time.Minute), now); err != nil || !ok {
+		t.Fatalf("claim issue = %v, %v", ok, err)
+	}
+	if ok, err := s.ClaimReviewFindingIssueAction(ctx, finding.ID, "racing-token", now.Add(time.Minute), now); err != nil || ok {
+		t.Fatalf("racing issue claim = %v, %v", ok, err)
+	}
+	if ok, err := s.ClaimReviewFindingIssueAction(ctx, finding.ID, "recovery-token", now.Add(3*time.Minute), now.Add(2*time.Minute)); err != nil || !ok {
+		t.Fatalf("expired issue claim recovery = %v, %v", ok, err)
+	}
+	if ok, err := s.CompleteReviewFindingIssueAction(ctx, finding.ID, "issue-token", "https://github.com/o/r/issues/wrong"); err != nil || ok {
+		t.Fatalf("mismatched issue receipt = %v, %v", ok, err)
+	}
+	if ok, err := s.CompleteReviewFindingIssueAction(ctx, finding.ID, "recovery-token", "https://github.com/o/r/issues/60"); err != nil || !ok {
 		t.Fatalf("mark issue = %v, %v", ok, err)
 	}
-	if ok, err := s.MarkReviewFindingThreadResolved(ctx, finding.ID); err != nil || !ok {
+	if ok, err := s.ClaimReviewFindingThreadAction(ctx, finding.ID, "thread-token", now.Add(time.Minute), now); err != nil || !ok {
+		t.Fatalf("claim thread = %v, %v", ok, err)
+	}
+	if ok, err := s.CompleteReviewFindingThreadAction(ctx, finding.ID, "thread-token", "reply-1"); err != nil || !ok {
 		t.Fatalf("mark thread = %v, %v", ok, err)
+	}
+	events, err = s.EventsAfter(ctx, updateBefore, 20)
+	if err != nil || len(events) < 4 {
+		t.Fatalf("finding update CDC = %+v, %v", events, err)
+	}
+	for _, event := range events {
+		if event.Type != "session_updated" || event.SessionID != string(rec.ID) {
+			t.Fatalf("unexpected finding update event = %+v", event)
+		}
 	}
 	got, err := s.ListReviewFindingsBySession(ctx, rec.ID)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("findings = %+v, %v", got, err)
 	}
-	if got[0].FixCommit != "sha2" || got[0].DeferredIssueURL == "" || !got[0].ThreadResolved {
+	if got[0].FixCommit != "" || got[0].DeferredIssueURL == "" || !got[0].ThreadResolved || got[0].ThreadReplyID != "reply-1" {
 		t.Fatalf("finding = %+v", got[0])
+	}
+}
+
+func TestCompleteReviewRunWithFindingsIsAtomicAndPersistsSimplificationDispatch(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.UpsertReview(ctx, domain.Review{ID: "rev-1", SessionID: rec.ID, ProjectID: rec.ProjectID, Harness: domain.ReviewerCodex, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertReviewRun(ctx, domain.ReviewRun{ID: "run-1", ReviewID: "rev-1", SessionID: rec.ID, Harness: domain.ReviewerCodex, PRURL: "pr1", TargetSHA: "sha1", Status: domain.ReviewRunRunning, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := domain.ReviewFinding{ID: "run-1:1", RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: 1, ClassTag: "missing-notify", CreatedAt: now}
+	if _, err := s.CompleteReviewRunWithFindings(ctx, "run-1", domain.VerdictChangesRequested, "fix", "123", "missing-notify", []domain.ReviewFinding{duplicate, duplicate}); err == nil {
+		t.Fatal("duplicate finding insert should fail")
+	}
+	run, _, err := s.GetReviewRun(ctx, "run-1")
+	if err != nil || run.Status != domain.ReviewRunRunning {
+		t.Fatalf("failed transaction run = %+v, %v", run, err)
+	}
+	if findings, err := s.ListReviewFindingsByRun(ctx, "run-1"); err != nil || len(findings) != 0 {
+		t.Fatalf("failed transaction findings = %+v, %v", findings, err)
+	}
+	if ok, err := s.CompleteReviewRunWithFindings(ctx, "run-1", domain.VerdictChangesRequested, "fix", "123", "missing-notify", []domain.ReviewFinding{duplicate}); err != nil || !ok {
+		t.Fatalf("complete = %v, %v", ok, err)
+	}
+	if ok, err := s.MarkReviewRunDelivered(ctx, "run-1", now.Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("deliver = %v, %v", ok, err)
+	}
+	if ok, err := s.MarkReviewRunDeflectedReviewCleared(ctx, "run-1", now.Add(2*time.Minute)); err != nil || !ok {
+		t.Fatalf("clear review = %v, %v", ok, err)
+	}
+	run, _, err = s.GetReviewRun(ctx, "run-1")
+	if err != nil || run.SimplificationClass != "missing-notify" || run.SimplificationDispatchedAt == nil || run.DeflectedReviewClearedAt == nil {
+		t.Fatalf("durable simplification = %+v, %v", run, err)
+	}
+}
+
+func TestSetPendingReviewFindingFixCommitExcludesDeferredFindings(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.UpsertReview(ctx, domain.Review{ID: "rev-1", SessionID: rec.ID, ProjectID: rec.ProjectID, Harness: domain.ReviewerCodex, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertReviewRun(ctx, domain.ReviewRun{ID: "run-1", ReviewID: "rev-1", SessionID: rec.ID, Harness: domain.ReviewerCodex, PRURL: "pr1", TargetSHA: "sha1", Status: domain.ReviewRunRunning, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	findings := []domain.ReviewFinding{
+		{ID: "run-1:1", RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: 1, ClassTag: "actionable", CreatedAt: now},
+		{ID: "run-1:2", RunID: "run-1", SessionID: rec.ID, PRURL: "pr1", Round: 1, ClassTag: "deferred", OutOfScope: true, CreatedAt: now},
+	}
+	for _, finding := range findings {
+		if err := s.InsertReviewFinding(ctx, finding); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := s.SetPendingReviewFindingFixCommit(ctx, rec.ID, "pr1", "sha2"); err != nil || n != 1 {
+		t.Fatalf("updated = %d, %v", n, err)
+	}
+	got, err := s.ListReviewFindingsByRun(ctx, "run-1")
+	if err != nil || got[0].FixCommit != "sha2" || got[1].FixCommit != "" {
+		t.Fatalf("findings = %+v, %v", got, err)
 	}
 }

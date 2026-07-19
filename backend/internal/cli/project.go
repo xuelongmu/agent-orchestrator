@@ -93,6 +93,11 @@ type trackerIntakeConfig struct {
 	Assignee string `json:"assignee,omitempty"`
 }
 
+// reviewPolicyConfig mirrors domain.ReviewPolicyConfig.
+type reviewPolicyConfig struct {
+	OutOfScopeDeflection bool `json:"outOfScopeDeflection,omitempty"`
+}
+
 // projectConfig mirrors the daemon's typed domain.ProjectConfig for the CLI
 // client. The CLI sets common fields via flags and the whole object via
 // --config-json.
@@ -108,6 +113,7 @@ type projectConfig struct {
 	AgentConfig       agentConfig         `json:"agentConfig,omitempty"`
 	Worker            roleOverride        `json:"worker,omitempty"`
 	Orchestrator      roleOverride        `json:"orchestrator,omitempty"`
+	ReviewPolicy      reviewPolicyConfig  `json:"reviewPolicy,omitempty"`
 	TrackerIntake     trackerIntakeConfig `json:"trackerIntake,omitempty"`
 }
 

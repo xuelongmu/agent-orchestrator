@@ -395,7 +395,7 @@ func (e *Engine) List(ctx stdctx.Context, workerID domain.SessionID) (SessionRev
 	if err != nil {
 		return SessionReviews{}, err
 	}
-	ledger, _ := FindingLedger(findings)
+	ledger := FindingLedger(findings)
 	return SessionReviews{ReviewerHandleID: handle, Runs: runs, Reviews: Plan(prs, runs), Findings: findings, Ledger: ledger}, nil
 }
 
