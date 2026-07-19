@@ -534,7 +534,7 @@ func (m *Manager) destroySpawnWorkspace(ctx context.Context, ws ports.WorkspaceI
 
 func (m *Manager) rollbackPreparedSpawnWorkspace(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo) {
 	if m.destroySpawnWorkspace(ctx, ws, workspaceProject) {
-		m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+		m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
 	}
 }
 
@@ -735,7 +735,7 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 		}
 		freed = cleaned
 		if cleaned {
-			m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+			m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
 		}
 	} else if ws.Path != "" {
 		if err := m.workspace.Destroy(ctx, ws); err != nil {
@@ -906,7 +906,7 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 		}
 		return fmt.Errorf("retire replacement %s: force destroy: %w", id, err)
 	}
-	m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+	m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
 	if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
 		return fmt.Errorf("retire replacement %s: clear restore markers: %w", id, err)
 	}
@@ -941,7 +941,7 @@ func (m *Manager) retireWorkspaceProjectForReplacement(ctx context.Context, rec 
 			return fmt.Errorf("retire replacement %s repo %s: force destroy: %w", rec.ID, rows[i].RepoName, err)
 		}
 	}
-	m.cleanupAgentWorkspace(ctx, rec, rec.Metadata.WorkspacePath)
+	m.cleanupAgentWorkspaceBestEffort(ctx, rec, rec.Metadata.WorkspacePath)
 	if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
 		return fmt.Errorf("retire replacement %s: clear restore markers: %w", rec.ID, err)
 	}
@@ -1214,7 +1214,7 @@ func (m *Manager) saveAndTeardownOne(ctx context.Context, rec domain.SessionReco
 	if err := m.workspace.ForceDestroy(ctx, ws); err != nil {
 		m.logger.Warn("save-teardown-all: force destroy failed", "sessionID", rec.ID, "error", err)
 	} else {
-		m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+		m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
 	}
 	return nil
 }
@@ -1707,7 +1707,7 @@ func (m *Manager) saveAndTeardownWorkspaceProject(ctx context.Context, rec domai
 		}
 	}
 	if rootDestroyed {
-		m.cleanupAgentWorkspace(ctx, rec, rec.Metadata.WorkspacePath)
+		m.cleanupAgentWorkspaceBestEffort(ctx, rec, rec.Metadata.WorkspacePath)
 	}
 	return nil
 }
@@ -2251,7 +2251,7 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: cleanupSkipReason(err)})
 				continue
 			}
-			m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+			m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
 		} else if err := m.workspace.Destroy(ctx, ws); err != nil {
 			if !errors.Is(err, ports.ErrWorkspaceDirty) {
 				// The public reason stays a fixed string (the raw error carries
@@ -2261,7 +2261,11 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: cleanupSkipReason(err)})
 			continue
 		} else {
-			m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+			if err := m.cleanupAgentWorkspace(ctx, rec, ws.Path); err != nil {
+				m.logger.Warn("cleanup: agent workspace cleanup failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
+				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "agent workspace cleanup failed"})
+				continue
+			}
 		}
 		m.cleanupSystemPromptDir(rec.ID)
 		result.Cleaned = append(result.Cleaned, rec.ID)
@@ -2840,6 +2844,12 @@ func (m *Manager) cleanupAgentWorkspace(ctx context.Context, rec domain.SessionR
 		}
 	}
 	return cleanupErr
+}
+
+func (m *Manager) cleanupAgentWorkspaceBestEffort(ctx context.Context, rec domain.SessionRecord, workspacePath string) {
+	if err := m.cleanupAgentWorkspace(ctx, rec, workspacePath); err != nil {
+		m.logger.Warn("workspace cleanup: agent cleanup failed", "sessionID", rec.ID, "workspacePath", workspacePath, "error", err)
+	}
 }
 
 func (m *Manager) deliverAfterStartPrompt(ctx context.Context, agent ports.Agent, cfg ports.LaunchConfig, handle ports.RuntimeHandle, id domain.SessionID, prompt string) error {
