@@ -219,9 +219,15 @@ func Clear() error {
 	if err := writeRaw(nil); err != nil {
 		return err
 	}
-	configured, configuredErr := registryFile()
-	legacy, legacyErr := legacyRegistryFile()
-	if configuredErr != nil || legacyErr != nil || filepath.Clean(configured) == filepath.Clean(legacy) {
+	configured, err := registryFile()
+	if err != nil {
+		return err
+	}
+	legacy, err := legacyRegistryFile()
+	if err != nil {
+		return err
+	}
+	if filepath.Clean(configured) == filepath.Clean(legacy) {
 		return nil
 	}
 	if err := os.Remove(legacy); err != nil && !errors.Is(err, os.ErrNotExist) {
