@@ -180,6 +180,7 @@ type Store interface {
 
 type claimedSessionStore interface {
 	CreateClaimedSession(ctx context.Context, rec domain.SessionRecord, claim ports.TrackerIntakeClaim, admittedAt time.Time) (domain.SessionRecord, error)
+	MarkTrackerIntakeSpawnStarted(ctx context.Context, claim ports.TrackerIntakeClaim, sessionID domain.SessionID, startedAt time.Time) (bool, error)
 }
 
 // Manager coordinates internal session spawn, restore, kill, and cleanup over
@@ -399,6 +400,17 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	branch := cfg.Branch
 	if cfg.WorkspaceKind == domain.WorkspaceKindWorktree && branch == "" {
 		branch = defaultSpawnBranch(id, cfg.Kind, sessionPrefix(project), project.Kind.WithDefault())
+	}
+	if cfg.IntakeClaim != nil {
+		claimedStore := m.store.(claimedSessionStore) // checked before CreateClaimedSession above
+		started, startErr := claimedStore.MarkTrackerIntakeSpawnStarted(ctx, *cfg.IntakeClaim, id, m.clock().UTC())
+		if startErr != nil || !started {
+			m.rollbackSpawnSeedRow(ctx, id)
+			if startErr != nil {
+				return domain.SessionRecord{}, fmt.Errorf("spawn %s: intake side-effect fence: %w", id, startErr)
+			}
+			return domain.SessionRecord{}, fmt.Errorf("spawn %s: intake side-effect fence: %w", id, ports.ErrTrackerIntakeClaimLost)
+		}
 	}
 	ws, workspaceProject, err := m.createSessionWorkspace(ctx, project, cfg, id, branch)
 	if err != nil {

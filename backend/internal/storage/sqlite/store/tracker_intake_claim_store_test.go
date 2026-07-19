@@ -118,8 +118,17 @@ func TestTrackerIntakeClaimReconcilesCrashSurvivingSession(t *testing.T) {
 		t.Fatalf("claim result=%v err=%v", result, err)
 	}
 	record := sampleRecord("demo")
+	record.Metadata = domain.SessionMetadata{}
 	record.IssueID = "github:acme/demo#28"
-	if _, err := first.CreateSession(ctx, record); err != nil {
+	record, err = first.CreateClaimedSession(ctx, record, claim, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started, err := first.MarkTrackerIntakeSpawnStarted(ctx, claim, record.ID, now.Add(2*time.Second)); err != nil || !started {
+		t.Fatalf("spawn started=%v err=%v", started, err)
+	}
+	record.Metadata = domain.SessionMetadata{WorkspacePath: "/workspace", RuntimeHandleID: "runtime", Prompt: "work"}
+	if err := first.UpdateSession(ctx, record); err != nil {
 		t.Fatal(err)
 	}
 	if err := first.Close(); err != nil {
@@ -259,32 +268,46 @@ func TestTrackerIntakeTransientSeedNeverCompletesClaimAndFailureRetriesAfterReop
 	}
 }
 
-func TestTrackerIntakeExpiredAdmissionWithSurvivingSeedFailsClosed(t *testing.T) {
+func TestTrackerIntakeExpiredAdmissionWithSurvivingPureSeedRecoversAfterReopen(t *testing.T) {
 	ctx := context.Background()
-	store := newTestStore(t)
-	seedProject(t, store, "demo")
+	dir := t.TempDir()
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	first, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedProject(t, first, "demo")
 	original := intakeClaim("demo", "acme/demo#28", "owner-a", now)
-	if result, err := store.ClaimTrackerIntakeIssue(ctx, original, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
+	if result, err := first.ClaimTrackerIntakeIssue(ctx, original, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
 		t.Fatalf("original claim result=%v err=%v", result, err)
 	}
 	seed := sampleRecord("demo")
 	seed.Metadata = domain.SessionMetadata{}
 	seed.IssueID = "github:acme/demo#28"
-	seed, err := store.CreateClaimedSession(ctx, seed, original, now.Add(time.Second))
+	seed, err = first.CreateClaimedSession(ctx, seed, original, now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Crash before MarkTrackerIntakeSpawnStarted: no external side effect can
+	// have begun, so the exact pure seed is bounded recovery state.
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 
 	successor := intakeClaim("demo", "acme/demo#28", "owner-b", now.Add(6*time.Minute))
-	if hasCapacity, err := store.TrackerIntakeHasCapacity(ctx, "demo", 1, successor.ClaimedAt); err != nil || hasCapacity {
-		t.Fatalf("expired admitted claim with a surviving seed capacity=%v err=%v, want reserved slot", hasCapacity, err)
+	if hasCapacity, err := store.TrackerIntakeHasCapacity(ctx, "demo", 1, successor.ClaimedAt); err != nil || !hasCapacity {
+		t.Fatalf("expired recoverable seed capacity=%v err=%v, want retry slot", hasCapacity, err)
 	}
-	if result, err := store.ClaimTrackerIntakeIssue(ctx, successor, 1); err != nil || result != ports.TrackerIntakeClaimBusy {
-		t.Fatalf("takeover result=%v err=%v, want fail-closed busy", result, err)
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, successor, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
+		t.Fatalf("takeover result=%v err=%v, want recovered claim", result, err)
 	}
-	if _, ok, err := store.GetSession(ctx, seed.ID); err != nil || !ok {
-		t.Fatalf("expired owner's seed was deleted: ok=%v err=%v", ok, err)
+	if _, ok, err := store.GetSession(ctx, seed.ID); err != nil || ok {
+		t.Fatalf("recoverable expired seed survived: ok=%v err=%v", ok, err)
 	}
 	late := sampleRecord("demo")
 	late.Metadata = domain.SessionMetadata{}
@@ -292,8 +315,52 @@ func TestTrackerIntakeExpiredAdmissionWithSurvivingSeedFailsClosed(t *testing.T)
 	if _, err := store.CreateClaimedSession(ctx, late, original, successor.ClaimedAt); !errors.Is(err, ports.ErrTrackerIntakeClaimLost) {
 		t.Fatalf("late original admission err=%v, want ErrTrackerIntakeClaimLost", err)
 	}
-	if _, err := store.CreateClaimedSession(ctx, late, successor, successor.ClaimedAt.Add(time.Second)); !errors.Is(err, ports.ErrTrackerIntakeClaimLost) {
-		t.Fatalf("unacquired successor admission err=%v, want ErrTrackerIntakeClaimLost", err)
+	if _, err := store.CreateClaimedSession(ctx, late, successor, successor.ClaimedAt.Add(time.Second)); err != nil {
+		t.Fatalf("successor admission: %v", err)
+	}
+}
+
+func TestTrackerIntakeExpiredSpawningSeedRemainsFencedAfterReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	first, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedProject(t, first, "demo")
+	original := intakeClaim("demo", "acme/demo#28", "owner-a", now)
+	if result, err := first.ClaimTrackerIntakeIssue(ctx, original, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
+		t.Fatalf("original claim result=%v err=%v", result, err)
+	}
+	seed := sampleRecord("demo")
+	seed.Metadata = domain.SessionMetadata{}
+	seed.IssueID = "github:acme/demo#28"
+	seed, err = first.CreateClaimedSession(ctx, seed, original, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started, err := first.MarkTrackerIntakeSpawnStarted(ctx, original, seed.ID, now.Add(2*time.Second)); err != nil || !started {
+		t.Fatalf("spawn started=%v err=%v", started, err)
+	}
+	// Crash after the side-effect fence but before handles reach the session row.
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	successor := intakeClaim("demo", "acme/demo#28", "owner-b", now.Add(6*time.Minute))
+	if hasCapacity, err := second.TrackerIntakeHasCapacity(ctx, "demo", 1, successor.ClaimedAt); err != nil || hasCapacity {
+		t.Fatalf("unsafe spawning seed capacity=%v err=%v, want fenced slot", hasCapacity, err)
+	}
+	if result, err := second.ClaimTrackerIntakeIssue(ctx, successor, 1); err != nil || result != ports.TrackerIntakeClaimBusy {
+		t.Fatalf("unsafe takeover result=%v err=%v, want busy", result, err)
+	}
+	if _, ok, err := second.GetSession(ctx, seed.ID); err != nil || !ok {
+		t.Fatalf("unsafe seed was deleted: ok=%v err=%v", ok, err)
 	}
 }
 
@@ -376,6 +443,7 @@ func TestTrackerIntakeRecognizesLegacyMixedCaseGitHubSessionOnly(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	legacy := sampleRecord("demo")
 	legacy.IssueID = "github:Acme/Demo#12"
+	legacy.IsTerminated = true
 	if _, err := store.CreateSession(ctx, legacy); err != nil {
 		t.Fatal(err)
 	}
@@ -430,6 +498,39 @@ func TestTrackerIntakeTerminatedFailedAdmissionCanBeReleasedAndRetried(t *testin
 	}
 }
 
+func TestTrackerIntakeCompletionAcceptsExactSessionThatTerminatedAfterSpawn(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	seedProject(t, store, "demo")
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	claim := intakeClaim("demo", "acme/demo#28", "owner-a", now)
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, claim, 1); err != nil || result != ports.TrackerIntakeClaimAcquired {
+		t.Fatalf("claim result=%v err=%v", result, err)
+	}
+	record := sampleRecord("demo")
+	record.Metadata = domain.SessionMetadata{}
+	record.IssueID = "github:acme/demo#28"
+	record, err := store.CreateClaimedSession(ctx, record, claim, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started, err := store.MarkTrackerIntakeSpawnStarted(ctx, claim, record.ID, now.Add(2*time.Second)); err != nil || !started {
+		t.Fatalf("spawn started=%v err=%v", started, err)
+	}
+	record.Metadata = domain.SessionMetadata{WorkspacePath: "/workspace", RuntimeHandleID: "runtime", Prompt: "work"}
+	record.IsTerminated = true
+	if err := store.UpdateSession(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if completed, err := store.CompleteTrackerIntakeIssue(ctx, claim, record.ID, now.Add(3*time.Second)); err != nil || !completed {
+		t.Fatalf("completion after termination completed=%v err=%v", completed, err)
+	}
+	retry := intakeClaim("demo", "acme/demo#28", "owner-b", now.Add(4*time.Second))
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, retry, 1); err != nil || result != ports.TrackerIntakeClaimAlreadyProcessed {
+		t.Fatalf("completed claim result=%v err=%v", result, err)
+	}
+}
+
 func TestTrackerIntakeExpiredAdmissionNeverDeletesAnySeed(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -439,6 +540,11 @@ func TestTrackerIntakeExpiredAdmissionNeverDeletesAnySeed(t *testing.T) {
 	if result, err := store.ClaimTrackerIntakeIssue(ctx, original, 3); err != nil || result != ports.TrackerIntakeClaimAcquired {
 		t.Fatalf("original claim result=%v err=%v", result, err)
 	}
+	otherRepo := intakeClaim("demo", "acme/demo#28", "other-owner", now)
+	otherRepo.Repo = "mirror/demo"
+	if result, err := store.ClaimTrackerIntakeIssue(ctx, otherRepo, 3); err != nil || result != ports.TrackerIntakeClaimAcquired {
+		t.Fatalf("other repo claim result=%v err=%v", result, err)
+	}
 	claimedSeed := sampleRecord("demo")
 	claimedSeed.Metadata = domain.SessionMetadata{}
 	claimedSeed.IssueID = "github:acme/demo#28"
@@ -446,17 +552,15 @@ func TestTrackerIntakeExpiredAdmissionNeverDeletesAnySeed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if started, err := store.MarkTrackerIntakeSpawnStarted(ctx, original, claimedSeed.ID, now.Add(2*time.Second)); err != nil || !started {
+		t.Fatalf("spawn started=%v err=%v", started, err)
+	}
 	manualSeed := sampleRecord("demo")
 	manualSeed.Metadata = domain.SessionMetadata{}
 	manualSeed.IssueID = "github:acme/demo#28"
 	manualSeed, err = store.CreateSession(ctx, manualSeed)
 	if err != nil {
 		t.Fatal(err)
-	}
-	otherRepo := intakeClaim("demo", "acme/demo#28", "other-owner", now)
-	otherRepo.Repo = "mirror/demo"
-	if result, err := store.ClaimTrackerIntakeIssue(ctx, otherRepo, 3); err != nil || result != ports.TrackerIntakeClaimAcquired {
-		t.Fatalf("other repo claim result=%v err=%v", result, err)
 	}
 	otherSeed := sampleRecord("demo")
 	otherSeed.Metadata = domain.SessionMetadata{}

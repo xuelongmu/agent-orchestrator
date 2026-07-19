@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestTrackerIntakeSessionLookupUsesProjectIssueIndex(t *testing.T) {
+func TestTrackerIntakeLegacyGitHubLookupUsesNoCaseProjectIssueIndex(t *testing.T) {
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "ao.db")+pragmas)
 	if err != nil {
 		t.Fatal(err)
@@ -19,8 +19,9 @@ func TestTrackerIntakeSessionLookupUsesProjectIssueIndex(t *testing.T) {
 
 	rows, err := db.Query(`EXPLAIN QUERY PLAN
 SELECT id FROM sessions
-WHERE project_id = ? AND issue_id = ? AND is_terminated = FALSE
-  AND (workspace_path <> '' OR runtime_handle_id <> '' OR agent_session_id <> '' OR prompt <> '')`, "demo", "github:acme/demo#28")
+WHERE project_id = ? AND issue_id = ? COLLATE NOCASE
+ORDER BY num
+LIMIT 1`, "demo", "github:acme/demo#28")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +39,7 @@ WHERE project_id = ? AND issue_id = ? AND is_terminated = FALSE
 		t.Fatal(err)
 	}
 	detail := strings.Join(plans, "\n")
-	if !strings.Contains(detail, "idx_sessions_project_issue") {
-		t.Fatalf("query plan does not use idx_sessions_project_issue:\n%s", detail)
+	if !strings.Contains(detail, "idx_sessions_project_issue_nocase (project_id=? AND issue_id=?)") {
+		t.Fatalf("production GitHub lookup does not use the full no-case project/issue index:\n%s", detail)
 	}
 }

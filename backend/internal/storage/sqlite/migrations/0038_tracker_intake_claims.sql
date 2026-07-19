@@ -11,9 +11,11 @@ CREATE TABLE tracker_intake_claims (
     repo             TEXT NOT NULL CHECK (repo <> ''),
     issue_id         TEXT NOT NULL CHECK (issue_id <> ''),
     owner_token      TEXT NOT NULL CHECK (owner_token <> ''),
-    status           TEXT NOT NULL CHECK (status IN ('pending', 'admitted', 'completed')),
+    status           TEXT NOT NULL CHECK (status IN ('pending', 'admitted', 'spawning', 'retryable', 'completed')),
     -- Pending has no session. Admitted binds the exact provisional seed owned
-    -- by this generation. Completed records the successfully spawned session.
+    -- by this generation before side effects. Spawning fences possible external
+    -- side effects. Retryable retains a failed current-generation marker so it
+    -- cannot be mistaken for legacy history. Completed records successful spawn.
     session_id       TEXT NOT NULL DEFAULT '',
     claimed_at       TIMESTAMP NOT NULL,
     lease_expires_at TIMESTAMP NOT NULL,
@@ -27,9 +29,13 @@ CREATE INDEX idx_tracker_intake_claims_capacity
 CREATE INDEX idx_sessions_project_issue
     ON sessions (project_id, issue_id);
 
+CREATE INDEX idx_sessions_project_issue_nocase
+    ON sessions (project_id, issue_id COLLATE NOCASE);
+
 -- Intake claims are internal control-plane state and intentionally do not emit
 -- change_log events.
 
 -- +goose Down
+DROP INDEX idx_sessions_project_issue_nocase;
 DROP INDEX idx_sessions_project_issue;
 DROP TABLE tracker_intake_claims;

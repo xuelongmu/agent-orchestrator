@@ -64,9 +64,9 @@ func (s *Store) CreateSession(ctx context.Context, rec domain.SessionRecord) (do
 
 // CreateClaimedSession atomically fences tracker-intake admission against the
 // exact live claim generation before inserting the provisional session seed.
-// A lease takeover committed first makes this a no-op; a seed committed first
-// is owned by that generation and may be atomically removed by a later expired
-// takeover before it can be marked spawned.
+// A lease takeover committed first makes this a no-op. The session manager must
+// durably advance the attached seed to spawning before any external side effect;
+// only a seed that never crossed that fence may be reaped after lease expiry.
 func (s *Store) CreateClaimedSession(ctx context.Context, rec domain.SessionRecord, claim ports.TrackerIntakeClaim, admittedAt time.Time) (domain.SessionRecord, error) {
 	if rec.ProjectID != claim.ProjectID || rec.IssueID != domain.IssueID(string(claim.Provider)+":"+claim.IssueID) || admittedAt.IsZero() {
 		return domain.SessionRecord{}, fmt.Errorf("create claimed session: %w", ports.ErrTrackerIntakeClaimLost)

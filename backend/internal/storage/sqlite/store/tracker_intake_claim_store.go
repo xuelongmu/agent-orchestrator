@@ -17,6 +17,8 @@ const trackerIntakeCompleted = "completed"
 
 const trackerIntakeAdmitted = "admitted"
 
+const trackerIntakeSpawning = "spawning"
+
 // TrackerIntakeHasCapacity is the cheap pre-list guard used to preserve the
 // observer's existing behavior of not calling the tracker while a project is
 // full. ClaimTrackerIntakeIssue repeats the check under BEGIN IMMEDIATE, so
@@ -26,12 +28,32 @@ func (s *Store) TrackerIntakeHasCapacity(ctx context.Context, projectID domain.P
 		return false, fmt.Errorf("invalid tracker intake capacity project=%q max=%d", projectID, maxConcurrent)
 	}
 	used, err := s.qr.CountTrackerIntakeCapacityUsed(ctx, gen.CountTrackerIntakeCapacityUsedParams{
-		ProjectID: projectID, ProjectID_2: string(projectID), LeaseExpiresAt: now, LeaseExpiresAt_2: now,
+		ProjectID: projectID, ProjectID_2: string(projectID),
+		LeaseExpiresAt: now, LeaseExpiresAt_2: now, LeaseExpiresAt_3: now,
 	})
 	if err != nil {
 		return false, fmt.Errorf("count tracker intake capacity for %s: %w", projectID, err)
 	}
 	return used < int64(maxConcurrent), nil
+}
+
+// MarkTrackerIntakeSpawnStarted durably closes pure-seed recovery immediately
+// before workspace/runtime side effects can begin. Only the exact live owner
+// and bound session generation may cross this fence.
+func (s *Store) MarkTrackerIntakeSpawnStarted(ctx context.Context, claim ports.TrackerIntakeClaim, sessionID domain.SessionID, startedAt time.Time) (bool, error) {
+	if err := validateTrackerIntakeClaim(claim, 1); err != nil || sessionID == "" || startedAt.IsZero() {
+		return false, fmt.Errorf("invalid tracker intake spawn start project=%q session=%q", claim.ProjectID, sessionID)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.MarkTrackerIntakeClaimSpawning(ctx, gen.MarkTrackerIntakeClaimSpawningParams{
+		ProjectID: string(claim.ProjectID), Provider: string(claim.Provider), Repo: claim.Repo,
+		IssueID: claim.IssueID, OwnerToken: claim.OwnerToken, SessionID: string(sessionID), LeaseExpiresAt: startedAt,
+	})
+	if err != nil {
+		return false, fmt.Errorf("mark tracker issue %s/%s/%s/%s spawning: %w", claim.ProjectID, claim.Provider, claim.Repo, claim.IssueID, err)
+	}
+	return rows == 1, nil
 }
 
 // ClaimTrackerIntakeIssue is the atomic CAS boundary before spawn. It first
@@ -45,34 +67,48 @@ func (s *Store) ClaimTrackerIntakeIssue(ctx context.Context, claim ports.Tracker
 	defer s.writeMu.Unlock()
 
 	result := ports.TrackerIntakeClaimAlreadyProcessed
-	err := s.inImmediateTx(ctx, "claim tracker intake issue", func(q *gen.Queries) error {
+	err := s.inImmediateConnTx(ctx, "claim tracker intake issue", func(conn *sql.Conn, q *gen.Queries) error {
 		canonicalIssueID := string(claim.Provider) + ":" + claim.IssueID
-		sessionID, sessionErr := q.FindAdmittedTrackerIntakeSession(ctx, gen.FindAdmittedTrackerIntakeSessionParams{
-			ProjectID: claim.ProjectID, CanonicalIssueID: domain.IssueID(canonicalIssueID), Provider: string(claim.Provider),
-		})
-		if sessionErr == nil {
-			return reconcileTrackerIntakeSession(ctx, q, claim, sessionID)
-		}
-		if !errors.Is(sessionErr, sql.ErrNoRows) {
-			return sessionErr
-		}
-
 		existing, claimErr := q.GetTrackerIntakeClaim(ctx, trackerIntakeClaimKeyParams(claim))
 		if claimErr != nil && !errors.Is(claimErr, sql.ErrNoRows) {
 			return claimErr
 		}
+		if errors.Is(claimErr, sql.ErrNoRows) {
+			sessionID, err := findLegacyTrackerIntakeSession(ctx, q, claim, domain.IssueID(canonicalIssueID))
+			if err == nil {
+				return reconcileTrackerIntakeSession(ctx, q, claim, sessionID)
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
 		if claimErr == nil {
-			switch {
-			case existing.Status == trackerIntakeCompleted:
+			if existing.Status == trackerIntakeCompleted {
 				return nil
-			case existing.Status == trackerIntakeAdmitted && !existing.LeaseExpiresAt.After(claim.ClaimedAt):
-				safe, err := expiredAdmittedTrackerIntakeClaimIsSafe(ctx, q, existing)
+			}
+			if (existing.Status == trackerIntakeAdmitted || existing.Status == trackerIntakeSpawning) && existing.SessionID != "" {
+				matches, err := trackerIntakeActiveSessionMatches(ctx, q, claim, domain.SessionID(existing.SessionID))
+				if err != nil {
+					return err
+				}
+				if matches {
+					return reconcileTrackerIntakeSession(ctx, q, claim, domain.SessionID(existing.SessionID))
+				}
+			}
+			switch {
+			case (existing.Status == trackerIntakeAdmitted || existing.Status == trackerIntakeSpawning) && !existing.LeaseExpiresAt.After(claim.ClaimedAt):
+				safe, deleteSeed, err := expiredTrackerIntakeClaimRecovery(ctx, q, existing)
 				if err != nil {
 					return err
 				}
 				if !safe {
 					result = ports.TrackerIntakeClaimBusy
 					return nil
+				}
+				if deleteSeed {
+					if err := deleteExpiredTrackerIntakeSeed(ctx, conn, q, domain.SessionID(existing.SessionID)); err != nil {
+						return err
+					}
 				}
 			case existing.OwnerToken == claim.OwnerToken && existing.LeaseExpiresAt.After(claim.ClaimedAt):
 				result = ports.TrackerIntakeClaimAcquired
@@ -84,7 +120,7 @@ func (s *Store) ClaimTrackerIntakeIssue(ctx context.Context, claim ports.Tracker
 		}
 		used, err := q.CountTrackerIntakeCapacityUsed(ctx, gen.CountTrackerIntakeCapacityUsedParams{
 			ProjectID: claim.ProjectID, ProjectID_2: string(claim.ProjectID),
-			LeaseExpiresAt: claim.ClaimedAt, LeaseExpiresAt_2: claim.ClaimedAt,
+			LeaseExpiresAt: claim.ClaimedAt, LeaseExpiresAt_2: claim.ClaimedAt, LeaseExpiresAt_3: claim.ClaimedAt,
 		})
 		if err != nil {
 			return err
@@ -139,7 +175,7 @@ func (s *Store) CompleteTrackerIntakeIssue(ctx context.Context, claim ports.Trac
 	defer s.writeMu.Unlock()
 	completed := false
 	err := s.inImmediateTx(ctx, "complete tracker intake issue", func(q *gen.Queries) error {
-		matches, err := q.TrackerIntakeSessionMatches(ctx, gen.TrackerIntakeSessionMatchesParams{
+		matches, err := q.TrackerIntakeCompletionSessionMatches(ctx, gen.TrackerIntakeCompletionSessionMatchesParams{
 			ID: sessionID, ProjectID: claim.ProjectID,
 			CanonicalIssueID: domain.IssueID(string(claim.Provider) + ":" + claim.IssueID), Provider: string(claim.Provider),
 		})
@@ -152,7 +188,7 @@ func (s *Store) CompleteTrackerIntakeIssue(ctx context.Context, claim ports.Trac
 		rows, err := q.CompleteTrackerIntakeClaim(ctx, gen.CompleteTrackerIntakeClaimParams{
 			SessionID: string(sessionID), LeaseExpiresAt: completedAt, CompletedAt: sql.NullTime{Time: completedAt, Valid: true},
 			ProjectID: string(claim.ProjectID), Provider: string(claim.Provider), Repo: claim.Repo,
-			IssueID: claim.IssueID, OwnerToken: claim.OwnerToken,
+			IssueID: claim.IssueID, OwnerToken: claim.OwnerToken, SessionID_2: string(sessionID),
 		})
 		if err != nil || rows == 1 {
 			completed = rows == 1
@@ -189,18 +225,17 @@ func (s *Store) ReleaseTrackerIntakeIssue(ctx context.Context, claim ports.Track
 		if err != nil {
 			return err
 		}
-		canonicalIssueID := domain.IssueID(string(claim.Provider) + ":" + claim.IssueID)
-		sessionID, err := q.FindAdmittedTrackerIntakeSession(ctx, gen.FindAdmittedTrackerIntakeSessionParams{
-			ProjectID: claim.ProjectID, CanonicalIssueID: canonicalIssueID, Provider: string(claim.Provider),
-		})
-		if err == nil {
-			return reconcileTrackerIntakeSessionAt(ctx, q, claim, sessionID, releasedAt)
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return err
+		if existing.SessionID != "" {
+			matches, err := trackerIntakeActiveSessionMatches(ctx, q, claim, domain.SessionID(existing.SessionID))
+			if err != nil {
+				return err
+			}
+			if matches {
+				return reconcileTrackerIntakeSessionAt(ctx, q, claim, domain.SessionID(existing.SessionID), releasedAt)
+			}
 		}
 		rows, err := q.ReleaseTrackerIntakeClaim(ctx, gen.ReleaseTrackerIntakeClaimParams{
-			ProjectID: string(claim.ProjectID), Provider: string(claim.Provider), Repo: claim.Repo,
+			LeaseExpiresAt: releasedAt, ProjectID: string(claim.ProjectID), Provider: string(claim.Provider), Repo: claim.Repo,
 			IssueID: claim.IssueID, OwnerToken: claim.OwnerToken,
 		})
 		released = rows == 1
@@ -253,29 +288,81 @@ func reconcileTrackerIntakeSessionAt(ctx context.Context, q *gen.Queries, claim 
 	return err
 }
 
-func expiredAdmittedTrackerIntakeClaimIsSafe(ctx context.Context, q *gen.Queries, claim gen.TrackerIntakeClaim) (bool, error) {
+func findLegacyTrackerIntakeSession(ctx context.Context, q *gen.Queries, claim ports.TrackerIntakeClaim, canonicalIssueID domain.IssueID) (domain.SessionID, error) {
+	if claim.Provider == domain.TrackerProviderGitHub {
+		return q.FindLegacyGitHubTrackerIntakeSession(ctx, gen.FindLegacyGitHubTrackerIntakeSessionParams{
+			ProjectID: claim.ProjectID, IssueID: canonicalIssueID,
+		})
+	}
+	return q.FindLegacyTrackerIntakeSession(ctx, gen.FindLegacyTrackerIntakeSessionParams{
+		ProjectID: claim.ProjectID, IssueID: canonicalIssueID,
+	})
+}
+
+func trackerIntakeActiveSessionMatches(ctx context.Context, q *gen.Queries, claim ports.TrackerIntakeClaim, sessionID domain.SessionID) (bool, error) {
+	return q.TrackerIntakeActiveSessionMatches(ctx, gen.TrackerIntakeActiveSessionMatchesParams{
+		ID: sessionID, ProjectID: claim.ProjectID,
+		CanonicalIssueID: domain.IssueID(string(claim.Provider) + ":" + claim.IssueID), Provider: string(claim.Provider),
+	})
+}
+
+func expiredTrackerIntakeClaimRecovery(ctx context.Context, q *gen.Queries, claim gen.TrackerIntakeClaim) (safe, deleteSeed bool, err error) {
 	if claim.SessionID == "" {
-		return false, errors.New("admitted tracker intake claim has no bound session")
+		return false, false, errors.New("admitted tracker intake claim has no bound session")
 	}
 	id := domain.SessionID(claim.SessionID)
 	if _, err := q.GetSession(ctx, id); errors.Is(err, sql.ErrNoRows) {
 		// A missing exact bound row proves normal spawn rollback already cleaned
 		// the provisional admission. No unknown workspace/runtime can be fenced
 		// by this claim anymore, so its expired generation is safe to replace.
-		return true, nil
+		return true, false, nil
 	} else if err != nil {
-		return false, err
+		return false, false, err
 	}
 	isSeed, err := q.SessionIsSeed(ctx, id)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if !isSeed {
-		return false, fmt.Errorf("expired tracker intake claim references non-seed session %s", id)
+		return false, false, fmt.Errorf("expired tracker intake claim references non-seed session %s", id)
 	}
-	// A surviving provisional row is fail-closed: workspace/runtime side effects
-	// may already exist even though MarkSpawned has not persisted their handles.
-	return false, nil
+	if claim.Status == trackerIntakeAdmitted {
+		// The session manager advances admitted -> spawning before the first
+		// workspace/runtime side effect, so this exact pure seed is safe to reap.
+		return true, true, nil
+	}
+	// Spawning is fail-closed: side effects may exist even though MarkSpawned has
+	// not persisted their handles on the still-pure session row.
+	return false, false, nil
+}
+
+func deleteExpiredTrackerIntakeSeed(ctx context.Context, conn *sql.Conn, q *gen.Queries, id domain.SessionID) error {
+	isSeed, err := q.SessionIsSeed(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !isSeed {
+		return fmt.Errorf("expired tracker intake seed %s changed before cleanup", id)
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM change_log WHERE session_id = ?`, id); err != nil {
+		return fmt.Errorf("clear expired intake seed change log for %s: %w", id, err)
+	}
+	res, err := conn.ExecContext(ctx, `
+DELETE FROM sessions
+WHERE id = ?
+  AND is_terminated = 0
+  AND workspace_path = ''
+  AND runtime_handle_id = ''
+  AND agent_session_id = ''
+  AND prompt = ''`, id)
+	if err != nil {
+		return fmt.Errorf("delete expired intake seed %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil || rows != 1 {
+		return fmt.Errorf("delete expired intake seed %s affected %d rows: %w", id, rows, err)
+	}
+	return nil
 }
 
 func trackerIntakeClaimKeyParams(claim ports.TrackerIntakeClaim) gen.GetTrackerIntakeClaimParams {
