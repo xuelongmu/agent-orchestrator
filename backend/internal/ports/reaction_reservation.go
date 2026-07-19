@@ -14,6 +14,7 @@ type PRReactionFence struct {
 // PRReactionReservationStatus classifies an atomic pre-send claim.
 type PRReactionReservationStatus string
 
+// PRReactionReserved and related values classify the durable pre-send decision.
 const (
 	PRReactionReserved  PRReactionReservationStatus = "reserved"
 	PRReactionAccounted PRReactionReservationStatus = "accounted"

@@ -1953,13 +1953,16 @@ func (m *Manager) handoffUncertainPRReactionLocked(ctx context.Context, id domai
 	}
 	if !m.react.loaded[prURL] {
 		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
-			return fmt.Errorf("%w: load reaction state: %v", errPRReactionHandoffPending, err)
+			return errors.Join(errPRReactionHandoffPending, fmt.Errorf("load reaction state: %w", err))
 		}
 		m.react.loaded[prURL] = true
 	}
 	rec, ok, err := m.store.GetSession(ctx, id)
-	if err != nil || !ok {
-		return fmt.Errorf("%w: resolve session %s (found=%v): %v", errPRReactionHandoffPending, id, ok, err)
+	if err != nil {
+		return errors.Join(errPRReactionHandoffPending, fmt.Errorf("resolve session %s: %w", id, err))
+	}
+	if !ok {
+		return fmt.Errorf("%w: resolve session %s: not found", errPRReactionHandoffPending, id)
 	}
 	sum := sha256.Sum256([]byte(key + "\x00" + signature))
 	handoffKey := fmt.Sprintf("reaction-uncertain:%s:%x", prURL, sum)
@@ -1974,7 +1977,7 @@ func (m *Manager) handoffUncertainPRReactionLocked(ctx context.Context, id domai
 		SessionDisplayName: rec.DisplayName,
 	}
 	if err := m.deliverHumanHandoffLocked(ctx, prURL, handoffKey, prReactionDeliveryUncertain, intent, nil); err != nil {
-		return fmt.Errorf("%w: %v", errPRReactionHandoffPending, err)
+		return errors.Join(errPRReactionHandoffPending, err)
 	}
 	return nil
 }
