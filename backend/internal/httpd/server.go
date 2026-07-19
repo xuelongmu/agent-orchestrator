@@ -110,7 +110,15 @@ func (s *Server) Run(ctx context.Context) error {
 		_ = s.listen.Close()
 		return fmt.Errorf("write run-file: %w", err)
 	}
+	// Removing running.json is durable evidence that shutdown was explicitly
+	// requested. Preserve it on an unexpected Serve exit so an Electron process
+	// that adopted this daemon can distinguish a crash from `ao stop` without a
+	// timing heuristic or access to a non-child process exit code.
+	removeRunFile := false
 	defer func() {
+		if !removeRunFile {
+			return
+		}
 		if err := runfile.RemoveIfOwned(s.cfg.RunFilePath, info.PID); err != nil {
 			s.log.Warn("failed to remove run-file", "path", s.cfg.RunFilePath, "err", err)
 		}
@@ -130,11 +138,14 @@ func (s *Server) Run(ctx context.Context) error {
 	select {
 	case err := <-serveErr:
 		// Serve died on its own (bind already happened, so this is a real
-		// runtime failure) before any shutdown signal.
+		// runtime failure) before any shutdown signal. Keep running.json as the
+		// durable crash marker; the next daemon start already treats it as stale.
 		return err
 	case <-s.shutdownRequested:
+		removeRunFile = true
 		s.log.Info("shutdown requested over HTTP", "timeout", s.cfg.ShutdownTimeout)
 	case <-ctx.Done():
+		removeRunFile = true
 		s.log.Info("shutdown signal received, draining connections", "timeout", s.cfg.ShutdownTimeout)
 	}
 

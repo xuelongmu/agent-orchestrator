@@ -147,6 +147,32 @@ describe("DaemonRestartController", () => {
 
 		expect(restart).not.toHaveBeenCalled();
 	});
+
+	it("leaves an adopted graceful stop stopped", async () => {
+		const ownership = new DaemonOwnershipController();
+		ownership.setAppOwned(true);
+		const { controller, restart } = createController();
+		const loss = ownership.classifyAdoptedLoss(null, 42, () => false);
+
+		controller.onAdoptedLoss(loss);
+		await vi.runAllTimersAsync();
+
+		expect(loss).toBe("graceful-stop");
+		expect(restart).not.toHaveBeenCalled();
+	});
+
+	it("restarts an adopted daemon whose dead PID retains its app-owned run-file", async () => {
+		const ownership = new DaemonOwnershipController();
+		ownership.setAppOwned(true);
+		const { controller, restart } = createController();
+		const loss = ownership.classifyAdoptedLoss({ pid: 42, owner: "app" }, 42, () => false);
+
+		controller.onAdoptedLoss(loss);
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(loss).toBe("crash");
+		expect(restart).toHaveBeenCalledTimes(1);
+	});
 });
 
 describe("daemon restart ownership and reachability", () => {
@@ -192,6 +218,15 @@ describe("daemon restart ownership and reachability", () => {
 			source: "run-file",
 		});
 		expect(fromExpectedPort).not.toHaveBeenCalled();
+	});
+
+	it("does not guess that an unreachable adopted daemon with a live PID crashed", () => {
+		const ownership = new DaemonOwnershipController();
+		ownership.setAppOwned(true);
+
+		const loss = ownership.classifyAdoptedLoss({ pid: 42, owner: "app" }, 42, () => true);
+
+		expect(loss).toBe("still-running");
 	});
 });
 

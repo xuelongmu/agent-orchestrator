@@ -13,6 +13,8 @@ export type DaemonSupervisorLink = {
 	dispose: () => void;
 };
 
+export type AdoptedDaemonLoss = "not-owned" | "graceful-stop" | "still-running" | "crash";
+
 /** Tracks whether Electron owns the daemon and the matching liveness link. */
 export class DaemonOwnershipController {
 	private ownedByApp = false;
@@ -43,6 +45,21 @@ export class DaemonOwnershipController {
 	clear(): void {
 		this.ownedByApp = false;
 		this.clearSupervisorLink();
+	}
+
+	/**
+	 * Classify loss of an adopted daemon using durable run-file ownership plus
+	 * process liveness. Graceful Go shutdown removes its owned run-file; a crash
+	 * leaves the same app-owned PID behind. A still-live PID is never guessed dead.
+	 */
+	classifyAdoptedLoss(
+		info: { pid: number; owner?: string } | null,
+		previousPID: number | undefined,
+		isProcessAlive: (pid: number) => boolean,
+	): AdoptedDaemonLoss {
+		if (!this.ownedByApp) return "not-owned";
+		if (previousPID === undefined || validatedDaemonOwner(info, previousPID) !== "app") return "graceful-stop";
+		return isProcessAlive(previousPID) ? "still-running" : "crash";
 	}
 
 	private clearSupervisorLink(): void {
@@ -137,6 +154,15 @@ export class DaemonRestartController {
 					this.onUnexpectedExit();
 				});
 		}, this.restartDelayMs);
+	}
+
+	/** Apply the centralized retry policy to loss of an adopted daemon. */
+	onAdoptedLoss(loss: AdoptedDaemonLoss): void {
+		if (loss === "crash") {
+			this.onUnexpectedExit();
+		} else if (loss === "graceful-stop" || loss === "not-owned") {
+			this.cancel();
+		}
 	}
 
 	/** Reset the bounded retry budget only after the replacement proves stable. */

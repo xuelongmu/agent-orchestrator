@@ -627,14 +627,19 @@ async function inspectExistingDaemon(
 	return { status, owner };
 }
 
-async function readValidatedDaemonOwner(pid: number | undefined): Promise<string | undefined> {
+async function readCurrentRunFile() {
 	const rfp = runFilePath();
-	if (!rfp || pid === undefined) return undefined;
+	if (!rfp) return null;
 	try {
-		return validatedDaemonOwner(parseRunFile(await readFile(rfp, "utf8")), pid);
+		return parseRunFile(await readFile(rfp, "utf8"));
 	} catch {
-		return undefined;
+		return null;
 	}
+}
+
+async function readValidatedDaemonOwner(pid: number | undefined): Promise<string | undefined> {
+	if (pid === undefined) return undefined;
+	return validatedDaemonOwner(await readCurrentRunFile(), pid);
 }
 
 async function refreshDaemonStatus(): Promise<DaemonStatus> {
@@ -649,6 +654,7 @@ async function refreshDaemonStatus(): Promise<DaemonStatus> {
 		process.platform,
 	);
 	if (!launch) return daemonStatus;
+	const previousStatus = daemonStatus;
 	const reachable = await resolveReachableDaemon(
 		() => inspectExistingDaemon(launch),
 		() =>
@@ -670,16 +676,34 @@ async function refreshDaemonStatus(): Promise<DaemonStatus> {
 			if (!wasReady && status.state === "ready") daemonRestart.onReady();
 			if (!daemonOwnership.hasSupervisorLink) establishSupervisorLink();
 		}
-	} else if (
-		daemonStatus.state === "ready" ||
-		(daemonStatus.state === "error" && (daemonStatus.pid || daemonStatus.port))
-	) {
-		setDaemonStatus({
-			state: "stopped",
-			message: "AO daemon is no longer reachable.",
-			code: "daemon_unreachable",
-		});
-		if (daemonOwnership.appOwned) daemonRestart.onUnexpectedExit();
+	} else if (previousStatus.state === "ready" || (previousStatus.state === "error" && previousStatus.pid)) {
+		const loss = daemonOwnership.classifyAdoptedLoss(await readCurrentRunFile(), previousStatus.pid, processAlive);
+		daemonRestart.onAdoptedLoss(loss);
+		if (loss === "still-running") {
+			setDaemonStatus({
+				...previousStatus,
+				state: "error",
+				message: "AO daemon is still running but is not ready yet.",
+				code: "not_ready",
+			});
+		} else if (loss === "crash") {
+			setDaemonStatus({
+				state: "stopped",
+				message: "AO daemon is no longer reachable.",
+				code: "daemon_unreachable",
+			});
+		} else {
+			daemonOwnership.clear();
+			if (loss === "graceful-stop") {
+				setDaemonStatus({ state: "stopped" });
+			} else {
+				setDaemonStatus({
+					state: "stopped",
+					message: "AO daemon is no longer reachable.",
+					code: "daemon_unreachable",
+				});
+			}
+		}
 	}
 	return daemonStatus;
 }
