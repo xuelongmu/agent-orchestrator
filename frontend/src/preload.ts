@@ -1,10 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import { NEW_SESSION_SHORTCUT_CHANNEL } from "./shared/shortcuts";
-import type {
-	BrowserBoundsInput,
-	BrowserNavigateInput,
-	BrowserNavState,
-} from "./main/browser-view-host";
+import type { BrowserBoundsInput, BrowserNavigateInput, BrowserNavState } from "./main/browser-view-host";
 import type { DaemonStatus } from "./shared/daemon-status";
 import type { TelemetryBootstrap } from "./shared/telemetry";
 import type { MigrationState } from "./main/app-state";
