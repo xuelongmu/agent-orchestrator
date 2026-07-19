@@ -239,7 +239,7 @@ export type AdoptedDaemonStopOptions = {
 
 /**
  * Stop an adopted app-owned daemon before releasing its ownership/link state.
- * Success means a shutdown path was initiated or the daemon was confirmed gone.
+ * Success means the daemon was confirmed gone or direct termination was started.
  */
 export async function stopAdoptedDaemon(options: AdoptedDaemonStopOptions): Promise<boolean> {
 	let ownershipCleared = false;
@@ -254,16 +254,22 @@ export async function stopAdoptedDaemon(options: AdoptedDaemonStopOptions): Prom
 		return true;
 	}
 
+	let shutdownAccepted = false;
 	try {
-		if (await options.requestShutdown()) {
-			clearOwnership();
-			return true;
+		shutdownAccepted = await options.requestShutdown();
+		if (shutdownAccepted) {
+			// A 202 only acknowledges the request. Keep the verified PID and its
+			// ownership until the daemon actually removes its run-file or exits.
+			if (await options.confirmStopped()) {
+				clearOwnership();
+				return true;
+			}
 		}
 	} catch {
 		// Fall through to the supervisor/PID stop paths.
 	}
 
-	if (options.supervisorConnected) {
+	if (!shutdownAccepted && options.supervisorConnected) {
 		// Disposing a connected link starts the daemon's supervisor grace timer.
 		// Do not report success until that delayed stop is actually observed.
 		clearOwnership();

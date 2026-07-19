@@ -324,6 +324,66 @@ describe("adopted daemon stop", () => {
 		expect(events).toEqual(["shutdown-request", "terminate-42", "clear"]);
 	});
 
+	it("retains ownership until an accepted HTTP shutdown is confirmed", async () => {
+		let confirmStop: (stopped: boolean) => void = () => undefined;
+		const confirmation = new Promise<boolean>((resolve) => {
+			confirmStop = resolve;
+		});
+		const clearOwnership = vi.fn();
+		const terminateProcess = vi.fn(async () => true);
+		let settled = false;
+		const stopPromise = stopAdoptedDaemon({
+			appOwned: true,
+			alreadyStopped: false,
+			supervisorConnected: true,
+			pid: 42,
+			requestShutdown: async () => true,
+			confirmStopped: () => confirmation,
+			terminateProcess,
+			clearOwnership,
+		}).then((result) => {
+			settled = true;
+			return result;
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(settled).toBe(false);
+		expect(clearOwnership).not.toHaveBeenCalled();
+		expect(terminateProcess).not.toHaveBeenCalled();
+
+		confirmStop(true);
+		await expect(stopPromise).resolves.toBe(true);
+		expect(clearOwnership).toHaveBeenCalledTimes(1);
+		expect(terminateProcess).not.toHaveBeenCalled();
+	});
+
+	it("falls back to single-PID termination when accepted HTTP shutdown is not confirmed", async () => {
+		const events: string[] = [];
+		const stopped = await stopAdoptedDaemon({
+			appOwned: true,
+			alreadyStopped: false,
+			supervisorConnected: true,
+			pid: 42,
+			requestShutdown: async () => {
+				events.push("shutdown-request");
+				return true;
+			},
+			confirmStopped: async () => {
+				events.push("confirm");
+				return false;
+			},
+			terminateProcess: async (pid) => {
+				events.push(`terminate-${pid}`);
+				return true;
+			},
+			clearOwnership: () => events.push("clear"),
+		});
+
+		expect(stopped).toBe(true);
+		expect(events).toEqual(["shutdown-request", "confirm", "terminate-42", "clear"]);
+	});
+
 	it("does not report success or clear ownership without an effective stop path", async () => {
 		const clearOwnership = vi.fn();
 		const stopped = await stopAdoptedDaemon({
