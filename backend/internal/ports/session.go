@@ -9,6 +9,10 @@ import (
 // ErrSessionNotFound reports an observation for an unknown session id.
 var ErrSessionNotFound = errors.New("session not found")
 
+// ErrHandoffConflict means a session already has a different immutable
+// completion handoff. An exact replay is not an error.
+var ErrHandoffConflict = errors.New("session handoff already submitted with a different payload")
+
 // Dependency graph validation errors. Persistence owns the atomic graph check;
 // service layers map these sentinels to stable API errors.
 var (

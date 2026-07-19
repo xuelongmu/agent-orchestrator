@@ -131,6 +131,50 @@ afterEach(() => {
 });
 
 describe("SessionInspector tabs", () => {
+	it("lazy-loads the selected session handoff omitted from session lists", async () => {
+		getMock.mockImplementation(async (path: string) => {
+			if (path === "/api/v1/sessions/{sessionId}") {
+				return {
+					data: {
+						session: {
+							handoff: {
+								changedFiles: ["lazy-detail.go"],
+								verificationCommands: ["go test ./detail"],
+								residualRisk: "None",
+							},
+						},
+					},
+					error: undefined,
+				};
+			}
+			return { data: undefined, error: undefined };
+		});
+		renderWithQuery(<SessionInspector session={session([])} />);
+
+		await waitFor(() => expect(screen.getByText("lazy-detail.go")).toBeInTheDocument());
+		expect(screen.getByText("go test ./detail")).toBeInTheDocument();
+	});
+
+	it("renders a structured completion handoff without inferring lifecycle state", () => {
+		renderWithQuery(
+			<SessionInspector
+				session={session([], {
+					status: "working",
+					handoff: {
+						changedFiles: ["backend/internal/domain/handoff.go"],
+						verificationCommands: ["go test ./internal/domain"],
+						residualRisk: "Full CI remains pending.",
+					},
+				})}
+			/>,
+		);
+
+		expect(screen.getByText("Completion handoff")).toBeInTheDocument();
+		expect(screen.getByText("backend/internal/domain/handoff.go")).toBeInTheDocument();
+		expect(screen.getByText("go test ./internal/domain")).toBeInTheDocument();
+		expect(screen.getByText("Full CI remains pending.")).toBeInTheDocument();
+	});
+
 	it("renders dependency edges read-only in the overview", () => {
 		renderWithQuery(<SessionInspector session={session([], { dependsOn: ["sess-parent", "sess-api"] })} />);
 

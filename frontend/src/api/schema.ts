@@ -452,6 +452,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sessions/{sessionId}/handoff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Submit an immutable structured completion handoff without changing lifecycle state */
+        post: operations["submitSessionHandoff"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sessions/{sessionId}/kill": {
         parameters: {
             query?: never;
@@ -759,6 +776,14 @@ export interface components {
             model?: string;
             permissions?: string;
         };
+        AgentHandoff: {
+            /** @description Changed paths; each item is bounded by the server to 1024 UTF-8 bytes. */
+            changedFiles: string[];
+            /** @description Remaining risk, bounded by the server to 8192 UTF-8 bytes. */
+            residualRisk: string;
+            /** @description Commands run; each item is bounded by the server to 4096 UTF-8 bytes. */
+            verificationCommands: string[];
+        };
         AgentInfo: {
             /**
              * @description Advisory local auth probe result. authorized means a recent local probe passed; spawn remains the authoritative validation point.
@@ -804,6 +829,7 @@ export interface components {
             dependsOn?: string[];
             diagnostic?: components["schemas"]["LifecycleDiagnostic"];
             displayName?: string;
+            handoff?: components["schemas"]["AgentHandoff"];
             harness?: string;
             id: string;
             isTerminated: boolean;
@@ -1303,6 +1329,20 @@ export interface components {
             runId: string;
             /** @description Review verdict: approved or changes_requested. */
             verdict: string;
+        };
+        SubmitSessionHandoffRequest: {
+            /** @description Changed paths; each item is bounded by the server to 1024 UTF-8 bytes. */
+            changedFiles: string[];
+            /** @description Remaining risk, bounded by the server to 8192 UTF-8 bytes. */
+            residualRisk: string;
+            /** @description Commands run; each item is bounded by the server to 4096 UTF-8 bytes. */
+            verificationCommands: string[];
+        };
+        SubmitSessionHandoffResponse: {
+            created: boolean;
+            handoff: components["schemas"]["AgentHandoff"];
+            ok: boolean;
+            sessionId: string;
         };
         TrackerIntakeConfig: {
             assignee?: string;
@@ -2905,6 +2945,78 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AddDesignContractInvariantResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    submitSessionHandoff: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SubmitSessionHandoffRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SubmitSessionHandoffResponse"];
                 };
             };
             /** @description Bad Request */

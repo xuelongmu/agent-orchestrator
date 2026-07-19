@@ -112,6 +112,13 @@ export type ChangedFile = {
 export type SessionKind = "worker" | "orchestrator";
 export type WorkspaceKind = "worktree" | "scratch" | "dir";
 
+/** Immutable structured completion summary explicitly submitted by the agent. */
+export type AgentHandoff = {
+	changedFiles: string[];
+	verificationCommands: string[];
+	residualRisk: string;
+};
+
 /** Lifecycle state of a single pull request, mirrors the daemon's enum. */
 export type PRState = "open" | "draft" | "merged" | "closed";
 
@@ -155,6 +162,8 @@ export type WorkspaceSession = {
 	activity?: SessionActivity;
 	/** Last privacy-scrubbed terminal evidence captured at a stuck/terminal boundary. */
 	diagnostic?: SessionDiagnostic;
+	/** Machine-readable completion handoff; independent of lifecycle status. */
+	handoff?: AgentHandoff;
 	/**
 	 * Live preview target set by the daemon (via `ao preview`) and streamed over
 	 * CDC. When non-empty, the browser panel opens and navigates here.

@@ -83,6 +83,11 @@ describe("useWorkspaceQuery", () => {
 								terminalTail: "probe timed out",
 								capturedAt: "2026-06-10T15:31:00Z",
 							},
+							handoff: {
+								changedFiles: ["a.go"],
+								verificationCommands: ["go test ./x"],
+								residualRisk: "CI pending",
+							},
 							updatedAt: "2026-06-10T16:15:04Z",
 						},
 						{
@@ -138,6 +143,11 @@ describe("useWorkspaceQuery", () => {
 				trigger: "runtime_probe_failed",
 				terminalTail: "probe timed out",
 				capturedAt: "2026-06-10T15:31:00Z",
+			},
+			handoff: {
+				changedFiles: ["a.go"],
+				verificationCommands: ["go test ./x"],
+				residualRisk: "CI pending",
 			},
 		});
 		expect(workspace.sessions[1]).toMatchObject({

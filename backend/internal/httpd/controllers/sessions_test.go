@@ -43,6 +43,9 @@ type fakeSessionService struct {
 	claimRef          string
 	claimOpts         sessionsvc.ClaimPROptions
 	contractReadPR    string
+	handoff           *domain.AgentHandoff
+	handoffCreated    bool
+	handoffErr        error
 }
 
 func newFakeSessionService() *fakeSessionService {
@@ -114,6 +117,21 @@ func (f *fakeSessionService) SetPreview(_ context.Context, id domain.SessionID, 
 	s.Metadata.PreviewRevision++
 	f.sessions[id] = s
 	return s, nil
+}
+
+func (f *fakeSessionService) SubmitHandoff(_ context.Context, id domain.SessionID, handoff domain.AgentHandoff) (bool, error) {
+	if f.handoffErr != nil {
+		return false, f.handoffErr
+	}
+	if _, ok := f.sessions[id]; !ok {
+		return false, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	f.handoff = &handoff
+	created := f.handoffCreated
+	if !created {
+		created = true
+	}
+	return created, nil
 }
 
 func (f *fakeSessionService) Restore(_ context.Context, id domain.SessionID) (domain.Session, error) {

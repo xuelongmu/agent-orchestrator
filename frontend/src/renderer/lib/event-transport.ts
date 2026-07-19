@@ -4,6 +4,7 @@ import { getApiBaseUrl, hasTrustedApiBaseUrl, subscribeApiBaseUrl } from "./api-
 import { setEventsConnectionState } from "./events-connection";
 import { workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import { sessionScmSummaryQueryKey } from "../hooks/useSessionScmSummary";
+import { sessionDetailQueryKey } from "../hooks/useSessionDetail";
 
 export type EventTransport = {
 	connect: () => () => void;
@@ -47,12 +48,34 @@ export function createEventTransport(queryClient: QueryClient): EventTransport {
 			let retryTimer: ReturnType<typeof setTimeout> | undefined;
 			let source: EventSource | undefined;
 			let sourceBaseUrl: string | undefined;
-			const refreshWorkspaces = () => {
+			const pendingSessionIds = new Set<string>();
+			let invalidateAllSessionDetails = false;
+			const refreshWorkspaces = (event?: Event) => {
+				const data = "data" in (event ?? {}) ? (event as MessageEvent<string>).data : undefined;
+				if (typeof data === "string") {
+					try {
+						const parsed = JSON.parse(data) as { sessionId?: unknown };
+						if (typeof parsed.sessionId === "string" && parsed.sessionId) pendingSessionIds.add(parsed.sessionId);
+					} catch {
+						invalidateAllSessionDetails = true;
+					}
+				} else {
+					invalidateAllSessionDetails = true;
+				}
 				if (debounce) clearTimeout(debounce);
 				debounce = setTimeout(() => {
 					void queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
 					void queryClient.invalidateQueries({ queryKey: sessionScmSummaryQueryKey() });
 					void queryClient.invalidateQueries({ queryKey: ["session-reviews"] });
+					if (invalidateAllSessionDetails) {
+						void queryClient.invalidateQueries({ queryKey: sessionDetailQueryKey() });
+					} else {
+						for (const sessionId of pendingSessionIds) {
+							void queryClient.invalidateQueries({ queryKey: sessionDetailQueryKey(sessionId) });
+						}
+					}
+					pendingSessionIds.clear();
+					invalidateAllSessionDetails = false;
 				}, INVALIDATE_DEBOUNCE_MS);
 			};
 

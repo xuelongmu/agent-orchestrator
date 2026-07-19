@@ -4,6 +4,7 @@ import { ArrowUpRight, Files as FilesIcon, GitPullRequest, Play, Shield, Termina
 import type { components } from "../../api/schema";
 import { apiClient, apiErrorMessage } from "../lib/api-client";
 import { workspaceQueryKey } from "../hooks/useWorkspaceQuery";
+import { sessionDetailQueryKey } from "../hooks/useSessionDetail";
 import { formatTimeCompact } from "../lib/format-time";
 import { useSessionScmSummary, type SessionPRSummary } from "../hooks/useSessionScmSummary";
 import { prBrowserUrl, sessionPRDisplaySummaries } from "../lib/pr-display";
@@ -144,6 +145,17 @@ export function SessionInspector({
 	onViewChange?: (view: InspectorView) => void;
 }) {
 	const [internalView, setInternalView] = useState<InspectorView>("summary");
+	const sessionDetail = useQuery({
+		queryKey: sessionDetailQueryKey(session?.id),
+		enabled: Boolean(session?.id),
+		queryFn: async () => {
+			const { data, error } = await apiClient.GET("/api/v1/sessions/{sessionId}", {
+				params: { path: { sessionId: session?.id ?? "" } },
+			});
+			if (error) throw error;
+			return data?.session;
+		},
+	});
 	const view = viewProp ?? internalView;
 	const setView = (next: InspectorView) => {
 		setInternalView(next);
@@ -160,6 +172,11 @@ export function SessionInspector({
 			</aside>
 		);
 	}
+	// Session lists intentionally omit the potentially large handoff blob.
+	// Fetch it only for the selected inspector and merge that one detail field.
+	const inspectedSession: WorkspaceSession = sessionDetail.data
+		? { ...session, handoff: sessionDetail.data.handoff }
+		: session;
 
 	return (
 		<aside className={inspectorShellClass} aria-label="Session inspector">
@@ -194,8 +211,8 @@ export function SessionInspector({
 					view === "files" && "p-0 overflow-hidden [&>[role=tabpanel]]:h-full",
 				)}
 			>
-				{view === "summary" ? <SummaryView session={session} /> : null}
-				{view === "reviews" ? <ReviewsView onOpenReviewerTerminal={onOpenReviewerTerminal} session={session} /> : null}
+				{view === "summary" ? <SummaryView session={inspectedSession} /> : null}
+				{view === "reviews" ? <ReviewsView onOpenReviewerTerminal={onOpenReviewerTerminal} session={inspectedSession} /> : null}
 				{view === "browser" ? (
 					<BrowserView
 						browserPoppedOut={browserPoppedOut}
@@ -203,7 +220,7 @@ export function SessionInspector({
 						browserView={browserView}
 						isActive={isInspectorVisible && !browserPoppedOut}
 						onTogglePopOut={onToggleBrowserPopOut}
-						session={session}
+						session={inspectedSession}
 					/>
 				) : null}
 				{view === "files" ? <FilesView filesView={filesView} onOpenFiles={onOpenFiles} /> : null}
@@ -263,6 +280,8 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 				<ActivityTimeline session={session} />
 			</Section>
 
+			{session.handoff ? <SessionHandoff handoff={session.handoff} /> : null}
+
 			{session.diagnostic ? <SessionDiagnostic diagnostic={session.diagnostic} /> : null}
 
 			<Section className="border-t border-border pt-5" title="Overview">
@@ -279,6 +298,51 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 				</dl>
 			</Section>
 		</div>
+	);
+}
+
+function SessionHandoff({ handoff }: { handoff: NonNullable<WorkspaceSession["handoff"]> }) {
+	return (
+		<Section title="Completion handoff">
+			<div className="flex flex-col gap-3 rounded-md border border-border bg-surface p-3">
+				<div>
+					<div className="mb-1 text-caption font-medium text-muted-foreground">Changed files</div>
+					{handoff.changedFiles.length > 0 ? (
+						<ul className="flex flex-col gap-1" aria-label="Changed files">
+							{handoff.changedFiles.map((file, index) => (
+								<li key={`${file}-${index}`} className="break-all font-mono text-2xs text-foreground">
+									{file}
+								</li>
+							))}
+						</ul>
+					) : (
+						<p className={inspectorEmptyClass}>None reported.</p>
+					)}
+				</div>
+				<div>
+					<div className="mb-1 text-caption font-medium text-muted-foreground">Verification commands</div>
+					{handoff.verificationCommands.length > 0 ? (
+						<ul className="flex flex-col gap-1.5" aria-label="Verification commands">
+							{handoff.verificationCommands.map((command, index) => (
+								<li key={`${command}-${index}`}>
+									<code className="block whitespace-pre-wrap break-words rounded bg-background px-2 py-1 font-mono text-2xs text-foreground">
+										{command}
+									</code>
+								</li>
+							))}
+						</ul>
+					) : (
+						<p className={inspectorEmptyClass}>None reported.</p>
+					)}
+				</div>
+				<div>
+					<div className="mb-1 text-caption font-medium text-muted-foreground">Residual risk</div>
+					<p className="whitespace-pre-wrap break-words text-xs text-foreground">
+						{handoff.residualRisk || "None reported."}
+					</p>
+				</div>
+			</div>
+		</Section>
 	);
 }
 

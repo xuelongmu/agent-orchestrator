@@ -40,12 +40,17 @@ class EventSourceStub {
 	onerror: (() => void) | null = null;
 	onmessage: (() => void) | null = null;
 	listeners: string[] = [];
+	listenerCallbacks = new Map<string, Array<(event: Event) => void>>();
 	constructor(url: string) {
 		this.url = url;
 		EventSourceStub.instances.push(this);
 	}
-	addEventListener(type: string) {
+	addEventListener(type: string, listener: (event: Event) => void) {
 		this.listeners.push(type);
+		this.listenerCallbacks.set(type, [...(this.listenerCallbacks.get(type) ?? []), listener]);
+	}
+	emit(type: string, data: string) {
+		for (const listener of this.listenerCallbacks.get(type) ?? []) listener({ data } as unknown as Event);
 	}
 	close() {
 		this.closed = true;
@@ -132,6 +137,20 @@ describe("createEventTransport", () => {
 			expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["workspaces"] });
 			expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-scm-summary"] });
 			expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-reviews"] });
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("invalidates the scoped session detail when a session event arrives", () => {
+		vi.useFakeTimers();
+		try {
+			const queryClient = fakeQueryClient();
+			createEventTransport(queryClient).connect();
+			EventSourceStub.instances[0].emit("session_updated", JSON.stringify({ sessionId: "ao-30" }));
+			vi.advanceTimersByTime(200);
+			expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-detail", "ao-30"] });
+			expect(queryClient.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ["session-detail", "other"] });
 		} finally {
 			vi.useRealTimers();
 		}
