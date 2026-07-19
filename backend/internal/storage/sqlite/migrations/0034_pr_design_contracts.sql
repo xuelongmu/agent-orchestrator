@@ -11,9 +11,14 @@ CREATE TABLE session_design_contract_seed (
 );
 
 CREATE TABLE pr_design_contract (
-    pr_url     TEXT PRIMARY KEY REFERENCES pr (url) ON DELETE CASCADE,
-    markdown   TEXT NOT NULL CHECK (length(markdown) <= 1048576),
-    updated_at TIMESTAMP NOT NULL
+    pr_url                       TEXT PRIMARY KEY REFERENCES pr (url) ON DELETE CASCADE,
+    markdown                     TEXT NOT NULL CHECK (length(markdown) <= 1048576),
+    pending_delivery_session_id  TEXT REFERENCES sessions (id) ON DELETE SET NULL,
+    pending_delivery_task_prompt TEXT NOT NULL DEFAULT '',
+    pending_delivery_token       TEXT NOT NULL DEFAULT '',
+    delivery_required_at         TIMESTAMP,
+    contract_revision            INTEGER NOT NULL DEFAULT 1,
+    updated_at                   TIMESTAMP NOT NULL
 );
 
 ALTER TABLE review_finding ADD COLUMN proposed_invariant TEXT NOT NULL DEFAULT '';

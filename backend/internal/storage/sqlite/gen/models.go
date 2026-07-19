@@ -119,9 +119,14 @@ type PRComment struct {
 }
 
 type PRDesignContract struct {
-	PRURL     string
-	Markdown  string
-	UpdatedAt time.Time
+	PRURL                     string
+	Markdown                  string
+	PendingDeliverySessionID  sql.NullString
+	PendingDeliveryTaskPrompt string
+	PendingDeliveryToken      string
+	DeliveryRequiredAt        sql.NullTime
+	ContractRevision          int64
+	UpdatedAt                 time.Time
 }
 
 type PRReview struct {

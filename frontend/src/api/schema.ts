@@ -758,9 +758,13 @@ export interface components {
         ClaimPRRequest: {
             allowTakeover?: null | boolean;
             pr: string;
+            /** @description Actionable task withheld by ao spawn --claim-pr until canonical contract delivery; empty for manual claims. */
+            taskPrompt?: string;
         };
         ClaimPRResponse: {
             branchChanged: boolean;
+            /** @description True only after the exact PR's canonical contract was delivered and the durable claim barrier cleared. */
+            contractReady: boolean;
             ok: boolean;
             prs: components["schemas"]["SessionPRFacts"][];
             sessionId: string;

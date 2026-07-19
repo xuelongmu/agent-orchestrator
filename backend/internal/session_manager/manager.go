@@ -2008,6 +2008,17 @@ func (m *Manager) applyWorkspaceProjectPreserved(ctx context.Context, rows []por
 // the session is active or the budget is exhausted. Confirmation never fails
 // the send: it only decides whether to nudge again.
 func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string) error {
+	return m.send(ctx, id, message, false)
+}
+
+// SendAutomated delivers AO-originated work while allowing waiting_input, but
+// never recovers across a blocked/rate-limited state or an unsubmitted draft.
+// Unlike Send, it cannot be interpreted as an explicit user retry.
+func (m *Manager) SendAutomated(ctx context.Context, id domain.SessionID, message string) error {
+	return m.send(ctx, id, message, true)
+}
+
+func (m *Manager) send(ctx context.Context, id domain.SessionID, message string, automated bool) error {
 	message, err := m.prepareOutboundMessage(ctx, id, message)
 	if err != nil {
 		return err
@@ -2021,6 +2032,9 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string)
 		return fmt.Errorf("send %s: pending submit lookup: %w", id, err)
 	}
 	if ok && latched.Metadata.PendingSubmitFingerprint != "" {
+		if automated {
+			return &InputPendingError{SessionID: id, RecoveryAttempted: latched.Metadata.PendingSubmitRecoveryAttempted}
+		}
 		fingerprint := pendingSubmitFingerprint(message)
 		stillPending, recoveryAttempted, recoverErr := m.recoverPendingSubmit(ctx, latched)
 		if recoverErr != nil {
@@ -2033,7 +2047,12 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string)
 			return nil
 		}
 	}
-	outcome, err := m.messenger.Deliver(ctx, id, message)
+	var outcome sessionguard.Outcome
+	if automated {
+		outcome, err = m.messenger.DeliverAutomated(ctx, id, message)
+	} else {
+		outcome, err = m.messenger.Deliver(ctx, id, message)
+	}
 	if err != nil {
 		return fmt.Errorf("send %s: %w", id, err)
 	}
@@ -2044,6 +2063,8 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string)
 		return fmt.Errorf("send %s: %w", id, ErrTerminated)
 	case sessionguard.SuppressedAwaitingUser:
 		return fmt.Errorf("send %s: %w", id, ErrAwaitingDecision)
+	case sessionguard.SuppressedRateLimited:
+		return fmt.Errorf("send %s: automated delivery suppressed while rate limited", id)
 	}
 	// confirmActive only helps — and is only SAFE — when the harness reports
 	// both a prompt-submit signal (so the loop can observe active) and a

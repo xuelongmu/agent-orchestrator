@@ -42,6 +42,171 @@ func TestPRDesignContractSurvivesTerminationAndReplacementWithoutWorkspaceState(
 	}
 }
 
+func TestClaimPRPersistsExactSessionContractDeliveryBarrier(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	owner := createContractSession(t, s, "mer")
+	other := createContractSession(t, s, "mer")
+	prURL := "https://gitlab.example.com/group/repo/-/merge_requests/17"
+	taskPrompt := "Fix the exact claimed merge request."
+	outcome, err := s.ClaimPR(ctx, domain.PullRequest{URL: prURL, SessionID: owner.ID, Number: 17, UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "", taskPrompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.ContractDeliveryPending {
+		t.Fatal("ownership transaction omitted delivery barrier")
+	}
+	delivery, pending, err := s.GetPendingPRDesignContractDelivery(ctx, owner.ID, prURL)
+	if err != nil || !pending || !strings.Contains(delivery.Contract, "Trust boundary") || delivery.TaskPrompt != taskPrompt || delivery.Token == "" || delivery.Token != outcome.ContractDeliveryToken {
+		t.Fatalf("pending delivery = pending %v contract %q err %v", pending, delivery.Contract, err)
+	}
+	if completed, err := s.CompletePRDesignContractDelivery(ctx, other.ID, prURL, delivery.Token, delivery.Revision); err != nil || completed {
+		t.Fatalf("sibling session cleared barrier: completed=%v err=%v", completed, err)
+	}
+	if completed, err := s.CompletePRDesignContractDelivery(ctx, owner.ID, prURL, delivery.Token, delivery.Revision); err != nil || !completed {
+		t.Fatalf("owner could not clear barrier: completed=%v err=%v", completed, err)
+	}
+	if _, pending, err := s.GetPendingPRDesignContractDelivery(ctx, owner.ID, prURL); err != nil || pending {
+		t.Fatalf("completed barrier still pending: %v, %v", pending, err)
+	}
+}
+
+func TestClaimPRDeliveryGenerationRejectsSameSessionReclaimAndTakeoverABA(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	owner := createContractSession(t, s, "mer")
+	replacement := createContractSession(t, s, "mer")
+	prURL := "https://github.com/acme/repo/pull/17"
+	claim := func(sessionID domain.SessionID, task string) ports.ClaimOutcome {
+		outcome, err := s.ClaimPR(ctx, domain.PullRequest{URL: prURL, SessionID: sessionID, Number: 17, UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "", task)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return outcome
+	}
+	first := claim(owner.ID, "first task")
+	firstDelivery, pending, err := s.GetPendingPRDesignContractDelivery(ctx, owner.ID, prURL)
+	if err != nil || !pending || firstDelivery.Token != first.ContractDeliveryToken {
+		t.Fatalf("first delivery = %+v pending=%v err=%v", firstDelivery, pending, err)
+	}
+	second := claim(owner.ID, "reclaimed task")
+	if second.ContractDeliveryToken == first.ContractDeliveryToken {
+		t.Fatal("same-session reclaim reused delivery generation")
+	}
+	if completed, err := s.CompletePRDesignContractDelivery(ctx, owner.ID, prURL, firstDelivery.Token, firstDelivery.Revision); err != nil || completed {
+		t.Fatalf("stale same-session generation cleared reclaim: completed=%v err=%v", completed, err)
+	}
+	secondDelivery, pending, err := s.GetPendingPRDesignContractDelivery(ctx, owner.ID, prURL)
+	if err != nil || !pending || secondDelivery.TaskPrompt != "reclaimed task" || secondDelivery.Token != second.ContractDeliveryToken {
+		t.Fatalf("reclaim delivery = %+v pending=%v err=%v", secondDelivery, pending, err)
+	}
+	third := claim(replacement.ID, "replacement task")
+	if _, pending, err := s.GetPendingPRDesignContractDelivery(ctx, owner.ID, prURL); err != nil || pending {
+		t.Fatalf("previous owner can still read takeover delivery: pending=%v err=%v", pending, err)
+	}
+	if completed, err := s.CompletePRDesignContractDelivery(ctx, owner.ID, prURL, secondDelivery.Token, secondDelivery.Revision); err != nil || completed {
+		t.Fatalf("previous owner generation cleared takeover: completed=%v err=%v", completed, err)
+	}
+	thirdDelivery, pending, err := s.GetPendingPRDesignContractDelivery(ctx, replacement.ID, prURL)
+	if err != nil || !pending || thirdDelivery.Token != third.ContractDeliveryToken || thirdDelivery.TaskPrompt != "replacement task" {
+		t.Fatalf("takeover delivery = %+v pending=%v err=%v", thirdDelivery, pending, err)
+	}
+}
+
+func TestPendingDeliveryRevisionRetriesAfterInvariantAppend(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	owner := createContractSession(t, s, "mer")
+	prURL := "https://github.com/acme/repo/pull/19"
+	if _, err := s.ClaimPR(ctx, domain.PullRequest{URL: prURL, SessionID: owner.ID, Number: 19, UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "", "fix review"); err != nil {
+		t.Fatal(err)
+	}
+	stale, pending, err := s.GetPendingPRDesignContractDelivery(ctx, owner.ID, prURL)
+	if err != nil || !pending {
+		t.Fatalf("initial pending delivery = %+v pending=%v err=%v", stale, pending, err)
+	}
+	invariant := "Every claim-ready acknowledgement fences the canonical contract revision."
+	if _, err := s.AddPRDesignContractInvariant(ctx, owner.ID, prURL, invariant, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if completed, err := s.CompletePRDesignContractDelivery(ctx, owner.ID, prURL, stale.Token, stale.Revision); err != nil || completed {
+		t.Fatalf("stale pre-append delivery cleared barrier: completed=%v err=%v", completed, err)
+	}
+	latest, pending, err := s.GetPendingPRDesignContractDelivery(ctx, owner.ID, prURL)
+	if err != nil || !pending || latest.Revision <= stale.Revision || !strings.Contains(latest.Contract, invariant) {
+		t.Fatalf("retry payload did not include appended invariant: stale=%+v latest=%+v pending=%v err=%v", stale, latest, pending, err)
+	}
+	if completed, err := s.CompletePRDesignContractDelivery(ctx, owner.ID, prURL, latest.Token, latest.Revision); err != nil || !completed {
+		t.Fatalf("latest delivery could not clear barrier: completed=%v err=%v", completed, err)
+	}
+}
+
+func TestClaimPRTakeoverWaitsAcrossFinalDeliveryBoundary(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	owner := createContractSession(t, s, "mer")
+	replacement := createContractSession(t, s, "mer")
+	prURL := "https://github.com/acme/repo/pull/18"
+	first, err := s.ClaimPR(ctx, domain.PullRequest{URL: prURL, SessionID: owner.ID, Number: 18, UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "", "owner task")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Model the exact final delivery boundary used by session/lifecycle: the
+	// generation is re-read while the per-PR delivery lock is held. A concurrent
+	// takeover cannot commit between that read and pane delivery/ack.
+	unlock := designcontract.LockDelivery(prURL)
+	started := make(chan struct{})
+	done := make(chan ports.ClaimOutcome, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		close(started)
+		outcome, claimErr := s.ClaimPR(ctx, domain.PullRequest{URL: prURL, SessionID: replacement.ID, Number: 18, UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "", "replacement task")
+		if claimErr != nil {
+			errCh <- claimErr
+			return
+		}
+		done <- outcome
+	}()
+	<-started
+	select {
+	case <-done:
+		unlock()
+		t.Fatal("takeover crossed in-flight delivery boundary")
+	case err := <-errCh:
+		unlock()
+		t.Fatalf("concurrent takeover: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	delivery, pending, err := s.GetPendingPRDesignContractDelivery(ctx, owner.ID, prURL)
+	if err != nil || !pending || delivery.Token != first.ContractDeliveryToken {
+		unlock()
+		t.Fatalf("owner delivery changed inside boundary: %+v pending=%v err=%v", delivery, pending, err)
+	}
+	if completed, err := s.CompletePRDesignContractDelivery(ctx, owner.ID, prURL, delivery.Token, delivery.Revision); err != nil || !completed {
+		unlock()
+		t.Fatalf("owner delivery ack = %v, %v", completed, err)
+	}
+	unlock()
+
+	var takeover ports.ClaimOutcome
+	select {
+	case takeover = <-done:
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("takeover did not resume after delivery boundary")
+	}
+	latest, pending, err := s.GetPendingPRDesignContractDelivery(ctx, replacement.ID, prURL)
+	if err != nil || !pending || latest.Token != takeover.ContractDeliveryToken || latest.Token == delivery.Token {
+		t.Fatalf("replacement delivery = %+v outcome=%+v pending=%v err=%v", latest, takeover, pending, err)
+	}
+}
+
 func TestReviewFindingUpdatesExactPRContractAcrossTakeover(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -98,13 +263,30 @@ func TestReviewFindingUpdatesExactPRContractAcrossTakeover(t *testing.T) {
 		}
 	}
 	fixerInvariant := "Every human-review fix declares its exact PR invariant through AO."
-	contract1, err := s.AddPRDesignContractInvariant(ctx, owner.ID, pr1, fixerInvariant, now.Add(time.Second))
+	contract1, err = s.AddPRDesignContractInvariant(ctx, owner.ID, pr1, fixerInvariant, now.Add(time.Second))
 	if err != nil || !strings.Contains(contract1, fixerInvariant) {
 		t.Fatalf("fixer invariant write = %q, %v", contract1, err)
 	}
 	contract2, _, _ = s.GetPRDesignContract(ctx, pr2)
 	if strings.Contains(contract2, fixerInvariant) {
 		t.Fatalf("fixer invariant leaked to sibling: %q", contract2)
+	}
+	partial := "human-review fix declares"
+	contract1, err = s.AddPRDesignContractInvariant(ctx, owner.ID, pr1, partial, now.Add(2*time.Second))
+	if err != nil || !designcontract.HasInvariant(contract1, partial) {
+		t.Fatalf("substring proposal was incorrectly deduplicated: %q, %v", contract1, err)
+	}
+	differentCase := "Every human-review fix DECLARES its exact PR invariant through AO."
+	contract1, err = s.AddPRDesignContractInvariant(ctx, owner.ID, pr1, differentCase, now.Add(3*time.Second))
+	if err != nil || !designcontract.HasInvariant(contract1, differentCase) {
+		t.Fatalf("case-distinct proposal was incorrectly deduplicated: %q, %v", contract1, err)
+	}
+	unchanged, err := s.AddPRDesignContractInvariant(ctx, owner.ID, pr1, "  "+fixerInvariant+"  ", now.Add(4*time.Second))
+	if err != nil || unchanged != contract1 {
+		t.Fatalf("normalized exact duplicate changed contract: equal=%v err=%v", unchanged == contract1, err)
+	}
+	if _, err := s.AddPRDesignContractInvariant(ctx, owner.ID, pr1, "control\x1b[31m", now.Add(5*time.Second)); err == nil {
+		t.Fatal("control-character invariant was persisted")
 	}
 	outcome := claimContractPR(t, s, replacement.ID, pr1, 1)
 	if !strings.Contains(outcome.DesignContract, invariant) || !strings.Contains(outcome.DesignContract, fixerInvariant) {
@@ -169,7 +351,7 @@ func TestClaimPRRollsBackOwnershipWhenCanonicalContractWriteFails(t *testing.T) 
 	}
 	prURL := "https://github.com/acme/repo/pull/99"
 	pr := domain.PullRequest{URL: prURL, SessionID: owner.ID, Number: 99, UpdatedAt: time.Now().UTC()}
-	if _, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, true, ""); err == nil {
+	if _, err := s.ClaimPR(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "", ""); err == nil {
 		t.Fatal("oversized canonical contract claim unexpectedly succeeded")
 	}
 	prs, err := s.ListPRsBySession(ctx, owner.ID)
@@ -192,7 +374,7 @@ func createContractSession(t *testing.T, s *sqlite.Store, project string) domain
 
 func claimContractPR(t *testing.T, s *sqlite.Store, sessionID domain.SessionID, url string, number int) ports.ClaimOutcome {
 	t.Helper()
-	outcome, err := s.ClaimPR(context.Background(), domain.PullRequest{URL: url, SessionID: sessionID, Number: number, UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "")
+	outcome, err := s.ClaimPR(context.Background(), domain.PullRequest{URL: url, SessionID: sessionID, Number: number, UpdatedAt: time.Now().UTC()}, nil, nil, nil, nil, ports.ReviewWritePreserve, true, "", "")
 	if err != nil {
 		t.Fatalf("claim %s: %v", url, err)
 	}

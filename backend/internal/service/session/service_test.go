@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -27,25 +28,44 @@ func (f *fakeTelemetrySink) Emit(_ context.Context, ev ports.TelemetryEvent) {
 func (f *fakeTelemetrySink) Close(context.Context) error { return nil }
 
 type fakeStore struct {
-	sessions map[domain.SessionID]domain.SessionRecord
-	pr       map[domain.SessionID]domain.PRFacts
-	projects map[string]domain.ProjectRecord
-	checks   map[string][]domain.PullRequestCheck
-	reviews  map[string][]domain.PullRequestReview
-	threads  map[string][]domain.PullRequestReviewThread
-	comments map[string][]domain.PullRequestComment
-	num      int
+	sessions                map[domain.SessionID]domain.SessionRecord
+	pr                      map[domain.SessionID]domain.PRFacts
+	ownedPRs                map[domain.SessionID][]domain.PullRequest
+	projects                map[string]domain.ProjectRecord
+	checks                  map[string][]domain.PullRequestCheck
+	reviews                 map[string][]domain.PullRequestReview
+	threads                 map[string][]domain.PullRequestReviewThread
+	comments                map[string][]domain.PullRequestComment
+	contracts               map[string]string
+	contractWrites          []contractWrite
+	pendingContractDelivery map[string]domain.SessionID
+	pendingContractTask     map[string]string
+	pendingContractToken    map[string]string
+	pendingContractRevision map[string]int64
+	num                     int
+}
+
+type contractWrite struct {
+	sessionID domain.SessionID
+	prURL     string
+	invariant string
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		sessions: map[domain.SessionID]domain.SessionRecord{},
-		pr:       map[domain.SessionID]domain.PRFacts{},
-		projects: map[string]domain.ProjectRecord{},
-		checks:   map[string][]domain.PullRequestCheck{},
-		reviews:  map[string][]domain.PullRequestReview{},
-		threads:  map[string][]domain.PullRequestReviewThread{},
-		comments: map[string][]domain.PullRequestComment{},
+		sessions:                map[domain.SessionID]domain.SessionRecord{},
+		pr:                      map[domain.SessionID]domain.PRFacts{},
+		ownedPRs:                map[domain.SessionID][]domain.PullRequest{},
+		projects:                map[string]domain.ProjectRecord{},
+		checks:                  map[string][]domain.PullRequestCheck{},
+		reviews:                 map[string][]domain.PullRequestReview{},
+		threads:                 map[string][]domain.PullRequestReviewThread{},
+		comments:                map[string][]domain.PullRequestComment{},
+		contracts:               map[string]string{},
+		pendingContractDelivery: map[string]domain.SessionID{},
+		pendingContractTask:     map[string]string{},
+		pendingContractToken:    map[string]string{},
+		pendingContractRevision: map[string]int64{},
 	}
 }
 
@@ -156,11 +176,45 @@ func (f *fakeStore) GetDisplayPRFactsForSession(_ context.Context, id domain.Ses
 }
 
 func (f *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]domain.PullRequest, error) {
+	if prs, ok := f.ownedPRs[id]; ok {
+		return append([]domain.PullRequest(nil), prs...), nil
+	}
 	pr, ok := f.pr[id]
 	if !ok {
 		return nil, nil
 	}
 	return []domain.PullRequest{{URL: pr.URL, SessionID: id, Number: pr.Number, Draft: pr.Draft, Merged: pr.Merged, Closed: pr.Closed, CI: pr.CI, Review: pr.Review, Mergeability: pr.Mergeability, UpdatedAt: pr.UpdatedAt}}, nil
+}
+
+func (f *fakeStore) AddPRDesignContractInvariant(_ context.Context, sessionID domain.SessionID, prURL, invariant string, _ time.Time) (string, error) {
+	owned := false
+	for _, pr := range f.ownedPRs[sessionID] {
+		if pr.URL == prURL {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		return "", fmt.Errorf("PR %s is not owned by session %s", prURL, sessionID)
+	}
+	f.contractWrites = append(f.contractWrites, contractWrite{sessionID: sessionID, prURL: prURL, invariant: invariant})
+	f.contracts[prURL] = designcontract.AppendInvariant(f.contracts[prURL], invariant)
+	return f.contracts[prURL], nil
+}
+
+func (f *fakeStore) GetPendingPRDesignContractDelivery(_ context.Context, sessionID domain.SessionID, prURL string) (designcontract.PendingDelivery, bool, error) {
+	return designcontract.PendingDelivery{Contract: f.contracts[prURL], TaskPrompt: f.pendingContractTask[prURL], Token: f.pendingContractToken[prURL], Revision: f.pendingContractRevision[prURL]}, f.pendingContractDelivery[prURL] == sessionID, nil
+}
+
+func (f *fakeStore) CompletePRDesignContractDelivery(_ context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error) {
+	if f.pendingContractDelivery[prURL] != sessionID || f.pendingContractToken[prURL] != deliveryToken || f.pendingContractRevision[prURL] != contractRevision {
+		return false, nil
+	}
+	delete(f.pendingContractDelivery, prURL)
+	delete(f.pendingContractTask, prURL)
+	delete(f.pendingContractToken, prURL)
+	delete(f.pendingContractRevision, prURL)
+	return true, nil
 }
 
 func (f *fakeStore) ListPRFactsForSession(_ context.Context, id domain.SessionID) ([]domain.PRFacts, error) {
@@ -216,6 +270,71 @@ func TestSessionRenameUpdatesDisplayName(t *testing.T) {
 	}
 	if got := st.sessions["mer-1"].DisplayName; got != "Fix issue #90" {
 		t.Fatalf("display name = %q, want trimmed rename", got)
+	}
+}
+
+func TestAddDesignContractInvariantUsesProviderNeutralOwnedPRIdentity(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Metadata: domain.SessionMetadata{WorkspacePath: t.TempDir()}}
+	gitlab := "https://gitlab.example.com/group/repo/-/merge_requests/17"
+	github := "https://github.com/acme/repo/pull/17"
+	st.ownedPRs["mer-1"] = []domain.PullRequest{{URL: gitlab, SessionID: "mer-1", Number: 17}}
+	st.ownedPRs["mer-2"] = []domain.PullRequest{{URL: github, SessionID: "mer-2", Number: 17}}
+	svc := NewWithDeps(Deps{Store: st, Clock: func() time.Time { return time.Unix(1, 0).UTC() }})
+
+	const invariant = "Every provider uses its canonical owned PR identity."
+	contract, err := svc.AddDesignContractInvariant(context.Background(), "mer-1", "https://GITLAB.example.com/group/repo/-/merge_requests/17/", invariant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !designcontract.HasInvariant(contract, invariant) || len(st.contractWrites) != 1 || st.contractWrites[0].prURL != gitlab {
+		t.Fatalf("provider-neutral append = contract %q writes %+v", contract, st.contractWrites)
+	}
+	if st.contracts[github] != "" {
+		t.Fatalf("sibling provider contract changed: %q", st.contracts[github])
+	}
+}
+
+func TestAddDesignContractInvariantResolvesUnambiguousOwnedNumber(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1"}
+	gitlab := "https://gitlab.example.com/group/repo/-/merge_requests/8"
+	st.ownedPRs["mer-1"] = []domain.PullRequest{{URL: gitlab, SessionID: "mer-1", Number: 8}}
+	svc := NewWithDeps(Deps{Store: st})
+	if _, err := svc.AddDesignContractInvariant(context.Background(), "mer-1", "#8", "Every number resolves through owned SCM rows."); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.contractWrites) != 1 || st.contractWrites[0].prURL != gitlab {
+		t.Fatalf("number write = %+v", st.contractWrites)
+	}
+}
+
+func TestAddDesignContractInvariantRejectsUnownedAmbiguousAndInvalidInputs(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1"}
+	st.ownedPRs["mer-1"] = []domain.PullRequest{
+		{URL: "https://gitlab.example.com/a/r/-/merge_requests/8", SessionID: "mer-1", Number: 8},
+		{URL: "https://github.com/b/r/pull/8", SessionID: "mer-1", Number: 8},
+	}
+	svc := NewWithDeps(Deps{Store: st})
+	cases := []struct {
+		name, ref, invariant, code string
+	}{
+		{"unowned", "https://gitlab.example.com/a/r/-/merge_requests/9", "Every path is owned.", "PR_NOT_OWNED"},
+		{"ambiguous", "8", "Every path is owned.", "AMBIGUOUS_PR_REF"},
+		{"control", st.ownedPRs["mer-1"][0].URL, "bad\x1b[31m", "INVALID_CONTRACT_INVARIANT"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := svc.AddDesignContractInvariant(context.Background(), "mer-1", tc.ref, tc.invariant)
+			var apiError *apierr.Error
+			if !errors.As(err, &apiError) || apiError.Code != tc.code {
+				t.Fatalf("error = %#v, want %s", err, tc.code)
+			}
+		})
+	}
+	if len(st.contractWrites) != 0 {
+		t.Fatalf("rejected input wrote contracts: %+v", st.contractWrites)
 	}
 }
 
@@ -437,6 +556,9 @@ func (f *fakeCommander) Send(_ context.Context, id domain.SessionID, message str
 	f.sent = append(f.sent, id)
 	f.sentMessages = append(f.sentMessages, message)
 	return nil
+}
+func (f *fakeCommander) SendAutomated(ctx context.Context, id domain.SessionID, message string) error {
+	return f.Send(ctx, id, message)
 }
 func (f *fakeCommander) Cleanup(_ context.Context, project domain.ProjectID) (sessionmanager.CleanupResult, error) {
 	f.cleanupProjects = append(f.cleanupProjects, project)
@@ -1003,6 +1125,7 @@ type fakePRClaimer struct {
 	preflightCalled *bool
 	called          *bool
 	workspaceBranch *string
+	taskPrompt      *string
 }
 
 type errorFreeClaimOutcome struct {
@@ -1019,12 +1142,15 @@ func (f fakePRClaimer) CheckPRClaim(context.Context, string, domain.SessionID, b
 	return f.out.ClaimOutcome, f.preflightErr
 }
 
-func (f fakePRClaimer) ClaimPR(_ context.Context, _ domain.PullRequest, _ []domain.PullRequestCheck, _ []domain.PullRequestReview, _ []domain.PullRequestReviewThread, _ []domain.PullRequestComment, _ ports.ReviewWriteMode, _ bool, workspaceBranch string) (ports.ClaimOutcome, error) {
+func (f fakePRClaimer) ClaimPR(_ context.Context, _ domain.PullRequest, _ []domain.PullRequestCheck, _ []domain.PullRequestReview, _ []domain.PullRequestReviewThread, _ []domain.PullRequestComment, _ ports.ReviewWriteMode, _ bool, workspaceBranch, taskPrompt string) (ports.ClaimOutcome, error) {
 	if f.called != nil {
 		*f.called = true
 	}
 	if f.workspaceBranch != nil {
 		*f.workspaceBranch = workspaceBranch
+	}
+	if f.taskPrompt != nil {
+		*f.taskPrompt = taskPrompt
 	}
 	return f.out.ClaimOutcome, f.err
 }
@@ -1165,29 +1291,67 @@ func TestClaimPRReplacementUsesFinalAtomicOwnerAndNudgesCanonicalContract(t *tes
 	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: replacementWorkspace}}
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
 	preflight := ports.ClaimOutcome{PreviousOwner: "mer-A", OwnerTerminated: true}
-	outcome := ports.ClaimOutcome{PreviousOwner: "mer-B", OwnerTerminated: true, DesignContract: want}
+	prURL := "https://github.com/acme/repo/pull/7"
+	token := "claim-generation-1"
+	outcome := ports.ClaimOutcome{PreviousOwner: "mer-B", OwnerTerminated: true, DesignContract: want, ContractDeliveryPending: true, ContractDeliveryToken: token}
+	st.pendingContractDelivery[prURL] = "mer-1"
+	st.pendingContractToken[prURL] = token
+	st.contracts[prURL] = want
 	commander := &fakeCommander{}
+	var persistedTask string
+	taskPrompt := "Fix the review without losing predecessor invariants."
+	st.pendingContractTask[prURL] = taskPrompt
 	svc := NewWithDeps(Deps{
 		Manager:   commander,
 		Store:     st,
-		PRClaimer: fakePRClaimer{out: errorFreeClaimOutcome{outcome}, preflightOut: &preflight},
-		SCM:       fakeSCM{obs: ports.SCMObservation{Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/repo", PR: ports.SCMPRObservation{URL: "https://github.com/acme/repo/pull/7", Number: 7}}},
+		PRClaimer: fakePRClaimer{out: errorFreeClaimOutcome{outcome}, preflightOut: &preflight, taskPrompt: &persistedTask},
+		SCM:       fakeSCM{obs: ports.SCMObservation{Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/repo", PR: ports.SCMPRObservation{URL: prURL, Number: 7}}},
 	})
 
-	res, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+	res, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true, TaskPrompt: taskPrompt})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(res.TakenOverFrom) != 1 || res.TakenOverFrom[0] != "mer-B" {
 		t.Fatalf("takeover donor = %v, want final atomic mer-B", res.TakenOverFrom)
 	}
-	if len(commander.sentMessages) != 1 || !strings.Contains(commander.sentMessages[0], "Preserve the final owner's rounds") || strings.Contains(commander.sentMessages[0], "mer-A") {
+	if !res.ContractReady || st.pendingContractDelivery[prURL] != "" {
+		t.Fatalf("contract delivery barrier = ready %v pending %q", res.ContractReady, st.pendingContractDelivery[prURL])
+	}
+	if persistedTask != taskPrompt || len(commander.sentMessages) != 1 || !strings.Contains(commander.sentMessages[0], "Preserve the final owner's rounds") || !strings.Contains(commander.sentMessages[0], taskPrompt) || strings.Contains(commander.sentMessages[0], "mer-A") {
 		t.Fatalf("claim-time contract nudge = %v", commander.sentMessages)
 	}
 	for _, forbidden := range []string{"\x1b", "\x00", "\u0085"} {
 		if strings.Contains(commander.sentMessages[0], forbidden) {
 			t.Fatalf("claim-time contract nudge retained control %q: %q", forbidden, commander.sentMessages[0])
 		}
+	}
+}
+
+func TestClaimPRSendFailureKeepsDurableContractBarrierPending(t *testing.T) {
+	prURL := "https://github.com/acme/repo/pull/7"
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: t.TempDir()}}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+	st.pendingContractDelivery[prURL] = "mer-1"
+	token := "claim-generation-1"
+	contract := designcontract.BuildSeed("61", "## Invariants\n- Preserve predecessor knowledge.")
+	outcome := ports.ClaimOutcome{PreviousOwner: "mer-B", OwnerTerminated: true, DesignContract: contract, ContractDeliveryPending: true, ContractDeliveryToken: token}
+	st.pendingContractToken[prURL] = token
+	st.contracts[prURL] = contract
+	svc := NewWithDeps(Deps{
+		Manager:   &fakeCommander{sendErr: errors.New("pane unavailable")},
+		Store:     st,
+		PRClaimer: fakePRClaimer{out: errorFreeClaimOutcome{outcome}},
+		SCM:       fakeSCM{obs: ports.SCMObservation{Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/repo", PR: ports.SCMPRObservation{URL: prURL, Number: 7}}},
+	})
+
+	res, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+	if err != nil {
+		t.Fatalf("post-commit delivery failure surfaced as failed ownership claim: %v", err)
+	}
+	if res.ContractReady || st.pendingContractDelivery[prURL] != "mer-1" {
+		t.Fatalf("failed delivery cleared barrier: ready=%v pending=%q", res.ContractReady, st.pendingContractDelivery[prURL])
 	}
 }
 

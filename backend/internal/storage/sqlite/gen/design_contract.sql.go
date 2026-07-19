@@ -7,28 +7,62 @@ package gen
 
 import (
 	"context"
+	"database/sql"
 	"time"
 )
 
 const appendPRDesignContractInvariant = `-- name: AppendPRDesignContractInvariant :execrows
 UPDATE pr_design_contract
-SET markdown = markdown || ?1, updated_at = ?2
-WHERE pr_url = ?3 AND instr(markdown, ?4) = 0
+SET markdown = markdown || ?1,
+    contract_revision = contract_revision + 1,
+    updated_at = ?2
+WHERE pr_url = ?3
 `
 
 type AppendPRDesignContractInvariantParams struct {
 	Addition  string
 	UpdatedAt time.Time
 	PRURL     string
-	Invariant string
 }
 
 func (q *Queries) AppendPRDesignContractInvariant(ctx context.Context, arg AppendPRDesignContractInvariantParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, appendPRDesignContractInvariant,
-		arg.Addition,
-		arg.UpdatedAt,
+	result, err := q.db.ExecContext(ctx, appendPRDesignContractInvariant, arg.Addition, arg.UpdatedAt, arg.PRURL)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const completePRDesignContractDelivery = `-- name: CompletePRDesignContractDelivery :execrows
+UPDATE pr_design_contract
+SET pending_delivery_session_id = NULL,
+    pending_delivery_task_prompt = '',
+    pending_delivery_token = '',
+    delivery_required_at = NULL
+WHERE pr_url = ?1
+  AND pending_delivery_session_id = ?2
+  AND pending_delivery_token = ?3
+  AND contract_revision = ?4
+  AND EXISTS (
+      SELECT 1 FROM pr
+      WHERE pr.url = pr_design_contract.pr_url
+        AND pr.session_id = ?2
+  )
+`
+
+type CompletePRDesignContractDeliveryParams struct {
+	PRURL            string
+	SessionID        sql.NullString
+	DeliveryToken    string
+	ContractRevision int64
+}
+
+func (q *Queries) CompletePRDesignContractDelivery(ctx context.Context, arg CompletePRDesignContractDeliveryParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, completePRDesignContractDelivery,
 		arg.PRURL,
-		arg.Invariant,
+		arg.SessionID,
+		arg.DeliveryToken,
+		arg.ContractRevision,
 	)
 	if err != nil {
 		return 0, err
@@ -72,6 +106,76 @@ func (q *Queries) GetPRDesignContract(ctx context.Context, prUrl string) (string
 	var markdown string
 	err := row.Scan(&markdown)
 	return markdown, err
+}
+
+const getPendingPRDesignContractDelivery = `-- name: GetPendingPRDesignContractDelivery :one
+SELECT markdown,
+       pending_delivery_task_prompt AS task_prompt,
+       pending_delivery_token AS delivery_token,
+       contract_revision
+FROM pr_design_contract
+WHERE pr_url = ?1
+  AND pending_delivery_session_id = ?2
+  AND EXISTS (
+      SELECT 1 FROM pr
+      WHERE pr.url = pr_design_contract.pr_url
+        AND pr.session_id = ?2
+  )
+`
+
+type GetPendingPRDesignContractDeliveryParams struct {
+	PRURL     string
+	SessionID sql.NullString
+}
+
+type GetPendingPRDesignContractDeliveryRow struct {
+	Markdown         string
+	TaskPrompt       string
+	DeliveryToken    string
+	ContractRevision int64
+}
+
+func (q *Queries) GetPendingPRDesignContractDelivery(ctx context.Context, arg GetPendingPRDesignContractDeliveryParams) (GetPendingPRDesignContractDeliveryRow, error) {
+	row := q.db.QueryRowContext(ctx, getPendingPRDesignContractDelivery, arg.PRURL, arg.SessionID)
+	var i GetPendingPRDesignContractDeliveryRow
+	err := row.Scan(
+		&i.Markdown,
+		&i.TaskPrompt,
+		&i.DeliveryToken,
+		&i.ContractRevision,
+	)
+	return i, err
+}
+
+const requirePRDesignContractDelivery = `-- name: RequirePRDesignContractDelivery :execrows
+UPDATE pr_design_contract
+SET pending_delivery_session_id = ?1,
+    pending_delivery_task_prompt = ?2,
+    pending_delivery_token = ?3,
+    delivery_required_at = ?4
+WHERE pr_url = ?5
+`
+
+type RequirePRDesignContractDeliveryParams struct {
+	SessionID     sql.NullString
+	TaskPrompt    string
+	DeliveryToken string
+	RequiredAt    sql.NullTime
+	PRURL         string
+}
+
+func (q *Queries) RequirePRDesignContractDelivery(ctx context.Context, arg RequirePRDesignContractDeliveryParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, requirePRDesignContractDelivery,
+		arg.SessionID,
+		arg.TaskPrompt,
+		arg.DeliveryToken,
+		arg.RequiredAt,
+		arg.PRURL,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const upsertSessionDesignContractSeed = `-- name: UpsertSessionDesignContractSeed :exec

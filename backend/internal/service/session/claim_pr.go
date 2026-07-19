@@ -41,6 +41,9 @@ var (
 // ClaimPROptions controls PR claim conflict behavior.
 type ClaimPROptions struct {
 	AllowTakeover bool
+	// TaskPrompt is withheld from ao spawn --claim-pr workers until the atomic
+	// ownership transaction's contract delivery barrier is lifted.
+	TaskPrompt string
 }
 
 // ClaimPRResult is the session PR read model returned after a claim.
@@ -49,6 +52,14 @@ type ClaimPRResult struct {
 	BranchChanged      bool
 	TakenOverFrom      []domain.SessionID
 	DonorWasTerminated bool
+	// ContractReady is true only after the claim-ready message containing the
+	// canonical contract reached the claimant and its durable barrier cleared.
+	ContractReady bool
+}
+
+type designContractDeliveryStore interface {
+	GetPendingPRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL string) (designcontract.PendingDelivery, bool, error)
+	CompletePRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error)
 }
 
 // ListPRs returns all PRs currently owned by a session, ordered for display.
@@ -137,22 +148,36 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	}
 	now := s.clock().UTC()
 	pr, checks, reviews, threads, comments := claimRowsFromSCM(id, obs, now)
-	outcome, err := s.prClaimer.ClaimPR(ctx, pr, checks, reviews, threads, comments, reviewMode, opts.AllowTakeover, workspaceBranch)
+	outcome, err := s.prClaimer.ClaimPR(ctx, pr, checks, reviews, threads, comments, reviewMode, opts.AllowTakeover, workspaceBranch, opts.TaskPrompt)
 	if err != nil {
 		return ClaimPRResult{}, err
 	}
-	// The canonical contract and final owner were read/written by ClaimPR in
-	// one SQLite transaction. Workspace projection is best effort: an unsafe or
-	// non-ignored checkout must never roll back durable ownership.
-	if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, outcome.DesignContract); err != nil {
-		slog.Debug("claim PR: design contract projection skipped", "prURL", prURL, "error", err)
-	}
-	if outcome.PreviousOwner != "" && outcome.PreviousOwner != id && s.manager != nil {
-		message := "[AO design contract] PR ownership changed after this worker started. Read the final per-PR contract below before making further changes; .ao/CONTRACT.md, when present, is a read-only projection.\n\n" + domain.SanitizeControlChars(designcontract.ForDispatch(outcome.DesignContract))
-		if err := s.manager.Send(ctx, id, message); err != nil {
-			// Ownership is already durable. Never surface a post-commit failure as
-			// a failed claim (spawn would roll back the worker but not the PR row).
-			slog.Warn("claim PR: replacement contract nudge failed", "sessionId", id, "prURL", prURL, "error", err)
+	contractReady := !outcome.ContractDeliveryPending
+	if outcome.ContractDeliveryPending && s.manager != nil {
+		deliveryStore, ok := s.store.(designContractDeliveryStore)
+		if !ok {
+			slog.Warn("claim PR: contract delivery acknowledgement unavailable", "sessionId", id, "prURL", prURL)
+		} else {
+			unlockDelivery := designcontract.LockDelivery(prURL)
+			delivery, pending, deliveryErr := deliveryStore.GetPendingPRDesignContractDelivery(ctx, id, prURL)
+			if deliveryErr == nil && pending {
+				// Projection is best effort: unsafe checkout state never rolls back
+				// ownership or bypasses canonical pane delivery.
+				if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, delivery.Contract); err != nil {
+					slog.Debug("claim PR: design contract projection skipped", "prURL", prURL, "error", err)
+				}
+				message := domain.SanitizeControlChars(designcontract.ClaimReadyMessage(prURL, delivery.Contract, delivery.TaskPrompt))
+				deliveryErr = s.manager.SendAutomated(ctx, id, message)
+				if deliveryErr == nil {
+					contractReady, deliveryErr = deliveryStore.CompletePRDesignContractDelivery(ctx, id, prURL, delivery.Token, delivery.Revision)
+				}
+			}
+			unlockDelivery()
+			if deliveryErr != nil || !contractReady {
+				// Ownership is already durable. Keep the delivery obligation pending;
+				// lifecycle retries it before any PR reaction after restart or polling.
+				slog.Warn("claim PR: contract delivery remains pending", "sessionId", id, "prURL", prURL, "error", deliveryErr)
+			}
 		}
 	}
 	prs, err := s.listPRFacts(ctx, id)
@@ -160,7 +185,7 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 		return ClaimPRResult{}, err
 	}
 	prs = claimedFirst(prs, prURL)
-	res := ClaimPRResult{PRs: prs, BranchChanged: branchChanged, DonorWasTerminated: outcome.OwnerTerminated}
+	res := ClaimPRResult{PRs: prs, BranchChanged: branchChanged, DonorWasTerminated: outcome.OwnerTerminated, ContractReady: contractReady}
 	if outcome.PreviousOwner != "" && outcome.PreviousOwner != id {
 		res.TakenOverFrom = []domain.SessionID{outcome.PreviousOwner}
 	}

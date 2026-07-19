@@ -19,5 +19,45 @@ SELECT markdown FROM pr_design_contract WHERE pr_url = ?;
 
 -- name: AppendPRDesignContractInvariant :execrows
 UPDATE pr_design_contract
-SET markdown = markdown || sqlc.arg(addition), updated_at = sqlc.arg(updated_at)
-WHERE pr_url = sqlc.arg(pr_url) AND instr(markdown, sqlc.arg(invariant)) = 0;
+SET markdown = markdown || sqlc.arg(addition),
+    contract_revision = contract_revision + 1,
+    updated_at = sqlc.arg(updated_at)
+WHERE pr_url = sqlc.arg(pr_url);
+
+-- name: RequirePRDesignContractDelivery :execrows
+UPDATE pr_design_contract
+SET pending_delivery_session_id = sqlc.arg(session_id),
+    pending_delivery_task_prompt = sqlc.arg(task_prompt),
+    pending_delivery_token = sqlc.arg(delivery_token),
+    delivery_required_at = sqlc.arg(required_at)
+WHERE pr_url = sqlc.arg(pr_url);
+
+-- name: GetPendingPRDesignContractDelivery :one
+SELECT markdown,
+       pending_delivery_task_prompt AS task_prompt,
+       pending_delivery_token AS delivery_token,
+       contract_revision
+FROM pr_design_contract
+WHERE pr_url = sqlc.arg(pr_url)
+  AND pending_delivery_session_id = sqlc.arg(session_id)
+  AND EXISTS (
+      SELECT 1 FROM pr
+      WHERE pr.url = pr_design_contract.pr_url
+        AND pr.session_id = sqlc.arg(session_id)
+  );
+
+-- name: CompletePRDesignContractDelivery :execrows
+UPDATE pr_design_contract
+SET pending_delivery_session_id = NULL,
+    pending_delivery_task_prompt = '',
+    pending_delivery_token = '',
+    delivery_required_at = NULL
+WHERE pr_url = sqlc.arg(pr_url)
+  AND pending_delivery_session_id = sqlc.arg(session_id)
+  AND pending_delivery_token = sqlc.arg(delivery_token)
+  AND contract_revision = sqlc.arg(contract_revision)
+  AND EXISTS (
+      SELECT 1 FROM pr
+      WHERE pr.url = pr_design_contract.pr_url
+        AND pr.session_id = sqlc.arg(session_id)
+  );

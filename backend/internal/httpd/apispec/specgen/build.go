@@ -774,7 +774,14 @@ func sessionOperations() []operation {
 			summary:    "Append an explicit invariant to one owned PR design contract",
 			pathParams: []any{controllers.SessionIDParam{}},
 			reqBody:    controllers.AddDesignContractInvariantRequest{},
-			resps:      []respUnit{{http.StatusOK, controllers.AddDesignContractInvariantResponse{}}},
+			resps: []respUnit{
+				{http.StatusOK, controllers.AddDesignContractInvariantResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
 		},
 		{
 			method: http.MethodPatch, path: "/api/v1/sessions/{sessionId}", id: "renameSession", tag: "sessions",

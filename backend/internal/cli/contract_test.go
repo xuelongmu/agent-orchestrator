@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -32,5 +33,19 @@ func TestContractAddRequiresSessionPRAndInvariant(t *testing.T) {
 	_, _, err := executeCLI(t, aliveDeps(), "contract", "add", "--pr", "7", "--invariant", "one line")
 	if err == nil || ExitCode(err) != 2 {
 		t.Fatalf("missing session error = %v", err)
+	}
+}
+
+func TestContractAddSurfacesDaemonOwnershipErrorAsRuntimeFailure(t *testing.T) {
+	t.Setenv("AO_SESSION_ID", "mer-1")
+	cfg := setConfigEnv(t)
+	srv, _ := reviewServer(t, http.StatusNotFound, `{"error":"not_found","code":"PR_NOT_OWNED","message":"PR is not owned by this session","requestId":"req-contract"}`)
+	writeRunFileFor(t, cfg, srv)
+	_, errOut, err := executeCLI(t, aliveDeps(), "contract", "add", "--pr", "17", "--invariant", "Every path reaches one ownership chokepoint.")
+	if err == nil || ExitCode(err) != 1 {
+		t.Fatalf("daemon ownership error = %v (exit %d), want runtime failure", err, ExitCode(err))
+	}
+	if !strings.Contains(err.Error()+errOut, "PR_NOT_OWNED") || !strings.Contains(err.Error()+errOut, "req-contract") {
+		t.Fatalf("daemon envelope not preserved: err=%v stderr=%q", err, errOut)
 	}
 }

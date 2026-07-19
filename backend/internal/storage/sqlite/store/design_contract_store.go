@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
@@ -31,6 +30,8 @@ func (s *Store) AddPRDesignContractInvariant(ctx context.Context, sessionID doma
 	if err != nil {
 		return "", err
 	}
+	unlockDelivery := designcontract.LockDelivery(prURL)
+	defer unlockDelivery()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	contract := ""
@@ -51,7 +52,7 @@ func (s *Store) AddPRDesignContractInvariant(ctx context.Context, sessionID doma
 		if err != nil {
 			return err
 		}
-		if strings.Contains(contract, invariant) {
+		if designcontract.HasInvariant(contract, invariant) {
 			return nil
 		}
 		addition := designcontract.AppendInvariant("", invariant)
@@ -59,7 +60,7 @@ func (s *Store) AddPRDesignContractInvariant(ctx context.Context, sessionID doma
 			return errors.New("canonical design contract capacity exceeded")
 		}
 		n, err := q.AppendPRDesignContractInvariant(ctx, gen.AppendPRDesignContractInvariantParams{
-			Addition: addition, UpdatedAt: updatedAt, PRURL: prURL, Invariant: invariant,
+			Addition: addition, UpdatedAt: updatedAt, PRURL: prURL,
 		})
 		if err != nil {
 			return err
@@ -83,4 +84,34 @@ func (s *Store) GetPRDesignContract(ctx context.Context, prURL string) (string, 
 		return "", false, fmt.Errorf("get PR design contract %s: %w", prURL, err)
 	}
 	return markdown, true, nil
+}
+
+// GetPendingPRDesignContractDelivery returns the canonical bytes only when the
+// exact PR currently has a durable claim barrier for sessionID.
+func (s *Store) GetPendingPRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL string) (designcontract.PendingDelivery, bool, error) {
+	row, err := s.qr.GetPendingPRDesignContractDelivery(ctx, gen.GetPendingPRDesignContractDeliveryParams{
+		PRURL: prURL, SessionID: sql.NullString{String: string(sessionID), Valid: true},
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return designcontract.PendingDelivery{}, false, nil
+	}
+	if err != nil {
+		return designcontract.PendingDelivery{}, false, fmt.Errorf("get pending PR design contract delivery %s: %w", prURL, err)
+	}
+	return designcontract.PendingDelivery{Contract: row.Markdown, TaskPrompt: row.TaskPrompt, Token: row.DeliveryToken, Revision: row.ContractRevision}, true, nil
+}
+
+// CompletePRDesignContractDelivery clears the claim barrier with an exact
+// PR/session compare-and-set, so a stale sender cannot acknowledge a newer
+// takeover's obligation.
+func (s *Store) CompletePRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	n, err := s.qw.CompletePRDesignContractDelivery(ctx, gen.CompletePRDesignContractDeliveryParams{
+		PRURL: prURL, SessionID: sql.NullString{String: string(sessionID), Valid: true}, DeliveryToken: deliveryToken, ContractRevision: contractRevision,
+	})
+	if err != nil {
+		return false, fmt.Errorf("complete PR design contract delivery %s: %w", prURL, err)
+	}
+	return n == 1, nil
 }

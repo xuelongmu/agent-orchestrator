@@ -436,6 +436,7 @@ func newSessionPRMergeabilitySummary(in sessionsvc.PRMergeabilitySummary) Sessio
 type ClaimPRRequest struct {
 	PR            string `json:"pr" minLength:"1"`
 	AllowTakeover *bool  `json:"allowTakeover,omitempty"`
+	TaskPrompt    string `json:"taskPrompt,omitempty" maxLength:"4096" description:"Actionable task withheld by ao spawn --claim-pr until canonical contract delivery; empty for manual claims."`
 }
 
 // ClaimPRResponse is the body of POST /sessions/{sessionId}/pr/claim.
@@ -445,6 +446,7 @@ type ClaimPRResponse struct {
 	PRs           []SessionPRFacts   `json:"prs"`
 	BranchChanged bool               `json:"branchChanged"`
 	TakenOverFrom []domain.SessionID `json:"takenOverFrom"`
+	ContractReady bool               `json:"contractReady" description:"True only after the exact PR's canonical contract was delivered and the durable claim barrier cleared."`
 }
 
 type AddDesignContractInvariantRequest struct {

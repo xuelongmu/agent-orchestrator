@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -19,12 +20,18 @@ import (
 var ctx = context.Background()
 
 type fakeStore struct {
-	sessions               map[domain.SessionID]domain.SessionRecord
-	prs                    map[domain.SessionID][]domain.PullRequest
-	signatures             map[string]string
-	simplificationReceipts map[string]time.Time
-	telemetryEvents        map[string]ports.TelemetryEvent
-	designContracts        map[string]string
+	sessions                map[domain.SessionID]domain.SessionRecord
+	prs                     map[domain.SessionID][]domain.PullRequest
+	signatures              map[string]string
+	simplificationReceipts  map[string]time.Time
+	telemetryEvents         map[string]ports.TelemetryEvent
+	designContracts         map[string]string
+	designContractErrors    map[string]error
+	missingDesignContracts  map[string]bool
+	pendingContractDelivery map[string]domain.SessionID
+	pendingContractTask     map[string]string
+	pendingContractToken    map[string]string
+	pendingContractRevision map[string]int64
 	// afterSessionRead deterministically models a concurrent reducer committing
 	// new activity immediately after a caller's store snapshot.
 	afterSessionRead func(domain.SessionID, int)
@@ -37,7 +44,7 @@ type fakeStore struct {
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		sessions: map[domain.SessionID]domain.SessionRecord{}, prs: map[domain.SessionID][]domain.PullRequest{},
-		signatures: map[string]string{}, simplificationReceipts: map[string]time.Time{}, telemetryEvents: map[string]ports.TelemetryEvent{}, designContracts: map[string]string{},
+		signatures: map[string]string{}, simplificationReceipts: map[string]time.Time{}, telemetryEvents: map[string]ports.TelemetryEvent{}, designContracts: map[string]string{}, designContractErrors: map[string]error{}, missingDesignContracts: map[string]bool{}, pendingContractDelivery: map[string]domain.SessionID{}, pendingContractTask: map[string]string{}, pendingContractToken: map[string]string{}, pendingContractRevision: map[string]int64{},
 	}
 }
 
@@ -80,8 +87,33 @@ func (f *fakeStore) UpdatePRLastNudgeSignature(_ context.Context, prURL, payload
 }
 
 func (f *fakeStore) GetPRDesignContract(_ context.Context, prURL string) (string, bool, error) {
+	if err := f.designContractErrors[prURL]; err != nil {
+		return "", false, err
+	}
+	if f.missingDesignContracts[prURL] {
+		return "", false, nil
+	}
 	contract, ok := f.designContracts[prURL]
+	if !ok {
+		return designcontract.BuildSeed("", ""), true, nil
+	}
 	return contract, ok, nil
+}
+
+func (f *fakeStore) GetPendingPRDesignContractDelivery(_ context.Context, sessionID domain.SessionID, prURL string) (designcontract.PendingDelivery, bool, error) {
+	pending := f.pendingContractDelivery[prURL] == sessionID
+	return designcontract.PendingDelivery{Contract: f.designContracts[prURL], TaskPrompt: f.pendingContractTask[prURL], Token: f.pendingContractToken[prURL], Revision: f.pendingContractRevision[prURL]}, pending, nil
+}
+
+func (f *fakeStore) CompletePRDesignContractDelivery(_ context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error) {
+	if f.pendingContractDelivery[prURL] != sessionID || f.pendingContractToken[prURL] != deliveryToken || f.pendingContractRevision[prURL] != contractRevision {
+		return false, nil
+	}
+	delete(f.pendingContractDelivery, prURL)
+	delete(f.pendingContractTask, prURL)
+	delete(f.pendingContractToken, prURL)
+	delete(f.pendingContractRevision, prURL)
+	return true, nil
 }
 
 func (f *fakeStore) EnsureReviewRunSimplificationEvent(_ context.Context, id, targetSHA string, event ports.TelemetryEvent) (ports.TelemetryEvent, bool, error) {
@@ -1074,6 +1106,77 @@ func TestPRObservation_NudgeIncludesPRIdentity(t *testing.T) {
 	}
 }
 
+func TestPRObservationRecoversPendingClaimContractAfterRestartBeforeOtherWork(t *testing.T) {
+	st := newFakeStore()
+	prURL := "https://github.com/o/r/pull/7"
+	rec := working("mer-1")
+	rec.Metadata.WorkspacePath = t.TempDir() // non-git: projection failure must not clear or block delivery
+	st.sessions[rec.ID] = rec
+	st.designContracts[prURL] = "# Design Contract\n\n## Invariants\n- Preserve predecessor knowledge.\x1b[31m\n"
+	st.pendingContractDelivery[prURL] = rec.ID
+	st.pendingContractTask[prURL] = "Fix the exact claimed PR."
+	observation := ports.PRObservation{Fetched: true, URL: prURL, CI: domain.CIFailing, Checks: []ports.PRCheckObservation{{Name: "build", Status: domain.PRCheckFailed}}}
+
+	failedMessenger := &fakeMessenger{err: errors.New("pane unavailable")}
+	first := New(st, failedMessenger)
+	if err := first.ApplyPRObservation(context.Background(), rec.ID, observation); err == nil {
+		t.Fatal("failed claim-ready delivery did not remain retryable")
+	}
+	if st.pendingContractDelivery[prURL] != rec.ID || len(failedMessenger.msgs) != 0 || st.signatures[prURL] != "" {
+		t.Fatalf("failed barrier allowed work or acknowledgement: pending=%q msgs=%v sig=%q", st.pendingContractDelivery[prURL], failedMessenger.msgs, st.signatures[prURL])
+	}
+
+	// A fresh manager models daemon restart: no in-memory reaction state is
+	// carried over, so recovery must come entirely from the durable obligation.
+	recoveredMessenger := &fakeMessenger{}
+	restarted := New(st, recoveredMessenger)
+	if err := restarted.ApplyPRObservation(context.Background(), rec.ID, observation); err != nil {
+		t.Fatal(err)
+	}
+	if st.pendingContractDelivery[prURL] != "" {
+		t.Fatalf("restart did not clear delivered barrier: %q", st.pendingContractDelivery[prURL])
+	}
+	if len(recoveredMessenger.msgs) != 2 || !strings.Contains(recoveredMessenger.msgs[0], "[AO PR claim ready]") || !strings.Contains(recoveredMessenger.msgs[0], "Preserve predecessor knowledge") || !strings.Contains(recoveredMessenger.msgs[0], "Fix the exact claimed PR.") || !strings.Contains(recoveredMessenger.msgs[1], "failed") {
+		t.Fatalf("delivery order after restart = %v", recoveredMessenger.msgs)
+	}
+	for _, forbidden := range []string{"\x1b", "\x00", "\u0085"} {
+		if strings.Contains(recoveredMessenger.msgs[0], forbidden) {
+			t.Fatalf("claim-ready delivery retained control %q: %q", forbidden, recoveredMessenger.msgs[0])
+		}
+	}
+}
+
+func TestPendingClaimContractAutomatedRetryWaitsForSafePaneState(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		state       domain.ActivityState
+		fingerprint string
+	}{
+		{name: "blocked", state: domain.ActivityBlocked},
+		{name: "rate limited", state: domain.ActivityRateLimited},
+		{name: "pending submit", state: domain.ActivityActive, fingerprint: "sha256-draft"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			prURL := "https://github.com/o/r/pull/7"
+			rec := working("mer-1")
+			rec.Activity.State = tc.state
+			rec.Metadata.PendingSubmitFingerprint = tc.fingerprint
+			st.sessions[rec.ID] = rec
+			st.designContracts[prURL] = designcontract.BuildSeed("61", "")
+			st.pendingContractDelivery[prURL] = rec.ID
+			msg := &fakeMessenger{}
+			m := New(st, msg)
+			if err := m.ApplyPRObservation(ctx, rec.ID, ports.PRObservation{Fetched: true, URL: prURL, CI: domain.CIFailing}); err != nil {
+				t.Fatal(err)
+			}
+			if len(msg.msgs) != 0 || st.pendingContractDelivery[prURL] != rec.ID {
+				t.Fatalf("unsafe state crossed claim barrier: messages=%v pending=%q", msg.msgs, st.pendingContractDelivery[prURL])
+			}
+		})
+	}
+}
+
 func TestPRObservation_MergedTerminatesWithoutNudge(t *testing.T) {
 	m, st, msg := newManager()
 	st.sessions["mer-1"] = working("mer-1")
@@ -1643,6 +1746,29 @@ func TestApplyReviewResultSendsAndDedupsThroughPRSignature(t *testing.T) {
 	}
 	if outcome != ReviewDeliverySent || len(msg.msgs) != 2 {
 		t.Fatalf("new review pass should send again, outcome=%q msgs=%v", outcome, msg.msgs)
+	}
+}
+
+func TestApplyReviewResultContractReadFailureIsRetryable(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	prURL := "https://github.com/o/r/pull/1"
+	st.designContractErrors[prURL] = errors.New("database busy")
+	msg := &fakeMessenger{}
+	m := New(st, msg)
+	result := ReviewResult{RunID: "run-1", WorkerID: "mer-1", PRURL: prURL, TargetSHA: "sha1", Verdict: domain.VerdictChangesRequested, Body: "fix"}
+	if outcome, err := m.ApplyReviewResult(ctx, "mer-1", result); err == nil || outcome != ReviewDeliveryNoop {
+		t.Fatalf("contract read failure = %q, %v; want retryable error", outcome, err)
+	}
+	if len(msg.msgs) != 0 || st.signatures[prURL] != "" {
+		t.Fatalf("failed contract read delivered or deduped review: msgs=%v signature=%q", msg.msgs, st.signatures[prURL])
+	}
+	delete(st.designContractErrors, prURL)
+	if outcome, err := m.ApplyReviewResult(ctx, "mer-1", result); err != nil || outcome != ReviewDeliverySent {
+		t.Fatalf("retry after contract recovery = %q, %v", outcome, err)
+	}
+	if len(msg.msgs) != 1 || st.signatures[prURL] == "" {
+		t.Fatalf("recovered review not delivered exactly once: msgs=%v signature=%q", msg.msgs, st.signatures[prURL])
 	}
 }
 
@@ -2852,6 +2978,28 @@ func TestIdleReviewHandoffIsCanonicalAcrossFetchAndSnapshotPathsAfterRestart(t *
 	key := idleReviewHandoffKey(prURL, rec.Activity.LastActivityAt)
 	if len(payload.Handoffs) != 1 || payload.Handoffs[key].Outcome != humanHandoffNotified {
 		t.Fatalf("handoffs = %+v, want one canonical notified latch at %q", payload.Handoffs, key)
+	}
+}
+
+func TestIdleReviewSnapshotCannotBypassPendingClaimContract(t *testing.T) {
+	st := newFakeStore()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	prURL := "https://github.com/o/r/pull/1"
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	rec.FirstSignalAt = rec.Activity.LastActivityAt
+	st.sessions[rec.ID] = rec
+	st.designContracts[prURL] = designcontract.BuildSeed("61", "## Invariants\n- Preserve claim order.")
+	st.pendingContractDelivery[prURL] = rec.ID
+	snapshot := idleReviewSnapshot(prURL, false, ports.SCMReviewThreadObservation{ID: "t1", Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix"}}})
+	msg := &fakeMessenger{err: errors.New("pane unavailable")}
+	m := New(st, msg)
+	m.clock = func() time.Time { return now }
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, snapshot); err == nil {
+		t.Fatal("idle review bypassed failed claim-ready delivery")
+	}
+	if st.pendingContractDelivery[prURL] != rec.ID || len(msg.msgs) != 0 || st.signatures[prURL] != "" {
+		t.Fatalf("idle review crossed pending claim barrier: pending=%q msgs=%v signature=%q", st.pendingContractDelivery[prURL], msg.msgs, st.signatures[prURL])
 	}
 }
 

@@ -110,13 +110,17 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 					return err
 				}
 			}
+			spawnPrompt := opts.prompt
+			if claimRef != "" {
+				spawnPrompt = claimBarrierPrompt(claimRef, opts.prompt)
+			}
 			req := spawnRequest{
 				ProjectID:     opts.project,
 				IssueID:       opts.issue,
 				Harness:       opts.harness,
 				Branch:        opts.branch,
 				WorkspaceKind: opts.workspaceKind,
-				Prompt:        opts.prompt,
+				Prompt:        spawnPrompt,
 				DisplayName:   name,
 			}
 			var res spawnResult
@@ -126,7 +130,7 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			claimed := ""
 			if opts.claimPR != "" {
 				var claim claimPRResponse
-				if err := ctx.postJSON(cmd.Context(), "sessions/"+url.PathEscape(res.Session.ID)+"/pr/claim", claimPRRequest{PR: claimRef, AllowTakeover: !opts.noTakeover}, &claim); err != nil {
+				if err := ctx.postJSON(cmd.Context(), "sessions/"+url.PathEscape(res.Session.ID)+"/pr/claim", claimPRRequest{PR: claimRef, AllowTakeover: !opts.noTakeover, TaskPrompt: opts.prompt}, &claim); err != nil {
 					if killErr := ctx.rollbackSpawnedSession(cmd.Context(), res.Session.ID); killErr != nil {
 						return fmt.Errorf("failed to claim PR %s: %w; rollback of session %s failed: %w", opts.claimPR, err, res.Session.ID, killErr)
 					}
@@ -134,6 +138,9 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 				}
 				if len(claim.PRs) > 0 {
 					claimed = claim.PRs[0].URL
+				}
+				if !claim.ContractReady {
+					claimed += " (claim barrier pending contract delivery)"
 				}
 			}
 			out := cmd.OutOrStdout()
@@ -177,6 +184,10 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 	f.BoolVar(&opts.noTakeover, "no-takeover", false, "Refuse if another active session owns the claimed PR (requires --claim-pr)")
 	f.BoolVar(&opts.skipAgentCheck, "skip-agent-check", false, "Skip advisory agent catalog install/auth preflight before spawning")
 	return cmd
+}
+
+func claimBarrierPrompt(prRef, _ string) string {
+	return "[AO PR CLAIM BARRIER]\nAO has withheld the actionable task until the claim ownership transaction completes and the exact canonical design contract is safely delivered. Do not inspect, edit, run, commit, or otherwise act on the claimed PR. Wait for a later `[AO PR claim ready]` message; never infer readiness from checkout state.\nClaim target: " + prRef
 }
 
 func validWorkspaceKind(kind string) bool {

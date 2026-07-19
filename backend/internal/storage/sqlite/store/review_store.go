@@ -91,10 +91,19 @@ func (s *Store) UpdateReviewRunResult(ctx context.Context, id string, status dom
 // entire finding set. A failed finding insert rolls the run back to running so
 // a retry can never observe a permanently partial complete ledger.
 func (s *Store) CompleteReviewRunWithFindings(ctx context.Context, id string, verdict domain.ReviewVerdict, body, githubReviewID, simplificationClass string, findings []domain.ReviewFinding) (bool, error) {
+	// Contract proposal appends share the same lock order as claim delivery:
+	// exact PR delivery lock, then writeMu/transaction. This prevents a sender
+	// from acknowledging bytes read immediately before a proposal append.
+	pendingRun, err := s.qr.GetReviewRun(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	unlockDelivery := designcontract.LockDelivery(pendingRun.PRURL)
+	defer unlockDelivery()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	updated := false
-	err := s.inTx(ctx, "complete review run with findings", func(q *gen.Queries) error {
+	err = s.inTx(ctx, "complete review run with findings", func(q *gen.Queries) error {
 		run, err := q.GetReviewRun(ctx, id)
 		if err != nil {
 			return err
@@ -142,14 +151,14 @@ func (s *Store) CompleteReviewRunWithFindings(ctx context.Context, id string, ve
 				}
 				contractLoaded = true
 			}
-			if invariant != "" && !finding.OutOfScope && !strings.Contains(contract, invariant) {
+			if invariant != "" && !finding.OutOfScope && !designcontract.HasInvariant(contract, invariant) {
 				addition := designcontract.AppendInvariant("", invariant)
 				if len(contract)+len(addition) > designcontract.MaxCanonicalBytes {
 					finding.RootCauseNote = strings.TrimSpace(finding.RootCauseNote + " [Invariant proposal rejected: canonical contract capacity exceeded.]")
 					finding.ProposedInvariant = ""
 				} else {
 					n, err := q.AppendPRDesignContractInvariant(ctx, gen.AppendPRDesignContractInvariantParams{
-						Addition: addition, UpdatedAt: finding.CreatedAt, PRURL: run.PRURL, Invariant: invariant,
+						Addition: addition, UpdatedAt: finding.CreatedAt, PRURL: run.PRURL,
 					})
 					if err != nil {
 						return err

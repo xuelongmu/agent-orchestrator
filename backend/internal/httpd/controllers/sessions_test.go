@@ -2,6 +2,7 @@ package controllers_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,18 +24,23 @@ import (
 )
 
 type fakeSessionService struct {
-	sessions        map[domain.SessionID]domain.Session
-	sent            string
-	cleanupProjects []domain.ProjectID
-	cleanupResult   []domain.SessionID
-	cleanupSkipped  []sessionsvc.CleanupSkipped
-	workspaceFiles  sessionsvc.WorkspaceFiles
-	workspaceFile   sessionsvc.WorkspaceFileDetail
-	spawnErr        error
-	claimErr        error
-	listPRErr       error
-	workspaceErr    error
-	lastSpawn       ports.SpawnConfig
+	sessions          map[domain.SessionID]domain.Session
+	sent              string
+	cleanupProjects   []domain.ProjectID
+	cleanupResult     []domain.SessionID
+	cleanupSkipped    []sessionsvc.CleanupSkipped
+	workspaceFiles    sessionsvc.WorkspaceFiles
+	workspaceFile     sessionsvc.WorkspaceFileDetail
+	spawnErr          error
+	claimErr          error
+	contractErr       error
+	listPRErr         error
+	workspaceErr      error
+	lastSpawn         ports.SpawnConfig
+	contractPR        string
+	contractInvariant string
+	claimRef          string
+	claimOpts         sessionsvc.ClaimPROptions
 }
 
 func newFakeSessionService() *fakeSessionService {
@@ -211,6 +217,7 @@ func (f *fakeSessionService) ListPRSummaries(_ context.Context, id domain.Sessio
 }
 
 func (f *fakeSessionService) ClaimPR(_ context.Context, id domain.SessionID, ref string, opts sessionsvc.ClaimPROptions) (sessionsvc.ClaimPRResult, error) {
+	f.claimRef, f.claimOpts = ref, opts
 	if f.claimErr != nil {
 		return sessionsvc.ClaimPRResult{}, f.claimErr
 	}
@@ -218,7 +225,19 @@ func (f *fakeSessionService) ClaimPR(_ context.Context, id domain.SessionID, ref
 		return sessionsvc.ClaimPRResult{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
 	}
 	prs, _ := f.ListPRs(context.Background(), id)
-	return sessionsvc.ClaimPRResult{PRs: prs, TakenOverFrom: []domain.SessionID{}, BranchChanged: true}, nil
+	return sessionsvc.ClaimPRResult{PRs: prs, TakenOverFrom: []domain.SessionID{}, BranchChanged: true, ContractReady: true}, nil
+}
+
+func (f *fakeSessionService) AddDesignContractInvariant(_ context.Context, id domain.SessionID, pr, invariant string) (string, error) {
+	if f.contractErr != nil {
+		return "", f.contractErr
+	}
+	if _, ok := f.sessions[id]; !ok {
+		return "", apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	f.contractPR = pr
+	f.contractInvariant = invariant
+	return "# Design Contract\n", nil
 }
 
 func (f *fakeSessionService) ListWorkspaceFiles(_ context.Context, id domain.SessionID) (sessionsvc.WorkspaceFiles, error) {
@@ -945,7 +964,8 @@ type sessionBody struct {
 }
 
 func TestSessionsAPI_PRRoutes(t *testing.T) {
-	srv := newSessionTestServer(t, newFakeSessionService())
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
 
 	body, status, _ := doRequest(t, srv, "GET", "/api/v1/sessions/ao-1/pr", "")
 	if status != http.StatusOK {
@@ -1006,7 +1026,7 @@ func TestSessionsAPI_PRRoutes(t *testing.T) {
 		t.Fatalf("mergeability = %#v", merge)
 	}
 
-	body, status, _ = doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/pr/claim", `{"pr":"142"}`)
+	body, status, _ = doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/pr/claim", `{"pr":"142","taskPrompt":"Fix exact head"}`)
 	if status != http.StatusOK {
 		t.Fatalf("claim = %d body=%s", status, body)
 	}
@@ -1016,10 +1036,59 @@ func TestSessionsAPI_PRRoutes(t *testing.T) {
 		PRs           []any    `json:"prs"`
 		BranchChanged bool     `json:"branchChanged"`
 		TakenOverFrom []string `json:"takenOverFrom"`
+		ContractReady bool     `json:"contractReady"`
 	}
 	mustJSON(t, body, &claimed)
-	if !claimed.OK || claimed.SessionID != "ao-1" || len(claimed.PRs) != 1 || !claimed.BranchChanged || len(claimed.TakenOverFrom) != 0 {
+	if !claimed.OK || claimed.SessionID != "ao-1" || len(claimed.PRs) != 1 || !claimed.BranchChanged || len(claimed.TakenOverFrom) != 0 || !claimed.ContractReady {
 		t.Fatalf("claim shape = %#v", claimed)
+	}
+	if svc.claimRef != "142" || svc.claimOpts.TaskPrompt != "Fix exact head" || !svc.claimOpts.AllowTakeover {
+		t.Fatalf("claim wiring = ref %q opts %+v", svc.claimRef, svc.claimOpts)
+	}
+}
+
+func TestSessionsAPI_AddDesignContractInvariant(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+	pr := "https://gitlab.example.com/group/repo/-/merge_requests/17"
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/design-contract/invariants", `{"pr":"`+pr+`","invariant":"Every path has one ownership chokepoint."}`)
+	if status != http.StatusOK {
+		t.Fatalf("contract add = %d body=%s", status, body)
+	}
+	var got struct {
+		OK        bool             `json:"ok"`
+		SessionID domain.SessionID `json:"sessionId"`
+		PR        string           `json:"pr"`
+	}
+	mustJSON(t, body, &got)
+	if !got.OK || got.SessionID != "ao-1" || got.PR != pr || svc.contractPR != pr || svc.contractInvariant != "Every path has one ownership chokepoint." {
+		t.Fatalf("response/call = %#v, %q, %q", got, svc.contractPR, svc.contractInvariant)
+	}
+}
+
+func TestSessionsAPI_AddDesignContractInvariantErrors(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		err    error
+		status int
+		code   string
+	}{
+		{"bad json", `{`, nil, http.StatusBadRequest, "INVALID_JSON"},
+		{"missing fields", `{}`, nil, http.StatusBadRequest, "CONTRACT_INVARIANT_REQUIRED"},
+		{"invalid invariant", `{"pr":"8","invariant":"bad"}`, apierr.Invalid("INVALID_CONTRACT_INVARIANT", "invalid", nil), http.StatusBadRequest, "INVALID_CONTRACT_INVARIANT"},
+		{"unowned PR", `{"pr":"8","invariant":"valid"}`, apierr.NotFound("PR_NOT_OWNED", "not owned"), http.StatusNotFound, "PR_NOT_OWNED"},
+		{"terminated", `{"pr":"8","invariant":"valid"}`, apierr.Conflict("SESSION_TERMINATED", "terminated", nil), http.StatusConflict, "SESSION_TERMINATED"},
+		{"storage", `{"pr":"8","invariant":"valid"}`, errors.New("sqlite failed"), http.StatusInternalServerError, "INTERNAL_ERROR"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newFakeSessionService()
+			svc.contractErr = tc.err
+			srv := newSessionTestServer(t, svc)
+			body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/design-contract/invariants", tc.body)
+			assertErrorCode(t, body, status, tc.status, tc.code)
+		})
 	}
 }
 

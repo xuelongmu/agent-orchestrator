@@ -48,7 +48,7 @@ type PRClaimer interface {
 	// CheckPRClaim performs the same active-owner guard as ClaimPR without
 	// changing ownership. Callers use it before mutating a claimant workspace.
 	CheckPRClaim(ctx context.Context, prURL string, claimant domain.SessionID, allowActiveTakeover bool) (ClaimOutcome, error)
-	ClaimPR(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ReviewWriteMode, allowActiveTakeover bool, workspaceBranch string) (ClaimOutcome, error)
+	ClaimPR(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ReviewWriteMode, allowActiveTakeover bool, workspaceBranch, taskPrompt string) (ClaimOutcome, error)
 }
 
 // ErrPRClaimedByActiveSession is returned by PRClaimer.ClaimPR when takeover is
@@ -73,6 +73,12 @@ type ClaimOutcome struct {
 	// DesignContract is the canonical per-PR contract read in the same
 	// transaction that finalized ownership.
 	DesignContract string
+	// ContractDeliveryPending is durably set in the ownership transaction and
+	// remains true until the claimant receives the claim-ready contract message.
+	ContractDeliveryPending bool
+	// ContractDeliveryToken identifies this exact claim generation. Completion
+	// must compare it so a stale same-session retry cannot clear a reclaim.
+	ContractDeliveryToken string
 }
 
 // PRCheckoutErrorKind identifies a claim checkout failure that the caller can

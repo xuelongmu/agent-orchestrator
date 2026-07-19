@@ -362,12 +362,12 @@ func (c *SessionsController) claimPR(w http.ResponseWriter, r *http.Request) {
 	if in.AllowTakeover != nil {
 		allowTakeover = *in.AllowTakeover
 	}
-	res, err := c.Svc.ClaimPR(r.Context(), sessionID(r), in.PR, sessionsvc.ClaimPROptions{AllowTakeover: allowTakeover})
+	res, err := c.Svc.ClaimPR(r.Context(), sessionID(r), in.PR, sessionsvc.ClaimPROptions{AllowTakeover: allowTakeover, TaskPrompt: in.TaskPrompt})
 	if err != nil {
 		writeSessionPRError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, ClaimPRResponse{OK: true, SessionID: sessionID(r), PRs: sessionPRFacts(res.PRs), BranchChanged: res.BranchChanged, TakenOverFrom: nonNilSessionIDs(res.TakenOverFrom)})
+	envelope.WriteJSON(w, http.StatusOK, ClaimPRResponse{OK: true, SessionID: sessionID(r), PRs: sessionPRFacts(res.PRs), BranchChanged: res.BranchChanged, TakenOverFrom: nonNilSessionIDs(res.TakenOverFrom), ContractReady: res.ContractReady})
 }
 
 func (c *SessionsController) addDesignContractInvariant(w http.ResponseWriter, r *http.Request) {
@@ -388,7 +388,7 @@ func (c *SessionsController) addDesignContractInvariant(w http.ResponseWriter, r
 		return
 	}
 	if _, err := writer.AddDesignContractInvariant(r.Context(), sessionID(r), in.PR, in.Invariant); err != nil {
-		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_CONTRACT_INVARIANT", err.Error(), nil)
+		envelope.WriteError(w, r, err)
 		return
 	}
 	envelope.WriteJSON(w, http.StatusOK, AddDesignContractInvariantResponse{OK: true, SessionID: sessionID(r), PR: in.PR})

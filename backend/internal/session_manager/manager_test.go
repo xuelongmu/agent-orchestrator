@@ -5384,6 +5384,34 @@ func TestSend_RateLimitedSessionAllowsExplicitRetryWithoutAutomatedNudge(t *test
 	}
 }
 
+func TestSendAutomatedSuppressesPausedAndPendingStates(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		state       domain.ActivityState
+		fingerprint string
+	}{
+		{name: "blocked", state: domain.ActivityBlocked},
+		{name: "rate limited", state: domain.ActivityRateLimited},
+		{name: "pending submit", state: domain.ActivityActive, fingerprint: "sha256-existing-draft"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.sessions["s1"] = domain.SessionRecord{ID: "s1", Harness: "claude-code", Activity: domain.Activity{State: tc.state}, Metadata: domain.SessionMetadata{PendingSubmitFingerprint: tc.fingerprint}}
+			msg := &fakeMessenger{}
+			m := newSendTestManager(t, signalingAgent{}, msg, st)
+			if err := m.SendAutomated(context.Background(), "s1", "claim ready"); err == nil {
+				t.Fatal("SendAutomated unexpectedly crossed unsafe state")
+			}
+			if len(msg.msgs) != 0 {
+				t.Fatalf("SendAutomated writes = %#v, want none", msg.msgs)
+			}
+			if got := st.sessions["s1"].Metadata.PendingSubmitFingerprint; got != tc.fingerprint {
+				t.Fatalf("pending fingerprint = %q, want unchanged %q", got, tc.fingerprint)
+			}
+		})
+	}
+}
+
 func TestSend_NoNudgeWhenBlockedAppearsMidWait(t *testing.T) {
 	// The permission dialog can appear between polls (e.g. the delivered prompt
 	// itself triggered a tool approval). The confirm loop must abort on the

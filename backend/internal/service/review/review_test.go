@@ -445,7 +445,8 @@ func TestDeliverSubmittedSimplificationReceiptSurvivesDeliveryStampFailureAndRes
 	}
 	st := &fakeStore{
 		ok: true, run: run, markErr: errors.New("delivery stamp unavailable"),
-		prs: []domain.PullRequest{{URL: run.PRURL, HeadSHA: run.TargetSHA}},
+		prs:             []domain.PullRequest{{URL: run.PRURL, HeadSHA: run.TargetSHA}},
+		designContracts: map[string]string{run.PRURL: "# Design Contract\n\n## Invariants\n- Review delivery includes canonical context.\n"},
 		sessions: map[domain.SessionID]domain.SessionRecord{
 			"mer-1": {ID: "mer-1", ProjectID: "mer", Activity: domain.Activity{State: domain.ActivityActive}},
 		},
@@ -687,7 +688,8 @@ func TestCoordinateReplaysParkedCompletedReviewAfterRecovery(t *testing.T) {
 			}
 			st := &fakeStore{
 				ok: true, run: run1,
-				prs: []domain.PullRequest{{URL: "pr1", HeadSHA: "sha1"}},
+				prs:             []domain.PullRequest{{URL: "pr1", HeadSHA: "sha1"}},
+				designContracts: map[string]string{"pr1": "# Design Contract\n\n## Invariants\n- Review delivery includes PR one context.\n"},
 				sessions: map[domain.SessionID]domain.SessionRecord{
 					"mer-1": {ID: "mer-1", Activity: domain.Activity{State: domain.ActivityRateLimited}},
 				},
@@ -700,6 +702,7 @@ func TestCoordinateReplaysParkedCompletedReviewAfterRecovery(t *testing.T) {
 				}
 				st.batchRuns = []domain.ReviewRun{run1, run2}
 				st.prs = append(st.prs, domain.PullRequest{URL: "pr2", HeadSHA: "sha2"})
+				st.designContracts["pr2"] = "# Design Contract\n\n## Invariants\n- Review delivery includes PR two context.\n"
 			}
 			messenger := &fakeMessenger{}
 			reducer := lifecycle.New(st, messenger)
