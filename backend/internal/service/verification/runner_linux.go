@@ -51,14 +51,65 @@ func newVerificationDescendantOwner() (*linuxVerificationDescendantOwner, error)
 func (*linuxVerificationDescendantOwner) Close() error { return nil }
 
 func waitVerificationProcess(cmd *exec.Cmd, owner io.Reader) (error, error) {
-	wait := make(chan error, 1)
-	go func() { wait <- cmd.Wait() }()
-	select {
-	case err := <-wait:
-		return err, nil
-	case <-ownershipCanceled(owner):
+	pidfd, err := unix.PidfdOpen(cmd.Process.Pid, 0)
+	if err != nil {
 		killVerificationProcessGroup(cmd.Process.Pid)
-		return <-wait, nil
+		return cmd.Wait(), fmt.Errorf("open target pidfd: %w", err)
+	}
+	defer func() { _ = unix.Close(pidfd) }()
+
+	exited := make(chan error, 1)
+	go func() { exited <- pollLinuxPIDFD(pidfd) }()
+	return completeLinuxVerificationProcess(
+		cmd.Process.Pid,
+		ownershipCanceled(owner),
+		exited,
+		killVerificationProcessGroup,
+		cmd.Wait,
+	)
+}
+
+// completeLinuxVerificationProcess is the single ordering point between target
+// exit, cancellation, process-group cleanup, and reap. cmd.Wait must only be
+// supplied as reap: every path signals the still-owned numeric PGID first.
+func completeLinuxVerificationProcess(
+	pid int,
+	canceled <-chan struct{},
+	exited <-chan error,
+	signalGroup func(int),
+	reap func() error,
+) (error, error) {
+	var observeErr error
+	select {
+	case observeErr = <-exited:
+		signalGroup(pid)
+	case <-canceled:
+		signalGroup(pid)
+		observeErr = <-exited
+	}
+	waitErr := reap()
+	if observeErr != nil {
+		return waitErr, fmt.Errorf("observe target exit: %w", observeErr)
+	}
+	return waitErr, nil
+}
+
+func pollLinuxPIDFD(pidfd int) error {
+	poll := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(poll, -1)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if n > 0 && poll[0].Revents&unix.POLLIN != 0 {
+			return nil
+		}
+		if n > 0 {
+			return fmt.Errorf("unexpected target pidfd events: %#x", poll[0].Revents)
+		}
 	}
 }
 

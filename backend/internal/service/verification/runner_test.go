@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -81,10 +80,7 @@ func TestOSRunnerCancellationKillsDescendant(t *testing.T) {
 	}
 }
 
-func TestOSRunnerFastDetachedParentCannotEscapeContainment(t *testing.T) {
-	if runtime.GOOS == "darwin" {
-		t.Skip("Darwin cannot provide race-free post-reap process-group ownership")
-	}
+func TestOSRunnerFastParentCannotEscapeContainment(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	res, err := testOSRunner().Run(context.Background(), RunSpec{
 		Argv:   []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "fast-parent", pidFile},

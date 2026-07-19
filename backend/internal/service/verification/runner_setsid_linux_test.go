@@ -9,11 +9,63 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestLinuxCompletionSignalsGroupBeforeReap(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		canceled   bool
+		exited     bool
+		exitOnKill bool
+	}{
+		{name: "natural exit", exited: true},
+		{name: "cancellation", canceled: true, exitOnKill: true},
+		{name: "cancellation and exit both ready", canceled: true, exited: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for range 100 {
+				canceled := make(chan struct{}, 1)
+				exited := make(chan error, 1)
+				if tc.canceled {
+					canceled <- struct{}{}
+				}
+				if tc.exited {
+					exited <- nil
+				}
+				var events []string
+				waitErr, observeErr := completeLinuxVerificationProcess(
+					123,
+					canceled,
+					exited,
+					func(pid int) {
+						if pid != 123 {
+							t.Fatalf("signal pid = %d, want 123", pid)
+						}
+						events = append(events, "signal")
+						if tc.exitOnKill {
+							exited <- nil
+						}
+					},
+					func() error {
+						events = append(events, "reap")
+						return nil
+					},
+				)
+				if waitErr != nil || observeErr != nil {
+					t.Fatalf("completeLinuxVerificationProcess() = %v, %v", waitErr, observeErr)
+				}
+				if got := strings.Join(events, ","); got != "signal,reap" {
+					t.Fatalf("completion order = %q, want signal,reap", got)
+				}
+			}
+		})
+	}
+}
 
 func TestLinuxGuardianCleansSetsidDescendantOnCancellation(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "setsid-child.pid")
