@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Entry is one registered pty-host process.
@@ -50,12 +51,19 @@ func legacyRegistryFile() (string, error) {
 	return filepath.Join(home, ".ao", "windows-pty-hosts.json"), nil
 }
 
+// sameRegistryPath follows Windows path identity. The ConPTY registry is a
+// Windows-only sideband, so casing differences must not split one daemon
+// namespace into two logical stores.
+func sameRegistryPath(a, b string) bool {
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
 // shouldMigrateLegacy distinguishes moving the default daemon's data store
 // from running a second isolated daemon. A custom AO_RUN_FILE identifies a
 // separate daemon namespace, whose registry must never read or remove entries
 // owned by the default ~/.ao/running.json instance.
 func shouldMigrateLegacy(configuredPath, legacyPath string) bool {
-	if filepath.Clean(configuredPath) == filepath.Clean(legacyPath) {
+	if sameRegistryPath(configuredPath, legacyPath) {
 		return false
 	}
 	runFile, customRunFile := os.LookupEnv("AO_RUN_FILE")
@@ -63,7 +71,7 @@ func shouldMigrateLegacy(configuredPath, legacyPath string) bool {
 		return true
 	}
 	defaultRunFile := filepath.Join(filepath.Dir(legacyPath), "running.json")
-	return filepath.Clean(runFile) == filepath.Clean(defaultRunFile)
+	return sameRegistryPath(runFile, defaultRunFile)
 }
 
 // readRaw reads and defensively parses the registry. Missing file or malformed

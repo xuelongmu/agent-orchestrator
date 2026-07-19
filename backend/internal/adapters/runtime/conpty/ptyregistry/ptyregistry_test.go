@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -130,6 +131,17 @@ func TestInitializedRegistryDoesNotImportLegacyEntries(t *testing.T) {
 	}
 	if _, err := os.Stat(legacyPath); err != nil {
 		t.Fatalf("initialized registry removed default registry: %v", err)
+	}
+}
+
+func TestShouldMigrateLegacyAcceptsDefaultRunFileCaseVariant(t *testing.T) {
+	legacyPath := filepath.Join(t.TempDir(), ".ao", "windows-pty-hosts.json")
+	configuredPath := filepath.Join(t.TempDir(), "data", "windows-pty-hosts.json")
+	defaultRunFile := filepath.Join(filepath.Dir(legacyPath), "running.json")
+	t.Setenv("AO_RUN_FILE", strings.ToUpper(defaultRunFile))
+
+	if !shouldMigrateLegacy(configuredPath, legacyPath) {
+		t.Fatal("default run-file case variant was treated as an isolated daemon")
 	}
 }
 
