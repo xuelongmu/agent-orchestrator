@@ -226,12 +226,24 @@ func (s *Store) ReleaseTrackerIntakeIssue(ctx context.Context, claim ports.Track
 			return err
 		}
 		if existing.SessionID != "" {
-			matches, err := trackerIntakeActiveSessionMatches(ctx, q, claim, domain.SessionID(existing.SessionID))
-			if err != nil {
+			boundID := domain.SessionID(existing.SessionID)
+			bound, err := q.GetSession(ctx, boundID)
+			if err == nil {
+				matches, matchErr := trackerIntakeActiveSessionMatches(ctx, q, claim, boundID)
+				if matchErr != nil {
+					return matchErr
+				}
+				if matches && (existing.Status == trackerIntakeSpawning || !bound.IsTerminated) {
+					return reconcileTrackerIntakeSessionAt(ctx, q, claim, boundID, releasedAt)
+				}
+				if !bound.IsTerminated {
+					// An attached admitted seed is still a live fence even when spawn
+					// failed before side effects began. Keep it busy until rollback
+					// removes the exact row; releasing here could admit a duplicate.
+					return nil
+				}
+			} else if !errors.Is(err, sql.ErrNoRows) {
 				return err
-			}
-			if matches {
-				return reconcileTrackerIntakeSessionAt(ctx, q, claim, domain.SessionID(existing.SessionID), releasedAt)
 			}
 		}
 		rows, err := q.ReleaseTrackerIntakeClaim(ctx, gen.ReleaseTrackerIntakeClaimParams{

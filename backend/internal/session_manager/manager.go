@@ -372,8 +372,10 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 
 	seed := seedRecord(cfg, m.clock())
 	var rec domain.SessionRecord
+	var claimedStore claimedSessionStore
 	if cfg.IntakeClaim != nil {
-		claimedStore, ok := m.store.(claimedSessionStore)
+		var ok bool
+		claimedStore, ok = m.store.(claimedSessionStore)
 		if !ok {
 			return domain.SessionRecord{}, fmt.Errorf("spawn: %w: store does not support claimed admission", ports.ErrTrackerIntakeClaimLost)
 		}
@@ -402,7 +404,6 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		branch = defaultSpawnBranch(id, cfg.Kind, sessionPrefix(project), project.Kind.WithDefault())
 	}
 	if cfg.IntakeClaim != nil {
-		claimedStore := m.store.(claimedSessionStore) // checked before CreateClaimedSession above
 		started, startErr := claimedStore.MarkTrackerIntakeSpawnStarted(ctx, *cfg.IntakeClaim, id, m.clock().UTC())
 		if startErr != nil || !started {
 			m.rollbackSpawnSeedRow(ctx, id)
