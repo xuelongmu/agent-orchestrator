@@ -194,6 +194,7 @@ type fakeProvider struct {
 	observations map[string]ports.SCMObservation
 	reviews      map[string]ports.SCMReviewObservation
 	logTails     map[string]string
+	logErr       error
 	changedFiles map[string][]string
 	rerunErr     error
 	fetchErr     error
@@ -287,7 +288,7 @@ func (p *fakeProvider) FetchFailedCheckLogTail(_ context.Context, _ ports.SCMRep
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.logCalls++
-	return p.logTails[check.Name], nil
+	return p.logTails[check.Name], p.logErr
 }
 func (p *fakeProvider) FetchReviewThreads(_ context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error) {
 	p.mu.Lock()
@@ -397,7 +398,7 @@ func TestStartUsesProviderRecommendedPollDelay(t *testing.T) {
 	}
 }
 
-func TestRunStartedPollIncludesCredentialGateInOverrunDuration(t *testing.T) {
+func TestRunStartedPollIncludesCredentialProbeInOverrunDuration(t *testing.T) {
 	now := time.Unix(900, 0).UTC()
 	provider := &fakeProvider{
 		credentialGate: true,
@@ -420,9 +421,7 @@ func TestRunStartedPollIncludesCredentialGateInOverrunDuration(t *testing.T) {
 		Logger:    quietSlog(),
 		Telemetry: sink,
 	})
-	var credentialGate sync.Once
-
-	if err := observer.runStartedPoll(context.Background(), &credentialGate); err != nil {
+	if err := observer.runStartedPoll(context.Background()); err != nil {
 		t.Fatalf("runStartedPoll: %v", err)
 	}
 
@@ -1000,6 +999,56 @@ func TestPoll_CredentialProbeErrorsRetryEscalateAndRecover(t *testing.T) {
 	}
 	if len(notifications.intents) != 3 || notifications.intents[2].Type != domain.NotificationControlPlaneRecovered {
 		t.Fatalf("credential recovery notifications = %#v, want one recovery", notifications.intents)
+	}
+}
+
+func TestPoll_SubjectlessCredentialProbeErrorsRetryAndRecover(t *testing.T) {
+	store := &fakeStore{
+		projects: map[string]domain.ProjectRecord{},
+		prs:      map[domain.SessionID][]domain.PullRequest{},
+		checks:   map[string][]domain.PullRequestCheck{},
+	}
+	notifications := &captureNotificationSink{}
+	secret := "credential-that-must-not-leak"
+	provider := &fakeProvider{
+		credentialGate: true,
+		credentialErr:  fmt.Errorf("temporary auth failure for %s", secret),
+	}
+	obs := New(provider, store, &fakeLifecycle{}, Config{
+		Clock:         func() time.Time { return time.Unix(1, 0).UTC() },
+		Tick:          time.Hour,
+		Logger:        quietSlog(),
+		Notifications: notifications,
+		CacheMax:      128,
+	})
+
+	for poll := 0; poll < controlPlaneEscalationFailureCount; poll++ {
+		if err := obs.Poll(context.Background()); err != nil {
+			t.Fatalf("poll %d: %v", poll+1, err)
+		}
+	}
+	if provider.credentialChecks != controlPlaneEscalationFailureCount {
+		t.Fatalf("credential checks = %d, want %d", provider.credentialChecks, controlPlaneEscalationFailureCount)
+	}
+	if len(notifications.intents) != 2 {
+		t.Fatalf("failure notifications = %#v, want failure and escalation", notifications.intents)
+	}
+	for _, intent := range notifications.intents {
+		if strings.Contains(intent.TitleOverride+intent.BodyOverride, secret) {
+			t.Fatalf("notification leaked credential probe error: %#v", intent)
+		}
+	}
+
+	provider.credentialErr = nil
+	provider.credentialOK = true
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.credentialChecks != controlPlaneEscalationFailureCount+1 {
+		t.Fatalf("credential checks after recovery = %d", provider.credentialChecks)
+	}
+	if len(notifications.intents) != 3 || notifications.intents[2].Type != domain.NotificationControlPlaneRecovered {
+		t.Fatalf("recovery notifications = %#v", notifications.intents)
 	}
 }
 
@@ -1858,6 +1907,49 @@ func TestEnrichFailureLogsDoesNotRefetchExistingTailOrMissingProviderID(t *testi
 	}
 	if got := obsValue.CI.FailureLogTail; got != "provider supplied tail" {
 		t.Fatalf("FailureLogTail = %q, want only existing tail", got)
+	}
+}
+
+func TestPoll_LogTailAuthenticationFailureRoutesHealthAndUnavailableFallback(t *testing.T) {
+	store := testStoreWithSession()
+	store.prs["p-1"] = []domain.PullRequest{knownPR(1)}
+	failing := testObs(1)
+	failing.CI.Summary = string(domain.CIFailing)
+	failing.CI.FailedFingerprint = "failed-build"
+	failedCheck := ports.SCMCheckObservation{
+		Name: "build", Status: string(domain.PRCheckFailed), Conclusion: "failure", ProviderID: "job-1",
+	}
+	failing.CI.Checks = []ports.SCMCheckObservation{failedCheck}
+	failing.CI.FailedChecks = []ports.SCMCheckObservation{failedCheck}
+	secret := "oauth-secret-that-must-not-leak"
+	provider := &fakeProvider{
+		repoGuards:   map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): failing},
+		logErr:       fmt.Errorf("%w: Bad credentials %s", ports.ErrSCMAuthentication, secret),
+	}
+	lifecycle := &fakeLifecycle{}
+	notifications := &captureNotificationSink{}
+	obs := New(provider, store, lifecycle, Config{
+		Clock:         func() time.Time { return time.Unix(1, 0).UTC() },
+		Tick:          time.Hour,
+		Logger:        quietSlog(),
+		Notifications: notifications,
+		CacheMax:      128,
+	})
+
+	err := obs.Poll(context.Background())
+	if !errors.Is(err, ports.ErrSCMAuthentication) {
+		t.Fatalf("poll error = %v, want SCM authentication", err)
+	}
+	if len(lifecycle.reviewFetchFailures) != 1 {
+		t.Fatalf("unavailable-SCM fallbacks = %d, want 1", len(lifecycle.reviewFetchFailures))
+	}
+	if len(notifications.intents) != 1 || notifications.intents[0].Type != domain.NotificationControlPlaneFailed {
+		t.Fatalf("health notifications = %#v, want one control-plane failure", notifications.intents)
+	}
+	text := notifications.intents[0].TitleOverride + "\n" + notifications.intents[0].BodyOverride
+	if strings.Contains(text, secret) || strings.Contains(text, "Bad credentials") {
+		t.Fatalf("health notification leaked provider error: %q", text)
 	}
 }
 

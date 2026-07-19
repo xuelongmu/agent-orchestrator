@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -220,22 +219,16 @@ func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Obser
 // goroutine so daemon startup is not blocked; subsequent polls use the base
 // tick widened by any optional provider rate-limit guidance.
 //
-// The first invocation of poll inside the supervisor also runs checkCredentials
-// up front. That way the "scm observer disabled: provider credentials
-// unavailable" warning is emitted on a fresh daemon even if discoverSubjects
-// has no subjects yet (which would otherwise short-circuit Poll before
-// checkCredentials). checkCredentials is guarded by credentialsChecked, so the
-// wrap stays once-per-process; a transient error there simply defers the check
-// to the next tick.
+// Poll checks credentials before subject discovery, so missing credentials and
+// transient probe failures are handled even when there are no tracked subjects.
 func (o *Observer) Start(ctx context.Context) <-chan struct{} {
-	var credentialGate sync.Once
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		// Keep each poll synchronous in this goroutine. Besides preserving cache
 		// mutation ordering, this is the loop's non-reentrancy guard: the next
 		// timer is not armed until the current cycle has fully completed.
-		if err := o.runStartedPoll(ctx, &credentialGate); err != nil && !errors.Is(err, context.Canceled) {
+		if err := o.runStartedPoll(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			o.logger.Error("scm observer: initial poll failed", "err", safePollError(err))
 		}
 		for {
@@ -250,7 +243,7 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 				}
 				return
 			case <-timer.C:
-				if err := o.runStartedPoll(ctx, &credentialGate); err != nil && !errors.Is(err, context.Canceled) {
+				if err := o.runStartedPoll(ctx); err != nil && !errors.Is(err, context.Canceled) {
 					o.logger.Error("scm observer: poll failed", "err", safePollError(err))
 				}
 			}
@@ -260,18 +253,9 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 }
 
 // runStartedPoll measures the complete cycle driven by Start, including the
-// once-per-process lazy credential gate. That gate may shell out to gh, so
-// excluding it would under-report the time during which this serialized loop
-// cannot arm its next timer.
-func (o *Observer) runStartedPoll(ctx context.Context, credentialGate *sync.Once) error {
-	return o.runPoll(ctx, func(ctx context.Context) error {
-		credentialGate.Do(func() {
-			if _, err := o.checkCredentials(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				o.logger.Error("scm observer: initial credential check failed", "err", safePollError(err))
-			}
-		})
-		return o.poll(ctx)
-	})
+// lazy credential probe that is part of poll.
+func (o *Observer) runStartedPoll(ctx context.Context) error {
+	return o.runPoll(ctx, o.poll)
 }
 
 // runPoll records the duration of one serialized SCM lifecycle cycle. The Go
@@ -499,19 +483,19 @@ func (o *Observer) poll(ctx context.Context) (pollErr error) {
 	if o.disabled {
 		return o.applyUnavailableSCMFallbacks(ctx, now, nil)
 	}
+	proceed, err := o.checkCredentials(ctx)
+	if err != nil {
+		return err
+	}
+	if !proceed || o.disabled {
+		return o.applyUnavailableSCMFallbacks(ctx, now, nil)
+	}
 	subjects, sessionRepos, err := o.discoverSubjects(ctx)
 	if err != nil {
 		return err
 	}
 	if len(sessionRepos) == 0 {
 		return nil
-	}
-	proceed, err := o.checkCredentials(ctx)
-	if err != nil {
-		return err
-	}
-	if !proceed || o.disabled {
-		return o.applyUnavailableSCMFallbacks(ctx, now, subjects)
 	}
 	// Any provider API authentication failure after the credential gate must
 	// still feed durable local PR facts through the unavailable-SCM lane. Keep
@@ -597,7 +581,9 @@ func (o *Observer) poll(ctx context.Context) (pollErr error) {
 			continue
 		}
 		local := subj.known
-		o.enrichFailureLogs(ctx, &obs, local)
+		if err := o.enrichFailureLogs(ctx, &obs, local); err != nil {
+			return err
+		}
 		observations[key] = obs
 	}
 
@@ -1277,14 +1263,14 @@ func missingLocalState(pr domain.PullRequest) bool {
 	return pr.URL == "" || pr.HeadSHA == "" || pr.MetadataHash == "" || pr.CIHash == ""
 }
 
-func (o *Observer) enrichFailureLogs(ctx context.Context, obs *ports.SCMObservation, local domain.PullRequest) {
+func (o *Observer) enrichFailureLogs(ctx context.Context, obs *ports.SCMObservation, local domain.PullRequest) error {
 	if obs.CI.Summary != string(domain.CIFailing) || obs.CI.FailedFingerprint == "" {
-		return
+		return nil
 	}
 	if strings.HasPrefix(local.CIHash, obs.CI.FailedFingerprint+":") {
 		checks, err := o.store.ListChecks(ctx, local.URL)
 		if err == nil && applyStoredFailedLogTails(obs, checks) {
-			return
+			return nil
 		}
 	}
 	tails := make([]string, 0, len(obs.CI.FailedChecks))
@@ -1299,6 +1285,9 @@ func (o *Observer) enrichFailureLogs(ctx context.Context, obs *ports.SCMObservat
 			var err error
 			tail, err = o.provider.FetchFailedCheckLogTail(ctx, ports.SCMRepo{Provider: obs.Provider, Host: obs.Host, Repo: obs.Repo, Owner: ownerOf(obs.Repo), Name: nameOf(obs.Repo)}, obs.CI.FailedChecks[i])
 			if err != nil {
+				if errors.Is(err, ports.ErrSCMAuthentication) {
+					return err
+				}
 				tail = "<log fetch failed: " + scrubLine(err.Error()) + ">"
 			}
 		}
@@ -1311,6 +1300,7 @@ func (o *Observer) enrichFailureLogs(ctx context.Context, obs *ports.SCMObservat
 		}
 	}
 	obs.CI.FailureLogTail = strings.Join(tails, "\n---\n")
+	return nil
 }
 
 func checkProviderKey(ch ports.SCMCheckObservation) string {

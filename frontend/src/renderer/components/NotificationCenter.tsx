@@ -169,6 +169,7 @@ function NotificationItem({
 	onOpen: (notification: NotificationDTO) => void;
 }) {
 	const Icon = notificationIcon(notification.type);
+	const canOpenTarget = notification.target.kind !== "control_plane";
 	return (
 		<div className="grid grid-cols-notification gap-2 rounded-md px-2 py-2.5">
 			<div
@@ -192,15 +193,17 @@ function NotificationItem({
 				) : null}
 			</div>
 			<div className="flex items-start gap-1">
-				<button
-					aria-label="Open notification target"
-					className="grid size-control-md place-items-center rounded-md text-muted-foreground hover:bg-surface hover:text-foreground"
-					onClick={() => onOpen(notification)}
-					title="Open target"
-					type="button"
-				>
-					<ExternalLink className="size-icon-md" aria-hidden="true" />
-				</button>
+				{canOpenTarget ? (
+					<button
+						aria-label="Open notification target"
+						className="grid size-control-md place-items-center rounded-md text-muted-foreground hover:bg-surface hover:text-foreground"
+						onClick={() => onOpen(notification)}
+						title="Open target"
+						type="button"
+					>
+						<ExternalLink className="size-icon-md" aria-hidden="true" />
+					</button>
+				) : null}
 				<button
 					aria-label="Mark notification read"
 					className="grid size-control-md place-items-center rounded-md text-muted-foreground hover:bg-surface hover:text-foreground disabled:pointer-events-none disabled:opacity-45"

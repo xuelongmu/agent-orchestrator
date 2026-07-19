@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { NotificationCenter } from "./NotificationCenter";
 import type { NotificationDTO } from "../lib/notifications";
@@ -29,6 +30,18 @@ const notifications: NotificationDTO[] = [
 		createdAt: "2026-06-16T11:00:00Z",
 		target: { kind: "session", sessionId: "sess-2" },
 	},
+	{
+		id: "ntf_3",
+		sessionId: "",
+		projectId: "",
+		prUrl: "",
+		type: "control_plane_failed",
+		title: "GitHub authentication needs attention",
+		body: "Update GitHub authentication.",
+		status: "unread",
+		createdAt: "2026-06-16T12:00:00Z",
+		target: { kind: "control_plane", sessionId: "" },
+	},
 ];
 
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
@@ -57,9 +70,9 @@ describe("NotificationCenter", () => {
 	it("renders a filled bell with a text-only yellow unread count", () => {
 		renderNotificationCenter();
 
-		const trigger = screen.getByRole("button", { name: "2 unread notifications" });
+		const trigger = screen.getByRole("button", { name: "3 unread notifications" });
 		const bell = trigger.querySelector("svg");
-		const count = screen.getByText("2");
+		const count = screen.getByText("3");
 
 		expect(bell).toHaveClass("fill-current");
 		expect(count).toHaveClass("text-caption");
@@ -67,5 +80,17 @@ describe("NotificationCenter", () => {
 		expect(count).not.toHaveClass("bg-warning");
 		expect(count).not.toHaveClass("rounded-full");
 		expect(count).not.toHaveClass("text-background");
+	});
+
+	it("does not offer an open action for control-plane notifications", async () => {
+		const user = userEvent.setup();
+		renderNotificationCenter();
+		await user.click(screen.getByRole("button", { name: "3 unread notifications" }));
+
+		const title = await screen.findByText("GitHub authentication needs attention");
+		const item = title.closest(".grid");
+		expect(item).not.toBeNull();
+		expect(within(item as HTMLElement).queryByTitle("Open target")).not.toBeInTheDocument();
+		expect(screen.getAllByTitle("Open target")).toHaveLength(2);
 	});
 });
