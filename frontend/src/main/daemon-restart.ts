@@ -1,3 +1,5 @@
+import type { ProcessLiveness } from "./process-lifecycle";
+
 export type DaemonRestartControllerOptions = {
 	restart: () => unknown | Promise<unknown>;
 	shouldRestart: () => boolean;
@@ -14,6 +16,34 @@ export type DaemonSupervisorLink = {
 };
 
 export type AdoptedDaemonLoss = "not-owned" | "graceful-stop" | "still-running" | "crash";
+
+/** Keeps explicit stop intent authoritative across in-flight async refreshes. */
+export class DaemonStopIntentController {
+	private epoch = 0;
+	private stopRequested = false;
+
+	get currentEpoch(): number {
+		return this.epoch;
+	}
+
+	get stopping(): boolean {
+		return this.stopRequested;
+	}
+
+	requestStop(): void {
+		this.epoch += 1;
+		this.stopRequested = true;
+	}
+
+	allowExplicitStart(): void {
+		this.epoch += 1;
+		this.stopRequested = false;
+	}
+
+	permitsAdoption(epoch = this.epoch): boolean {
+		return !this.stopRequested && epoch === this.epoch;
+	}
+}
 
 /** Tracks whether Electron owns the daemon and the matching liveness link. */
 export class DaemonOwnershipController {
@@ -55,11 +85,11 @@ export class DaemonOwnershipController {
 	classifyAdoptedLoss(
 		info: { pid: number; owner?: string } | null,
 		previousPID: number | undefined,
-		isProcessAlive: (pid: number) => boolean,
+		probeProcess: (pid: number) => ProcessLiveness,
 	): AdoptedDaemonLoss {
 		if (!this.ownedByApp) return "not-owned";
 		if (previousPID === undefined || validatedDaemonOwner(info, previousPID) !== "app") return "graceful-stop";
-		return isProcessAlive(previousPID) ? "still-running" : "crash";
+		return probeProcess(previousPID) === "dead" ? "crash" : "still-running";
 	}
 
 	private clearSupervisorLink(): void {
@@ -160,15 +190,18 @@ export class DaemonRestartController {
 	onAdoptedLoss(loss: AdoptedDaemonLoss): void {
 		if (loss === "crash") {
 			this.onUnexpectedExit();
+		} else if (loss === "still-running") {
+			this.clearRestartTimer();
+			this.clearStableTimer();
 		} else if (loss === "graceful-stop" || loss === "not-owned") {
 			this.cancel();
 		}
 	}
 
 	/** Reset the bounded retry budget only after the replacement proves stable. */
-	onReady(): void {
+	onReady(confirmed = true): void {
 		this.clearStableTimer();
-		if (this.restartAttempts === 0) return;
+		if (!confirmed || this.restartAttempts === 0) return;
 		this.stableTimer = setTimeout(() => {
 			this.stableTimer = undefined;
 			this.restartAttempts = 0;
@@ -177,14 +210,80 @@ export class DaemonRestartController {
 
 	/** Cancel pending work for intentional stop and app-quit paths. */
 	cancel(): void {
-		if (this.restartTimer) clearTimeout(this.restartTimer);
-		this.restartTimer = undefined;
+		this.clearRestartTimer();
 		this.clearStableTimer();
 		this.restartAttempts = 0;
+	}
+
+	private clearRestartTimer(): void {
+		if (this.restartTimer) clearTimeout(this.restartTimer);
+		this.restartTimer = undefined;
 	}
 
 	private clearStableTimer(): void {
 		if (this.stableTimer) clearTimeout(this.stableTimer);
 		this.stableTimer = undefined;
 	}
+}
+
+export type AdoptedDaemonStopOptions = {
+	appOwned: boolean;
+	alreadyStopped: boolean;
+	supervisorConnected: boolean;
+	pid: number | undefined;
+	requestShutdown: () => Promise<boolean>;
+	confirmStopped: () => Promise<boolean>;
+	terminateProcess: (pid: number) => Promise<boolean>;
+	clearOwnership: () => void;
+};
+
+/**
+ * Stop an adopted app-owned daemon before releasing its ownership/link state.
+ * Success means a shutdown path was initiated or the daemon was confirmed gone.
+ */
+export async function stopAdoptedDaemon(options: AdoptedDaemonStopOptions): Promise<boolean> {
+	let ownershipCleared = false;
+	const clearOwnership = () => {
+		if (ownershipCleared) return;
+		ownershipCleared = true;
+		options.clearOwnership();
+	};
+
+	if (!options.appOwned || options.alreadyStopped) {
+		clearOwnership();
+		return true;
+	}
+
+	try {
+		if (await options.requestShutdown()) {
+			clearOwnership();
+			return true;
+		}
+	} catch {
+		// Fall through to the supervisor/PID stop paths.
+	}
+
+	if (options.supervisorConnected) {
+		// Disposing a connected link starts the daemon's supervisor grace timer.
+		// Do not report success until that delayed stop is actually observed.
+		clearOwnership();
+		try {
+			if (await options.confirmStopped()) return true;
+		} catch {
+			// Fall through to direct-PID termination.
+		}
+	}
+
+	if (options.pid !== undefined) {
+		try {
+			if (await options.terminateProcess(options.pid)) {
+				clearOwnership();
+				return true;
+			}
+		} catch {
+			// Preserve ownership so a later stop attempt can retry.
+		}
+	}
+
+	return false;
 }
