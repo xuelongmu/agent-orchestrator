@@ -2,6 +2,9 @@ package review
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -118,6 +121,49 @@ func TestLauncherSpawnReturnsStableHandle(t *testing.T) {
 	}
 	if reviewer.gotInv.RunID != "run-1" || reviewer.gotInv.TargetSHA != "sha1" || reviewer.gotInv.ReviewerID != "review-mer-1" {
 		t.Fatalf("invocation = %+v", reviewer.gotInv)
+	}
+}
+
+func TestLauncherSpawnPreservesReviewerArgvElements(t *testing.T) {
+	prompt := "review spaces, \"quotes\", & metacharacters, 東京\nand a second line"
+	reviewer := &fakeReviewer{}
+	rt := &fakeRuntime{}
+	reviewerCommand := []string{"codex", "exec", "--sandbox", "read-only", prompt}
+	reviewerWithCommand := reviewerCommandAdapter{fakeReviewer: reviewer, argv: reviewerCommand}
+	l := NewLauncher(fakeReviewerResolver{reviewer: reviewerWithCommand, ok: true}, rt)
+
+	if _, err := l.Spawn(context.Background(), launchSpec()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if !reflect.DeepEqual(rt.createCfg.Argv, reviewerCommand) {
+		t.Fatalf("runtime argv = %#v, want exact reviewer argv %#v", rt.createCfg.Argv, reviewerCommand)
+	}
+	if rt.createCfg.Argv[len(rt.createCfg.Argv)-1] != prompt {
+		t.Fatalf("runtime prompt = %q, want one argv element %q", rt.createCfg.Argv[len(rt.createCfg.Argv)-1], prompt)
+	}
+}
+
+type reviewerCommandAdapter struct {
+	*fakeReviewer
+	argv []string
+}
+
+func (r reviewerCommandAdapter) ReviewCommand(_ context.Context, inv ports.ReviewInvocation) (ports.ReviewCommandSpec, error) {
+	r.gotInv = inv
+	return ports.ReviewCommandSpec{Argv: append([]string(nil), r.argv...)}, nil
+}
+
+func TestInsertAgentBinAfterDaemon(t *testing.T) {
+	sep := string(os.PathListSeparator)
+	daemonDir := filepath.Join("root", "daemon")
+	agentBin := filepath.Join("root", ".ao", "bin")
+	systemDir := filepath.Join("root", "system")
+	want := strings.Join([]string{daemonDir, agentBin, systemDir}, sep)
+	if got := insertAgentBinAfterDaemon(daemonDir+sep+systemDir, agentBin); got != want {
+		t.Fatalf("PATH = %q, want %q", got, want)
+	}
+	if got := insertAgentBinAfterDaemon(want, agentBin); got != want {
+		t.Fatalf("deduplicated PATH = %q, want %q", got, want)
 	}
 }
 

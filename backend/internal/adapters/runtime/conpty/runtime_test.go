@@ -174,7 +174,8 @@ func TestCreatePreservesAbsoluteExecutableArgvAcrossWindowsShellSettings(t *test
 				got = append([]string(nil), argv...)
 				return "127.0.0.1:1", livePID(), nil
 			}})
-			want := []string{`C:\Program Files\Claude\claude.exe`, "--model", "opus"}
+			prompt := "review spaces, \"quotes\", & | ; $(nope), 東京\nand another line"
+			want := []string{`C:\Program Files\Codex\codex.exe`, "exec", "--sandbox", "read-only", prompt}
 			_, err := rt.Create(context.Background(), ports.RuntimeConfig{
 				SessionID:     domain.SessionID("sess-shell"),
 				WorkspacePath: `C:\work tree`,
@@ -185,6 +186,9 @@ func TestCreatePreservesAbsoluteExecutableArgvAcrossWindowsShellSettings(t *test
 			}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("spawner argv = %#v, want %#v", got, want)
+			}
+			if got[len(got)-1] != prompt {
+				t.Fatalf("prompt = %q, want one argv element %q", got[len(got)-1], prompt)
 			}
 		})
 	}

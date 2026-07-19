@@ -151,7 +151,7 @@ func TestResolveCodexBinaryPrefersNPMOverWindowsAppsExecutable(t *testing.T) {
 	root := t.TempDir()
 	appData := filepath.Join(root, "Roaming")
 	npmDir := filepath.Join(appData, "npm")
-	want := filepath.Join(npmDir, "node_modules", "@openai", "codex", "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe")
+	want := filepath.Join(npmDir, "node_modules", "@openai", "codex", "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "codex", "codex.exe")
 	if err := os.MkdirAll(filepath.Dir(want), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -179,6 +179,33 @@ func TestResolveCodexBinaryPrefersNPMOverWindowsAppsExecutable(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("ResolveCodexBinary = %q, want %q", got, want)
+	}
+}
+
+func TestResolveCodexBinaryFindsConfiguredWindowsAgentWrapperPath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows resolver only")
+	}
+	root := t.TempDir()
+	binDir := filepath.Join(root, "isolated", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(binDir, "codex.exe")
+	if err := os.WriteFile(want, []byte("native codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("AO_RUN_FILE", filepath.Join(root, "isolated", "running.json"))
+	t.Setenv("APPDATA", filepath.Join(root, "empty-appdata"))
+	t.Setenv("PATH", "")
+
+	got, err := ResolveCodexBinary(context.Background())
+	if err != nil {
+		t.Fatalf("ResolveCodexBinary: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ResolveCodexBinary = %q, want AO agent wrapper path %q", got, want)
 	}
 }
 

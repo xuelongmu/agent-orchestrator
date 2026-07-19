@@ -685,6 +685,24 @@ func TestAttachEnvForcesUsableTerm(t *testing.T) {
 	}
 }
 
+func TestBuildLaunchCommandQuotesEveryReviewerArgvElement(t *testing.T) {
+	prompt := "review spaces, \"quotes\", 'single quotes', & | ; $(nope), 東京\nand another line"
+	argv := []string{"/opt/codex path/codex", "exec", "--sandbox", "read-only", prompt}
+	command := buildLaunchCommand(ports.RuntimeConfig{Argv: argv})
+
+	quoted := make([]string, len(argv))
+	for i, arg := range argv {
+		quoted[i] = shellQuote(arg)
+	}
+	want := strings.Join(quoted, " ")
+	if !strings.Contains(command, want) {
+		t.Fatalf("launch command %q does not contain discrete quoted argv %q", command, want)
+	}
+	if strings.Contains(command, "codex exec --sandbox") {
+		t.Fatalf("launch command contains an unquoted reviewer command: %q", command)
+	}
+}
+
 // -- commandError tests --
 
 func TestCommandErrorUnwraps(t *testing.T) {

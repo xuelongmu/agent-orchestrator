@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/pathenv"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
 )
@@ -118,14 +122,18 @@ func (l *agentLauncher) Spawn(ctx context.Context, spec LaunchSpec) (string, err
 }
 
 // pinnedEnv returns the reviewer command's env with PATH pinned to the daemon's
-// own directory, so the bare `ao` the reviewer runs (e.g. `ao review submit`)
-// resolves to this daemon's CLI rather than a foreign `ao` first on the
-// inherited PATH. Mirrors the worker-session pin in the session manager.
+// own directory, followed by AO's agent-wrapper directory. Thus the bare `ao`
+// used for review submission resolves to this daemon while gh/git (and a
+// configured native Codex wrapper) resolve through the same cross-platform
+// wrapper path as worker agents. Mirrors the worker-session daemon pin.
 // Best-effort: an unpinnable daemon (not named "ao") keeps the inherited PATH.
 func pinnedEnv(base map[string]string) map[string]string {
 	path, err := sessionmanager.HookPATH(os.Executable, os.Getenv, base)
 	if err != nil {
 		return base
+	}
+	if agentBin, err := pathenv.AgentBinDir(os.Getenv, os.UserHomeDir); err == nil {
+		path = insertAgentBinAfterDaemon(path, agentBin)
 	}
 	env := make(map[string]string, len(base)+1)
 	for k, v := range base {
@@ -133,6 +141,33 @@ func pinnedEnv(base map[string]string) map[string]string {
 	}
 	env["PATH"] = path
 	return env
+}
+
+func insertAgentBinAfterDaemon(path, agentBin string) string {
+	if agentBin == "" {
+		return path
+	}
+	entries := filepath.SplitList(path)
+	for _, entry := range entries {
+		if samePATHEntry(entry, agentBin) {
+			return path
+		}
+	}
+	if len(entries) == 0 {
+		return agentBin
+	}
+	entries = append(entries, "")
+	copy(entries[2:], entries[1:])
+	entries[1] = agentBin
+	return strings.Join(entries, string(os.PathListSeparator))
+}
+
+func samePATHEntry(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }
 
 func (l *agentLauncher) Notify(ctx context.Context, handleID string, spec LaunchSpec) error {

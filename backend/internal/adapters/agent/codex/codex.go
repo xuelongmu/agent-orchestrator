@@ -20,6 +20,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
+	"github.com/aoagents/agent-orchestrator/backend/internal/pathenv"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -193,6 +194,11 @@ func ResolveCodexBinary(ctx context.Context) (string, error) {
 
 	if runtime.GOOS == "windows" {
 		candidates := []string{}
+		if agentBin, err := pathenv.AgentBinDir(os.Getenv, os.UserHomeDir); err == nil {
+			shim := filepath.Join(agentBin, "codex.cmd")
+			candidates = append(candidates, windowsNativeCodexCandidatesForShim(shim)...)
+			candidates = append(candidates, filepath.Join(agentBin, "codex.exe"))
+		}
 		if appData := os.Getenv("APPDATA"); appData != "" {
 			shim := filepath.Join(appData, "npm", "codex.cmd")
 			candidates = append(candidates, windowsNativeCodexCandidatesForShim(shim)...)
@@ -280,6 +286,12 @@ func resolveNativeWindowsCodex(path string) string {
 func windowsNativeCodexCandidatesForShim(shim string) []string {
 	dir := filepath.Dir(shim)
 	return []string{
+		// Current npm platform packages place the native binary in a `codex`
+		// directory below the Rust target triple. Keep resolving the native
+		// executable instead of launching the .cmd shim: reviewer prompts contain
+		// arbitrary shell metacharacters and must stay discrete argv elements.
+		filepath.Join(dir, "node_modules", "@openai", "codex", "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "codex", "codex.exe"),
+		// Older Codex npm packages used `bin` at the same level.
 		filepath.Join(dir, "node_modules", "@openai", "codex", "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe"),
 		filepath.Join(dir, "node_modules", "@openai", "codex", "bin", "codex.exe"),
 	}
