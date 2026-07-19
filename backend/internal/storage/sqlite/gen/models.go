@@ -31,9 +31,11 @@ type ChangeLog struct {
 }
 
 type CoordinationClaim struct {
-	ClaimKey  string
-	OwnerPid  int64
-	ClaimedAt time.Time
+	ClaimKey       string
+	OwnerToken     string
+	OwnerPid       int64
+	ClaimedAt      time.Time
+	LeaseExpiresAt time.Time
 }
 
 type Notification struct {

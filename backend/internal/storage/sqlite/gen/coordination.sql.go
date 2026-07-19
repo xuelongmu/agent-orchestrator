@@ -11,7 +11,7 @@ import (
 )
 
 const getCoordinationClaim = `-- name: GetCoordinationClaim :one
-SELECT claim_key, owner_pid, claimed_at
+SELECT claim_key, owner_token, owner_pid, claimed_at, lease_expires_at
 FROM coordination_claims
 WHERE claim_key = ?
 `
@@ -19,24 +19,38 @@ WHERE claim_key = ?
 func (q *Queries) GetCoordinationClaim(ctx context.Context, claimKey string) (CoordinationClaim, error) {
 	row := q.db.QueryRowContext(ctx, getCoordinationClaim, claimKey)
 	var i CoordinationClaim
-	err := row.Scan(&i.ClaimKey, &i.OwnerPid, &i.ClaimedAt)
+	err := row.Scan(
+		&i.ClaimKey,
+		&i.OwnerToken,
+		&i.OwnerPid,
+		&i.ClaimedAt,
+		&i.LeaseExpiresAt,
+	)
 	return i, err
 }
 
 const insertCoordinationClaim = `-- name: InsertCoordinationClaim :execrows
-INSERT INTO coordination_claims (claim_key, owner_pid, claimed_at)
-VALUES (?, ?, ?)
+INSERT INTO coordination_claims (claim_key, owner_token, owner_pid, claimed_at, lease_expires_at)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT (claim_key) DO NOTHING
 `
 
 type InsertCoordinationClaimParams struct {
-	ClaimKey  string
-	OwnerPid  int64
-	ClaimedAt time.Time
+	ClaimKey       string
+	OwnerToken     string
+	OwnerPid       int64
+	ClaimedAt      time.Time
+	LeaseExpiresAt time.Time
 }
 
 func (q *Queries) InsertCoordinationClaim(ctx context.Context, arg InsertCoordinationClaimParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, insertCoordinationClaim, arg.ClaimKey, arg.OwnerPid, arg.ClaimedAt)
+	result, err := q.db.ExecContext(ctx, insertCoordinationClaim,
+		arg.ClaimKey,
+		arg.OwnerToken,
+		arg.OwnerPid,
+		arg.ClaimedAt,
+		arg.LeaseExpiresAt,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -45,16 +59,49 @@ func (q *Queries) InsertCoordinationClaim(ctx context.Context, arg InsertCoordin
 
 const releaseCoordinationClaim = `-- name: ReleaseCoordinationClaim :execrows
 DELETE FROM coordination_claims
-WHERE claim_key = ? AND owner_pid = ?
+WHERE claim_key = ? AND owner_token = ?
 `
 
 type ReleaseCoordinationClaimParams struct {
-	ClaimKey string
-	OwnerPid int64
+	ClaimKey   string
+	OwnerToken string
 }
 
 func (q *Queries) ReleaseCoordinationClaim(ctx context.Context, arg ReleaseCoordinationClaimParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, releaseCoordinationClaim, arg.ClaimKey, arg.OwnerPid)
+	result, err := q.db.ExecContext(ctx, releaseCoordinationClaim, arg.ClaimKey, arg.OwnerToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const renewCoordinationClaim = `-- name: RenewCoordinationClaim :execrows
+UPDATE coordination_claims
+SET lease_expires_at = CASE
+    WHEN lease_expires_at < ? THEN ?
+    ELSE lease_expires_at
+END
+WHERE claim_key = ?
+  AND owner_token = ?
+  AND lease_expires_at > ?
+`
+
+type RenewCoordinationClaimParams struct {
+	LeaseExpiresAt   time.Time
+	LeaseExpiresAt_2 time.Time
+	ClaimKey         string
+	OwnerToken       string
+	LeaseExpiresAt_3 time.Time
+}
+
+func (q *Queries) RenewCoordinationClaim(ctx context.Context, arg RenewCoordinationClaimParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, renewCoordinationClaim,
+		arg.LeaseExpiresAt,
+		arg.LeaseExpiresAt_2,
+		arg.ClaimKey,
+		arg.OwnerToken,
+		arg.LeaseExpiresAt_3,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -63,23 +110,31 @@ func (q *Queries) ReleaseCoordinationClaim(ctx context.Context, arg ReleaseCoord
 
 const takeOverCoordinationClaim = `-- name: TakeOverCoordinationClaim :execrows
 UPDATE coordination_claims
-SET owner_pid = ?, claimed_at = ?
-WHERE claim_key = ? AND owner_pid = ?
+SET owner_token = ?, owner_pid = ?, claimed_at = ?, lease_expires_at = ?
+WHERE claim_key = ?
+  AND owner_token = ?
+  AND lease_expires_at <= ?
 `
 
 type TakeOverCoordinationClaimParams struct {
-	OwnerPid   int64
-	ClaimedAt  time.Time
-	ClaimKey   string
-	OwnerPid_2 int64
+	OwnerToken       string
+	OwnerPid         int64
+	ClaimedAt        time.Time
+	LeaseExpiresAt   time.Time
+	ClaimKey         string
+	OwnerToken_2     string
+	LeaseExpiresAt_2 time.Time
 }
 
 func (q *Queries) TakeOverCoordinationClaim(ctx context.Context, arg TakeOverCoordinationClaimParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, takeOverCoordinationClaim,
+		arg.OwnerToken,
 		arg.OwnerPid,
 		arg.ClaimedAt,
+		arg.LeaseExpiresAt,
 		arg.ClaimKey,
-		arg.OwnerPid_2,
+		arg.OwnerToken_2,
+		arg.LeaseExpiresAt_2,
 	)
 	if err != nil {
 		return 0, err

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,8 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/coordination"
 	"github.com/aoagents/agent-orchestrator/backend/internal/legacyimport"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
 func writeLegacyProject(t *testing.T) string {
@@ -95,5 +98,64 @@ func TestImportCommand_RefusesWhenDaemonRunning(t *testing.T) {
 	_, _, err := executeCLI(t, Deps{}, "import", "--from", root, "--yes")
 	if err == nil || !strings.Contains(err.Error(), "daemon is running") {
 		t.Fatalf("err = %v, want refusal because daemon is running", err)
+	}
+}
+
+func TestImportCommandRefusesWhenDaemonClaimsAfterPreflight(t *testing.T) {
+	cfg := setConfigEnv(t)
+	root := writeLegacyProject(t)
+	var holderStore *sqlite.Store
+	var holderLease *coordination.Lease
+	deps := Deps{OpenExclusiveStore: func(ctx context.Context, dataDir string, ownerPID int) (*sqlite.Store, *coordination.Lease, error) {
+		// runImport's run-file preflight and confirmation have already completed
+		// when executeImport calls OpenExclusiveStore. Claim as a concurrently starting
+		// daemon in this exact TOCTOU window, then return the import connection.
+		var err error
+		holderStore, err = sqlite.Open(dataDir)
+		if err != nil {
+			return nil, nil, err
+		}
+		holderLease, err = coordination.Acquire(context.Background(), holderStore, os.Getpid())
+		if err != nil {
+			_ = holderStore.Close()
+			return nil, nil, err
+		}
+		return coordination.OpenExclusive(ctx, dataDir, ownerPID)
+	}}
+	t.Cleanup(func() {
+		if holderLease != nil {
+			_ = holderLease.Release(context.Background())
+		}
+		if holderStore != nil {
+			_ = holderStore.Close()
+		}
+	})
+
+	_, _, err := executeCLI(t, deps, "import", "--from", root, "--yes")
+	if err == nil || !strings.Contains(err.Error(), "exclusive database writer leased") {
+		t.Fatalf("err = %v, want post-preflight lease refusal (data dir %s)", err, cfg.dataDir)
+	}
+}
+
+func TestImportCommandDryRunDoesNotTakeWriterLease(t *testing.T) {
+	cfg := setConfigEnv(t)
+	root := writeLegacyProject(t)
+	holderStore, err := sqlite.Open(cfg.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = holderStore.Close() })
+	holderLease, err := coordination.Acquire(context.Background(), holderStore, os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = holderLease.Release(context.Background()) })
+
+	out, _, err := executeCLI(t, Deps{}, "import", "--from", root, "--dry-run", "--yes")
+	if err != nil {
+		t.Fatalf("dry-run under an active writer lease: %v", err)
+	}
+	if !strings.Contains(out, "Dry run -- no changes written") {
+		t.Fatalf("dry-run output = %q", out)
 	}
 }
