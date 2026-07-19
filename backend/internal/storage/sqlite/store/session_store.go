@@ -40,6 +40,111 @@ func (s *Store) UpdateSession(ctx context.Context, rec domain.SessionRecord) err
 	return s.qw.UpdateSession(ctx, recordToUpdate(rec))
 }
 
+// UpdateSessionLifecycle persists one explicit reducer transition. The core
+// lifecycle facts are merged against the current writer snapshot; auxiliary
+// durable metadata is compare-and-set only when before/after proves the
+// reducer intentionally changed it. Generic hook/runtime writes therefore
+// cannot replay stale pending-submit or merged-cleanup latches.
+func (s *Store) UpdateSessionLifecycle(ctx context.Context, before, after domain.SessionRecord) error {
+	if before.ID == "" || before.ID != after.ID {
+		return fmt.Errorf("lifecycle update session id mismatch: before=%q after=%q", before.ID, after.ID)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.inTx(ctx, "update session lifecycle", func(q *gen.Queries) error {
+		row, err := q.GetSession(ctx, after.ID)
+		if err != nil {
+			return fmt.Errorf("get session %s: %w", after.ID, err)
+		}
+		current := rowToRecord(row)
+		core := current
+		if lifecycleActivityEqual(current.Activity, before.Activity) && !lifecycleActivityEqual(before.Activity, after.Activity) {
+			core.Activity = after.Activity
+		}
+		if current.FirstSignalAt.Equal(before.FirstSignalAt) && !before.FirstSignalAt.Equal(after.FirstSignalAt) {
+			core.FirstSignalAt = after.FirstSignalAt
+		}
+		if current.IsTerminated == before.IsTerminated && before.IsTerminated != after.IsTerminated {
+			core.IsTerminated = after.IsTerminated
+		}
+		if lifecycleDiagnosticEqual(current.Diagnostic, before.Diagnostic) && !lifecycleDiagnosticEqual(before.Diagnostic, after.Diagnostic) {
+			core.Diagnostic = after.Diagnostic
+		}
+		core.UpdatedAt = after.UpdatedAt
+		if current.UpdatedAt.After(core.UpdatedAt) {
+			core.UpdatedAt = current.UpdatedAt
+		}
+		activity := normalActivity(core.Activity, core.UpdatedAt)
+		diagnosticTrigger, diagnosticTail, diagnosticErrorType, diagnosticAt := diagnosticFields(core.Diagnostic)
+		if err := q.UpdateSessionLifecycle(ctx, gen.UpdateSessionLifecycleParams{
+			ActivityState:           activity.State,
+			ActivityLastAt:          activity.LastActivityAt,
+			FirstSignalAt:           timeToNullTime(core.FirstSignalAt),
+			IsTerminated:            core.IsTerminated,
+			DiagnosticTrigger:       diagnosticTrigger,
+			DiagnosticTerminalTail:  diagnosticTail,
+			DiagnosticHookErrorType: diagnosticErrorType,
+			DiagnosticCapturedAt:    diagnosticAt,
+			UpdatedAt:               core.UpdatedAt,
+			ID:                      core.ID,
+		}); err != nil {
+			return err
+		}
+
+		if before.Metadata.AgentSessionID != after.Metadata.AgentSessionID {
+			if _, err := q.UpdateSessionLifecycleAgentID(ctx, gen.UpdateSessionLifecycleAgentIDParams{
+				AgentSessionID:   after.Metadata.AgentSessionID,
+				ID:               after.ID,
+				AgentSessionID_2: before.Metadata.AgentSessionID,
+			}); err != nil {
+				return err
+			}
+		}
+		if !lifecyclePendingSubmitEqual(before.Metadata, after.Metadata) {
+			if _, err := q.UpdateSessionLifecyclePendingSubmit(ctx, gen.UpdateSessionLifecyclePendingSubmitParams{
+				PendingSubmitFingerprint:         after.Metadata.PendingSubmitFingerprint,
+				PendingSubmitRecoveryAttempted:   after.Metadata.PendingSubmitRecoveryAttempted,
+				ID:                               after.ID,
+				PendingSubmitFingerprint_2:       before.Metadata.PendingSubmitFingerprint,
+				PendingSubmitRecoveryAttempted_2: before.Metadata.PendingSubmitRecoveryAttempted,
+			}); err != nil {
+				return err
+			}
+		}
+		if !lifecycleMergedCleanupEqual(before.Metadata, after.Metadata) {
+			if _, err := q.UpdateSessionLifecycleMergedCleanup(ctx, gen.UpdateSessionLifecycleMergedCleanupParams{
+				MergedCleanupPending:   after.Metadata.MergedCleanupPending,
+				MergedCleanupPRURL:     after.Metadata.MergedCleanupPRURL,
+				ID:                     after.ID,
+				MergedCleanupPending_2: before.Metadata.MergedCleanupPending,
+				MergedCleanupPRURL_2:   before.Metadata.MergedCleanupPRURL,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func lifecycleActivityEqual(a, b domain.Activity) bool {
+	return a.State == b.State && a.LastActivityAt.Equal(b.LastActivityAt)
+}
+
+func lifecycleDiagnosticEqual(a, b *domain.LifecycleDiagnostic) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Trigger == b.Trigger && a.TerminalTail == b.TerminalTail && a.HookErrorType == b.HookErrorType && a.CapturedAt.Equal(b.CapturedAt)
+}
+
+func lifecyclePendingSubmitEqual(a, b domain.SessionMetadata) bool {
+	return a.PendingSubmitFingerprint == b.PendingSubmitFingerprint && a.PendingSubmitRecoveryAttempted == b.PendingSubmitRecoveryAttempted
+}
+
+func lifecycleMergedCleanupEqual(a, b domain.SessionMetadata) bool {
+	return a.MergedCleanupPending == b.MergedCleanupPending && a.MergedCleanupPRURL == b.MergedCleanupPRURL
+}
+
 // RenameSession updates only the user-facing display name for an existing
 // session. It returns ok=false when the session id does not exist.
 func (s *Store) RenameSession(ctx context.Context, id domain.SessionID, displayName string, updatedAt time.Time) (bool, error) {
