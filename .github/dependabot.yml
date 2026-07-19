@@ -1,0 +1,43 @@
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      development-dependencies:
+        dependency-type: development
+
+  - package-ecosystem: npm
+    directory: "/frontend"
+    schedule:
+      interval: weekly
+    groups:
+      development-dependencies:
+        dependency-type: development
+
+  - package-ecosystem: npm
+    directory: "/frontend/src/landing"
+    schedule:
+      interval: weekly
+    groups:
+      development-dependencies:
+        dependency-type: development
+
+  - package-ecosystem: npm
+    directory: "/packages/mobile"
+    schedule:
+      interval: weekly
+    groups:
+      development-dependencies:
+        dependency-type: development
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
