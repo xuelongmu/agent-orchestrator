@@ -1,11 +1,84 @@
 export type DaemonRestartControllerOptions = {
-	restart: () => void | Promise<void>;
+	restart: () => unknown | Promise<unknown>;
 	shouldRestart: () => boolean;
 	log: (message: string) => void;
+	onExhausted?: () => void;
 	maxRestarts?: number;
 	restartDelayMs?: number;
 	stableWindowMs?: number;
 };
+
+export type DaemonSupervisorLink = {
+	connected: boolean;
+	dispose: () => void;
+};
+
+/** Tracks whether Electron owns the daemon and the matching liveness link. */
+export class DaemonOwnershipController {
+	private ownedByApp = false;
+	private supervisorLink: DaemonSupervisorLink | null = null;
+
+	get appOwned(): boolean {
+		return this.ownedByApp;
+	}
+
+	get hasSupervisorLink(): boolean {
+		return this.supervisorLink !== null;
+	}
+
+	get supervisorConnected(): boolean {
+		return this.supervisorLink?.connected ?? false;
+	}
+
+	setAppOwned(appOwned: boolean): void {
+		this.ownedByApp = appOwned;
+		if (!appOwned) this.clearSupervisorLink();
+	}
+
+	replaceSupervisorLink(link: DaemonSupervisorLink): void {
+		this.clearSupervisorLink();
+		this.supervisorLink = link;
+	}
+
+	clear(): void {
+		this.ownedByApp = false;
+		this.clearSupervisorLink();
+	}
+
+	private clearSupervisorLink(): void {
+		this.supervisorLink?.dispose();
+		this.supervisorLink = null;
+	}
+}
+
+/** Only trust a run-file owner when it describes the daemon that answered. */
+export function validatedDaemonOwner(
+	info: { pid: number; owner?: string } | null,
+	probedPID: number | undefined,
+): string | undefined {
+	return info && info.pid === probedPID ? info.owner : undefined;
+}
+
+/** SIGINT/SIGTERM and exit 0 are intentional stops; everything else is crash-like. */
+export function isCrashLikeDaemonExit(code: number | null, signal: string | null): boolean {
+	if (signal === "SIGINT" || signal === "SIGTERM") return false;
+	return code !== 0;
+}
+
+export type ReachableDaemon<TFromRunFile, TFromPort> =
+	| { source: "run-file"; value: TFromRunFile }
+	| { source: "port"; value: TFromPort };
+
+/** Fall back to the expected port before declaring an adopted daemon gone. */
+export async function resolveReachableDaemon<TFromRunFile, TFromPort>(
+	fromRunFile: () => Promise<TFromRunFile | null>,
+	fromExpectedPort: () => Promise<TFromPort | null>,
+): Promise<ReachableDaemon<TFromRunFile, TFromPort> | null> {
+	const runFileDaemon = await fromRunFile();
+	if (runFileDaemon !== null) return { source: "run-file", value: runFileDaemon };
+	const portDaemon = await fromExpectedPort();
+	return portDaemon === null ? null : { source: "port", value: portDaemon };
+}
 
 const DEFAULT_MAX_RESTARTS = 3;
 const DEFAULT_RESTART_DELAY_MS = 1_000;
@@ -19,9 +92,10 @@ const DEFAULT_STABLE_WINDOW_MS = 30_000;
  * crash and never schedule a replacement process.
  */
 export class DaemonRestartController {
-	private readonly restart: () => void | Promise<void>;
+	private readonly restart: () => unknown | Promise<unknown>;
 	private readonly shouldRestart: () => boolean;
 	private readonly log: (message: string) => void;
+	private readonly onExhausted: () => void;
 	private readonly maxRestarts: number;
 	private readonly restartDelayMs: number;
 	private readonly stableWindowMs: number;
@@ -33,6 +107,7 @@ export class DaemonRestartController {
 		this.restart = options.restart;
 		this.shouldRestart = options.shouldRestart;
 		this.log = options.log;
+		this.onExhausted = options.onExhausted ?? (() => undefined);
 		this.maxRestarts = options.maxRestarts ?? DEFAULT_MAX_RESTARTS;
 		this.restartDelayMs = options.restartDelayMs ?? DEFAULT_RESTART_DELAY_MS;
 		this.stableWindowMs = options.stableWindowMs ?? DEFAULT_STABLE_WINDOW_MS;
@@ -45,6 +120,7 @@ export class DaemonRestartController {
 
 		if (this.restartAttempts >= this.maxRestarts) {
 			this.log(`daemon restart limit reached (${this.maxRestarts}); leaving it stopped`);
+			this.onExhausted();
 			return;
 		}
 
@@ -59,6 +135,7 @@ export class DaemonRestartController {
 				.then(() => this.restart())
 				.catch((error: unknown) => {
 					this.log(`daemon restart ${attempt}/${this.maxRestarts} failed: ${String(error)}`);
+					this.onUnexpectedExit();
 				});
 		}, this.restartDelayMs);
 	}

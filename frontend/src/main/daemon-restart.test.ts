@@ -1,6 +1,12 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DaemonRestartController } from "./daemon-restart";
+import {
+	DaemonOwnershipController,
+	DaemonRestartController,
+	isCrashLikeDaemonExit,
+	resolveReachableDaemon,
+	validatedDaemonOwner,
+} from "./daemon-restart";
 
 describe("DaemonRestartController", () => {
 	beforeEach(() => {
@@ -11,13 +17,21 @@ describe("DaemonRestartController", () => {
 		vi.useRealTimers();
 	});
 
-	function createController(overrides: { shouldRestart?: () => boolean; maxRestarts?: number } = {}) {
-		const restart = vi.fn();
+	function createController(
+		overrides: {
+			shouldRestart?: () => boolean;
+			maxRestarts?: number;
+			onExhausted?: () => void;
+			restart?: () => unknown | Promise<unknown>;
+		} = {},
+	) {
+		const restart = vi.fn(overrides.restart ?? (() => undefined));
 		const log = vi.fn();
 		const controller = new DaemonRestartController({
 			restart,
 			shouldRestart: overrides.shouldRestart ?? (() => true),
 			log,
+			onExhausted: overrides.onExhausted,
 			maxRestarts: overrides.maxRestarts,
 			restartDelayMs: 100,
 			stableWindowMs: 1_000,
@@ -39,7 +53,8 @@ describe("DaemonRestartController", () => {
 	});
 
 	it("bounds a crash loop", async () => {
-		const { controller, restart, log } = createController({ maxRestarts: 2 });
+		const onExhausted = vi.fn();
+		const { controller, restart, log } = createController({ maxRestarts: 2, onExhausted });
 
 		for (let crash = 0; crash < 3; crash += 1) {
 			controller.onUnexpectedExit();
@@ -48,9 +63,10 @@ describe("DaemonRestartController", () => {
 
 		expect(restart).toHaveBeenCalledTimes(2);
 		expect(log).toHaveBeenCalledWith("daemon restart limit reached (2); leaving it stopped");
+		expect(onExhausted).toHaveBeenCalledTimes(1);
 	});
 
-	it("restores the retry budget only after the daemon stays ready", async () => {
+	it("restores the retry budget when fallback readiness stays stable", async () => {
 		const { controller, restart } = createController({ maxRestarts: 1 });
 
 		controller.onUnexpectedExit();
@@ -76,6 +92,43 @@ describe("DaemonRestartController", () => {
 		expect(restart).toHaveBeenCalledTimes(1);
 	});
 
+	it("continues the bounded policy when a replacement reports a spawn error", async () => {
+		const { controller, restart } = createController();
+
+		controller.onUnexpectedExit();
+		await vi.advanceTimersByTimeAsync(100);
+		// The replacement ChildProcess emitted error instead of exit.
+		controller.onUnexpectedExit();
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(restart).toHaveBeenCalledTimes(2);
+	});
+
+	it("continues the bounded policy when starting a replacement rejects", async () => {
+		const onExhausted = vi.fn();
+		const { controller, restart } = createController({
+			maxRestarts: 2,
+			onExhausted,
+			restart: () => Promise.reject(new Error("launch failed")),
+		});
+
+		controller.onUnexpectedExit();
+		await vi.advanceTimersByTimeAsync(200);
+
+		expect(restart).toHaveBeenCalledTimes(2);
+		expect(onExhausted).toHaveBeenCalledTimes(1);
+	});
+
+	it("suppresses duplicate restart requests while one is pending", async () => {
+		const { controller, restart } = createController();
+
+		controller.onUnexpectedExit();
+		controller.onUnexpectedExit();
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(restart).toHaveBeenCalledTimes(1);
+	});
+
 	it("cancels a pending restart for an intentional stop or app quit", async () => {
 		const { controller, restart } = createController();
 
@@ -93,5 +146,65 @@ describe("DaemonRestartController", () => {
 		await vi.runAllTimersAsync();
 
 		expect(restart).not.toHaveBeenCalled();
+	});
+});
+
+describe("daemon restart ownership and reachability", () => {
+	it("disposes and clears a stale supervisor link when adopting a headless daemon", () => {
+		const ownership = new DaemonOwnershipController();
+		const link = { connected: true, dispose: vi.fn() };
+		ownership.setAppOwned(true);
+		ownership.replaceSupervisorLink(link);
+
+		ownership.setAppOwned(false);
+
+		expect(link.dispose).toHaveBeenCalledTimes(1);
+		expect(ownership.appOwned).toBe(false);
+		expect(ownership.hasSupervisorLink).toBe(false);
+		expect(ownership.supervisorConnected).toBe(false);
+	});
+
+	it("trusts direct-port ownership only when running.json matches the probed PID", () => {
+		const info = { pid: 42, owner: "app" };
+
+		expect(validatedDaemonOwner(info, 42)).toBe("app");
+		expect(validatedDaemonOwner(info, 99)).toBeUndefined();
+		expect(validatedDaemonOwner(null, 42)).toBeUndefined();
+	});
+
+	it("uses the expected-port probe before declaring an adopted daemon unreachable", async () => {
+		const fromRunFile = vi.fn().mockResolvedValue(null);
+		const ready = { state: "ready" as const, port: 3001, pid: 42 };
+		const fromExpectedPort = vi.fn().mockResolvedValue(ready);
+
+		await expect(resolveReachableDaemon(fromRunFile, fromExpectedPort)).resolves.toEqual({
+			source: "port",
+			value: ready,
+		});
+		expect(fromExpectedPort).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not probe the port when the validated run-file daemon is reachable", async () => {
+		const fromRunFile = vi.fn().mockResolvedValue({ status: { state: "ready" }, owner: "app" });
+		const fromExpectedPort = vi.fn();
+
+		await expect(resolveReachableDaemon(fromRunFile, fromExpectedPort)).resolves.toMatchObject({
+			source: "run-file",
+		});
+		expect(fromExpectedPort).not.toHaveBeenCalled();
+	});
+});
+
+describe("isCrashLikeDaemonExit", () => {
+	it("leaves graceful external stops stopped", () => {
+		expect(isCrashLikeDaemonExit(0, null)).toBe(false);
+		expect(isCrashLikeDaemonExit(null, "SIGTERM")).toBe(false);
+		expect(isCrashLikeDaemonExit(null, "SIGINT")).toBe(false);
+	});
+
+	it("restarts non-zero exits, fatal signals, and unknown exits", () => {
+		expect(isCrashLikeDaemonExit(1, null)).toBe(true);
+		expect(isCrashLikeDaemonExit(null, "SIGKILL")).toBe(true);
+		expect(isCrashLikeDaemonExit(null, null)).toBe(true);
 	});
 });

@@ -51,9 +51,15 @@ import { buildDaemonEnv, resolveShellEnv, type ShellRunner } from "./shared/shel
 import { DEFAULT_POSTHOG_HOST, DEFAULT_POSTHOG_PROJECT_KEY } from "./shared/posthog-config";
 import { buildTelemetryBootstrap } from "./shared/telemetry";
 import { createBrowserViewHost, type BrowserViewHost } from "./main/browser-view-host";
-import { connectSupervisor, type SupervisorLinkHandle } from "./main/supervisor-link";
+import { connectSupervisor } from "./main/supervisor-link";
 import { shouldLinkOnAttach } from "./main/daemon-owner";
-import { DaemonRestartController } from "./main/daemon-restart";
+import {
+	DaemonOwnershipController,
+	DaemonRestartController,
+	isCrashLikeDaemonExit,
+	resolveReachableDaemon,
+	validatedDaemonOwner,
+} from "./main/daemon-restart";
 import { readMigrationState, updateMigration, writeAppStateMarker, type MigrationState } from "./main/app-state";
 import { isAllowedAppExternalURL, openAllowedAppExternalURL } from "./main/external-open";
 
@@ -100,9 +106,7 @@ let daemonStartEpoch = 0;
 let daemonStatus: DaemonStatus = { state: "stopped" };
 let browserViewHost: BrowserViewHost | null = null;
 let appQuitting = false;
-let daemonOwnedByApp = false;
-// Held for the app lifetime. Dropping it (on any exit) triggers daemon self-stop.
-let supervisorLink: SupervisorLinkHandle | null = null;
+const daemonOwnership = new DaemonOwnershipController();
 
 // The desktop app owns the daemon it spawns, so replace an unexpectedly exited
 // child with a bounded retry loop. Go's boot reconciliation adopts the durable
@@ -110,11 +114,10 @@ let supervisorLink: SupervisorLinkHandle | null = null;
 // stops and app quit cancel the loop below; no signal handling changes are
 // needed in either process.
 const daemonRestart = new DaemonRestartController({
-	restart: () => {
-		if (!daemonProcess) void startDaemon();
-	},
-	shouldRestart: () => daemonOwnedByApp && !appQuitting,
+	restart: () => (daemonProcess ? undefined : startDaemon()),
+	shouldRestart: () => daemonOwnership.appOwned && !appQuitting,
 	log: (message) => console.log(`AO: ${message}`),
+	onExhausted: () => daemonOwnership.clear(),
 });
 
 const execFileAsync = promisify(execFile);
@@ -591,10 +594,11 @@ function establishSupervisorLink(): void {
 				? path.join(path.dirname(rfp), "supervise.sock")
 				: null;
 	if (addr) {
-		supervisorLink?.dispose();
-		supervisorLink = connectSupervisor(addr, {
-			log: (msg) => console.log(`AO: ${msg}`),
-		});
+		daemonOwnership.replaceSupervisorLink(
+			connectSupervisor(addr, {
+				log: (msg) => console.log(`AO: ${msg}`),
+			}),
+		);
 	} else {
 		console.warn("AO: supervisor link skipped; run-file path unavailable");
 	}
@@ -623,6 +627,16 @@ async function inspectExistingDaemon(
 	return { status, owner };
 }
 
+async function readValidatedDaemonOwner(pid: number | undefined): Promise<string | undefined> {
+	const rfp = runFilePath();
+	if (!rfp || pid === undefined) return undefined;
+	try {
+		return validatedDaemonOwner(parseRunFile(await readFile(rfp, "utf8")), pid);
+	} catch {
+		return undefined;
+	}
+}
+
 async function refreshDaemonStatus(): Promise<DaemonStatus> {
 	if (daemonProcess) {
 		return daemonStatus;
@@ -635,12 +649,27 @@ async function refreshDaemonStatus(): Promise<DaemonStatus> {
 		process.platform,
 	);
 	if (!launch) return daemonStatus;
-	const existing = await inspectExistingDaemon(launch);
-	if (existing) {
+	const reachable = await resolveReachableDaemon(
+		() => inspectExistingDaemon(launch),
+		() =>
+			resolveDaemonFromPort({
+				expectedPort: resolvedDaemonPort(),
+				probe: readDaemonProbe,
+				identityError: (probe) => daemonIdentityError(launch, probe),
+			}),
+	);
+	if (reachable) {
 		const wasReady = daemonStatus.state === "ready";
-		daemonOwnedByApp = shouldLinkOnAttach(existing.owner);
-		setDaemonStatus(existing.status);
-		if (daemonOwnedByApp && !wasReady && existing.status.state === "ready") daemonRestart.onReady();
+		const status = reachable.source === "run-file" ? reachable.value.status : reachable.value;
+		const owner =
+			reachable.source === "run-file" ? reachable.value.owner : await readValidatedDaemonOwner(reachable.value.pid);
+		const appOwned = shouldLinkOnAttach(owner);
+		daemonOwnership.setAppOwned(appOwned);
+		setDaemonStatus(status);
+		if (appOwned) {
+			if (!wasReady && status.state === "ready") daemonRestart.onReady();
+			if (!daemonOwnership.hasSupervisorLink) establishSupervisorLink();
+		}
 	} else if (
 		daemonStatus.state === "ready" ||
 		(daemonStatus.state === "error" && (daemonStatus.pid || daemonStatus.port))
@@ -650,7 +679,7 @@ async function refreshDaemonStatus(): Promise<DaemonStatus> {
 			message: "AO daemon is no longer reachable.",
 			code: "daemon_unreachable",
 		});
-		if (daemonOwnedByApp) daemonRestart.onUnexpectedExit();
+		if (daemonOwnership.appOwned) daemonRestart.onUnexpectedExit();
 	}
 	return daemonStatus;
 }
@@ -711,12 +740,11 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		// Re-link the supervisor only when attaching to an app-owned daemon (one we
 		// previously spawned). Headless `ao start` daemons (owner unset) stay unlinked
 		// so they remain persistent after app quit.
-		if (shouldLinkOnAttach(existing.owner)) {
-			daemonOwnedByApp = true;
+		const appOwned = shouldLinkOnAttach(existing.owner);
+		daemonOwnership.setAppOwned(appOwned);
+		if (appOwned) {
 			if (existing.status.state === "ready") daemonRestart.onReady();
 			establishSupervisorLink();
-		} else {
-			daemonOwnedByApp = false;
 		}
 		return daemonStatus;
 	}
@@ -739,28 +767,14 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	}
 	if (directDaemon) {
 		setDaemonStatus(directDaemon);
-		// Re-link iff the daemon is app-owned. Read the run-file for the owner tag;
-		// if unavailable (run-file absent or unreadable), treat as headless and skip.
-		// ponytail: narrow TOCTOU here (the port was probed live, then the run-file
-		// is read separately), so in theory a headless daemon could have replaced an
-		// app-owned one in the gap. Acceptable: the window is tiny, the worst case is
-		// linking a headless daemon, and establishSupervisorLink disposes any prior
-		// link so nothing leaks.
-		const rfp = runFilePath();
-		let portAttachOwner: string | undefined;
-		if (rfp) {
-			try {
-				portAttachOwner = parseRunFile(await readFile(rfp, "utf8"))?.owner ?? undefined;
-			} catch {
-				// run-file absent or unreadable: treat as headless, skip link.
-			}
-		}
-		if (shouldLinkOnAttach(portAttachOwner)) {
-			daemonOwnedByApp = true;
+		// A direct-port attach deliberately distrusts stale running.json ownership.
+		// Re-link only when the run-file PID names the daemon that answered the probe.
+		const portAttachOwner = await readValidatedDaemonOwner(directDaemon.pid);
+		const appOwned = shouldLinkOnAttach(portAttachOwner);
+		daemonOwnership.setAppOwned(appOwned);
+		if (appOwned) {
 			if (directDaemon.state === "ready") daemonRestart.onReady();
 			establishSupervisorLink();
-		} else {
-			daemonOwnedByApp = false;
 		}
 		return daemonStatus;
 	}
@@ -825,7 +839,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	}
 
 	if (launch.source === "bundled" && !existsSync(launch.command)) {
-		daemonOwnedByApp = false;
+		daemonOwnership.clear();
 		setDaemonStatus({
 			state: "error",
 			message: `Bundled AO daemon binary was not found at ${launch.command}. Rebuild the desktop package.`,
@@ -835,7 +849,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	}
 
 	setDaemonStatus({ state: "starting" });
-	daemonOwnedByApp = true;
+	daemonOwnership.setAppOwned(true);
 
 	// Capture the spawned handle locally so the async lifecycle listeners act only
 	// on THIS process. Without this, a stale exit from an already-stopped daemon
@@ -870,22 +884,19 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		if (fallbackTimer) clearTimeout(fallbackTimer);
 		fallbackTimer = undefined;
 	};
+	const reportReady = (status: DaemonStatus) => {
+		stopDiscovery();
+		setDaemonStatus(status);
+		daemonRestart.onReady();
+		// Establish the OS-native liveness link unconditionally: this callback is
+		// used only on the spawn path, where Electron owns the daemon.
+		establishSupervisorLink();
+	};
 
 	const reportBoundPort = (port: number) => {
 		if (portConfirmed || daemonProcess !== child || daemonStoppingProcess === child) return;
 		portConfirmed = true;
-		stopDiscovery();
-		setDaemonStatus({ state: "ready", port });
-		daemonRestart.onReady();
-
-		// Establish the OS-native liveness link unconditionally: this callback fires
-		// only on the spawn path (we own this daemon). Holding the connection keeps
-		// the daemon alive; when Electron exits for any reason, the OS closes the fd
-		// and the daemon detects EOF, then self-stops after its ~5s grace period.
-		// The attach paths link only when the daemon is app-owned (see
-		// establishSupervisorLink + shouldLinkOnAttach); headless `ao start` daemons
-		// stay unlinked so they remain persistent across app quit.
-		establishSupervisorLink();
+		reportReady({ state: "ready", port });
 	};
 
 	// One scanner per stream: each keeps its own partial-line buffer.
@@ -924,8 +935,8 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// the configured port so the renderer is not stuck on "starting" forever.
 	fallbackTimer = setTimeout(() => {
 		if (portConfirmed || daemonProcess !== child || daemonStoppingProcess === child) return;
-		stopDiscovery();
-		setDaemonStatus({
+		portConfirmed = true;
+		reportReady({
 			state: "ready",
 			port: resolvedDaemonPort(),
 			message: "Daemon port not confirmed from logs or running.json; assuming the configured port.",
@@ -939,6 +950,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		daemonProcess = null;
 		if (daemonStoppingProcess === child) daemonStoppingProcess = null;
 		setDaemonStatus({ state: "error", message: error.message, code: "spawn_failed" });
+		daemonRestart.onUnexpectedExit();
 	});
 
 	child.once("exit", (code, signal) => {
@@ -952,6 +964,12 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		// failures. Preserve the clean stopped status instead.
 		if (daemonStoppingProcess === child) {
 			daemonStoppingProcess = null;
+			setDaemonStatus({ state: "stopped" });
+			return;
+		}
+		if (!isCrashLikeDaemonExit(code, signal)) {
+			daemonRestart.cancel();
+			daemonOwnership.clear();
 			setDaemonStatus({ state: "stopped" });
 			return;
 		}
@@ -983,7 +1001,7 @@ function killDaemon(child: ChildProcessWithoutNullStreams): void {
 
 function stopDaemon(): DaemonStatus {
 	daemonRestart.cancel();
-	daemonOwnedByApp = false;
+	daemonOwnership.clear();
 	daemonStartEpoch += 1;
 	daemonStartPromise = null;
 	if (!daemonProcess) {
@@ -995,8 +1013,6 @@ function stopDaemon(): DaemonStatus {
 	// Drop the liveness link: an explicit stop is not a frontend death, so stop
 	// holding the socket open (and stop the reconnect loop retrying a dead daemon).
 	// A later daemon:start re-establishes the link via reportBoundPort.
-	supervisorLink?.dispose();
-	supervisorLink = null;
 	killDaemon(daemonProcess);
 	setDaemonStatus({ state: "stopped" });
 	return daemonStatus;
@@ -1445,7 +1461,7 @@ app.on("before-quit", () => {
 // When the link IS connected we do nothing here and rely on the OS closing the
 // fd on exit, which covers crash and SIGKILL uniformly.
 process.on("exit", () => {
-	if (daemonProcess && !supervisorLink?.connected) {
+	if (daemonProcess && !daemonOwnership.supervisorConnected) {
 		killDaemon(daemonProcess);
 	}
 });
