@@ -1564,6 +1564,50 @@ func TestApplyReviewResultSendsAndDedupsThroughPRSignature(t *testing.T) {
 	}
 }
 
+func TestApplyReviewResultThirdClassOccurrenceUsesSimplificationRound(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	msg := &fakeMessenger{}
+	telemetry := &telemetrySink{}
+	m := New(st, msg, WithTelemetry(telemetry))
+	result := ReviewResult{
+		RunID: "run-3", WorkerID: "mer-1", PRURL: "https://github.com/o/r/pull/1",
+		Verdict:             domain.VerdictChangesRequested,
+		Findings:            []domain.ReviewFinding{{ClassTag: "missing-notify", File: "notify.go", Body: "broken path skips notify"}},
+		Ledger:              domain.FindingLedgerSummary{TotalFindings: 3, Rounds: 3, Classes: []domain.FindingClassCount{{ClassTag: "missing-notify", Count: 3}}},
+		SimplificationClass: "missing-notify",
+	}
+	outcome, err := m.ApplyReviewResult(ctx, "mer-1", result)
+	if err != nil || outcome != ReviewDeliverySent {
+		t.Fatalf("ApplyReviewResult = %q, %v", outcome, err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("messages = %v", msg.msgs)
+	}
+	for _, want := range []string{"Finding-class ledger: 3 findings over 3 rounds", "KIND: SIMPLIFICATION ROUND", "enforce it at ONE chokepoint", "enumerate every sibling code path"} {
+		if !strings.Contains(msg.msgs[0], want) {
+			t.Fatalf("simplification dispatch missing %q: %s", want, msg.msgs[0])
+		}
+	}
+	if len(telemetry.events) != 1 || telemetry.events[0].Name != "review_simplification_round" {
+		t.Fatalf("telemetry = %+v", telemetry.events)
+	}
+}
+
+func TestActionableReviewBodyKeepsPartialDeflection(t *testing.T) {
+	result := ReviewResult{Findings: []domain.ReviewFinding{
+		{ClassTag: "partial", Body: "still resolve the bound thread", OutOfScope: true, DeferredIssueURL: "issue", ThreadID: "thread"},
+		{ClassTag: "done", Body: "already deferred", OutOfScope: true, DeferredIssueURL: "issue", ThreadID: "thread", ThreadResolved: true},
+	}}
+	body := actionableReviewBody(result)
+	if !strings.Contains(body, "still resolve the bound thread") {
+		t.Fatalf("partial deflection omitted from dispatch: %q", body)
+	}
+	if strings.Contains(body, "already deferred") {
+		t.Fatalf("fully deflected finding remained actionable: %q", body)
+	}
+}
+
 func TestApplyReviewResultSuppressedByJITGuardIsNotDelivered(t *testing.T) {
 	// The worker is working at ApplyReviewResult's entry guard (read #1) but a
 	// permission dialog stores blocked before sendOnce's just-in-time re-read

@@ -77,7 +77,14 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 			}
 		} else {
 			outcome := CoordinateWaiting
+			findings, err := e.store.ListReviewFindingsBySession(ctx, workerID)
+			if err != nil {
+				return CoordinateResult{}, err
+			}
+			allDeflected := currentRunFindingsDeflected(findings, current.ID)
 			if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictApproved && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
+				outcome = CoordinateSatisfied
+			} else if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictChangesRequested && allDeflected && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
 				outcome = CoordinateSatisfied
 			} else if current.Status != domain.ReviewRunRunning && current.Verdict == domain.VerdictChangesRequested && !reviewBodyHasBlockingFindings(current.Body) && !reviewpolicy.HasUnresolvedCodexP0P1(obs.Review.Threads) {
 				outcome = CoordinateSatisfied
@@ -92,6 +99,14 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 			}
 		}
 		return CoordinateResult{Outcome: CoordinateExhausted, Round: round}, nil
+	}
+	// A newly eligible head is the worker's attempted fix for every still-open
+	// finding from earlier rounds. Persist that relationship before launching so
+	// it survives reviewer failures and daemon restarts.
+	if !hasCurrent {
+		if _, err := e.store.SetPendingReviewFindingFixCommit(ctx, workerID, prURL, head); err != nil {
+			return CoordinateResult{}, err
+		}
 	}
 
 	triggered, err := e.trigger(ctx, workerID, prURL)
@@ -111,6 +126,20 @@ func (e *Engine) Coordinate(ctx stdctx.Context, workerID domain.SessionID, obs p
 		round++
 	}
 	return CoordinateResult{Outcome: CoordinateStarted, Round: round, Run: triggered.Run}, nil
+}
+
+func currentRunFindingsDeflected(findings []domain.ReviewFinding, runID string) bool {
+	found := false
+	for _, finding := range findings {
+		if finding.RunID != runID {
+			continue
+		}
+		found = true
+		if !finding.FullyDeflected() {
+			return false
+		}
+	}
+	return found
 }
 
 func coordinateEligible(obs ports.SCMObservation) bool {

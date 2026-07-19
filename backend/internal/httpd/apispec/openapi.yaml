@@ -2079,6 +2079,31 @@ components:
       required:
       - harness
       type: object
+    FindingClassCount:
+      properties:
+        classTag:
+          type: string
+        count:
+          type: integer
+      required:
+      - classTag
+      - count
+      type: object
+    FindingLedgerSummary:
+      properties:
+        classes:
+          items:
+            $ref: '#/components/schemas/FindingClassCount'
+          type: array
+        rounds:
+          type: integer
+        totalFindings:
+          type: integer
+      required:
+      - totalFindings
+      - rounds
+      - classes
+      type: object
     ImportReport:
       properties:
         dryRun:
@@ -2199,6 +2224,12 @@ components:
       type: object
     ListReviewsResponse:
       properties:
+        findings:
+          items:
+            $ref: '#/components/schemas/ReviewFinding'
+          type: array
+        ledger:
+          $ref: '#/components/schemas/FindingLedgerSummary'
         reviewerHandleId:
           type: string
         reviews:
@@ -2208,6 +2239,8 @@ components:
       required:
       - reviewerHandleId
       - reviews
+      - findings
+      - ledger
       type: object
     ListSessionPRsResponse:
       properties:
@@ -2481,6 +2514,8 @@ components:
           items:
             type: string
           type: array
+        reviewPolicy:
+          $ref: '#/components/schemas/ReviewPolicyConfig'
         reviewers:
           items:
             $ref: '#/components/schemas/DomainReviewerConfig'
@@ -2609,6 +2644,55 @@ components:
       - ok
       - sessionId
       - session
+      type: object
+    ReviewFinding:
+      properties:
+        body:
+          type: string
+        classTag:
+          type: string
+        createdAt:
+          format: date-time
+          type: string
+        deferredIssueUrl:
+          type: string
+        file:
+          type: string
+        fixCommit:
+          type: string
+        id:
+          type: string
+        outOfScope:
+          type: boolean
+        prUrl:
+          type: string
+        rootCauseNote:
+          type: string
+        round:
+          type: integer
+        runId:
+          type: string
+        sessionId:
+          type: string
+        threadId:
+          type: string
+        threadResolved:
+          type: boolean
+      required:
+      - id
+      - runId
+      - sessionId
+      - prUrl
+      - round
+      - file
+      - classTag
+      - rootCauseNote
+      - createdAt
+      type: object
+    ReviewPolicyConfig:
+      properties:
+        outOfScopeDeflection:
+          type: boolean
       type: object
     ReviewRun:
       properties:
@@ -3097,11 +3181,37 @@ components:
       required:
       - projectId
       type: object
+    SubmitFindingItem:
+      properties:
+        body:
+          type: string
+        classTag:
+          description: Stable kebab-case root-cause class.
+          type: string
+        file:
+          type: string
+        outOfScope:
+          description: Finding belongs to a subsystem outside this PR's core scope.
+          type: boolean
+        rootCauseNote:
+          description: One-line invariant or root-cause explanation.
+          type: string
+        threadId:
+          description: Provider review-thread node id.
+          type: string
+      required:
+      - classTag
+      - rootCauseNote
+      type: object
     SubmitReviewInput:
       properties:
         body:
           description: Review body recorded by AO. Required for changes_requested.
           type: string
+        findings:
+          items:
+            $ref: '#/components/schemas/SubmitFindingItem'
+          type: array
         githubReviewId:
           description: Id of the GitHub PR review the reviewer posted, if any.
           type: string
@@ -3122,6 +3232,11 @@ components:
         body:
           description: Review body recorded by AO. Required for changes_requested.
           type: string
+        findings:
+          description: Structured blocking findings for the finding-class ledger.
+          items:
+            $ref: '#/components/schemas/SubmitFindingItem'
+          type: array
         githubReviewId:
           description: Id of the GitHub PR review the reviewer posted, if any.
           type: string

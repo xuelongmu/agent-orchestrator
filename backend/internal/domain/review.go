@@ -53,6 +53,55 @@ type ReviewRun struct {
 	GithubReviewID string     `json:"githubReviewId"`
 	CreatedAt      time.Time  `json:"createdAt"`
 	DeliveredAt    *time.Time `json:"deliveredAt,omitempty"`
+	// SimplificationClass is initially selected atomically with the finding set,
+	// then atomically refreshed from the actionable ledger after deflection. It
+	// is empty unless an actionable class in this run crossed the repetition
+	// threshold. SimplificationDispatchedAt records durable delivery of that mode.
+	SimplificationClass        string     `json:"-"`
+	SimplificationDispatchedAt *time.Time `json:"-"`
+	DeflectedReviewClearedAt   *time.Time `json:"-"`
+}
+
+// ReviewFinding is one durable entry in a PR's finding-class ledger. Round is
+// the distinct reviewed-head number for the PR. FixCommit is filled when a
+// later head is observed, preserving which commit attempted to address it.
+type ReviewFinding struct {
+	ID               string    `json:"id"`
+	RunID            string    `json:"runId"`
+	SessionID        SessionID `json:"sessionId"`
+	PRURL            string    `json:"prUrl"`
+	Round            int       `json:"round"`
+	File             string    `json:"file"`
+	ClassTag         string    `json:"classTag"`
+	RootCauseNote    string    `json:"rootCauseNote"`
+	FixCommit        string    `json:"fixCommit,omitempty"`
+	ThreadID         string    `json:"threadId,omitempty"`
+	Body             string    `json:"body,omitempty"`
+	OutOfScope       bool      `json:"outOfScope,omitempty"`
+	DeferredIssueURL string    `json:"deferredIssueUrl,omitempty"`
+	ThreadResolved   bool      `json:"threadResolved,omitempty"`
+	ThreadReplyID    string    `json:"-"`
+	CreatedAt        time.Time `json:"createdAt"`
+}
+
+// FullyDeflected reports whether provider-backed deflection is durably
+// complete. Partial external work remains actionable until both the backlog
+// issue and the bound review-thread resolution have receipts.
+func (f ReviewFinding) FullyDeflected() bool {
+	return f.OutOfScope && f.DeferredIssueURL != "" && f.ThreadID != "" && f.ThreadResolved
+}
+
+// FindingClassCount summarizes a finding taxonomy for dispatch and UI use.
+type FindingClassCount struct {
+	ClassTag string `json:"classTag"`
+	Count    int    `json:"count"`
+}
+
+// FindingLedgerSummary is the compact per-session view of review history.
+type FindingLedgerSummary struct {
+	TotalFindings int                 `json:"totalFindings"`
+	Rounds        int                 `json:"rounds"`
+	Classes       []FindingClassCount `json:"classes"`
 }
 
 // ReviewRunStatus is the lifecycle state of a single review pass.

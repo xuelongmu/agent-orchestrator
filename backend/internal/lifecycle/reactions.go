@@ -64,15 +64,18 @@ const (
 // Lifecycle treats it as input to the reaction reducer; it does not write the
 // review_run row.
 type ReviewResult struct {
-	RunID          string
-	BatchID        string
-	WorkerID       domain.SessionID
-	PRURL          string
-	TargetSHA      string
-	Verdict        domain.ReviewVerdict
-	Body           string
-	GithubReviewID string
-	DeliveredAt    *time.Time
+	RunID               string
+	BatchID             string
+	WorkerID            domain.SessionID
+	PRURL               string
+	TargetSHA           string
+	Verdict             domain.ReviewVerdict
+	Body                string
+	GithubReviewID      string
+	DeliveredAt         *time.Time
+	Findings            []domain.ReviewFinding
+	Ledger              domain.FindingLedgerSummary
+	SimplificationClass string
 }
 
 // ApplyReviewBatch reacts to one reviewer CLI submission after the review
@@ -106,13 +109,14 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 		if r.TargetSHA != "" {
 			fmt.Fprintf(&msg, "\nHead commit: %s", domain.SanitizeControlChars(r.TargetSHA))
 		}
+		writeReviewDispatchPolicy(&msg, r)
 		if r.GithubReviewID != "" {
 			safeReviewID := domain.SanitizeControlChars(r.GithubReviewID)
 			fmt.Fprintf(&msg, "\nGitHub review: %s", safeReviewID)
 			fmt.Fprintf(&msg, "\nOnce you have addressed it, reply on GitHub review %s with how you addressed it, then resolve the review comment threads you addressed.", safeReviewID)
 		}
-		if r.Body != "" {
-			fmt.Fprintf(&msg, "\n\nReview body:\n%s\n", domain.SanitizeControlChars(r.Body))
+		if body := actionableReviewBody(r); body != "" {
+			fmt.Fprintf(&msg, "\n\n%s:\n%s\n", reviewBodyLabel(r), domain.SanitizeControlChars(body))
 		}
 		sigParts = append(sigParts, strings.Join([]string{r.RunID, r.PRURL, r.TargetSHA, r.GithubReviewID, r.Body}, "\x00"))
 	}
@@ -129,7 +133,77 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 		// delivered — it must re-fire once the session is workable again.
 		return ReviewDeliveryNoop, nil
 	}
+	for _, result := range results {
+		m.emitSimplificationRound(ctx, rec, result)
+	}
 	return ReviewDeliverySent, nil
+}
+
+func writeReviewDispatchPolicy(msg *strings.Builder, r ReviewResult) {
+	if r.Ledger.TotalFindings > 0 {
+		fmt.Fprintf(msg, "\nFinding-class ledger: %s\n", findingLedgerSummary(r.Ledger))
+	}
+	if r.SimplificationClass != "" {
+		fmt.Fprintf(msg, "\nKIND: SIMPLIFICATION ROUND\nThe class %q has recurred at least 3 times. Identify the invariant this class violates and enforce it at ONE chokepoint; delete the per-site predicates. Treat the individual findings as symptoms and test cases, not as a patch list.\n", domain.SanitizeControlChars(r.SimplificationClass))
+	}
+	msg.WriteString("\nAfter addressing each finding, enumerate every sibling code path with the same shape and apply the same guarantee before pushing.\n")
+}
+
+func findingLedgerSummary(ledger domain.FindingLedgerSummary) string {
+	parts := make([]string, 0, len(ledger.Classes))
+	for _, class := range ledger.Classes {
+		parts = append(parts, fmt.Sprintf("%d are class %s", class.Count, domain.SanitizeControlChars(class.ClassTag)))
+	}
+	summary := fmt.Sprintf("%d findings over %d rounds", ledger.TotalFindings, ledger.Rounds)
+	if len(parts) > 0 {
+		summary += "; " + strings.Join(parts, "; ")
+	}
+	return summary
+}
+
+func actionableReviewBody(r ReviewResult) string {
+	if len(r.Findings) == 0 {
+		return r.Body
+	}
+	var lines []string
+	for _, finding := range r.Findings {
+		if finding.FullyDeflected() {
+			continue
+		}
+		line := fmt.Sprintf("- [%s]", finding.ClassTag)
+		if finding.File != "" {
+			line += " " + finding.File
+		}
+		if finding.Body != "" {
+			line += ": " + finding.Body
+		} else if finding.RootCauseNote != "" {
+			line += ": " + finding.RootCauseNote
+		}
+		if finding.ThreadID != "" {
+			line += " (thread " + finding.ThreadID + ")"
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func reviewBodyLabel(r ReviewResult) string {
+	if len(r.Findings) == 0 {
+		return "Review body"
+	}
+	return "Actionable findings"
+}
+
+func (m *Manager) emitSimplificationRound(ctx context.Context, rec domain.SessionRecord, r ReviewResult) {
+	if r.SimplificationClass == "" {
+		return
+	}
+	projectID, sessionID := rec.ProjectID, rec.ID
+	m.emitTelemetry(ctx, ports.TelemetryEvent{
+		Name: "review_simplification_round", Source: "lifecycle", OccurredAt: m.clock(),
+		Level: ports.TelemetryLevelInfo, ProjectID: &projectID, SessionID: &sessionID,
+		Payload: map[string]any{"pr_url": r.PRURL, "class_tag": r.SimplificationClass, "findings": r.Ledger.TotalFindings, "rounds": r.Ledger.Rounds},
+	})
 }
 
 type reactionState struct {
@@ -847,13 +921,16 @@ func (m *Manager) ApplyReviewResult(ctx context.Context, workerID domain.Session
 		return ReviewDeliveryNoop, nil
 	}
 	msg := fmt.Sprintf("[AO reviewer] AO's internal code reviewer submitted a review.\n\nPR: %s\nVerdict: %s", domain.SanitizeControlChars(r.PRURL), domain.SanitizeControlChars(string(r.Verdict)))
+	var policy strings.Builder
+	writeReviewDispatchPolicy(&policy, r)
+	msg += policy.String()
 	if r.GithubReviewID != "" {
 		safeReviewID := domain.SanitizeControlChars(r.GithubReviewID)
 		msg += fmt.Sprintf("\nGitHub review: %s", safeReviewID)
 		msg += fmt.Sprintf("\n\nOnce you have addressed it, reply on GitHub review %s with how you addressed it, then resolve the review comment threads you addressed.", safeReviewID)
 	}
-	if r.Body != "" {
-		msg += "\n\nReview body:\n" + domain.SanitizeControlChars(r.Body)
+	if body := actionableReviewBody(r); body != "" {
+		msg += "\n\n" + reviewBodyLabel(r) + ":\n" + domain.SanitizeControlChars(body)
 	}
 	key := "review:" + r.PRURL + ":ao:" + r.RunID
 	sig := strings.Join([]string{r.TargetSHA, r.RunID, r.GithubReviewID, r.Body}, "\x00")
@@ -867,6 +944,7 @@ func (m *Manager) ApplyReviewResult(ctx context.Context, workerID domain.Session
 		// undelivered to re-fire on the next observation.
 		return ReviewDeliveryNoop, nil
 	}
+	m.emitSimplificationRound(ctx, rec, r)
 	return ReviewDeliverySent, nil
 }
 
