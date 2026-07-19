@@ -6,6 +6,7 @@ package designcontract
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -38,6 +39,14 @@ const (
 	// Together with the target-bound digest and exact structural prefix, it
 	// lets a later daemon refresh only files created by this projection writer.
 	projectionOwnershipVersion = "ao-design-contract-projection/v1"
+	gitignoreStageDirectory    = ".git"
+	gitignoreStageMarker       = "ao-design-contract-gitignore-stage-v1"
+	gitignorePayloadPrefix     = "gitignore-"
+	gitignorePayloadSuffix     = ".stage"
+	bootstrapContainerPrefix   = ".bootstrap-"
+	bootstrapContainerSuffix   = ".stage"
+	legacyContainerPrefix      = ".git-"
+	legacyContainerSuffix      = ".stage"
 )
 
 var (
@@ -358,6 +367,44 @@ type PendingDelivery struct {
 
 var deliveryLocks sync.Map
 var projectionLocks sync.Map
+var publishGitignoreStageDirectory = publishProjectionDirectory
+
+type projectionFailureBoundary string
+
+const (
+	projectionCreateBoundary  projectionFailureBoundary = "create"
+	projectionWriteBoundary   projectionFailureBoundary = "write"
+	projectionSyncBoundary    projectionFailureBoundary = "sync"
+	projectionCloseBoundary   projectionFailureBoundary = "close"
+	projectionReplaceBoundary projectionFailureBoundary = "replace"
+	projectionStageValidated  projectionFailureBoundary = "post-stage-validation"
+	projectionTargetValidated projectionFailureBoundary = "post-target-validation"
+	projectionPublishBoundary projectionFailureBoundary = "publish-operation"
+)
+
+type projectionFailureHook func(projectionFailureBoundary, string) error
+
+type projectionIO struct {
+	openStage func(*os.Root, string, string) (*os.File, error)
+	write     func(*os.File, []byte, string) (int, error)
+	sync      func(*os.File, string) error
+	close     func(*os.File, string) error
+	publish   func(*os.Root, *os.Root, *os.File, os.FileInfo, string, string, os.FileInfo, func() error, string) error
+}
+
+func defaultProjectionIO() projectionIO {
+	return projectionIO{
+		openStage: func(root *os.Root, name, _ string) (*os.File, error) {
+			return root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		},
+		write: func(file *os.File, content []byte, _ string) (int, error) { return file.Write(content) },
+		sync:  func(file *os.File, _ string) error { return file.Sync() },
+		close: func(file *os.File, _ string) error { return file.Close() },
+		publish: func(sourceRoot, targetRoot *os.Root, stage *os.File, stageIdentity os.FileInfo, stageName, targetName string, targetIdentity os.FileInfo, beforePublish func() error, _ string) error {
+			return publishProjectionFile(sourceRoot, targetRoot, stage, stageIdentity, stageName, targetName, targetIdentity, beforePublish)
+		},
+	}
+}
 
 // LockDelivery serializes ownership claims and claim-ready pane delivery for
 // one exact PR inside the daemon. Callers still compare the durable generation
@@ -377,14 +424,25 @@ func Materialize(ctx context.Context, workspace, contract string) error {
 	return materialize(ctx, workspace, "Session draft (no PR identity yet)", "", contract)
 }
 
-// MaterializePR writes both a collision-safe per-PR projection and the current
-// task mapping. The explicit scope prevents stacked-PR workers from applying a
-// sibling's invariants.
+// MaterializePR attempts both a collision-safe per-PR projection and the
+// current task mapping. A platform that cannot conditionally replace the exact
+// validated target fails closed on refresh; SQLite remains canonical. The
+// explicit scope prevents stacked-PR workers from applying sibling invariants.
 func MaterializePR(ctx context.Context, workspace, prURL, contract string) error {
 	return materialize(ctx, workspace, "Pull request: "+prURL, prURL, contract)
 }
 
 func materialize(ctx context.Context, workspace, scope, prURL, contract string) error {
+	ops := defaultProjectionIO()
+	return materializeWithProjectionControls(ctx, workspace, scope, prURL, contract, nil, &ops)
+}
+
+func materializeWithFailureHook(ctx context.Context, workspace, contract string, failureHook projectionFailureHook) error {
+	ops := defaultProjectionIO()
+	return materializeWithProjectionControls(ctx, workspace, "Session draft (no PR identity yet)", "", contract, failureHook, &ops)
+}
+
+func materializeWithProjectionControls(ctx context.Context, workspace, scope, prURL, contract string, failureHook projectionFailureHook, ops *projectionIO) error {
 	if strings.TrimSpace(workspace) == "" {
 		return nil
 	}
@@ -452,9 +510,18 @@ func materialize(ctx context.Context, workspace, scope, prURL, contract string) 
 	if err := ensureSubrootStillBound(root, directory, aoIdentity); err != nil {
 		return err
 	}
-	if err := ensureProjectionGitignore(aoRoot, initialized); err != nil {
+	if err := rejectCaseFoldedEntry(aoRoot, ".", ".git"); err != nil {
+		return err
+	}
+	gitignorePath := filepath.ToSlash(filepath.Join(directory, ".gitignore"))
+	if err := ensureProjectionGitignore(aoRoot, initialized, gitignorePath, failureHook, ops); err != nil {
 		return fmt.Errorf("ignore design contract projection: %w", err)
 	}
+	projectionStageRoot, err := openOrCreateGitignoreStage(aoRoot, initialized)
+	if err != nil {
+		return fmt.Errorf("open authenticated projection staging root: %w", err)
+	}
+	defer func() { _ = projectionStageRoot.Close() }()
 	var contractsRoot *os.Root
 	var contractsIdentity os.FileInfo
 	if prURL != "" {
@@ -489,7 +556,7 @@ func materialize(ctx context.Context, workspace, scope, prURL, contract string) 
 			return err
 		}
 		content := projectionContent(perPRRelative, scope, contract)
-		if err := writeProjection(contractsRoot, filepath.Base(perPRRelative), perPRRelative, content); err != nil {
+		if err := writeProjectionWithControls(projectionStageRoot, contractsRoot, filepath.Base(perPRRelative), perPRRelative, content, failureHook, ops); err != nil {
 			return err
 		}
 	}
@@ -497,7 +564,7 @@ func materialize(ctx context.Context, workspace, scope, prURL, contract string) 
 		return err
 	}
 	content := projectionContent(currentPath, scope, contract)
-	return writeProjection(aoRoot, filename, currentPath, content)
+	return writeProjectionWithControls(projectionStageRoot, aoRoot, filename, currentPath, content, failureHook, ops)
 }
 
 func lockProjectionWorkspace(workspace string) func() {
@@ -606,6 +673,9 @@ func rejectTrackedProjectionDirectory(ctx context.Context, workspace string) err
 }
 
 func projectionGitignoreContent() string {
+	// This exact byte sequence shipped before crash-atomic projection updates.
+	// It is an ownership credential, so append-only compatibility changes are
+	// not permitted here.
 	return hookutil.GitignoreSentinel + "\n/.gitignore\n/CONTRACT.md\n/.CONTRACT-*.tmp\n/contracts/\n"
 }
 
@@ -639,30 +709,297 @@ func preflightProjectionOwnership(root *os.Root, targets []projectionTarget) (bo
 	return initialized, nil
 }
 
-func ensureProjectionGitignore(root *os.Root, initialized bool) error {
+// ensureProjectionGitignore bootstraps AO's local ignore marker through an
+// authenticated staging directory under the reserved .git pathname. Git
+// ignores every .git path component even before a repository rule exists. A
+// pre-existing regular .git file is always foreign; AO resumes a directory only
+// when its atomically-created marker entry proves staging ownership.
+func ensureProjectionGitignore(root *os.Root, initialized bool, ownershipTarget string, failureHook projectionFailureHook, ops *projectionIO) error {
 	if initialized {
+		// Authenticated staging is intentionally retained. POSIX has no
+		// identity-conditional unlink; leaving an ignored, reusable stage is
+		// safer than a path-based cleanup that could delete a foreign swap.
 		return nil
 	}
-	path := ".gitignore"
-	f, err := root.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	want := []byte(projectionGitignoreContent())
+	stageRoot, err := openOrCreateGitignoreStage(root, false)
 	if err != nil {
 		return err
 	}
-	pathInfo, lstatErr := root.Lstat(path)
+	defer func() { _ = stageRoot.Close() }()
+	entries, err := readRootEntries(stageRoot)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !isGitignoreStagePayload(entry.Name()) {
+			continue
+		}
+		existing, exists, err := readUnlinkedRegularFile(stageRoot, entry.Name())
+		if err != nil {
+			return fmt.Errorf("inspect design contract gitignore staging payload: %w", err)
+		}
+		if exists && bytes.Equal(existing, want) {
+			return installProjectionGitignore(root, stageRoot, entry.Name(), ownershipTarget, failureHook, ops)
+		}
+	}
+	if err := injectProjectionFailure(failureHook, projectionCreateBoundary, ownershipTarget); err != nil {
+		return err
+	}
+	payloadName, err := newGitignoreStageName()
+	if err != nil {
+		return err
+	}
+	f, err := ops.openStage(stageRoot, payloadName, ownershipTarget)
+	if err != nil {
+		return err
+	}
+	pathInfo, lstatErr := stageRoot.Lstat(payloadName)
 	info, statErr := f.Stat()
 	if lstatErr != nil || statErr != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() || !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
 		_ = f.Close()
 		return errors.New("design contract gitignore changed before ownership initialization")
 	}
-	if _, err := f.WriteString(projectionGitignoreContent()); err != nil {
+	if err := injectProjectionFailure(failureHook, projectionWriteBoundary, ownershipTarget); err != nil {
 		_ = f.Close()
 		return err
 	}
-	if err := f.Sync(); err != nil {
+	if _, err := ops.write(f, want, ownershipTarget); err != nil {
 		_ = f.Close()
 		return err
 	}
-	return f.Close()
+	if err := injectProjectionFailure(failureHook, projectionSyncBoundary, ownershipTarget); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := ops.sync(f, ownershipTarget); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := injectProjectionFailure(failureHook, projectionCloseBoundary, ownershipTarget); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := ops.close(f, ownershipTarget); err != nil {
+		return err
+	}
+	if err := syncProjectionContainer(stageRoot); err != nil {
+		return fmt.Errorf("sync gitignore staging directory: %w", err)
+	}
+	return installProjectionGitignore(root, stageRoot, payloadName, ownershipTarget, failureHook, ops)
+}
+
+func openOrCreateGitignoreStage(root *os.Root, allowLegacyFinal bool) (*os.Root, error) {
+	info, err := root.Lstat(gitignoreStageDirectory)
+	if err == nil {
+		return openAuthenticatedGitignoreStage(root, info, allowLegacyFinal)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect design contract gitignore staging directory: %w", err)
+	}
+
+	// The exact nested .git component is ignored by Git from the instant it is
+	// created, before AO owns .ao/.gitignore. Abandoned bootstrap containers are
+	// deliberately never enumerated or trusted; a restart creates a fresh one.
+	bootstrapName, err := newBootstrapContainerName()
+	if err != nil {
+		return nil, err
+	}
+	if err := root.Mkdir(bootstrapName, 0o700); err != nil {
+		return nil, fmt.Errorf("create design contract bootstrap container: %w", err)
+	}
+	bootstrapInfo, err := root.Lstat(bootstrapName)
+	if err != nil {
+		return nil, fmt.Errorf("inspect design contract bootstrap container: %w", err)
+	}
+	bootstrapRoot, _, err := openVerifiedSubroot(root, bootstrapName, bootstrapInfo)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = bootstrapRoot.Close() }()
+	if err := bootstrapRoot.Mkdir(gitignoreStageDirectory, 0o700); err != nil {
+		return nil, fmt.Errorf("create git-invisible design contract staging directory: %w", err)
+	}
+	stageInfo, err := bootstrapRoot.Lstat(gitignoreStageDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("inspect git-invisible design contract staging directory: %w", err)
+	}
+	stageRoot, stageIdentity, err := openVerifiedSubroot(bootstrapRoot, gitignoreStageDirectory, stageInfo)
+	if err != nil {
+		return nil, err
+	}
+	marker, err := stageRoot.OpenFile(gitignoreStageMarker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		_ = stageRoot.Close()
+		return nil, fmt.Errorf("authenticate git-invisible staging directory: %w", err)
+	}
+	if _, err := marker.Write(gitignoreStageMarkerContent(bootstrapName)); err != nil {
+		_ = marker.Close()
+		_ = stageRoot.Close()
+		return nil, fmt.Errorf("write gitignore staging ownership marker: %w", err)
+	}
+	if err := marker.Sync(); err != nil {
+		_ = marker.Close()
+		_ = stageRoot.Close()
+		return nil, fmt.Errorf("sync gitignore staging ownership marker: %w", err)
+	}
+	if err := marker.Close(); err != nil {
+		_ = stageRoot.Close()
+		return nil, fmt.Errorf("close gitignore staging ownership marker: %w", err)
+	}
+	if err := syncProjectionContainer(stageRoot); err != nil {
+		_ = stageRoot.Close()
+		return nil, fmt.Errorf("sync authenticated gitignore staging container: %w", err)
+	}
+	if err := syncProjectionContainer(bootstrapRoot); err != nil {
+		_ = stageRoot.Close()
+		return nil, fmt.Errorf("sync nested gitignore staging directory entry: %w", err)
+	}
+	if err := syncProjectionContainer(root); err != nil {
+		_ = stageRoot.Close()
+		return nil, fmt.Errorf("sync bootstrap container entry: %w", err)
+	}
+	_ = stageRoot.Close()
+	if err := publishGitignoreStageDirectory(bootstrapRoot, root, gitignoreStageDirectory, gitignoreStageDirectory, stageIdentity); err != nil {
+		return nil, fmt.Errorf("publish authenticated gitignore staging directory: %w", err)
+	}
+	return openPublishedGitignoreStage(root, false)
+}
+
+func openPublishedGitignoreStage(root *os.Root, allowLegacyFinal bool) (*os.Root, error) {
+	info, err := root.Lstat(gitignoreStageDirectory)
+	if err != nil {
+		return nil, err
+	}
+	return openAuthenticatedGitignoreStage(root, info, allowLegacyFinal)
+}
+
+func openAuthenticatedGitignoreStage(root *os.Root, info os.FileInfo, allowLegacyFinal bool) (*os.Root, error) {
+	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("foreign .ao/.git staging path prevents safe projection initialization")
+	}
+	stageRoot, _, err := openVerifiedSubroot(root, gitignoreStageDirectory, info)
+	if err != nil {
+		return nil, err
+	}
+	marker, exists, err := readUnlinkedRegularFile(stageRoot, gitignoreStageMarker)
+	if err != nil || !exists || !validGitignoreStageMarker(marker, allowLegacyFinal) {
+		_ = stageRoot.Close()
+		return nil, errors.New("unauthenticated .ao/.git staging directory prevents safe projection initialization")
+	}
+	entries, err := readRootEntries(stageRoot)
+	if err != nil {
+		_ = stageRoot.Close()
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.Name() != gitignoreStageMarker && !isGitignoreStagePayload(entry.Name()) && !isProjectionStage(entry.Name()) {
+			_ = stageRoot.Close()
+			return nil, errors.New("foreign entry in design contract gitignore staging directory")
+		}
+	}
+	return stageRoot, nil
+}
+
+func gitignoreStageMarkerContent(stageName string) []byte {
+	return []byte(gitignoreStageMarker + "\n" + stageName + "\n")
+}
+
+func validGitignoreStageMarker(marker []byte, allowLegacyFinal bool) bool {
+	if allowLegacyFinal && len(marker) == 0 {
+		return true
+	}
+	parts := strings.Split(string(marker), "\n")
+	return len(parts) == 3 && parts[0] == gitignoreStageMarker && parts[2] == "" && (isBootstrapContainer(parts[1]) || isLegacyStageContainer(parts[1]))
+}
+
+func installProjectionGitignore(root, stageRoot *os.Root, payloadName, ownershipTarget string, failureHook projectionFailureHook, ops *projectionIO) error {
+	if err := injectProjectionFailure(failureHook, projectionReplaceBoundary, ownershipTarget); err != nil {
+		return err
+	}
+	stageFile, stageIdentity, staged, err := openValidatedProjectionFile(stageRoot, payloadName)
+	if err != nil || string(staged) != projectionGitignoreContent() {
+		return errors.New("design contract gitignore staging file is incomplete")
+	}
+	defer func() { _ = stageFile.Close() }()
+	if err := injectProjectionFailure(failureHook, projectionStageValidated, ownershipTarget); err != nil {
+		return err
+	}
+	if err := ensureOpenedFileStillBound(stageRoot, payloadName, stageIdentity); err != nil {
+		return fmt.Errorf("revalidate gitignore staging payload before publish: %w", err)
+	}
+	if _, err := root.Lstat(".gitignore"); err == nil {
+		return errors.New("design contract gitignore appeared before atomic installation")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("reinspect design contract gitignore before installation: %w", err)
+	}
+	return ops.publish(stageRoot, root, stageFile, stageIdentity, payloadName, ".gitignore", nil, func() error {
+		return injectProjectionFailure(failureHook, projectionPublishBoundary, ownershipTarget)
+	}, ownershipTarget)
+}
+
+func isGitignoreStagePayload(name string) bool {
+	return strings.HasPrefix(name, gitignorePayloadPrefix) && strings.HasSuffix(name, gitignorePayloadSuffix)
+}
+
+func isBootstrapContainer(name string) bool {
+	return isRandomStageContainer(name, bootstrapContainerPrefix, bootstrapContainerSuffix)
+}
+
+func isLegacyStageContainer(name string) bool {
+	return isRandomStageContainer(name, legacyContainerPrefix, legacyContainerSuffix)
+}
+
+func isRandomStageContainer(name, prefix, suffix string) bool {
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return false
+	}
+	nonce := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+	if len(nonce) != 32 {
+		return false
+	}
+	for _, r := range nonce {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func isProjectionStage(name string) bool {
+	return strings.HasPrefix(name, ".CONTRACT-") && strings.HasSuffix(name, ".tmp")
+}
+
+func newGitignoreStageName() (string, error) {
+	name, err := newProjectionStageName()
+	if err != nil {
+		return "", err
+	}
+	return gitignorePayloadPrefix + strings.TrimSuffix(strings.TrimPrefix(name, ".CONTRACT-"), ".tmp") + gitignorePayloadSuffix, nil
+}
+
+func newBootstrapContainerName() (string, error) {
+	name, err := newProjectionStageName()
+	if err != nil {
+		return "", err
+	}
+	return bootstrapContainerPrefix + strings.TrimSuffix(strings.TrimPrefix(name, ".CONTRACT-"), ".tmp") + bootstrapContainerSuffix, nil
+}
+
+func readRootEntries(root *os.Root) ([]os.DirEntry, error) {
+	dir, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	entries, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return entries, nil
 }
 
 func verifyIgnored(ctx context.Context, workspace, relative string) error {
@@ -725,79 +1062,185 @@ func isOwnedProjection(target string, content []byte) bool {
 	return strings.HasPrefix(string(content), prefix) && strings.Contains(string(content), "\n\nWARNING: This projection applies only to the scope above. Do not apply it to a sibling PR, and do not edit it directly.\n\n"+trustBoundary)
 }
 
-// writeProjection opens a new target exclusively or refreshes an existing
-// AO-owned target through the verified file handle. It never performs a
-// check-then-rename replacement that could clobber a foreign file swapped into
-// the pathname between ownership validation and the write.
+// writeProjection stages complete bytes in AO's authenticated, ignored staging
+// root before publishing them. Fresh publication is handle-bound and
+// no-replace. Refresh is attempted only where the platform can keep the exact
+// validated target identity locked through publication; otherwise it fails
+// closed and leaves SQLite canonical.
 func writeProjection(root *os.Root, target, ownershipTarget, content string) error {
-	f, err := root.OpenFile(target, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	ops := defaultProjectionIO()
+	return writeProjectionWithControls(root, root, target, ownershipTarget, content, nil, &ops)
+}
+
+func writeProjectionWithControls(stageRoot, targetRoot *os.Root, target, ownershipTarget, content string, failureHook projectionFailureHook, ops *projectionIO) error {
+	if err := cleanupOwnedProjectionStages(stageRoot, ownershipTarget); err != nil {
+		return fmt.Errorf("recover design contract projection staging files: %w", err)
+	}
+	stage, err := newProjectionStageName()
 	if err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("create design contract projection: %w", err)
-		}
-		pathInfo, lstatErr := root.Lstat(target)
-		if lstatErr != nil {
-			return fmt.Errorf("inspect design contract projection: %w", lstatErr)
-		}
-		if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
-			return errors.New("design contract target is not an unlinked regular file")
-		}
-		f, err = root.OpenFile(target, os.O_RDWR, 0)
-		if err != nil {
-			return fmt.Errorf("open design contract projection: %w", err)
-		}
-		info, statErr := f.Stat()
-		if statErr != nil {
-			_ = f.Close()
-			return fmt.Errorf("inspect design contract projection: %w", statErr)
-		}
-		if !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
-			_ = f.Close()
-			return errors.New("design contract target changed during ownership validation")
-		}
-		existing, readErr := io.ReadAll(io.LimitReader(f, MaxCanonicalBytes+64*1024))
-		if readErr != nil {
-			_ = f.Close()
-			return fmt.Errorf("read design contract projection: %w", readErr)
-		}
-		if !isOwnedProjection(ownershipTarget, existing) {
-			_ = f.Close()
-			return errors.New("design contract target is not AO-owned")
-		}
-		if err := f.Truncate(0); err != nil {
-			_ = f.Close()
-			return fmt.Errorf("truncate design contract projection: %w", err)
-		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			_ = f.Close()
-			return fmt.Errorf("rewind design contract projection: %w", err)
-		}
-	} else {
-		pathInfo, lstatErr := root.Lstat(target)
-		if lstatErr != nil {
-			_ = f.Close()
-			return fmt.Errorf("inspect new design contract projection: %w", lstatErr)
-		}
-		info, statErr := f.Stat()
-		if statErr != nil {
-			_ = f.Close()
-			return fmt.Errorf("inspect new design contract projection handle: %w", statErr)
-		}
-		if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() || !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
-			_ = f.Close()
-			return errors.New("new design contract target changed before write")
-		}
+		return err
 	}
-	if _, err := f.WriteString(content); err != nil {
+	if err := injectProjectionFailure(failureHook, projectionCreateBoundary, ownershipTarget); err != nil {
+		return err
+	}
+	f, err := ops.openStage(stageRoot, stage, ownershipTarget)
+	if err != nil {
+		return fmt.Errorf("create design contract projection staging file: %w", err)
+	}
+	pathInfo, lstatErr := stageRoot.Lstat(stage)
+	info, statErr := f.Stat()
+	if lstatErr != nil || statErr != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() || !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
 		_ = f.Close()
-		return fmt.Errorf("write design contract projection: %w", err)
+		return errors.New("design contract projection staging file changed after creation")
 	}
-	if err := f.Sync(); err != nil {
+	marker := projectionOwnershipMarker(ownershipTarget)
+	if !strings.HasPrefix(content, marker) {
 		_ = f.Close()
-		return fmt.Errorf("sync design contract projection: %w", err)
+		return errors.New("design contract projection content lacks its ownership marker")
 	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close design contract projection: %w", err)
+	if _, err := ops.write(f, []byte(marker), ownershipTarget); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write design contract projection staging ownership: %w", err)
+	}
+	if err := injectProjectionFailure(failureHook, projectionWriteBoundary, ownershipTarget); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := ops.write(f, []byte(strings.TrimPrefix(content, marker)), ownershipTarget); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write design contract projection staging file: %w", err)
+	}
+	if err := injectProjectionFailure(failureHook, projectionSyncBoundary, ownershipTarget); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := ops.sync(f, ownershipTarget); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync design contract projection staging file: %w", err)
+	}
+	if err := injectProjectionFailure(failureHook, projectionCloseBoundary, ownershipTarget); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := ops.close(f, ownershipTarget); err != nil {
+		return fmt.Errorf("close design contract projection staging file: %w", err)
+	}
+	if err := syncProjectionContainer(stageRoot); err != nil {
+		return fmt.Errorf("sync design contract projection staging entry: %w", err)
+	}
+	if err := replaceProjection(stageRoot, targetRoot, stage, target, ownershipTarget, failureHook, ops); err != nil {
+		return err
+	}
+	return nil
+}
+
+func replaceProjection(stageRoot, targetRoot *os.Root, stage, target, ownershipTarget string, failureHook projectionFailureHook, ops *projectionIO) error {
+	if err := injectProjectionFailure(failureHook, projectionReplaceBoundary, ownershipTarget); err != nil {
+		return err
+	}
+	stageFile, stageIdentity, staged, err := openValidatedProjectionFile(stageRoot, stage)
+	if err != nil || !isOwnedProjection(ownershipTarget, staged) {
+		return errors.New("design contract projection staging file is incomplete or changed")
+	}
+	defer func() { _ = stageFile.Close() }()
+	if err := injectProjectionFailure(failureHook, projectionStageValidated, ownershipTarget); err != nil {
+		return err
+	}
+	if err := ensureOpenedFileStillBound(stageRoot, stage, stageIdentity); err != nil {
+		return fmt.Errorf("revalidate design contract staging file before publish: %w", err)
+	}
+	pathInfo, err := targetRoot.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return ops.publish(stageRoot, targetRoot, stageFile, stageIdentity, stage, target, nil, func() error {
+			return injectProjectionFailure(failureHook, projectionPublishBoundary, ownershipTarget)
+		}, ownershipTarget)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect design contract projection at replace boundary: %w", err)
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+		return errors.New("design contract target is not an unlinked regular file")
+	}
+	current, err := targetRoot.OpenFile(target, os.O_RDONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open design contract projection at replace boundary: %w", err)
+	}
+	handleInfo, err := current.Stat()
+	if err != nil || !handleInfo.Mode().IsRegular() || !os.SameFile(pathInfo, handleInfo) {
+		_ = current.Close()
+		return errors.New("design contract target changed during replace-boundary validation")
+	}
+	existing, err := io.ReadAll(io.LimitReader(current, MaxCanonicalBytes+64*1024))
+	if err != nil || !isOwnedProjection(ownershipTarget, existing) {
+		_ = current.Close()
+		return errors.New("design contract target is not AO-owned at replace boundary")
+	}
+	currentPathInfo, err := targetRoot.Lstat(target)
+	if err != nil || currentPathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(currentPathInfo, handleInfo) {
+		_ = current.Close()
+		return errors.New("design contract target changed immediately before replacement")
+	}
+	if err := current.Close(); err != nil {
+		return fmt.Errorf("close validated design contract target before conditional publish: %w", err)
+	}
+	return ops.publish(stageRoot, targetRoot, stageFile, stageIdentity, stage, target, handleInfo, func() error {
+		if err := injectProjectionFailure(failureHook, projectionTargetValidated, ownershipTarget); err != nil {
+			return err
+		}
+		return injectProjectionFailure(failureHook, projectionPublishBoundary, ownershipTarget)
+	}, ownershipTarget)
+}
+
+func openValidatedProjectionFile(root *os.Root, target string) (*os.File, os.FileInfo, []byte, error) {
+	pathInfo, err := root.Lstat(target)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+		return nil, nil, nil, fmt.Errorf("file %s is not an unlinked regular file", target)
+	}
+	f, err := root.OpenFile(target, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
+		_ = f.Close()
+		return nil, nil, nil, fmt.Errorf("file %s changed during identity validation", target)
+	}
+	content, err := io.ReadAll(io.LimitReader(f, MaxCanonicalBytes+64*1024))
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, nil, err
+	}
+	return f, info, content, nil
+}
+
+func ensureOpenedFileStillBound(root *os.Root, target string, identity os.FileInfo) error {
+	current, err := root.Lstat(target)
+	if err != nil {
+		return err
+	}
+	if current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(current, identity) {
+		return fmt.Errorf("file %s changed after identity validation", target)
+	}
+	return nil
+}
+
+func newProjectionStageName() (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("generate design contract projection staging name: %w", err)
+	}
+	return fmt.Sprintf(".CONTRACT-%x.tmp", nonce[:]), nil
+}
+
+func injectProjectionFailure(hook projectionFailureHook, boundary projectionFailureBoundary, target string) error {
+	if hook == nil {
+		return nil
+	}
+	if err := hook(boundary, target); err != nil {
+		return fmt.Errorf("design contract projection %s boundary: %w", boundary, err)
 	}
 	return nil
 }

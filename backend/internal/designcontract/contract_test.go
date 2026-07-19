@@ -397,6 +397,289 @@ func TestMaterializeForeignGitignoreSkipsProjectionWithoutMutation(t *testing.T)
 	}
 }
 
+func TestMaterializeDoesNotClaimForeignGitignoreStagingPath(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prepare func(*testing.T, string)
+	}{
+		{
+			name: "gitfile",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("gitdir: ../foreign\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "empty regular file",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "gitignore prefix regular file",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				content := projectionGitignoreContent()
+				if err := os.WriteFile(path, []byte(content[:len(content)/2]), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "empty directory",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o750); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "directory",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "foreign"), []byte("must survive\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := initRepo(t)
+			dir := filepath.Join(workspace, directory)
+			if err := os.Mkdir(dir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			stage := filepath.Join(dir, ".git")
+			tc.prepare(t, stage)
+			foreignPath := filepath.Join(stage, "foreign")
+			if tc.name != "directory" && tc.name != "empty directory" {
+				foreignPath = stage
+			}
+			before, err := os.ReadFile(foreignPath)
+			if tc.name == "empty directory" {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("empty foreign directory was not empty: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if err := Materialize(context.Background(), workspace, "canonical"); err == nil {
+				t.Fatal("foreign .ao/.git unexpectedly claimed as AO staging")
+			}
+			after, err := os.ReadFile(foreignPath)
+			if tc.name == "empty directory" {
+				entries, readErr := os.ReadDir(stage)
+				if readErr != nil || len(entries) != 0 {
+					t.Fatalf("empty foreign final .ao/.git was mutated: %+v, %v", entries, readErr)
+				}
+			} else if err != nil || string(after) != string(before) {
+				t.Fatalf("foreign staging state changed: %q, %v", after, err)
+			}
+		})
+	}
+}
+
+func TestGitignoreBootstrapCrashRecoveryMatrix(t *testing.T) {
+	const bootstrapName = ".bootstrap-0123456789abcdef0123456789abcdef.stage"
+	for _, tc := range []struct {
+		name        string
+		prepare     func(*testing.T, string)
+		innerExists bool
+	}{
+		{
+			name: "crash after outer container mkdir",
+			prepare: func(t *testing.T, aoDir string) {
+				t.Helper()
+				if err := os.Mkdir(filepath.Join(aoDir, bootstrapName), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "crash after nested exact git mkdir",
+			prepare: func(t *testing.T, aoDir string) {
+				t.Helper()
+				stage := filepath.Join(aoDir, bootstrapName, gitignoreStageDirectory)
+				if err := os.MkdirAll(stage, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			innerExists: true,
+		},
+		{
+			name: "crash after zero-byte marker create",
+			prepare: func(t *testing.T, aoDir string) {
+				t.Helper()
+				stage := filepath.Join(aoDir, bootstrapName, gitignoreStageDirectory)
+				if err := os.MkdirAll(stage, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(stage, gitignoreStageMarker), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			innerExists: true,
+		},
+		{
+			name: "crash after authenticated marker sync",
+			prepare: func(t *testing.T, aoDir string) {
+				t.Helper()
+				stage := filepath.Join(aoDir, bootstrapName, gitignoreStageDirectory)
+				if err := os.MkdirAll(stage, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(stage, gitignoreStageMarker), gitignoreStageMarkerContent(bootstrapName), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			innerExists: true,
+		},
+		{
+			name: "crash after no-replace rename before payload creation",
+			prepare: func(t *testing.T, aoDir string) {
+				t.Helper()
+				stage := filepath.Join(aoDir, bootstrapName, gitignoreStageDirectory)
+				if err := os.MkdirAll(stage, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(stage, gitignoreStageMarker), gitignoreStageMarkerContent(bootstrapName), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(stage, filepath.Join(aoDir, gitignoreStageDirectory)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := initRepo(t)
+			aoDir := filepath.Join(workspace, directory)
+			if err := os.Mkdir(aoDir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			tc.prepare(t, aoDir)
+			// Crash/error state must be invisible before any restart or AO-owned
+			// .ao/.gitignore exists.
+			assertCleanGitStatus(t, workspace)
+			if err := Materialize(context.Background(), workspace, "recovered complete contract"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(Path(workspace))
+			if err != nil || !strings.Contains(string(got), "recovered complete contract") {
+				t.Fatalf("recovered projection = %q, %v", got, err)
+			}
+			bootstrapPath := filepath.Join(aoDir, bootstrapName)
+			if _, stageErr := os.Stat(bootstrapPath); stageErr != nil {
+				t.Fatalf("abandoned bootstrap container was enumerated or mutated: %v", stageErr)
+			}
+			_, innerErr := os.Stat(filepath.Join(bootstrapPath, gitignoreStageDirectory))
+			if tc.innerExists && innerErr != nil {
+				t.Fatalf("abandoned nested stage was enumerated or consumed: %v", innerErr)
+			}
+			if !tc.innerExists && !errors.Is(innerErr, os.ErrNotExist) {
+				t.Fatalf("unexpected abandoned nested stage state: %v", innerErr)
+			}
+			assertCleanGitStatus(t, workspace)
+		})
+	}
+}
+
+func TestMaterializeUpgradesLegacyZeroByteFinalStageMarker(t *testing.T) {
+	workspace := initRepo(t)
+	aoDir := filepath.Join(workspace, directory)
+	if err := os.MkdirAll(filepath.Join(aoDir, gitignoreStageDirectory), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(aoDir, ".gitignore"), []byte(projectionGitignoreContent()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(aoDir, gitignoreStageDirectory, gitignoreStageMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	targetRel := filepath.ToSlash(filepath.Join(directory, filename))
+	legacyProjection := projectionContent(targetRel, "Session draft (no PR identity yet)", "legacy complete contract")
+	if err := os.WriteFile(Path(workspace), []byte(legacyProjection), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertCleanGitStatus(t, workspace)
+
+	if err := Materialize(context.Background(), workspace, "upgraded complete contract"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(Path(workspace))
+	if err != nil || !strings.Contains(string(got), "upgraded complete contract") || strings.Contains(string(got), "legacy complete contract") {
+		t.Fatalf("upgraded projection = %q, %v", got, err)
+	}
+	marker, err := os.ReadFile(filepath.Join(aoDir, gitignoreStageDirectory, gitignoreStageMarker))
+	if err != nil || len(marker) != 0 {
+		t.Fatalf("legacy final marker was not accepted in place: %q, %v", marker, err)
+	}
+	assertCleanGitStatus(t, workspace)
+}
+
+func TestLegacyZeroByteFinalMarkerDoesNotOverrideForeignProjection(t *testing.T) {
+	workspace := initRepo(t)
+	aoDir := filepath.Join(workspace, directory)
+	if err := os.MkdirAll(filepath.Join(aoDir, gitignoreStageDirectory), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(aoDir, ".gitignore"), []byte(projectionGitignoreContent()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(aoDir, gitignoreStageDirectory, gitignoreStageMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	foreign := []byte("foreign projection must survive\n")
+	if err := os.WriteFile(Path(workspace), foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Materialize(context.Background(), workspace, "replacement"); err == nil {
+		t.Fatal("legacy marker bypassed AO-owned projection validation")
+	}
+	got, err := os.ReadFile(Path(workspace))
+	if err != nil || string(got) != string(foreign) {
+		t.Fatalf("foreign projection changed: %q, %v", got, err)
+	}
+}
+
+func TestGitignoreBootstrapRenameErrorIsImmediatelyInvisibleAndRecoverable(t *testing.T) {
+	workspace := initRepo(t)
+	original := publishGitignoreStageDirectory
+	publishGitignoreStageDirectory = func(_, _ *os.Root, _, _ string, _ os.FileInfo) error {
+		return errors.New("injected no-replace directory rename")
+	}
+	if err := Materialize(context.Background(), workspace, "complete after restart"); err == nil {
+		t.Fatal("injected bootstrap rename error was not reported")
+	}
+	// No AO-owned ignore file exists yet, so cleanliness here proves the nested
+	// exact .git component hid the abandoned stage immediately.
+	if _, err := os.Stat(filepath.Join(workspace, directory, ".gitignore")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("gitignore appeared after failed bootstrap rename: %v", err)
+	}
+	assertCleanGitStatus(t, workspace)
+
+	publishGitignoreStageDirectory = original
+	t.Cleanup(func() { publishGitignoreStageDirectory = original })
+	if err := Materialize(context.Background(), workspace, "complete after restart"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(Path(workspace))
+	if err != nil || !strings.Contains(string(got), "complete after restart") {
+		t.Fatalf("recovered projection = %q, %v", got, err)
+	}
+	assertCleanGitStatus(t, workspace)
+}
+
 func TestMaterializeDoesNotInitializeOwnershipOverForeignTargets(t *testing.T) {
 	prURL := "https://github.com/o/r/pull/7"
 	for _, tc := range []struct {
@@ -462,8 +745,9 @@ func TestMaterializeRefreshesOnlyGenuineAOProjectionsAcrossRestart(t *testing.T)
 
 	// A second call has no in-memory ownership state, matching refresh after a
 	// daemon restart. Deterministic ownership markers must allow the refresh.
-	if err := MaterializePR(context.Background(), workspace, prURL, "second canonical"); err != nil {
-		t.Fatal(err)
+	refreshErr := MaterializePR(context.Background(), workspace, prURL, "second canonical")
+	if refreshErr != nil {
+		t.Fatal(refreshErr)
 	}
 	for _, target := range []string{currentPath, keyedPath} {
 		got, err := os.ReadFile(target)
@@ -669,6 +953,444 @@ func TestConcurrentMaterializePRWritesCompleteSerializedProjections(t *testing.T
 	}
 }
 
+func TestMaterializeProjectionFailuresAreCrashAtomicAndRecoverable(t *testing.T) {
+	prURL := "https://github.com/o/r/pull/151"
+	boundaries := []projectionFailureBoundary{
+		projectionCreateBoundary,
+		projectionWriteBoundary,
+		projectionSyncBoundary,
+		projectionCloseBoundary,
+		projectionReplaceBoundary,
+	}
+	tests := []struct {
+		name       string
+		target     func(string) string
+		initialize func(*testing.T, string)
+		write      func(string, string, *projectionIO) error
+		restart    func(string, string) error
+	}{
+		{
+			name:   "fresh gitignore initialization",
+			target: func(string) string { return filepath.ToSlash(filepath.Join(directory, ".gitignore")) },
+			write: func(workspace, contract string, ops *projectionIO) error {
+				return materializeWithProjectionControls(context.Background(), workspace, "Session draft (no PR identity yet)", "", contract, nil, ops)
+			},
+			restart: func(workspace, contract string) error { return Materialize(context.Background(), workspace, contract) },
+		},
+		{
+			name:   "fresh current projection",
+			target: func(string) string { return filepath.ToSlash(filepath.Join(directory, filename)) },
+			initialize: func(t *testing.T, workspace string) {
+				t.Helper()
+				initializeProjectionIgnore(t, workspace)
+			},
+			write: func(workspace, contract string, ops *projectionIO) error {
+				return materializeWithProjectionControls(context.Background(), workspace, "Session draft (no PR identity yet)", "", contract, nil, ops)
+			},
+			restart: func(workspace, contract string) error { return Materialize(context.Background(), workspace, contract) },
+		},
+		{
+			name:   "refresh current projection",
+			target: func(string) string { return filepath.ToSlash(filepath.Join(directory, filename)) },
+			initialize: func(t *testing.T, workspace string) {
+				t.Helper()
+				if err := Materialize(context.Background(), workspace, "previous complete contract"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			write: func(workspace, contract string, ops *projectionIO) error {
+				return materializeWithProjectionControls(context.Background(), workspace, "Session draft (no PR identity yet)", "", contract, nil, ops)
+			},
+			restart: func(workspace, contract string) error { return Materialize(context.Background(), workspace, contract) },
+		},
+		{
+			name:   "fresh keyed per-PR projection",
+			target: func(string) string { return testKeyedProjectionRelative(prURL) },
+			initialize: func(t *testing.T, workspace string) {
+				t.Helper()
+				initializeProjectionIgnore(t, workspace)
+			},
+			write: func(workspace, contract string, ops *projectionIO) error {
+				return materializeWithProjectionControls(context.Background(), workspace, "Pull request: "+prURL, prURL, contract, nil, ops)
+			},
+			restart: func(workspace, contract string) error {
+				return MaterializePR(context.Background(), workspace, prURL, contract)
+			},
+		},
+		{
+			name:   "refresh keyed per-PR projection",
+			target: func(string) string { return testKeyedProjectionRelative(prURL) },
+			initialize: func(t *testing.T, workspace string) {
+				t.Helper()
+				if err := MaterializePR(context.Background(), workspace, prURL, "previous complete contract"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			write: func(workspace, contract string, ops *projectionIO) error {
+				return materializeWithProjectionControls(context.Background(), workspace, "Pull request: "+prURL, prURL, contract, nil, ops)
+			},
+			restart: func(workspace, contract string) error {
+				return MaterializePR(context.Background(), workspace, prURL, contract)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		for _, boundary := range boundaries {
+			t.Run(tc.name+"/"+string(boundary), func(t *testing.T) {
+				workspace := initRepo(t)
+				if tc.initialize != nil {
+					tc.initialize(t, workspace)
+				}
+				targetRel := tc.target(workspace)
+				targetPath := filepath.Join(workspace, filepath.FromSlash(targetRel))
+				before, beforeErr := os.ReadFile(targetPath)
+				injected := false
+				ops := failingProjectionIO(boundary, targetRel, &injected)
+				contract := "replacement complete contract " + string(boundary)
+				if err := tc.write(workspace, contract, &ops); err == nil || !injected {
+					t.Fatalf("failure injection = %v, injected=%v", err, injected)
+				}
+
+				after, afterErr := os.ReadFile(targetPath)
+				if beforeErr == nil {
+					if afterErr != nil || string(after) != string(before) {
+						t.Fatalf("failed refresh changed complete target: before=%q after=%q err=%v", before, after, afterErr)
+					}
+				} else if !errors.Is(beforeErr, os.ErrNotExist) || !errors.Is(afterErr, os.ErrNotExist) {
+					t.Fatalf("failed fresh write left final target: before=%v after=%q, %v", beforeErr, after, afterErr)
+				}
+				assertCleanGitStatus(t, workspace)
+
+				restartErr := tc.restart(workspace, contract)
+				if restartErr != nil {
+					t.Fatalf("restart recovery: %v", restartErr)
+				}
+				recovered, err := os.ReadFile(targetPath)
+				wantRecovered := contract
+				if filepath.Base(targetPath) == ".gitignore" {
+					wantRecovered = projectionGitignoreContent()
+				}
+				if err != nil || !strings.Contains(string(recovered), wantRecovered) {
+					t.Fatalf("recovered projection = %q, %v", recovered, err)
+				}
+				current, err := os.ReadFile(Path(workspace))
+				if err != nil || !strings.Contains(string(current), contract) {
+					t.Fatalf("recovered current projection = %q, %v", current, err)
+				}
+				assertCleanGitStatus(t, workspace)
+			})
+		}
+	}
+}
+
+func TestProjectionReplaceBoundaryRevalidatesTargetIdentity(t *testing.T) {
+	workspace := initRepo(t)
+	if err := Materialize(context.Background(), workspace, "previous complete contract"); err != nil {
+		t.Fatal(err)
+	}
+	targetRel := filepath.ToSlash(filepath.Join(directory, filename))
+	targetPath := filepath.Join(workspace, filepath.FromSlash(targetRel))
+	movedPath := filepath.Join(workspace, directory, "previous-owned.md")
+	foreign := []byte("foreign path-swap bytes must survive\n")
+	hook := func(boundary projectionFailureBoundary, target string) error {
+		if boundary != projectionReplaceBoundary || target != targetRel {
+			return nil
+		}
+		if err := os.Rename(targetPath, movedPath); err != nil {
+			return err
+		}
+		return os.WriteFile(targetPath, foreign, 0o600)
+	}
+	err := materializeWithFailureHook(context.Background(), workspace, "replacement contract", hook)
+	if err == nil {
+		t.Fatal("foreign replace-boundary swap unexpectedly allowed refresh")
+	}
+	got, readErr := os.ReadFile(targetPath)
+	if readErr != nil || string(got) != string(foreign) {
+		t.Fatalf("foreign replacement changed: %q, %v", got, readErr)
+	}
+}
+
+func TestFreshProjectionPublishIsBoundToValidatedStageHandle(t *testing.T) {
+	workspace := initRepo(t)
+	initializeProjectionIgnore(t, workspace)
+	targetRel := filepath.ToSlash(filepath.Join(directory, filename))
+	foreignSource := filepath.Join(t.TempDir(), "foreign-stage-source")
+	foreign := []byte("foreign stage bytes must survive\n")
+	if err := os.WriteFile(foreignSource, foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hookRan := false
+	hook := func(boundary projectionFailureBoundary, target string) error {
+		if boundary != projectionPublishBoundary || target != targetRel {
+			return nil
+		}
+		hookRan = true
+		stage := findProjectionStage(t, filepath.Join(workspace, directory, gitignoreStageDirectory))
+		moved := filepath.Join(filepath.Dir(stage), "owned-stage-moved")
+		if err := os.Rename(stage, moved); err != nil {
+			if runtime.GOOS == "windows" {
+				return err // the no-share-delete stage handle is the guarantee
+			}
+			t.Fatal(err)
+		}
+		return os.WriteFile(stage, foreign, 0o600)
+	}
+	err := materializeWithFailureHook(context.Background(), workspace, "complete canonical", hook)
+	if !hookRan {
+		t.Fatal("post-validation publish seam was not reached")
+	}
+	if runtime.GOOS == "windows" {
+		if err == nil {
+			t.Fatal("Windows stage pathname swap unexpectedly succeeded")
+		}
+		if _, statErr := os.Stat(Path(workspace)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("failed stage swap published a final projection: %v", statErr)
+		}
+	} else {
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, readErr := os.ReadFile(Path(workspace))
+		if readErr != nil || !strings.Contains(string(got), "complete canonical") {
+			t.Fatalf("handle-bound fresh projection = %q, %v", got, readErr)
+		}
+		stage := findForeignProjectionStage(t, filepath.Join(workspace, directory, gitignoreStageDirectory), foreign)
+		if got, readErr := os.ReadFile(stage); readErr != nil || string(got) != string(foreign) {
+			t.Fatalf("foreign staging path changed: %q, %v", got, readErr)
+		}
+	}
+	got, readErr := os.ReadFile(foreignSource)
+	if readErr != nil || string(got) != string(foreign) {
+		t.Fatalf("foreign source changed: %q, %v", got, readErr)
+	}
+}
+
+func TestGitignoreBootstrapPublishIsBoundToValidatedStageHandle(t *testing.T) {
+	workspace := initRepo(t)
+	targetRel := filepath.ToSlash(filepath.Join(directory, ".gitignore"))
+	foreign := []byte("foreign bootstrap stage must survive\n")
+	hookRan := false
+	hook := func(boundary projectionFailureBoundary, target string) error {
+		if boundary != projectionPublishBoundary || target != targetRel {
+			return nil
+		}
+		hookRan = true
+		stageDir := filepath.Join(workspace, directory, gitignoreStageDirectory)
+		entries, err := os.ReadDir(stageDir)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !isGitignoreStagePayload(entry.Name()) {
+				continue
+			}
+			stage := filepath.Join(stageDir, entry.Name())
+			if err := os.Rename(stage, filepath.Join(stageDir, "owned-bootstrap-moved")); err != nil {
+				return err
+			}
+			return os.WriteFile(stage, foreign, 0o600)
+		}
+		return errors.New("bootstrap payload not found")
+	}
+	err := materializeWithFailureHook(context.Background(), workspace, "canonical", hook)
+	if !hookRan {
+		t.Fatal("bootstrap publish seam was not reached")
+	}
+	if runtime.GOOS == "windows" {
+		if err == nil {
+			t.Fatal("Windows bootstrap stage swap unexpectedly succeeded")
+		}
+		if _, statErr := os.Stat(filepath.Join(workspace, directory, ".gitignore")); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("failed bootstrap swap installed gitignore: %v", statErr)
+		}
+		return
+	}
+	if err == nil {
+		t.Fatal("post-validation foreign entry unexpectedly allowed the full materialization")
+	}
+	got, readErr := os.ReadFile(filepath.Join(workspace, directory, ".gitignore"))
+	if readErr != nil || string(got) != projectionGitignoreContent() {
+		t.Fatalf("handle-bound gitignore = %q, %v", got, readErr)
+	}
+	stageDir := filepath.Join(workspace, directory, gitignoreStageDirectory)
+	if findForeignProjectionStage(t, stageDir, foreign) == "" {
+		t.Fatal("foreign bootstrap stage disappeared")
+	}
+}
+
+func TestFreshProjectionPublishNeverReplacesAppearingTarget(t *testing.T) {
+	workspace := initRepo(t)
+	initializeProjectionIgnore(t, workspace)
+	targetRel := filepath.ToSlash(filepath.Join(directory, filename))
+	foreign := []byte("foreign final bytes must survive\n")
+	hook := func(boundary projectionFailureBoundary, target string) error {
+		if boundary == projectionPublishBoundary && target == targetRel {
+			return os.WriteFile(Path(workspace), foreign, 0o600)
+		}
+		return nil
+	}
+	if err := materializeWithFailureHook(context.Background(), workspace, "canonical", hook); err == nil {
+		t.Fatal("appearing foreign target unexpectedly replaced")
+	}
+	got, err := os.ReadFile(Path(workspace))
+	if err != nil || string(got) != string(foreign) {
+		t.Fatalf("appearing foreign target changed: %q, %v", got, err)
+	}
+}
+
+func TestRefreshPublishLocksExactTargetOrFailsClosed(t *testing.T) {
+	workspace := initRepo(t)
+	if err := Materialize(context.Background(), workspace, "previous complete contract"); err != nil {
+		t.Fatal(err)
+	}
+	targetRel := filepath.ToSlash(filepath.Join(directory, filename))
+	foreignSource := filepath.Join(t.TempDir(), "foreign-refresh-source")
+	foreign := []byte("foreign refresh bytes must survive\n")
+	if err := os.WriteFile(foreignSource, foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hookRan := false
+	hook := func(boundary projectionFailureBoundary, target string) error {
+		if boundary != projectionPublishBoundary || target != targetRel {
+			return nil
+		}
+		hookRan = true
+		return os.Rename(Path(workspace), filepath.Join(workspace, directory, "swapped-target"))
+	}
+	err := materializeWithFailureHook(context.Background(), workspace, "replacement", hook)
+	if err == nil {
+		t.Fatal("refresh swap unexpectedly succeeded")
+	}
+	if !hookRan {
+		t.Fatal("conditional refresh did not reach the final publish seam")
+	}
+	oldPath := Path(workspace)
+	if runtime.GOOS != "windows" {
+		oldPath = filepath.Join(workspace, directory, "swapped-target")
+	}
+	got, readErr := os.ReadFile(oldPath)
+	if readErr != nil || !strings.Contains(string(got), "previous complete contract") {
+		t.Fatalf("validated old target changed: %q, %v", got, readErr)
+	}
+	got, readErr = os.ReadFile(foreignSource)
+	if readErr != nil || string(got) != string(foreign) {
+		t.Fatalf("foreign refresh source changed: %q, %v", got, readErr)
+	}
+}
+
+func findProjectionStage(t *testing.T, dir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".CONTRACT-") && strings.HasSuffix(entry.Name(), ".tmp") {
+			return filepath.Join(dir, entry.Name())
+		}
+	}
+	t.Fatal("projection stage not found")
+	return ""
+}
+
+func findForeignProjectionStage(t *testing.T, dir string, foreign []byte) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		if got, err := os.ReadFile(path); err == nil && string(got) == string(foreign) {
+			return path
+		}
+	}
+	t.Fatal("foreign projection stage not found")
+	return ""
+}
+
+func initializeProjectionIgnore(t *testing.T, workspace string) {
+	t.Helper()
+	dir := filepath.Join(workspace, directory)
+	if err := os.Mkdir(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(projectionGitignoreContent()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertCleanGitStatus(t *testing.T, workspace string) {
+	t.Helper()
+	out, err := exec.Command("git", "-C", workspace, "status", "--porcelain", "--untracked-files=all").CombinedOutput()
+	if err != nil || len(out) != 0 {
+		t.Fatalf("projection staging dirtied repo: %v: %q", err, out)
+	}
+}
+
+func failingProjectionIO(boundary projectionFailureBoundary, target string, injected *bool) projectionIO {
+	ops := defaultProjectionIO()
+	inject := func(gotTarget string) bool {
+		if !*injected && gotTarget == target {
+			*injected = true
+			return true
+		}
+		return false
+	}
+	switch boundary {
+	case projectionCreateBoundary:
+		base := ops.openStage
+		ops.openStage = func(root *os.Root, name, gotTarget string) (*os.File, error) {
+			file, err := base(root, name, gotTarget)
+			if err == nil && inject(gotTarget) {
+				_ = file.Close()
+				return nil, errors.New("injected create result failure")
+			}
+			return file, err
+		}
+	case projectionWriteBoundary:
+		ops.write = func(file *os.File, content []byte, gotTarget string) (int, error) {
+			if inject(gotTarget) {
+				partial := len(content) / 2
+				if partial == 0 {
+					partial = 1
+				}
+				n, err := file.Write(content[:partial])
+				if err != nil {
+					return n, err
+				}
+				return n, errors.New("injected partial write failure")
+			}
+			return file.Write(content)
+		}
+	case projectionSyncBoundary:
+		ops.sync = func(_ *os.File, gotTarget string) error {
+			if inject(gotTarget) {
+				return errors.New("injected sync operation failure")
+			}
+			return nil
+		}
+	case projectionCloseBoundary:
+		ops.close = func(file *os.File, gotTarget string) error {
+			err := file.Close()
+			if err == nil && inject(gotTarget) {
+				return errors.New("injected close operation failure")
+			}
+			return err
+		}
+	case projectionReplaceBoundary:
+		ops.publish = func(_ *os.Root, _ *os.Root, _ *os.File, _ os.FileInfo, _, _ string, _ os.FileInfo, _ func() error, gotTarget string) error {
+			if inject(gotTarget) {
+				return errors.New("injected publish primitive failure")
+			}
+			return errors.New("unexpected non-target publish")
+		}
+	}
+	return ops
+}
+
 func TestMaterializeLinkedWorktreeDoesNotMutateSharedGitMetadata(t *testing.T) {
 	main := initRepo(t)
 	for _, args := range [][]string{{"config", "user.email", "ao@example.com"}, {"config", "user.name", "AO Tests"}} {
@@ -716,11 +1438,13 @@ func TestMaterializePRKeepsCollisionSafeSiblingSetAndCurrentScope(t *testing.T) 
 	if err := MaterializePR(context.Background(), workspace, prA, "invariant-A"); err != nil {
 		t.Fatal(err)
 	}
-	if err := MaterializePR(context.Background(), workspace, prB, "invariant-B"); err != nil {
-		t.Fatal(err)
+	secondErr := MaterializePR(context.Background(), workspace, prB, "invariant-B")
+	if secondErr != nil {
+		t.Fatal(secondErr)
 	}
 	current, err := os.ReadFile(Path(workspace))
-	if err != nil || !strings.Contains(string(current), "Scope: Pull request: "+prB) || strings.Contains(string(current), "invariant-A") {
+	wantCurrent, rejectCurrent := prB, "invariant-A"
+	if err != nil || !strings.Contains(string(current), "Scope: Pull request: "+wantCurrent) || strings.Contains(string(current), rejectCurrent) {
 		t.Fatalf("current projection = %q, %v", current, err)
 	}
 	entries, err := os.ReadDir(filepath.Join(workspace, directory, "contracts"))
