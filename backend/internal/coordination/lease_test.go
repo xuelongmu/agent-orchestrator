@@ -362,27 +362,43 @@ func TestDelayedTickerPayloadCannotRenewAfterExecutionTimeExpiry(t *testing.T) {
 	}
 }
 
-func TestBackwardClockRenewalDoesNotShortenLocalWatchdog(t *testing.T) {
+func TestBackwardClockRenewalFailsClosedBeforeForwardJumpTakeover(t *testing.T) {
 	store := openStore(t)
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	lease, err := acquireAt(context.Background(), store, 101, "owner", base)
+	holder, err := acquireAt(context.Background(), store, 101, "owner", base)
 	if err != nil {
 		t.Fatal(err)
 	}
 	workCtx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	ticks := make(chan time.Time, 1)
-	advanced := make(chan time.Time, 1)
-	watchdog := &fakeWatchdog{deadline: lease.confirmedUntil, cancel: cancel, advanced: advanced}
+	watchdog := &fakeWatchdog{deadline: holder.confirmedUntil, cancel: cancel}
 	now := func() time.Time { return base.Add(-5 * time.Second) }
-	done := maintainWithTicks(workCtx, lease, ticks, now, watchdog, cancel, nil)
+	done := maintainWithTicks(workCtx, holder, ticks, now, watchdog, cancel, nil)
 	ticks <- base
-	deadline := <-advanced
-	if !deadline.Equal(base.Add(10 * time.Second)) {
-		t.Fatalf("local deadline shortened to %s", deadline)
-	}
-	cancel()
 	<-done
+	if workCtx.Err() == nil {
+		t.Fatal("backward renewal left holder work live without advancing persisted expiry")
+	}
+
+	jumped := base.Add(365 * 24 * time.Hour)
+	waited := time.Duration(0)
+	successor, err := acquireWithClock(
+		context.Background(), store, 202, "successor", 10*time.Second,
+		func() time.Time { return jumped },
+		func(_ context.Context, duration time.Duration) error {
+			waited += duration
+			if workCtx.Err() == nil {
+				t.Fatal("successor quarantined while old holder work was live")
+			}
+			return nil
+		},
+	)
+	if err != nil || successor == nil || successor.token != "successor" {
+		t.Fatalf("forward-jump successor=%+v err=%v", successor, err)
+	}
+	if waited != 10*time.Second {
+		t.Fatalf("quarantine=%s, want 10s", waited)
+	}
 }
 
 func TestRunningHolderStopsWorkAfterSuccessorTakesLease(t *testing.T) {

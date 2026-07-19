@@ -17,13 +17,11 @@ WHERE claim_key = ?
 
 -- name: RenewCoordinationClaim :execrows
 UPDATE coordination_claims
-SET lease_expires_at = CASE
-    WHEN lease_expires_at < ? THEN ?
-    ELSE lease_expires_at
-END
-WHERE claim_key = ?
-  AND owner_token = ?
-  AND lease_expires_at > ?;
+SET lease_expires_at = sqlc.arg(proposed_expiry)
+WHERE claim_key = sqlc.arg(claim_key)
+  AND owner_token = sqlc.arg(owner_token)
+  AND lease_expires_at > sqlc.arg(now)
+  AND lease_expires_at < sqlc.arg(proposed_expiry);
 
 -- name: ReleaseCoordinationClaim :execrows
 DELETE FROM coordination_claims
