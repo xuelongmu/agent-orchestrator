@@ -1,0 +1,29 @@
+{
+	"schemaVersion": 1,
+	"loop": {
+		"id": "",
+		"repository": "",
+		"pullRequest": 0,
+		"expectedBaseBranch": "main",
+		"configuredReviewer": {
+			"id": "",
+			"channels": ["reviews", "issue_comments"]
+		},
+		"authorities": {
+			"merge": false,
+			"fileIssues": false,
+			"resolveThreads": false,
+			"switchReviewer": false
+		},
+		"createdAt": "",
+		"policy": {
+			"path": "skills/autonomous-drive-loop/POLICY.md",
+			"version": 1,
+			"gitCommit": ""
+		}
+	},
+	"decisions": [],
+	"dispatchLog": [],
+	"findingClassLedger": [],
+	"owedOutputs": []
+}
