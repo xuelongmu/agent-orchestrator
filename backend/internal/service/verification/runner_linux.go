@@ -53,7 +53,8 @@ func (*linuxVerificationDescendantOwner) Terminate(targetPID int) error {
 	// numeric process-group signal here: the PGID may have been reused.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := reapExitedLinuxChildren(); err != nil {
+		none, err := reapExitedLinuxChildren()
+		if err != nil {
 			return err
 		}
 		children, err := linuxDirectChildren()
@@ -63,7 +64,9 @@ func (*linuxVerificationDescendantOwner) Terminate(targetPID int) error {
 		if len(children) == 0 {
 			// Wait4/ECHILD is the kernel-backed completion barrier. Do not rely
 			// on repeated procfs observations, which can race delayed reparenting.
-			return nil
+			if none {
+				return nil
+			}
 		}
 		for _, pid := range children {
 			if err := killLinuxPID(pid); err != nil && !errors.Is(err, syscall.ESRCH) {
@@ -94,14 +97,17 @@ func killLinuxPID(pid int) error {
 	return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
 }
 
-func reapExitedLinuxChildren() error {
+func reapExitedLinuxChildren() (bool, error) {
 	for {
 		pid, err := unix.Wait4(-1, nil, unix.WNOHANG, nil)
-		if errors.Is(err, unix.ECHILD) || pid == 0 {
-			return nil
+		if errors.Is(err, unix.ECHILD) {
+			return true, nil
+		}
+		if pid == 0 {
+			return false, nil
 		}
 		if err != nil {
-			return fmt.Errorf("reap adopted verifier descendant: %w", err)
+			return false, fmt.Errorf("reap adopted verifier descendant: %w", err)
 		}
 	}
 }

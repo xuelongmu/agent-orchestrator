@@ -20,6 +20,7 @@ func newVerificationDescendantOwner() (*darwinVerificationDescendantOwner, error
 func (*darwinVerificationDescendantOwner) Close() error { return nil }
 
 func (*darwinVerificationDescendantOwner) Terminate(targetPID int) error {
-	killVerificationProcessGroup(targetPID)
+	// Darwin provides no race-free post-reap process-group ownership. Detached
+	// descendants are intentionally outside the supported guarantee.
 	return nil
 }
