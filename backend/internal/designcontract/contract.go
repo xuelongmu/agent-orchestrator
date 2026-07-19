@@ -434,13 +434,9 @@ func materialize(ctx context.Context, workspace, scope, prURL, contract string) 
 	return materializeWithProjectionControls(ctx, workspace, scope, prURL, contract, nil, &ops)
 }
 
-func materializeWithFailureHook(ctx context.Context, workspace, prURL, contract string, failureHook projectionFailureHook) error {
+func materializeWithFailureHook(ctx context.Context, workspace, contract string, failureHook projectionFailureHook) error {
 	ops := defaultProjectionIO()
-	scope := "Session draft (no PR identity yet)"
-	if prURL != "" {
-		scope = "Pull request: " + prURL
-	}
-	return materializeWithProjectionControls(ctx, workspace, scope, prURL, contract, failureHook, &ops)
+	return materializeWithProjectionControls(ctx, workspace, "Session draft (no PR identity yet)", "", contract, failureHook, &ops)
 }
 
 func materializeWithProjectionControls(ctx context.Context, workspace, scope, prURL, contract string, failureHook projectionFailureHook, ops *projectionIO) error {

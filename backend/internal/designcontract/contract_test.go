@@ -996,7 +996,7 @@ func TestProjectionReplaceBoundaryRevalidatesTargetIdentity(t *testing.T) {
 		}
 		return os.WriteFile(targetPath, foreign, 0o600)
 	}
-	err := materializeWithFailureHook(context.Background(), workspace, "", "replacement contract", hook)
+	err := materializeWithFailureHook(context.Background(), workspace, "replacement contract", hook)
 	if err == nil {
 		t.Fatal("foreign replace-boundary swap unexpectedly allowed refresh")
 	}
@@ -1031,7 +1031,7 @@ func TestFreshProjectionPublishIsBoundToValidatedStageHandle(t *testing.T) {
 		}
 		return os.WriteFile(stage, foreign, 0o600)
 	}
-	err := materializeWithFailureHook(context.Background(), workspace, "", "complete canonical", hook)
+	err := materializeWithFailureHook(context.Background(), workspace, "complete canonical", hook)
 	if !hookRan {
 		t.Fatal("post-validation publish seam was not reached")
 	}
@@ -1088,7 +1088,7 @@ func TestGitignoreBootstrapPublishIsBoundToValidatedStageHandle(t *testing.T) {
 		}
 		return errors.New("bootstrap payload not found")
 	}
-	err := materializeWithFailureHook(context.Background(), workspace, "", "canonical", hook)
+	err := materializeWithFailureHook(context.Background(), workspace, "canonical", hook)
 	if !hookRan {
 		t.Fatal("bootstrap publish seam was not reached")
 	}
@@ -1125,7 +1125,7 @@ func TestFreshProjectionPublishNeverReplacesAppearingTarget(t *testing.T) {
 		}
 		return nil
 	}
-	if err := materializeWithFailureHook(context.Background(), workspace, "", "canonical", hook); err == nil {
+	if err := materializeWithFailureHook(context.Background(), workspace, "canonical", hook); err == nil {
 		t.Fatal("appearing foreign target unexpectedly replaced")
 	}
 	got, err := os.ReadFile(Path(workspace))
@@ -1153,7 +1153,7 @@ func TestRefreshPublishLocksExactTargetOrFailsClosed(t *testing.T) {
 		hookRan = true
 		return os.Rename(Path(workspace), filepath.Join(workspace, directory, "swapped-target"))
 	}
-	err := materializeWithFailureHook(context.Background(), workspace, "", "replacement", hook)
+	err := materializeWithFailureHook(context.Background(), workspace, "replacement", hook)
 	if err == nil {
 		t.Fatal("refresh swap unexpectedly succeeded")
 	}
