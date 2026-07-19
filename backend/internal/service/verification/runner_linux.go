@@ -91,7 +91,7 @@ func killLinuxPID(pid int) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
 }
 
