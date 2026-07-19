@@ -85,6 +85,10 @@ FROM review_run WHERE session_id = ? AND pr_url = ? AND target_sha = ? ORDER BY 
 SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at, simplification_event_id
 FROM review_run WHERE session_id = ? ORDER BY created_at DESC;
 
+-- name: ListReviewRunsByPR :many
+SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at, simplification_event_id
+FROM review_run WHERE pr_url = ? ORDER BY created_at DESC;
+
 -- name: ListRunningReviewRunsBySession :many
 SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at, simplification_event_id
 FROM review_run WHERE session_id = ? AND status = 'running' AND verdict = '' ORDER BY created_at DESC;
@@ -132,6 +136,30 @@ SET fix_commit = ?
 WHERE session_id = ? AND pr_url = ? AND fix_commit = ''
   AND NOT (
     out_of_scope = 1 AND deferred_issue_url != '' AND thread_id != '' AND thread_resolved = 1
+  );
+
+-- name: CountPendingActionableReviewFindingsByPR :one
+SELECT COUNT(*) FROM review_finding AS finding
+JOIN review_run AS run ON run.id = finding.run_id
+WHERE finding.pr_url = sqlc.arg(pr_url)
+  AND run.target_sha != sqlc.arg(head_sha)
+  AND finding.fix_commit = ''
+  AND NOT (
+    finding.out_of_scope = 1 AND finding.deferred_issue_url != '' AND finding.thread_id != '' AND finding.thread_resolved = 1
+  );
+
+-- name: SetPendingReviewFindingFixCommitByPR :execrows
+UPDATE review_finding
+SET fix_commit = sqlc.arg(fix_commit)
+WHERE id IN (
+  SELECT finding.id FROM review_finding AS finding
+  JOIN review_run AS run ON run.id = finding.run_id
+  WHERE finding.pr_url = sqlc.arg(pr_url)
+    AND run.target_sha != sqlc.arg(head_sha)
+    AND finding.fix_commit = ''
+    AND NOT (
+      finding.out_of_scope = 1 AND finding.deferred_issue_url != '' AND finding.thread_id != '' AND finding.thread_resolved = 1
+    )
   );
 
 -- name: ClaimReviewFindingIssueAction :execrows

@@ -2088,8 +2088,9 @@ func TestPoll_CIPassingForcesExactHeadReviewRefreshBeforeReady(t *testing.T) {
 func TestPoll_CoordinationRefreshesPassingBlockedHeadWithCachedReviewHashAfterRestart(t *testing.T) {
 	store := testStoreWithSession()
 	review := ports.SCMReviewObservation{
-		Decision: string(domain.ReviewRequired),
-		HeadSHA:  "sha1",
+		Decision:          string(domain.ReviewRequired),
+		HeadSHA:           "sha1",
+		HeadCommitMessage: "fix after restart\n\nAO-Review-Fix-Invariant: {}",
 	}
 	local := knownPR(1)
 	local.CI = domain.CIPassing
@@ -2123,6 +2124,9 @@ func TestPoll_CoordinationRefreshesPassingBlockedHeadWithCachedReviewHashAfterRe
 	got := coordinator.observed[0]
 	if got.Review.HeadSHA != got.PR.HeadSHA || got.Review.HeadSHA != "sha1" || got.Review.Partial {
 		t.Fatalf("coordinator snapshot = %#v, want complete exact-head review facts", got)
+	}
+	if got.PR.HeadCommitMessage != review.HeadCommitMessage {
+		t.Fatalf("restart coordinator head message = %q, want %q", got.PR.HeadCommitMessage, review.HeadCommitMessage)
 	}
 }
 

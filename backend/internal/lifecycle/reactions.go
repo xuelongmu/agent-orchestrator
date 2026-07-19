@@ -206,7 +206,7 @@ func (m *Manager) writeDesignContractDispatch(ctx context.Context, msg *strings.
 		slog.Debug("review dispatch: design contract projection skipped", "prURL", prURL, "error", err)
 	}
 	fmt.Fprintf(msg, "\nDesign contract (canonical AO state; .ao/CONTRACT.md is a read-only projection):\n%s\n", domain.SanitizeControlChars(designcontract.ForDispatch(contract)))
-	fmt.Fprintf(msg, "\nFor each fix, state which invariant it preserves. If a finding reveals a missing invariant, enforce it at one chokepoint and record the plain one-line guarantee durably with `ao contract add --pr %s --invariant \"<guarantee>\"`; never edit the workspace projection directly. AO also persists explicit reviewer invariant proposals through the finding ledger. Record the preserved or added invariant in the review-fix commit body.\n", domain.SanitizeControlChars(prURL))
+	fmt.Fprintf(msg, "\nEvery review-fix head commit must end with exactly one structured trailer bound by AO to this provider-observed commit and exact normalized PR. Preserve an existing canonical list item with `AO-Review-Fix-Invariant: {\"pr\":%q,\"mode\":\"preserve\",\"invariant\":\"<exact canonical line text without the list marker>\"}`. If a finding reveals a missing invariant, enforce it at one chokepoint and use mode `add` with a new plain one-line guarantee; AO validates and atomically appends it to this PR's canonical contract while binding the pending findings. Never edit the workspace projection directly. `ao contract add --pr %s --invariant \"<guarantee>\"` remains the explicit human/fixer contract path outside this commit boundary.\n", domain.SanitizeControlChars(prURL), domain.SanitizeControlChars(prURL))
 	return nil
 }
 

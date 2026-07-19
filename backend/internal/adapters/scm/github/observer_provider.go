@@ -132,7 +132,11 @@ func (p *Provider) FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef)
 				return nil, err
 			}
 		}
-		out = append(out, scmObservationFromGraphQL(ref, pr))
+		obs, err := scmObservationFromGraphQL(ref, pr)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, obs)
 	}
 	return out, nil
 }
@@ -224,7 +228,7 @@ func (p *Provider) FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (
 		return ports.SCMReviewObservation{}, err
 	}
 	if !boolv(latest.pageInfo["hasPreviousPage"]) {
-		return ports.SCMReviewObservation{Decision: latest.decision, HeadSHA: latest.headSHA, Reviews: latest.reviews, Threads: latest.threads}, nil
+		return ports.SCMReviewObservation{Decision: latest.decision, HeadSHA: latest.headSHA, HeadCommitMessage: latest.headCommitMessage, Reviews: latest.reviews, Threads: latest.threads}, nil
 	}
 	out := latest.threads
 	startCursor := str(latest.pageInfo["startCursor"])
@@ -253,7 +257,7 @@ func (p *Provider) FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (
 			}
 		}
 	}
-	return ports.SCMReviewObservation{Decision: latest.decision, HeadSHA: latest.headSHA, Reviews: latest.reviews, Threads: out, Partial: true}, nil
+	return ports.SCMReviewObservation{Decision: latest.decision, HeadSHA: latest.headSHA, HeadCommitMessage: latest.headCommitMessage, Reviews: latest.reviews, Threads: out, Partial: true}, nil
 }
 
 type restListPull struct {
@@ -324,7 +328,7 @@ mergeable mergeStateStatus reviewDecision headRefName headRefOid baseRefName bas
 createdAt updatedAt mergedAt closedAt
 author{ login }
 mergeCommit{ oid }
-commits(last:1){ nodes{ commit{ oid statusCheckRollup{ state contexts(first:CONTEXT_LIMIT){ nodes{
+commits(last:1){ nodes{ commit{ oid message statusCheckRollup{ state contexts(first:CONTEXT_LIMIT){ nodes{
   __typename
   ... on CheckRun { name status conclusion detailsUrl url databaseId }
   ... on StatusContext { context state targetUrl }
@@ -406,7 +410,12 @@ func pageInfoEndCursor(connection map[string]any) string {
 	return str(pi["endCursor"])
 }
 
-func scmObservationFromGraphQL(ref ports.SCMPRRef, pr map[string]any) ports.SCMObservation {
+func scmObservationFromGraphQL(ref ports.SCMPRRef, pr map[string]any) (ports.SCMObservation, error) {
+	headSHA := str(pr["headRefOid"])
+	commitSHA := latestCommitOID(pr)
+	if headSHA == "" || commitSHA == "" || commitSHA != headSHA {
+		return ports.SCMObservation{}, fmt.Errorf("github scm: latest commit OID %q does not equal observed PR head OID %q", commitSHA, headSHA)
+	}
 	checks := scmChecksFromGraphQL(pr)
 	failed := failedSCMChecks(checks)
 	ci := string(ciSummaryFromRollupState(pr))
@@ -431,7 +440,8 @@ func scmObservationFromGraphQL(ref ports.SCMPRRef, pr map[string]any) ports.SCMO
 			Closed:                   closed,
 			SourceBranch:             str(pr["headRefName"]),
 			TargetBranch:             str(pr["baseRefName"]),
-			HeadSHA:                  firstNonEmpty(str(pr["headRefOid"]), latestCommitOID(pr)),
+			HeadSHA:                  headSHA,
+			HeadCommitMessage:        latestCommitMessage(pr),
 			Title:                    str(pr["title"]),
 			Additions:                int(num(pr["additions"])),
 			Deletions:                int(num(pr["deletions"])),
@@ -450,15 +460,15 @@ func scmObservationFromGraphQL(ref ports.SCMPRRef, pr map[string]any) ports.SCMO
 		},
 		CI: ports.SCMCIObservation{
 			Summary:           ci,
-			HeadSHA:           firstNonEmpty(str(pr["headRefOid"]), latestCommitOID(pr)),
+			HeadSHA:           headSHA,
 			Checks:            checks,
 			FailedChecks:      failed,
-			FailedFingerprint: githubFailedFingerprint(firstNonEmpty(str(pr["headRefOid"]), latestCommitOID(pr)), failed),
+			FailedFingerprint: githubFailedFingerprint(headSHA, failed),
 		},
 		Review: ports.SCMReviewObservation{Decision: review},
 	}
 	obs.Mergeability = mergeabilityObservation(providerMergeable, providerMergeState, ci, review, draft)
-	return obs
+	return obs, nil
 }
 
 func ciSummaryFromRollupState(pr map[string]any) domain.CIState {
@@ -582,11 +592,12 @@ func mergeabilityObservation(providerMergeable, providerMergeState, ci, review s
 }
 
 type reviewThreadPage struct {
-	threads  []ports.SCMReviewThreadObservation
-	reviews  []ports.SCMReviewSummaryObservation
-	decision string
-	headSHA  string
-	pageInfo map[string]any
+	threads           []ports.SCMReviewThreadObservation
+	reviews           []ports.SCMReviewSummaryObservation
+	decision          string
+	headSHA           string
+	headCommitMessage string
+	pageInfo          map[string]any
 }
 
 func (p *Provider) fetchReviewThreadPage(ctx context.Context, ref ports.SCMPRRef, beforeCursor string, includeReviews bool) (reviewThreadPage, error) {
@@ -602,6 +613,10 @@ func (p *Provider) fetchReviewThreadPage(ctx context.Context, ref ports.SCMPRRef
 	}
 	decision := string(reviewDecisionFromGraphQL(pr))
 	headSHA := str(pr["headRefOid"])
+	commitSHA := latestCommitOID(pr)
+	if headSHA == "" || commitSHA == "" || commitSHA != headSHA {
+		return reviewThreadPage{}, fmt.Errorf("github scm: latest review commit OID %q does not equal observed PR head OID %q", commitSHA, headSHA)
+	}
 	reviewSummaries, _ := pr["reviewSummaries"].(map[string]any)
 	reviews := make([]ports.SCMReviewSummaryObservation, 0, len(nodes(reviewSummaries["nodes"])))
 	for _, review := range nodes(reviewSummaries["nodes"]) {
@@ -617,7 +632,7 @@ func (p *Provider) fetchReviewThreadPage(ctx context.Context, ref ports.SCMPRRef
 		out = append(out, scmThreadFromGraphQL(th))
 	}
 	pi, _ := threads["pageInfo"].(map[string]any)
-	return reviewThreadPage{threads: out, reviews: reviews, decision: decision, headSHA: headSHA, pageInfo: pi}, nil
+	return reviewThreadPage{threads: out, reviews: reviews, decision: decision, headSHA: headSHA, headCommitMessage: latestCommitMessage(pr), pageInfo: pi}, nil
 }
 
 func buildReviewThreadsQuery(ref ports.SCMPRRef, beforeCursor string, includeReviews bool) string {
@@ -630,7 +645,7 @@ func buildReviewThreadsQuery(ref ports.SCMPRRef, beforeCursor string, includeRev
 		reviewSelection = fmt.Sprintf(" reviewSummaries: reviews(last:%d, states:[APPROVED,CHANGES_REQUESTED]){ nodes{ id state url submittedAt commit{ oid } author{ login __typename } } }", githubReviewSummaryLimit)
 	}
 	return fmt.Sprintf(`query{
-repo: repository(owner:%s,name:%s){ pullRequest(number:%d){ headRefOid reviewDecision%s reviewThreads(last:%d, before:%s){ nodes{
+repo: repository(owner:%s,name:%s){ pullRequest(number:%d){ headRefOid commits(last:1){nodes{commit{oid message}}} reviewDecision%s reviewThreads(last:%d, before:%s){ nodes{
   id isResolved path line
   comments(first:%d){ nodes{ id body url author{ login __typename } } }
 } pageInfo{ hasPreviousPage startCursor } } } }
@@ -792,6 +807,17 @@ func latestCommitOID(pr map[string]any) string {
 		commit, _ := n["commit"].(map[string]any)
 		if oid := str(commit["oid"]); oid != "" {
 			return oid
+		}
+	}
+	return ""
+}
+
+func latestCommitMessage(pr map[string]any) string {
+	commits, _ := pr["commits"].(map[string]any)
+	for _, n := range nodes(commits["nodes"]) {
+		commit, _ := n["commit"].(map[string]any)
+		if message, ok := commit["message"].(string); ok {
+			return message
 		}
 	}
 	return ""

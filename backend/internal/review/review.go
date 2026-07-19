@@ -39,9 +39,11 @@ type Store interface {
 	GetReviewRun(ctx stdctx.Context, id string) (domain.ReviewRun, bool, error)
 	GetReviewRunBySessionPRAndSHA(ctx stdctx.Context, id domain.SessionID, prURL, targetSHA string) (domain.ReviewRun, bool, error)
 	ListReviewRunsBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.ReviewRun, error)
+	ListReviewRunsByPR(ctx stdctx.Context, prURL string) ([]domain.ReviewRun, error)
 	ListRunningReviewRunsBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.ReviewRun, error)
 	ListReviewFindingsBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.ReviewFinding, error)
-	SetPendingReviewFindingFixCommit(ctx stdctx.Context, id domain.SessionID, prURL, commit string) (int64, error)
+	ListReviewFindingsByRun(ctx stdctx.Context, runID string) ([]domain.ReviewFinding, error)
+	AcceptReviewFixCommit(ctx stdctx.Context, id domain.SessionID, prURL, headSHA, commitMessage string, requireDeclaration bool, updatedAt time.Time) (required bool, bound int64, err error)
 }
 
 // Sessions resolves the worker session under review.

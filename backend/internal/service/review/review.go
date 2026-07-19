@@ -58,6 +58,7 @@ type Store interface {
 	ListReviewRunsByBatch(ctx context.Context, sessionID domain.SessionID, batchID string) ([]domain.ReviewRun, error)
 	ListPRsBySession(ctx context.Context, id domain.SessionID) ([]domain.PullRequest, error)
 	ListReviewRunsBySession(ctx context.Context, id domain.SessionID) ([]domain.ReviewRun, error)
+	ListReviewRunsByPR(ctx context.Context, prURL string) ([]domain.ReviewRun, error)
 	ListReviewFindingsByRun(ctx context.Context, runID string) ([]domain.ReviewFinding, error)
 	ListReviewFindingsBySession(ctx context.Context, id domain.SessionID) ([]domain.ReviewFinding, error)
 	ClaimReviewFindingIssueAction(ctx context.Context, id, token string, leaseUntil, staleBefore time.Time) (bool, error)
@@ -283,6 +284,11 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		submitted := review.Findings
 		if verdict == domain.VerdictChangesRequested && len(submitted) == 0 {
 			submitted = inferFindings(body)
+			if len(submitted) == 0 && reviewcore.ReviewBodyHasBlockingFindings(body) {
+				submitted = []SubmittedFinding{{
+					ClassTag: "unclassified-blocking", RootCauseNote: strings.TrimSpace(body), Body: strings.TrimSpace(body),
+				}}
+			}
 		}
 		findings, err := s.buildFindings(ctx, run, submitted)
 		if err != nil {
@@ -452,13 +458,13 @@ func (s *Service) buildFindings(ctx context.Context, run domain.ReviewRun, submi
 	if len(submitted) == 0 {
 		return nil, nil
 	}
-	runs, err := s.store.ListReviewRunsBySession(ctx, run.SessionID)
+	runs, err := s.store.ListReviewRunsByPR(ctx, run.PRURL)
 	if err != nil {
 		return nil, err
 	}
 	heads := map[string]struct{}{}
 	for _, candidate := range runs {
-		if candidate.PRURL == run.PRURL && candidate.TargetSHA != "" {
+		if candidate.TargetSHA != "" {
 			heads[candidate.TargetSHA] = struct{}{}
 		}
 	}
