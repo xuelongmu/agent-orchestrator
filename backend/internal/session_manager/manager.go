@@ -202,11 +202,6 @@ type Manager struct {
 	// sharedDirMu serializes the durable lease check with dir spawn/restore so
 	// concurrent requests cannot both observe the project directory as free.
 	sharedDirMu sync.Mutex
-	// cleanupRetries coalesces same-daemon retries for durable non-git cleanup
-	// markers left behind by a transient natural-completion failure.
-	cleanupRetryMu    sync.Mutex
-	cleanupRetries    map[domain.SessionID]struct{}
-	cleanupRetryDelay time.Duration
 }
 
 // sendConfirmConfig bounds the best-effort activity-confirmation loop run after
@@ -278,9 +273,7 @@ func New(d Deps) *Manager {
 			attemptDeadline: sendConfirmAttemptDeadline,
 			maxAttempts:     sendConfirmMaxAttempts,
 		},
-		logger:            d.Logger,
-		cleanupRetries:    make(map[domain.SessionID]struct{}),
-		cleanupRetryDelay: time.Second,
+		logger: d.Logger,
 	}
 	if m.clock == nil {
 		// UTC so spawn-stamped CreatedAt/UpdatedAt match every other session
@@ -391,7 +384,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	agentConfig := effectiveAgentConfig(cfg.Kind, project.Config)
 	env := m.runtimeEnv(id, cfg.ProjectID, cfg.IssueID, project.Config.Env)
 	m.augmentAgentRuntimeEnv(agent, env)
-	if err := m.prepareWorkspace(ctx, agent, id, ws.WorkspaceKind.WithDefault(), ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
+	if err := m.prepareWorkspace(ctx, agent, id, ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
 		cleanupErr := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
 		if cleanupErr == nil {
 			m.rollbackSpawnSeedRow(ctx, id)
@@ -1059,10 +1052,19 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	if !ok {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotFound)
 	}
-	if !rec.IsTerminated {
+	if !rec.IsTerminated && rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindScratch {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
 	}
 	meta := rec.Metadata
+	if meta.WorkspaceKind.WithDefault() == domain.WorkspaceKindScratch {
+		rows, rowErr := m.store.ListSessionWorktrees(ctx, id)
+		if rowErr != nil {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: restore marker: %w", id, rowErr)
+		}
+		if len(restorableWorktreeRows(rows)) == 0 && rec.Activity.State == domain.ActivityExited && rec.Metadata.RuntimeHandleID == "" {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
+		}
+	}
 	// Mirror Kill's incomplete-handle guard. Git worktrees require both path and
 	// branch; scratch and dir sessions are intentionally branchless.
 	if meta.WorkspacePath == "" || (meta.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree && meta.Branch == "") {
@@ -1121,7 +1123,7 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 	agentConfig := effectiveAgentConfig(rec.Kind, project.Config)
 	env := m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
 	m.augmentAgentRuntimeEnv(agent, env)
-	if err := m.prepareWorkspace(ctx, agent, rec.ID, ws.WorkspaceKind.WithDefault(), ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
+	if err := m.prepareWorkspace(ctx, agent, rec.ID, ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
 		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
 	}
@@ -2875,7 +2877,7 @@ func (m *Manager) augmentAgentRuntimeEnv(agent ports.Agent, env map[string]strin
 // starts the agent: installing the workspace-local activity hooks (so early
 // startup hooks can update the already-created session row), then any optional
 // PreLaunch step. Shared by Spawn and Restore.
-func (m *Manager) prepareWorkspace(ctx context.Context, agent ports.Agent, id domain.SessionID, workspaceKind domain.WorkspaceKind, workspacePath, systemPrompt, systemPromptFile string, agentConfig ports.AgentConfig, env map[string]string) error {
+func (m *Manager) prepareWorkspace(ctx context.Context, agent ports.Agent, id domain.SessionID, workspacePath, systemPrompt, systemPromptFile string, agentConfig ports.AgentConfig, env map[string]string) error {
 	if err := agent.GetAgentHooks(ctx, ports.WorkspaceHookConfig{
 		SessionID:        string(id),
 		WorkspacePath:    workspacePath,

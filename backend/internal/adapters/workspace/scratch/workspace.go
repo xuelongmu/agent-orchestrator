@@ -219,11 +219,11 @@ func (w *Workspace) projectRoot(projectID domain.ProjectID, create bool) (string
 func removeLinkWithRetry(ctx context.Context, path string) error {
 	var last error
 	for attempt := 0; attempt < removeAttempts; attempt++ {
-		if err := os.Remove(path); err == nil || errors.Is(err, os.ErrNotExist) {
+		err := os.Remove(path)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
 			return nil
-		} else {
-			last = err
 		}
+		last = err
 		if attempt == removeAttempts-1 {
 			break
 		}
