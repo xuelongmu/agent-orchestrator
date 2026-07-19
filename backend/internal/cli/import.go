@@ -3,14 +3,18 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/legacyimport"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 )
@@ -31,7 +35,10 @@ func newImportCommand(ctx *commandContext) *cobra.Command {
 			"(~/.agent-orchestrator) read-only and ports its projects and per-project " +
 			"settings into the rewrite database. Legacy files are never modified, and " +
 			"a re-run skips rows that already exist, so it is safe to run more than once.\n\n" +
-			"The daemon must be stopped: it is the sole writer of the database.",
+			"The daemon must be stopped: it is the sole writer of the database. Dry-run " +
+			"reconciliation uses a private copy of ao.db and its WAL instead of opening " +
+			"the source. The snapshot is consistent while those files are quiescent, so " +
+			"other standalone database writers must also be stopped while it is taken.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return ctx.runImport(cmd, opts)
@@ -108,11 +115,15 @@ func (c *commandContext) runImport(cmd *cobra.Command, opts importOptions) error
 // confirmation-prompt/startup TOCTOU left by the preliminary run-file check.
 func (c *commandContext) executeImport(ctx context.Context, cfg config.Config, opts legacyimport.Options) (rep legacyimport.Report, err error) {
 	if opts.DryRun {
-		store, err := c.deps.OpenStore(cfg.DataDir)
-		if err != nil {
-			return legacyimport.Report{}, fmt.Errorf("open store: %w", err)
+		store, cleanup, openErr := c.openImportPlanningStore(cfg.DataDir)
+		if openErr != nil {
+			return legacyimport.Report{}, fmt.Errorf("open planning store: %w", openErr)
 		}
-		defer func() { _ = store.Close() }()
+		defer func() {
+			if cleanupErr := cleanup(); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("close planning store: %w", cleanupErr))
+			}
+		}()
 		return legacyimport.Run(ctx, store, opts)
 	}
 
@@ -133,6 +144,94 @@ func (c *commandContext) executeImport(ctx context.Context, cfg config.Config, o
 		<-leaseDone
 	}()
 	return legacyimport.Run(writeCtx, store, opts)
+}
+
+// openImportPlanningStore returns a source-independent view for a dry run.
+// sqlite.Open cannot be used against the source even with mode=ro: on Windows
+// SQLite may still create a zero-byte WAL beside a read-only database. For an
+// existing, quiescent database, copy the database and WAL as a pair and let
+// SQLite rebuild private SHM state, run migrations, and query only that copy.
+// runImport's live-daemon exclusion supplies the normal quiescence boundary;
+// the command help calls out that other standalone writers must also be idle.
+func (c *commandContext) openImportPlanningStore(dataDir string) (legacyimport.Store, func() error, error) {
+	sourceDB := filepath.Join(dataDir, "ao.db")
+	if _, err := os.Stat(sourceDB); errors.Is(err, os.ErrNotExist) {
+		return emptyImportPlanningStore{}, func() error { return nil }, nil
+	} else if err != nil {
+		return nil, nil, fmt.Errorf("inspect source database: %w", err)
+	}
+	dataDirInfo, err := os.Stat(dataDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("inspect source data directory: %w", err)
+	}
+
+	// Keep even a crash-leaked snapshot inside AO's configured state boundary;
+	// MkdirTemp makes the directory private (0700) before any database bytes are
+	// copied into it. A missing source database returns above without creating
+	// dataDir or any snapshot directory.
+	snapshotDir, err := os.MkdirTemp(dataDir, ".ao-import-plan-")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create private database snapshot directory: %w", err)
+	}
+	removeSnapshot := func() error {
+		if err := c.deps.RemoveAll(snapshotDir); err != nil {
+			return err
+		}
+		// Creating/removing the private child changes the parent timestamp on
+		// Windows and POSIX. Restore it so a completed dry run leaves the source
+		// directory inventory and stable metadata byte-for-byte unchanged.
+		return os.Chtimes(dataDir, time.Time{}, dataDirInfo.ModTime())
+	}
+
+	for _, name := range []string{"ao.db", "ao.db-wal"} {
+		err := copyImportSnapshotFile(filepath.Join(dataDir, name), filepath.Join(snapshotDir, name))
+		if name == "ao.db-wal" && errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, nil, errors.Join(fmt.Errorf("copy source %s: %w", name, err), removeSnapshot())
+		}
+	}
+
+	store, err := c.deps.OpenStore(snapshotDir)
+	if err != nil {
+		return nil, nil, errors.Join(err, removeSnapshot())
+	}
+	cleanup := func() error {
+		closeErr := store.Close()
+		removeErr := removeSnapshot()
+		return errors.Join(closeErr, removeErr)
+	}
+	return store, cleanup, nil
+}
+
+func copyImportSnapshotFile(source, destination string) (retErr error) {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, in.Close()) }()
+
+	out, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, out.Close()) }()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+// emptyImportPlanningStore models a missing rewrite database without creating
+// the source data directory. Dry-run never calls UpsertProject; keep the method
+// fail-closed so this planning-only store cannot silently become writable.
+type emptyImportPlanningStore struct{}
+
+func (emptyImportPlanningStore) GetProject(context.Context, string) (domain.ProjectRecord, bool, error) {
+	return domain.ProjectRecord{}, false, nil
+}
+
+func (emptyImportPlanningStore) UpsertProject(context.Context, domain.ProjectRecord) error {
+	return errors.New("empty import planning store is read-only")
 }
 
 func writeImportSummary(w io.Writer, rep legacyimport.Report) error {
