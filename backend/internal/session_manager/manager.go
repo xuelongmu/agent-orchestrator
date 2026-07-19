@@ -22,6 +22,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessioncap"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
 )
 
@@ -120,6 +121,11 @@ type runtimeController interface {
 	IsAlive(ctx context.Context, handle ports.RuntimeHandle) (bool, error)
 }
 
+// VerificationCapabilityIssuer binds a runtime capability to its session/project.
+type VerificationCapabilityIssuer interface {
+	Token(domain.SessionID, domain.ProjectID) string
+}
+
 // inputPendingDetector is an optional agent capability for terminal editors
 // that can definitively identify a paste which has not started a turn. It is
 // intentionally local to the session manager until more than one adapter
@@ -199,6 +205,7 @@ type Manager struct {
 	// sendConfirm* defaults; tests in this package shrink the timings directly.
 	sendConfirm sendConfirmConfig
 	logger      *slog.Logger
+	verificationCapabilities VerificationCapabilityIssuer
 	// sharedDirMu serializes the durable lease check with dir spawn/restore so
 	// concurrent requests cannot both observe the project directory as free.
 	sharedDirMu       sync.Mutex
@@ -256,6 +263,9 @@ type Deps struct {
 	// Logger receives spawn-time diagnostics (e.g. when the session PATH
 	// cannot be pinned to the daemon binary). Nil defaults to slog.Default().
 	Logger *slog.Logger
+	// VerificationCapabilities issues a capability bound to the spawned
+	// session/project. Nil disables out-of-band verification for that runtime.
+	VerificationCapabilities VerificationCapabilityIssuer
 }
 
 // New builds a Session Manager from its dependencies, defaulting the clock to
@@ -277,6 +287,7 @@ func New(d Deps) *Manager {
 			maxAttempts:     sendConfirmMaxAttempts,
 		},
 		logger: d.Logger, cleanupRetries: make(map[domain.SessionID]string), cleanupRetryDelay: time.Second,
+		verificationCapabilities: d.VerificationCapabilities,
 	}
 	if m.clock == nil {
 		// UTC so spawn-stamped CreatedAt/UpdatedAt match every other session
@@ -2771,6 +2782,9 @@ func spawnEnv(id domain.SessionID, project domain.ProjectID, issue domain.IssueI
 // logged so the degradation isn't silent.
 func (m *Manager) runtimeEnv(id domain.SessionID, project domain.ProjectID, issue domain.IssueID, projectEnv map[string]string) map[string]string {
 	env := spawnEnv(id, project, issue, m.dataDir, projectEnv)
+	if m.verificationCapabilities != nil {
+		env[sessioncap.EnvVerificationCapability] = m.verificationCapabilities.Token(id, project)
+	}
 	path, err := HookPATH(m.executable, os.Getenv, projectEnv)
 	if err != nil {
 		m.logger.Warn("session PATH not pinned to the daemon binary; `ao hooks` callbacks may resolve to a different ao and activity tracking will stall",

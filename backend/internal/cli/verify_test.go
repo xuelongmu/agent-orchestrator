@@ -8,26 +8,33 @@ import (
 	"testing"
 )
 
-func verifyServer(t *testing.T, status int, body string) (*httptest.Server, *string) {
+type verifyCapture struct {
+	body       string
+	capability string
+}
+
+func verifyServer(t *testing.T, status int, body string) (*httptest.Server, *verifyCapture) {
 	t.Helper()
-	var requestBody string
+	capture := &verifyCapture{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/sessions/ao-7/verify" {
 			http.NotFound(w, r)
 			return
 		}
 		b, _ := io.ReadAll(r.Body)
-		requestBody = string(b)
+		capture.body = string(b)
+		capture.capability = r.Header.Get("X-AO-Verification-Capability")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, body)
 	}))
 	t.Cleanup(srv.Close)
-	return srv, &requestBody
+	return srv, capture
 }
 
 func TestVerifyPrintsOutcomeAndLog(t *testing.T) {
 	t.Setenv("AO_SESSION_ID", "ao-7")
+	t.Setenv("AO_VERIFY_CAPABILITY", "cap-7")
 	cfg := setConfigEnv(t)
 	srv, request := verifyServer(t, http.StatusOK, `{"sessionId":"ao-7","profile":"backend","outcome":"passed","exitCode":0,"logPath":"C:\\work\\.ao\\verify-1.log","truncated":false,"durationMs":12}`)
 	writeRunFileFor(t, cfg, srv)
@@ -35,8 +42,8 @@ func TestVerifyPrintsOutcomeAndLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if *request != `{"profile":"backend"}` {
-		t.Fatalf("body=%s", *request)
+	if request.body != `{"profile":"backend"}` || request.capability != "cap-7" {
+		t.Fatalf("request=%#v", request)
 	}
 	if !strings.Contains(out, "outcome: passed") || !strings.Contains(out, "verify-1.log") {
 		t.Fatalf("output=%q", out)
@@ -45,6 +52,7 @@ func TestVerifyPrintsOutcomeAndLog(t *testing.T) {
 
 func TestVerifyFailureReturnsRuntimeErrorAfterPrintingLog(t *testing.T) {
 	t.Setenv("AO_SESSION_ID", "ao-7")
+	t.Setenv("AO_VERIFY_CAPABILITY", "cap-7")
 	cfg := setConfigEnv(t)
 	srv, _ := verifyServer(t, http.StatusOK, `{"sessionId":"ao-7","profile":"frontend","outcome":"failed","exitCode":2,"logPath":"/work/.ao/verify-2.log","truncated":true,"durationMs":12}`)
 	writeRunFileFor(t, cfg, srv)
@@ -70,8 +78,19 @@ func TestVerifyRequiresSessionAndExactlyOneProfile(t *testing.T) {
 	}
 }
 
+func TestVerifyRequiresInjectedCapability(t *testing.T) {
+	t.Setenv("AO_SESSION_ID", "ao-7")
+	t.Setenv("AO_VERIFY_CAPABILITY", "")
+	setConfigEnv(t)
+	_, _, err := executeCLI(t, Deps{}, "verify", "backend")
+	if err == nil || ExitCode(err) != 2 || !strings.Contains(err.Error(), "AO_VERIFY_CAPABILITY") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestVerifySurfacesDaemonErrorEnvelope(t *testing.T) {
 	t.Setenv("AO_SESSION_ID", "ao-7")
+	t.Setenv("AO_VERIFY_CAPABILITY", "cap-7")
 	cfg := setConfigEnv(t)
 	srv, _ := verifyServer(t, http.StatusConflict, `{"message":"verification already running","code":"VERIFY_ALREADY_RUNNING","requestId":"req-7"}`)
 	writeRunFileFor(t, cfg, srv)

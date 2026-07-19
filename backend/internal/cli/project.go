@@ -349,7 +349,9 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 	}
 	if opts.configJSON != "" {
 		var cfg projectConfig
-		if err := json.Unmarshal([]byte(opts.configJSON), &cfg); err != nil {
+		decoder := json.NewDecoder(strings.NewReader(opts.configJSON))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&cfg); err != nil {
 			return projectConfig{}, usageError{fmt.Errorf("--config-json is not a valid JSON object: %w", err)}
 		}
 		return cfg, nil

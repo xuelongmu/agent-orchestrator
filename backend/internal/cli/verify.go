@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"net/http"
 	"os"
 	"strings"
 
@@ -48,9 +49,15 @@ func (c *commandContext) verify(ctx context.Context, profile string) error {
 	if sessionID == "" {
 		return usageError{errors.New("ao verify must run inside an AO session (AO_SESSION_ID is not set)")}
 	}
+	capability := strings.TrimSpace(os.Getenv("AO_VERIFY_CAPABILITY"))
+	if capability == "" {
+		return usageError{errors.New("ao verify is unavailable in this session (AO_VERIFY_CAPABILITY is not set)")}
+	}
 	var result verifyAPIResponse
 	path := "sessions/" + url.PathEscape(sessionID) + "/verify"
-	if err := c.postLongJSON(ctx, path, verifyAPIRequest{Profile: profile}, &result); err != nil {
+	header := make(http.Header)
+	header.Set("X-AO-Verification-Capability", capability)
+	if err := c.postLongJSON(ctx, path, verifyAPIRequest{Profile: profile}, &result, header); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(c.deps.Out, "outcome: %s\nlog: %s\n", result.Outcome, result.LogPath)

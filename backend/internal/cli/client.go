@@ -71,8 +71,8 @@ func (c *commandContext) postJSON(ctx context.Context, path string, body, out an
 // postLongJSON is for daemon operations with their own server-side timeout.
 // The request context (and connection close if the CLI exits) remains the
 // cancellation signal; the generic two-minute client deadline does not apply.
-func (c *commandContext) postLongJSON(ctx context.Context, path string, body, out any) error {
-	return c.doJSONPathTimeout(ctx, http.MethodPost, "/api/v1/"+path, body, out, 0)
+func (c *commandContext) postLongJSON(ctx context.Context, path string, body, out any, header http.Header) error {
+	return c.doJSONPathTimeout(ctx, http.MethodPost, "/api/v1/"+path, body, out, 0, header)
 }
 
 // patchJSON sends body as JSON to PATCH /api/v1/<path> on the running daemon
@@ -102,10 +102,10 @@ func (c *commandContext) postLoopbackJSON(ctx context.Context, path string, body
 }
 
 func (c *commandContext) doJSONPath(ctx context.Context, method, path string, body, out any) error {
-	return c.doJSONPathTimeout(ctx, method, path, body, out, commandTimeout)
+	return c.doJSONPathTimeout(ctx, method, path, body, out, commandTimeout, nil)
 }
 
-func (c *commandContext) doJSONPathTimeout(ctx context.Context, method, path string, body, out any, timeout time.Duration) error {
+func (c *commandContext) doJSONPathTimeout(ctx context.Context, method, path string, body, out any, timeout time.Duration, header http.Header) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -136,6 +136,11 @@ func (c *commandContext) doJSONPathTimeout(ctx context.Context, method, path str
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for name, values := range header {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
 	}
 
 	// Reuse the injected client's transport (keeps it stubbable in tests) but

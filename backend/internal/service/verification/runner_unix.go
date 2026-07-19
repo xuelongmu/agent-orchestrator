@@ -5,38 +5,71 @@ package verification
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
 	"os/exec"
 	"syscall"
 	"time"
 )
 
 func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
-	if len(spec.Argv) == 0 {
-		return RunResult{ExitCode: -1}, errors.New("empty verification argv")
-	}
-	cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
-	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = spec.Dir, spec.Env, spec.Output, spec.Output
-	cmd.SysProcAttr = verificationSysProcAttr()
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return err
-		}
-		return nil
-	}
-	if err := cmd.Start(); err != nil {
+	ownerRead, ownerWrite, err := os.Pipe()
+	if err != nil {
 		return RunResult{ExitCode: -1}, err
 	}
-	err := cmd.Wait()
-	// A verifier that exits after daemonizing a child must not leak that child.
-	// The process-group id remains the original leader pid after it exits.
+	cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
+	cmd.Dir, cmd.Env, cmd.Stdin, cmd.Stdout, cmd.Stderr = spec.Dir, spec.Env, ownerRead, spec.Output, spec.Output
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = 5 * time.Second
+	// CommandContext owns cancellation; the explicit select below also closes
+	// the guardian pipe so hosted descendants observe ownership loss.
+	if err := cmd.Start(); err != nil {
+		_ = ownerRead.Close()
+		_ = ownerWrite.Close()
+		return RunResult{ExitCode: -1}, err
+	}
+	_ = ownerRead.Close()
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	select {
+	case err = <-wait:
+		_ = ownerWrite.Close()
+	case <-ctx.Done():
+		_ = ownerWrite.Close()
+		err = <-wait
+	}
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	if ctx.Err() != nil {
 		return RunResult{ExitCode: -1}, ctx.Err()
 	}
+	return processResult(err)
+}
+
+func runHostedProcess(argv []string, owner io.Reader, stdout, stderr io.Writer) int {
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.SysProcAttr = verificationSysProcAttr()
+	if err := cmd.Start(); err != nil {
+		return 126
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	var err error
+	select {
+	case err = <-wait:
+	case <-ownershipCanceled(owner):
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		err = <-wait
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	result, resultErr := processResult(err)
+	if resultErr != nil {
+		return 126
+	}
+	return result.ExitCode
+}
+
+func processResult(err error) (RunResult, error) {
 	var exit *exec.ExitError
 	if errors.As(err, &exit) {
 		return RunResult{ExitCode: exit.ExitCode()}, nil

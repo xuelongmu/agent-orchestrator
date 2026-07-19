@@ -1,6 +1,7 @@
 package httpd
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -33,6 +34,8 @@ type APIDeps struct {
 	Telemetry          ports.EventSink
 	Mobile             *controllers.MobileController
 	Verification       controllers.VerificationService
+	// CancelVerification is invoked before HTTP shutdown drains active handlers.
+	CancelVerification context.CancelFunc
 }
 
 // API owns one controller per resource and is the single Register call the

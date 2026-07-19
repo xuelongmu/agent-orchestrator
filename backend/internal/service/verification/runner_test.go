@@ -20,7 +20,7 @@ func TestOSRunnerPreservesArgumentBoundaries(t *testing.T) {
 	var output bytes.Buffer
 	want := []string{"argument with spaces", `quote"kept`, "shell;&text"}
 	argv := append([]string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "argv"}, want...)
-	res, err := (OSRunner{}).Run(context.Background(), RunSpec{Argv: argv, Dir: t.TempDir(), Env: append(os.Environ(), "GO_WANT_VERIFY_HELPER=1"), Output: &output})
+	res, err := testOSRunner().Run(context.Background(), RunSpec{Argv: argv, Dir: t.TempDir(), Env: append(os.Environ(), "GO_WANT_VERIFY_HELPER=1"), Output: &output})
 	if err != nil || res.ExitCode != 0 {
 		t.Fatalf("Run() = %#v, %v; output=%s", res, err, output.String())
 	}
@@ -34,7 +34,7 @@ func TestOSRunnerCancellationKillsDescendant(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := (OSRunner{}).Run(ctx, RunSpec{Argv: []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "parent", pidFile}, Dir: t.TempDir(), Env: append(os.Environ(), "GO_WANT_VERIFY_HELPER=1"), Output: io.Discard})
+		_, err := testOSRunner().Run(ctx, RunSpec{Argv: []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "parent", pidFile}, Dir: t.TempDir(), Env: append(os.Environ(), "GO_WANT_VERIFY_HELPER=1"), Output: io.Discard})
 		done <- err
 	}()
 	var pid int
@@ -65,6 +65,16 @@ func TestOSRunnerCancellationKillsDescendant(t *testing.T) {
 	}
 	if processalive.Alive(pid) {
 		t.Fatalf("descendant pid %d survived cancellation", pid)
+	}
+}
+
+func testOSRunner() OSRunner {
+	return OSRunner{HostArgv: []string{os.Args[0], "-test.run=TestVerificationGuardianHelper"}}
+}
+
+func TestVerificationGuardianHelper(t *testing.T) {
+	if code, handled := RunHostFromEnvironment(); handled {
+		os.Exit(code)
 	}
 }
 

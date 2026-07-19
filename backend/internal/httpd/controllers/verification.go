@@ -14,7 +14,7 @@ import (
 
 // VerificationService is the daemon boundary for an out-of-band workspace check.
 type VerificationService interface {
-	Run(context.Context, domain.SessionID, string) (verifysvc.Result, error)
+	Run(context.Context, domain.SessionID, string, string) (verifysvc.Result, error)
 }
 
 // VerifyRequest selects one configured profile. Executables and arguments are
@@ -26,8 +26,10 @@ type VerifyRequest struct {
 // VerifyResponse reports the completed run and its bounded workspace-local log.
 type VerifyResponse = verifysvc.Result
 
+// VerificationController owns the loopback-only session verification route.
 type VerificationController struct{ Svc VerificationService }
 
+// Register mounts the verification route on the supplied router.
 func (c *VerificationController) Register(r chi.Router) {
 	r.Post("/sessions/{sessionId}/verify", c.run)
 }
@@ -42,7 +44,8 @@ func (c *VerificationController) run(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_BODY", "Invalid request body", nil)
 		return
 	}
-	res, err := c.Svc.Run(r.Context(), domain.SessionID(chi.URLParam(r, "sessionId")), in.Profile)
+	capability := r.Header.Get("X-AO-Verification-Capability")
+	res, err := c.Svc.Run(r.Context(), domain.SessionID(chi.URLParam(r, "sessionId")), in.Profile, capability)
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return

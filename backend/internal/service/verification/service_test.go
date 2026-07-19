@@ -31,7 +31,13 @@ type runnerFunc func(context.Context, RunSpec) (RunResult, error)
 
 func (f runnerFunc) Run(ctx context.Context, spec RunSpec) (RunResult, error) { return f(ctx, spec) }
 
-func serviceFixture(t *testing.T, command domain.VerificationCommand, runner Runner) (*Service, string) {
+type fakeAuthorizer struct{}
+
+func (fakeAuthorizer) Verify(session domain.SessionID, project domain.ProjectID, capability string) bool {
+	return session == "ao-1" && project == "ao" && capability == "cap"
+}
+
+func serviceFixture(t *testing.T, command Command, runner Runner) (*Service, string) {
 	t.Helper()
 	workspace := t.TempDir()
 	if command.WorkingDirectory != "" {
@@ -41,20 +47,20 @@ func serviceFixture(t *testing.T, command domain.VerificationCommand, runner Run
 	}
 	store := fakeStore{
 		session: domain.SessionRecord{ID: "ao-1", ProjectID: "ao", Metadata: domain.SessionMetadata{WorkspacePath: workspace}},
-		project: domain.ProjectRecord{ID: "ao", Config: domain.ProjectConfig{Verification: map[string]domain.VerificationCommand{"unit": command}}},
+		project: domain.ProjectRecord{ID: "ao"},
 	}
-	return New(Deps{Store: store, Runner: runner}), workspace
+	return New(Deps{Store: store, Runner: runner, Policy: Policy{Profiles: map[string]Command{"unit": command}}, Auth: fakeAuthorizer{}}), workspace
 }
 
 func TestRunPreservesArgvAndReportsFailure(t *testing.T) {
-	command := domain.VerificationCommand{Argv: []string{"tool", "argument with spaces", `quote"kept`}, WorkingDirectory: "src"}
+	command := Command{Argv: []string{"tool", "argument with spaces", `quote"kept`}, WorkingDirectory: "src"}
 	var got RunSpec
 	svc, _ := serviceFixture(t, command, runnerFunc(func(_ context.Context, spec RunSpec) (RunResult, error) {
 		got = spec
 		_, _ = io.WriteString(spec.Output, "failed output\n")
 		return RunResult{ExitCode: 7}, nil
 	}))
-	res, err := svc.Run(context.Background(), "ao-1", "unit")
+	res, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,12 +82,12 @@ func TestRunPreservesArgvAndReportsFailure(t *testing.T) {
 func TestRunCancellationAndTimeout(t *testing.T) {
 	tests := []struct {
 		name    string
-		command domain.VerificationCommand
+		command Command
 		setup   func() (context.Context, context.CancelFunc)
 		want    Outcome
 	}{
-		{name: "canceled", command: domain.VerificationCommand{Argv: []string{"tool"}}, setup: func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) }, want: OutcomeCanceled},
-		{name: "timeout", command: domain.VerificationCommand{Argv: []string{"tool"}, TimeoutSeconds: 1}, setup: func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) }, want: OutcomeTimedOut},
+		{name: "canceled", command: Command{Argv: []string{"tool"}}, setup: func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) }, want: OutcomeCanceled},
+		{name: "timeout", command: Command{Argv: []string{"tool"}, TimeoutSeconds: 1}, setup: func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) }, want: OutcomeTimedOut},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -97,7 +103,7 @@ func TestRunCancellationAndTimeout(t *testing.T) {
 			if tt.want == OutcomeCanceled {
 				go func() { <-started; cancel() }()
 			}
-			res, err := svc.Run(ctx, "ao-1", "unit")
+			res, err := svc.Run(ctx, "ao-1", "unit", "cap")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -111,14 +117,14 @@ func TestRunCancellationAndTimeout(t *testing.T) {
 func TestDaemonRootCancellationStopsRun(t *testing.T) {
 	root, stop := context.WithCancel(context.Background())
 	started := make(chan struct{})
-	svc, _ := serviceFixture(t, domain.VerificationCommand{Argv: []string{"tool"}}, runnerFunc(func(ctx context.Context, _ RunSpec) (RunResult, error) {
+	svc, _ := serviceFixture(t, Command{Argv: []string{"tool"}}, runnerFunc(func(ctx context.Context, _ RunSpec) (RunResult, error) {
 		close(started)
 		<-ctx.Done()
 		return RunResult{ExitCode: -1}, ctx.Err()
 	}))
 	svc.root = root
 	go func() { <-started; stop() }()
-	res, err := svc.Run(context.Background(), "ao-1", "unit")
+	res, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,11 +136,11 @@ func TestDaemonRootCancellationStopsRun(t *testing.T) {
 func TestRunRejectsConcurrentWorkspaceRun(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	svc, _ := serviceFixture(t, domain.VerificationCommand{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) { close(started); <-release; return RunResult{}, nil }))
+	svc, _ := serviceFixture(t, Command{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) { close(started); <-release; return RunResult{}, nil }))
 	done := make(chan error, 1)
-	go func() { _, err := svc.Run(context.Background(), "ao-1", "unit"); done <- err }()
+	go func() { _, err := svc.Run(context.Background(), "ao-1", "unit", "cap"); done <- err }()
 	<-started
-	_, err := svc.Run(context.Background(), "ao-1", "unit")
+	_, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
 	var ae *apierr.Error
 	if !errors.As(err, &ae) || ae.Code != "VERIFY_ALREADY_RUNNING" {
 		t.Fatalf("error=%v", err)
@@ -147,11 +153,11 @@ func TestRunRejectsConcurrentWorkspaceRun(t *testing.T) {
 
 func TestRunBoundsLogAndRetainsTail(t *testing.T) {
 	payload := strings.Repeat("x", maxLogBytes) + "TAIL"
-	svc, _ := serviceFixture(t, domain.VerificationCommand{Argv: []string{"tool"}}, runnerFunc(func(_ context.Context, s RunSpec) (RunResult, error) {
+	svc, _ := serviceFixture(t, Command{Argv: []string{"tool"}}, runnerFunc(func(_ context.Context, s RunSpec) (RunResult, error) {
 		_, err := io.WriteString(s.Output, payload)
 		return RunResult{}, err
 	}))
-	res, err := svc.Run(context.Background(), "ao-1", "unit")
+	res, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,11 +176,11 @@ func TestRunBoundsLogAndRetainsTail(t *testing.T) {
 
 func TestRunRejectsLogDirectorySymlink(t *testing.T) {
 	outside := t.TempDir()
-	svc, workspace := serviceFixture(t, domain.VerificationCommand{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) { return RunResult{}, nil }))
+	svc, workspace := serviceFixture(t, Command{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) { return RunResult{}, nil }))
 	if err := os.Symlink(outside, filepath.Join(workspace, ".ao")); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
-	_, err := svc.Run(context.Background(), "ao-1", "unit")
+	_, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
 	var ae *apierr.Error
 	if !errors.As(err, &ae) || ae.Code != "VERIFY_LOG_UNSAFE" {
 		t.Fatalf("error=%v", err)
@@ -182,7 +188,7 @@ func TestRunRejectsLogDirectorySymlink(t *testing.T) {
 }
 
 func TestRunRejectsLogIgnoreSymlinkWithoutTouchingTarget(t *testing.T) {
-	svc, workspace := serviceFixture(t, domain.VerificationCommand{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) {
+	svc, workspace := serviceFixture(t, Command{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) {
 		t.Fatal("runner called")
 		return RunResult{}, nil
 	}))
@@ -196,7 +202,7 @@ func TestRunRejectsLogIgnoreSymlinkWithoutTouchingTarget(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(workspace, ".ao", ".gitignore")); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
-	_, err := svc.Run(context.Background(), "ao-1", "unit")
+	_, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
 	var ae *apierr.Error
 	if !errors.As(err, &ae) || ae.Code != "VERIFY_LOG_UNSAFE" {
 		t.Fatalf("error=%v", err)
@@ -208,11 +214,23 @@ func TestRunRejectsLogIgnoreSymlinkWithoutTouchingTarget(t *testing.T) {
 }
 
 func TestUnknownProfileIsNotExecutableInput(t *testing.T) {
-	svc, _ := serviceFixture(t, domain.VerificationCommand{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) { t.Fatal("runner called"); return RunResult{}, nil }))
-	_, err := svc.Run(context.Background(), "ao-1", "rm -rf workspace")
+	svc, _ := serviceFixture(t, Command{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) { t.Fatal("runner called"); return RunResult{}, nil }))
+	_, err := svc.Run(context.Background(), "ao-1", "rm -rf workspace", "cap")
 	var ae *apierr.Error
 	if !errors.As(err, &ae) || ae.Code != "VERIFY_PROFILE_NOT_ALLOWED" {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestCapabilityCannotAuthorizeAnotherSession(t *testing.T) {
+	svc, _ := serviceFixture(t, Command{Argv: []string{"tool"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) {
+		t.Fatal("runner called")
+		return RunResult{}, nil
+	}))
+	_, err := svc.Run(context.Background(), "ao-1", "unit", "cap-from-another-session")
+	var apiError *apierr.Error
+	if !errors.As(err, &apiError) || apiError.Code != "VERIFY_CAPABILITY_INVALID" || apiError.Kind != apierr.KindForbidden {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -223,19 +241,19 @@ func TestDefaultBackendAndFrontendProfiles(t *testing.T) {
 	}
 	for profile, want := range tests {
 		t.Run(profile, func(t *testing.T) {
-			got, ok := resolveCommand(domain.ProjectConfig{}, profile)
+			got, ok := (Policy{}).withDefaults().Resolve("ao", profile)
 			if !ok || strings.Join(got.Argv, "|") != strings.Join(want, "|") {
-				t.Fatalf("resolveCommand() = %#v, %v", got, ok)
+				t.Fatalf("Resolve() = %#v, %v", got, ok)
 			}
 		})
 	}
 }
 
 func TestRunReportsStartFailureWithLog(t *testing.T) {
-	svc, _ := serviceFixture(t, domain.VerificationCommand{Argv: []string{"missing"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) {
+	svc, _ := serviceFixture(t, Command{Argv: []string{"missing"}}, runnerFunc(func(context.Context, RunSpec) (RunResult, error) {
 		return RunResult{ExitCode: -1}, errors.New("executable not found")
 	}))
-	res, err := svc.Run(context.Background(), "ao-1", "unit")
+	res, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,18 +267,16 @@ func TestWorkingDirectoryCannotEscapeThroughSymlink(t *testing.T) {
 	workspace := t.TempDir()
 	store := fakeStore{
 		session: domain.SessionRecord{ID: "ao-1", ProjectID: "ao", Metadata: domain.SessionMetadata{WorkspacePath: workspace}},
-		project: domain.ProjectRecord{ID: "ao", Config: domain.ProjectConfig{Verification: map[string]domain.VerificationCommand{
-			"unit": {Argv: []string{"tool"}, WorkingDirectory: "linked"},
-		}}},
+		project: domain.ProjectRecord{ID: "ao"},
 	}
 	svc := New(Deps{Store: store, Runner: runnerFunc(func(context.Context, RunSpec) (RunResult, error) {
 		t.Fatal("runner called")
 		return RunResult{}, nil
-	})})
+	}), Policy: Policy{Profiles: map[string]Command{"unit": {Argv: []string{"tool"}, WorkingDirectory: "linked"}}}, Auth: fakeAuthorizer{}})
 	if err := os.Symlink(outside, filepath.Join(workspace, "linked")); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
-	_, err := svc.Run(context.Background(), "ao-1", "unit")
+	_, err := svc.Run(context.Background(), "ao-1", "unit", "cap")
 	var ae *apierr.Error
 	if !errors.As(err, &ae) || ae.Code != "VERIFY_WORKING_DIRECTORY_INVALID" {
 		t.Fatalf("error = %v", err)
@@ -308,3 +324,4 @@ func TestVerificationLogsAreGitIgnored(t *testing.T) {
 		t.Fatalf("log is not ignored: %v (%s)", err, out)
 	}
 }
+

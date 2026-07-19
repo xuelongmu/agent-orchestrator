@@ -17,13 +17,15 @@ import (
 )
 
 type fakeVerifier struct {
-	session domain.SessionID
-	profile string
+	session    domain.SessionID
+	profile    string
+	capability string
 }
 
-func (f *fakeVerifier) Run(_ context.Context, session domain.SessionID, profile string) (verifysvc.Result, error) {
+func (f *fakeVerifier) Run(_ context.Context, session domain.SessionID, profile, capability string) (verifysvc.Result, error) {
 	f.session = session
 	f.profile = profile
+	f.capability = capability
 	return verifysvc.Result{SessionID: session, Profile: profile, Outcome: verifysvc.OutcomePassed, LogPath: `C:\\workspace\\.ao\\verify-1.log`}, nil
 }
 
@@ -33,13 +35,14 @@ func TestVerificationAPI(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/v1/sessions/ao-7/verify", strings.NewReader(`{"profile":"backend"}`))
 	req.Host = "127.0.0.1"
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-AO-Verification-Capability", "secret")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	if fake.session != "ao-7" || fake.profile != "backend" {
-		t.Fatalf("call=%q %q", fake.session, fake.profile)
+	if fake.session != "ao-7" || fake.profile != "backend" || fake.capability != "secret" {
+		t.Fatalf("call=%q %q %q", fake.session, fake.profile, fake.capability)
 	}
 	var got verifysvc.Result
 	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {

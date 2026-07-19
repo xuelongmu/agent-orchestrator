@@ -18,21 +18,22 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 )
 
+// Verification outcomes reported to callers.
 const (
 	defaultTimeout = 10 * time.Minute
 	maxLogBytes    = 1024 * 1024
 	retainedLogs   = 10
 )
 
-var defaultCommands = map[string]domain.VerificationCommand{
-	"backend":  {Argv: []string{"go", "test", "./..."}, WorkingDirectory: "backend"},
-	"frontend": {Argv: []string{"npm", "test", "--", "--run"}, WorkingDirectory: "frontend"},
-}
-
 // Store supplies the session workspace and its project's verification config.
 type Store interface {
 	GetSession(context.Context, domain.SessionID) (domain.SessionRecord, bool, error)
 	GetProject(context.Context, string) (domain.ProjectRecord, bool, error)
+}
+
+// Authorizer validates a capability against its owning session and project.
+type Authorizer interface {
+	Verify(domain.SessionID, domain.ProjectID, string) bool
 }
 
 // RunSpec is the already-validated direct process invocation handed to a Runner.
@@ -79,6 +80,8 @@ type Service struct {
 	runner Runner
 	root   context.Context
 	now    func() time.Time
+	policy Policy
+	auth   Authorizer
 	mu     sync.Mutex
 	active map[string]struct{}
 }
@@ -89,6 +92,8 @@ type Deps struct {
 	Runner Runner
 	Root   context.Context
 	Now    func() time.Time
+	Policy Policy
+	Auth   Authorizer
 }
 
 // New builds a workspace verification service.
@@ -105,11 +110,12 @@ func New(d Deps) *Service {
 	if runner == nil {
 		runner = OSRunner{}
 	}
-	return &Service{store: d.Store, runner: runner, root: root, now: now, active: make(map[string]struct{})}
+	policy := d.Policy.withDefaults()
+	return &Service{store: d.Store, runner: runner, root: root, now: now, policy: policy, auth: d.Auth, active: make(map[string]struct{})}
 }
 
 // Run executes one configured profile and waits for its terminal outcome.
-func (s *Service) Run(ctx context.Context, sessionID domain.SessionID, profile string) (Result, error) {
+func (s *Service) Run(ctx context.Context, sessionID domain.SessionID, profile, capability string) (Result, error) {
 	profile = strings.TrimSpace(profile)
 	if sessionID == "" {
 		return Result{}, apierr.Invalid("SESSION_REQUIRED", "sessionId is required", nil)
@@ -138,9 +144,12 @@ func (s *Service) Run(ctx context.Context, sessionID domain.SessionID, profile s
 	if !ok || !project.ArchivedAt.IsZero() {
 		return Result{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
 	}
-	command, ok := resolveCommand(project.Config, profile)
+	if s.auth == nil || !s.auth.Verify(session.ID, session.ProjectID, capability) {
+		return Result{}, apierr.Forbidden("VERIFY_CAPABILITY_INVALID", "Verification capability does not own this session")
+	}
+	command, ok := s.policy.Resolve(session.ProjectID, profile)
 	if !ok {
-		return Result{}, apierr.Invalid("VERIFY_PROFILE_NOT_ALLOWED", "Unknown verification profile", map[string]any{"profile": profile, "allowed": allowedProfiles(project.Config)})
+		return Result{}, apierr.Invalid("VERIFY_PROFILE_NOT_ALLOWED", "Unknown verification profile", map[string]any{"profile": profile, "allowed": s.policy.Allowed(session.ProjectID)})
 	}
 
 	workspace, err := confinedWorkspace(session.Metadata.WorkspacePath)
@@ -197,30 +206,6 @@ func (s *Service) Run(ctx context.Context, sessionID domain.SessionID, profile s
 		result.Truncated = writer.Truncated()
 	}
 	return result, nil
-}
-
-func resolveCommand(cfg domain.ProjectConfig, name string) (domain.VerificationCommand, bool) {
-	if c, ok := cfg.Verification[name]; ok {
-		return c, true
-	}
-	c, ok := defaultCommands[name]
-	return c, ok
-}
-
-func allowedProfiles(cfg domain.ProjectConfig) []string {
-	seen := make(map[string]struct{}, len(defaultCommands)+len(cfg.Verification))
-	for name := range defaultCommands {
-		seen[name] = struct{}{}
-	}
-	for name := range cfg.Verification {
-		seen[name] = struct{}{}
-	}
-	out := make([]string, 0, len(seen))
-	for name := range seen {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
 }
 
 func (s *Service) claim(path string) bool {
@@ -283,14 +268,14 @@ func pathWithin(root, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
-var logNameRE = regexp.MustCompile(`^verify-([0-9]+)\.log$`)
+var logNameRE = regexp.MustCompile(`^verify-(\d+)\.log$`)
 
 func newLog(workspace string) (*os.File, string, error) {
 	root, err := os.OpenRoot(workspace)
 	if err != nil {
 		return nil, "", fmt.Errorf("open workspace root: %w", err)
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	dir := filepath.Join(workspace, ".ao")
 	if info, err := root.Lstat(".ao"); err == nil {
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || isReparsePoint(dir) {
@@ -306,7 +291,7 @@ func newLog(workspace string) (*os.File, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("open verification log directory: %w", err)
 	}
-	defer dirRoot.Close()
+	defer func() { _ = dirRoot.Close() }()
 	// A local ignore file ignores itself and every run log without editing the worktree's tracked files.
 	if err := ensureLogIgnore(dirRoot, dir); err != nil {
 		return nil, "", err
@@ -321,7 +306,7 @@ func newLog(workspace string) (*os.File, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("list log directory: %w", err)
 	}
-	max := 0
+	highest := 0
 	type oldLog struct {
 		n    int
 		name string
@@ -333,8 +318,8 @@ func newLog(workspace string) (*os.File, string, error) {
 			continue
 		}
 		n, _ := strconv.Atoi(m[1])
-		if n > max {
-			max = n
+		if n > highest {
+			highest = n
 		}
 		if entry.Type().IsRegular() {
 			logs = append(logs, oldLog{n, entry.Name()})
@@ -347,7 +332,7 @@ func newLog(workspace string) (*os.File, string, error) {
 		}
 		logs = logs[1:]
 	}
-	name := fmt.Sprintf("verify-%d.log", max+1)
+	name := fmt.Sprintf("verify-%d.log", highest+1)
 	path := filepath.Join(dir, name)
 	f, err := dirRoot.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
@@ -402,18 +387,20 @@ func formatArgv(argv []string) string {
 type boundedWriter struct {
 	mu        sync.Mutex
 	file      *os.File
-	max       int64
+	limit     int64
 	truncated bool
 }
 
-func newBoundedWriter(f *os.File, max int64) *boundedWriter { return &boundedWriter{file: f, max: max} }
+func newBoundedWriter(f *os.File, limit int64) *boundedWriter {
+	return &boundedWriter{file: f, limit: limit}
+}
 func (w *boundedWriter) Truncated() bool                    { w.mu.Lock(); defer w.mu.Unlock(); return w.truncated }
 func (w *boundedWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	original := len(p)
-	if int64(len(p)) >= w.max {
-		p = p[len(p)-int(w.max):]
+	if int64(len(p)) >= w.limit {
+		p = p[len(p)-int(w.limit):]
 		w.truncated = true
 		if _, err := w.file.Seek(0, 0); err != nil {
 			return 0, err
@@ -421,7 +408,7 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 		if _, err := w.file.Write(p); err != nil {
 			return 0, err
 		}
-		if err := w.file.Truncate(w.max); err != nil {
+		if err := w.file.Truncate(w.limit); err != nil {
 			return 0, err
 		}
 		return original, nil
@@ -430,7 +417,7 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if info.Size()+int64(len(p)) <= w.max {
+	if info.Size()+int64(len(p)) <= w.limit {
 		if _, err = w.file.Seek(0, io.SeekEnd); err != nil {
 			return 0, err
 		}
@@ -439,7 +426,7 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 		}
 		return original, nil
 	}
-	keep := int(w.max) - len(p)
+	keep := int(w.limit) - len(p)
 	tail := make([]byte, keep)
 	if _, err = w.file.ReadAt(tail, info.Size()-int64(keep)); err != nil {
 		return 0, err
@@ -453,7 +440,7 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 	if _, err = w.file.Write(p); err != nil {
 		return 0, err
 	}
-	if err = w.file.Truncate(w.max); err != nil {
+	if err = w.file.Truncate(w.limit); err != nil {
 		return 0, err
 	}
 	w.truncated = true
