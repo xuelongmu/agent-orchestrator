@@ -80,7 +80,7 @@ func TestOSRunnerCancellationKillsDescendant(t *testing.T) {
 	}
 }
 
-func TestOSRunnerFastDetachedParentCannotEscapeContainment(t *testing.T) {
+func TestOSRunnerFastParentCannotEscapeContainment(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	res, err := testOSRunner().Run(context.Background(), RunSpec{
 		Argv:   []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "fast-parent", pidFile},
@@ -160,6 +160,31 @@ func TestVerificationProcessHelper(t *testing.T) {
 			os.Exit(92)
 		}
 		os.Exit(0)
+	case "setsid-parent", "setsid-fast-parent":
+		cmd := exec.Command(os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "setsid-child", os.Args[idx+2])
+		cmd.Env = os.Environ()
+		if err := cmd.Start(); err != nil {
+			os.Exit(91)
+		}
+		if os.Args[idx+1] == "setsid-fast-parent" {
+			if !waitForHelperFile(os.Args[idx+2], 5*time.Second) {
+				_ = cmd.Process.Kill()
+				os.Exit(95)
+			}
+			os.Exit(0)
+		}
+		_ = cmd.Wait()
+		os.Exit(0)
+	case "setsid-child":
+		if err := detachCurrentProcessSession(); err != nil {
+			os.Exit(96)
+		}
+		if err := os.WriteFile(os.Args[idx+2], []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+			os.Exit(92)
+		}
+		for {
+			time.Sleep(time.Second)
+		}
 	case "inherited-output-parent":
 		cmd := exec.Command(os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "child")
 		cmd.Env = os.Environ()
@@ -172,9 +197,32 @@ func TestVerificationProcessHelper(t *testing.T) {
 			os.Exit(92)
 		}
 		os.Exit(0)
+	case "inherited-output-gated-parent":
+		cmd := exec.Command(os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "child")
+		cmd.Env = os.Environ()
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Start(); err != nil {
+			os.Exit(91)
+		}
+		if err := os.WriteFile(os.Args[idx+2], []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+			os.Exit(92)
+		}
+		if !waitForHelperFile(os.Args[idx+3], 5*time.Second) {
+			_ = cmd.Process.Kill()
+			os.Exit(95)
+		}
+		os.Exit(0)
 	case "outer-runner":
 		_, _ = testOSRunner().Run(context.Background(), RunSpec{
 			Argv:   []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "parent", os.Args[idx+2]},
+			Dir:    os.TempDir(),
+			Env:    os.Environ(),
+			Output: io.Discard,
+		})
+		os.Exit(0)
+	case "outer-runner-setsid":
+		_, _ = testOSRunner().Run(context.Background(), RunSpec{
+			Argv:   []string{os.Args[0], "-test.run=TestVerificationProcessHelper", "--", "setsid-parent", os.Args[idx+2]},
 			Dir:    os.TempDir(),
 			Env:    os.Environ(),
 			Output: io.Discard,
@@ -198,4 +246,15 @@ func TestVerificationProcessHelper(t *testing.T) {
 		_, _ = fmt.Fprintln(os.Stderr, "bad helper mode")
 		os.Exit(93)
 	}
+}
+
+func waitForHelperFile(path string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
 }

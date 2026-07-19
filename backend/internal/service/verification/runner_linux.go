@@ -2,8 +2,216 @@
 
 package verification
 
-import "syscall"
+import (
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
 
 func verificationSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+}
+
+// linuxVerificationDescendantOwner makes the guardian a child subreaper. If a
+// verifier descendant leaves the target process group with setsid(2), killing
+// its in-group ancestors reparents it to this guardian instead of init. The
+// guardian can then enumerate and terminate only those adopted direct children.
+type linuxVerificationDescendantOwner struct{}
+
+func newVerificationDescendantOwner() (*linuxVerificationDescendantOwner, error) {
+	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
+		return nil, fmt.Errorf("enable child subreaper: %w", err)
+	}
+	// Refuse to start a target if procfs cannot provide the direct-child list
+	// needed to close the setsid escape after children are adopted.
+	if _, err := linuxDirectChildren(); err != nil {
+		return nil, fmt.Errorf("read guardian children from procfs: %w", err)
+	}
+	fd, err := unix.PidfdOpen(os.Getpid(), 0)
+	if err != nil {
+		return nil, fmt.Errorf("open pidfd capability: %w", err)
+	}
+	if err := unix.PidfdSendSignal(fd, 0, nil, 0); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("probe pidfd signal capability: %w", err)
+	}
+	_ = unix.Close(fd)
+	return &linuxVerificationDescendantOwner{}, nil
+}
+
+func (*linuxVerificationDescendantOwner) Close() error { return nil }
+
+func waitVerificationProcess(cmd *exec.Cmd, owner io.Reader) (error, error) {
+	pidfd, err := unix.PidfdOpen(cmd.Process.Pid, 0)
+	if err != nil {
+		killVerificationProcessGroup(cmd.Process.Pid)
+		return cmd.Wait(), fmt.Errorf("open target pidfd: %w", err)
+	}
+	defer func() { _ = unix.Close(pidfd) }()
+
+	exited := make(chan error, 1)
+	go func() { exited <- pollLinuxPIDFD(pidfd) }()
+	return completeLinuxVerificationProcess(
+		cmd.Process.Pid,
+		ownershipCanceled(owner),
+		exited,
+		killVerificationProcessGroup,
+		cmd.Wait,
+	)
+}
+
+// completeLinuxVerificationProcess is the single ordering point between target
+// exit, cancellation, process-group cleanup, and reap. cmd.Wait must only be
+// supplied as reap: every path signals the still-owned numeric PGID first.
+func completeLinuxVerificationProcess(
+	pid int,
+	canceled <-chan struct{},
+	exited <-chan error,
+	signalGroup func(int),
+	reap func() error,
+) (error, error) {
+	var observeErr error
+	select {
+	case observeErr = <-exited:
+		signalGroup(pid)
+	case <-canceled:
+		signalGroup(pid)
+		observeErr = <-exited
+	}
+	waitErr := reap()
+	if observeErr != nil {
+		return waitErr, fmt.Errorf("observe target exit: %w", observeErr)
+	}
+	return waitErr, nil
+}
+
+func pollLinuxPIDFD(pidfd int) error {
+	if pidfd < 0 || pidfd > math.MaxInt32 {
+		return fmt.Errorf("target pidfd is outside pollfd range: %d", pidfd)
+	}
+	poll := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}} // #nosec G115 -- pidfd is range-checked immediately above.
+	for {
+		n, err := unix.Poll(poll, -1)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if n > 0 && poll[0].Revents&unix.POLLIN != 0 {
+			return nil
+		}
+		if n > 0 {
+			return fmt.Errorf("unexpected target pidfd events: %#x", poll[0].Revents)
+		}
+	}
+}
+
+func (*linuxVerificationDescendantOwner) Terminate(targetPID int) error {
+	// The target leader has already been reaped by the caller. Never issue a
+	// numeric process-group signal here: the PGID may have been reused.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		none, err := reapExitedLinuxChildren()
+		if err != nil {
+			return err
+		}
+		children, err := linuxDirectChildren()
+		if err != nil {
+			return err
+		}
+		if len(children) == 0 {
+			// Wait4/ECHILD is the kernel-backed completion barrier. Do not rely
+			// on repeated procfs observations, which can race delayed reparenting.
+			if none {
+				return nil
+			}
+		}
+		for _, pid := range children {
+			if err := killLinuxPID(pid); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return fmt.Errorf("kill adopted verifier descendant %d: %w", pid, err)
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	children, err := linuxDirectChildren()
+	if err != nil {
+		return err
+	}
+	if len(children) != 0 {
+		return fmt.Errorf("adopted verifier descendants did not exit: %v", children)
+	}
+	return fmt.Errorf("adopted verifier cleanup did not observe ECHILD")
+}
+
+// killLinuxPID binds the signal to the kernel process identity. Numeric PIDs
+// may be reused between a procfs scan and cleanup; pidfds make that race
+// harmless (the signal targets the originally opened process or no process).
+func killLinuxPID(pid int) error {
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
+}
+
+func reapExitedLinuxChildren() (bool, error) {
+	for {
+		pid, err := unix.Wait4(-1, nil, unix.WNOHANG, nil)
+		if errors.Is(err, unix.ECHILD) {
+			return true, nil
+		}
+		if pid == 0 {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("reap adopted verifier descendant: %w", err)
+		}
+	}
+}
+
+// Linux exposes children per task, so scan every guardian thread rather than
+// assuming the thread-group leader performed every os/exec fork.
+func linuxDirectChildren() ([]int, error) {
+	paths, err := filepath.Glob("/proc/self/task/*/children")
+	if err != nil {
+		return nil, err
+	}
+	if len(paths) == 0 {
+		return nil, errors.New("no /proc self task children files")
+	}
+	seen := make(map[int]struct{})
+	for _, path := range paths {
+		body, readErr := os.ReadFile(path)
+		if readErr != nil {
+			// Runtime threads can disappear between Glob and ReadFile.
+			if errors.Is(readErr, os.ErrNotExist) {
+				continue
+			}
+			return nil, readErr
+		}
+		for _, field := range strings.Fields(string(body)) {
+			pid, convErr := strconv.Atoi(field)
+			if convErr != nil || pid <= 0 {
+				return nil, fmt.Errorf("invalid procfs child pid %q", field)
+			}
+			seen[pid] = struct{}{}
+		}
+	}
+	children := make([]int, 0, len(seen))
+	for pid := range seen {
+		children = append(children, pid)
+	}
+	return children, nil
 }

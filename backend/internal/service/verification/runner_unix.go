@@ -33,13 +33,15 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
 	select {
-	case err = <-wait:
-		_ = ownerWrite.Close()
 	case <-ctx.Done():
+		// INVARIANT: NEVER SIGKILL the guardian PGID from outer runProcessTree;
+		// the guardian owns cancellation cleanup via EOF. Reintroducing an
+		// outer group kill breaks macOS/Linux cancellation and setsid cleanup.
 		_ = ownerWrite.Close()
 		err = <-wait
+	case err = <-wait:
+		_ = ownerWrite.Close()
 	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	if ctx.Err() != nil {
 		return RunResult{ExitCode: -1}, ctx.Err()
 	}
@@ -47,6 +49,13 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 }
 
 func runHostedProcess(argv []string, owner io.Reader, stdout, stderr io.Writer) int {
+	descendants, ownerErr := newVerificationDescendantOwner()
+	if ownerErr != nil {
+		_, _ = io.WriteString(stderr, "prepare verification descendant ownership: "+ownerErr.Error()+"\n")
+		return 126
+	}
+	defer func() { _ = descendants.Close() }()
+
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.Env = targetEnvironment()
@@ -54,21 +63,24 @@ func runHostedProcess(argv []string, owner io.Reader, stdout, stderr io.Writer) 
 	if err := cmd.Start(); err != nil {
 		return 126
 	}
-	wait := make(chan error, 1)
-	go func() { wait <- cmd.Wait() }()
-	var err error
-	select {
-	case err = <-wait:
-	case <-ownershipCanceled(owner):
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		err = <-wait
+	err, waitCleanupErr := waitVerificationProcess(cmd, owner)
+	if waitCleanupErr != nil {
+		_, _ = io.WriteString(stderr, "wait for verification process: "+waitCleanupErr.Error()+"\n")
+		return 126
 	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	if cleanupErr := descendants.Terminate(cmd.Process.Pid); cleanupErr != nil {
+		_, _ = io.WriteString(stderr, "terminate verification descendants: "+cleanupErr.Error()+"\n")
+		return 126
+	}
 	result, resultErr := processResult(err)
 	if resultErr != nil {
 		return 126
 	}
 	return result.ExitCode
+}
+
+func killVerificationProcessGroup(pid int) {
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
 func processResult(err error) (RunResult, error) {
