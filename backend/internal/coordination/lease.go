@@ -33,29 +33,40 @@ type store interface {
 
 // Lease is one token-fenced generation of the exclusive database writer.
 type Lease struct {
-	store    store
-	token    string
-	ownerPID int
-	duration time.Duration
+	store       store
+	token       string
+	ownerPID    int
+	duration    time.Duration
+	processLock *processLock
+	releaseMu   sync.Mutex
+	released    bool
 	// confirmedUntil is the holder's local monotonic watchdog deadline for
 	// the acquired lease. Only the renewal goroutine advances it.
 	confirmedUntil time.Time
 }
 
-// OpenExclusive opens the canonical SQLite store and immediately acquires its
-// exclusive-writer lease. It is the shared boundary for the daemon and every
-// exceptional direct-DB writer. On claim failure it closes the store before
-// returning, so callers can never receive an unfenced writable handle.
+// OpenExclusive acquires the cross-process bootstrap lock before opening (and
+// migrating) the canonical SQLite store, then acquires its durable lease. The
+// OS lock remains held for the Lease lifetime, so no contender can migrate or
+// write while this generation is active. On any failure all opened resources
+// are closed before returning.
 func OpenExclusive(ctx context.Context, dataDir string, ownerPID int) (*sqlite.Store, *Lease, error) {
+	processLock, err := acquireProcessLock(dataDir)
+	if err != nil {
+		return nil, nil, err
+	}
 	store, err := sqlite.Open(dataDir)
 	if err != nil {
+		_ = processLock.Close()
 		return nil, nil, err
 	}
 	lease, err := Acquire(ctx, store, ownerPID)
 	if err != nil {
 		_ = store.Close()
+		_ = processLock.Close()
 		return nil, nil, err
 	}
+	lease.processLock = processLock
 	return store, lease, nil
 }
 
@@ -187,10 +198,24 @@ func (l *Lease) renewAt(ctx context.Context, now time.Time) (bool, error) {
 	return l.store.RenewCoordinationClaim(ctx, claimKey, l.token, now, now.Add(l.duration))
 }
 
-// Release removes the claim only if this Lease's token still owns it.
+// Release removes the durable claim only if this Lease's token still owns it,
+// then releases the OS lock. A durable-release error intentionally leaves the
+// OS lock held; process exit remains the crash-safe release path.
 func (l *Lease) Release(ctx context.Context) error {
+	l.releaseMu.Lock()
+	defer l.releaseMu.Unlock()
+	if l.released {
+		return nil
+	}
 	_, err := l.store.ReleaseCoordinationClaim(ctx, claimKey, l.token)
-	return err
+	if err != nil {
+		return err
+	}
+	if err := l.processLock.Close(); err != nil {
+		return err
+	}
+	l.released = true
+	return nil
 }
 
 // Maintain renews the lease until ctx ends. Any renewal error or ownership
