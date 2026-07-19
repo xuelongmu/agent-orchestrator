@@ -179,6 +179,7 @@ func (s *Store) EnsureReviewRunSimplificationEvent(ctx context.Context, id, targ
 	err = s.inTx(ctx, "ensure review simplification event", func(q *gen.Queries) error {
 		n, claimErr := q.ClaimReviewRunSimplificationDispatch(ctx, gen.ClaimReviewRunSimplificationDispatchParams{
 			SimplificationDispatchedAt: sql.NullTime{Time: event.OccurredAt, Valid: true},
+			SimplificationEventID:      event.ID,
 			ID:                         id,
 			TargetSha:                  targetSHA,
 		})
@@ -186,10 +187,17 @@ func (s *Store) EnsureReviewRunSimplificationEvent(ctx context.Context, id, targ
 			return claimErr
 		}
 		if n == 0 {
+			run, runErr := q.GetReviewRun(ctx, id)
+			if runErr != nil {
+				return runErr
+			}
+			if run.TargetSha != targetSHA || run.SimplificationEventID != event.ID {
+				return fmt.Errorf("review run %q exact-head simplification receipt does not match event %q", id, event.ID)
+			}
 			row, getErr := q.GetTelemetryEvent(ctx, event.ID)
 			if getErr != nil {
 				if errors.Is(getErr, sql.ErrNoRows) {
-					return fmt.Errorf("review run %q exact-head simplification receipt does not match event %q", id, event.ID)
+					return fmt.Errorf("review run %q simplification event %q is missing", id, event.ID)
 				}
 				return getErr
 			}
@@ -440,6 +448,7 @@ func reviewRunFromRow(r gen.ReviewRun) domain.ReviewRun {
 		DeliveredAt:                deliveredAt,
 		SimplificationClass:        r.SimplificationClass,
 		SimplificationDispatchedAt: simplificationDispatchedAt,
+		SimplificationEventID:      r.SimplificationEventID,
 		DeflectedReviewClearedAt:   deflectedReviewClearedAt,
 	}
 }

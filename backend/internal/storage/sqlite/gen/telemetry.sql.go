@@ -152,6 +152,12 @@ WHERE id IN (
     SELECT te.id
     FROM telemetry_event te
     WHERE te.occurred_at < ?
+      AND NOT EXISTS (
+        SELECT 1
+        FROM review_run rr
+        WHERE rr.simplification_event_id = te.id
+          AND rr.delivered_at IS NULL
+      )
     ORDER BY te.occurred_at ASC
     LIMIT ?
 )

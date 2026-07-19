@@ -98,7 +98,8 @@ func (s *Store) ListTelemetryEventsSince(ctx context.Context, since time.Time, l
 }
 
 // PruneTelemetryEventsBefore deletes at most limit rows older than before and
-// returns how many rows were removed.
+// returns how many rows were removed. Stable simplification intents referenced
+// by review runs remain protected until those runs are durably delivered.
 func (s *Store) PruneTelemetryEventsBefore(ctx context.Context, before time.Time, limit int64) (int64, error) {
 	n, err := s.qw.PruneTelemetryEventsBefore(ctx, gen.PruneTelemetryEventsBeforeParams{
 		OccurredAt: before.UTC(),

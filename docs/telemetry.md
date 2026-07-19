@@ -71,7 +71,9 @@ after a crash; SQLite ignores the repeated ID and PostHog receives the same
 `$insert_id` for provider deduplication. The local SQLite row is therefore the
 exactly-once system of record. Remote export remains buffered and best-effort:
 AO can make retries idempotent, but cannot guarantee that an external provider
-accepts an event before the review run is ultimately stamped delivered.
+accepts an event before the review run is ultimately stamped delivered. The
+30-day retention job does not prune a referenced simplification intent while
+its review run remains undelivered; after delivery, normal retention applies.
 
 ## PostHog Retention And Geography Dashboard
 

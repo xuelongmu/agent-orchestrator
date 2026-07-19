@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	sqlitestore "github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
@@ -57,6 +58,73 @@ func TestTelemetryStore_CreateListAndPrune(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ID != "tev_new" {
 		t.Fatalf("remaining rows = %+v", rows)
+	}
+}
+
+func TestTelemetryPrunePreservesUndeliveredSimplificationIntentAcrossRestart(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Unix(2_000_000_000, 0).UTC()
+	eventAt := now.Add(-31 * 24 * time.Hour)
+	cutoff := now.Add(-30 * 24 * time.Hour)
+
+	seedProject(t, s, "mer")
+	session, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertReview(ctx, domain.Review{
+		ID: "review-1", SessionID: session.ID, ProjectID: session.ProjectID,
+		Harness: domain.ReviewerCodex, CreatedAt: eventAt, UpdatedAt: eventAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertReviewRun(ctx, domain.ReviewRun{
+		ID: "run-1", ReviewID: "review-1", SessionID: session.ID,
+		Harness: domain.ReviewerCodex, PRURL: "pr1", TargetSHA: "sha1",
+		Status: domain.ReviewRunRunning, CreatedAt: eventAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.CompleteReviewRunWithFindings(ctx, "run-1", domain.VerdictChangesRequested, "fix", "", "missing-notify", nil); err != nil || !ok {
+		t.Fatalf("complete review = %v, %v", ok, err)
+	}
+	projectID, sessionID := session.ProjectID, session.ID
+	event := ports.TelemetryEvent{
+		ID: "tev_review_simplification_retention", Name: "review_simplification_round", Source: "lifecycle",
+		OccurredAt: eventAt, Level: ports.TelemetryLevelInfo, ProjectID: &projectID, SessionID: &sessionID,
+		Payload: map[string]any{"class_tag": "missing-notify"},
+	}
+	if _, created, err := s.EnsureReviewRunSimplificationEvent(ctx, "run-1", "sha1", event); err != nil || !created {
+		t.Fatalf("ensure simplification intent = %v, %v", created, err)
+	}
+
+	if pruned, err := s.PruneTelemetryEventsBefore(ctx, cutoff, 100); err != nil || pruned != 0 {
+		t.Fatalf("prune undelivered intent = %d, %v, want 0", pruned, err)
+	}
+	rows, err := s.ListTelemetryEventsSince(ctx, eventAt.Add(-time.Second), 10)
+	if err != nil || len(rows) != 1 || rows[0].ID != event.ID {
+		t.Fatalf("protected telemetry rows = %+v, %v", rows, err)
+	}
+
+	// A restarted delivery rebuilds a candidate with a new clock value, but
+	// drains the original durable intent instead of failing or replacing it.
+	replay, created, err := s.EnsureReviewRunSimplificationEvent(ctx, "run-1", "sha1", ports.TelemetryEvent{
+		ID: event.ID, OccurredAt: now,
+	})
+	if err != nil || created || !replay.OccurredAt.Equal(eventAt) {
+		t.Fatalf("restart replay = %+v, created=%v, err=%v", replay, created, err)
+	}
+
+	if ok, err := s.MarkReviewRunDelivered(ctx, "run-1", now); err != nil || !ok {
+		t.Fatalf("mark delivered = %v, %v", ok, err)
+	}
+	if pruned, err := s.PruneTelemetryEventsBefore(ctx, cutoff, 100); err != nil || pruned != 1 {
+		t.Fatalf("prune delivered intent = %d, %v, want 1", pruned, err)
+	}
+	rows, err = s.ListTelemetryEventsSince(ctx, eventAt.Add(-time.Second), 10)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("telemetry rows after delivered retention = %+v, %v", rows, err)
 	}
 }
 

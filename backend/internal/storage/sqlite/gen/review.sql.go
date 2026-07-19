@@ -86,19 +86,25 @@ func (q *Queries) ClaimReviewFindingThreadAction(ctx context.Context, arg ClaimR
 
 const claimReviewRunSimplificationDispatch = `-- name: ClaimReviewRunSimplificationDispatch :execrows
 UPDATE review_run
-SET simplification_dispatched_at = ?
+SET simplification_dispatched_at = ?, simplification_event_id = ?
 WHERE id = ? AND target_sha = ? AND status = 'complete'
   AND simplification_class != '' AND simplification_dispatched_at IS NULL
 `
 
 type ClaimReviewRunSimplificationDispatchParams struct {
 	SimplificationDispatchedAt sql.NullTime
+	SimplificationEventID      string
 	ID                         string
 	TargetSha                  string
 }
 
 func (q *Queries) ClaimReviewRunSimplificationDispatch(ctx context.Context, arg ClaimReviewRunSimplificationDispatchParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, claimReviewRunSimplificationDispatch, arg.SimplificationDispatchedAt, arg.ID, arg.TargetSha)
+	result, err := q.db.ExecContext(ctx, claimReviewRunSimplificationDispatch,
+		arg.SimplificationDispatchedAt,
+		arg.SimplificationEventID,
+		arg.ID,
+		arg.TargetSha,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -195,7 +201,7 @@ func (q *Queries) GetReviewBySession(ctx context.Context, sessionID domain.Sessi
 }
 
 const getReviewRun = `-- name: GetReviewRun :one
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at
+SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at, simplification_event_id
 FROM review_run WHERE id = ?
 `
 
@@ -219,12 +225,13 @@ func (q *Queries) GetReviewRun(ctx context.Context, id string) (ReviewRun, error
 		&i.SimplificationClass,
 		&i.SimplificationDispatchedAt,
 		&i.DeflectedReviewClearedAt,
+		&i.SimplificationEventID,
 	)
 	return i, err
 }
 
 const getReviewRunBySessionPRAndSHA = `-- name: GetReviewRunBySessionPRAndSHA :one
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at
+SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at, simplification_event_id
 FROM review_run WHERE session_id = ? AND pr_url = ? AND target_sha = ? ORDER BY created_at DESC LIMIT 1
 `
 
@@ -254,6 +261,7 @@ func (q *Queries) GetReviewRunBySessionPRAndSHA(ctx context.Context, arg GetRevi
 		&i.SimplificationClass,
 		&i.SimplificationDispatchedAt,
 		&i.DeflectedReviewClearedAt,
+		&i.SimplificationEventID,
 	)
 	return i, err
 }
@@ -502,7 +510,7 @@ func (q *Queries) ListReviewFindingsBySession(ctx context.Context, sessionID dom
 }
 
 const listReviewRunsByBatch = `-- name: ListReviewRunsByBatch :many
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at
+SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at, simplification_event_id
 FROM review_run WHERE session_id = ? AND batch_id = ? ORDER BY created_at ASC, id ASC
 `
 
@@ -537,6 +545,7 @@ func (q *Queries) ListReviewRunsByBatch(ctx context.Context, arg ListReviewRunsB
 			&i.SimplificationClass,
 			&i.SimplificationDispatchedAt,
 			&i.DeflectedReviewClearedAt,
+			&i.SimplificationEventID,
 		); err != nil {
 			return nil, err
 		}
@@ -552,7 +561,7 @@ func (q *Queries) ListReviewRunsByBatch(ctx context.Context, arg ListReviewRunsB
 }
 
 const listReviewRunsBySession = `-- name: ListReviewRunsBySession :many
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at
+SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at, simplification_event_id
 FROM review_run WHERE session_id = ? ORDER BY created_at DESC
 `
 
@@ -582,6 +591,7 @@ func (q *Queries) ListReviewRunsBySession(ctx context.Context, sessionID domain.
 			&i.SimplificationClass,
 			&i.SimplificationDispatchedAt,
 			&i.DeflectedReviewClearedAt,
+			&i.SimplificationEventID,
 		); err != nil {
 			return nil, err
 		}
@@ -597,7 +607,7 @@ func (q *Queries) ListReviewRunsBySession(ctx context.Context, sessionID domain.
 }
 
 const listRunningReviewRunsBySession = `-- name: ListRunningReviewRunsBySession :many
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at
+SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, simplification_class, simplification_dispatched_at, deflected_review_cleared_at, simplification_event_id
 FROM review_run WHERE session_id = ? AND status = 'running' AND verdict = '' ORDER BY created_at DESC
 `
 
@@ -627,6 +637,7 @@ func (q *Queries) ListRunningReviewRunsBySession(ctx context.Context, sessionID 
 			&i.SimplificationClass,
 			&i.SimplificationDispatchedAt,
 			&i.DeflectedReviewClearedAt,
+			&i.SimplificationEventID,
 		); err != nil {
 			return nil, err
 		}

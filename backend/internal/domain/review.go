@@ -60,7 +60,10 @@ type ReviewRun struct {
 	// with that run's durable local simplification telemetry event.
 	SimplificationClass        string     `json:"-"`
 	SimplificationDispatchedAt *time.Time `json:"-"`
-	DeflectedReviewClearedAt   *time.Time `json:"-"`
+	// SimplificationEventID links the receipt to its stable local telemetry row.
+	// Retention protects this row until DeliveredAt is set.
+	SimplificationEventID    string     `json:"-"`
+	DeflectedReviewClearedAt *time.Time `json:"-"`
 }
 
 // ReviewFinding is one durable entry in a PR's finding-class ledger. Round is
