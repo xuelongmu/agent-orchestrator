@@ -177,6 +177,12 @@ func copilotAgentProfile(agentName, sessionID, systemPrompt string) string {
 }
 
 func ignoreCopilotPath(workspacePath, pattern string) error {
+	return ignoreCopilotPathWithLockContention(workspacePath, pattern, nil)
+}
+
+// ignoreCopilotPathWithLockContention exposes only the confirmed-contention
+// boundary needed to synchronize the concurrency regression test.
+func ignoreCopilotPathWithLockContention(workspacePath, pattern string, onLockContention func()) error {
 	gitDir, err := workspaceGitCommonDir(workspacePath)
 	if err != nil {
 		return err
@@ -188,7 +194,7 @@ func ignoreCopilotPath(workspacePath, pattern string) error {
 	if err := os.MkdirAll(filepath.Dir(excludePath), 0o750); err != nil {
 		return fmt.Errorf("create %s: %w", filepath.Dir(excludePath), err)
 	}
-	unlock, err := lockCopilotExclude(excludePath + ".ao.lock")
+	unlock, err := lockCopilotExclude(excludePath+".ao.lock", onLockContention)
 	if err != nil {
 		return fmt.Errorf("lock %s: %w", excludePath, err)
 	}

@@ -641,25 +641,45 @@ func TestIgnoreCopilotPathSerializesConcurrentCommonExcludeUpdates(t *testing.T)
 
 	// Hold the same cross-process lock used by ignoreCopilotPath so both
 	// goroutines queue before either can perform its read-modify-write.
-	unlock, err := lockCopilotExclude(filepath.Join(commonGitDir, "info", "exclude.ao.lock"))
+	unlock, err := lockCopilotExclude(filepath.Join(commonGitDir, "info", "exclude.ao.lock"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	started := make(chan struct{}, len(workspaces))
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
+	blocked := make(chan struct{}, len(workspaces))
 	errs := make(chan error, len(workspaces))
 	var wg sync.WaitGroup
 	for i := range workspaces {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			started <- struct{}{}
-			errs <- ignoreCopilotPath(workspaces[i], patterns[i])
+			errs <- ignoreCopilotPathWithLockContention(workspaces[i], patterns[i], func() {
+				blocked <- struct{}{}
+			})
 		}(i)
 	}
 	for range workspaces {
-		<-started
+		<-blocked
+	}
+	select {
+	case err := <-errs:
+		t.Fatalf("exclude update completed while common lock was held: %v", err)
+	default:
+	}
+	before, err := os.ReadFile(filepath.Join(commonGitDir, "info", "exclude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != "# existing\n/user-entry\n" {
+		t.Fatalf("exclude changed while common lock was held:\n%s", before)
 	}
 	unlock()
+	locked = false
 	wg.Wait()
 	close(errs)
 	for err := range errs {
