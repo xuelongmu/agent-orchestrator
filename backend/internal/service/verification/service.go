@@ -77,24 +77,26 @@ type Result struct {
 
 // Service resolves allowlisted profiles and owns active workspace runs.
 type Service struct {
-	store  Store
-	runner Runner
-	root   context.Context
-	now    func() time.Time
-	policy Policy
-	auth   Authorizer
-	mu     sync.Mutex
-	active map[string]struct{}
+	store   Store
+	runner  Runner
+	root    context.Context
+	now     func() time.Time
+	policy  Policy
+	auth    Authorizer
+	dataDir string
+	mu      sync.Mutex
+	active  map[string]struct{}
 }
 
 // Deps supplies Service collaborators and the daemon root context.
 type Deps struct {
-	Store  Store
-	Runner Runner
-	Root   context.Context
-	Now    func() time.Time
-	Policy Policy
-	Auth   Authorizer
+	Store   Store
+	Runner  Runner
+	Root    context.Context
+	Now     func() time.Time
+	Policy  Policy
+	Auth    Authorizer
+	DataDir string
 }
 
 // New builds a workspace verification service.
@@ -112,7 +114,7 @@ func New(d Deps) *Service {
 		runner = OSRunner{}
 	}
 	policy := d.Policy.withDefaults()
-	return &Service{store: d.Store, runner: runner, root: root, now: now, policy: policy, auth: d.Auth, active: make(map[string]struct{})}
+	return &Service{store: d.Store, runner: runner, root: root, now: now, policy: policy, auth: d.Auth, dataDir: d.DataDir, active: make(map[string]struct{})}
 }
 
 // Run executes one configured profile and waits for its terminal outcome.
@@ -167,7 +169,11 @@ func (s *Service) Run(ctx context.Context, sessionID domain.SessionID, profile, 
 	}
 	defer s.release(workspace)
 
-	logFile, logPath, err := newLog(workspace)
+	logRoot := s.dataDir
+	if logRoot == "" {
+		logRoot = workspace
+	}
+	logFile, logPath, err := newLogAt(logRoot, string(sessionID))
 	if err != nil {
 		return Result{}, apierr.Conflict("VERIFY_LOG_UNSAFE", err.Error(), nil)
 	}
@@ -272,6 +278,11 @@ func pathWithin(root, path string) bool {
 var logNameRE = regexp.MustCompile(`^verify-(\d+)\.log$`)
 
 func newLog(workspace string) (*os.File, string, error) {
+	return newLogAt(workspace, "workspace")
+}
+
+func newLogAt(base, scope string) (*os.File, string, error) {
+	workspace := filepath.Join(base, "verification", scope)
 	root, err := os.OpenRoot(workspace)
 	if err != nil {
 		return nil, "", fmt.Errorf("open workspace root: %w", err)

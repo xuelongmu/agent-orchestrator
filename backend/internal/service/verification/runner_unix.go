@@ -17,7 +17,7 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 	if err != nil {
 		return RunResult{ExitCode: -1}, err
 	}
-	cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
+	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
 	cmd.Dir, cmd.Env, cmd.Stdin, cmd.Stdout, cmd.Stderr = spec.Dir, spec.Env, ownerRead, spec.Output, spec.Output
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 5 * time.Second

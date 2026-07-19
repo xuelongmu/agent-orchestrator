@@ -199,7 +199,7 @@ func Run() error {
 		Activity:           lcStack.LCM,
 		Telemetry:          telemetrySink,
 		Mobile:             mc,
-		Verification:       verifysvc.New(verifysvc.Deps{Store: store, Root: verificationCtx, Policy: verificationPolicy, Auth: verificationCapabilities}),
+		Verification:       verifysvc.New(verifysvc.Deps{Store: store, Root: verificationCtx, Policy: verificationPolicy, Auth: verificationCapabilities, DataDir: cfg.DataDir}),
 		CancelVerification: cancelVerification,
 	})
 	if err != nil {
