@@ -47,6 +47,7 @@ type Store interface {
 	GetReviewRun(ctx context.Context, id string) (domain.ReviewRun, bool, error)
 	UpdateReviewRunResult(ctx context.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string) (bool, error)
 	MarkReviewRunDelivered(ctx context.Context, id string, deliveredAt time.Time) (bool, error)
+	ListReviewRunsByBatch(ctx context.Context, sessionID domain.SessionID, batchID string) ([]domain.ReviewRun, error)
 	ListPRsBySession(ctx context.Context, id domain.SessionID) ([]domain.PullRequest, error)
 }
 
@@ -92,7 +93,32 @@ func (s *Service) Trigger(ctx context.Context, workerID domain.SessionID) (revie
 // SCM observation. It is daemon-internal and intentionally not part of the
 // HTTP Manager contract.
 func (s *Service) Coordinate(ctx context.Context, workerID domain.SessionID, obs ports.SCMObservation) (reviewcore.CoordinateResult, error) {
-	return s.engine.Coordinate(ctx, workerID, obs)
+	result, err := s.engine.Coordinate(ctx, workerID, obs)
+	if err != nil || s.store == nil || s.lifecycle == nil {
+		return result, err
+	}
+	run := result.Run
+	if run.Status != domain.ReviewRunComplete || run.Verdict != domain.VerdictChangesRequested || run.DeliveredAt != nil {
+		return result, nil
+	}
+	runs := []domain.ReviewRun{run}
+	if run.BatchID != "" {
+		runs, err = s.store.ListReviewRunsByBatch(ctx, workerID, run.BatchID)
+		if err != nil {
+			return result, err
+		}
+	}
+	delivered, err := s.deliverSubmitted(ctx, workerID, runs)
+	if err != nil {
+		return result, err
+	}
+	for _, replayed := range delivered {
+		if replayed.ID == result.Run.ID {
+			result.Run = replayed
+			break
+		}
+	}
+	return result, nil
 }
 
 // CoordinateReview implements the SCM observer's restart-safe coordination

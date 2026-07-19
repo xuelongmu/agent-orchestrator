@@ -1055,8 +1055,22 @@ func TestPRObservation_MergedCleanupWaitsWhileRateLimited(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := st.sessions[rec.ID]
-	if cleaner.calls != 0 || got.IsTerminated || got.Metadata.MergedCleanupPending || got.Activity.State != domain.ActivityRateLimited {
+	if cleaner.calls != 0 || got.IsTerminated || !got.Metadata.MergedCleanupPending || got.Metadata.MergedCleanupPRURL != "pr1" || got.Activity.State != domain.ActivityRateLimited {
 		t.Fatalf("rate-limited merged cleanup mutated session: rec=%+v cleaner calls=%d", got, cleaner.calls)
+	}
+
+	// The provider no longer returns the terminal PR on subsequent open-PR
+	// polls. The durable latch must still survive recovery and drive cleanup.
+	st.prs[rec.ID] = nil
+	if err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{Valid: true, Event: "user-prompt-submit", State: domain.ActivityActive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RetryMergedCleanup(ctx, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	got = st.sessions[rec.ID]
+	if cleaner.calls != 1 || !got.IsTerminated || got.Activity.State != domain.ActivityExited || got.Metadata.MergedCleanupPending || got.Metadata.MergedCleanupPRURL != "" {
+		t.Fatalf("recovered cleanup did not replay after provider dropped PR: rec=%+v cleaner calls=%d", got, cleaner.calls)
 	}
 }
 

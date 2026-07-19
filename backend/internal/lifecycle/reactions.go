@@ -728,12 +728,14 @@ func reviewFetchFailureSignature(o ports.SCMObservation) string {
 func (m *Manager) cleanupMergedSession(ctx context.Context, id domain.SessionID, prURL string) error {
 	shouldClean := false
 	if err := m.mutate(ctx, id, func(cur domain.SessionRecord, _ time.Time) (domain.SessionRecord, bool) {
-		if cur.IsTerminated || cur.Activity.State == domain.ActivityRateLimited || cur.Metadata.MergedCleanupPending {
+		if cur.IsTerminated || cur.Metadata.MergedCleanupPending {
 			return cur, false
 		}
-		shouldClean = true
 		cur.Metadata.MergedCleanupPending = true
 		cur.Metadata.MergedCleanupPRURL = prURL
+		if cur.Activity.State != domain.ActivityRateLimited {
+			shouldClean = true
+		}
 		return cur, true
 	}); err != nil {
 		return err

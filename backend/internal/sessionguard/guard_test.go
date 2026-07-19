@@ -120,6 +120,29 @@ func TestGuard_MessengerErrorIsSentPlusError(t *testing.T) {
 	}
 }
 
+func TestGuard_RateLimitedDeliverDistinguishesExplicitRetryFromAutomatedEnter(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  string
+		want Outcome
+	}{
+		{name: "explicit retry", msg: "retry after reset", want: Sent},
+		{name: "automated Enter", msg: "", want: SuppressedRateLimited},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			messenger := &fakeMessenger{}
+			g := New(&fakeStore{rec: record(domain.ActivityRateLimited, false), ok: true}, messenger, nil)
+			got, err := g.Deliver(context.Background(), "s1", tc.msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want || (len(messenger.sent) == 1) != (tc.want == Sent) {
+				t.Fatalf("outcome=%v sends=%d, want outcome=%v", got, len(messenger.sent), tc.want)
+			}
+		})
+	}
+}
+
 func TestGuard_NudgeIdleEpisodeRequiresExactFinalState(t *testing.T) {
 	idleSince := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {

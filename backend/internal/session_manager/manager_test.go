@@ -5036,6 +5036,33 @@ func TestSend_NoNudgeWhenBlockedAppearsBeforeNudge(t *testing.T) {
 	}
 }
 
+func TestSend_NoNudgeWhenRateLimitAppearsBeforeNudge(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = domain.SessionRecord{ID: "s1", Harness: "claude-code",
+		Activity: domain.Activity{State: domain.ActivityIdle}}
+	// The provider limit lands only at confirmActive's final guard read, after
+	// the preceding poll still observed idle. The Enter-only Deliver must fail
+	// closed while preserving the already-sent explicit prompt.
+	rst := &rateLimitBeforeNudgeStore{fakeStore: st, id: "s1"}
+	msg := &fakeMessenger{}
+	m := New(Deps{
+		Runtime: &fakeRuntime{}, Agents: singleAgent{signalingAgent{}}, Workspace: &fakeWorkspace{},
+		Store: rst, Messenger: msg, Lifecycle: &fakeLCM{store: st},
+		LookPath: func(string) (string, error) { return "/bin/true", nil },
+	})
+	m.sendConfirm = sendConfirmConfig{pollInterval: time.Millisecond, attemptDeadline: 0, maxAttempts: 3}
+
+	if err := m.Send(context.Background(), "s1", "run the migration"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(msg.msgs) != 1 || msg.msgs[0] != "run the migration" {
+		t.Fatalf("Send calls = %#v, want explicit message only", msg.msgs)
+	}
+	if got := st.sessions["s1"].Activity.State; got != domain.ActivityRateLimited {
+		t.Fatalf("Activity.State = %s, want rate_limited", got)
+	}
+}
+
 func TestSend_SkipsConfirmForSubmitOnlyHarness(t *testing.T) {
 	// A harness that submits but cannot report blocked (goose/opencode/agy) is
 	// NOT nudge-safe: confirmActive must be skipped entirely, so an Enter can
@@ -5082,6 +5109,23 @@ type blockAfterFirstReadStore struct {
 	*fakeStore
 	id    domain.SessionID
 	reads int
+}
+
+type rateLimitBeforeNudgeStore struct {
+	*fakeStore
+	id    domain.SessionID
+	reads int
+}
+
+func (s *rateLimitBeforeNudgeStore) GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
+	s.reads++
+	if s.reads >= 4 {
+		if rec, ok := s.sessions[s.id]; ok {
+			rec.Activity.State = domain.ActivityRateLimited
+			s.sessions[s.id] = rec
+		}
+	}
+	return s.fakeStore.GetSession(ctx, id)
 }
 
 func (s *blockAfterFirstReadStore) GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {

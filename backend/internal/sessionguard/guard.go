@@ -112,16 +112,21 @@ func (g *Guard) Send(ctx context.Context, id domain.SessionID, msg string) error
 	return err
 }
 
-// Deliver writes a user-initiated message (or its Enter-only re-submit: an
-// empty msg) into the session. It refuses only when the session is blocked on
-// a pending decision — waiting_input does NOT suppress, because an agent
-// sitting at an idle prompt is exactly where a user message (or the Enter that
-// submits its unsent draft) belongs.
+// Deliver writes a user-initiated message or an Enter-only re-submit. A
+// non-empty explicit message remains the intentional retry path after a usage
+// limit resets. An empty message is AO automation, so a final-read rate-limit
+// transition suppresses it alongside blocked decisions. waiting_input does not
+// suppress: that idle prompt is exactly where an Enter re-submit belongs.
 func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
 	return g.send(ctx, id, msg, func(rec domain.SessionRecord) Outcome {
 		switch rec.Activity.State {
 		case domain.ActivityBlocked:
 			return SuppressedAwaitingUser
+		case domain.ActivityRateLimited:
+			if msg == "" {
+				return SuppressedRateLimited
+			}
+			return Sent
 		default:
 			return Sent
 		}
