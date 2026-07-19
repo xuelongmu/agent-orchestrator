@@ -50,9 +50,12 @@ target, findingIds, outcome, externalId, evidence}`. Every provider-backed
 - `mutationLog`: append write-ahead and receipt events for every non-idempotent
   provider mutation. A prepared event is `{id, intentId, recordedAt,
 phase: "prepared", attemptId, kind, target, headSha, externalMarker,
-payloadHash}`; a terminal event reuses `intentId` and `attemptId` with
-  `phase: "succeeded" | "failed" | "reconciled"` plus the provider
-  receipt/evidence. Allocate `attemptId` from the durable
+payloadHash, providerBaseline}`; a terminal event reuses `intentId` and
+  `attemptId` with `phase: "succeeded" | "failed" | "reconciled"` plus the
+  provider receipt/evidence. `providerBaseline` is required when the provider
+  cannot carry the external marker and records the pre-mutation state plus the
+  exact observable transition that would prove this attempt occurred. Allocate
+  `attemptId` from the durable
   `nextAttemptSequence`, then derive `intentId` and `externalMarker`
   deterministically from the loop, attempt ID, action kind, target, HEAD, and
   payload hash. Thus two policy-authorized writes with otherwise identical
@@ -71,19 +74,28 @@ later outcome look inevitable. Never store credentials, tokens, or raw secrets.
 
 Complete initialization before the first health check:
 
-1. Resolve the repository-relative `POLICY.md` path and require its loaded bytes
-   to match the checked-in file. Set `policy.gitCommit` to the full commit SHA
-   returned by `git log -1 --format=%H -- <policy-path>`: the commit that last
-   changed that path, not the repository HEAD when the loop happens to be
-   created. Verify that the policy blob at that commit has the loaded bytes.
-2. Compute `policy.contentSha256` over those exact loaded bytes and read the
-   policy version from the file.
-3. Copy [STATE.template.json](STATE.template.json) to the private state path.
+1. Resolve the repository root with `git rev-parse --show-toplevel` and treat
+   `policy.path` as repository-relative. Run Git operations with
+   `git -C <repo-root>` (or use a `:(top)` pathspec) so initialization is
+   independent of the caller's current directory. Require the policy path to be
+   tracked and unchanged in both the index and working tree.
+2. Set `policy.gitCommit` to the full SHA returned by
+   `git -C <repo-root> log -1 --format=%H -- ":(top)<policy-path>"`: the commit
+   that last changed that path, not the repository HEAD when the loop happens to
+   be created. Require the policy blob at repository `HEAD` and at that commit to
+   have the same object ID.
+3. Read the canonical policy bytes directly from that Git blob with a binary-safe
+   `git cat-file blob <commit>:<policy-path>` equivalent. Compute
+   `policy.contentSha256` over those blob bytes and read the policy version from
+   the same bytes. Do not hash checkout bytes: line-ending conversion such as
+   Windows `core.autocrlf` may make them bytewise different without changing the
+   committed policy.
+4. Copy [STATE.template.json](STATE.template.json) to the private state path.
    Populate every loop identity, target, reviewer, authority, and creation field;
    populate all policy fields with the values just computed; and leave
    `nextAttemptSequence` at `1`. Do not leave required strings or the pull-request
    number empty.
-4. Persist the initialized document with the durable replacement procedure in
+5. Persist the initialized document with the durable replacement procedure in
    step 4 below. Initialization is incomplete until the new state file and its
    parent-directory metadata have both been flushed successfully. Only then run
    the first health check.
@@ -95,21 +107,29 @@ Complete initialization before the first health check:
 - Confirm the AO daemon and relevant worker/reviewer sessions are reachable.
   Prefer `ao status` and `ao session get <id>` when those sessions are involved.
 - Confirm the state parses, its repository and PR match the requested target,
-  and its policy version is understood. Require `policy.gitCommit` and
-  `policy.contentSha256` to be populated, recompute the policy file's SHA-256,
-  resolve the commit that last changed the policy path, and confirm both values
+  and `schemaVersion` is exactly the supported version `2`. A version 1 state
+  lacks attempt sequencing and dispatch-to-intent links; stop before every
+  provider write, including owed-output delivery, and require an explicit,
+  operator-reviewed offline migration. Do not invent links or sequence values
+  from prompt memory. Also stop on an unknown newer schema.
+- Require `policy.gitCommit` and `policy.contentSha256` to be populated. From the
+  repository root, require the policy path to be tracked and unchanged, resolve
+  the commit that last changed its top-rooted path, read that commit's canonical
+  Git blob bytes, and recompute the SHA-256 over those bytes. Confirm both values
   match the pins. The commit pin never means current repository HEAD or the HEAD
-  at loop creation. Stop for operator confirmation before any action if either
-  value is missing or mismatched.
+  at loop creation, and checkout line endings never define the content pin. Stop
+  for operator confirmation before any action if either value is missing or
+  mismatched.
 - Stop rather than guess if identity, credentials, repository, or state integrity
   is uncertain.
 - Before any provider write, including owed-output delivery, check for every
   prepared mutation without a terminal event and every `ambiguous` dispatch left
   by a crash. Resolve a dispatch through its `mutationIntentId`; search the
   provider by that intent's attempt-aware external marker, exact target, and
-  payload hash. Append a reconciliation event and do not issue any provider
-  mutation until every prior outcome is known. Stop if an ambiguous dispatch has
-  no valid intent link or the search is inconclusive.
+  payload hash, or apply its recorded baseline rule for a permitted markerless
+  attempt. Append a reconciliation event and do not issue any provider mutation
+  until every prior outcome is known. Stop if an ambiguous dispatch has no valid
+  intent link or the search is inconclusive.
 - Only after reconciliation leaves no unresolved provider write, inspect
   `owedOutputs`. Deliver outstanding items using the same write-ahead mutation
   protocol even when the cycle's only other safe action is to wait or stop.
@@ -169,10 +189,19 @@ intent ID, and marker and must not consume a new sequence value.
 Put the marker in the provider-visible payload or idempotency-key field when
 supported. This applies to review requests and re-triggers, fix dispatches, issue
 filing, thread resolution, owed-output delivery, and other provider writes. A
-provider-backed `dispatchLog` entry must reference the prepared intent. If a
-provider cannot carry a marker, record the exact target and payload fingerprint
-and use both with the attempt ID during reconciliation. Never perform the
-mutation if the prepared intent cannot be made durable.
+provider-backed `dispatchLog` entry must reference the prepared intent.
+
+If a provider cannot carry a marker, record a `providerBaseline` in the prepared
+event: the exact pre-mutation provider state or watermark and the observable
+transition that would uniquely prove the attempt occurred. Permit the mutation
+only when that transition can be attributed to this attempt. After any prior
+attempt with the same kind, target, HEAD, and payload hash, do not issue another
+markerless attempt; a policy-authorized repeated attempt requires a
+provider-visible marker or idempotency key. If recovery cannot distinguish a
+markerless attempt from pre-existing or concurrent state, leave it unresolved,
+stop provider writes, and request an operator disposition rather than matching
+an earlier receipt or retrying. Never perform any mutation if its prepared intent
+and required baseline cannot be made durable.
 
 After the provider responds, append a terminal mutation event and capture the
 command/tool result, provider ID or URL, target HEAD, and timestamp. If the
@@ -208,9 +237,12 @@ rename alone is not durable. Never patch the live JSON in place.
 
 If the action may have succeeded but its terminal receipt was not persisted, the
 next cycle must use the prepared intent's marker and payload fingerprint to
-search the provider and append a reconciliation event. Do not blindly repeat the
-action. If no valid state or backup exists, stop and ask a human to reconstruct
-the non-derivable facts; never recover them from a recurring prompt.
+search the provider and append a reconciliation event. For a permitted
+markerless attempt, compare the provider against its durable `providerBaseline`
+and require the recorded transition to be uniquely attributable; otherwise stop
+for operator disposition. Do not blindly repeat the action. If no valid state or
+backup exists, stop and ask a human to reconstruct the non-derivable facts;
+never recover them from a recurring prompt.
 
 ### 5. Deliver owed output
 
@@ -299,7 +331,10 @@ After the retry limit, surface non-convergence instead of scheduling more retrie
 ## Recover after a crash
 
 1. Load the last valid `STATE.json` (or its backup) and the versioned policy.
-2. Run the health check and derive all provider/AO facts again.
+2. Run the health check and derive all provider/AO facts again. Reject any state
+   whose schema is not the supported version before delivering owed output or
+   issuing another provider write; version 1 requires an explicit,
+   operator-reviewed offline migration.
 3. Before delivering owed output or issuing any other provider write, reconcile
    every unresolved prepared mutation and ambiguous dispatch through its linked
    attempt-aware intent. Mark uncertain actions `ambiguous` until evidence

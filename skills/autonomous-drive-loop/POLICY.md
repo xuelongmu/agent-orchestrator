@@ -12,19 +12,32 @@ reviewed commit. Never let a recurring loop rewrite it. Procedures belong in
 - Re-query mutable provider and AO facts before acting. Do not act from a prior
   cycle's prompt, summary, cached HEAD, or cached status.
 - Before each non-idempotent provider mutation, durably record a deterministic
-  intent, a unique durable attempt ID, and an external marker derived from that
-  attempt ID. Distinct policy-authorized attempts use distinct attempt IDs even
-  when their target, HEAD, and payload match. Require an external receipt before
-  recording the mutation as successful; reconcile prepared or ambiguous
-  mutations by their original attempt-aware marker, target, and payload
-  fingerprint before retrying them.
+  intent, a unique durable attempt ID, and either an external marker derived from
+  that attempt ID or the permitted markerless baseline below. Distinct
+  policy-authorized attempts use distinct attempt IDs even when their target,
+  HEAD, and payload match. Require an external receipt before recording the
+  mutation as successful; reconcile prepared or ambiguous mutations by their
+  original attempt-aware marker, target, and payload fingerprint before retrying
+  them.
+- Require a provider-visible marker or idempotency key for a repeated attempt
+  with the same action kind, target, HEAD, and payload. For a first markerless
+  attempt, durably record a provider baseline and proceed only when an observable
+  transition can be uniquely attributed to that attempt. If recovery remains
+  ambiguous, stop for operator disposition; never match an earlier receipt or
+  issue an automatic retry.
 - Flush each new state file and its parent-directory metadata to stable storage
   before treating a prepared or terminal mutation event as durable. Atomic
   rename without those flushes is insufficient.
 - Pin both the policy file's content hash and the commit that last changed
   `POLICY.md` when a loop is created. The commit pin is never arbitrary current
-  HEAD or loop-creation HEAD. On recovery, stop before acting if either pin is
-  missing or does not match the loaded policy and its last-changing commit.
+  HEAD or loop-creation HEAD. Hash the canonical Git blob bytes from a
+  repository-rooted path, not checkout bytes subject to line-ending conversion.
+  On recovery, stop before acting if either pin is missing or does not match the
+  policy blob and its last-changing commit.
+- Accept only a state schema whose migration rules this skill explicitly
+  understands. Stop every provider write for an older or newer schema until an
+  operator-reviewed offline migration produces a supported state; never infer
+  missing mutation identity or reconciliation links.
 - Do not override branch protection, dismiss findings, resolve another author's
   thread, file issues, switch reviewers, or merge unless the operator has granted
   that authority.
