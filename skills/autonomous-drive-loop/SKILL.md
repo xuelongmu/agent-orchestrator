@@ -9,10 +9,9 @@ Run one evidence-based cycle at a time. Treat the recurring prompt only as a
 pointer to this skill, the policy, and the state file.
 
 Read [POLICY.md](POLICY.md) before acting. Its rules are binding until a human
-deliberately changes the versioned file. Initialize a new loop by copying
-[STATE.template.json](STATE.template.json) to a private `STATE.json` under the AO
-data directory, normally `~/.ao/drive-loops/<loop-id>/STATE.json`. Never put
-runtime state in the repo.
+deliberately changes the versioned file. Initialize a new loop with the procedure
+below and keep its private `STATE.json` under the AO data directory, normally
+`~/.ao/drive-loops/<loop-id>/STATE.json`. Never put runtime state in the repo.
 
 ## Keep three stores separate
 
@@ -35,18 +34,30 @@ them from the current provider response or prompt memory.
 Keep the event collections limited to facts that cannot safely be reconstructed
 after a crash:
 
+Treat `nextAttemptSequence` as the next unused positive integer. Form each new
+`attemptId` from the loop ID and that sequence value, and advance the value only
+in the same durable state replacement that appends the prepared mutation.
+
 - `decisions`: append `{id, recordedAt, kind, summary, evidence[]}`. Cite command
   output, provider URL/ID, or a tool receipt; do not cite memory.
-- `dispatchLog`: append `{id, requestedAt, kind, headSha, target, findingIds,
-outcome, externalId, evidence}`. Use `outcome: "ambiguous"` when a crash makes
-  delivery uncertain.
+- `dispatchLog`: append `{id, mutationIntentId, requestedAt, kind, headSha,
+target, findingIds, outcome, externalId, evidence}`. Every provider-backed
+  dispatch must point to its prepared `mutationLog` event through
+  `mutationIntentId`; use that intent's attempt ID, external marker, and payload
+  hash as the dispatch reconciliation keys. Use `outcome: "ambiguous"` when a
+  crash makes delivery uncertain. Never create an ambiguous dispatch without
+  its linked intent already durable.
 - `mutationLog`: append write-ahead and receipt events for every non-idempotent
   provider mutation. A prepared event is `{id, intentId, recordedAt,
-phase: "prepared", kind, target, headSha, externalMarker, payloadHash}`; a
-  terminal event reuses `intentId` with `phase: "succeeded" | "failed" |
-"reconciled"` plus the provider receipt/evidence. Derive `intentId` and
-  `externalMarker` deterministically from the loop, action kind, target, HEAD,
-  and payload hash so recovery can search for the same action.
+phase: "prepared", attemptId, kind, target, headSha, externalMarker,
+payloadHash}`; a terminal event reuses `intentId` and `attemptId` with
+  `phase: "succeeded" | "failed" | "reconciled"` plus the provider
+  receipt/evidence. Allocate `attemptId` from the durable
+  `nextAttemptSequence`, then derive `intentId` and `externalMarker`
+  deterministically from the loop, attempt ID, action kind, target, HEAD, and
+  payload hash. Thus two policy-authorized writes with otherwise identical
+  inputs remain distinct, while recovery of one ambiguous attempt reuses its
+  original keys.
 - `findingClassLedger`: keep one record per normalized root-cause class with
   `{classTag, invariant, rootCauseNote, occurrences[]}`. Each occurrence records
   `{findingId, round, url, file, headSha, disposition, fixCommit, issueUrl}`.
@@ -55,6 +66,27 @@ deliveryEvidence}`. Leave `status: "owed"` until delivery occurs.
 
 Use stable event IDs and append history; do not rewrite prior decisions to make a
 later outcome look inevitable. Never store credentials, tokens, or raw secrets.
+
+## Initialize a new loop
+
+Complete initialization before the first health check:
+
+1. Resolve the repository-relative `POLICY.md` path and require its loaded bytes
+   to match the checked-in file. Set `policy.gitCommit` to the full commit SHA
+   returned by `git log -1 --format=%H -- <policy-path>`: the commit that last
+   changed that path, not the repository HEAD when the loop happens to be
+   created. Verify that the policy blob at that commit has the loaded bytes.
+2. Compute `policy.contentSha256` over those exact loaded bytes and read the
+   policy version from the file.
+3. Copy [STATE.template.json](STATE.template.json) to the private state path.
+   Populate every loop identity, target, reviewer, authority, and creation field;
+   populate all policy fields with the values just computed; and leave
+   `nextAttemptSequence` at `1`. Do not leave required strings or the pull-request
+   number empty.
+4. Persist the initialized document with the durable replacement procedure in
+   step 4 below. Initialization is incomplete until the new state file and its
+   parent-directory metadata have both been flushed successfully. Only then run
+   the first health check.
 
 ## Run one cycle
 
@@ -65,18 +97,22 @@ later outcome look inevitable. Never store credentials, tokens, or raw secrets.
 - Confirm the state parses, its repository and PR match the requested target,
   and its policy version is understood. Require `policy.gitCommit` and
   `policy.contentSha256` to be populated, recompute the policy file's SHA-256,
-  and confirm both the content hash and the commit which last changed the file
-  match the pinned values. Stop for operator confirmation before any action if
-  either value is missing or mismatched.
-- Inspect `owedOutputs` immediately after loading state. Deliver outstanding
-  items even when the cycle's only safe action is to wait or stop and no other
-  state mutation will occur.
-- Check for a prepared mutation without a terminal event and for an `ambiguous`
-  dispatch or decision left by a crash. Search the provider by its deterministic
-  external marker, target, and payload hash, append a reconciliation event, and
-  do not issue another mutation until its outcome is known.
+  resolve the commit that last changed the policy path, and confirm both values
+  match the pins. The commit pin never means current repository HEAD or the HEAD
+  at loop creation. Stop for operator confirmation before any action if either
+  value is missing or mismatched.
 - Stop rather than guess if identity, credentials, repository, or state integrity
   is uncertain.
+- Before any provider write, including owed-output delivery, check for every
+  prepared mutation without a terminal event and every `ambiguous` dispatch left
+  by a crash. Resolve a dispatch through its `mutationIntentId`; search the
+  provider by that intent's attempt-aware external marker, exact target, and
+  payload hash. Append a reconciliation event and do not issue any provider
+  mutation until every prior outcome is known. Stop if an ambiguous dispatch has
+  no valid intent link or the search is inconclusive.
+- Only after reconciliation leaves no unresolved provider write, inspect
+  `owedOutputs`. Deliver outstanding items using the same write-ahead mutation
+  protocol even when the cycle's only other safe action is to wait or stop.
 
 ### 2. Derive live facts
 
@@ -120,30 +156,55 @@ the invariant, enforce it at one chokepoint, remove redundant per-site predicate
 and treat individual findings as regression cases. Do not request another local
 symptom patch.
 
-Before every non-idempotent provider mutation, derive its deterministic intent
-ID, external marker, and payload hash; append the prepared event to
-`mutationLog`; atomically persist and validate the state; then perform exactly
-that mutation. Put the marker in the provider-visible payload or idempotency-key
-field when supported. This applies to review re-triggers, issue filing, thread
-resolution, owed-output delivery, and other provider writes. If a provider
-cannot carry a marker, record the exact target and payload fingerprint and use
-both during reconciliation. Never perform the mutation if the prepared intent
-cannot be made durable.
+Before every non-idempotent provider mutation, hash the exact payload, allocate
+the next `attemptId`, and derive the deterministic intent ID and external marker
+from the loop ID, attempt ID, action kind, exact target, HEAD, and payload hash.
+In one state update, append the prepared event to `mutationLog` and advance
+`nextAttemptSequence`; durably persist and validate the state; then perform
+exactly that mutation. A policy-authorized new attempt consumes a new attempt ID
+even when its target, HEAD, and payload match an earlier attempt. A recovery or
+transport retry for an unresolved attempt must reuse the existing attempt ID,
+intent ID, and marker and must not consume a new sequence value.
+
+Put the marker in the provider-visible payload or idempotency-key field when
+supported. This applies to review requests and re-triggers, fix dispatches, issue
+filing, thread resolution, owed-output delivery, and other provider writes. A
+provider-backed `dispatchLog` entry must reference the prepared intent. If a
+provider cannot carry a marker, record the exact target and payload fingerprint
+and use both with the attempt ID during reconciliation. Never perform the
+mutation if the prepared intent cannot be made durable.
 
 After the provider responds, append a terminal mutation event and capture the
 command/tool result, provider ID or URL, target HEAD, and timestamp. If the
-response is lost or the receipt cannot be persisted, leave the durable prepared
-intent unresolved so recovery reconciles it before any retry. Never report
-success from intent alone.
+response is lost or the receipt cannot be durably persisted, leave the prepared
+intent unresolved so recovery reconciles it before any retry. Treat the mutation
+as completed only after the terminal event has passed the file and directory
+flushes in step 4. Never report success from intent alone.
 
 ### 4. Update state from evidence
 
 For ordinary observations and decisions, update `STATE.json` only after the
 result is known. Provider mutations are the exception: persist their prepared
 intent before acting and their terminal receipt afterward. For every state
-write, write a complete new JSON document to a temporary file in the same
-directory, parse/validate it, keep the previous valid file as a backup, and
-atomically rename the new file. Never patch the live JSON in place.
+write, use this durable replacement sequence:
+
+1. Write a complete new JSON document to a temporary file in the same directory,
+   flush its file contents to stable storage (`fsync`, `FlushFileBuffers`, or the
+   platform equivalent), and close it.
+2. Parse and validate the temporary file, then preserve the previous valid state
+   as a backup without patching the live JSON in place.
+3. Atomically replace `STATE.json` with the temporary file. Flush the resulting
+   state file and then its parent-directory metadata to stable storage (or use a
+   documented platform primitive that provides those same durability
+   guarantees).
+4. Treat the update as durable only after every flush succeeds. If a prepared
+   update fails, stop before the provider write. If a terminal update fails after
+   the provider write, treat its prepared event as unresolved so the next cycle
+   reconciles it.
+
+Prepared and terminal mutation events, attempt-sequence advancement, initialized
+policy pins, decisions, and delivery receipts all use this sequence. Atomic
+rename alone is not durable. Never patch the live JSON in place.
 
 If the action may have succeeded but its terminal receipt was not persisted, the
 next cycle must use the prepared intent's marker and payload fingerprint to
@@ -153,11 +214,12 @@ the non-derivable facts; never recover them from a recurring prompt.
 
 ### 5. Deliver owed output
 
-Read `owedOutputs` once from the state loaded at cycle start and again after every
-state update. Send each owed human-facing result to its intended audience, then
-record the delivery receipt and set it to `delivered`. A prepared message, a
-state entry, or a prompt saying `DONE` is not delivery. Retry or surface failures;
-do not silently clear them.
+After the health check has reconciled all prior provider writes, read
+`owedOutputs` from the reconciled state and again after every state update. Send
+each owed human-facing result to its intended audience through the write-ahead
+mutation protocol, then record the delivery receipt and set it to `delivered`. A
+prepared message, a state entry, or a prompt saying `DONE` is not delivery. Retry
+or surface failures; do not silently clear them.
 
 ### 6. Reschedule with pointers only
 
@@ -238,9 +300,12 @@ After the retry limit, surface non-convergence instead of scheduling more retrie
 
 1. Load the last valid `STATE.json` (or its backup) and the versioned policy.
 2. Run the health check and derive all provider/AO facts again.
-3. Reconcile the external systems with the last dispatch receipt. Mark uncertain
-   actions `ambiguous` until evidence resolves them.
-4. Resume from the first incomplete action, including owed output. Never trust a
-   scheduler prompt's claim that an action or delivery happened.
+3. Before delivering owed output or issuing any other provider write, reconcile
+   every unresolved prepared mutation and ambiguous dispatch through its linked
+   attempt-aware intent. Mark uncertain actions `ambiguous` until evidence
+   resolves them.
+4. After reconciliation is complete, resume from the first incomplete action,
+   including owed output. Never trust a scheduler prompt's claim that an action
+   or delivery happened.
 5. Reschedule only after state is durably written and policy still permits
    another cycle.

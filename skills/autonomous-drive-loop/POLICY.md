@@ -12,12 +12,19 @@ reviewed commit. Never let a recurring loop rewrite it. Procedures belong in
 - Re-query mutable provider and AO facts before acting. Do not act from a prior
   cycle's prompt, summary, cached HEAD, or cached status.
 - Before each non-idempotent provider mutation, durably record a deterministic
-  intent and external marker. Require an external receipt before recording the
-  mutation as successful; reconcile prepared or ambiguous mutations by marker
-  and payload fingerprint before retrying them.
-- Pin both the policy file's content hash and the commit that supplied it when a
-  loop is created. On recovery, stop before acting if either pin is missing or
-  does not match the loaded policy.
+  intent, a unique durable attempt ID, and an external marker derived from that
+  attempt ID. Distinct policy-authorized attempts use distinct attempt IDs even
+  when their target, HEAD, and payload match. Require an external receipt before
+  recording the mutation as successful; reconcile prepared or ambiguous
+  mutations by their original attempt-aware marker, target, and payload
+  fingerprint before retrying them.
+- Flush each new state file and its parent-directory metadata to stable storage
+  before treating a prepared or terminal mutation event as durable. Atomic
+  rename without those flushes is insufficient.
+- Pin both the policy file's content hash and the commit that last changed
+  `POLICY.md` when a loop is created. The commit pin is never arbitrary current
+  HEAD or loop-creation HEAD. On recovery, stop before acting if either pin is
+  missing or does not match the loaded policy and its last-changing commit.
 - Do not override branch protection, dismiss findings, resolve another author's
   thread, file issues, switch reviewers, or merge unless the operator has granted
   that authority.
@@ -57,7 +64,8 @@ immediately before merge; restart evaluation if it changed.
   them as clean verdicts.
 - After engagement without a verdict, wait 30 minutes before re-triggering. Send
   at most two re-triggers for the same HEAD, and only after confirming no newer
-  request or verdict exists.
+  request or verdict exists. Give each authorized re-trigger its own durable
+  attempt ID and marker; never reconcile it against an earlier attempt's receipt.
 - Do not silently switch to a different reviewer. A policy-authorized substitute
   must produce its own current-HEAD verdict.
 
@@ -87,8 +95,11 @@ immediately before merge; restart evaluation if it changed.
 
 - Consider user/operator output delivered only after it is sent and a receipt or
   equivalent evidence is recorded.
-- Keep owed output durable across crashes and process it every cycle.
+- Keep owed output durable across crashes and process it every cycle, but first
+  reconcile every unresolved prepared mutation and ambiguous dispatch. Owed
+  delivery is itself a provider mutation and must not bypass that ordering.
 - Recurring prompts may contain only the loop ID and pointers to `SKILL.md`, this
   policy, and `STATE.json`. They must not carry mutable facts or completion claims.
-- Reschedule only when another action remains, state is durable, and no policy
-  stop condition applies.
+- Reschedule only when another action remains, state is durable including the
+  required file and parent-directory flushes, and no policy stop condition
+  applies.
