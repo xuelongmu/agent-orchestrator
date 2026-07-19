@@ -203,7 +203,7 @@ type Manager struct {
 	// concurrent requests cannot both observe the project directory as free.
 	sharedDirMu       sync.Mutex
 	cleanupRetryMu    sync.Mutex
-	cleanupRetries    map[domain.SessionID]struct{}
+	cleanupRetries    map[domain.SessionID]string
 	cleanupRetryDelay time.Duration
 }
 
@@ -276,7 +276,7 @@ func New(d Deps) *Manager {
 			attemptDeadline: sendConfirmAttemptDeadline,
 			maxAttempts:     sendConfirmMaxAttempts,
 		},
-		logger: d.Logger, cleanupRetries: make(map[domain.SessionID]struct{}), cleanupRetryDelay: time.Second,
+		logger: d.Logger, cleanupRetries: make(map[domain.SessionID]string), cleanupRetryDelay: time.Second,
 	}
 	if m.clock == nil {
 		// UTC so spawn-stamped CreatedAt/UpdatedAt match every other session
@@ -920,18 +920,21 @@ func (m *Manager) cleanupCompletedSessionOwned(ctx context.Context, id domain.Se
 // activity-exit callback or a daemon restart.
 func (m *Manager) scheduleCleanupRetry(id domain.SessionID, lease string) {
 	m.cleanupRetryMu.Lock()
-	if _, ok := m.cleanupRetries[id]; ok {
+	if current, ok := m.cleanupRetries[id]; ok && current == lease {
 		m.cleanupRetryMu.Unlock()
 		return
 	}
-	m.cleanupRetries[id] = struct{}{}
+	m.cleanupRetries[id] = lease
 	m.cleanupRetryMu.Unlock()
 	time.AfterFunc(m.cleanupRetryDelay, func() {
 		err := m.cleanupCompletedSessionOwned(context.Background(), id, lease)
 		m.cleanupRetryMu.Lock()
-		delete(m.cleanupRetries, id)
+		current, ownsGeneration := m.cleanupRetries[id]
+		if ownsGeneration && current == lease {
+			delete(m.cleanupRetries, id)
+		}
 		m.cleanupRetryMu.Unlock()
-		if err != nil {
+		if err != nil && ownsGeneration && current == lease {
 			m.scheduleCleanupRetry(id, lease)
 		}
 	})

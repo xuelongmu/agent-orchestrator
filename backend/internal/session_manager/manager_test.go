@@ -1579,6 +1579,36 @@ func TestCleanupRetry_DoesNotTearDownReplacement(t *testing.T) {
 	}
 }
 
+func TestCleanupRetry_NewLeaseSupersedesOldTimer(t *testing.T) {
+	m, st, _, ws := newManager()
+	m.cleanupRetryDelay = 20 * time.Millisecond
+	rec := mkLive("mer-1")
+	rec.IsTerminated = true
+	rec.Activity = domain.Activity{State: domain.ActivityExited}
+	rec.Metadata.WorkspaceKind = domain.WorkspaceKindScratch
+	rec.Metadata.WorkspacePath = "/scratch/a"
+	rec.Metadata.RuntimeHandleID = "lease-a"
+	st.sessions[rec.ID] = rec
+	m.scheduleCleanupRetry(rec.ID, "lease-a")
+	// Before A fires, a replacement gets a new durable lease and its cleanup
+	// fails. Scheduling B must supersede A rather than being suppressed by ID.
+	rec.Metadata.RuntimeHandleID = "lease-b"
+	rec.Metadata.WorkspacePath = "/scratch/b"
+	st.sessions[rec.ID] = rec
+	ws.destroyErr = errors.New("busy")
+	if err := m.CleanupCompletedSession(ctx, rec.ID); err == nil {
+		t.Fatal("lease B cleanup unexpectedly succeeded")
+	}
+	ws.destroyErr = nil
+	deadline := time.Now().Add(time.Second)
+	for st.sessions[rec.ID].Metadata.RuntimeHandleID != "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st.sessions[rec.ID].Metadata.RuntimeHandleID != "" {
+		t.Fatal("new lease cleanup was abandoned after old timer fired")
+	}
+}
+
 func TestCleanupMergedSession_PreservesDirtyWorkspaceWithoutLifecycleReentry(t *testing.T) {
 	m, st, rt, ws := newManager()
 	rec := mkLive("mer-1")
