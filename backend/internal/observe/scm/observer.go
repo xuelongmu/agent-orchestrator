@@ -211,21 +211,13 @@ func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Obser
 // to the next tick.
 func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 	var credentialGate sync.Once
-	poll := func(ctx context.Context) error {
-		credentialGate.Do(func() {
-			if _, err := o.checkCredentials(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				o.logger.Error("scm observer: initial credential check failed", "err", err)
-			}
-		})
-		return o.Poll(ctx)
-	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		// Keep each poll synchronous in this goroutine. Besides preserving cache
 		// mutation ordering, this is the loop's non-reentrancy guard: the next
 		// timer is not armed until the current cycle has fully completed.
-		if err := poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := o.runStartedPoll(ctx, &credentialGate); err != nil && !errors.Is(err, context.Canceled) {
 			o.logger.Error("scm observer: initial poll failed", "err", err)
 		}
 		for {
@@ -240,13 +232,28 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 				}
 				return
 			case <-timer.C:
-				if err := poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				if err := o.runStartedPoll(ctx, &credentialGate); err != nil && !errors.Is(err, context.Canceled) {
 					o.logger.Error("scm observer: poll failed", "err", err)
 				}
 			}
 		}
 	}()
 	return done
+}
+
+// runStartedPoll measures the complete cycle driven by Start, including the
+// once-per-process lazy credential gate. That gate may shell out to gh, so
+// excluding it would under-report the time during which this serialized loop
+// cannot arm its next timer.
+func (o *Observer) runStartedPoll(ctx context.Context, credentialGate *sync.Once) error {
+	return o.runPoll(ctx, func(ctx context.Context) error {
+		credentialGate.Do(func() {
+			if _, err := o.checkCredentials(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				o.logger.Error("scm observer: initial credential check failed", "err", err)
+			}
+		})
+		return o.poll(ctx)
+	})
 }
 
 // runPoll records the duration of one serialized SCM lifecycle cycle. The Go

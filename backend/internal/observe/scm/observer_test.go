@@ -43,6 +43,7 @@ type fakeStore struct {
 
 	listEntered chan struct{}
 	listRelease chan struct{}
+	listHook    func()
 	listCalls   int
 }
 
@@ -65,6 +66,9 @@ func (s *captureTelemetrySink) Emit(_ context.Context, ev ports.TelemetryEvent) 
 func (s *captureTelemetrySink) Close(context.Context) error { return nil }
 
 func (s *fakeStore) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error) {
+	if s.listHook != nil {
+		s.listHook()
+	}
 	if s.listEntered != nil {
 		select {
 		case <-s.listEntered:
@@ -187,6 +191,7 @@ type fakeProvider struct {
 	credentialGate   bool
 	credentialOK     bool
 	credentialErr    error
+	credentialHook   func()
 	credentialChecks int
 	repoGuardCalls   int
 	listCalls        int
@@ -210,6 +215,9 @@ func (p *fakeProvider) RecommendedPollDelay(_ time.Time, base time.Duration) tim
 func (p *fakeProvider) SCMCredentialsAvailable(context.Context) (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.credentialHook != nil {
+		p.credentialHook()
+	}
 	p.credentialChecks++
 	if !p.credentialGate {
 		return true, nil
@@ -375,6 +383,57 @@ func TestStartUsesProviderRecommendedPollDelay(t *testing.T) {
 	}
 	if got := store.getListCalls(); got < 2 {
 		t.Fatalf("poll did not resume after provider backoff: calls = %d", got)
+	}
+}
+
+func TestRunStartedPollIncludesCredentialGateInOverrunDuration(t *testing.T) {
+	now := time.Unix(900, 0).UTC()
+	provider := &fakeProvider{
+		credentialGate: true,
+		credentialOK:   true,
+		credentialHook: func() { now = now.Add(20 * time.Second) },
+	}
+	pollDelayed := false
+	store := &fakeStore{
+		listHook: func() {
+			if !pollDelayed {
+				pollDelayed = true
+				now = now.Add(15 * time.Second)
+			}
+		},
+	}
+	sink := &captureTelemetrySink{}
+	observer := New(provider, store, nil, Config{
+		Tick:      30 * time.Second,
+		Clock:     func() time.Time { return now },
+		Logger:    quietSlog(),
+		Telemetry: sink,
+	})
+	var credentialGate sync.Once
+
+	if err := observer.runStartedPoll(context.Background(), &credentialGate); err != nil {
+		t.Fatalf("runStartedPoll: %v", err)
+	}
+
+	if provider.credentialChecks != 1 {
+		t.Fatalf("credential checks = %d, want 1", provider.credentialChecks)
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("telemetry events = %d, want 1", len(sink.events))
+	}
+	event := sink.events[0]
+	if event.Level != ports.TelemetryLevelWarn {
+		t.Fatalf("event level = %q, want warn", event.Level)
+	}
+	for key, want := range map[string]any{
+		"duration_ms":   int64(35_000),
+		"overrun_ms":    int64(5_000),
+		"reason":        "poll_overrun",
+		"health_status": "warn",
+	} {
+		if got := event.Payload[key]; got != want {
+			t.Errorf("payload[%q] = %#v, want %#v", key, got, want)
+		}
 	}
 }
 
