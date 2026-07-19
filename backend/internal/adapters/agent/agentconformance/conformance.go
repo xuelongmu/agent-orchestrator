@@ -331,11 +331,14 @@ func installFakeBinaries(t *testing.T, dir string, names []string) {
 	}
 	for _, name := range names {
 		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte("conformance test placeholder\n"), 0o700); err != nil {
+		if err := os.WriteFile(path, []byte("conformance test placeholder\n"), 0o600); err != nil {
 			t.Fatalf("write fake CLI %q: %v", name, err)
 		}
+		if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // G302: owner-only test fixture must be executable
+			t.Fatalf("make fake CLI %q executable: %v", name, err)
+		}
 		if runtime.GOOS == "windows" && filepath.Ext(name) == "" {
-			if err := os.WriteFile(path+".cmd", []byte("@exit /b 0\r\n"), 0o700); err != nil {
+			if err := os.WriteFile(path+".cmd", []byte("@exit /b 0\r\n"), 0o600); err != nil {
 				t.Fatalf("write fake CLI %q: %v", name+".cmd", err)
 			}
 		}
