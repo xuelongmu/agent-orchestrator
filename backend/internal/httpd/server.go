@@ -26,8 +26,9 @@ type Server struct {
 	http   *http.Server
 	listen net.Listener
 
-	shutdownRequested chan struct{}
-	shutdownOnce      sync.Once
+	shutdownRequested  chan struct{}
+	shutdownOnce       sync.Once
+	cancelVerification context.CancelFunc
 }
 
 // NewWithDeps constructs a Server with API dependencies supplied by the daemon
@@ -60,10 +61,11 @@ func NewWithDeps(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager,
 	}
 
 	srv := &Server{
-		cfg:               cfg,
-		log:               log,
-		listen:            ln,
-		shutdownRequested: make(chan struct{}),
+		cfg:                cfg,
+		log:                log,
+		listen:             ln,
+		shutdownRequested:  make(chan struct{}),
+		cancelVerification: deps.CancelVerification,
 	}
 	srv.http = &http.Server{
 		Handler: NewRouterWithControl(cfg, log, termMgr, deps, ControlDeps{
@@ -172,6 +174,9 @@ func (s *Server) boundPort() int {
 
 func (s *Server) requestShutdown() {
 	s.shutdownOnce.Do(func() {
+		if s.cancelVerification != nil {
+			s.cancelVerification()
+		}
 		close(s.shutdownRequested)
 	})
 }

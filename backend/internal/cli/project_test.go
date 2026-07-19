@@ -128,6 +128,12 @@ func TestBuildProjectConfigWorkspaceKind(t *testing.T) {
 	}
 }
 
+func TestBuildProjectConfigRejectsTrailingJSONValue(t *testing.T) {
+	if _, err := buildProjectConfig(projectSetConfigOptions{configJSON: `{} {}`}); err == nil {
+		t.Fatal("expected trailing JSON value to be rejected")
+	}
+}
+
 func TestProjectList_Success(t *testing.T) {
 	cfg := setConfigEnv(t)
 	srv, capture := projectServer(t, http.StatusOK, `{"projects":[{"id":"zeta","name":"Zeta","sessionPrefix":"zeta"},{"id":"alpha","name":"Alpha","sessionPrefix":"alpha","resolveError":"config missing"}]}`)

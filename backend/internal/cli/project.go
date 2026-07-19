@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"reflect"
 	"sort"
@@ -349,8 +350,13 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 	}
 	if opts.configJSON != "" {
 		var cfg projectConfig
-		if err := json.Unmarshal([]byte(opts.configJSON), &cfg); err != nil {
+		decoder := json.NewDecoder(strings.NewReader(opts.configJSON))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&cfg); err != nil {
 			return projectConfig{}, usageError{fmt.Errorf("--config-json is not a valid JSON object: %w", err)}
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			return projectConfig{}, usageError{errors.New("--config-json must contain exactly one JSON object")}
 		}
 		return cfg, nil
 	}

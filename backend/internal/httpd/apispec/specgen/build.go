@@ -73,6 +73,8 @@ func Build() ([]byte, error) {
 			"Legacy AO project import (availability probe and run)"),
 		*(&openapi31.Tag{Name: "mobile"}).WithDescription(
 			"Connect Mobile LAN bridge control (loopback/desktop only)"),
+		*(&openapi31.Tag{Name: "verification"}).WithDescription(
+			"Loopback-only out-of-band workspace verification"),
 	}
 
 	for _, op := range operations() {
@@ -138,6 +140,7 @@ var schemaNames = map[string]string{
 	"DomainTrackerIntakeConfig": "TrackerIntakeConfig",
 	"DomainAgentConfig":         "AgentConfig",
 	"DomainRoleOverride":        "RoleOverride",
+	"DomainVerificationCommand": "VerificationCommand",
 	// httpd/controllers (wire envelopes)
 	"ControllersListProjectsResponse":             "ListProjectsResponse",
 	"ControllersProjectResponse":                  "ProjectResponse",
@@ -217,6 +220,8 @@ var schemaNames = map[string]string{
 	"ControllersImportRunResponse":    "ImportRunResponse",
 	// httpd/controllers: mobile wire envelopes
 	"ControllersMobileStatusResponse": "MobileStatusResponse",
+	"ControllersVerifyRequest":        "VerifyRequest",
+	"VerificationResult":              "VerifyResponse",
 	// legacyimport report
 	"LegacyimportReport": "ImportReport",
 	// service/project entities + DTOs
@@ -312,7 +317,26 @@ func operations() []operation {
 	ops = append(ops, notificationOperations()...)
 	ops = append(ops, importOperations()...)
 	ops = append(ops, mobileOperations()...)
+	ops = append(ops, verificationOperations()...)
 	return ops
+}
+
+func verificationOperations() []operation {
+	return []operation{{
+		method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/verify", id: "runVerification", tag: "verification",
+		summary:    "Run an allowed verification profile outside the worker terminal process tree",
+		pathParams: []any{controllers.SessionIDParam{}, controllers.VerificationCapabilityHeader{}},
+		reqBody:    controllers.VerifyRequest{},
+		resps: []respUnit{
+			{http.StatusOK, controllers.VerifyResponse{}},
+			{http.StatusBadRequest, envelope.APIError{}},
+			{http.StatusForbidden, envelope.APIError{}},
+			{http.StatusNotFound, envelope.APIError{}},
+			{http.StatusConflict, envelope.APIError{}},
+			{http.StatusInternalServerError, envelope.APIError{}},
+			{http.StatusNotImplemented, envelope.APIError{}},
+		},
+	}}
 }
 
 func agentOperations() []operation {

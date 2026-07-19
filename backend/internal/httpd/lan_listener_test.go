@@ -64,6 +64,7 @@ func TestLANManagerBlocksLoopbackOnlyControlRoutes(t *testing.T) {
 		"/shutdown",
 		"/internal/telemetry/cli-invoked",
 		"/api/v1/mobile/status",
+		"/api/v1/sessions/ao-1/verify",
 	}
 	for _, path := range blocked {
 		req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)

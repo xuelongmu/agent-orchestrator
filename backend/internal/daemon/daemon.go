@@ -30,6 +30,8 @@ import (
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
+	verifysvc "github.com/aoagents/agent-orchestrator/backend/internal/service/verification"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessioncap"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
 )
@@ -71,6 +73,14 @@ func Run() error {
 			log.Warn("release daemon coordination claim", "err", err)
 		}
 	}()
+	verificationCapabilities, err := sessioncap.Open(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("open verification capabilities: %w", err)
+	}
+	verificationPolicy, err := verifysvc.LoadPolicy(cfg.VerificationConfigFile)
+	if err != nil {
+		return fmt.Errorf("load verification policy: %w", err)
+	}
 
 	// Root every background loop and reconcile operation in the same context
 	// that lease loss cancels. Renewal starts before any side effect does.
@@ -133,7 +143,7 @@ func Run() error {
 	// selected runtime, a gitworktree workspace, the per-session agent resolver
 	// (AO_AGENT validated here for compatibility), and the agent messenger, then mount it
 	// on the API.
-	sessionSvc, reviewSvc, sessMgr, err := startSession(cfg, runtimeAdapter, store, lcStack.LCM, messenger, telemetrySink, log)
+	sessionSvc, reviewSvc, sessMgr, err := startSession(cfg, runtimeAdapter, store, lcStack.LCM, messenger, telemetrySink, log, verificationCapabilities)
 	if err != nil {
 		stop()
 		lcStack.Stop()
@@ -173,6 +183,8 @@ func Run() error {
 	}
 	mc := &controllers.MobileController{Bridge: bs}
 
+	verificationCtx, cancelVerification := context.WithCancel(ctx)
+	defer cancelVerification()
 	srv, err := httpd.NewWithDeps(cfg, log, termMgr, httpd.APIDeps{
 		Projects:           projectsvc.NewWithDeps(projectsvc.Deps{Store: store, Sessions: sessionSvc, DefaultHarness: domain.AgentHarness(cfg.Agent), Telemetry: telemetrySink}),
 		Agents:             agentSvc,
@@ -187,6 +199,8 @@ func Run() error {
 		Activity:           lcStack.LCM,
 		Telemetry:          telemetrySink,
 		Mobile:             mc,
+		Verification:       verifysvc.New(verifysvc.Deps{Store: store, Root: verificationCtx, Policy: verificationPolicy, Auth: verificationCapabilities, DataDir: cfg.DataDir}),
+		CancelVerification: cancelVerification,
 	})
 	if err != nil {
 		stop()

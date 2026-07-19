@@ -94,6 +94,9 @@ type Config struct {
 	AllowedOrigins []string
 	// Telemetry controls local/remote telemetry sinks.
 	Telemetry TelemetryConfig
+	// VerificationConfigFile is an optional absolute operator-owned policy
+	// loaded once at daemon startup. Worker project APIs cannot mutate it.
+	VerificationConfigFile string
 }
 
 // Addr returns the host:port the HTTP server binds. It uses net.JoinHostPort so
@@ -120,6 +123,7 @@ func (c Config) Addr() string {
 //	AO_TELEMETRY_REMOTE  remote exporter off|posthog (default off)
 //	AO_TELEMETRY_POSTHOG_KEY   PostHog project key
 //	AO_TELEMETRY_POSTHOG_HOST  PostHog host (default DefaultTelemetryPostHogHost)
+//	AO_VERIFY_CONFIG_FILE      absolute operator verification policy path
 //
 // The bind host is not configurable: the daemon is loopback-only by design.
 func Load() (Config, error) {
@@ -165,6 +169,12 @@ func Load() (Config, error) {
 
 	if raw := os.Getenv("AO_AGENT"); raw != "" {
 		cfg.Agent = raw
+	}
+	if raw := strings.TrimSpace(os.Getenv("AO_VERIFY_CONFIG_FILE")); raw != "" {
+		if !filepath.IsAbs(raw) {
+			return Config{}, fmt.Errorf("AO_VERIFY_CONFIG_FILE must be absolute")
+		}
+		cfg.VerificationConfigFile = filepath.Clean(raw)
 	}
 
 	if raw, ok := os.LookupEnv("AO_ALLOWED_ORIGINS"); ok && raw != "" {

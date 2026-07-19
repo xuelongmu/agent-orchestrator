@@ -360,6 +360,10 @@ func TestProjectsAPI_RejectsUnknownConfigKeys(t *testing.T) {
 	body, status, _ = doRequest(t, srv, "PUT", "/api/v1/projects/rej/config", `{"config":{"defaultBranch":"develop"},"surprise":"!"}`)
 	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
 
+	// A second JSON value must not be ignored after an otherwise valid config.
+	body, status, _ = doRequest(t, srv, "PUT", "/api/v1/projects/rej/config", `{"config":{"defaultBranch":"develop"}} {"config":{}}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
+
 	// Prompt rules are now modeled and accepted in project config.
 	body, status, _ = doRequest(t, srv, "PUT", "/api/v1/projects/rej/config", `{"config":{"agentRules":"x"}}`)
 	if status != http.StatusOK {
@@ -369,6 +373,11 @@ func TestProjectsAPI_RejectsUnknownConfigKeys(t *testing.T) {
 	// A still-unknown nested config field is rejected, so misspellings cannot be
 	// silently persisted.
 	body, status, _ = doRequest(t, srv, "PUT", "/api/v1/projects/rej/config", `{"config":{"tracker":{"plugin":"github"}}}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
+
+	// Verification policy is operator-owned startup configuration and cannot be
+	// replaced through the worker-reachable project API.
+	body, status, _ = doRequest(t, srv, "PUT", "/api/v1/projects/rej/config", `{"config":{"verification":{"evil":{"argv":["sh","-c","id"]}}}}`)
 	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
 
 	// POST /projects gets the same gate, so add-time config rides the same rail.

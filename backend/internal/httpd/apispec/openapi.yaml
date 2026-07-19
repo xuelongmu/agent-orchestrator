@@ -1713,6 +1713,79 @@ paths:
       summary: Send a message to a running session's agent
       tags:
       - sessions
+  /api/v1/sessions/{sessionId}/verify:
+    post:
+      operationId: runVerification
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      - description: Session-scoped verification capability issued by the daemon.
+        in: header
+        name: X-AO-Verification-Capability
+        required: true
+        schema:
+          description: Session-scoped verification capability issued by the daemon.
+          minLength: 1
+          type: string
+          writeOnly: true
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Run an allowed verification profile outside the worker terminal process
+        tree
+      tags:
+      - verification
   /api/v1/sessions/{sessionId}/workspace/file:
     get:
       operationId: getSessionWorkspaceFile
@@ -3296,6 +3369,47 @@ components:
       - reviewerHandleId
       - reviews
       type: object
+    VerifyRequest:
+      properties:
+        profile:
+          minLength: 1
+          type: string
+      required:
+      - profile
+      type: object
+    VerifyResponse:
+      properties:
+        durationMs:
+          format: int64
+          type: integer
+        error:
+          type: string
+        exitCode:
+          type: integer
+        logPath:
+          type: string
+        outcome:
+          enum:
+          - passed
+          - failed
+          - canceled
+          - timed_out
+          type: string
+        profile:
+          type: string
+        sessionId:
+          type: string
+        truncated:
+          type: boolean
+      required:
+      - sessionId
+      - profile
+      - outcome
+      - exitCode
+      - logPath
+      - truncated
+      - durationMs
+      type: object
     WorkspaceFileResponse:
       properties:
         additions:
@@ -3404,3 +3518,5 @@ tags:
   name: import
 - description: Connect Mobile LAN bridge control (loopback/desktop only)
   name: mobile
+- description: Loopback-only out-of-band workspace verification
+  name: verification
