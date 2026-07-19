@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aoagents/agent-orchestrator/backend/internal/processalive"
+	"golang.org/x/sys/unix"
 )
 
 func TestLinuxGuardianCleansSetsidDescendantOnCancellation(t *testing.T) {
@@ -110,11 +110,16 @@ func TestLinuxGuardianDoesNotOwnUnrelatedWorker(t *testing.T) {
 
 func assertProcessDies(t *testing.T, pid int, message string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for processalive.Alive(pid) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		t.Fatalf("open pidfd %d: %v", pid, err)
 	}
-	if processalive.Alive(pid) {
+	defer func() { _ = unix.Close(fd) }()
+	poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	if _, err := unix.Poll(poll, 5000); err != nil {
+		t.Fatalf("poll pidfd %d: %v", pid, err)
+	}
+	if poll[0].Revents&unix.POLLIN == 0 {
 		t.Fatalf("%s: pid %d", message, pid)
 	}
 }
