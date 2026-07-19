@@ -1,6 +1,6 @@
 # Agent Orchestrator Architecture
 
-Agent Orchestrator is a long-running Go daemon that supervises multiple parallel agent sessions. Sessions use an isolated git worktree by default, but can instead use an ephemeral scratch directory or the registered project's shared directory for non-git workloads. Each session has its own runtime while the daemon coordinates lifecycle, observes external state, and routes feedback.
+Agent Orchestrator is a long-running Go daemon that supervises multiple parallel agent sessions. Sessions use a dedicated git worktree by default, but can instead use an ephemeral scratch directory or the registered project's shared directory for non-git workloads. Each session has its own runtime while the daemon coordinates lifecycle, observes external state, and routes feedback.
 
 AO is a single-user supervisor, not a sandbox: the daemon and managed workers
 normally share one OS account and trust boundary. See the

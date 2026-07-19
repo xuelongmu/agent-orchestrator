@@ -11,7 +11,7 @@
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.com/invite/UZv7JjxbwG)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-An Agentic IDE that supervises parallel AI coding agents in isolated workspaces, with complete control and automatic feedback loops from CI failures, review comments, and merge conflicts.
+An Agentic IDE that supervises parallel AI coding agents in separate workspaces, with complete control and automatic feedback loops from CI failures, review comments, and merge conflicts.
 
 <img src="docs/assets/readme/dashboard.png" alt="Agent Orchestrator dashboard showing parallel coding agent sessions" width="100%" />
 </div>
@@ -22,7 +22,7 @@ An Agentic IDE that supervises parallel AI coding agents in isolated workspaces,
 
 Agent Orchestrator is a meta-harness agent IDE for running AI coding agents in parallel. It gives terminal-based agents like Claude Code, Codex, Cursor, Kimi Code, opencode, and others a shared workspace where their sessions, terminals, branches, pull requests, and feedback loops can be supervised from one place.
 
-The agents still do the coding. AO provides the harness around them: isolated workspaces, live terminal access, session state, PR awareness, and automatic loops that send CI failures, review comments, and merge conflicts back to the right agent. Instead of manually coordinating a pile of agent terminals, AO turns parallel agent work into a managed workflow.
+The agents still do the coding. AO provides the harness around them: separate workspaces, live terminal access, session state, PR awareness, and automatic loops that send CI failures, review comments, and merge conflicts back to the right agent. Instead of manually coordinating a pile of agent terminals, AO turns parallel agent work into a managed workflow.
 
 ## Why Agent Orchestrator?
 
@@ -42,7 +42,7 @@ At a high level, Agent Orchestrator follows a simple loop:
 
 1. Add a project you want agents to work on.
 2. Start one or more sessions from the desktop app or CLI.
-3. AO creates the session workspace: an isolated git worktree by default, an ephemeral scratch directory, or the project's shared directory.
+3. AO creates the session workspace: a dedicated git worktree by default, an ephemeral scratch directory, or the project's shared directory.
 4. AO launches the selected coding agent in that session's terminal runtime.
 5. The local daemon watches session state, terminal activity, pull requests, CI, and review feedback.
 6. The desktop app and CLI show the current state and let you send follow-up instructions to the right session.
