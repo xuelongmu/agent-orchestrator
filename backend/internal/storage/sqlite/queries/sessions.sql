@@ -25,17 +25,33 @@ WHERE id = ?;
 
 -- name: UpdateSessionLifecycle :exec
 -- Lifecycle reads a session snapshot before reducing a hook/runtime signal.
--- Limit that write-back to lifecycle-owned facts so a concurrent targeted
--- metadata update (for example preview_url or a claimed branch) is not
--- overwritten by the older snapshot.
+-- This generic write-back is limited to the reducer's core fact columns.
+-- Auxiliary durable metadata is updated only by the compare-and-set queries
+-- below when the reducer explicitly transitions that field.
 UPDATE sessions SET
     activity_state = ?, activity_last_at = ?, first_signal_at = ?, is_terminated = ?,
-    agent_session_id = ?, pending_submit_fingerprint = ?,
-    pending_submit_recovery_attempted = ?, diagnostic_trigger = ?,
+    diagnostic_trigger = ?,
     diagnostic_terminal_tail = ?, diagnostic_hook_error_type = ?,
-    diagnostic_captured_at = ?, merged_cleanup_pending = ?, merged_cleanup_pr_url = ?,
-    updated_at = ?
+    diagnostic_captured_at = ?, updated_at = ?
 WHERE id = ?;
+
+-- name: UpdateSessionLifecycleAgentID :execrows
+UPDATE sessions SET agent_session_id = ?
+WHERE id = ? AND agent_session_id = ?;
+
+-- name: UpdateSessionLifecyclePendingSubmit :execrows
+UPDATE sessions SET
+    pending_submit_fingerprint = ?, pending_submit_recovery_attempted = ?
+WHERE id = ?
+  AND pending_submit_fingerprint = ?
+  AND pending_submit_recovery_attempted = ?;
+
+-- name: UpdateSessionLifecycleMergedCleanup :execrows
+UPDATE sessions SET
+    merged_cleanup_pending = ?, merged_cleanup_pr_url = ?
+WHERE id = ?
+  AND merged_cleanup_pending = ?
+  AND merged_cleanup_pr_url = ?;
 
 -- name: GetSession :one
 SELECT id, project_id, num, issue_id, kind, harness,

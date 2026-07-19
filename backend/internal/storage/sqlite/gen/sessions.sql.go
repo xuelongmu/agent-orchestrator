@@ -491,53 +491,120 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) er
 const updateSessionLifecycle = `-- name: UpdateSessionLifecycle :exec
 UPDATE sessions SET
     activity_state = ?, activity_last_at = ?, first_signal_at = ?, is_terminated = ?,
-    agent_session_id = ?, pending_submit_fingerprint = ?,
-    pending_submit_recovery_attempted = ?, diagnostic_trigger = ?,
+    diagnostic_trigger = ?,
     diagnostic_terminal_tail = ?, diagnostic_hook_error_type = ?,
-    diagnostic_captured_at = ?, merged_cleanup_pending = ?, merged_cleanup_pr_url = ?,
-    updated_at = ?
+    diagnostic_captured_at = ?, updated_at = ?
 WHERE id = ?
 `
 
 type UpdateSessionLifecycleParams struct {
-	ActivityState                  domain.ActivityState
-	ActivityLastAt                 time.Time
-	FirstSignalAt                  sql.NullTime
-	IsTerminated                   bool
-	AgentSessionID                 string
-	PendingSubmitFingerprint       string
-	PendingSubmitRecoveryAttempted bool
-	DiagnosticTrigger              string
-	DiagnosticTerminalTail         string
-	DiagnosticHookErrorType        string
-	DiagnosticCapturedAt           sql.NullTime
-	MergedCleanupPending           bool
-	MergedCleanupPRURL             string
-	UpdatedAt                      time.Time
-	ID                             domain.SessionID
+	ActivityState           domain.ActivityState
+	ActivityLastAt          time.Time
+	FirstSignalAt           sql.NullTime
+	IsTerminated            bool
+	DiagnosticTrigger       string
+	DiagnosticTerminalTail  string
+	DiagnosticHookErrorType string
+	DiagnosticCapturedAt    sql.NullTime
+	UpdatedAt               time.Time
+	ID                      domain.SessionID
 }
 
 // Lifecycle reads a session snapshot before reducing a hook/runtime signal.
-// Limit that write-back to lifecycle-owned facts so a concurrent targeted
-// metadata update (for example preview_url or a claimed branch) is not
-// overwritten by the older snapshot.
+// This generic write-back is limited to the reducer's core fact columns.
+// Auxiliary durable metadata is updated only by the compare-and-set queries
+// below when the reducer explicitly transitions that field.
 func (q *Queries) UpdateSessionLifecycle(ctx context.Context, arg UpdateSessionLifecycleParams) error {
 	_, err := q.db.ExecContext(ctx, updateSessionLifecycle,
 		arg.ActivityState,
 		arg.ActivityLastAt,
 		arg.FirstSignalAt,
 		arg.IsTerminated,
-		arg.AgentSessionID,
-		arg.PendingSubmitFingerprint,
-		arg.PendingSubmitRecoveryAttempted,
 		arg.DiagnosticTrigger,
 		arg.DiagnosticTerminalTail,
 		arg.DiagnosticHookErrorType,
 		arg.DiagnosticCapturedAt,
-		arg.MergedCleanupPending,
-		arg.MergedCleanupPRURL,
 		arg.UpdatedAt,
 		arg.ID,
 	)
 	return err
+}
+
+const updateSessionLifecycleAgentID = `-- name: UpdateSessionLifecycleAgentID :execrows
+UPDATE sessions SET agent_session_id = ?
+WHERE id = ? AND agent_session_id = ?
+`
+
+type UpdateSessionLifecycleAgentIDParams struct {
+	AgentSessionID   string
+	ID               domain.SessionID
+	AgentSessionID_2 string
+}
+
+func (q *Queries) UpdateSessionLifecycleAgentID(ctx context.Context, arg UpdateSessionLifecycleAgentIDParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateSessionLifecycleAgentID, arg.AgentSessionID, arg.ID, arg.AgentSessionID_2)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const updateSessionLifecycleMergedCleanup = `-- name: UpdateSessionLifecycleMergedCleanup :execrows
+UPDATE sessions SET
+    merged_cleanup_pending = ?, merged_cleanup_pr_url = ?
+WHERE id = ?
+  AND merged_cleanup_pending = ?
+  AND merged_cleanup_pr_url = ?
+`
+
+type UpdateSessionLifecycleMergedCleanupParams struct {
+	MergedCleanupPending   bool
+	MergedCleanupPRURL     string
+	ID                     domain.SessionID
+	MergedCleanupPending_2 bool
+	MergedCleanupPRURL_2   string
+}
+
+func (q *Queries) UpdateSessionLifecycleMergedCleanup(ctx context.Context, arg UpdateSessionLifecycleMergedCleanupParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateSessionLifecycleMergedCleanup,
+		arg.MergedCleanupPending,
+		arg.MergedCleanupPRURL,
+		arg.ID,
+		arg.MergedCleanupPending_2,
+		arg.MergedCleanupPRURL_2,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const updateSessionLifecyclePendingSubmit = `-- name: UpdateSessionLifecyclePendingSubmit :execrows
+UPDATE sessions SET
+    pending_submit_fingerprint = ?, pending_submit_recovery_attempted = ?
+WHERE id = ?
+  AND pending_submit_fingerprint = ?
+  AND pending_submit_recovery_attempted = ?
+`
+
+type UpdateSessionLifecyclePendingSubmitParams struct {
+	PendingSubmitFingerprint         string
+	PendingSubmitRecoveryAttempted   bool
+	ID                               domain.SessionID
+	PendingSubmitFingerprint_2       string
+	PendingSubmitRecoveryAttempted_2 bool
+}
+
+func (q *Queries) UpdateSessionLifecyclePendingSubmit(ctx context.Context, arg UpdateSessionLifecyclePendingSubmitParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateSessionLifecyclePendingSubmit,
+		arg.PendingSubmitFingerprint,
+		arg.PendingSubmitRecoveryAttempted,
+		arg.ID,
+		arg.PendingSubmitFingerprint_2,
+		arg.PendingSubmitRecoveryAttempted_2,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }

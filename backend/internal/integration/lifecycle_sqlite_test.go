@@ -129,12 +129,42 @@ type blockingLifecycleWriteStore struct {
 	once    sync.Once
 }
 
-func (s *blockingLifecycleWriteStore) UpdateSessionLifecycle(ctx context.Context, rec domain.SessionRecord) error {
+func (s *blockingLifecycleWriteStore) UpdateSessionLifecycle(ctx context.Context, before, after domain.SessionRecord) error {
 	s.once.Do(func() {
 		close(s.ready)
 		<-s.release
 	})
-	return s.Store.UpdateSessionLifecycle(ctx, rec)
+	return s.Store.UpdateSessionLifecycle(ctx, before, after)
+}
+
+func beginBlockedLifecycleCall(t *testing.T, store *sqlite.Store, run func(*lifecycle.Manager) error) func() {
+	t.Helper()
+	blocking := &blockingLifecycleWriteStore{
+		Store:   store,
+		ready:   make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	done := make(chan error, 1)
+	go func() { done <- run(lifecycle.New(blocking, nil)) }()
+	select {
+	case <-blocking.ready:
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle call did not reach its store write")
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(blocking.release) }) })
+	return func() {
+		t.Helper()
+		releaseOnce.Do(func() { close(blocking.release) })
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("lifecycle call did not finish")
+		}
+	}
 }
 
 func newStack(t *testing.T) *stack {
@@ -232,47 +262,19 @@ func TestClaudeCodeActivityHookDoesNotLoseConcurrentSessionMetadataUpdate(t *tes
 		t.Fatal(err)
 	}
 
-	blocking := &blockingLifecycleWriteStore{
-		Store:   st.store,
-		ready:   make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	released := false
-	defer func() {
-		if !released {
-			close(blocking.release)
-		}
-	}()
-	lcm := lifecycle.New(blocking, nil)
-	done := make(chan error, 1)
-	go func() {
-		done <- lcm.ApplyActivitySignal(ctx, sess.ID, ports.ActivitySignal{
+	finish := beginBlockedLifecycleCall(t, st.store, func(lcm *lifecycle.Manager) error {
+		return lcm.ApplyActivitySignal(ctx, sess.ID, ports.ActivitySignal{
 			Valid:          true,
 			State:          domain.ActivityActive,
 			AgentSessionID: "claude-native-1",
 		})
-	}()
-
-	select {
-	case <-blocking.ready:
-	case <-time.After(time.Second):
-		t.Fatal("activity hook did not reach its lifecycle write")
-	}
+	})
 	previewURL := "http://127.0.0.1:4173/"
 	previewAt := time.Now().UTC().Add(time.Hour)
 	if updated, updateErr := st.store.SetSessionPreviewURL(ctx, sess.ID, previewURL, previewAt); updateErr != nil || !updated {
 		t.Fatalf("SetSessionPreviewURL = %v, %v; want true, nil", updated, updateErr)
 	}
-	close(blocking.release)
-	released = true
-	select {
-	case hookErr := <-done:
-		if hookErr != nil {
-			t.Fatal(hookErr)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("activity hook did not finish")
-	}
+	finish()
 
 	got, ok, err := st.store.GetSession(ctx, sess.ID)
 	if err != nil || !ok {
@@ -286,6 +288,142 @@ func TestClaudeCodeActivityHookDoesNotLoseConcurrentSessionMetadataUpdate(t *tes
 	}
 	if !got.UpdatedAt.Equal(previewAt) {
 		t.Fatalf("UpdatedAt = %v, want concurrent metadata timestamp %v", got.UpdatedAt, previewAt)
+	}
+}
+
+func TestClaudeCodeActivityHookPreservesConcurrentPendingSubmitLatch(t *testing.T) {
+	ctx := context.Background()
+	st := newStack(t)
+	sess, err := st.sm.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Branch: "b", Prompt: "prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finish := beginBlockedLifecycleCall(t, st.store, func(lcm *lifecycle.Manager) error {
+		return lcm.ApplyActivitySignal(ctx, sess.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityActive})
+	})
+	fingerprint := "sha256-concurrent-prompt"
+	if updated, updateErr := st.store.SetPendingSubmit(ctx, sess.ID, fingerprint, time.Now().UTC().Add(time.Hour)); updateErr != nil || !updated {
+		t.Fatalf("SetPendingSubmit = %v, %v; want true, nil", updated, updateErr)
+	}
+	finish()
+
+	got, ok, err := st.store.GetSession(ctx, sess.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetSession = found %v, err %v", ok, err)
+	}
+	if got.Activity.State != domain.ActivityActive {
+		t.Fatalf("activity = %q, want active", got.Activity.State)
+	}
+	if got.Metadata.PendingSubmitFingerprint != fingerprint || got.Metadata.PendingSubmitRecoveryAttempted {
+		t.Fatalf("concurrent pending-submit latch lost: %+v", got.Metadata)
+	}
+}
+
+func TestClaudeCodeActivityHookConsumesOnlyObservedPendingSubmitLatch(t *testing.T) {
+	ctx := context.Background()
+	st := newStack(t)
+	sess, err := st.sm.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Branch: "b", Prompt: "prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observedFingerprint := "sha256-observed-prompt"
+	if updated, updateErr := st.store.SetPendingSubmit(ctx, sess.ID, observedFingerprint, time.Now().UTC()); updateErr != nil || !updated {
+		t.Fatalf("SetPendingSubmit = %v, %v; want true, nil", updated, updateErr)
+	}
+	finish := beginBlockedLifecycleCall(t, st.store, func(lcm *lifecycle.Manager) error {
+		return lcm.ApplyActivitySignal(ctx, sess.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityActive})
+	})
+	newFingerprint := "sha256-newer-prompt"
+	if updated, updateErr := st.store.SetPendingSubmit(ctx, sess.ID, newFingerprint, time.Now().UTC().Add(time.Hour)); updateErr != nil || !updated {
+		t.Fatalf("replace pending submit = %v, %v; want true, nil", updated, updateErr)
+	}
+	finish()
+
+	got, ok, err := st.store.GetSession(ctx, sess.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetSession = found %v, err %v", ok, err)
+	}
+	if got.Metadata.PendingSubmitFingerprint != newFingerprint || got.Metadata.PendingSubmitRecoveryAttempted {
+		t.Fatalf("newer pending-submit latch consumed with %q: %+v", observedFingerprint, got.Metadata)
+	}
+}
+
+func TestRuntimeObservationPreservesConcurrentPendingSubmitRecoveryClaim(t *testing.T) {
+	ctx := context.Background()
+	st := newStack(t)
+	sess, err := st.sm.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Branch: "b", Prompt: "prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, ok, err := st.store.GetSession(ctx, sess.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetSession = found %v, err %v", ok, err)
+	}
+	seed.Diagnostic = &domain.LifecycleDiagnostic{
+		Trigger:      domain.DiagnosticRuntimeProbeFailed,
+		TerminalTail: "runtime probe failed",
+		CapturedAt:   time.Now().UTC(),
+	}
+	seed.UpdatedAt = seed.Diagnostic.CapturedAt
+	if err := st.store.UpdateSession(ctx, seed); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := "sha256-pending-recovery"
+	if updated, updateErr := st.store.SetPendingSubmit(ctx, sess.ID, fingerprint, time.Now().UTC()); updateErr != nil || !updated {
+		t.Fatalf("SetPendingSubmit = %v, %v; want true, nil", updated, updateErr)
+	}
+	finish := beginBlockedLifecycleCall(t, st.store, func(lcm *lifecycle.Manager) error {
+		return lcm.ApplyRuntimeObservation(ctx, sess.ID, ports.RuntimeFacts{Probe: ports.ProbeAlive})
+	})
+	if claimed, claimErr := st.store.ClaimPendingSubmitRecovery(ctx, sess.ID, fingerprint, time.Now().UTC().Add(time.Hour)); claimErr != nil || !claimed {
+		t.Fatalf("ClaimPendingSubmitRecovery = %v, %v; want true, nil", claimed, claimErr)
+	}
+	finish()
+
+	got, ok, err := st.store.GetSession(ctx, sess.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetSession = found %v, err %v", ok, err)
+	}
+	if got.Metadata.PendingSubmitFingerprint != fingerprint || !got.Metadata.PendingSubmitRecoveryAttempted {
+		t.Fatalf("concurrent pending-submit recovery claim lost: %+v", got.Metadata)
+	}
+	if got.Diagnostic != nil {
+		t.Fatalf("recovered runtime diagnostic not cleared: %+v", got.Diagnostic)
+	}
+}
+
+func TestClaudeCodeActivityHookPreservesConcurrentMergedCleanupLatch(t *testing.T) {
+	ctx := context.Background()
+	st := newStack(t)
+	sess, err := st.sm.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Branch: "b", Prompt: "prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finish := beginBlockedLifecycleCall(t, st.store, func(lcm *lifecycle.Manager) error {
+		return lcm.ApplyActivitySignal(ctx, sess.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityActive})
+	})
+	concurrent, ok, err := st.store.GetSession(ctx, sess.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetSession = found %v, err %v", ok, err)
+	}
+	prURL := "https://github.com/acme/repo/pull/57"
+	concurrent.Metadata.MergedCleanupPending = true
+	concurrent.Metadata.MergedCleanupPRURL = prURL
+	concurrent.UpdatedAt = time.Now().UTC().Add(time.Hour)
+	if err := st.store.UpdateSession(ctx, concurrent); err != nil {
+		t.Fatal(err)
+	}
+	finish()
+
+	got, ok, err := st.store.GetSession(ctx, sess.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetSession = found %v, err %v", ok, err)
+	}
+	if got.Activity.State != domain.ActivityActive {
+		t.Fatalf("activity = %q, want active", got.Activity.State)
+	}
+	if !got.Metadata.MergedCleanupPending || got.Metadata.MergedCleanupPRURL != prURL {
+		t.Fatalf("concurrent merged-cleanup latch lost: %+v", got.Metadata)
 	}
 }
 

@@ -37,8 +37,8 @@ func (f *fakeStore) UpdateSession(_ context.Context, rec domain.SessionRecord) e
 	f.sessions[rec.ID] = rec
 	return nil
 }
-func (f *fakeStore) UpdateSessionLifecycle(ctx context.Context, rec domain.SessionRecord) error {
-	return f.UpdateSession(ctx, rec)
+func (f *fakeStore) UpdateSessionLifecycle(ctx context.Context, _, after domain.SessionRecord) error {
+	return f.UpdateSession(ctx, after)
 }
 func (f *fakeStore) GetPRLastNudgeSignature(_ context.Context, prURL string) (string, error) {
 	return f.signatures[prURL], nil

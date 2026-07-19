@@ -20,7 +20,7 @@ import (
 type sessionStore interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	UpdateSession(ctx context.Context, rec domain.SessionRecord) error
-	UpdateSessionLifecycle(ctx context.Context, rec domain.SessionRecord) error
+	UpdateSessionLifecycle(ctx context.Context, before, after domain.SessionRecord) error
 	// ListPRsBySession returns every PR row tracked for the session. The
 	// reducer reads it to apply the multi-PR completion rule (terminate only
 	// when no open PR remains and at least one merged) and to suppress
@@ -140,8 +140,9 @@ func (m *Manager) mutate(ctx context.Context, id domain.SessionID, fn func(domai
 	if !changed {
 		return nil
 	}
+	next = applyPendingSubmitInvariant(next)
 	next.UpdatedAt = now
-	if err := m.store.UpdateSessionLifecycle(ctx, next); err != nil {
+	if err := m.store.UpdateSessionLifecycle(ctx, rec, next); err != nil {
 		return err
 	}
 	return nil
@@ -226,6 +227,7 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 		m.mu.Unlock()
 		return fmt.Errorf("%w: %s", ports.ErrSessionNotFound, id)
 	}
+	before := rec
 	now := m.clock()
 	if rec.IsTerminated {
 		delete(m.flights, id)
@@ -252,7 +254,7 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	// no longer waiting to be submitted. Clear that delivery latch before the
 	// same-state fast path below: activity persistence may otherwise be a no-op,
 	// but the safety latch is an independent durable fact.
-	pendingSubmitCleared := s.Valid && !s.State.NeedsInput() &&
+	pendingSubmitCleared := s.Valid && (!s.State.NeedsInput() || s.State.BlocksAutomatedDelivery()) &&
 		(rec.Metadata.PendingSubmitFingerprint != "" || rec.Metadata.PendingSubmitRecoveryAttempted)
 	if pendingSubmitCleared {
 		rec.Metadata.PendingSubmitFingerprint = ""
@@ -266,7 +268,7 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	if !s.Valid {
 		rec.Metadata.AgentSessionID = s.AgentSessionID
 		rec.UpdatedAt = now
-		err := m.store.UpdateSessionLifecycle(ctx, rec)
+		err := m.store.UpdateSessionLifecycle(ctx, before, rec)
 		m.mu.Unlock()
 		return err
 	}
@@ -290,7 +292,7 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 				rec.Diagnostic = diagnostic
 			}
 			rec.UpdatedAt = now
-			err := m.store.UpdateSessionLifecycle(ctx, rec)
+			err := m.store.UpdateSessionLifecycle(ctx, before, rec)
 			m.mu.Unlock()
 			return err
 		}
@@ -309,7 +311,7 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 		next.IsTerminated = true
 	}
 	next.UpdatedAt = now
-	if err := m.store.UpdateSessionLifecycle(ctx, next); err != nil {
+	if err := m.store.UpdateSessionLifecycle(ctx, before, next); err != nil {
 		m.mu.Unlock()
 		return err
 	}
@@ -646,12 +648,14 @@ func (m *Manager) reserveMergedCleanup(ctx context.Context, id domain.SessionID)
 	if cur.IsTerminated && cur.Activity.State == domain.ActivityExited {
 		return nil
 	}
+	before := cur
 	now := m.clock()
 	cur.IsTerminated = true
 	cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
+	cur = applyPendingSubmitInvariant(cur)
 	cur.UpdatedAt = now
 	delete(m.flights, id)
-	return m.store.UpdateSessionLifecycle(ctx, cur)
+	return m.store.UpdateSessionLifecycle(ctx, before, cur)
 }
 
 // markMergedCleanupComplete is the only write that clears the durable replay
@@ -781,4 +785,16 @@ func mergeMetadata(base, in domain.SessionMetadata) domain.SessionMetadata {
 	set(&base.AgentSessionID, in.AgentSessionID)
 	set(&base.Prompt, in.Prompt)
 	return base
+}
+
+// applyPendingSubmitInvariant makes terminal/delivery-blocked transitions
+// explicitly consume the latch visible in the reducer snapshot. Persistence
+// compare-and-sets that exact before/after pair, so a newer concurrent latch
+// is preserved for its owner rather than being cleared by a stale reduction.
+func applyPendingSubmitInvariant(rec domain.SessionRecord) domain.SessionRecord {
+	if rec.IsTerminated || rec.Activity.State.BlocksAutomatedDelivery() {
+		rec.Metadata.PendingSubmitFingerprint = ""
+		rec.Metadata.PendingSubmitRecoveryAttempted = false
+	}
+	return rec
 }
