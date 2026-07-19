@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -132,8 +133,10 @@ func (f *fakeStore) EnsureReviewRunSimplificationEvent(_ context.Context, id, ta
 }
 
 type fakeMessenger struct {
-	msgs []string
-	err  error
+	msgs         []string
+	err          error
+	writeThenErr bool
+	onSend       func()
 }
 
 type fakeAutomatedSender struct {
@@ -245,7 +248,13 @@ func (*telemetrySink) Close(context.Context) error { return nil }
 func (*telemetrySink) DurableLocalTelemetry() bool { return true }
 
 func (f *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) error {
+	if f.onSend != nil {
+		f.onSend()
+	}
 	if f.err != nil {
+		if f.writeThenErr {
+			f.msgs = append(f.msgs, msg)
+		}
 		return f.err
 	}
 	f.msgs = append(f.msgs, msg)
@@ -254,6 +263,140 @@ func (f *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) 
 
 func (f *fakeMessenger) SendAutomated(ctx context.Context, id domain.SessionID, msg string) error {
 	return f.Send(ctx, id, msg)
+}
+
+type fakeReactionReservation struct {
+	owner     string
+	phase     string
+	signature string
+	attempts  int
+	prior     string
+	fences    []ports.PRReactionFence
+}
+
+// reservationFakeStore adds the production pre-send contract to fakeStore so
+// lifecycle tests can deterministically inspect the crash boundary.
+type reservationFakeStore struct {
+	*fakeStore
+	mu           sync.Mutex
+	reservations map[string]fakeReactionReservation
+	commitErr    error
+	beforeStart  func()
+	heads        map[string]string
+	owners       map[string]domain.SessionID
+}
+
+func newReservationFakeStore() *reservationFakeStore {
+	return &reservationFakeStore{
+		fakeStore: newFakeStore(), reservations: map[string]fakeReactionReservation{},
+		heads: map[string]string{}, owners: map[string]domain.SessionID{},
+	}
+}
+
+func (s *reservationFakeStore) ReservePRReaction(_ context.Context, prURL, key, signature string, maxAttempts int, ownerToken string, fences []ports.PRReactionFence, _, _ time.Time) (ports.PRReactionReservation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, fence := range fences {
+		if head, ok := s.heads[fence.PRURL]; ok && head != fence.HeadSHA {
+			return ports.PRReactionReservation{Status: ports.PRReactionStale}, nil
+		}
+		if owner, ok := s.owners[fence.PRURL]; ok && owner != fence.SessionID {
+			return ports.PRReactionReservation{Status: ports.PRReactionStale}, nil
+		}
+	}
+	reservationKey := prURL + "\x00" + key
+	if current, ok := s.reservations[reservationKey]; ok {
+		if current.phase == "started" {
+			return ports.PRReactionReservation{Status: ports.PRReactionUncertain, Signature: current.signature, Attempts: current.attempts}, nil
+		}
+		return ports.PRReactionReservation{Status: ports.PRReactionBusy, Signature: current.signature}, nil
+	}
+	var payload reactionPayload
+	_ = json.Unmarshal([]byte(s.signatures[prURL]), &payload)
+	if payload.Seen == nil {
+		payload.Seen = map[string]string{}
+	}
+	if payload.Attempts == nil {
+		payload.Attempts = map[string]int{}
+	}
+	if payload.Seen[key] == signature {
+		return ports.PRReactionReservation{Status: ports.PRReactionAccounted, Signature: signature, Attempts: payload.Attempts[key]}, nil
+	}
+	attempts := payload.Attempts[key]
+	if prior, ok := payload.Seen[key]; ok && prior != signature {
+		attempts = 0
+	}
+	if maxAttempts > 0 && attempts >= maxAttempts {
+		return ports.PRReactionReservation{Status: ports.PRReactionExhausted, Signature: payload.Seen[key], Attempts: attempts}, nil
+	}
+	s.reservations[reservationKey] = fakeReactionReservation{owner: ownerToken, phase: "reserved", signature: signature, attempts: attempts + 1, prior: s.signatures[prURL], fences: append([]ports.PRReactionFence(nil), fences...)}
+	return ports.PRReactionReservation{Status: ports.PRReactionReserved, Signature: signature, Attempts: attempts + 1}, nil
+}
+
+func (s *reservationFakeStore) StartPRReaction(_ context.Context, prURL, key, ownerToken string, _, _ time.Time) (ports.PRReactionReservation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reservationKey := prURL + "\x00" + key
+	reservation, ok := s.reservations[reservationKey]
+	if !ok || reservation.owner != ownerToken || reservation.phase != "reserved" {
+		return ports.PRReactionReservation{Status: ports.PRReactionBusy}, nil
+	}
+	if s.beforeStart != nil {
+		s.beforeStart()
+	}
+	for _, fence := range reservation.fences {
+		if head, ok := s.heads[fence.PRURL]; ok && head != fence.HeadSHA {
+			delete(s.reservations, reservationKey)
+			return ports.PRReactionReservation{Status: ports.PRReactionStale}, nil
+		}
+		if owner, ok := s.owners[fence.PRURL]; ok && owner != fence.SessionID {
+			delete(s.reservations, reservationKey)
+			return ports.PRReactionReservation{Status: ports.PRReactionStale}, nil
+		}
+	}
+	var payload reactionPayload
+	_ = json.Unmarshal([]byte(s.signatures[prURL]), &payload)
+	if payload.Seen == nil {
+		payload.Seen = map[string]string{}
+	}
+	if payload.Attempts == nil {
+		payload.Attempts = map[string]int{}
+	}
+	payload.Seen[key] = reservation.signature
+	payload.Attempts[key] = reservation.attempts
+	raw, _ := json.Marshal(payload)
+	s.signatures[prURL] = string(raw)
+	reservation.phase = "started"
+	s.reservations[reservationKey] = reservation
+	return ports.PRReactionReservation{Status: ports.PRReactionReserved, Signature: reservation.signature, Attempts: reservation.attempts}, nil
+}
+
+func (s *reservationFakeStore) CommitPRReaction(_ context.Context, prURL, key, ownerToken string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.commitErr != nil {
+		return false, s.commitErr
+	}
+	reservationKey := prURL + "\x00" + key
+	reservation, ok := s.reservations[reservationKey]
+	if !ok || reservation.owner != ownerToken {
+		return false, nil
+	}
+	delete(s.reservations, reservationKey)
+	return true, nil
+}
+
+func (s *reservationFakeStore) ReleasePRReaction(_ context.Context, prURL, key, ownerToken string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reservationKey := prURL + "\x00" + key
+	reservation, ok := s.reservations[reservationKey]
+	if !ok || reservation.owner != ownerToken {
+		return false, nil
+	}
+	s.signatures[prURL] = reservation.prior
+	delete(s.reservations, reservationKey)
+	return true, nil
 }
 
 func newManager() (*Manager, *fakeStore, *fakeMessenger) {
@@ -719,7 +862,7 @@ func TestActivity_WaitingInputEntryAndExitEmitTelemetry(t *testing.T) {
 func TestPRObservation_CIFailingNudgesAgentWithLogs(t *testing.T) {
 	m, st, msg := newManager()
 	st.sessions["mer-1"] = working("mer-1")
-	o := ports.PRObservation{Fetched: true, URL: "pr1", CI: domain.CIFailing, Checks: []ports.PRCheckObservation{
+	o := ports.PRObservation{Fetched: true, URL: "pr1", HeadSHA: "c1", CI: domain.CIFailing, Checks: []ports.PRCheckObservation{
 		{Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed, URL: "https://ci.example/build", LogTail: "boom"},
 		{Name: "lint", CommitHash: "c1", Status: domain.PRCheckCancelled, URL: "https://ci.example/lint"},
 	}}
@@ -811,7 +954,7 @@ func TestFormatCIFailureMessageUsesNonMutatingFence(t *testing.T) {
 func TestPRObservation_ReviewCommentsNudgeAgent(t *testing.T) {
 	m, st, msg := newManager()
 	st.sessions["mer-1"] = working("mer-1")
-	o := ports.PRObservation{Fetched: true, URL: "pr1", Review: domain.ReviewChangesRequest, Comments: []ports.PRCommentObservation{
+	o := ports.PRObservation{Fetched: true, URL: "pr1", HeadSHA: "head-1", Review: domain.ReviewChangesRequest, Comments: []ports.PRCommentObservation{
 		{ID: "1", ThreadID: "T1", Author: "alice", File: "foo.go", Line: 12, Body: "fix this", URL: "https://github.com/o/r/pull/1#discussion_r1"},
 		{ID: "2", Author: "bob", Body: "already handled", Resolved: true},
 	}}
@@ -844,6 +987,7 @@ func TestPRObservation_CIFailingAndReviewBothNudge(t *testing.T) {
 	o := ports.PRObservation{
 		Fetched:  true,
 		URL:      "pr1",
+		HeadSHA:  "c1",
 		CI:       domain.CIFailing,
 		Checks:   []ports.PRCheckObservation{{Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed, LogTail: "boom"}},
 		Review:   domain.ReviewChangesRequest,
@@ -877,7 +1021,7 @@ func TestPRObservation_CINudgeSanitizesLogTailControlChars(t *testing.T) {
 	st.sessions["mer-1"] = working("mer-1")
 	// A CI log tail with an embedded ANSI escape sequence and a NUL byte; the
 	// agent's pane must receive the visible text without the control bytes.
-	o := ports.PRObservation{Fetched: true, URL: "pr1", CI: domain.CIFailing, Checks: []ports.PRCheckObservation{{Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed, LogTail: "line1\x1b[2Jline2\x00\ttabbed"}}}
+	o := ports.PRObservation{Fetched: true, URL: "pr1", HeadSHA: "c1", CI: domain.CIFailing, Checks: []ports.PRCheckObservation{{Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed, LogTail: "line1\x1b[2Jline2\x00\ttabbed"}}}
 	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
 		t.Fatal(err)
 	}
@@ -896,7 +1040,7 @@ func TestPRObservation_CINudgeSanitizesLogTailControlChars(t *testing.T) {
 func TestPRObservation_ReviewNudgeSanitizesCommentControlChars(t *testing.T) {
 	m, st, msg := newManager()
 	st.sessions["mer-1"] = working("mer-1")
-	o := ports.PRObservation{Fetched: true, URL: "pr1", Review: domain.ReviewChangesRequest, Comments: []ports.PRCommentObservation{{ID: "1", Body: "please\x1b]0;pwned\afix this"}}}
+	o := ports.PRObservation{Fetched: true, URL: "pr1", HeadSHA: "head-1", Review: domain.ReviewChangesRequest, Comments: []ports.PRCommentObservation{{ID: "1", Body: "please\x1b]0;pwned\afix this"}}}
 	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
 		t.Fatal(err)
 	}
@@ -917,7 +1061,7 @@ func TestSCMObservationProjectsToExistingPRReactions(t *testing.T) {
 	st.sessions["mer-1"] = working("mer-1")
 	o := ports.SCMObservation{
 		Fetched: true,
-		PR:      ports.SCMPRObservation{URL: "pr1", Number: 1},
+		PR:      ports.SCMPRObservation{URL: "pr1", Number: 1, HeadSHA: "c1"},
 		CI: ports.SCMCIObservation{
 			Summary: string(domain.CIFailing),
 			HeadSHA: "c1",
@@ -1120,6 +1264,7 @@ func TestPRObservation_NudgeIncludesPRIdentity(t *testing.T) {
 	o := ports.PRObservation{
 		Fetched:      true,
 		URL:          "https://github.com/o/r/pull/7",
+		HeadSHA:      "c1",
 		Number:       7,
 		Title:        "Add auth",
 		SourceBranch: "feat/x/auth",
@@ -1151,7 +1296,7 @@ func TestPRObservationRecoversPendingClaimContractAfterRestartBeforeOtherWork(t 
 	st.designContracts[prURL] = "# Design Contract\n\n## Invariants\n- Preserve predecessor knowledge.\x1b[31m\n"
 	st.pendingContractDelivery[prURL] = rec.ID
 	st.pendingContractTask[prURL] = "Fix the exact claimed PR."
-	observation := ports.PRObservation{Fetched: true, URL: prURL, CI: domain.CIFailing, Checks: []ports.PRCheckObservation{{Name: "build", Status: domain.PRCheckFailed}}}
+	observation := ports.PRObservation{Fetched: true, URL: prURL, HeadSHA: "head-7", CI: domain.CIFailing, Checks: []ports.PRCheckObservation{{Name: "build", CommitHash: "head-7", Status: domain.PRCheckFailed}}}
 
 	failedMessenger := &fakeMessenger{err: errors.New("pane unavailable")}
 	first := New(st, failedMessenger)
@@ -1616,6 +1761,7 @@ func TestPRObservation_DedupSurvivesManagerRestart(t *testing.T) {
 	o := ports.PRObservation{
 		Fetched: true,
 		URL:     "https://github.com/o/r/pull/1",
+		HeadSHA: "c1",
 		CI:      domain.CIFailing,
 		Checks:  []ports.PRCheckObservation{{Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed, LogTail: "boom"}},
 	}
@@ -1656,12 +1802,157 @@ func TestPRObservation_DedupSurvivesManagerRestart(t *testing.T) {
 	}
 }
 
+func TestPRObservation_DurableAttemptExistsBeforeMessengerWrite(t *testing.T) {
+	st := newReservationFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	prURL := "https://github.com/o/r/pull/28"
+	o := ports.PRObservation{
+		Fetched: true, URL: prURL, HeadSHA: "head-a", CI: domain.CIFailing,
+		Checks: []ports.PRCheckObservation{{Name: "build", Status: domain.PRCheckFailed, LogTail: "boom"}},
+	}
+	msg := &fakeMessenger{}
+	msg.onSend = func() {
+		var payload reactionPayload
+		if err := json.Unmarshal([]byte(st.signatures[prURL]), &payload); err != nil {
+			t.Fatalf("decode pre-send payload: %v", err)
+		}
+		key := "ci:" + prURL
+		if payload.Seen[key] == "" || payload.Attempts[key] != 1 {
+			t.Fatalf("messenger crossed before durable attempt: %+v", payload)
+		}
+	}
+	if err := New(st, msg).ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("messages = %v, want one", msg.msgs)
+	}
+}
+
+func TestPRObservation_BlankHeadNeverDispatchesHeadSpecificNudge(t *testing.T) {
+	st := newReservationFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	msg := &fakeMessenger{}
+	o := ports.PRObservation{
+		Fetched: true, URL: "https://github.com/o/r/pull/28", CI: domain.CIFailing,
+		// Even a unanimous check commit can be stale relative to an omitted PR
+		// head and must never authorize CI or review dispatch.
+		Checks: []ports.PRCheckObservation{{Name: "build", CommitHash: "stale-head", Status: domain.PRCheckFailed, LogTail: "boom"}},
+	}
+	if err := New(st, msg).ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 || st.signatures[o.URL] != "" {
+		t.Fatalf("blank-head reaction dispatched: messages=%v signature=%q", msg.msgs, st.signatures[o.URL])
+	}
+}
+
+func TestPRObservation_WriteThenErrorStaysAccountedAcrossRestart(t *testing.T) {
+	st := newReservationFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	prURL := "https://github.com/o/r/pull/28"
+	o := ports.PRObservation{
+		Fetched: true, URL: prURL, HeadSHA: "head-a", CI: domain.CIFailing,
+		Checks: []ports.PRCheckObservation{{Name: "build", CommitHash: "head-a", Status: domain.PRCheckFailed, LogTail: "boom"}},
+	}
+	msg := &fakeMessenger{err: errors.New("ambiguous terminal write"), writeThenErr: true}
+	if err := New(st, msg).ApplyPRObservation(ctx, "mer-1", o); err == nil {
+		t.Fatal("want messenger error")
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("first messages = %v, want exactly one attempted write", msg.msgs)
+	}
+	msg.err = nil
+	if err := New(st, msg).ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatalf("restart observation: %v", err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("ambiguous write retried after restart: %v", msg.msgs)
+	}
+}
+
+func TestPRObservation_StartedCrashAlertsOnceAndDoesNotBlockSiblingReaction(t *testing.T) {
+	st := newReservationFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	prURL := "https://github.com/o/r/pull/28"
+	o := ports.PRObservation{
+		Fetched: true, URL: prURL, HeadSHA: "head-a", CI: domain.CIFailing, Review: domain.ReviewChangesRequest,
+		Checks:   []ports.PRCheckObservation{{Name: "build", CommitHash: "head-a", Status: domain.PRCheckFailed, LogTail: "boom"}},
+		Comments: []ports.PRCommentObservation{{ID: "review-1", Body: "fix review feedback"}},
+	}
+	key := "ci:" + prURL
+	sig := ciFailureSignature(failedPRChecks(o.Checks))
+	now := time.Now().UTC()
+	fences := []ports.PRReactionFence{{PRURL: prURL, SessionID: "mer-1", HeadSHA: "head-a"}}
+	reserved, err := st.ReservePRReaction(ctx, prURL, key, sig, 0, "crashed-owner", fences, now, now.Add(time.Minute))
+	if err != nil || reserved.Status != ports.PRReactionReserved {
+		t.Fatalf("reserve = %+v, err=%v", reserved, err)
+	}
+	started, err := st.StartPRReaction(ctx, prURL, key, "crashed-owner", now, now.Add(time.Minute))
+	if err != nil || started.Status != ports.PRReactionReserved {
+		t.Fatalf("start = %+v, err=%v", started, err)
+	}
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{err: errors.New("notification unavailable")}
+	err = New(st, msg, WithNotificationSink(sink)).ApplyPRObservation(ctx, "mer-1", o)
+	if !errors.Is(err, errPRReactionHandoffPending) {
+		t.Fatalf("failed uncertain handoff error = %v, want retryable pending handoff", err)
+	}
+	if len(msg.msgs) != 1 || !strings.Contains(msg.msgs[0], "review feedback") {
+		t.Fatalf("uncertain CI must not re-send or block the sibling review reaction: %v", msg.msgs)
+	}
+	if len(sink.intents) != 1 || !strings.Contains(sink.intents[0].BodyOverride, "will not resend automatically") {
+		t.Fatalf("uncertain delivery handoff = %+v, want one explicit no-auto-recovery alert", sink.intents)
+	}
+	sink.err = nil
+	if err := New(st, msg, WithNotificationSink(sink)).ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatalf("replayed uncertain handoff did not recover: %v", err)
+	}
+	if err := New(st, msg, WithNotificationSink(sink)).ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatalf("latched uncertain handoff failed replay: %v", err)
+	}
+	if len(msg.msgs) != 1 || len(sink.intents) != 2 {
+		t.Fatalf("uncertain replay duplicated pane delivery or successful alert: messages=%v intents=%+v", msg.msgs, sink.intents)
+	}
+}
+
+func TestPRObservation_CrashAfterWriteBeforeCommitNeverResends(t *testing.T) {
+	st := newReservationFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	st.commitErr = errors.New("simulated crash before commit")
+	sink := &fakeNotificationSink{}
+	prURL := "https://github.com/o/r/pull/28"
+	o := ports.PRObservation{
+		Fetched: true, URL: prURL, HeadSHA: "head-a", CI: domain.CIFailing,
+		Checks: []ports.PRCheckObservation{{Name: "build", CommitHash: "head-a", Status: domain.PRCheckFailed, LogTail: "boom"}},
+	}
+	msg := &fakeMessenger{}
+	if err := New(st, msg, WithNotificationSink(sink)).ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatalf("commit uncertainty must be accounted after alert: %v", err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("pre-crash writes = %v, want one", msg.msgs)
+	}
+	st.commitErr = nil
+	err := New(st, msg, WithNotificationSink(sink)).ApplyPRObservation(ctx, "mer-1", o)
+	if err != nil {
+		t.Fatalf("restart uncertainty must not fail the control plane: %v", err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("post-write crash re-sent: %v", msg.msgs)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("commit uncertainty alerts = %+v, want one durable handoff", sink.intents)
+	}
+}
+
 func TestPRObservation_EditedReviewCommentRenudgesAcrossRestart(t *testing.T) {
 	st := newFakeStore()
 	st.sessions["mer-1"] = working("mer-1")
 	o := ports.PRObservation{
 		Fetched: true,
 		URL:     "https://github.com/o/r/pull/49",
+		HeadSHA: "head-49",
 		Review:  domain.ReviewChangesRequest,
 		Comments: []ports.PRCommentObservation{{
 			ID: "c1", ThreadID: "t1", Author: "alice", File: "main.go", Line: 49, Body: "first request",
@@ -1712,6 +2003,7 @@ func TestPRObservation_NewReviewRoundResetsExhaustedBudgetForIdleSession(t *test
 		o := ports.PRObservation{
 			Fetched: true,
 			URL:     prURL,
+			HeadSHA: fmt.Sprintf("head-%d", round),
 			Review:  domain.ReviewChangesRequest,
 			Comments: []ports.PRCommentObservation{{
 				ID: fmt.Sprintf("comment-%d", round), Body: fmt.Sprintf("round %d feedback", round),
@@ -1735,6 +2027,7 @@ func TestPRObservation_NewReviewRoundResetsExhaustedBudgetForIdleSession(t *test
 	roundTwo := ports.PRObservation{
 		Fetched: true,
 		URL:     prURL,
+		HeadSHA: "head-new",
 		Review:  domain.ReviewChangesRequest,
 		Comments: []ports.PRCommentObservation{{
 			ID: "comment-new", Body: "new review round feedback",
@@ -1768,6 +2061,7 @@ func TestPRObservation_NewCIFailureReachesIdleSessionAndDedups(t *testing.T) {
 		return ports.PRObservation{
 			Fetched: true,
 			URL:     prURL,
+			HeadSHA: commit,
 			CI:      domain.CIFailing,
 			Checks: []ports.PRCheckObservation{{
 				Name: "build", CommitHash: commit, Status: domain.PRCheckFailed, LogTail: tail,
@@ -1802,7 +2096,7 @@ func TestPRObservation_DedupPersistsAcrossPRs(t *testing.T) {
 
 	for _, url := range []string{"https://github.com/o/r/pull/1", "https://github.com/o/r/pull/2"} {
 		o := ports.PRObservation{
-			Fetched: true, URL: url, CI: domain.CIFailing,
+			Fetched: true, URL: url, HeadSHA: "c1", CI: domain.CIFailing,
 			Checks: []ports.PRCheckObservation{{Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed, LogTail: "boom"}},
 		}
 		if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
@@ -1904,7 +2198,7 @@ func TestApplyReviewResultThirdClassOccurrenceUsesSimplificationRound(t *testing
 	telemetry := &telemetrySink{}
 	m := New(st, msg, WithTelemetry(telemetry))
 	result := ReviewResult{
-		RunID: "run-3", WorkerID: "mer-1", PRURL: "https://github.com/o/r/pull/1",
+		RunID: "run-3", WorkerID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha3",
 		Verdict:             domain.VerdictChangesRequested,
 		Findings:            []domain.ReviewFinding{{ClassTag: "missing-notify", File: "notify.go", Body: "broken path skips notify"}},
 		Ledger:              domain.FindingLedgerSummary{TotalFindings: 3, Rounds: 3, Classes: []domain.FindingClassCount{{ClassTag: "missing-notify", Count: 3}}},
@@ -1978,7 +2272,7 @@ func TestApplyReviewResultIncludesCanonicalPRDesignContract(t *testing.T) {
 	st.designContracts["https://github.com/o/r/pull/1"] = "# Design Contract\n\n## Invariants\n- Every idle backlog poll notifies or exits with a reason.\x1b[31m\x00\u0085\n"
 	msg := &fakeMessenger{}
 	m := New(st, msg)
-	result := ReviewResult{RunID: "run-1", WorkerID: rec.ID, PRURL: "https://github.com/o/r/pull/1", Verdict: domain.VerdictChangesRequested, Body: "fix the missed path"}
+	result := ReviewResult{RunID: "run-1", WorkerID: rec.ID, PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Verdict: domain.VerdictChangesRequested, Body: "fix the missed path"}
 
 	outcome, err := m.ApplyReviewResult(ctx, rec.ID, result)
 	if err != nil || outcome != ReviewDeliverySent {
@@ -2005,7 +2299,7 @@ func TestPRObservationReviewDispatchIncludesMatchingCanonicalContract(t *testing
 	msg := &fakeMessenger{}
 	m := New(st, msg)
 	o := ports.PRObservation{
-		Fetched: true, URL: "https://github.com/o/r/pull/1", Review: domain.ReviewChangesRequest,
+		Fetched: true, URL: "https://github.com/o/r/pull/1", HeadSHA: "sha1", Review: domain.ReviewChangesRequest,
 		Comments: []ports.PRCommentObservation{{ID: "c1", Body: "fix ownership", Author: "reviewer"}},
 	}
 
@@ -2146,6 +2440,80 @@ func TestApplyReviewBatchSendsCombinedAndDedups(t *testing.T) {
 	}
 	if outcome != ReviewDeliverySent || len(msg.msgs) != 1 {
 		t.Fatalf("repeat should suppress duplicate send, outcome=%q msgs=%v", outcome, msg.msgs)
+	}
+}
+
+func TestApplyReviewBatchBusyReservationIsNotStampedDeliveredAndRetries(t *testing.T) {
+	st := newReservationFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	msg := &fakeMessenger{}
+	result := ReviewResult{
+		RunID: "run-1", BatchID: "batch-1", WorkerID: "mer-1",
+		PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1",
+		Verdict: domain.VerdictChangesRequested, Body: "fix auth", GithubReviewID: "101",
+	}
+	key := "review-batch:" + result.PRURL + ":batch-1"
+	sig := strings.Join([]string{result.RunID, result.PRURL, result.TargetSHA, result.GithubReviewID, result.Body}, "\x00")
+	now := time.Now().UTC()
+	fences := []ports.PRReactionFence{{PRURL: result.PRURL, SessionID: "mer-1", HeadSHA: result.TargetSHA}}
+	reserved, err := st.ReservePRReaction(ctx, result.PRURL, key, sig, reviewMaxNudge, "owner-a", fences, now, now.Add(time.Minute))
+	if err != nil || reserved.Status != ports.PRReactionReserved {
+		t.Fatalf("owner reserve = %+v, err=%v", reserved, err)
+	}
+
+	outcome, err := New(st, msg).ApplyReviewBatch(ctx, "mer-1", "batch-1", []ReviewResult{result})
+	if err != nil {
+		t.Fatalf("busy ApplyReviewBatch: %v", err)
+	}
+	if outcome != ReviewDeliveryNoop || len(msg.msgs) != 0 {
+		t.Fatalf("busy outcome/messages = %q/%v, want no delivery proof", outcome, msg.msgs)
+	}
+	// Model owner A's guard suppression: no pane write occurred, so releasing
+	// the pre-boundary reservation must let a current owner retry.
+	if released, err := st.ReleasePRReaction(ctx, result.PRURL, key, "owner-a"); err != nil || !released {
+		t.Fatalf("owner suppression release = %v, err=%v", released, err)
+	}
+	outcome, err = New(st, msg).ApplyReviewBatch(ctx, "mer-1", "batch-1", []ReviewResult{result})
+	if err != nil {
+		t.Fatalf("retry ApplyReviewBatch: %v", err)
+	}
+	if outcome != ReviewDeliverySent || len(msg.msgs) != 1 {
+		t.Fatalf("retry outcome/messages = %q/%v, want sent once", outcome, msg.msgs)
+	}
+}
+
+func TestApplyReviewBatchFencesEveryPRBeforePaneWrite(t *testing.T) {
+	st := newReservationFakeStore()
+	st.sessions["mer-1"] = working("mer-1")
+	st.heads["https://github.com/o/r/pull/1"] = "sha1"
+	st.heads["https://github.com/o/r/pull/2"] = "sha2"
+	st.owners["https://github.com/o/r/pull/1"] = "mer-1"
+	st.owners["https://github.com/o/r/pull/2"] = "mer-1"
+	msg := &fakeMessenger{}
+	results := []ReviewResult{
+		{RunID: "run-1", BatchID: "batch-1", WorkerID: "mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1", Verdict: domain.VerdictChangesRequested, Body: "fix auth"},
+		{RunID: "run-2", BatchID: "batch-1", WorkerID: "mer-1", PRURL: "https://github.com/o/r/pull/2", TargetSHA: "sha2", Verdict: domain.VerdictChangesRequested, Body: "fix tests"},
+	}
+	st.beforeStart = func() {
+		// The non-anchor PR advances after selection/reservation but before the
+		// durable pane boundary. Validating only pull/1 would send stale feedback.
+		st.heads["https://github.com/o/r/pull/2"] = "sha3"
+		st.beforeStart = nil
+	}
+	outcome, err := New(st, msg).ApplyReviewBatch(ctx, "mer-1", "batch-1", results)
+	if err != nil {
+		t.Fatalf("stale batch: %v", err)
+	}
+	if outcome != ReviewDeliveryNoop || len(msg.msgs) != 0 {
+		t.Fatalf("stale secondary PR outcome/messages = %q/%v", outcome, msg.msgs)
+	}
+	st.heads["https://github.com/o/r/pull/2"] = "sha2"
+	outcome, err = New(st, msg).ApplyReviewBatch(ctx, "mer-1", "batch-1", results)
+	if err != nil {
+		t.Fatalf("current batch retry: %v", err)
+	}
+	if outcome != ReviewDeliverySent || len(msg.msgs) != 1 {
+		t.Fatalf("current retry outcome/messages = %q/%v", outcome, msg.msgs)
 	}
 }
 
@@ -2776,7 +3144,7 @@ func TestSCMObservation_PendingSubmitHandsOffOnceWithoutSpendingNudgeBudget(t *t
 		Fetched:  true,
 		Provider: "github",
 		Repo:     "o/r",
-		PR:       ports.SCMPRObservation{URL: "https://github.com/o/r/pull/1", Number: 1, Title: "fix pending input"},
+		PR:       ports.SCMPRObservation{URL: "https://github.com/o/r/pull/1", Number: 1, Title: "fix pending input", HeadSHA: "sha1"},
 		CI: ports.SCMCIObservation{
 			Summary:      string(domain.CIFailing),
 			HeadSHA:      "sha1",
@@ -2836,6 +3204,7 @@ func TestPRObservation_IdleReviewSendFailureHandsOffOnceAcrossRestart(t *testing
 	o := ports.PRObservation{
 		Fetched: true,
 		URL:     "https://github.com/o/r/pull/1",
+		HeadSHA: "sha1",
 		Number:  1,
 		Title:   "fix review feedback",
 		Review:  domain.ReviewChangesRequest,
@@ -2908,6 +3277,7 @@ func TestReviewFailureHandoffs_JITRecheckSkipsAfterConcurrentRecovery(t *testing
 				return m.ApplyPRObservation(ctx, id, ports.PRObservation{
 					Fetched:  true,
 					URL:      prURL,
+					HeadSHA:  "sha1",
 					Review:   domain.ReviewChangesRequest,
 					Comments: []ports.PRCommentObservation{{ID: "c1", ThreadID: "t1", Author: "reviewer", Body: "fix"}},
 				})

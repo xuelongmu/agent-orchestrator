@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -22,6 +24,7 @@ import (
 const reviewMaxNudge = 3
 const mergeConflictMaxNudge = 1
 const idleReviewMaxNudges = 3
+const reactionReservationLease = 30 * time.Second
 
 const reviewRoundCapNotificationFailed = "review-round-cap-notification-failed"
 const suppressedNudgeNotificationFailed = "suppressed-nudge-notification-failed"
@@ -30,8 +33,10 @@ const reviewFetchFailed = "review-fetch-failed"
 const idleReviewUndeliverable = "idle-review-undeliverable"
 const idleReviewNudgeFailed = "idle-review-nudge-failed"
 const idleReviewNudgeExhausted = "idle-review-nudge-exhausted"
+const prReactionDeliveryUncertain = "pr-reaction-delivery-uncertain"
 
 var errMergedCleanupRateLimited = errors.New("merged cleanup parked by agent usage limit")
+var errPRReactionHandoffPending = errors.New("uncertain PR reaction operator handoff is pending")
 
 type humanHandoffOutcomeKind string
 
@@ -111,6 +116,10 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 		}
 		return results[i].RunID < results[j].RunID
 	})
+	fences, ok := reviewBatchReactionFences(workerID, results)
+	if !ok {
+		return ReviewDeliveryNoop, nil
+	}
 	var msg strings.Builder
 	fmt.Fprintf(&msg, "[AO reviewer] AO's internal code reviewer submitted %d review(s) requesting changes.\n", len(results))
 	var sigParts []string
@@ -136,7 +145,7 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 	anchorPR := results[0].PRURL
 	key := "review-batch:" + anchorPR + ":" + batchID
 	sig := strings.Join(sigParts, "\x01")
-	outcome, err := m.sendOnce(ctx, workerID, anchorPR, key, sig, msg.String(), reviewMaxNudge)
+	outcome, err := m.sendOnce(ctx, workerID, anchorPR, key, sig, fences, msg.String(), reviewMaxNudge)
 	if err != nil {
 		return ReviewDeliveryNoop, err
 	}
@@ -152,6 +161,27 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 		}
 	}
 	return ReviewDeliverySent, nil
+}
+
+func reviewBatchReactionFences(workerID domain.SessionID, results []ReviewResult) ([]ports.PRReactionFence, bool) {
+	fences := make([]ports.PRReactionFence, 0, len(results))
+	byPR := make(map[string]string, len(results))
+	for _, result := range results {
+		prURL := strings.TrimSpace(result.PRURL)
+		head := strings.TrimSpace(result.TargetSHA)
+		if prURL == "" || head == "" || workerID == "" {
+			return nil, false
+		}
+		if prior, ok := byPR[prURL]; ok {
+			if prior != head {
+				return nil, false
+			}
+			continue
+		}
+		byPR[prURL] = head
+		fences = append(fences, ports.PRReactionFence{PRURL: prURL, SessionID: workerID, HeadSHA: head})
+	}
+	return fences, len(fences) > 0
 }
 
 func writeReviewDispatchPolicy(msg *strings.Builder, r ReviewResult) {
@@ -444,8 +474,10 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 	// persisted their own dedup signature so the next poll retries only the rest.
 	ident := prIdentity(o)
 	var nudges []pendingNudge
+	reactionHead := trustworthyPRReactionHead(o)
+	trustedHead := reactionHead != ""
 
-	if o.CI == domain.CIFailing {
+	if trustedHead && o.CI == domain.CIFailing {
 		checks := failedPRChecks(o.Checks)
 		if len(checks) > 0 {
 			msg := formatCIFailureMessage(checks)
@@ -458,7 +490,7 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 			nudges = append(nudges, pendingNudge{key: "ci:" + o.URL, sig: ciFailureSignature(checks), msg: msg, maxAttempts: 0})
 		}
 	}
-	if o.Review == domain.ReviewChangesRequest || hasUnresolvedComments(o.Comments) {
+	if trustedHead && (o.Review == domain.ReviewChangesRequest || hasUnresolvedComments(o.Comments)) {
 		comments := unresolvedReviewComments(o.Comments)
 		msg := formatReviewCommentsMessage(comments)
 		var contract strings.Builder
@@ -507,12 +539,24 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 		}
 	}
 
+	var reactionErrs []error
 	for _, n := range nudges {
-		if _, err := m.sendOnce(ctx, id, o.URL, n.key, n.sig, n.msg, n.maxAttempts); err != nil {
-			return err
+		fences := []ports.PRReactionFence{{PRURL: o.URL, SessionID: id, HeadSHA: reactionHead}}
+		if _, err := m.sendOnce(ctx, id, o.URL, n.key, n.sig, fences, n.msg, n.maxAttempts); err != nil {
+			// One condition's retryable control-plane failure must not prevent
+			// independent sibling reactions from reaching the agent. Return the
+			// joined failure only after every condition has been reduced so the
+			// observer withholds its semantic acknowledgement and retries.
+			reactionErrs = append(reactionErrs, err)
 		}
 	}
-	return nil
+	return errors.Join(reactionErrs...)
+}
+
+func trustworthyPRReactionHead(o ports.PRObservation) string {
+	// Check results can lag the PR snapshot even when every check names the
+	// same commit. Only the provider-observed PR head authorizes dispatch.
+	return strings.TrimSpace(o.HeadSHA)
 }
 
 func mergeConflictSignature(o ports.PRObservation) string {
@@ -1021,7 +1065,11 @@ func (m *Manager) ApplyReviewResult(ctx context.Context, workerID domain.Session
 	}
 	key := "review:" + r.PRURL + ":ao:" + r.RunID
 	sig := strings.Join([]string{r.TargetSHA, r.RunID, r.GithubReviewID, r.Body}, "\x00")
-	outcome, err := m.sendOnce(ctx, workerID, r.PRURL, key, sig, msg, reviewMaxNudge)
+	if strings.TrimSpace(r.TargetSHA) == "" {
+		return ReviewDeliveryNoop, nil
+	}
+	fences := []ports.PRReactionFence{{PRURL: r.PRURL, SessionID: workerID, HeadSHA: r.TargetSHA}}
+	outcome, err := m.sendOnce(ctx, workerID, r.PRURL, key, sig, fences, msg, reviewMaxNudge)
 	if err != nil {
 		return ReviewDeliveryNoop, err
 	}
@@ -1272,7 +1320,7 @@ func (m *Manager) ApplyTrackerFacts(ctx context.Context, id domain.SessionID, o 
 			// the PR-row signature load/persist is skipped, so the dedup
 			// survives only for the lifetime of this Manager. Cross-restart
 			// persistence ships with #35.
-			_, err := m.sendOnce(ctx, id, "", "tracker-bot:"+o.Issue.URL, strings.Join(ids, ","), msg, 0)
+			_, err := m.sendOnce(ctx, id, "", "tracker-bot:"+o.Issue.URL, strings.Join(ids, ","), nil, msg, 0)
 			return err
 		}
 	}
@@ -1502,7 +1550,7 @@ const (
 	sendOnceSuppressed
 )
 
-func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key, sig, msg string, maxAttempts int) (sendOnceOutcome, error) {
+func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key, sig string, fences []ports.PRReactionFence, msg string, maxAttempts int) (sendOnceOutcome, error) {
 	ready, err := m.ensurePRDesignContractDelivered(ctx, id, prURL)
 	if err != nil {
 		return sendOnceSuppressed, err
@@ -1516,27 +1564,125 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 	m.react.mu.Lock()
 	defer m.react.mu.Unlock()
 
-	if prURL != "" && !m.react.loaded[prURL] {
-		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+	reservationStore, durableReservation := m.store.(reactionReservationStore)
+	reservationToken := ""
+	attempts := 0
+	var priorSeen string
+	var priorSeenPresent bool
+	var priorAttempts int
+	var priorAttemptsPresent bool
+	if prURL != "" && durableReservation {
+		// The durable CAS is deliberately first. In particular, do not trust a
+		// rehydrated seen entry before Reserve has had a chance to surface a
+		// crash-surviving started reservation as unknown delivery.
+		reservationToken = uuid.NewString()
+		now := m.clock()
+		reservation, err := reservationStore.ReservePRReaction(
+			ctx, prURL, key, sig, maxAttempts, reservationToken,
+			fences, now, now.Add(reactionReservationLease),
+		)
+		if err != nil {
 			return sendOnceAccounted, err
 		}
-		m.react.loaded[prURL] = true
+		switch reservation.Status {
+		case ports.PRReactionAccounted, ports.PRReactionExhausted:
+			if reservation.Signature != "" {
+				m.react.seen[key] = reservation.Signature
+			}
+			m.react.attempts[key] = reservation.Attempts
+			return sendOnceAccounted, nil
+		case ports.PRReactionBusy, ports.PRReactionStale:
+			// No pane write is proven. Review callers must not stamp their run
+			// delivered while another owner is only preparing a send or while
+			// the observation fence is stale.
+			return sendOnceSuppressed, nil
+		case ports.PRReactionUncertain:
+			// The prior owner may have crossed the pane boundary. Account it
+			// fail-closed, surface one durable operator handoff, and keep reducing
+			// sibling reactions; there is intentionally no automatic recovery.
+			return sendOnceAccounted, m.handoffUncertainPRReactionLocked(ctx, id, prURL, key, reservation.Signature)
+		case ports.PRReactionReserved:
+			// Continue to the final exact-head/session fence immediately before
+			// the guard is allowed to attempt a pane write.
+		default:
+			return sendOnceAccounted, fmt.Errorf("reserve PR reaction %s/%q: unexpected status %q", prURL, key, reservation.Status)
+		}
+		if !m.react.loaded[prURL] {
+			if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+				_, releaseErr := reservationStore.ReleasePRReaction(ctx, prURL, key, reservationToken)
+				return sendOnceSuppressed, errors.Join(err, releaseErr)
+			}
+			m.react.loaded[prURL] = true
+		}
+		priorSeen, priorSeenPresent = m.react.seen[key]
+		priorAttempts, priorAttemptsPresent = m.react.attempts[key]
+		startedAt := m.clock()
+		started, err := reservationStore.StartPRReaction(ctx, prURL, key, reservationToken, startedAt, startedAt.Add(reactionReservationLease))
+		if err != nil {
+			// Start is transactional: an error proves the pane boundary was not
+			// crossed. Free the still-reserved token so a later poll need not wait
+			// for its lease to expire.
+			_, releaseErr := reservationStore.ReleasePRReaction(ctx, prURL, key, reservationToken)
+			return sendOnceSuppressed, errors.Join(err, releaseErr)
+		}
+		if started.Status != ports.PRReactionReserved {
+			if started.Status == ports.PRReactionUncertain {
+				return sendOnceAccounted, m.handoffUncertainPRReactionLocked(ctx, id, prURL, key, sig)
+			}
+			// A stale/expired start has not crossed the pane boundary. Free only
+			// this token; a newer owner generation is protected by the guard.
+			_, releaseErr := reservationStore.ReleasePRReaction(ctx, prURL, key, reservationToken)
+			return sendOnceSuppressed, releaseErr
+		}
+		m.react.seen[key] = started.Signature
+		m.react.attempts[key] = started.Attempts
+	} else {
+		// Non-SQLite embeddings retain the old in-memory fast path and
+		// send-then-persist behavior as a graceful degradation floor.
+		if prURL != "" && !m.react.loaded[prURL] {
+			if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+				return sendOnceAccounted, err
+			}
+			m.react.loaded[prURL] = true
+		}
+		if m.react.seen[key] == sig {
+			return sendOnceAccounted, nil
+		}
+		attempts = m.react.attempts[key]
+		// A bounded attempt budget belongs to one reaction fingerprint, not to
+		// the PR for the rest of its lifetime. In particular, an idle worker may
+		// have exhausted an earlier review round; new content must still wake it.
+		if prior, ok := m.react.seen[key]; ok && prior != sig {
+			attempts = 0
+		}
+		if maxAttempts > 0 && attempts >= maxAttempts {
+			return sendOnceAccounted, nil
+		}
 	}
 
-	if m.react.seen[key] == sig {
-		return sendOnceAccounted, nil
-	}
-	attempts := m.react.attempts[key]
-	// A bounded attempt budget belongs to one reaction fingerprint, not to the
-	// PR for the rest of its lifetime. In particular, an idle worker may have
-	// exhausted the review budget for an earlier round; new comment content must
-	// still wake it. Keep the reset local until the new nudge is actually sent so
-	// a suppressed or failed write cannot consume/alter durable delivery state.
-	if prior, ok := m.react.seen[key]; ok && prior != sig {
-		attempts = 0
-	}
-	if maxAttempts > 0 && attempts >= maxAttempts {
-		return sendOnceAccounted, nil
+	rollbackReservation := func() error {
+		if reservationToken == "" {
+			return nil
+		}
+		released, err := reservationStore.ReleasePRReaction(ctx, prURL, key, reservationToken)
+		if err != nil {
+			return err
+		}
+		if !released {
+			return fmt.Errorf("release PR reaction %s/%q: reservation ownership changed", prURL, key)
+		}
+		if priorSeenPresent {
+			m.react.seen[key] = priorSeen
+		} else {
+			delete(m.react.seen, key)
+		}
+		if priorAttemptsPresent {
+			m.react.attempts[key] = priorAttempts
+		} else {
+			delete(m.react.attempts, key)
+		}
+		reservationToken = ""
+		return nil
 	}
 	// The guard re-reads the session immediately before pasting: the caller's
 	// NeedsInput() entry check ran before this function's dedup/persist I/O, so
@@ -1550,31 +1696,59 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 	outcome, err := m.guard.Nudge(ctx, id, msg)
 	if err != nil {
 		if outcome != sessionguard.Sent {
-			return sendOnceSuppressed, err
+			rollbackErr := rollbackReservation()
+			return sendOnceSuppressed, errors.Join(err, rollbackErr)
+		}
+		// Sent+error is explicitly an unknown delivery: the messenger crossed
+		// its write boundary and may have landed the bytes. Finalize the durable
+		// attempt before surfacing the error; releasing here would permit a
+		// restart/concurrent poll to oversend.
+		finalizeErr := error(nil)
+		if reservationToken != "" {
+			committed, commitErr := reservationStore.CommitPRReaction(ctx, prURL, key, reservationToken)
+			if commitErr != nil {
+				finalizeErr = commitErr
+			} else if !committed {
+				finalizeErr = fmt.Errorf("commit PR reaction %s/%q: reservation ownership changed", prURL, key)
+			}
+			reservationToken = ""
 		}
 		// A review nudge for an idle PR overlay has no separate stuck-state
 		// transition to alert the user. Surface a durable, one-time fallback while
-		// leaving the failed send unaccounted so the agent delivery may retry.
+		// leaving the unknown agent delivery accounted so it cannot oversend.
 		if key == "review:"+prURL {
 			rec, eligible, readErr := m.idleReviewFailureSession(ctx, id)
 			if readErr != nil {
-				return sendOnceAccounted, errors.Join(err, readErr)
+				return sendOnceAccounted, errors.Join(err, finalizeErr, readErr)
 			}
 			if eligible {
 				obs := ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: prURL}}
 				handoffErr := m.deliverReviewFailureHandoffLocked(ctx, rec, obs, reviewNudgeSendFailed)
-				return sendOnceAccounted, errors.Join(err, handoffErr)
+				return sendOnceAccounted, errors.Join(err, finalizeErr, handoffErr)
 			}
 		}
-		return sendOnceAccounted, err
+		return sendOnceAccounted, errors.Join(err, finalizeErr)
 	}
 	if outcome != sessionguard.Sent {
+		rollbackErr := rollbackReservation()
 		if outcome == sessionguard.SuppressedAwaitingUser {
 			if err := m.handoffSuppressedPendingNudgeLocked(ctx, id, prURL, key, sig); err != nil {
-				return sendOnceSuppressed, err
+				return sendOnceSuppressed, errors.Join(rollbackErr, err)
 			}
 		}
-		return sendOnceSuppressed, nil
+		return sendOnceSuppressed, rollbackErr
+	}
+	if reservationToken != "" {
+		committed, err := reservationStore.CommitPRReaction(ctx, prURL, key, reservationToken)
+		if err != nil {
+			slog.Default().Warn("lifecycle: PR reaction commit is uncertain", "session", id, "pr", prURL, "reaction", key, "err", err)
+			return sendOnceAccounted, m.handoffUncertainPRReactionLocked(ctx, id, prURL, key, sig)
+		}
+		if !committed {
+			slog.Default().Warn("lifecycle: PR reaction commit ownership changed", "session", id, "pr", prURL, "reaction", key)
+			return sendOnceAccounted, m.handoffUncertainPRReactionLocked(ctx, id, prURL, key, sig)
+		}
+		return sendOnceAccounted, nil
 	}
 	// Order: Send → in-memory mutation → durable persist. Sending first means a
 	// transient persist failure does NOT swallow a real send (the agent saw the
@@ -1762,6 +1936,47 @@ func (m *Manager) handoffSuppressedPendingNudgeLocked(ctx context.Context, id do
 		SessionDisplayName: rec.DisplayName,
 	}
 	return m.deliverHumanHandoffLocked(ctx, prURL, handoffKey, suppressedNudgeNotificationFailed, intent, nil)
+}
+
+// handoffUncertainPRReactionLocked records the fail-closed liveness tradeoff
+// for a started reservation whose pane delivery cannot be proven. The
+// reservation remains permanently uncertain so AO never auto-resends it; a
+// durable, successful notification is latched once and subsequent polls treat
+// the reaction as accounted. Failed notification/persistence returns a
+// handoff-pending error after sibling reactions have run, keeping the
+// observer's semantic acknowledgement stale so the next poll retries only the
+// idempotent handoff path (never the pane write).
+// Caller holds react.mu.
+func (m *Manager) handoffUncertainPRReactionLocked(ctx context.Context, id domain.SessionID, prURL, key, signature string) error {
+	if prURL == "" {
+		return nil
+	}
+	if !m.react.loaded[prURL] {
+		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+			return fmt.Errorf("%w: load reaction state: %v", errPRReactionHandoffPending, err)
+		}
+		m.react.loaded[prURL] = true
+	}
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return fmt.Errorf("%w: resolve session %s (found=%v): %v", errPRReactionHandoffPending, id, ok, err)
+	}
+	sum := sha256.Sum256([]byte(key + "\x00" + signature))
+	handoffKey := fmt.Sprintf("reaction-uncertain:%s:%x", prURL, sum)
+	intent := ports.NotificationIntent{
+		Type:               domain.NotificationNeedsInput,
+		SessionID:          rec.ID,
+		ProjectID:          rec.ProjectID,
+		PRURL:              prURL,
+		CreatedAt:          m.clock(),
+		TitleOverride:      "PR delivery outcome needs verification",
+		BodyOverride:       "AO cannot determine whether a lifecycle message reached the agent. It will not resend automatically. Inspect the agent pane and pull request, then resolve the outstanding work manually.",
+		SessionDisplayName: rec.DisplayName,
+	}
+	if err := m.deliverHumanHandoffLocked(ctx, prURL, handoffKey, prReactionDeliveryUncertain, intent, nil); err != nil {
+		return fmt.Errorf("%w: %v", errPRReactionHandoffPending, err)
+	}
+	return nil
 }
 
 // loadPRSignaturesLocked merges any previously persisted reaction-dedup state

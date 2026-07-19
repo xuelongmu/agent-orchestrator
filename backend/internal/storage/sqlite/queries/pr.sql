@@ -50,9 +50,9 @@ ON CONFLICT (url) DO UPDATE SET
 -- name: UpsertLegacyPR :exec
 INSERT INTO pr (
     url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at,
-    is_draft, is_merged, is_closed
+    head_sha, is_draft, is_merged, is_closed
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (url) DO UPDATE SET
     number = excluded.number,
     pr_state = excluded.pr_state,
@@ -60,6 +60,7 @@ ON CONFLICT (url) DO UPDATE SET
     ci_state = excluded.ci_state,
     mergeability = excluded.mergeability,
     updated_at = excluded.updated_at,
+    head_sha = CASE WHEN excluded.head_sha <> '' THEN excluded.head_sha ELSE pr.head_sha END,
     is_draft = excluded.is_draft,
     is_merged = excluded.is_merged,
     is_closed = excluded.is_closed;
