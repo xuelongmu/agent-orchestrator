@@ -754,6 +754,8 @@ export interface components {
             terminalHandleId?: string;
             /** Format: date-time */
             updatedAt: string;
+            /** @enum {string} */
+            workspaceKind: "worktree" | "scratch" | "dir";
         };
         DegradedProject: {
             id: string;
@@ -939,6 +941,8 @@ export interface components {
             symlinks?: string[];
             trackerIntake?: components["schemas"]["TrackerIntakeConfig"];
             worker?: components["schemas"]["RoleOverride"];
+            /** @enum {string} */
+            workspaceKind?: "worktree" | "scratch" | "dir";
         };
         ProjectGetResponse: {
             project: components["schemas"]["ProjectOrDegraded"];
@@ -1184,6 +1188,8 @@ export interface components {
             kind?: "worker" | "orchestrator";
             projectId: string;
             prompt?: string;
+            /** @enum {string} */
+            workspaceKind?: "worktree" | "scratch" | "dir";
         };
         SubmitFindingItem: {
             body?: string;

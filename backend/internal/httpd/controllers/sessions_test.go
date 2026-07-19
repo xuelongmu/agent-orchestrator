@@ -34,6 +34,7 @@ type fakeSessionService struct {
 	claimErr        error
 	listPRErr       error
 	workspaceErr    error
+	lastSpawn       ports.SpawnConfig
 }
 
 func newFakeSessionService() *fakeSessionService {
@@ -64,7 +65,8 @@ func (f *fakeSessionService) Spawn(_ context.Context, cfg ports.SpawnConfig) (do
 		return domain.Session{}, f.spawnErr
 	}
 	now := time.Now().UTC()
-	s := domain.Session{SessionRecord: domain.SessionRecord{ID: domain.SessionID(string(cfg.ProjectID) + "-2"), ProjectID: cfg.ProjectID, IssueID: cfg.IssueID, Kind: cfg.Kind, Harness: cfg.Harness, DisplayName: cfg.DisplayName, Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}, CreatedAt: now, UpdatedAt: now}, Status: domain.StatusIdle}
+	f.lastSpawn = cfg
+	s := domain.Session{SessionRecord: domain.SessionRecord{ID: domain.SessionID(string(cfg.ProjectID) + "-2"), ProjectID: cfg.ProjectID, IssueID: cfg.IssueID, Kind: cfg.Kind, Harness: cfg.Harness, DisplayName: cfg.DisplayName, Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}, Metadata: domain.SessionMetadata{WorkspaceKind: cfg.WorkspaceKind}, CreatedAt: now, UpdatedAt: now}, Status: domain.StatusIdle}
 	f.sessions[s.ID] = s
 	return s, nil
 }
@@ -302,7 +304,7 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 		t.Fatalf("list leaked prompt: %s", body)
 	}
 
-	body, status, _ = doRequest(t, srv, "POST", "/api/v1/sessions", `{"projectId":"ao","issueId":"ISS-1","kind":"worker","harness":"codex","prompt":"fix","displayName":"my worker"}`)
+	body, status, _ = doRequest(t, srv, "POST", "/api/v1/sessions", `{"projectId":"ao","issueId":"ISS-1","kind":"worker","harness":"codex","workspaceKind":"scratch","prompt":"fix","displayName":"my worker"}`)
 	if status != http.StatusCreated {
 		t.Fatalf("POST session = %d, want 201; body=%s", status, body)
 	}
@@ -315,6 +317,9 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	}
 	if spawned.Session.DisplayName != "my worker" {
 		t.Fatalf("spawned displayName = %q, want %q", spawned.Session.DisplayName, "my worker")
+	}
+	if svc.lastSpawn.WorkspaceKind != domain.WorkspaceKindScratch {
+		t.Fatalf("spawn workspace kind = %q, want scratch", svc.lastSpawn.WorkspaceKind)
 	}
 
 	body, status, _ = doRequest(t, srv, "GET", "/api/v1/sessions/ao-2", "")

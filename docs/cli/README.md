@@ -75,6 +75,14 @@ or unauthorized. It warns-but-continues when auth remains unknown because daemon
 spawn remains the authoritative runtime validation point. Use
 `--skip-agent-check` to bypass only this CLI-side preflight.
 
+`ao spawn --workspace worktree|scratch|dir` selects the session filesystem
+shape. `worktree` remains the default and is the only kind that accepts
+`--branch` or participates in pull-request checkout/observation. `scratch`
+creates an ephemeral directory under `AO_DATA_DIR` and removes it when the
+session is killed or cleaned up. `dir` runs directly in the registered project
+path and never removes that shared directory. Set the per-project default with
+`ao project set-config <id> --workspace <kind>`; an explicit spawn flag wins.
+
 `ao preview` resolves its session from the `AO_SESSION_ID` environment variable
 (it is meant to run inside a session), not a flag. With no argument it
 autodetects an `index.html` in the session workspace; with a URL argument it

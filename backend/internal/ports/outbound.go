@@ -167,28 +167,22 @@ type Attacher interface {
 
 // The Agent port and its supporting types live in agent.go.
 
-// Workspace is the isolated checkout an agent works in (a git worktree or clone).
+// Workspace provisions the filesystem location an agent works in. Implementations
+// may be git-backed worktrees, ephemeral scratch directories, or shared dirs.
 type Workspace interface {
 	Create(ctx context.Context, cfg WorkspaceConfig) (WorkspaceInfo, error)
 	Destroy(ctx context.Context, info WorkspaceInfo) error
 	Restore(ctx context.Context, cfg WorkspaceConfig) (WorkspaceInfo, error)
-	// ForceDestroy removes the worktree unconditionally, bypassing the
-	// dirty-worktree refusal that Destroy enforces. It is only safe to call
-	// AFTER the session's uncommitted work has been captured via StashUncommitted.
-	// Never call it from interactive teardown paths.
+	// ForceDestroy removes an isolated workspace unconditionally, bypassing the
+	// dirty-worktree refusal that the git adapter enforces. Shared-directory
+	// adapters must leave their directory untouched.
 	ForceDestroy(ctx context.Context, info WorkspaceInfo) error
-	// StashUncommitted captures all uncommitted work in the worktree as a git
-	// commit object stored at refs/ao/preserved/<session-id>, WITHOUT mutating
-	// the working tree or the global stash stack. Tracked edits and new
-	// non-ignored files are captured; .gitignore-d files are skipped (the count
-	// of skipped ignored paths is logged). Returns the ref name on success, or
-	// an empty string if the worktree is clean (nothing to preserve).
+	// StashUncommitted captures git worktree state before forced teardown.
+	// Non-git adapters return an empty ref because their lifecycle never uses
+	// git preservation markers.
 	StashUncommitted(ctx context.Context, info WorkspaceInfo) (ref string, err error)
-	// ApplyPreserved replays a capture created by StashUncommitted onto the
-	// worktree identified by info. On clean success the preserve ref is deleted.
-	// On conflict, the ref is kept, conflict markers are left in the working
-	// tree, and ErrPreservedConflict (wrapped) is returned. The ref must never
-	// be deleted on a failed or conflicted apply.
+	// ApplyPreserved replays a git capture created by StashUncommitted. Non-git
+	// adapters accept only an empty ref.
 	ApplyPreserved(ctx context.Context, info WorkspaceInfo, ref string) error
 }
 
@@ -218,10 +212,9 @@ var (
 	// it holds uncommitted changes or untracked files. Teardown is never
 	// forced; callers treat the workspace as intentionally preserved.
 	ErrWorkspaceDirty = errors.New("workspace: uncommitted changes present")
-	// ErrWorkspaceStale reports an AO-managed workspace path no longer points
-	// at a registered git worktree. Replacement paths may skip preservation for
-	// this state after path-safety checks, while real preserve failures remain
-	// fatal.
+	// ErrWorkspaceStale reports an AO-managed workspace path that can no longer
+	// be restored. Replacement paths may skip preservation for this state after
+	// path-safety checks, while real preserve failures remain fatal.
 	ErrWorkspaceStale = errors.New("workspace: stale managed worktree")
 	// ErrPreservedConflict is returned by ApplyPreserved when replaying a
 	// preserved ref onto the worktree produces merge conflicts. The ref is
@@ -236,9 +229,10 @@ var (
 
 // WorkspaceConfig is the spec for creating or restoring a session's workspace.
 type WorkspaceConfig struct {
-	ProjectID domain.ProjectID
-	SessionID domain.SessionID
-	Kind      domain.SessionKind
+	ProjectID     domain.ProjectID
+	SessionID     domain.SessionID
+	Kind          domain.SessionKind
+	WorkspaceKind domain.WorkspaceKind
 	// SessionPrefix is the human-readable project prefix used to name the
 	// orchestrator worktree. Defaults to a truncation of ProjectID when empty.
 	SessionPrefix string
@@ -248,16 +242,17 @@ type WorkspaceConfig struct {
 	BaseBranch string
 	// RepoPath optionally overrides ProjectID-based repo resolution.
 	RepoPath string
-	// Path optionally supplies an existing managed worktree path for restore.
+	// Path optionally supplies an existing workspace path for restore.
 	Path string
 }
 
-// WorkspaceInfo describes a created workspace — where it lives and its branch.
+// WorkspaceInfo describes a created workspace. Branch is empty for non-git kinds.
 type WorkspaceInfo struct {
-	Path      string
-	Branch    string
-	SessionID domain.SessionID
-	ProjectID domain.ProjectID
+	Path          string
+	Branch        string
+	WorkspaceKind domain.WorkspaceKind
+	SessionID     domain.SessionID
+	ProjectID     domain.ProjectID
 	// RepoPath optionally overrides ProjectID-based repo resolution. It is used
 	// when the normal workspace lifecycle primitives operate on one child repo
 	// inside a workspace project.

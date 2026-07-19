@@ -115,6 +115,19 @@ func TestBuildProjectConfigTrackerIntakeFlags(t *testing.T) {
 	}
 }
 
+func TestBuildProjectConfigWorkspaceKind(t *testing.T) {
+	got, err := buildProjectConfig(projectSetConfigOptions{workspaceKind: "scratch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WorkspaceKind != "scratch" {
+		t.Fatalf("workspace kind = %q, want scratch", got.WorkspaceKind)
+	}
+	if _, err := buildProjectConfig(projectSetConfigOptions{workspaceKind: "clone"}); err == nil {
+		t.Fatal("invalid workspace kind succeeded")
+	}
+}
+
 func TestProjectList_Success(t *testing.T) {
 	cfg := setConfigEnv(t)
 	srv, capture := projectServer(t, http.StatusOK, `{"projects":[{"id":"zeta","name":"Zeta","sessionPrefix":"zeta"},{"id":"alpha","name":"Alpha","sessionPrefix":"alpha","resolveError":"config missing"}]}`)

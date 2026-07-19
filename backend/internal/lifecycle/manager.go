@@ -46,6 +46,13 @@ type MergedSessionCleaner interface {
 	CleanupMergedSession(ctx context.Context, id domain.SessionID) error
 }
 
+// CompletedSessionCleaner tears down ephemeral or shared external resources
+// after an agent exit or authoritative dead-runtime observation. Implementations
+// must leave git worktrees untouched and must not call back into lifecycle.
+type CompletedSessionCleaner interface {
+	CleanupCompletedSession(ctx context.Context, id domain.SessionID) error
+}
+
 // diagnosticRuntime is the read-only runtime surface lifecycle needs to attach
 // terminal evidence to abnormal transitions. It is optional so pure reducer
 // tests and embeddings can run without a runtime.
@@ -88,6 +95,7 @@ type Manager struct {
 	guard             *sessionguard.Guard
 	notifications     notificationSink
 	mergedCleaner     MergedSessionCleaner
+	completedCleaner  CompletedSessionCleaner
 	diagnosticRuntime diagnosticRuntime
 
 	mu        sync.Mutex
@@ -108,6 +116,24 @@ func (m *Manager) SetMergedSessionCleaner(cleaner MergedSessionCleaner) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.mergedCleaner = cleaner
+}
+
+// SetCompletedSessionCleaner wires resource teardown for naturally completed
+// non-git sessions after the session manager has been constructed.
+func (m *Manager) SetCompletedSessionCleaner(cleaner CompletedSessionCleaner) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.completedCleaner = cleaner
+}
+
+func (m *Manager) cleanupCompletedSession(ctx context.Context, id domain.SessionID) error {
+	m.mu.Lock()
+	cleaner := m.completedCleaner
+	m.mu.Unlock()
+	if cleaner == nil {
+		return nil
+	}
+	return cleaner.CleanupCompletedSession(ctx, id)
 }
 
 // New builds a Lifecycle Manager over the session store it writes and the messenger it uses for agent nudges.
@@ -159,7 +185,8 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 	case ports.ProbeDead:
 		diagnostic = m.captureDiagnostic(ctx, id, domain.DiagnosticRuntimeDead, "")
 	}
-	return m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
+	terminated := false
+	err := m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
 		if cur.IsTerminated {
 			return cur, false
 		}
@@ -196,8 +223,13 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		// (later observations return early on cur.IsTerminated). Runs under
 		// m.mu — mutate holds it across this callback.
 		delete(m.flights, id)
+		terminated = true
 		return next, true
 	})
+	if err != nil || !terminated {
+		return err
+	}
+	return m.cleanupCompletedSession(ctx, id)
 }
 
 // ApplyActivitySignal records an authoritative agent activity signal and any
@@ -232,6 +264,9 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	if rec.IsTerminated {
 		delete(m.flights, id)
 		m.mu.Unlock()
+		if s.Valid && s.State == domain.ActivityExited {
+			return m.cleanupCompletedSession(ctx, id)
+		}
 		return nil
 	}
 	// Event-tagged signals fold through the session's tool-flight state first:
@@ -352,6 +387,11 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 		m.emitTelemetry(ctx, ev)
 	}
 	m.emitNotification(ctx, intent)
+	if next.Activity.State == domain.ActivityExited {
+		if err := m.cleanupCompletedSession(ctx, id); err != nil {
+			return err
+		}
+	}
 	return recoveryErr
 }
 

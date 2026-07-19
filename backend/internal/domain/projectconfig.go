@@ -18,6 +18,9 @@ import (
 // yet exist (tracker/SCM per-project config) are intentionally absent and land in
 // focused follow-up PRs alongside the code that reads them.
 type ProjectConfig struct {
+	// WorkspaceKind is the default filesystem shape for new sessions. Empty is
+	// the backwards-compatible git worktree default.
+	WorkspaceKind WorkspaceKind `json:"workspaceKind,omitempty" enum:"worktree,scratch,dir"`
 	// DefaultBranch is the base branch new session worktrees are created from.
 	DefaultBranch string `json:"defaultBranch,omitempty"`
 	// SessionPrefix overrides the displayed session-id prefix.
@@ -102,10 +105,11 @@ type RoleOverride struct {
 const DefaultBranchName = "main"
 
 // DefaultProjectConfig returns the config a project has when it sets nothing:
-// branch "main". Every other field defaults to its zero value (no
-// env/symlinks/post-create, agent + role defaults).
+// worktree workspace and branch "main". Every other field defaults to its zero
+// value (no env/symlinks/post-create, agent + role defaults).
 func DefaultProjectConfig() ProjectConfig {
 	return ProjectConfig{
+		WorkspaceKind: WorkspaceKindWorktree,
 		DefaultBranch: DefaultBranchName,
 	}
 }
@@ -114,6 +118,9 @@ func DefaultProjectConfig() ProjectConfig {
 // project left unset. A set field is always preserved.
 func (c ProjectConfig) WithDefaults() ProjectConfig {
 	def := DefaultProjectConfig()
+	if c.WorkspaceKind == "" {
+		c.WorkspaceKind = def.WorkspaceKind
+	}
 	if c.DefaultBranch == "" {
 		c.DefaultBranch = def.DefaultBranch
 	}
@@ -130,6 +137,9 @@ func (c ProjectConfig) IsZero() bool {
 // Validate rejects values outside the typed vocabulary so a bad config is
 // refused when it is set (CLI/API) rather than surfacing at spawn.
 func (c ProjectConfig) Validate() error {
+	if !c.WorkspaceKind.IsKnown() {
+		return fmt.Errorf("workspaceKind: unknown workspace kind %q", c.WorkspaceKind)
+	}
 	if err := c.AgentConfig.Validate(); err != nil {
 		return err
 	}

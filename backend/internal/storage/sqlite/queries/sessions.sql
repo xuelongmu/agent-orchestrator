@@ -5,18 +5,18 @@ SELECT COALESCE(MAX(num), 0) + 1 AS next FROM sessions WHERE project_id = ?;
 INSERT INTO sessions (
     id, project_id, num, issue_id, kind, harness, display_name,
     activity_state, activity_last_at, first_signal_at, is_terminated,
-    branch, workspace_path, runtime_handle_id, agent_session_id, prompt,
+    workspace_kind, branch, workspace_path, runtime_handle_id, agent_session_id, prompt,
     preview_url, preview_revision, pending_submit_fingerprint,
     pending_submit_recovery_attempted, diagnostic_trigger,
     diagnostic_terminal_tail, diagnostic_hook_error_type,
     diagnostic_captured_at, merged_cleanup_pending, merged_cleanup_pr_url, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 -- name: UpdateSession :exec
 UPDATE sessions SET
     issue_id = ?, kind = ?, harness = ?, display_name = ?,
     activity_state = ?, activity_last_at = ?, first_signal_at = ?, is_terminated = ?,
-    branch = ?, workspace_path = ?, runtime_handle_id = ?, agent_session_id = ?, prompt = ?,
+    workspace_kind = ?, branch = ?, workspace_path = ?, runtime_handle_id = ?, agent_session_id = ?, prompt = ?,
     preview_url = ?, preview_revision = ?, pending_submit_fingerprint = ?,
     pending_submit_recovery_attempted = ?, diagnostic_trigger = ?,
     diagnostic_terminal_tail = ?, diagnostic_hook_error_type = ?,
@@ -60,7 +60,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     pending_submit_fingerprint, pending_submit_recovery_attempted,
     merged_cleanup_pending, merged_cleanup_pr_url,
     diagnostic_trigger, diagnostic_terminal_tail, diagnostic_hook_error_type,
-    diagnostic_captured_at
+    diagnostic_captured_at, workspace_kind
 FROM sessions WHERE id = ?;
 
 -- name: ListSessionsByProject :many
@@ -70,7 +70,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     pending_submit_fingerprint, pending_submit_recovery_attempted,
     merged_cleanup_pending, merged_cleanup_pr_url,
     diagnostic_trigger, diagnostic_terminal_tail, diagnostic_hook_error_type,
-    diagnostic_captured_at
+    diagnostic_captured_at, workspace_kind
 FROM sessions WHERE project_id = ? ORDER BY num;
 
 -- name: ListAllSessions :many
@@ -80,7 +80,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     pending_submit_fingerprint, pending_submit_recovery_attempted,
     merged_cleanup_pending, merged_cleanup_pr_url,
     diagnostic_trigger, diagnostic_terminal_tail, diagnostic_hook_error_type,
-    diagnostic_captured_at
+    diagnostic_captured_at, workspace_kind
 FROM sessions ORDER BY project_id, num;
 
 -- name: SetPendingSubmit :execrows

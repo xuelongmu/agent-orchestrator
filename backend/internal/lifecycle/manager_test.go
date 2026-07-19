@@ -88,6 +88,16 @@ func (c *retryMergedCleaner) CleanupMergedSession(ctx context.Context, id domain
 	return nil
 }
 
+type retryCompletedCleaner struct {
+	err   error
+	calls int
+}
+
+func (c *retryCompletedCleaner) CleanupCompletedSession(context.Context, domain.SessionID) error {
+	c.calls++
+	return c.err
+}
+
 type blockingMergedCleaner struct {
 	entered chan struct{}
 	release chan struct{}
@@ -149,6 +159,8 @@ func working(id domain.SessionID) domain.SessionRecord {
 
 func TestRuntimeObservation_InferredDeathSetsTerminated(t *testing.T) {
 	m, st, _ := newManager()
+	cleaner := &retryCompletedCleaner{}
+	m.SetCompletedSessionCleaner(cleaner)
 	rec := working("mer-1")
 	rec.Activity.LastActivityAt = time.Now().Add(-2 * time.Minute)
 	st.sessions["mer-1"] = rec
@@ -158,6 +170,33 @@ func TestRuntimeObservation_InferredDeathSetsTerminated(t *testing.T) {
 	got := st.sessions["mer-1"]
 	if !got.IsTerminated || got.Activity.State != domain.ActivityExited {
 		t.Fatalf("want terminated/exited, got %+v", got)
+	}
+	if cleaner.calls != 1 {
+		t.Fatalf("completed cleanup calls = %d, want 1", cleaner.calls)
+	}
+}
+
+func TestActivityExitedRetriesCompletedCleanup(t *testing.T) {
+	m, st, _ := newManager()
+	rec := working("mer-1")
+	st.sessions[rec.ID] = rec
+	cleaner := &retryCompletedCleaner{err: errors.New("workspace busy")}
+	m.SetCompletedSessionCleaner(cleaner)
+
+	err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityExited})
+	if err == nil || !strings.Contains(err.Error(), "workspace busy") {
+		t.Fatalf("first cleanup error = %v, want workspace busy", err)
+	}
+	if got := st.sessions[rec.ID]; !got.IsTerminated || got.Activity.State != domain.ActivityExited {
+		t.Fatalf("failed cleanup must preserve terminal state: %+v", got)
+	}
+
+	cleaner.err = nil
+	if err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{Valid: true, State: domain.ActivityExited}); err != nil {
+		t.Fatalf("retry cleanup: %v", err)
+	}
+	if cleaner.calls != 2 {
+		t.Fatalf("completed cleanup calls = %d, want 2", cleaner.calls)
 	}
 }
 

@@ -102,6 +102,7 @@ type reviewPolicyConfig struct {
 // client. The CLI sets common fields via flags and the whole object via
 // --config-json.
 type projectConfig struct {
+	WorkspaceKind     string              `json:"workspaceKind,omitempty"`
 	DefaultBranch     string              `json:"defaultBranch,omitempty"`
 	SessionPrefix     string              `json:"sessionPrefix,omitempty"`
 	Env               map[string]string   `json:"env,omitempty"`
@@ -124,6 +125,7 @@ type setConfigRequest struct {
 }
 
 type projectSetConfigOptions struct {
+	workspaceKind     string
 	defaultBranch     string
 	sessionPrefix     string
 	model             string
@@ -282,7 +284,7 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "set-config <id>",
 		Short: "Set the per-project config",
-		Long: "Replace a project's per-project config (branch, session prefix, env, " +
+		Long: "Replace a project's per-project config (workspace kind, branch, session prefix, env, " +
 			"symlinks, post-create, rules, agent model/permissions, role overrides, tracker intake). The config " +
 			"is resolved when a session spawns.\n\n" +
 			"Set fields via flags, pass the whole object with --config-json, or --clear " +
@@ -315,6 +317,7 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
+	f.StringVar(&opts.workspaceKind, "workspace", "", "Default workspace kind: worktree, scratch, or dir")
 	f.StringVar(&opts.defaultBranch, "default-branch", "", "Base branch new session worktrees are created from")
 	f.StringVar(&opts.sessionPrefix, "session-prefix", "", "Displayed session-id prefix")
 	f.StringVar(&opts.model, "model", "", "Agent model override (e.g. claude-opus-4-5)")
@@ -351,12 +354,16 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 		}
 		return cfg, nil
 	}
+	if !validWorkspaceKind(opts.workspaceKind) {
+		return projectConfig{}, usageError{fmt.Errorf("--workspace must be worktree, scratch, or dir")}
+	}
 
 	env, err := parseEnvPairs(opts.env)
 	if err != nil {
 		return projectConfig{}, err
 	}
 	cfg := projectConfig{
+		WorkspaceKind:     opts.workspaceKind,
 		DefaultBranch:     opts.defaultBranch,
 		SessionPrefix:     opts.sessionPrefix,
 		Env:               env,

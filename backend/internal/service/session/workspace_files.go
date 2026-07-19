@@ -24,7 +24,8 @@ const (
 	maxWorkspaceDiffBytes = 512 * 1024
 )
 
-// WorkspaceFileStatus describes a session-worktree file relative to HEAD.
+// WorkspaceFileStatus describes a file in a session workspace. Git worktrees
+// are compared with HEAD; non-git workspace files are unmodified.
 type WorkspaceFileStatus string
 
 // Workspace file status values reported by the session workspace browser.
@@ -70,18 +71,26 @@ type WorkspaceFileDetail struct {
 	WorkspaceTruncated bool
 }
 
-// ListWorkspaceFiles returns all tracked and untracked, non-ignored files in a
-// session worktree, annotated with their current git status against HEAD.
+// ListWorkspaceFiles returns files from a session workspace. Worktrees use
+// tracked and untracked, non-ignored git files; non-git workspaces use a plain
+// bounded filesystem walk.
 func (s *Service) ListWorkspaceFiles(ctx context.Context, id domain.SessionID) (WorkspaceFiles, error) {
 	rec, err := s.sessionWorkspaceRecord(ctx, id)
 	if err != nil {
 		return WorkspaceFiles{}, err
 	}
-	statuses, counts, err := workspaceChangeMaps(ctx, rec.Metadata.WorkspacePath)
-	if err != nil {
-		return WorkspaceFiles{}, err
+	statuses := map[string]WorkspaceFileStatus{}
+	counts := map[string][2]int{}
+	var paths []string
+	var truncated bool
+	if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree {
+		statuses, counts, err = workspaceChangeMaps(ctx, rec.Metadata.WorkspacePath)
+		if err == nil {
+			paths, truncated, err = workspaceGitFiles(ctx, rec.Metadata.WorkspacePath)
+		}
+	} else {
+		paths, truncated, err = plainWorkspaceFiles(rec.Metadata.WorkspacePath)
 	}
-	paths, truncated, err := workspaceGitFiles(ctx, rec.Metadata.WorkspacePath)
 	if err != nil {
 		return WorkspaceFiles{}, err
 	}
@@ -89,7 +98,13 @@ func (s *Service) ListWorkspaceFiles(ctx context.Context, id domain.SessionID) (
 	for _, rel := range paths {
 		status := statuses[rel]
 		if status == "" {
-			status = WorkspaceFileUnmodified
+			if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree {
+				status = WorkspaceFileUnmodified
+			} else {
+				// Non-git workspaces have no baseline. Treat every present file as
+				// added so the changed-files UI does not filter their output away.
+				status = WorkspaceFileAdded
+			}
 		}
 		additions, deletions := counts[rel][0], counts[rel][1]
 		size, binary := workspaceFileSizeAndBinary(rec.Metadata.WorkspacePath, rel, status)
@@ -106,8 +121,8 @@ func (s *Service) ListWorkspaceFiles(ctx context.Context, id domain.SessionID) (
 	return WorkspaceFiles{SessionID: id, Files: files, Truncated: truncated}, nil
 }
 
-// GetWorkspaceFile returns one session-worktree file's current text content and
-// the git diff for that path. Binary or deleted files omit content.
+// GetWorkspaceFile returns one session workspace file's current text content
+// and, for worktrees, its git diff. Binary or deleted files omit content.
 func (s *Service) GetWorkspaceFile(ctx context.Context, id domain.SessionID, rawPath string) (WorkspaceFileDetail, error) {
 	rec, err := s.sessionWorkspaceRecord(ctx, id)
 	if err != nil {
@@ -117,13 +132,21 @@ func (s *Service) GetWorkspaceFile(ctx context.Context, id domain.SessionID, raw
 	if err != nil {
 		return WorkspaceFileDetail{}, err
 	}
-	statuses, counts, err := workspaceChangeMaps(ctx, rec.Metadata.WorkspacePath)
-	if err != nil {
-		return WorkspaceFileDetail{}, err
+	statuses := map[string]WorkspaceFileStatus{}
+	counts := map[string][2]int{}
+	if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree {
+		statuses, counts, err = workspaceChangeMaps(ctx, rec.Metadata.WorkspacePath)
+		if err != nil {
+			return WorkspaceFileDetail{}, err
+		}
 	}
 	status := statuses[rel]
 	if status == "" {
-		status = WorkspaceFileUnmodified
+		if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree {
+			status = WorkspaceFileUnmodified
+		} else {
+			status = WorkspaceFileAdded
+		}
 	}
 	additions, deletions := counts[rel][0], counts[rel][1]
 	detail := WorkspaceFileDetail{
@@ -150,13 +173,52 @@ func (s *Service) GetWorkspaceFile(ctx context.Context, id domain.SessionID, raw
 			detail.Content = content
 		}
 	}
-	diff, truncated, err := workspaceFileDiff(ctx, rec.Metadata.WorkspacePath, rel, status, detail.Content, detail.Binary)
-	if err != nil {
-		return WorkspaceFileDetail{}, err
+	if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree {
+		diff, truncated, err := workspaceFileDiff(ctx, rec.Metadata.WorkspacePath, rel, status, detail.Content, detail.Binary)
+		if err != nil {
+			return WorkspaceFileDetail{}, err
+		}
+		detail.Diff = diff
+		detail.DiffTruncated = truncated
 	}
-	detail.Diff = diff
-	detail.DiffTruncated = truncated
 	return detail, nil
+}
+
+func plainWorkspaceFiles(root string) ([]string, bool, error) {
+	return plainWorkspaceFilesLimit(root, maxWorkspaceFiles)
+}
+
+func plainWorkspaceFilesLimit(root string, limit int) ([]string, bool, error) {
+	paths := make([]string, 0)
+	truncated := false
+	err := filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if current == root {
+			return nil
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, current)
+		if err != nil {
+			return err
+		}
+		paths = append(paths, filepath.ToSlash(rel))
+		if len(paths) >= limit {
+			truncated = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return paths, truncated, err
 }
 
 func (s *Service) sessionWorkspaceRecord(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error) {

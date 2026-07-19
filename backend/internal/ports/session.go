@@ -16,11 +16,12 @@ type SpawnConfig struct {
 	IssueID   domain.IssueID
 	// IssueContext is optional pre-fetched tracker context for the task prompt.
 	// Standing rules stay in SystemPrompt; issue facts belong to the user task.
-	IssueContext string
-	Kind         domain.SessionKind
-	Harness      domain.AgentHarness
-	Branch       string
-	Prompt       string
+	IssueContext  string
+	Kind          domain.SessionKind
+	Harness       domain.AgentHarness
+	WorkspaceKind domain.WorkspaceKind
+	Branch        string
+	Prompt        string
 
 	// DisplayName is the user-facing sidebar label. Empty falls back to the
 	// session id in the read model (e.g. orchestrator sessions).

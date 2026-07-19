@@ -36,6 +36,10 @@ func New() *Plugin {
 	return &Plugin{}
 }
 
+// SupportsSharedDirHooks reports whether hooks are scoped to the workspace.
+// Autohand mutates a user-level config, so it is unsafe for shared directories.
+func (*Plugin) SupportsSharedDirHooks() bool { return false }
+
 var _ adapters.Adapter = (*Plugin)(nil)
 var _ ports.Agent = (*Plugin)(nil)
 

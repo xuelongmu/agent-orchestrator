@@ -77,6 +77,7 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 	const activeOrchestrator = newestActiveOrchestrator(workspace?.sessions ?? []);
 	const intake: TrackerIntakeConfig = config.trackerIntake ?? {};
 	const [form, setForm] = useState({
+		workspaceKind: config.workspaceKind ?? "worktree",
 		defaultBranch: config.defaultBranch ?? project.defaultBranch ?? "",
 		sessionPrefix: config.sessionPrefix ?? "",
 		workerAgent: config.worker?.agent ?? "",
@@ -93,6 +94,7 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 	const [replacementError, setReplacementError] = useState<string | null>(null);
 	const [validationError, setValidationError] = useState<string | null>(null);
 	const initialOrchestratorAgent = config.orchestrator?.agent ?? "";
+	const initialWorkspaceKind = config.workspaceKind ?? "worktree";
 	const missingRequiredAgent = form.workerAgent === "" || form.orchestratorAgent === "";
 	const agentsQuery = useQuery(agentsQueryOptions);
 	const agentCatalog = agentsQuery.data;
@@ -127,6 +129,7 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 			// so we don't drop env/symlinks/postCreate the form doesn't expose.
 			const next: ProjectConfig = {
 				...config,
+				workspaceKind: form.workspaceKind,
 				defaultBranch: form.defaultBranch || undefined,
 				sessionPrefix: form.sessionPrefix || undefined,
 				worker: { ...config.worker, agent: form.workerAgent },
@@ -148,6 +151,7 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 			});
 			if (error) throw new Error(apiErrorMessage(error));
 			if (
+				form.workspaceKind !== initialWorkspaceKind ||
 				form.orchestratorAgent !== initialOrchestratorAgent ||
 				(activeOrchestrator && activeOrchestrator.provider !== form.orchestratorAgent)
 			) {
@@ -233,14 +237,35 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 
 			<Card>
 				<CardHeader>
-					<CardTitle className="text-control">Worktrees</CardTitle>
+					<CardTitle className="text-control">Workspaces</CardTitle>
 				</CardHeader>
 				<CardContent className="flex flex-col gap-4">
+					<Field label="Default workspace" htmlFor="workspaceKind">
+						<Select
+							value={form.workspaceKind}
+							onValueChange={(v) =>
+								setForm((f) => ({
+									...f,
+									workspaceKind: v as NonNullable<ProjectConfig["workspaceKind"]>,
+								}))
+							}
+						>
+							<SelectTrigger id="workspaceKind" aria-label="Default workspace">
+								<SelectValue />
+							</SelectTrigger>
+							<SelectContent>
+								<SelectItem value="worktree">Git worktree (isolated)</SelectItem>
+								<SelectItem value="scratch">Scratch (ephemeral)</SelectItem>
+								<SelectItem value="dir">Project directory (shared)</SelectItem>
+							</SelectContent>
+						</Select>
+					</Field>
 					<Field label="Default branch" htmlFor="defaultBranch">
 						<input
 							id="defaultBranch"
 							className="h-control-form w-full rounded-md border border-input bg-transparent px-2.5 text-control text-foreground placeholder:text-passive focus-visible:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-weak"
 							value={form.defaultBranch}
+							disabled={form.workspaceKind !== "worktree"}
 							onChange={(e) => setForm((f) => ({ ...f, defaultBranch: e.target.value }))}
 							placeholder="main"
 						/>
