@@ -77,30 +77,26 @@ func (q *Queries) ReleaseCoordinationClaim(ctx context.Context, arg ReleaseCoord
 
 const renewCoordinationClaim = `-- name: RenewCoordinationClaim :execrows
 UPDATE coordination_claims
-SET lease_expires_at = CASE
-    WHEN lease_expires_at < ? THEN ?
-    ELSE lease_expires_at
-END
-WHERE claim_key = ?
-  AND owner_token = ?
-  AND lease_expires_at > ?
+SET lease_expires_at = ?1
+WHERE claim_key = ?2
+  AND owner_token = ?3
+  AND lease_expires_at > ?4
+  AND lease_expires_at < ?1
 `
 
 type RenewCoordinationClaimParams struct {
-	LeaseExpiresAt   time.Time
-	LeaseExpiresAt_2 time.Time
-	ClaimKey         string
-	OwnerToken       string
-	LeaseExpiresAt_3 time.Time
+	ProposedExpiry time.Time
+	ClaimKey       string
+	OwnerToken     string
+	Now            time.Time
 }
 
 func (q *Queries) RenewCoordinationClaim(ctx context.Context, arg RenewCoordinationClaimParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, renewCoordinationClaim,
-		arg.LeaseExpiresAt,
-		arg.LeaseExpiresAt_2,
+		arg.ProposedExpiry,
 		arg.ClaimKey,
 		arg.OwnerToken,
-		arg.LeaseExpiresAt_3,
+		arg.Now,
 	)
 	if err != nil {
 		return 0, err

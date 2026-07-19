@@ -104,7 +104,7 @@ func TestCoordinationClaimSurvivesReopenAndReleaseChecksToken(t *testing.T) {
 	}
 }
 
-func TestCoordinationRenewalNeverShortensExpiry(t *testing.T) {
+func TestCoordinationRenewalRequiresPersistedExpiryAdvance(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
@@ -113,8 +113,8 @@ func TestCoordinationRenewalNeverShortensExpiry(t *testing.T) {
 		t.Fatalf("initial claim acquired=%v err=%v", acquired, err)
 	}
 	backwardNow := now.Add(-5 * time.Second)
-	if renewed, err := store.RenewCoordinationClaim(ctx, original.Key, original.OwnerToken, backwardNow, backwardNow.Add(10*time.Second)); err != nil || !renewed {
-		t.Fatalf("backward renewal=%v err=%v", renewed, err)
+	if renewed, err := store.RenewCoordinationClaim(ctx, original.Key, original.OwnerToken, backwardNow, backwardNow.Add(10*time.Second)); err != nil || renewed {
+		t.Fatalf("backward renewal=%v err=%v, want fail-closed no-op", renewed, err)
 	}
 	current, acquired, err := store.TryAcquireCoordinationClaim(ctx, testClaim("owner-b", 202, now))
 	if err != nil || acquired {
@@ -122,6 +122,15 @@ func TestCoordinationRenewalNeverShortensExpiry(t *testing.T) {
 	}
 	if !current.LeaseExpiresAt.Equal(original.LeaseExpiresAt) {
 		t.Fatalf("expiry shortened to %s, want %s", current.LeaseExpiresAt, original.LeaseExpiresAt)
+	}
+	forwardNow := now.Add(time.Second)
+	forwardExpiry := forwardNow.Add(10 * time.Second)
+	if renewed, err := store.RenewCoordinationClaim(ctx, original.Key, original.OwnerToken, forwardNow, forwardExpiry); err != nil || !renewed {
+		t.Fatalf("forward renewal=%v err=%v", renewed, err)
+	}
+	current, acquired, err = store.TryAcquireCoordinationClaim(ctx, testClaim("owner-b", 202, now))
+	if err != nil || acquired || !current.LeaseExpiresAt.Equal(forwardExpiry) {
+		t.Fatalf("renewed claim=%+v acquired=%v err=%v", current, acquired, err)
 	}
 }
 
