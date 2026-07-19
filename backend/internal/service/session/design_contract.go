@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -18,7 +19,7 @@ type designContractWriter interface {
 }
 
 type designContractReader interface {
-	GetPRDesignContract(ctx context.Context, prURL string) (string, bool, error)
+	GetOwnedPRDesignContract(ctx context.Context, sessionID domain.SessionID, prURL string) (string, bool, error)
 }
 
 // GetDesignContract returns the full canonical bytes for one exact owned PR.
@@ -47,9 +48,9 @@ func (s *Service) GetDesignContract(ctx context.Context, id domain.SessionID, re
 	if !ok {
 		return "", apierr.Internal("CONTRACT_STORAGE_UNAVAILABLE", "Design contract storage is unavailable")
 	}
-	contract, found, err := reader.GetPRDesignContract(ctx, prURL)
+	contract, found, err := reader.GetOwnedPRDesignContract(ctx, id, prURL)
 	if err != nil {
-		return "", err
+		return "", designContractStoreError(err)
 	}
 	if !found {
 		return "", apierr.NotFound("CONTRACT_NOT_FOUND", "Design contract is unavailable")
@@ -89,12 +90,23 @@ func (s *Service) AddDesignContractInvariant(ctx context.Context, id domain.Sess
 	}
 	contract, err := writer.AddPRDesignContractInvariant(ctx, id, prURL, invariant, s.clock().UTC())
 	if err != nil {
-		return "", err
+		return "", designContractStoreError(err)
 	}
 	// Canonical success must not be reported as failure because the checkout
 	// projection is optional and untrusted.
 	_ = designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, contract)
 	return contract, nil
+}
+
+func designContractStoreError(err error) error {
+	switch {
+	case errors.Is(err, designcontract.ErrPRNotOwned):
+		return apierr.NotFound("PR_NOT_OWNED", "PR is not owned by this session")
+	case errors.Is(err, designcontract.ErrContractCapacityExceeded):
+		return apierr.Conflict("CONTRACT_CAPACITY_EXCEEDED", "Design contract has reached its canonical capacity", nil)
+	default:
+		return err
+	}
 }
 
 // resolveOwnedPR binds a user reference to the canonical URL of an existing

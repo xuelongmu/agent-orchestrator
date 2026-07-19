@@ -2,12 +2,15 @@ package designcontract
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -119,7 +122,8 @@ func TestWriteProjectionRejectsDirectoryReplacedByLinkAfterRootOpen(t *testing.T
 	}
 	outside := t.TempDir()
 	linkTestDirectory(t, outside, filepath.Join(workspace, directory))
-	if err := writeProjection(root, directory, filepath.ToSlash(filepath.Join(directory, filename)), "must stay confined"); err == nil {
+	target := filepath.ToSlash(filepath.Join(directory, filename))
+	if err := writeProjection(root, target, target, projectionContent(target, "scope", "must stay confined")); err == nil {
 		t.Fatal("handle-relative write followed replacement link")
 	}
 	if _, err := os.Stat(filepath.Join(outside, filename)); !errors.Is(err, os.ErrNotExist) {
@@ -151,6 +155,123 @@ func TestMaterializeRejectsLinkedGitignoreAndContractTargets(t *testing.T) {
 				t.Fatalf("outside target changed: %q, %v", got, err)
 			}
 		})
+	}
+}
+
+func TestMaterializeRejectsInRootLinkedProjectionTargets(t *testing.T) {
+	t.Run("gitignore symlink", func(t *testing.T) {
+		workspace := initRepo(t)
+		dir := filepath.Join(workspace, directory)
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		source := filepath.Join(workspace, "crafted-gitignore")
+		before := []byte(projectionGitignoreContent())
+		if err := os.WriteFile(source, before, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		linkTestFile(t, source, filepath.Join(dir, ".gitignore"))
+		if err := Materialize(context.Background(), workspace, "new canonical"); err == nil {
+			t.Fatal("in-root gitignore symlink unexpectedly initialized projection ownership")
+		}
+		got, err := os.ReadFile(source)
+		if err != nil || string(got) != string(before) {
+			t.Fatalf("crafted gitignore source changed: %q, %v", got, err)
+		}
+		if _, err := os.Stat(Path(workspace)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("projection written through linked gitignore: %v", err)
+		}
+	})
+
+	t.Run("file symlink", func(t *testing.T) {
+		workspace := initRepo(t)
+		dir := filepath.Join(workspace, directory)
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(projectionGitignoreContent()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		targetRel := filepath.ToSlash(filepath.Join(directory, filename))
+		source := filepath.Join(dir, "crafted.md")
+		before := []byte(projectionContent(targetRel, "crafted", "foreign bytes must survive"))
+		if err := os.WriteFile(source, before, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		linkTestFile(t, source, Path(workspace))
+		if err := Materialize(context.Background(), workspace, "new canonical"); err == nil {
+			t.Fatal("in-root file symlink unexpectedly allowed projection")
+		}
+		got, err := os.ReadFile(source)
+		if err != nil || string(got) != string(before) {
+			t.Fatalf("in-root symlink source changed: %q, %v", got, err)
+		}
+	})
+
+	t.Run("contracts directory junction", func(t *testing.T) {
+		workspace := initRepo(t)
+		dir := filepath.Join(workspace, directory)
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(projectionGitignoreContent()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		prURL := "https://github.com/o/r/pull/31"
+		targetRel := testKeyedProjectionRelative(prURL)
+		sourceDir := filepath.Join(workspace, "crafted-contracts")
+		if err := os.Mkdir(sourceDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		source := filepath.Join(sourceDir, filepath.Base(targetRel))
+		before := []byte(projectionContent(targetRel, "crafted", "junction bytes must survive"))
+		if err := os.WriteFile(source, before, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		linkTestDirectory(t, sourceDir, filepath.Join(dir, "contracts"))
+		if err := MaterializePR(context.Background(), workspace, prURL, "new canonical"); err == nil {
+			t.Fatal("in-root contracts junction unexpectedly allowed projection")
+		}
+		got, err := os.ReadFile(source)
+		if err != nil || string(got) != string(before) {
+			t.Fatalf("junction source changed: %q, %v", got, err)
+		}
+	})
+}
+
+func TestOpenVerifiedSubrootRejectsInRootParentReplacementWithoutMutation(t *testing.T) {
+	workspace := initRepo(t)
+	dir := filepath.Join(workspace, directory)
+	if err := os.Mkdir(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	targetRel := filepath.ToSlash(filepath.Join(directory, filename))
+	target := filepath.Join(dir, filename)
+	before := []byte(projectionContent(targetRel, "original", "must remain unchanged"))
+	if err := os.WriteFile(target, before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	expected, err := root.Lstat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realPath := filepath.Join(workspace, ".ao-real")
+	if err := os.Rename(dir, realPath); err != nil {
+		t.Fatal(err)
+	}
+	linkTestDirectoryInRoot(t, workspace, ".ao-real", dir)
+	if child, _, err := openVerifiedSubroot(root, directory, expected); err == nil {
+		_ = child.Close()
+		t.Fatal("in-root parent replacement unexpectedly passed identity validation")
+	}
+	got, err := os.ReadFile(filepath.Join(realPath, filename))
+	if err != nil || string(got) != string(before) {
+		t.Fatalf("renamed .ao-real projection changed: %q, %v", got, err)
 	}
 }
 
@@ -225,6 +346,123 @@ func TestMaterializeForeignGitignoreSkipsProjectionWithoutMutation(t *testing.T)
 	}
 }
 
+func TestMaterializeDoesNotInitializeOwnershipOverForeignTargets(t *testing.T) {
+	prURL := "https://github.com/o/r/pull/7"
+	for _, tc := range []struct {
+		name        string
+		target      func(string) string
+		materialize func(string) error
+	}{
+		{
+			name:   "current projection",
+			target: Path,
+			materialize: func(workspace string) error {
+				return Materialize(context.Background(), workspace, "canonical")
+			},
+		},
+		{
+			name: "keyed projection",
+			target: func(workspace string) string {
+				return testKeyedProjectionPath(workspace, prURL)
+			},
+			materialize: func(workspace string) error {
+				return MaterializePR(context.Background(), workspace, prURL, "canonical")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := initRepo(t)
+			target := tc.target(workspace)
+			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			foreign := []byte("foreign contract bytes\n")
+			if err := os.WriteFile(target, foreign, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.materialize(workspace); err == nil {
+				t.Fatal("foreign target unexpectedly allowed AO projection ownership")
+			}
+			got, err := os.ReadFile(target)
+			if err != nil || string(got) != string(foreign) {
+				t.Fatalf("foreign target changed: %q, %v", got, err)
+			}
+			if _, err := os.Stat(filepath.Join(workspace, directory, ".gitignore")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("projection ownership initialized despite foreign target: %v", err)
+			}
+		})
+	}
+}
+
+func TestMaterializeRefreshesOnlyGenuineAOProjectionsAcrossRestart(t *testing.T) {
+	workspace := initRepo(t)
+	prURL := "https://github.com/o/r/pull/8"
+	if err := MaterializePR(context.Background(), workspace, prURL, "first canonical"); err != nil {
+		t.Fatal(err)
+	}
+	currentPath := Path(workspace)
+	keyedPath := testKeyedProjectionPath(workspace, prURL)
+	for _, target := range []string{currentPath, keyedPath} {
+		got, err := os.ReadFile(target)
+		if err != nil || !strings.Contains(string(got), projectionOwnershipVersion) {
+			t.Fatalf("initial AO projection %s lacks ownership contract: %q, %v", target, got, err)
+		}
+	}
+
+	// A second call has no in-memory ownership state, matching refresh after a
+	// daemon restart. Deterministic ownership markers must allow the refresh.
+	if err := MaterializePR(context.Background(), workspace, prURL, "second canonical"); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{currentPath, keyedPath} {
+		got, err := os.ReadFile(target)
+		if err != nil || !strings.Contains(string(got), "second canonical") || strings.Contains(string(got), "first canonical") {
+			t.Fatalf("AO projection %s was not refreshed: %q, %v", target, got, err)
+		}
+	}
+
+	for _, foreignTarget := range []string{currentPath, keyedPath} {
+		t.Run(filepath.Base(foreignTarget), func(t *testing.T) {
+			beforeCurrent, err := os.ReadFile(currentPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeKeyed, err := os.ReadFile(keyedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foreign := []byte("foreign replacement must survive\n")
+			if err := os.WriteFile(foreignTarget, foreign, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := MaterializePR(context.Background(), workspace, prURL, "third canonical"); err == nil {
+				t.Fatal("foreign replacement unexpectedly accepted as AO-owned")
+			}
+			got, err := os.ReadFile(foreignTarget)
+			if err != nil || string(got) != string(foreign) {
+				t.Fatalf("foreign replacement changed: %q, %v", got, err)
+			}
+			other := currentPath
+			wantOther := beforeCurrent
+			if foreignTarget == currentPath {
+				other, wantOther = keyedPath, beforeKeyed
+			}
+			got, err = os.ReadFile(other)
+			if err != nil || string(got) != string(wantOther) {
+				t.Fatalf("sibling projection partially refreshed: %q, %v", got, err)
+			}
+
+			// Restore the genuine projection for the other table case.
+			if err := os.WriteFile(currentPath, beforeCurrent, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(keyedPath, beforeKeyed, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestMaterializeTrackedAODirectorySkipsProjection(t *testing.T) {
 	workspace := initRepo(t)
 	dir := filepath.Join(workspace, directory)
@@ -247,6 +485,136 @@ func TestMaterializeTrackedAODirectorySkipsProjection(t *testing.T) {
 	got, err := os.ReadFile(owned)
 	if err != nil || string(got) != "repository-owned\n" {
 		t.Fatalf("tracked content changed: %q, %v", got, err)
+	}
+}
+
+func TestMaterializeRejectsCaseFoldedProjectionDirectoryBeforeMutation(t *testing.T) {
+	workspace := initRepo(t)
+	if out, err := exec.Command("git", "-C", workspace, "config", "core.ignorecase", "true").CombinedOutput(); err != nil {
+		t.Fatalf("set core.ignorecase: %v: %s", err, out)
+	}
+	upperDir := filepath.Join(workspace, ".AO")
+	if err := os.Mkdir(upperDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(upperDir, filename)
+	foreign := []byte("tracked uppercase contract must survive\n")
+	if err := os.WriteFile(target, foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", workspace, "add", ".AO/CONTRACT.md").CombinedOutput(); err != nil {
+		t.Fatalf("git add uppercase projection: %v: %s", err, out)
+	}
+	if err := Materialize(context.Background(), workspace, "canonical"); err == nil {
+		t.Fatal("case-folded .AO directory unexpectedly allowed projection")
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != string(foreign) {
+		t.Fatalf("uppercase foreign contract changed: %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(upperDir, ".gitignore")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uppercase directory mutated before rejection: %v", err)
+	}
+}
+
+func TestMaterializePRRejectsCaseFoldedContractsDirectoryBeforeMutation(t *testing.T) {
+	workspace := initRepo(t)
+	dir := filepath.Join(workspace, directory)
+	upperContracts := filepath.Join(dir, "Contracts")
+	if err := os.MkdirAll(upperContracts, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	foreignPath := filepath.Join(upperContracts, "foreign.md")
+	foreign := []byte("capitalized child must survive\n")
+	if err := os.WriteFile(foreignPath, foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := MaterializePR(context.Background(), workspace, "https://github.com/o/r/pull/32", "canonical"); err == nil {
+		t.Fatal("case-folded Contracts directory unexpectedly allowed projection")
+	}
+	got, err := os.ReadFile(foreignPath)
+	if err != nil || string(got) != string(foreign) {
+		t.Fatalf("capitalized contracts content changed: %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".gitignore")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf(".ao mutated before child case-collision rejection: %v", err)
+	}
+}
+
+func TestMaterializeRejectsTrackedMissingProjectionPathWithoutCreatingDirectory(t *testing.T) {
+	workspace := initRepo(t)
+	dir := filepath.Join(workspace, directory)
+	if err := os.Mkdir(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	owned := filepath.Join(dir, "sparse-owned.txt")
+	if err := os.WriteFile(owned, []byte("tracked\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", workspace, "add", ".ao/sparse-owned.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add sparse path: %v: %s", err, out)
+	}
+	if err := os.Remove(owned); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := Materialize(context.Background(), workspace, "canonical"); err == nil {
+		t.Fatal("missing tracked .ao path unexpectedly allowed projection")
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tracked missing .ao directory was recreated: %v", err)
+	}
+}
+
+func TestConcurrentMaterializePRWritesCompleteSerializedProjections(t *testing.T) {
+	workspace := initRepo(t)
+	type input struct {
+		pr       string
+		contract string
+	}
+	inputs := []input{
+		{"https://github.com/o/r/pull/40", "contract-A-" + strings.Repeat("A", 128*1024)},
+		{"https://github.com/o/r/pull/41", "contract-B-" + strings.Repeat("B", 128*1024)},
+	}
+	start := make(chan struct{})
+	errs := make(chan error, len(inputs))
+	var wg sync.WaitGroup
+	for _, in := range inputs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- MaterializePR(context.Background(), workspace, in.pr, in.contract)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent materialize: %v", err)
+		}
+	}
+
+	currentRel := filepath.ToSlash(filepath.Join(directory, filename))
+	current, err := os.ReadFile(Path(workspace))
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentA := projectionContent(currentRel, "Pull request: "+inputs[0].pr, inputs[0].contract)
+	currentB := projectionContent(currentRel, "Pull request: "+inputs[1].pr, inputs[1].contract)
+	if string(current) != currentA && string(current) != currentB {
+		t.Fatalf("current projection is mixed or partial: %d bytes", len(current))
+	}
+	for _, in := range inputs {
+		rel := testKeyedProjectionRelative(in.pr)
+		got, err := os.ReadFile(filepath.Join(workspace, filepath.FromSlash(rel)))
+		want := projectionContent(rel, "Pull request: "+in.pr, in.contract)
+		if err != nil || string(got) != want {
+			t.Fatalf("keyed projection %s is mixed or partial: %d/%d bytes, %v", in.pr, len(got), len(want), err)
+		}
 	}
 }
 
@@ -320,6 +688,15 @@ func initRepo(t *testing.T) string {
 	return dir
 }
 
+func testKeyedProjectionPath(workspace, prURL string) string {
+	return filepath.Join(workspace, filepath.FromSlash(testKeyedProjectionRelative(prURL)))
+}
+
+func testKeyedProjectionRelative(prURL string) string {
+	sum := sha256.Sum256([]byte(prURL))
+	return filepath.ToSlash(filepath.Join(directory, "contracts", fmt.Sprintf("%x.md", sum[:])))
+}
+
 func linkTestDirectory(t *testing.T, target, link string) {
 	t.Helper()
 	if err := os.Symlink(target, link); err == nil {
@@ -330,6 +707,35 @@ func linkTestDirectory(t *testing.T, target, link string) {
 		cmd := exec.Command("cmd", "/c", "mklink", "/J", link, target)
 		if out, junctionErr := cmd.CombinedOutput(); junctionErr != nil {
 			t.Skipf("creating symlink or junction: symlink: %v; junction: %v: %s", err, junctionErr, out)
+		}
+	}
+}
+
+func linkTestDirectoryInRoot(t *testing.T, workspace, relativeTarget, link string) {
+	t.Helper()
+	if err := os.Symlink(relativeTarget, link); err == nil {
+		return
+	} else if runtime.GOOS != "windows" {
+		t.Skipf("creating in-root directory symlink: %v", err)
+	} else {
+		target := filepath.Join(workspace, relativeTarget)
+		cmd := exec.Command("cmd", "/c", "mklink", "/J", link, target)
+		if out, junctionErr := cmd.CombinedOutput(); junctionErr != nil {
+			t.Skipf("creating in-root symlink or junction: symlink: %v; junction: %v: %s", err, junctionErr, out)
+		}
+	}
+}
+
+func linkTestFile(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err == nil {
+		return
+	} else if runtime.GOOS != "windows" {
+		t.Skipf("creating file symlink: %v", err)
+	} else {
+		cmd := exec.Command("cmd", "/c", "mklink", link, target)
+		if out, linkErr := cmd.CombinedOutput(); linkErr != nil {
+			t.Skipf("creating file symlink: symlink: %v; mklink: %v: %s", err, linkErr, out)
 		}
 	}
 }

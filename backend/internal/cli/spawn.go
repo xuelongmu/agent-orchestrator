@@ -21,7 +21,10 @@ import (
 
 // maxDisplayNameLen caps the sidebar label set by `--name`. Mirrored by the
 // daemon's spawn handler so a direct API call is held to the same limit.
-const maxDisplayNameLen = 20
+const (
+	maxDisplayNameLen = 20
+	maxPromptLen      = 4096
+)
 
 type spawnOptions struct {
 	project        string
@@ -80,6 +83,9 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			}
 			if opts.noTakeover && opts.claimPR == "" {
 				return usageError{fmt.Errorf("--no-takeover requires --claim-pr")}
+			}
+			if opts.claimPR != "" && len(opts.prompt) > maxPromptLen {
+				return usageError{fmt.Errorf("--prompt must be %d UTF-8 bytes or fewer with --claim-pr", maxPromptLen)}
 			}
 			if explicitName := strings.TrimSpace(opts.name); utf8.RuneCountInString(explicitName) > maxDisplayNameLen {
 				return usageError{fmt.Errorf("--name must be %d characters or fewer", maxDisplayNameLen)}

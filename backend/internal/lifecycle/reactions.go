@@ -401,10 +401,6 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 	if !o.Fetched {
 		return nil
 	}
-	ready, err := m.ensurePRDesignContractDelivered(ctx, id, o.URL)
-	if err != nil || !ready {
-		return err
-	}
 	// A PR reaching a terminal state (merged or closed) no longer ends the
 	// session on its own: a session may own several PRs. Terminate only when no
 	// open PR remains and at least one of them merged. The observer persists the
@@ -419,6 +415,10 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 			return m.cleanupMergedSession(ctx, id, o.URL)
 		}
 		return nil
+	}
+	ready, err := m.ensurePRDesignContractDelivered(ctx, id, o.URL)
+	if err != nil || !ready {
+		return err
 	}
 	// A provider-confirmed recovery ends the current conflict episode. Clear its
 	// durable one-shot so the same head can be dispatched again if a later base
@@ -1616,12 +1616,25 @@ func (m *Manager) ensurePRDesignContractDelivered(ctx context.Context, id domain
 	if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, delivery.Contract); err != nil {
 		slog.Debug("claim barrier: design contract projection skipped", "sessionId", id, "prURL", prURL, "error", err)
 	}
-	if m.guard == nil {
+	m.mu.Lock()
+	sender := m.automatedSender
+	m.mu.Unlock()
+	if sender == nil {
 		return false, nil
 	}
 	message := domain.SanitizeControlChars(designcontract.ClaimReadyMessage(prURL, delivery.Contract, delivery.TaskPrompt))
-	outcome, err := m.guard.DeliverAutomated(ctx, id, message)
-	if err != nil || outcome != sessionguard.Sent {
+	if err := sender.SendAutomated(ctx, id, message); err != nil {
+		latest, exists, readErr := m.store.GetSession(ctx, id)
+		if readErr != nil {
+			return false, readErr
+		}
+		// Unsafe pane states are expected suppression/retry conditions, not
+		// observer failures. The confirmed sender may also have just persisted
+		// PendingSubmitFingerprint after detecting an unsubmitted large draft.
+		// In every case leave the durable claim barrier pending for a safe poll.
+		if !exists || latest.IsTerminated || latest.Activity.State.PausesAutomation() || latest.Metadata.PendingSubmitFingerprint != "" {
+			return false, nil
+		}
 		return false, err
 	}
 	completed, err := store.CompletePRDesignContractDelivery(ctx, id, prURL, delivery.Token, delivery.Revision)

@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +40,50 @@ func TestPRDesignContractSurvivesTerminationAndReplacementWithoutWorkspaceState(
 	got, ok, err := s.GetPRDesignContract(ctx, "https://github.com/acme/repo/pull/1")
 	if err != nil || !ok || got != want {
 		t.Fatalf("durable contract after replacement = ok=%v bytes=%d err=%v", ok, len(got), err)
+	}
+}
+
+func TestOwnedPRDesignContractReadFencesTakeoverAndPreservesInheritance(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	owner := createContractSession(t, s, "mer")
+	replacement := createContractSession(t, s, "mer")
+	prURL := "https://github.com/acme/repo/pull/19"
+	want := designcontract.BuildSeed("61", "## Invariants\n- Ownership is checked with the canonical read.")
+	if err := s.SaveSessionDesignContractSeed(ctx, owner.ID, want, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	claimContractPR(t, s, owner.ID, prURL, 19)
+	if got, found, err := s.GetOwnedPRDesignContract(ctx, owner.ID, prURL); err != nil || !found || got != want {
+		t.Fatalf("owner read = %q found=%v err=%v", got, found, err)
+	}
+	claimContractPR(t, s, replacement.ID, prURL, 19)
+	if _, _, err := s.GetOwnedPRDesignContract(ctx, owner.ID, prURL); !errors.Is(err, designcontract.ErrPRNotOwned) {
+		t.Fatalf("predecessor read after takeover error = %v, want ErrPRNotOwned", err)
+	}
+	if got, found, err := s.GetOwnedPRDesignContract(ctx, replacement.ID, prURL); err != nil || !found || got != want {
+		t.Fatalf("replacement inherited read = %q found=%v err=%v", got, found, err)
+	}
+}
+
+func TestAddPRDesignContractInvariantReturnsStableOwnershipAndCapacityErrors(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	owner := createContractSession(t, s, "mer")
+	other := createContractSession(t, s, "mer")
+	prURL := "https://github.com/acme/repo/pull/21"
+	seed := strings.Repeat("x", designcontract.MaxCanonicalBytes-80)
+	if err := s.SaveSessionDesignContractSeed(ctx, owner.ID, seed, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	claimContractPR(t, s, owner.ID, prURL, 21)
+	if _, err := s.AddPRDesignContractInvariant(ctx, other.ID, prURL, "Every append rechecks exact ownership.", time.Now().UTC()); !errors.Is(err, designcontract.ErrPRNotOwned) {
+		t.Fatalf("ownership mismatch error = %v, want ErrPRNotOwned", err)
+	}
+	if _, err := s.AddPRDesignContractInvariant(ctx, owner.ID, prURL, strings.Repeat("i", 128), time.Now().UTC()); !errors.Is(err, designcontract.ErrContractCapacityExceeded) {
+		t.Fatalf("capacity error = %v, want ErrContractCapacityExceeded", err)
 	}
 }
 

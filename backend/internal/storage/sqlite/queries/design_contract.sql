@@ -17,6 +17,14 @@ ON CONFLICT (pr_url) DO NOTHING;
 -- name: GetPRDesignContract :one
 SELECT markdown FROM pr_design_contract WHERE pr_url = ?;
 
+-- name: GetOwnedPRDesignContract :one
+SELECT COALESCE(pr_design_contract.markdown, '') AS markdown,
+       pr_design_contract.pr_url IS NOT NULL AS contract_exists
+FROM pr
+LEFT JOIN pr_design_contract ON pr_design_contract.pr_url = pr.url
+WHERE pr.url = sqlc.arg(pr_url)
+  AND pr.session_id = sqlc.arg(session_id);
+
 -- name: AppendPRDesignContractInvariant :execrows
 UPDATE pr_design_contract
 SET markdown = markdown || sqlc.arg(addition),

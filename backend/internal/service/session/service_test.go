@@ -42,6 +42,8 @@ type fakeStore struct {
 	pendingContractTask     map[string]string
 	pendingContractToken    map[string]string
 	pendingContractRevision map[string]int64
+	afterListOwnedPRs       func(domain.SessionID)
+	contractWriteErr        error
 	num                     int
 }
 
@@ -177,7 +179,12 @@ func (f *fakeStore) GetDisplayPRFactsForSession(_ context.Context, id domain.Ses
 
 func (f *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]domain.PullRequest, error) {
 	if prs, ok := f.ownedPRs[id]; ok {
-		return append([]domain.PullRequest(nil), prs...), nil
+		result := append([]domain.PullRequest(nil), prs...)
+		if hook := f.afterListOwnedPRs; hook != nil {
+			f.afterListOwnedPRs = nil
+			hook(id)
+		}
+		return result, nil
 	}
 	pr, ok := f.pr[id]
 	if !ok {
@@ -187,6 +194,9 @@ func (f *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]
 }
 
 func (f *fakeStore) AddPRDesignContractInvariant(_ context.Context, sessionID domain.SessionID, prURL, invariant string, _ time.Time) (string, error) {
+	if f.contractWriteErr != nil {
+		return "", f.contractWriteErr
+	}
 	owned := false
 	for _, pr := range f.ownedPRs[sessionID] {
 		if pr.URL == prURL {
@@ -195,14 +205,24 @@ func (f *fakeStore) AddPRDesignContractInvariant(_ context.Context, sessionID do
 		}
 	}
 	if !owned {
-		return "", fmt.Errorf("PR %s is not owned by session %s", prURL, sessionID)
+		return "", fmt.Errorf("%w: PR %s is not owned by session %s", designcontract.ErrPRNotOwned, prURL, sessionID)
 	}
 	f.contractWrites = append(f.contractWrites, contractWrite{sessionID: sessionID, prURL: prURL, invariant: invariant})
 	f.contracts[prURL] = designcontract.AppendInvariant(f.contracts[prURL], invariant)
 	return f.contracts[prURL], nil
 }
 
-func (f *fakeStore) GetPRDesignContract(_ context.Context, prURL string) (string, bool, error) {
+func (f *fakeStore) GetOwnedPRDesignContract(_ context.Context, sessionID domain.SessionID, prURL string) (string, bool, error) {
+	owned := false
+	for _, pr := range f.ownedPRs[sessionID] {
+		if pr.URL == prURL {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		return "", false, fmt.Errorf("%w: %s", designcontract.ErrPRNotOwned, prURL)
+	}
 	contract, ok := f.contracts[prURL]
 	return contract, ok, nil
 }
@@ -360,6 +380,59 @@ func TestGetDesignContractReturnsFullProviderNeutralOwnedContract(t *testing.T) 
 	}
 	if _, err := svc.GetDesignContract(context.Background(), "mer-1", "9"); err == nil {
 		t.Fatal("unowned PR contract read succeeded")
+	}
+}
+
+func TestGetDesignContractFencesConcurrentTakeoverAtAtomicRead(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1"}
+	st.sessions["mer-2"] = domain.SessionRecord{ID: "mer-2"}
+	prURL := "https://gitlab.example.com/a/r/-/merge_requests/9"
+	pr := domain.PullRequest{URL: prURL, SessionID: "mer-1", Number: 9}
+	st.ownedPRs["mer-1"] = []domain.PullRequest{pr}
+	st.contracts[prURL] = "canonical inherited bytes"
+	st.afterListOwnedPRs = func(domain.SessionID) {
+		delete(st.ownedPRs, "mer-1")
+		pr.SessionID = "mer-2"
+		st.ownedPRs["mer-2"] = []domain.PullRequest{pr}
+	}
+	svc := NewWithDeps(Deps{Store: st})
+	if _, err := svc.GetDesignContract(context.Background(), "mer-1", "9"); err == nil {
+		t.Fatal("predecessor read contract after concurrent takeover")
+	} else {
+		var apiError *apierr.Error
+		if !errors.As(err, &apiError) || apiError.Code != "PR_NOT_OWNED" {
+			t.Fatalf("predecessor error = %#v, want PR_NOT_OWNED", err)
+		}
+	}
+	got, err := svc.GetDesignContract(context.Background(), "mer-2", "9")
+	if err != nil || got != "canonical inherited bytes" {
+		t.Fatalf("replacement inherited read = %q, %v", got, err)
+	}
+}
+
+func TestAddDesignContractInvariantMapsFinalOwnershipAndCapacityErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		code string
+		kind apierr.Kind
+	}{
+		{"ownership changed", designcontract.ErrPRNotOwned, "PR_NOT_OWNED", apierr.KindNotFound},
+		{"capacity", designcontract.ErrContractCapacityExceeded, "CONTRACT_CAPACITY_EXCEEDED", apierr.KindConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1"}
+			prURL := "https://github.com/a/r/pull/9"
+			st.ownedPRs["mer-1"] = []domain.PullRequest{{URL: prURL, SessionID: "mer-1", Number: 9}}
+			st.contractWriteErr = tc.err
+			_, err := NewWithDeps(Deps{Store: st}).AddDesignContractInvariant(context.Background(), "mer-1", "9", "Every append rechecks ownership and capacity.")
+			var apiError *apierr.Error
+			if !errors.As(err, &apiError) || apiError.Code != tc.code || apiError.Kind != tc.kind {
+				t.Fatalf("error = %#v, want %s kind %v", err, tc.code, tc.kind)
+			}
+		})
 	}
 }
 
@@ -1306,6 +1379,14 @@ func TestClaimPRUsesAndPersistsSessionPrivateBranch(t *testing.T) {
 	}
 	if checkoutBranch != "ao/claim/mer-1/pr-7/root" || persistedBranch != checkoutBranch {
 		t.Fatalf("checkout branch = %q, persisted branch = %q", checkoutBranch, persistedBranch)
+	}
+}
+
+func TestClaimPRRejectsOversizedTaskPromptBeforeStoreAccess(t *testing.T) {
+	svc := NewWithDeps(Deps{Store: newFakeStore()})
+	_, err := svc.ClaimPR(context.Background(), "missing", "7", ClaimPROptions{TaskPrompt: strings.Repeat("é", MaxClaimTaskPromptBytes/2+1)})
+	if !errors.Is(err, ErrClaimTaskPromptTooLong) {
+		t.Fatalf("ClaimPR error = %v, want ErrClaimTaskPromptTooLong", err)
 	}
 }
 

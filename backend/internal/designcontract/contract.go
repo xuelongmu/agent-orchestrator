@@ -5,10 +5,10 @@ package designcontract
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +29,19 @@ const (
 	// MaxCanonicalBytes is the explicit SQLite contract capacity.
 	MaxCanonicalBytes = 1024 * 1024
 	maxInvariantBytes = 512
+	// projectionOwnershipVersion is embedded in every AO-owned projection.
+	// Together with the target-bound digest and exact structural prefix, it
+	// lets a later daemon refresh only files created by this projection writer.
+	projectionOwnershipVersion = "ao-design-contract-projection/v1"
+)
+
+var (
+	// ErrPRNotOwned means the requested PR is not currently owned by the
+	// session at the final canonical store boundary.
+	ErrPRNotOwned = errors.New("PR is not owned by session")
+	// ErrContractCapacityExceeded means an append would exceed the canonical
+	// one-MiB UTF-8 byte limit.
+	ErrContractCapacityExceeded = errors.New("canonical design contract capacity exceeded")
 )
 
 // NormalizeInvariant validates one explicit agent-authored invariant proposal.
@@ -210,6 +223,7 @@ type PendingDelivery struct {
 }
 
 var deliveryLocks sync.Map
+var projectionLocks sync.Map
 
 // LockDelivery serializes ownership claims and claim-ready pane delivery for
 // one exact PR inside the daemon. Callers still compare the durable generation
@@ -240,46 +254,210 @@ func materialize(ctx context.Context, workspace, scope, prURL, contract string) 
 	if strings.TrimSpace(workspace) == "" {
 		return nil
 	}
+	unlockProjection := lockProjectionWorkspace(workspace)
+	defer unlockProjection()
+	// Index inspection must precede even creation of .ao: a sparse or missing
+	// tracked path is repository-owned despite having no current directory
+	// entry to inspect.
+	if err := rejectTrackedProjectionDirectory(ctx, workspace); err != nil {
+		return err
+	}
 	root, err := os.OpenRoot(workspace)
 	if err != nil {
 		return fmt.Errorf("open design contract workspace root: %w", err)
 	}
 	defer func() { _ = root.Close() }()
-	if err := root.Mkdir(directory, 0o750); err != nil && !errors.Is(err, os.ErrExist) {
-		return fmt.Errorf("create design contract directory: %w", err)
-	}
-	if info, err := root.Lstat(directory); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("design contract directory is not a confined regular directory")
-	}
-	if err := rejectTrackedProjectionDirectory(ctx, workspace); err != nil {
+	if err := rejectCaseFoldedProjectionDirectory(root); err != nil {
 		return err
 	}
-	if err := ensureProjectionGitignore(root); err != nil {
-		return fmt.Errorf("ignore design contract projection: %w", err)
-	}
-	currentPath := filepath.ToSlash(filepath.Join(directory, filename))
-	if err := verifyIgnored(ctx, workspace, currentPath); err != nil {
-		return err
-	}
-	content := "# AO Design Contract Projection\n\nScope: " + domain.SanitizeControlChars(scope) + "\n\nWARNING: This projection applies only to the scope above. Do not apply it to a sibling PR, and do not edit it directly.\n\n" + forProjection(contract) + "\n"
-	if prURL != "" {
-		contractsDir := filepath.ToSlash(filepath.Join(directory, "contracts"))
-		if err := root.Mkdir(contractsDir, 0o750); err != nil && !errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("create per-PR contract directory: %w", err)
+	var aoPathInfo os.FileInfo
+	if info, err := root.Lstat(directory); errors.Is(err, os.ErrNotExist) {
+		if err := root.Mkdir(directory, 0o750); err != nil {
+			return fmt.Errorf("create design contract directory: %w", err)
 		}
-		if info, err := root.Lstat(contractsDir); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		aoPathInfo, err = root.Lstat(directory)
+		if err != nil {
+			return fmt.Errorf("inspect created design contract directory: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("inspect design contract directory: %w", err)
+	} else if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("design contract directory is not a confined regular directory")
+	} else {
+		aoPathInfo = info
+	}
+	aoRoot, aoIdentity, err := openVerifiedSubroot(root, directory, aoPathInfo)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = aoRoot.Close() }()
+	currentPath := filepath.ToSlash(filepath.Join(directory, filename))
+	targets := []projectionTarget{{path: filename, ownershipPath: currentPath}}
+	var contractsPathInfo os.FileInfo
+	var contractsRelative, perPRRelative string
+	if prURL != "" {
+		if err := rejectCaseFoldedContractsDirectory(aoRoot); err != nil {
+			return err
+		}
+		contractsRelative = "contracts"
+		if info, err := aoRoot.Lstat(contractsRelative); err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
 			return errors.New("per-PR contract directory is not a confined regular directory")
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect per-PR contract directory: %w", err)
+		} else if err == nil {
+			contractsPathInfo = info
 		}
 		sum := sha256.Sum256([]byte(prURL))
-		perPRRelative := filepath.ToSlash(filepath.Join(contractsDir, fmt.Sprintf("%x.md", sum[:])))
-		if err := verifyIgnored(ctx, workspace, perPRRelative); err != nil {
+		perPRRelative = filepath.ToSlash(filepath.Join(directory, contractsRelative, fmt.Sprintf("%x.md", sum[:])))
+		targets = append([]projectionTarget{{path: filepath.ToSlash(filepath.Join(contractsRelative, filepath.Base(perPRRelative))), ownershipPath: perPRRelative}}, targets...)
+	}
+	initialized, err := preflightProjectionOwnership(aoRoot, targets)
+	if err != nil {
+		return err
+	}
+	if err := ensureSubrootStillBound(root, directory, aoIdentity); err != nil {
+		return err
+	}
+	if err := ensureProjectionGitignore(aoRoot, initialized); err != nil {
+		return fmt.Errorf("ignore design contract projection: %w", err)
+	}
+	var contractsRoot *os.Root
+	var contractsIdentity os.FileInfo
+	if prURL != "" {
+		if contractsPathInfo == nil {
+			if err := ensureSubrootStillBound(root, directory, aoIdentity); err != nil {
+				return err
+			}
+			if err := aoRoot.Mkdir(contractsRelative, 0o750); err != nil {
+				return fmt.Errorf("create per-PR contract directory: %w", err)
+			}
+			contractsPathInfo, err = aoRoot.Lstat(contractsRelative)
+			if err != nil {
+				return fmt.Errorf("inspect created per-PR contract directory: %w", err)
+			}
+		}
+		contractsRoot, contractsIdentity, err = openVerifiedSubroot(aoRoot, contractsRelative, contractsPathInfo)
+		if err != nil {
 			return err
 		}
-		if err := writeProjection(root, contractsDir, perPRRelative, content); err != nil {
+		defer func() { _ = contractsRoot.Close() }()
+	}
+	for _, target := range targets {
+		if err := verifyIgnored(ctx, workspace, target.ownershipPath); err != nil {
 			return err
 		}
 	}
-	return writeProjection(root, directory, filepath.ToSlash(filepath.Join(directory, filename)), content)
+	if prURL != "" {
+		if err := ensureSubrootStillBound(root, directory, aoIdentity); err != nil {
+			return err
+		}
+		if err := ensureSubrootStillBound(aoRoot, contractsRelative, contractsIdentity); err != nil {
+			return err
+		}
+		content := projectionContent(perPRRelative, scope, contract)
+		if err := writeProjection(contractsRoot, filepath.Base(perPRRelative), perPRRelative, content); err != nil {
+			return err
+		}
+	}
+	if err := ensureSubrootStillBound(root, directory, aoIdentity); err != nil {
+		return err
+	}
+	content := projectionContent(currentPath, scope, contract)
+	return writeProjection(aoRoot, filename, currentPath, content)
+}
+
+func lockProjectionWorkspace(workspace string) func() {
+	key, err := filepath.Abs(workspace)
+	if err != nil {
+		key = workspace
+	}
+	// Case-folding is deliberately platform-independent: over-serialization on
+	// a case-sensitive filesystem is harmless, while aliases on Windows/APFS
+	// must share one projection writer.
+	key = strings.ToLower(filepath.Clean(key))
+	value, _ := projectionLocks.LoadOrStore(key, &sync.Mutex{})
+	lock, ok := value.(*sync.Mutex)
+	if !ok {
+		panic("design contract projection lock has unexpected type")
+	}
+	lock.Lock()
+	return lock.Unlock
+}
+
+func rejectCaseFoldedProjectionDirectory(root *os.Root) error {
+	return rejectCaseFoldedEntry(root, ".", directory)
+}
+
+func rejectCaseFoldedContractsDirectory(root *os.Root) error {
+	return rejectCaseFoldedEntry(root, ".", "contracts")
+}
+
+func rejectCaseFoldedEntry(root *os.Root, parent, intended string) error {
+	dir, err := root.Open(parent)
+	if err != nil {
+		return fmt.Errorf("open %s for design contract case-collision inspection: %w", parent, err)
+	}
+	entries, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil {
+		return fmt.Errorf("inspect %s entries for design contract projection: %w", parent, readErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close %s after design contract inspection: %w", parent, closeErr)
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(entry.Name(), intended) && entry.Name() != intended {
+			return fmt.Errorf("case-folded entry %q in %s conflicts with AO projection entry %q", entry.Name(), parent, intended)
+		}
+	}
+	return nil
+}
+
+type projectionTarget struct {
+	path          string
+	ownershipPath string
+}
+
+func openVerifiedSubroot(parent *os.Root, name string, expected os.FileInfo) (*os.Root, os.FileInfo, error) {
+	if expected == nil || !expected.IsDir() || expected.Mode()&os.ModeSymlink != 0 {
+		return nil, nil, fmt.Errorf("projection directory %s is not an unlinked directory", name)
+	}
+	child, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open projection subroot %s: %w", name, err)
+	}
+	dir, err := child.Open(".")
+	if err != nil {
+		_ = child.Close()
+		return nil, nil, fmt.Errorf("open projection subroot handle %s: %w", name, err)
+	}
+	handleInfo, statErr := dir.Stat()
+	closeErr := dir.Close()
+	if statErr != nil {
+		_ = child.Close()
+		return nil, nil, fmt.Errorf("inspect projection subroot handle %s: %w", name, statErr)
+	}
+	if closeErr != nil {
+		_ = child.Close()
+		return nil, nil, fmt.Errorf("close projection subroot handle %s: %w", name, closeErr)
+	}
+	current, err := parent.Lstat(name)
+	if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() || !os.SameFile(expected, handleInfo) || !os.SameFile(current, handleInfo) {
+		_ = child.Close()
+		return nil, nil, fmt.Errorf("projection directory %s changed during subroot validation", name)
+	}
+	return child, handleInfo, nil
+}
+
+func ensureSubrootStillBound(parent *os.Root, name string, identity os.FileInfo) error {
+	current, err := parent.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("revalidate projection directory %s: %w", name, err)
+	}
+	if current.Mode()&os.ModeSymlink != 0 || !current.IsDir() || !os.SameFile(current, identity) {
+		return fmt.Errorf("projection directory %s changed before write", name)
+	}
+	return nil
 }
 
 func rejectTrackedProjectionDirectory(ctx context.Context, workspace string) error {
@@ -293,17 +471,64 @@ func rejectTrackedProjectionDirectory(ctx context.Context, workspace string) err
 	return nil
 }
 
-func ensureProjectionGitignore(root *os.Root) error {
-	path := filepath.ToSlash(filepath.Join(directory, ".gitignore"))
-	existing, err := root.ReadFile(path)
-	if err == nil && !strings.Contains(string(existing), hookutil.GitignoreSentinel) {
-		return errors.New("foreign .ao/.gitignore prevents safe projection")
+func projectionGitignoreContent() string {
+	return hookutil.GitignoreSentinel + "\n/.gitignore\n/CONTRACT.md\n/.CONTRACT-*.tmp\n/contracts/\n"
+}
+
+// preflightProjectionOwnership checks every target before creating AO's child
+// .gitignore or writing any projection. A pre-existing target cannot become
+// AO-owned merely because AO later creates its sentinel. Once initialized,
+// every existing target must satisfy the deterministic AO content contract.
+func preflightProjectionOwnership(root *os.Root, targets []projectionTarget) (bool, error) {
+	existing, initialized, err := readUnlinkedRegularFile(root, ".gitignore")
+	if err != nil {
+		return false, fmt.Errorf("read design contract projection ownership: %w", err)
 	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if initialized && string(existing) != projectionGitignoreContent() {
+		return false, errors.New("foreign .ao/.gitignore prevents safe projection")
+	}
+	for _, target := range targets {
+		exists, owned, err := inspectProjectionTarget(root, target.path, target.ownershipPath)
+		if err != nil {
+			return false, err
+		}
+		if !exists {
+			continue
+		}
+		if !initialized {
+			return false, fmt.Errorf("existing design contract target %s prevents projection ownership initialization", target.path)
+		}
+		if !owned {
+			return false, fmt.Errorf("existing design contract target %s is not AO-owned", target.path)
+		}
+	}
+	return initialized, nil
+}
+
+func ensureProjectionGitignore(root *os.Root, initialized bool) error {
+	if initialized {
+		return nil
+	}
+	path := ".gitignore"
+	f, err := root.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		return err
 	}
-	content := hookutil.GitignoreSentinel + "\n/.gitignore\n/CONTRACT.md\n/contracts/\n"
-	return writeProjection(root, directory, path, content)
+	pathInfo, lstatErr := root.Lstat(path)
+	info, statErr := f.Stat()
+	if lstatErr != nil || statErr != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() || !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
+		_ = f.Close()
+		return errors.New("design contract gitignore changed before ownership initialization")
+	}
+	if _, err := f.WriteString(projectionGitignoreContent()); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func verifyIgnored(ctx context.Context, workspace, relative string) error {
@@ -313,41 +538,132 @@ func verifyIgnored(ctx context.Context, workspace, relative string) error {
 	return nil
 }
 
-func writeProjection(root *os.Root, parent, target, content string) error {
-	if info, err := root.Lstat(target); err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()) {
-		return errors.New("design contract target is not a regular file")
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect design contract target: %w", err)
+func projectionOwnershipMarker(target string) string {
+	sum := sha256.Sum256([]byte(projectionOwnershipVersion + "\x00" + filepath.ToSlash(target)))
+	return fmt.Sprintf("<!-- %s target-sha256=%x -->\n", projectionOwnershipVersion, sum[:])
+}
+
+func projectionContent(target, scope, contract string) string {
+	return projectionOwnershipMarker(target) + "# AO Design Contract Projection\n\nScope: " + domain.SanitizeControlChars(scope) + "\n\nWARNING: This projection applies only to the scope above. Do not apply it to a sibling PR, and do not edit it directly.\n\n" + forProjection(contract) + "\n"
+}
+
+func readUnlinkedRegularFile(root *os.Root, target string) ([]byte, bool, error) {
+	pathInfo, err := root.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
 	}
-	random := make([]byte, 12)
-	if _, err := rand.Read(random); err != nil {
-		return fmt.Errorf("name design contract projection: %w", err)
-	}
-	tmpName := filepath.ToSlash(filepath.Join(parent, fmt.Sprintf(".CONTRACT-%x.tmp", random)))
-	tmp, err := root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return fmt.Errorf("create design contract projection: %w", err)
+		return nil, false, fmt.Errorf("inspect file %s: %w", target, err)
 	}
-	complete := false
-	defer func() {
-		if !complete {
-			_ = root.Remove(tmpName)
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+		return nil, true, fmt.Errorf("file %s is not an unlinked regular file", target)
+	}
+	f, err := root.OpenFile(target, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, true, fmt.Errorf("open file %s: %w", target, err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, true, fmt.Errorf("inspect opened file %s: %w", target, err)
+	}
+	if !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
+		return nil, true, fmt.Errorf("file %s changed during identity validation", target)
+	}
+	content, err := io.ReadAll(io.LimitReader(f, MaxCanonicalBytes+64*1024))
+	if err != nil {
+		return nil, true, fmt.Errorf("read file %s: %w", target, err)
+	}
+	return content, true, nil
+
+}
+
+func inspectProjectionTarget(root *os.Root, target, ownershipTarget string) (exists, owned bool, err error) {
+	content, exists, err := readUnlinkedRegularFile(root, target)
+	if err != nil {
+		return exists, false, err
+	}
+	return exists, exists && isOwnedProjection(ownershipTarget, content), nil
+}
+
+func isOwnedProjection(target string, content []byte) bool {
+	prefix := projectionOwnershipMarker(target) + "# AO Design Contract Projection\n\nScope: "
+	return strings.HasPrefix(string(content), prefix) && strings.Contains(string(content), "\n\nWARNING: This projection applies only to the scope above. Do not apply it to a sibling PR, and do not edit it directly.\n\n"+trustBoundary)
+}
+
+// writeProjection opens a new target exclusively or refreshes an existing
+// AO-owned target through the verified file handle. It never performs a
+// check-then-rename replacement that could clobber a foreign file swapped into
+// the pathname between ownership validation and the write.
+func writeProjection(root *os.Root, target, ownershipTarget, content string) error {
+	f, err := root.OpenFile(target, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("create design contract projection: %w", err)
 		}
-	}()
-	if _, err := tmp.WriteString(content); err != nil {
-		_ = tmp.Close()
+		pathInfo, lstatErr := root.Lstat(target)
+		if lstatErr != nil {
+			return fmt.Errorf("inspect design contract projection: %w", lstatErr)
+		}
+		if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+			return errors.New("design contract target is not an unlinked regular file")
+		}
+		f, err = root.OpenFile(target, os.O_RDWR, 0)
+		if err != nil {
+			return fmt.Errorf("open design contract projection: %w", err)
+		}
+		info, statErr := f.Stat()
+		if statErr != nil {
+			_ = f.Close()
+			return fmt.Errorf("inspect design contract projection: %w", statErr)
+		}
+		if !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
+			_ = f.Close()
+			return errors.New("design contract target changed during ownership validation")
+		}
+		existing, readErr := io.ReadAll(io.LimitReader(f, MaxCanonicalBytes+64*1024))
+		if readErr != nil {
+			_ = f.Close()
+			return fmt.Errorf("read design contract projection: %w", readErr)
+		}
+		if !isOwnedProjection(ownershipTarget, existing) {
+			_ = f.Close()
+			return errors.New("design contract target is not AO-owned")
+		}
+		if err := f.Truncate(0); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("truncate design contract projection: %w", err)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("rewind design contract projection: %w", err)
+		}
+	} else {
+		pathInfo, lstatErr := root.Lstat(target)
+		if lstatErr != nil {
+			_ = f.Close()
+			return fmt.Errorf("inspect new design contract projection: %w", lstatErr)
+		}
+		info, statErr := f.Stat()
+		if statErr != nil {
+			_ = f.Close()
+			return fmt.Errorf("inspect new design contract projection handle: %w", statErr)
+		}
+		if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() || !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
+			_ = f.Close()
+			return errors.New("new design contract target changed before write")
+		}
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("write design contract projection: %w", err)
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("sync design contract projection: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
+	if err := f.Close(); err != nil {
 		return fmt.Errorf("close design contract projection: %w", err)
 	}
-	if err := root.Rename(tmpName, target); err != nil {
-		return fmt.Errorf("replace design contract projection: %w", err)
-	}
-	complete = true
 	return nil
 }

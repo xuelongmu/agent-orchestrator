@@ -1097,6 +1097,9 @@ func TestSessionsAPI_GetDesignContract(t *testing.T) {
 	}
 	body, status, _ = doRequest(t, srv, "GET", "/api/v1/sessions/ao-1/design-contract", "")
 	assertErrorCode(t, body, status, http.StatusBadRequest, "PR_REQUIRED")
+	svc.contractErr = apierr.NotFound("PR_NOT_OWNED", "not owned")
+	body, status, _ = doRequest(t, srv, "GET", "/api/v1/sessions/ao-1/design-contract?pr=17", "")
+	assertErrorCode(t, body, status, http.StatusNotFound, "PR_NOT_OWNED")
 }
 
 func TestSessionsAPI_AddDesignContractInvariantErrors(t *testing.T) {
@@ -1111,6 +1114,7 @@ func TestSessionsAPI_AddDesignContractInvariantErrors(t *testing.T) {
 		{"missing fields", `{}`, nil, http.StatusBadRequest, "CONTRACT_INVARIANT_REQUIRED"},
 		{"invalid invariant", `{"pr":"8","invariant":"bad"}`, apierr.Invalid("INVALID_CONTRACT_INVARIANT", "invalid", nil), http.StatusBadRequest, "INVALID_CONTRACT_INVARIANT"},
 		{"unowned PR", `{"pr":"8","invariant":"valid"}`, apierr.NotFound("PR_NOT_OWNED", "not owned"), http.StatusNotFound, "PR_NOT_OWNED"},
+		{"capacity", `{"pr":"8","invariant":"valid"}`, apierr.Conflict("CONTRACT_CAPACITY_EXCEEDED", "full", nil), http.StatusConflict, "CONTRACT_CAPACITY_EXCEEDED"},
 		{"terminated", `{"pr":"8","invariant":"valid"}`, apierr.Conflict("SESSION_TERMINATED", "terminated", nil), http.StatusConflict, "SESSION_TERMINATED"},
 		{"storage", `{"pr":"8","invariant":"valid"}`, errors.New("sqlite failed"), http.StatusInternalServerError, "INTERNAL_ERROR"},
 	}
@@ -1135,6 +1139,8 @@ func TestSessionsAPI_ClaimPRErrors(t *testing.T) {
 	}{
 		{"bad json", `{`, nil, http.StatusBadRequest, "INVALID_JSON"},
 		{"missing pr", `{}`, nil, http.StatusBadRequest, "PR_REQUIRED"},
+		{"task prompt too long direct request", `{"pr":"142","taskPrompt":"` + strings.Repeat("x", sessionsvc.MaxClaimTaskPromptBytes+1) + `"}`, nil, http.StatusBadRequest, "PROMPT_TOO_LONG"},
+		{"task prompt too long from service", `{"pr":"142","taskPrompt":"valid"}`, sessionsvc.ErrClaimTaskPromptTooLong, http.StatusBadRequest, "PROMPT_TOO_LONG"},
 		{"invalid ref", `{"pr":"x"}`, sessionsvc.ErrInvalidPRRef, http.StatusBadRequest, "INVALID_PR_REF"},
 		{"session missing", `{"pr":"142"}`, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session"), http.StatusNotFound, "SESSION_NOT_FOUND"},
 		{"pr missing", `{"pr":"142"}`, sessionsvc.ErrPRNotFound, http.StatusNotFound, "PR_NOT_FOUND"},

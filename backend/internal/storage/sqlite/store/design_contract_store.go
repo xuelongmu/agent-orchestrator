@@ -37,11 +37,14 @@ func (s *Store) AddPRDesignContractInvariant(ctx context.Context, sessionID doma
 	contract := ""
 	err = s.inTx(ctx, "add PR design contract invariant", func(q *gen.Queries) error {
 		pr, err := q.GetPR(ctx, prURL)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: PR %s no longer exists", designcontract.ErrPRNotOwned, prURL)
+		}
 		if err != nil {
 			return err
 		}
 		if pr.SessionID != sessionID {
-			return fmt.Errorf("PR %s is owned by session %s", prURL, pr.SessionID)
+			return fmt.Errorf("%w: PR %s is owned by session %s", designcontract.ErrPRNotOwned, prURL, pr.SessionID)
 		}
 		if err := q.EnsurePRDesignContract(ctx, gen.EnsurePRDesignContractParams{
 			PRURL: prURL, SessionID: string(sessionID), FallbackMarkdown: designcontract.BuildSeed("", ""), UpdatedAt: updatedAt,
@@ -57,7 +60,7 @@ func (s *Store) AddPRDesignContractInvariant(ctx context.Context, sessionID doma
 		}
 		addition := designcontract.AppendInvariant("", invariant)
 		if len(contract)+len(addition) > designcontract.MaxCanonicalBytes {
-			return errors.New("canonical design contract capacity exceeded")
+			return designcontract.ErrContractCapacityExceeded
 		}
 		n, err := q.AppendPRDesignContractInvariant(ctx, gen.AppendPRDesignContractInvariantParams{
 			Addition: addition, UpdatedAt: updatedAt, PRURL: prURL,
@@ -72,6 +75,23 @@ func (s *Store) AddPRDesignContractInvariant(ctx context.Context, sessionID doma
 		return nil
 	})
 	return contract, err
+}
+
+// GetOwnedPRDesignContract atomically verifies current PR ownership and reads
+// canonical bytes in one SQLite statement. A pre-takeover session cannot read
+// after another daemon commits a new owner between service resolution and the
+// final store boundary.
+func (s *Store) GetOwnedPRDesignContract(ctx context.Context, sessionID domain.SessionID, prURL string) (string, bool, error) {
+	row, err := s.qr.GetOwnedPRDesignContract(ctx, gen.GetOwnedPRDesignContractParams{
+		PRURL: prURL, SessionID: sessionID,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, fmt.Errorf("%w: %s", designcontract.ErrPRNotOwned, prURL)
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get owned PR design contract %s: %w", prURL, err)
+	}
+	return row.Markdown, row.ContractExists, nil
 }
 
 // GetPRDesignContract returns canonical contract bytes for one normalized PR.

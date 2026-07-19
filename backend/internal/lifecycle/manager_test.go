@@ -15,6 +15,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
 )
 
 var ctx = context.Background()
@@ -135,6 +136,35 @@ type fakeMessenger struct {
 	err  error
 }
 
+type fakeAutomatedSender struct {
+	msgs         []string
+	err          error
+	beforeReturn func()
+}
+
+type guardedAutomatedSender struct {
+	guard *sessionguard.Guard
+}
+
+func (s guardedAutomatedSender) SendAutomated(ctx context.Context, id domain.SessionID, msg string) error {
+	outcome, err := s.guard.DeliverAutomated(ctx, id, msg)
+	if err != nil {
+		return err
+	}
+	if outcome != sessionguard.Sent {
+		return fmt.Errorf("automated delivery suppressed: %s", outcome)
+	}
+	return nil
+}
+
+func (f *fakeAutomatedSender) SendAutomated(_ context.Context, _ domain.SessionID, msg string) error {
+	f.msgs = append(f.msgs, msg)
+	if f.beforeReturn != nil {
+		f.beforeReturn()
+	}
+	return f.err
+}
+
 type retryMergedCleaner struct {
 	err   error
 	calls int
@@ -222,10 +252,16 @@ func (f *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) 
 	return nil
 }
 
+func (f *fakeMessenger) SendAutomated(ctx context.Context, id domain.SessionID, msg string) error {
+	return f.Send(ctx, id, msg)
+}
+
 func newManager() (*Manager, *fakeStore, *fakeMessenger) {
 	st := newFakeStore()
 	msg := &fakeMessenger{}
-	return New(st, msg), st, msg
+	m := New(st, msg)
+	m.SetAutomatedMessageSender(msg)
+	return m, st, msg
 }
 
 func working(id domain.SessionID) domain.SessionRecord {
@@ -1119,6 +1155,7 @@ func TestPRObservationRecoversPendingClaimContractAfterRestartBeforeOtherWork(t 
 
 	failedMessenger := &fakeMessenger{err: errors.New("pane unavailable")}
 	first := New(st, failedMessenger)
+	first.SetAutomatedMessageSender(failedMessenger)
 	if err := first.ApplyPRObservation(context.Background(), rec.ID, observation); err == nil {
 		t.Fatal("failed claim-ready delivery did not remain retryable")
 	}
@@ -1130,6 +1167,7 @@ func TestPRObservationRecoversPendingClaimContractAfterRestartBeforeOtherWork(t 
 	// carried over, so recovery must come entirely from the durable obligation.
 	recoveredMessenger := &fakeMessenger{}
 	restarted := New(st, recoveredMessenger)
+	restarted.SetAutomatedMessageSender(recoveredMessenger)
 	if err := restarted.ApplyPRObservation(context.Background(), rec.ID, observation); err != nil {
 		t.Fatal(err)
 	}
@@ -1167,8 +1205,9 @@ func TestPendingClaimContractAutomatedRetryWaitsForSafePaneState(t *testing.T) {
 			st.pendingContractDelivery[prURL] = rec.ID
 			msg := &fakeMessenger{}
 			m := New(st, msg)
+			m.SetAutomatedMessageSender(guardedAutomatedSender{guard: m.guard})
 			if err := m.ApplyPRObservation(ctx, rec.ID, ports.PRObservation{Fetched: true, URL: prURL, CI: domain.CIFailing}); err != nil {
-				t.Fatal(err)
+				t.Fatalf("unsafe state should remain a quiet retry condition: %v", err)
 			}
 			if len(msg.msgs) != 0 || st.pendingContractDelivery[prURL] != rec.ID {
 				t.Fatalf("unsafe state crossed claim barrier: messages=%v pending=%q", msg.msgs, st.pendingContractDelivery[prURL])
@@ -1190,6 +1229,92 @@ func TestPRObservation_MergedTerminatesWithoutNudge(t *testing.T) {
 	}
 	if len(msg.msgs) != 0 {
 		t.Fatalf("merged PR should not send nudge, got %v", msg.msgs)
+	}
+}
+
+func TestPRObservationClaimRetryRequiresConfirmedAutomatedSubmission(t *testing.T) {
+	st := newFakeStore()
+	prURL := "https://github.com/o/r/pull/7"
+	rec := working("mer-1")
+	rec.Metadata.WorkspacePath = t.TempDir()
+	st.sessions[rec.ID] = rec
+	st.designContracts[prURL] = designcontract.BuildSeed("61", "")
+	st.pendingContractDelivery[prURL] = rec.ID
+	st.pendingContractToken[prURL] = "generation-1"
+	st.pendingContractTask[prURL] = strings.Repeat("x", 4096)
+	raw := &fakeMessenger{}
+	confirmation := &fakeAutomatedSender{
+		err: errors.New("input remains an unsubmitted editor draft"),
+		beforeReturn: func() {
+			latched := st.sessions[rec.ID]
+			latched.Metadata.PendingSubmitFingerprint = "sha256-large-claim-ready"
+			st.sessions[rec.ID] = latched
+		},
+	}
+	m := New(st, raw)
+	m.SetAutomatedMessageSender(confirmation)
+
+	if err := m.ApplyPRObservation(ctx, rec.ID, ports.PRObservation{Fetched: true, URL: prURL, CI: domain.CIFailing}); err != nil {
+		t.Fatalf("latched input should remain a quiet retry condition: %v", err)
+	}
+	if len(confirmation.msgs) != 1 || !strings.Contains(confirmation.msgs[0], strings.Repeat("x", 4096)) {
+		t.Fatalf("confirmed delivery calls = %d, want full large claim message", len(confirmation.msgs))
+	}
+	if len(raw.msgs) != 0 {
+		t.Fatalf("claim retry bypassed confirmed sender through raw pane: %v", raw.msgs)
+	}
+	if st.pendingContractDelivery[prURL] != rec.ID {
+		t.Fatal("unconfirmed claim retry cleared durable barrier")
+	}
+}
+
+func TestPRObservationClaimRetryPropagatesUnexpectedSenderError(t *testing.T) {
+	st := newFakeStore()
+	prURL := "https://github.com/o/r/pull/7"
+	rec := working("mer-1")
+	st.sessions[rec.ID] = rec
+	st.designContracts[prURL] = designcontract.BuildSeed("61", "")
+	st.pendingContractDelivery[prURL] = rec.ID
+	sender := &fakeAutomatedSender{err: errors.New("runtime transport failed")}
+	m := New(st, &fakeMessenger{})
+	m.SetAutomatedMessageSender(sender)
+
+	err := m.ApplyPRObservation(ctx, rec.ID, ports.PRObservation{Fetched: true, URL: prURL, CI: domain.CIFailing})
+	if err == nil || !strings.Contains(err.Error(), "runtime transport failed") {
+		t.Fatalf("ApplyPRObservation error = %v, want unexpected sender failure", err)
+	}
+	if st.pendingContractDelivery[prURL] != rec.ID {
+		t.Fatal("unexpected sender failure cleared durable barrier")
+	}
+}
+
+func TestPRObservation_TerminalStateBypassesPendingClaimDelivery(t *testing.T) {
+	for _, terminal := range []ports.PRObservation{
+		{Fetched: true, URL: "pr1", Merged: true},
+		{Fetched: true, URL: "pr1", Closed: true},
+	} {
+		name := "closed"
+		if terminal.Merged {
+			name = "merged"
+		}
+		t.Run(name, func(t *testing.T) {
+			m, st, msg := newManager()
+			st.sessions["mer-1"] = working("mer-1")
+			st.pendingContractDelivery["pr1"] = "mer-1"
+			st.pendingContractToken["pr1"] = "generation-1"
+			st.designContracts["pr1"] = designcontract.BuildSeed("61", "")
+			st.prs["mer-1"] = []domain.PullRequest{{URL: "pr1", Merged: terminal.Merged, Closed: terminal.Closed}}
+
+			if err := m.ApplyPRObservation(ctx, "mer-1", terminal); err != nil {
+				t.Fatal(err)
+			}
+			if len(msg.msgs) != 0 {
+				t.Fatalf("terminal observation attempted claim-ready delivery: %v", msg.msgs)
+			}
+			if terminal.Merged && !st.sessions["mer-1"].IsTerminated {
+				t.Fatalf("merged observation did not complete session: %+v", st.sessions["mer-1"])
+			}
+		})
 	}
 }
 
@@ -2994,6 +3119,7 @@ func TestIdleReviewSnapshotCannotBypassPendingClaimContract(t *testing.T) {
 	snapshot := idleReviewSnapshot(prURL, false, ports.SCMReviewThreadObservation{ID: "t1", Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix"}}})
 	msg := &fakeMessenger{err: errors.New("pane unavailable")}
 	m := New(st, msg)
+	m.SetAutomatedMessageSender(guardedAutomatedSender{guard: m.guard})
 	m.clock = func() time.Time { return now }
 	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, snapshot); err == nil {
 		t.Fatal("idle review bypassed failed claim-ready delivery")

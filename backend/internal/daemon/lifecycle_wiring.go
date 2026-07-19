@@ -132,6 +132,7 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 	// edge here before daemon startup launches the SCM observer's first poll.
 	lcm.SetMergedSessionCleaner(mgr)
 	lcm.SetCompletedSessionCleaner(mgr)
+	lcm.SetAutomatedMessageSender(mgr)
 	scmProvider, err := newGitHubSCMProvider(log)
 	if err != nil {
 		logSCMProviderDisabled(log, err)

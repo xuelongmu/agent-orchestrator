@@ -9,6 +9,8 @@ import (
 	"context"
 	"database/sql"
 	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
 const appendPRDesignContractInvariant = `-- name: AppendPRDesignContractInvariant :execrows
@@ -95,6 +97,32 @@ func (q *Queries) EnsurePRDesignContract(ctx context.Context, arg EnsurePRDesign
 		arg.UpdatedAt,
 	)
 	return err
+}
+
+const getOwnedPRDesignContract = `-- name: GetOwnedPRDesignContract :one
+SELECT COALESCE(pr_design_contract.markdown, '') AS markdown,
+       pr_design_contract.pr_url IS NOT NULL AS contract_exists
+FROM pr
+LEFT JOIN pr_design_contract ON pr_design_contract.pr_url = pr.url
+WHERE pr.url = ?1
+  AND pr.session_id = ?2
+`
+
+type GetOwnedPRDesignContractParams struct {
+	PRURL     string
+	SessionID domain.SessionID
+}
+
+type GetOwnedPRDesignContractRow struct {
+	Markdown       string
+	ContractExists bool
+}
+
+func (q *Queries) GetOwnedPRDesignContract(ctx context.Context, arg GetOwnedPRDesignContractParams) (GetOwnedPRDesignContractRow, error) {
+	row := q.db.QueryRowContext(ctx, getOwnedPRDesignContract, arg.PRURL, arg.SessionID)
+	var i GetOwnedPRDesignContractRow
+	err := row.Scan(&i.Markdown, &i.ContractExists)
+	return i, err
 }
 
 const getPRDesignContract = `-- name: GetPRDesignContract :one

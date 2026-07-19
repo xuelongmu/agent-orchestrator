@@ -184,6 +184,13 @@ func TestSpawnNoTakeoverRequiresClaimPR(t *testing.T) {
 	}
 }
 
+func TestSpawnClaimPRRejectsOversizedTaskPromptBeforeNetwork(t *testing.T) {
+	_, _, err := executeCLI(t, Deps{}, "spawn", "--project", "demo", "--name", "worker", "--claim-pr", "142", "--prompt", strings.Repeat("é", maxPromptLen/2+1))
+	if err == nil || ExitCode(err) != 2 || !strings.Contains(err.Error(), "4096 UTF-8 bytes or fewer") {
+		t.Fatalf("err=%v exit=%d, want bounded claim prompt usage error", err, ExitCode(err))
+	}
+}
+
 // TestSpawnCommand_RejectsOverlongName asserts `ao spawn` rejects a --name
 // longer than 20 characters without contacting the daemon.
 func TestSpawnCommand_RejectsOverlongName(t *testing.T) {

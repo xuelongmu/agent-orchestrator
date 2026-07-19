@@ -36,7 +36,14 @@ var (
 	// ErrSessionWorkspaceNotGit reports that SCM branch operations are
 	// inapplicable to scratch and shared-directory sessions.
 	ErrSessionWorkspaceNotGit = errors.New("session: workspace is not git-backed")
+	// ErrClaimTaskPromptTooLong rejects withheld claim work that cannot cross
+	// the same bounded prompt boundary used for a normal spawn.
+	ErrClaimTaskPromptTooLong = errors.New("session: claim task prompt is too long")
 )
+
+// MaxClaimTaskPromptBytes is the maximum UTF-8 payload accepted for work held
+// behind a claim-ready contract barrier.
+const MaxClaimTaskPromptBytes = 4096
 
 // ClaimPROptions controls PR claim conflict behavior.
 type ClaimPROptions struct {
@@ -76,6 +83,9 @@ func (s *Service) ListPRs(ctx context.Context, id domain.SessionID) ([]domain.PR
 
 // ClaimPR attaches a live GitHub PR to a worker session and persists the current SCM facts atomically.
 func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, opts ClaimPROptions) (ClaimPRResult, error) {
+	if len(opts.TaskPrompt) > MaxClaimTaskPromptBytes {
+		return ClaimPRResult{}, ErrClaimTaskPromptTooLong
+	}
 	rec, ok, err := s.store.GetSession(ctx, id)
 	if err != nil {
 		return ClaimPRResult{}, fmt.Errorf("get %s: %w", id, err)

@@ -359,6 +359,10 @@ func (c *SessionsController) claimPR(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PR_REQUIRED", "pr is required", nil)
 		return
 	}
+	if len(in.TaskPrompt) > maxPromptLen {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PROMPT_TOO_LONG", "taskPrompt is too long", nil)
+		return
+	}
 	allowTakeover := true
 	if in.AllowTakeover != nil {
 		allowTakeover = *in.AllowTakeover
@@ -682,6 +686,8 @@ func writeSessionPRError(w http.ResponseWriter, r *http.Request, err error) {
 	var claimed ports.PRClaimedByActiveSessionError
 	var checkout ports.PRCheckoutError
 	switch {
+	case errors.Is(err, sessionsvc.ErrClaimTaskPromptTooLong):
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PROMPT_TOO_LONG", "taskPrompt is too long", nil)
 	case errors.Is(err, sessionsvc.ErrInvalidPRRef):
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_PR_REF", "PR reference must be a github.com PR URL or a number", nil)
 	case errors.Is(err, sessionsvc.ErrPRNotFound):
