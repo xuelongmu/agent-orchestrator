@@ -175,6 +175,48 @@ func TestServerShutdownEndpoint(t *testing.T) {
 	}
 }
 
+func TestServerUnexpectedServeExitPreservesRunFile(t *testing.T) {
+	runPath := filepath.Join(t.TempDir(), "running.json")
+	cfg := config.Config{
+		Host:            "127.0.0.1",
+		Port:            0,
+		ShutdownTimeout: 5 * time.Second,
+		RunFilePath:     runPath,
+	}
+
+	srv, err := NewWithDeps(cfg, discardLogger(), nil, APIDeps{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- srv.Run(context.Background()) }()
+	waitForHealth(t, "http://"+srv.Addr().String())
+
+	// Closing the listener without a shutdown request simulates an unexpected
+	// Serve failure. The stale run-file is the durable crash evidence used by an
+	// Electron process that adopted (rather than spawned) this daemon.
+	if err := srv.listen.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	select {
+	case err := <-runErr:
+		if err == nil {
+			t.Fatal("Run returned nil after unexpected listener close; want an error")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after unexpected listener close")
+	}
+
+	info, err := runfile.Read(runPath)
+	if err != nil {
+		t.Fatalf("read run-file: %v", err)
+	}
+	if info == nil {
+		t.Fatal("run-file removed after unexpected Serve exit; want durable crash evidence")
+	}
+}
+
 func waitForHealth(t *testing.T, base string) {
 	t.Helper()
 	// Per-request timeout so a stalled connect or hung handshake doesn't park
