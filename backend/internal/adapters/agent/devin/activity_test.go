@@ -13,7 +13,7 @@ func TestDeriveActivityStateUsesClaudeCompatibility(t *testing.T) {
 		want    domain.ActivityState
 		ok      bool
 	}{
-		{event: "session-start"},
+		{event: "session-start", want: domain.ActivityActive, ok: true},
 		{event: "user-prompt-submit", want: domain.ActivityActive, ok: true},
 		{event: "stop", want: domain.ActivityIdle, ok: true},
 		{event: "session-end", payload: `{"reason":"logout"}`, want: domain.ActivityExited, ok: true},
