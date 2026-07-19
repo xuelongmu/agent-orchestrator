@@ -17,12 +17,30 @@ const (
 	NotificationPRMerged NotificationType = "pr_merged"
 	// NotificationPRClosedUnmerged means a tracked PR closed without merging.
 	NotificationPRClosedUnmerged NotificationType = "pr_closed_unmerged"
+	// NotificationControlPlaneFailed means the SCM supervision poll entered a failing episode.
+	NotificationControlPlaneFailed NotificationType = "control_plane_failed"
+	// NotificationControlPlaneEscalated means the SCM supervision poll crossed the repeated-failure threshold.
+	NotificationControlPlaneEscalated NotificationType = "control_plane_escalated"
+	// NotificationControlPlaneRecovered means a previously failing SCM supervision poll succeeded again.
+	NotificationControlPlaneRecovered NotificationType = "control_plane_recovered"
 )
 
 // Valid reports whether t is one of the v1 notification kinds.
 func (t NotificationType) Valid() bool {
 	switch t {
-	case NotificationNeedsInput, NotificationReadyToMerge, NotificationPRMerged, NotificationPRClosedUnmerged:
+	case NotificationNeedsInput, NotificationReadyToMerge, NotificationPRMerged, NotificationPRClosedUnmerged,
+		NotificationControlPlaneFailed, NotificationControlPlaneEscalated, NotificationControlPlaneRecovered:
+		return true
+	default:
+		return false
+	}
+}
+
+// ControlPlane reports whether the notification belongs to the daemon rather
+// than to a project/session row.
+func (t NotificationType) ControlPlane() bool {
+	switch t {
+	case NotificationControlPlaneFailed, NotificationControlPlaneEscalated, NotificationControlPlaneRecovered:
 		return true
 	default:
 		return false
@@ -73,11 +91,18 @@ var (
 
 // Validate checks the required fields and enum values for a stored notification.
 func (r NotificationRecord) Validate() error {
-	if r.SessionID == "" || r.ProjectID == "" || r.Title == "" || r.CreatedAt.IsZero() {
+	if r.Title == "" || r.CreatedAt.IsZero() {
 		return ErrInvalidNotificationRecord
 	}
 	if !r.Type.Valid() {
 		return ErrInvalidNotificationType
+	}
+	if r.Type.ControlPlane() {
+		if r.SessionID != "" || r.ProjectID != "" || r.PRURL != "" {
+			return ErrInvalidNotificationRecord
+		}
+	} else if r.SessionID == "" || r.ProjectID == "" {
+		return ErrInvalidNotificationRecord
 	}
 	if !r.Status.Valid() {
 		return ErrInvalidNotificationStatus

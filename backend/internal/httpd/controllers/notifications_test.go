@@ -74,10 +74,16 @@ func notificationsvcNotFound() error {
 
 func TestNotificationsAPI_ListUnread(t *testing.T) {
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
-	svc := &fakeNotificationService{items: []notificationsvc.Notification{{
-		NotificationRecord: domain.NotificationRecord{ID: "ntf_1", SessionID: "mer-1", ProjectID: "mer", Type: domain.NotificationNeedsInput, Title: "checkout-flow needs input", Body: "The agent is waiting for your response.", Status: domain.NotificationUnread, CreatedAt: now},
-		Target:             notificationsvc.Target{Kind: notificationsvc.TargetSession, SessionID: "mer-1"},
-	}}}
+	svc := &fakeNotificationService{items: []notificationsvc.Notification{
+		{
+			NotificationRecord: domain.NotificationRecord{ID: "ntf_1", SessionID: "mer-1", ProjectID: "mer", Type: domain.NotificationNeedsInput, Title: "checkout-flow needs input", Body: "The agent is waiting for your response.", Status: domain.NotificationUnread, CreatedAt: now},
+			Target:             notificationsvc.Target{Kind: notificationsvc.TargetSession, SessionID: "mer-1"},
+		},
+		{
+			NotificationRecord: domain.NotificationRecord{ID: "ntf_control", Type: domain.NotificationControlPlaneFailed, Title: "AO control plane poll failed", Status: domain.NotificationUnread, CreatedAt: now},
+			Target:             notificationsvc.Target{Kind: notificationsvc.TargetControlPlane},
+		},
+	}}
 	srv := newNotificationTestServer(t, svc)
 
 	body, status, _ := doRequest(t, srv, "GET", "/api/v1/notifications?limit=10", "")
@@ -101,7 +107,7 @@ func TestNotificationsAPI_ListUnread(t *testing.T) {
 		} `json:"notifications"`
 	}
 	mustJSON(t, body, &resp)
-	if len(resp.Notifications) != 1 || resp.Notifications[0].ID != "ntf_1" || resp.Notifications[0].Target.Kind != "session" {
+	if len(resp.Notifications) != 2 || resp.Notifications[0].ID != "ntf_1" || resp.Notifications[0].Target.Kind != "session" || resp.Notifications[1].Type != "control_plane_failed" || resp.Notifications[1].Target.Kind != "control_plane" || resp.Notifications[1].SessionID != "" || resp.Notifications[1].ProjectID != "" {
 		t.Fatalf("resp = %+v", resp)
 	}
 }

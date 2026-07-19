@@ -13,6 +13,11 @@ import (
 // that found no matching resource, such as a branch with no open pull request.
 var ErrSCMNotFound = errors.New("scm: not found")
 
+// ErrSCMAuthentication classifies provider authentication failures without
+// exposing provider response text (which can contain credential material) to
+// observer and notification layers.
+var ErrSCMAuthentication = errors.New("scm: authentication failed")
+
 // SCMRepo identifies a repository without assuming a provider-specific URL
 // shape. Repo is conventionally "owner/name" for providers that expose an
 // owner namespace, while Owner/Name are kept split for provider calls.

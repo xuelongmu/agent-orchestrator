@@ -19,7 +19,7 @@ func enrich(intent Intent) (domain.NotificationRecord, error) {
 	if !intent.Type.Valid() {
 		return domain.NotificationRecord{}, domain.ErrInvalidNotificationType
 	}
-	if intent.Type != domain.NotificationNeedsInput && rec.PRURL == "" {
+	if intent.Type != domain.NotificationNeedsInput && !intent.Type.ControlPlane() && rec.PRURL == "" {
 		return domain.NotificationRecord{}, domain.ErrInvalidNotificationRecord
 	}
 	rec.Title = strings.TrimSpace(intent.TitleOverride)
@@ -46,6 +46,12 @@ func titleForIntent(intent Intent) string {
 		return fmt.Sprintf("%s was merged", prLabel(intent))
 	case domain.NotificationPRClosedUnmerged:
 		return fmt.Sprintf("%s was closed without merging", prLabel(intent))
+	case domain.NotificationControlPlaneFailed:
+		return "AO control plane poll failed"
+	case domain.NotificationControlPlaneEscalated:
+		return "AO control plane poll is still failing"
+	case domain.NotificationControlPlaneRecovered:
+		return "AO control plane poll recovered"
 	default:
 		return "Notification"
 	}
@@ -70,6 +76,12 @@ func bodyForIntent(intent Intent) string {
 			return fmt.Sprintf("%s was closed without merging.", title)
 		}
 		return "The pull request was closed without merging."
+	case domain.NotificationControlPlaneFailed:
+		return "AO could not refresh GitHub state. It will retry automatically."
+	case domain.NotificationControlPlaneEscalated:
+		return "AO has repeatedly failed to refresh GitHub state. Check GitHub connectivity and AO logs."
+	case domain.NotificationControlPlaneRecovered:
+		return "AO is refreshing GitHub state again."
 	default:
 		return ""
 	}

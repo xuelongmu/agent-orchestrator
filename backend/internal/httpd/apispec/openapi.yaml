@@ -2345,6 +2345,9 @@ components:
           - ready_to_merge
           - pr_merged
           - pr_closed_unmerged
+          - control_plane_failed
+          - control_plane_escalated
+          - control_plane_recovered
           type: string
       required:
       - id
@@ -2364,6 +2367,7 @@ components:
           enum:
           - session
           - pr
+          - control_plane
           type: string
         prUrl:
           type: string

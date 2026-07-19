@@ -89,6 +89,28 @@ func TestManagerNotifyUsesHumanHandoffCopy(t *testing.T) {
 	}
 }
 
+func TestManagerNotifyPersistsDaemonScopedControlPlaneIntent(t *testing.T) {
+	st := &fakeStore{}
+	now := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+	mgr := New(Deps{Store: st, Clock: func() time.Time { return now }, NewID: func() string { return "ntf_control" }})
+
+	if err := mgr.Notify(context.Background(), Intent{
+		Type:          domain.NotificationControlPlaneFailed,
+		TitleOverride: "GitHub authentication needs attention",
+		BodyOverride:  "Run `gh auth login` and restart AO.",
+	}); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+
+	if len(st.rows) != 1 {
+		t.Fatalf("stored rows = %d, want 1", len(st.rows))
+	}
+	got := st.rows[0]
+	if got.ID != "ntf_control" || got.SessionID != "" || got.ProjectID != "" || got.Type != domain.NotificationControlPlaneFailed {
+		t.Fatalf("stored control notification = %#v", got)
+	}
+}
+
 func TestManagerNotifyRejectsUnknownType(t *testing.T) {
 	mgr := New(Deps{Store: &fakeStore{}, Clock: func() time.Time { return time.Now() }})
 	err := mgr.Notify(context.Background(), Intent{Type: "surprise", SessionID: "mer-1", ProjectID: "mer"})

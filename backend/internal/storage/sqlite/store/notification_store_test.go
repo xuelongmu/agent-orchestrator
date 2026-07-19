@@ -92,6 +92,32 @@ func TestNotificationStore_MarkReadReopensUnreadDedupe(t *testing.T) {
 	}
 }
 
+func TestNotificationStore_ControlPlaneRowsAreDaemonScopedWithoutCrossIncidentDedupe(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	rec := domain.NotificationRecord{
+		ID:        "ntf_control_1",
+		Type:      domain.NotificationControlPlaneFailed,
+		Title:     "AO control plane poll failed",
+		Status:    domain.NotificationUnread,
+		CreatedAt: now,
+	}
+
+	created, inserted, err := s.CreateNotification(ctx, rec)
+	if err != nil || !inserted {
+		t.Fatalf("CreateNotification inserted=%v err=%v", inserted, err)
+	}
+	if created.SessionID != "" || created.ProjectID != "" || created.Type != rec.Type {
+		t.Fatalf("created = %#v", created)
+	}
+	dup := rec
+	dup.ID = "ntf_control_2"
+	if got, inserted, err := s.CreateNotification(ctx, dup); err != nil || !inserted || got.ID != dup.ID {
+		t.Fatalf("second incident = %#v inserted=%v err=%v", got, inserted, err)
+	}
+}
+
 func TestNotificationStore_MarkReadMissing(t *testing.T) {
 	s := newTestStore(t)
 	_, ok, err := s.MarkNotificationRead(context.Background(), "missing")

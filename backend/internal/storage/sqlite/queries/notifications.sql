@@ -26,5 +26,5 @@ RETURNING *;
 -- name: GetUnreadNotificationByDedupe :one
 SELECT *
 FROM notifications
-WHERE session_id = ? AND type = ? AND pr_url = ? AND status = 'unread'
+WHERE session_id IS ? AND type = ? AND pr_url = ? AND status = 'unread'
 LIMIT 1;

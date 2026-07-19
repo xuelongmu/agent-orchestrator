@@ -96,6 +96,9 @@ func notificationFromRecord(rec domain.NotificationRecord) Notification {
 }
 
 func targetForRecord(rec domain.NotificationRecord) Target {
+	if rec.Type.ControlPlane() {
+		return Target{Kind: TargetControlPlane}
+	}
 	if rec.PRURL != "" {
 		return Target{Kind: TargetPR, SessionID: rec.SessionID, PRURL: rec.PRURL}
 	}

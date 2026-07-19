@@ -24,15 +24,17 @@ func (s *Store) CreateNotification(ctx context.Context, rec domain.NotificationR
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if existing, ok, err := s.getUnreadNotificationByDedupe(ctx, rec); err != nil {
-		return domain.NotificationRecord{}, false, err
-	} else if ok {
-		return existing, false, nil
+	if !rec.Type.ControlPlane() {
+		if existing, ok, err := s.getUnreadNotificationByDedupe(ctx, rec); err != nil {
+			return domain.NotificationRecord{}, false, err
+		} else if ok {
+			return existing, false, nil
+		}
 	}
 	row, err := s.qw.CreateNotification(ctx, gen.CreateNotificationParams{
 		ID:        rec.ID,
-		SessionID: rec.SessionID,
-		ProjectID: rec.ProjectID,
+		SessionID: optionalSessionID(rec.SessionID),
+		ProjectID: optionalProjectID(rec.ProjectID),
 		PRURL:     rec.PRURL,
 		Type:      rec.Type,
 		Title:     rec.Title,
@@ -41,7 +43,7 @@ func (s *Store) CreateNotification(ctx context.Context, rec domain.NotificationR
 		CreatedAt: rec.CreatedAt,
 	})
 	if err != nil {
-		if isSQLiteUnique(err) {
+		if isSQLiteUnique(err) && !rec.Type.ControlPlane() {
 			if existing, ok, lookupErr := s.getUnreadNotificationByDedupe(ctx, rec); lookupErr != nil {
 				return domain.NotificationRecord{}, false, lookupErr
 			} else if ok {
@@ -89,7 +91,7 @@ func (s *Store) MarkAllNotificationsRead(ctx context.Context) ([]domain.Notifica
 
 func (s *Store) getUnreadNotificationByDedupe(ctx context.Context, rec domain.NotificationRecord) (domain.NotificationRecord, bool, error) {
 	row, err := s.qw.GetUnreadNotificationByDedupe(ctx, gen.GetUnreadNotificationByDedupeParams{
-		SessionID: rec.SessionID,
+		SessionID: optionalSessionID(rec.SessionID),
 		Type:      rec.Type,
 		PRURL:     rec.PRURL,
 	})
@@ -108,10 +110,18 @@ func isSQLiteUnique(err error) bool {
 }
 
 func notificationFromGen(row gen.Notification) domain.NotificationRecord {
+	var sessionID domain.SessionID
+	if row.SessionID != nil {
+		sessionID = *row.SessionID
+	}
+	var projectID domain.ProjectID
+	if row.ProjectID != nil {
+		projectID = *row.ProjectID
+	}
 	return domain.NotificationRecord{
 		ID:        row.ID,
-		SessionID: row.SessionID,
-		ProjectID: row.ProjectID,
+		SessionID: sessionID,
+		ProjectID: projectID,
 		PRURL:     row.PRURL,
 		Type:      row.Type,
 		Title:     row.Title,
@@ -119,6 +129,20 @@ func notificationFromGen(row gen.Notification) domain.NotificationRecord {
 		Status:    row.Status,
 		CreatedAt: row.CreatedAt,
 	}
+}
+
+func optionalSessionID(id domain.SessionID) *domain.SessionID {
+	if id == "" {
+		return nil
+	}
+	return &id
+}
+
+func optionalProjectID(id domain.ProjectID) *domain.ProjectID {
+	if id == "" {
+		return nil
+	}
+	return &id
 }
 
 func notificationsFromGen(rows []gen.Notification) []domain.NotificationRecord {

@@ -21,8 +21,8 @@ RETURNING id, session_id, project_id, pr_url, type, title, body, status, created
 
 type CreateNotificationParams struct {
 	ID        string
-	SessionID domain.SessionID
-	ProjectID domain.ProjectID
+	SessionID *domain.SessionID
+	ProjectID *domain.ProjectID
 	PRURL     string
 	Type      domain.NotificationType
 	Title     string
@@ -61,12 +61,12 @@ func (q *Queries) CreateNotification(ctx context.Context, arg CreateNotification
 const getUnreadNotificationByDedupe = `-- name: GetUnreadNotificationByDedupe :one
 SELECT id, session_id, project_id, pr_url, type, title, body, status, created_at
 FROM notifications
-WHERE session_id = ? AND type = ? AND pr_url = ? AND status = 'unread'
+WHERE session_id IS ? AND type = ? AND pr_url = ? AND status = 'unread'
 LIMIT 1
 `
 
 type GetUnreadNotificationByDedupeParams struct {
-	SessionID domain.SessionID
+	SessionID *domain.SessionID
 	Type      domain.NotificationType
 	PRURL     string
 }

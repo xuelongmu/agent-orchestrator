@@ -873,11 +873,11 @@ export interface components {
             target: components["schemas"]["NotificationTarget"];
             title: string;
             /** @enum {string} */
-            type: "needs_input" | "ready_to_merge" | "pr_merged" | "pr_closed_unmerged";
+            type: "needs_input" | "ready_to_merge" | "pr_merged" | "pr_closed_unmerged" | "control_plane_failed" | "control_plane_escalated" | "control_plane_recovered";
         };
         NotificationTarget: {
             /** @enum {string} */
-            kind: "session" | "pr";
+            kind: "session" | "pr" | "control_plane";
             prUrl?: string;
             sessionId: string;
         };

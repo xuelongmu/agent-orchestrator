@@ -65,6 +65,16 @@ func (s *captureTelemetrySink) Emit(_ context.Context, ev ports.TelemetryEvent) 
 
 func (s *captureTelemetrySink) Close(context.Context) error { return nil }
 
+type captureNotificationSink struct {
+	intents []ports.NotificationIntent
+	err     error
+}
+
+func (s *captureNotificationSink) Notify(_ context.Context, intent ports.NotificationIntent) error {
+	s.intents = append(s.intents, intent)
+	return s.err
+}
+
 func (s *fakeStore) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error) {
 	if s.listHook != nil {
 		s.listHook()
@@ -559,6 +569,166 @@ func TestPollDoesNotDegradeHealthForShutdownCancellation(t *testing.T) {
 	}
 	if logged := buf.String(); logged != "" {
 		t.Fatalf("shutdown cancellation emitted health warning:\n%s", logged)
+	}
+}
+
+func TestPollFirstFailureNotifiesControlPlaneTransition(t *testing.T) {
+	now := time.Unix(4_000, 0).UTC()
+	notifications := &captureNotificationSink{}
+	telemetry := &captureTelemetrySink{}
+	observer := New(nil, nil, nil, Config{
+		Clock:         func() time.Time { return now },
+		Logger:        quietSlog(),
+		Telemetry:     telemetry,
+		Notifications: notifications,
+	})
+	pollErr := errors.New("database unavailable")
+
+	if err := observer.runPoll(context.Background(), func(context.Context) error { return pollErr }); !errors.Is(err, pollErr) {
+		t.Fatalf("runPoll error = %v, want original poll error", err)
+	}
+
+	if len(notifications.intents) != 1 {
+		t.Fatalf("notifications = %d, want 1", len(notifications.intents))
+	}
+	intent := notifications.intents[0]
+	if intent.Type != domain.NotificationControlPlaneFailed || intent.SessionID != "" || intent.ProjectID != "" {
+		t.Fatalf("intent = %#v, want daemon-scoped first-failure notification", intent)
+	}
+	if len(telemetry.events) != 1 || telemetry.events[0].Level != ports.TelemetryLevelError || telemetry.events[0].Payload["health_status"] != "error" {
+		t.Fatalf("failure telemetry = %#v", telemetry.events)
+	}
+}
+
+func TestPollRepeatedFailuresThrottleAndEscalateOnce(t *testing.T) {
+	now := time.Unix(5_000, 0).UTC()
+	notifications := &captureNotificationSink{}
+	observer := New(nil, nil, nil, Config{
+		Clock:         func() time.Time { return now },
+		Logger:        quietSlog(),
+		Notifications: notifications,
+	})
+
+	for failure := 1; failure <= 7; failure++ {
+		now = now.Add(time.Second)
+		_ = observer.runPoll(context.Background(), func(context.Context) error { return errors.New("still down") })
+	}
+
+	if len(notifications.intents) != 2 {
+		t.Fatalf("notifications = %d, want first failure plus one escalation: %#v", len(notifications.intents), notifications.intents)
+	}
+	if notifications.intents[0].Type != domain.NotificationControlPlaneFailed || notifications.intents[1].Type != domain.NotificationControlPlaneEscalated {
+		t.Fatalf("notification types = %q, %q", notifications.intents[0].Type, notifications.intents[1].Type)
+	}
+	if !strings.Contains(notifications.intents[1].BodyOverride, "3 polls in a row") {
+		t.Fatalf("escalation body = %q, want threshold count", notifications.intents[1].BodyOverride)
+	}
+}
+
+func TestPollRecoveryNotifiesOnceAndResetsEpisode(t *testing.T) {
+	now := time.Unix(6_000, 0).UTC()
+	notifications := &captureNotificationSink{}
+	observer := New(nil, nil, nil, Config{
+		Clock:         func() time.Time { return now },
+		Logger:        quietSlog(),
+		Notifications: notifications,
+	})
+	_ = observer.runPoll(context.Background(), func(context.Context) error { return errors.New("down") })
+	_ = observer.runPoll(context.Background(), func(context.Context) error { return errors.New("down") })
+	_ = observer.runPoll(context.Background(), func(context.Context) error { return nil })
+	_ = observer.runPoll(context.Background(), func(context.Context) error { return nil })
+
+	if len(notifications.intents) != 2 {
+		t.Fatalf("notifications = %d, want failure and one recovery: %#v", len(notifications.intents), notifications.intents)
+	}
+	recovery := notifications.intents[1]
+	if recovery.Type != domain.NotificationControlPlaneRecovered || !strings.Contains(recovery.BodyOverride, "after 2 failed polls") {
+		t.Fatalf("recovery = %#v", recovery)
+	}
+	if observer.consecutiveFailures != 0 || observer.failureWasAuth {
+		t.Fatalf("episode state not reset: failures=%d auth=%v", observer.consecutiveFailures, observer.failureWasAuth)
+	}
+}
+
+func TestPollGitHubAuthClassificationIsActionableAndRedacted(t *testing.T) {
+	now := time.Unix(7_000, 0).UTC()
+	notifications := &captureNotificationSink{}
+	telemetry := &captureTelemetrySink{}
+	observer := New(nil, nil, nil, Config{
+		Clock:         func() time.Time { return now },
+		Logger:        quietSlog(),
+		Telemetry:     telemetry,
+		Notifications: notifications,
+	})
+	secret := "ghp_super_secret_token"
+	authErr := fmt.Errorf("%w: Bad credentials at https://oauth2:%s@github.com", ports.ErrSCMAuthentication, secret)
+
+	_ = observer.runPoll(context.Background(), func(context.Context) error { return authErr })
+
+	if len(notifications.intents) != 1 {
+		t.Fatalf("notifications = %d, want 1", len(notifications.intents))
+	}
+	intent := notifications.intents[0]
+	copy := intent.TitleOverride + "\n" + intent.BodyOverride
+	if !strings.Contains(copy, "gh auth login") || !strings.Contains(strings.ToLower(copy), "github authentication") {
+		t.Fatalf("auth notification is not actionable: %q", copy)
+	}
+	for _, forbidden := range []string{secret, "oauth2", "Bad credentials", authErr.Error()} {
+		if strings.Contains(copy, forbidden) {
+			t.Fatalf("auth notification leaked %q: %q", forbidden, copy)
+		}
+	}
+	if got := safePollError(authErr); got != ports.ErrSCMAuthentication.Error() || strings.Contains(got, secret) {
+		t.Fatalf("safePollError = %q", got)
+	}
+	if got := telemetry.events[0].Payload["reason"]; got != "github_authentication" {
+		t.Fatalf("telemetry reason = %#v, want github_authentication", got)
+	}
+}
+
+func TestPollRoutesProviderAuthenticationFailureToControlPlaneNotifier(t *testing.T) {
+	store := testStoreWithSession()
+	provider := &fakeProvider{
+		repoGuards: map[string]ports.SCMGuardResult{},
+		listErr:    fmt.Errorf("%w: Bad credentials", ports.ErrSCMAuthentication),
+	}
+	notifications := &captureNotificationSink{}
+	observer := New(provider, store, &fakeLifecycle{}, Config{
+		Clock:         func() time.Time { return time.Unix(7_100, 0).UTC() },
+		Logger:        quietSlog(),
+		Notifications: notifications,
+	})
+
+	err := observer.Poll(context.Background())
+	if !errors.Is(err, ports.ErrSCMAuthentication) {
+		t.Fatalf("Poll error = %v, want provider-neutral auth classification", err)
+	}
+	if len(notifications.intents) != 1 || notifications.intents[0].Type != domain.NotificationControlPlaneFailed || !strings.Contains(notifications.intents[0].BodyOverride, "gh auth login") {
+		t.Fatalf("notifications = %#v", notifications.intents)
+	}
+}
+
+func TestPollNotifierFailureIsIsolatedAndRedacted(t *testing.T) {
+	now := time.Unix(8_000, 0).UTC()
+	secret := "hook-secret"
+	notifications := &captureNotificationSink{err: fmt.Errorf("post https://%s@example.test: refused", secret)}
+	buf := &syncBuffer{}
+	observer := New(nil, nil, nil, Config{
+		Clock:         func() time.Time { return now },
+		Logger:        slog.New(slog.NewTextHandler(buf, nil)),
+		Notifications: notifications,
+	})
+	pollErr := errors.New("poll failed")
+
+	err := observer.runPoll(context.Background(), func(context.Context) error { return pollErr })
+	if !errors.Is(err, pollErr) {
+		t.Fatalf("runPoll error = %v, want original poll error", err)
+	}
+	if strings.Contains(buf.String(), secret) {
+		t.Fatalf("notifier diagnostic leaked credentials:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "notifier_failed") {
+		t.Fatalf("missing isolated notifier diagnostic:\n%s", buf.String())
 	}
 }
 

@@ -39,6 +39,10 @@ const (
 	DefaultCacheMax = 512
 	// BatchSize is the maximum number of PRs in one provider batch fetch.
 	BatchSize = 25
+	// controlPlaneEscalationFailureCount is the one repeated-failure threshold
+	// for an incident. Notifications fire on failure 1, failure 3, and recovery;
+	// later failures stay quiet so a 30-second poll cannot create an alert storm.
+	controlPlaneEscalationFailureCount = 3
 )
 
 // Provider is the normalized SCM provider contract used by the observer.
@@ -107,6 +111,9 @@ type Config struct {
 	// Telemetry receives poll-cycle duration and health observations. Nil disables
 	// structured emission; warning logs remain enabled for poll overruns.
 	Telemetry ports.EventSink
+	// Notifications receives control-plane failure, escalation, and recovery
+	// transitions. Nil disables push delivery without changing poll behavior.
+	Notifications ports.NotificationSink
 	// ReviewCoordinator optionally advances the durable automatic review loop.
 	ReviewCoordinator ReviewCoordinator
 	// CacheMax bounds each in-memory ETag/review cache. Zero uses DefaultCacheMax.
@@ -171,10 +178,20 @@ type Observer struct {
 	logger *slog.Logger
 	// telemetry receives best-effort operational observations for the poll loop.
 	telemetry ports.EventSink
+	// notifications receives best-effort control-plane health transitions.
+	notifications ports.NotificationSink
+	// consecutiveFailures and failureWasAuth are the in-memory state for the
+	// current control-plane incident. The Start loop is serialized, so no lock is
+	// needed around these fields.
+	consecutiveFailures int
+	failureWasAuth      bool
 	// credentialsChecked records whether an optional provider credential gate ran.
 	credentialsChecked bool
 	// disabled is set after the credential gate reports unavailable credentials.
 	disabled bool
+	// credentialFailure distinguishes a credential-disabled observer from tests
+	// or embeddings that deliberately disable provider work for other reasons.
+	credentialFailure bool
 	// Cache holds bounded in-memory provider ETags and review poll timestamps.
 	Cache ObserverCache
 }
@@ -182,7 +199,7 @@ type Observer struct {
 // New constructs an Observer with default cadence/cache settings for zero
 // values in cfg.
 func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Observer {
-	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, reviewCoordinator: cfg.ReviewCoordinator, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, telemetry: cfg.Telemetry, Cache: newCache(cfg.CacheMax)}
+	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, reviewCoordinator: cfg.ReviewCoordinator, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, telemetry: cfg.Telemetry, notifications: cfg.Notifications, Cache: newCache(cfg.CacheMax)}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
@@ -218,7 +235,7 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 		// mutation ordering, this is the loop's non-reentrancy guard: the next
 		// timer is not armed until the current cycle has fully completed.
 		if err := o.runStartedPoll(ctx, &credentialGate); err != nil && !errors.Is(err, context.Canceled) {
-			o.logger.Error("scm observer: initial poll failed", "err", err)
+			o.logger.Error("scm observer: initial poll failed", "err", safePollError(err))
 		}
 		for {
 			timer := time.NewTimer(o.nextPollDelay())
@@ -233,7 +250,7 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 				return
 			case <-timer.C:
 				if err := o.runStartedPoll(ctx, &credentialGate); err != nil && !errors.Is(err, context.Canceled) {
-					o.logger.Error("scm observer: poll failed", "err", err)
+					o.logger.Error("scm observer: poll failed", "err", safePollError(err))
 				}
 			}
 		}
@@ -249,7 +266,7 @@ func (o *Observer) runStartedPoll(ctx context.Context, credentialGate *sync.Once
 	return o.runPoll(ctx, func(ctx context.Context) error {
 		credentialGate.Do(func() {
 			if _, err := o.checkCredentials(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				o.logger.Error("scm observer: initial credential check failed", "err", err)
+				o.logger.Error("scm observer: initial credential check failed", "err", safePollError(err))
 			}
 		})
 		return o.poll(ctx)
@@ -268,7 +285,15 @@ func (o *Observer) runPoll(ctx context.Context, poll func(context.Context) error
 	err := poll(ctx)
 	completedAt := o.clock()
 	if !errors.Is(err, context.Canceled) {
-		o.recordPollCompletion(ctx, startedAt, completedAt, err)
+		healthErr := err
+		// A missing credential gate disables provider polling while the local
+		// fallback lane keeps returning nil. Treat that deliberate fail-closed
+		// state as unhealthy for alerting without changing Poll's existing return
+		// contract or suppressing fallback work.
+		if healthErr == nil && o.credentialFailure {
+			healthErr = ports.ErrSCMAuthentication
+		}
+		o.recordPollCompletion(ctx, startedAt, completedAt, healthErr)
 	}
 	return err
 }
@@ -285,19 +310,20 @@ func (o *Observer) recordPollCompletion(ctx context.Context, startedAt, complete
 		"interval_ms":   o.tick.Milliseconds(),
 		"health_status": "ok",
 	}
+	level := ports.TelemetryLevelInfo
 	if pollErr != nil {
 		payload["outcome"] = "failure"
-		// Poll errors already have their established error-log path in Start.
-		// Leave health classification to the notifier follow-up rather than
-		// expanding this overrun-only producer into failure alerting.
-		delete(payload, "health_status")
+		payload["health_status"] = "error"
+		payload["reason"] = pollFailureReason(pollErr)
+		level = ports.TelemetryLevelError
 	}
 
-	level := ports.TelemetryLevelInfo
 	if overrun := duration - o.tick; overrun > 0 {
-		level = ports.TelemetryLevelWarn
-		payload["reason"] = "poll_overrun"
-		payload["health_status"] = "warn"
+		if pollErr == nil {
+			level = ports.TelemetryLevelWarn
+			payload["reason"] = "poll_overrun"
+			payload["health_status"] = "warn"
+		}
 		payload["overrun_ms"] = overrun.Milliseconds()
 		o.logger.Warn("scm observer: poll overrun; lifecycle health degraded",
 			"reason", "poll_overrun",
@@ -314,6 +340,84 @@ func (o *Observer) recordPollCompletion(ctx context.Context, startedAt, complete
 			Level:      level,
 			Payload:    payload,
 		})
+	}
+	o.routeControlPlaneHealth(ctx, completedAt.UTC(), pollErr)
+}
+
+func pollFailureReason(err error) string {
+	if errors.Is(err, ports.ErrSCMAuthentication) {
+		return "github_authentication"
+	}
+	return "poll_failed"
+}
+
+func safePollError(err error) string {
+	if errors.Is(err, ports.ErrSCMAuthentication) {
+		return ports.ErrSCMAuthentication.Error()
+	}
+	return err.Error()
+}
+
+// routeControlPlaneHealth is a small transition machine over serialized poll
+// completions. Delivery is best-effort and never changes the poll's return
+// value. The notifier receives only fixed copy and counters; raw provider
+// errors never cross this boundary.
+func (o *Observer) routeControlPlaneHealth(ctx context.Context, occurredAt time.Time, pollErr error) {
+	if pollErr == nil {
+		failures := o.consecutiveFailures
+		if failures == 0 {
+			return
+		}
+		o.consecutiveFailures = 0
+		o.failureWasAuth = false
+		o.deliverControlPlaneNotification(ctx, ports.NotificationIntent{
+			Type:          domain.NotificationControlPlaneRecovered,
+			CreatedAt:     occurredAt,
+			TitleOverride: "AO control plane poll recovered",
+			BodyOverride:  fmt.Sprintf("AO is refreshing GitHub state again after %d failed polls.", failures),
+		})
+		return
+	}
+
+	o.consecutiveFailures++
+	o.failureWasAuth = o.failureWasAuth || errors.Is(pollErr, ports.ErrSCMAuthentication)
+	intent := ports.NotificationIntent{CreatedAt: occurredAt}
+	switch o.consecutiveFailures {
+	case 1:
+		intent.Type = domain.NotificationControlPlaneFailed
+		if o.failureWasAuth {
+			intent.TitleOverride = "GitHub authentication needs attention"
+			intent.BodyOverride = "AO cannot refresh GitHub state. Run `gh auth login` and restart AO."
+		} else {
+			intent.TitleOverride = "AO control plane poll failed"
+			intent.BodyOverride = "AO could not refresh GitHub state. It will retry automatically."
+		}
+	case controlPlaneEscalationFailureCount:
+		intent.Type = domain.NotificationControlPlaneEscalated
+		if o.failureWasAuth {
+			intent.TitleOverride = "GitHub authentication is still blocking AO"
+			intent.BodyOverride = fmt.Sprintf("AO has failed to refresh GitHub state %d polls in a row. Run `gh auth login` and restart AO.", o.consecutiveFailures)
+		} else {
+			intent.TitleOverride = "AO control plane poll is still failing"
+			intent.BodyOverride = fmt.Sprintf("AO has failed to refresh GitHub state %d polls in a row. Check GitHub connectivity and AO logs.", o.consecutiveFailures)
+		}
+	default:
+		return
+	}
+	o.deliverControlPlaneNotification(ctx, intent)
+}
+
+func (o *Observer) deliverControlPlaneNotification(ctx context.Context, intent ports.NotificationIntent) {
+	if o.notifications == nil {
+		return
+	}
+	if err := o.notifications.Notify(ctx, intent); err != nil {
+		// Do not attach the notifier error: notifier transports may include
+		// credential-bearing endpoints in their errors. The failure is isolated
+		// from the poll and this fixed diagnostic is enough to find the sink.
+		o.logger.Warn("scm observer: control-plane notification delivery failed",
+			"notification_type", intent.Type,
+			"reason", "notifier_failed")
 	}
 }
 
@@ -410,6 +514,9 @@ func (o *Observer) poll(ctx context.Context) error {
 	}
 
 	repoGuards := o.guardRepos(ctx, sessionRepos)
+	if err := repoGuardAuthFailure(repoGuards); err != nil {
+		return err
+	}
 	repoRefreshOK := pendingRepoRefreshes(repoGuards)
 	markRepoRefreshFailed := func(repo ports.SCMRepo) {
 		key := prKey(repo, 0)
@@ -420,12 +527,17 @@ func (o *Observer) poll(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	o.discoverNewPRs(ctx, sessionRepos, subjects, repoGuards, now, markRepoRefreshFailed)
+	if err := o.discoverNewPRs(ctx, sessionRepos, subjects, repoGuards, now, markRepoRefreshFailed); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	selection := o.selectRefreshCandidates(ctx, subjects, repoGuards, markRepoRefreshFailed)
+	selection, err := o.selectRefreshCandidates(ctx, subjects, repoGuards, markRepoRefreshFailed)
+	if err != nil {
+		return err
+	}
 	observations := map[string]ports.SCMObservation{}
 	prRefreshOK := map[string]bool{}
 	for key := range selection.candidateKeys {
@@ -437,7 +549,10 @@ func (o *Observer) poll(ctx context.Context) error {
 		}
 		batch, err := o.provider.FetchPullRequests(ctx, chunk)
 		if err != nil {
-			o.logger.Error("scm observer: GraphQL PR batch failed", "err", err)
+			o.logger.Error("scm observer: GraphQL PR batch failed", "err", safePollError(err))
+			if errors.Is(err, ports.ErrSCMAuthentication) {
+				return err
+			}
 			for _, ref := range chunk {
 				markRepoRefreshFailed(ref.Repo)
 			}
@@ -477,7 +592,9 @@ func (o *Observer) poll(ctx context.Context) error {
 	reviewModes := map[string]ports.ReviewWriteMode{}
 	localOnlyObservations := map[string]bool{}
 	reviewStale := map[string]bool{}
-	o.refreshReviews(ctx, subjects, observations, selection.subjectsByPR, reviewModes, localOnlyObservations, reviewStale, now)
+	if err := o.refreshReviews(ctx, subjects, observations, selection.subjectsByPR, reviewModes, localOnlyObservations, reviewStale, now); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -686,7 +803,11 @@ func (o *Observer) checkCredentials(ctx context.Context) (bool, error) {
 	if checker, ok := o.provider.(credentialChecker); ok {
 		probe = checker.SCMCredentialsAvailable
 	}
-	return observe.CheckCredentialsOnce(ctx, probe, &o.credentialsChecked, &o.disabled, o.logger, "scm observer")
+	proceed, err := observe.CheckCredentialsOnce(ctx, probe, &o.credentialsChecked, &o.disabled, o.logger, "scm observer")
+	if err == nil && !proceed && o.disabled {
+		o.credentialFailure = true
+	}
+	return proceed, err
 }
 
 // discoverSubjects builds the per-PR refresh subjects (one per open tracked PR)
@@ -918,13 +1039,22 @@ func (o *Observer) guardRepos(ctx context.Context, sessionRepos []sessionRepo) m
 		prev, had := o.Cache.RepoPRListETag[key]
 		res, err := o.provider.RepoPRListGuard(ctx, repo, prev)
 		if err != nil {
-			o.logger.Error("scm observer: repo PR-list guard failed", "repo", repoFullName(repo), "err", err)
+			o.logger.Error("scm observer: repo PR-list guard failed", "repo", repoFullName(repo), "err", safePollError(err))
 			out[key] = repoGuardState{hadETag: had, err: err}
 			continue
 		}
 		out[key] = repoGuardState{result: res, hadETag: had}
 	}
 	return out
+}
+
+func repoGuardAuthFailure(guards map[string]repoGuardState) error {
+	for _, guard := range guards {
+		if errors.Is(guard.err, ports.ErrSCMAuthentication) {
+			return guard.err
+		}
+	}
+	return nil
 }
 
 func pendingRepoRefreshes(guards map[string]repoGuardState) map[string]bool {
@@ -944,7 +1074,7 @@ func pendingRepoRefreshes(guards map[string]repoGuardState) map[string]bool {
 // PRs (its root plus stacked children). Repos whose PR-list guard reports
 // NotModified against a known ETag are skipped, since nothing new can have
 // appeared since the last poll.
-func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRepo, subjects map[string]*subject, guards map[string]repoGuardState, now time.Time, markRepoFailed func(ports.SCMRepo)) {
+func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRepo, subjects map[string]*subject, guards map[string]repoGuardState, now time.Time, markRepoFailed func(ports.SCMRepo)) error {
 	byRepo := map[string][]sessionRepo{}
 	repos := map[string]ports.SCMRepo{}
 	for _, sr := range sessionRepos {
@@ -962,7 +1092,10 @@ func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRep
 		}
 		pulls, err := o.provider.ListOpenPRsByRepo(ctx, repo)
 		if err != nil {
-			o.logger.Debug("scm observer: open PR list failed", "repo", repoFullName(repo), "err", err)
+			o.logger.Debug("scm observer: open PR list failed", "repo", repoFullName(repo), "err", safePollError(err))
+			if errors.Is(err, ports.ErrSCMAuthentication) {
+				return err
+			}
 			if markRepoFailed != nil && !errors.Is(err, ports.ErrSCMNotFound) {
 				markRepoFailed(repo)
 			}
@@ -1023,6 +1156,7 @@ func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRep
 			}
 		}
 	}
+	return nil
 }
 
 // matchSession picks the session that owns sourceBranch. A session owns the
@@ -1078,7 +1212,7 @@ func sessionBranchPrefixes(branch string) []string {
 	return prefixes
 }
 
-func (o *Observer) selectRefreshCandidates(ctx context.Context, subjects map[string]*subject, guards map[string]repoGuardState, markRepoFailed func(ports.SCMRepo)) refreshSelection {
+func (o *Observer) selectRefreshCandidates(ctx context.Context, subjects map[string]*subject, guards map[string]repoGuardState, markRepoFailed func(ports.SCMRepo)) (refreshSelection, error) {
 	selection := refreshSelection{
 		subjectsByPR:  map[string]*subject{},
 		commitETags:   map[string]pendingCacheString{},
@@ -1100,7 +1234,10 @@ func (o *Observer) selectRefreshCandidates(ctx context.Context, subjects map[str
 			prev := o.Cache.CommitChecksETag[commitKey]
 			res, err := o.provider.CommitChecksGuard(ctx, s.repo, s.known.HeadSHA, prev)
 			if err != nil {
-				o.logger.Error("scm observer: commit check-runs guard failed", "pr", s.known.URL, "sha", s.known.HeadSHA, "err", err)
+				o.logger.Error("scm observer: commit check-runs guard failed", "pr", s.known.URL, "sha", s.known.HeadSHA, "err", safePollError(err))
+				if errors.Is(err, ports.ErrSCMAuthentication) {
+					return selection, err
+				}
 				if markRepoFailed != nil {
 					markRepoFailed(s.repo)
 				}
@@ -1116,7 +1253,7 @@ func (o *Observer) selectRefreshCandidates(ctx context.Context, subjects map[str
 			selection.candidateKeys[key] = true
 		}
 	}
-	return selection
+	return selection, nil
 }
 
 func missingLocalState(pr domain.PullRequest) bool {
@@ -1194,7 +1331,7 @@ func applyStoredFailedLogTails(obs *ports.SCMObservation, checks []domain.PullRe
 	return true
 }
 
-func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subject, observations map[string]ports.SCMObservation, subjectsByPR map[string]*subject, reviewModes map[string]ports.ReviewWriteMode, localOnlyObservations, reviewStale map[string]bool, now time.Time) {
+func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subject, observations map[string]ports.SCMObservation, subjectsByPR map[string]*subject, reviewModes map[string]ports.ReviewWriteMode, localOnlyObservations, reviewStale map[string]bool, now time.Time) error {
 	for _, s := range subjects {
 		if !s.hasPR || s.known.Number <= 0 {
 			continue
@@ -1226,7 +1363,10 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		}
 		review, err := o.provider.FetchReviewThreads(ctx, ports.SCMPRRef{Repo: s.repo, Number: s.known.Number, URL: s.known.URL})
 		if err != nil {
-			o.logger.Error("scm observer: review refresh failed", "pr", s.known.URL, "err", err)
+			o.logger.Error("scm observer: review refresh failed", "pr", s.known.URL, "err", safePollError(err))
+			if errors.Is(err, ports.ErrSCMAuthentication) {
+				return err
+			}
 			o.cacheSetBool(o.Cache.ReviewRefreshFailed, &o.Cache.reviewFailedOrder, pkey, true)
 			failureObs := obs
 			if !hasObs {
@@ -1279,6 +1419,7 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		}
 		cacheDelete(o.Cache.ReviewRefreshFailed, &o.Cache.reviewFailedOrder, pkey)
 	}
+	return nil
 }
 
 func (o *Observer) needsReviewRefresh(key string, local domain.PullRequest, decision, currentHeadSHA string, hasObs bool, now time.Time) bool {
