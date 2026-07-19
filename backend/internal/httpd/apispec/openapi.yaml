@@ -1897,12 +1897,14 @@ paths:
         schema:
           description: Session identifier, e.g. project-1.
           type: string
-      - description: Session-scoped verification capability issued by the daemon.
+      - description: Opaque capability for accidental cross-session request isolation;
+          not a same-user security boundary.
         in: header
         name: X-AO-Verification-Capability
         required: true
         schema:
-          description: Session-scoped verification capability issued by the daemon.
+          description: Opaque capability for accidental cross-session request isolation;
+            not a same-user security boundary.
           minLength: 1
           type: string
           writeOnly: true

@@ -25,9 +25,9 @@ type VerifyRequest struct {
 
 // VerificationCapabilityHeader carries the opaque, session-scoped capability
 // issued when a session starts. It binds normal CLI requests to their session
-// and project; AO does not provide an OS-identity boundary between same-user workers.
+// and project for accidental isolation; it is not a same-user security boundary.
 type VerificationCapabilityHeader struct {
-	Capability string `header:"X-AO-Verification-Capability" required:"true" minLength:"1" writeOnly:"true" description:"Session-scoped verification capability issued by the daemon."`
+	Capability string `header:"X-AO-Verification-Capability" required:"true" minLength:"1" writeOnly:"true" description:"Opaque capability for accidental cross-session request isolation; not a same-user security boundary."`
 }
 
 // VerifyResponse reports the completed run and its bounded daemon-owned log.

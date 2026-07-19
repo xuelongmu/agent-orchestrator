@@ -64,6 +64,7 @@ func TestBuild_VerificationAuthorizationContract(t *testing.T) {
 		[]byte("name: X-AO-Verification-Capability"),
 		[]byte(`"403":`),
 		[]byte("writeOnly: true"),
+		[]byte("not a same-user security boundary"),
 	} {
 		if !bytes.Contains(got, want) {
 			t.Fatalf("generated verification contract is missing %q", want)

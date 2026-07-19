@@ -65,9 +65,10 @@ binds normal CLI requests and prevents blind or accidental cross-session calls.
 Workers run as the same OS user, and AO itself does not provide an OS-identity
 isolation boundary between them. A hostile same-UID worker that reads another
 session's process environment or `AO_DATA_DIR` is therefore outside this
-authorization boundary. OS-isolated authorization hardening is tracked in
-[#150](https://github.com/xuelongmu/agent-orchestrator/issues/150). Do not copy
-capabilities between sessions or put them in logs.
+authorization boundary. Hostile-worker isolation is explicitly out of scope;
+see the [worker/daemon threat model](worker-daemon-threat-model.md) for the
+cross-platform access assumptions and decision. Do not copy capabilities
+between sessions or put them in logs.
 
 The route is `POST /api/v1/sessions/{sessionId}/verify`. It intentionally
 bypasses the ordinary short REST timeout, enforces its own profile timeout, and

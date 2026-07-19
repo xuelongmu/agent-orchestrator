@@ -208,6 +208,9 @@ func TestCapabilityCannotAuthorizeAnotherSession(t *testing.T) {
 	if !errors.As(err, &apiError) || apiError.Code != "VERIFY_CAPABILITY_INVALID" || apiError.Kind != apierr.KindForbidden {
 		t.Fatalf("error = %v", err)
 	}
+	if apiError.Message != "Verification capability is missing or invalid for this session" {
+		t.Fatalf("message = %q", apiError.Message)
+	}
 }
 
 func TestCapabilityIsCheckedBeforeSessionState(t *testing.T) {

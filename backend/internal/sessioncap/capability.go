@@ -15,7 +15,8 @@ import (
 )
 
 const (
-	// EnvVerificationCapability is injected only into the owning session runtime.
+	// EnvVerificationCapability is injected into the environment AO builds for
+	// the owning session runtime.
 	EnvVerificationCapability = "AO_VERIFY_CAPABILITY"
 	keyFileName               = "verification-capability.key"
 	keyBytes                  = 32
@@ -24,7 +25,8 @@ const (
 // Manager signs and verifies session/project-bound capabilities.
 type Manager struct{ key [keyBytes]byte }
 
-// Open loads or atomically creates the daemon's private capability key.
+// Open loads or atomically creates the daemon-managed capability key. The key
+// is not isolated from hostile processes running as the same OS account.
 func Open(dataDir string) (*Manager, error) {
 	root, err := os.OpenRoot(dataDir)
 	if err != nil {
