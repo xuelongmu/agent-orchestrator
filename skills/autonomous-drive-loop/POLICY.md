@@ -26,11 +26,13 @@ Merge only when all of these conditions hold in one fresh snapshot:
 2. The candidate verdict and every merge check apply to the current HEAD SHA.
 3. All required checks have completed successfully; none are pending, skipped
    when required, cancelled, failing, or unknown.
-4. Every review and issue-comment verdict channel has been inspected. The
-   configured reviewer supplied an explicit clean final verdict for current HEAD.
-5. No unresolved actionable finding remains in review threads, reviews, or issue
-   comments. Finding contents and dispositions, not a summary count, determine
-   this condition.
+4. Every review and issue-comment verdict channel has been inspected, and one
+   current-HEAD reviewer terminal condition holds: (a) an explicit clean final
+   verdict/thumbs-up, (b) a completed review with no unresolved P1 finding, or
+   (c) the sixth completed review round with every P1 finding dispositioned.
+5. No unresolved human feedback or undispositioned reviewer finding remains.
+   Capture, resolve, or explicitly disposition non-P1 findings before merging;
+   finding contents and dispositions, not a summary count, determine this.
 6. No human hold, requested change, unresolved ambiguity, out-of-scope correctness
    dependency, or owed merge-blocking output remains.
 7. The provider reports the PR mergeable and repository-required human approvals
@@ -65,15 +67,16 @@ immediately before merge; restart evaluation if it changed.
 - A finding may be deflected out of scope only when it is not required for this
   PR's correctness. File and link a follow-up issue before resolving the thread;
   otherwise escalate it as owed output.
-- Permit at most six automated fix rounds per PR. The terminal alternatives are:
-  (a) a simplification round produces the same class again, (b) the reviewer retry
-  limit is exhausted, or (c) the sixth completed review round has all P1 findings
-  dispositioned. In (c), capture, resolve, or explicitly disposition every
-  remaining non-P1 finding. In all three cases, still require exact-head green
-  required CI, mergeable/non-draft state, and no unresolved human hold or feedback
-  before merge. Stop dispatches and deliver a human escalation with the current
-  HEAD, finding classes and occurrences, attempted invariant or chokepoint,
-  verification evidence, and precise decision required.
+- Permit at most six automated fix rounds per PR. Stop and escalate earlier when
+  a simplification round produces the same class again or the reviewer retry
+  limit is exhausted; those stops are not merge approval unless a reviewer
+  terminal condition from the merge bar independently holds. At the sixth
+  completed review round, capture, resolve, or explicitly disposition every
+  remaining non-P1 finding and require every P1 finding to be dispositioned.
+  Exact-head green required CI, mergeable/non-draft state, and no unresolved
+  human hold or feedback remain mandatory. Include the current HEAD, finding
+  classes and occurrences, attempted invariant or chokepoint, verification
+  evidence, and precise decision required in any escalation.
 
 ## Delivery and scheduling
 

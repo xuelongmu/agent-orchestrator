@@ -57,6 +57,9 @@ later outcome look inevitable. Never store credentials, tokens, or raw secrets.
   Prefer `ao status` and `ao session get <id>` when those sessions are involved.
 - Confirm the state parses, its repository and PR match the requested target,
   and its policy version is understood.
+- Inspect `owedOutputs` immediately after loading state. Deliver outstanding
+  items even when the cycle's only safe action is to wait or stop and no other
+  state mutation will occur.
 - Check for an `ambiguous` dispatch or decision left by a crash. Reconcile it
   against the remote system before issuing another mutation.
 - Stop rather than guess if identity, credentials, repository, or state integrity
@@ -122,10 +125,11 @@ prompt.
 
 ### 5. Deliver owed output
 
-Read `owedOutputs` after every state update. Send each owed human-facing result
-to its intended audience, then record the delivery receipt and set it to
-`delivered`. A prepared message, a state entry, or a prompt saying `DONE` is not
-delivery. Retry or surface failures; do not silently clear them.
+Read `owedOutputs` once from the state loaded at cycle start and again after every
+state update. Send each owed human-facing result to its intended audience, then
+record the delivery receipt and set it to `delivered`. A prepared message, a
+state entry, or a prompt saying `DONE` is not delivery. Retry or surface failures;
+do not silently clear them.
 
 ### 6. Reschedule with pointers only
 
