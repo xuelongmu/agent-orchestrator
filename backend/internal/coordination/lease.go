@@ -17,10 +17,9 @@ import (
 )
 
 const (
-	claimKey          = "exclusive-db-writer"
-	leaseDuration     = 15 * time.Second
-	leaseRenewEvery   = 5 * time.Second
-	acquireCASRetries = 3
+	claimKey        = "exclusive-db-writer"
+	leaseDuration   = 15 * time.Second
+	leaseRenewEvery = 5 * time.Second
 )
 
 var errLeaseLost = errors.New("exclusive database-writer lease lost")
@@ -64,39 +63,106 @@ func OpenExclusive(ctx context.Context, dataDir string, ownerPID int) (*sqlite.S
 // holder exists. The random token, not the diagnostic PID, is the fencing
 // generation, so PID reuse cannot impersonate a crashed holder.
 func Acquire(ctx context.Context, st store, ownerPID int) (*Lease, error) {
-	// Keep the monotonic component for the local watchdog. acquireAt derives a
-	// UTC wall-clock value separately for the cross-process SQLite lease.
-	return acquireAt(ctx, st, ownerPID, uuid.NewString(), time.Now(), leaseDuration)
+	return acquireWithClock(ctx, st, ownerPID, uuid.NewString(), leaseDuration, time.Now, waitMonotonic)
 }
 
 func acquireAt(ctx context.Context, st store, ownerPID int, token string, now time.Time, duration time.Duration) (*Lease, error) {
+	// Tests that do not exercise takeover timing use a fixed wall clock and a
+	// quarantine seam that has already elapsed.
+	return acquireWithClock(ctx, st, ownerPID, token, duration, func() time.Time { return now }, func(context.Context, time.Duration) error { return nil })
+}
+
+func acquireWithClock(
+	ctx context.Context,
+	st store,
+	ownerPID int,
+	token string,
+	duration time.Duration,
+	now func() time.Time,
+	wait func(context.Context, time.Duration) error,
+) (*Lease, error) {
 	if token == "" || ownerPID <= 0 || duration <= 0 {
 		return nil, errors.New("invalid exclusive database-writer lease")
 	}
-	lease := &Lease{store: st, token: token, ownerPID: ownerPID, duration: duration, confirmedUntil: now.Add(duration)}
-	wallNow := now.UTC()
-	for range acquireCASRetries {
-		desired := lease.claimAt(wallNow)
-		current, acquired, err := st.TryAcquireCoordinationClaim(ctx, desired)
-		if err != nil {
-			return nil, err
-		}
-		if acquired {
-			return lease, nil
-		}
-		if current.LeaseExpiresAt.After(wallNow) {
-			return nil, fmt.Errorf("exclusive database writer leased by pid %d until %s", current.OwnerPID, current.LeaseExpiresAt.UTC().Format(time.RFC3339Nano))
-		}
-		taken, err := st.TakeOverCoordinationClaim(ctx, current.OwnerToken, wallNow, desired)
-		if err != nil {
-			return nil, err
-		}
-		if taken {
-			return lease, nil
-		}
-		// A concurrent renewal or takeover changed the guarded token or expiry.
+	if now == nil || wait == nil {
+		return nil, errors.New("invalid exclusive database-writer lease clock")
 	}
-	return nil, errors.New("exclusive database-writer lease changed repeatedly")
+	leaseAt := func(acquiredAt time.Time) *Lease {
+		return &Lease{
+			store:          st,
+			token:          token,
+			ownerPID:       ownerPID,
+			duration:       duration,
+			confirmedUntil: acquiredAt.Add(duration),
+		}
+	}
+
+	attemptedAt := now()
+	lease := leaseAt(attemptedAt)
+	wallNow := attemptedAt.UTC()
+	desired := lease.claimAt(wallNow)
+	current, acquired, err := st.TryAcquireCoordinationClaim(ctx, desired)
+	if err != nil {
+		return nil, err
+	}
+	if acquired {
+		return lease, nil
+	}
+	if current.LeaseExpiresAt.After(wallNow) {
+		return nil, fmt.Errorf("exclusive database writer leased by pid %d until %s", current.OwnerPID, current.LeaseExpiresAt.UTC().Format(time.RFC3339Nano))
+	}
+
+	// An arbitrary forward wall-clock adjustment can make a healthy holder's
+	// persisted expiry appear elapsed while its monotonic watchdog still permits
+	// work. Quarantine this exact token+expiry generation for the watchdog's
+	// maximum remaining lifetime. A live holder advances the persisted expiry;
+	// a crashed holder leaves the generation unchanged and becomes reclaimable.
+	observedToken := current.OwnerToken
+	observedExpiry := current.LeaseExpiresAt
+	if err := wait(ctx, duration); err != nil {
+		return nil, err
+	}
+
+	takeoverAt := now()
+	lease = leaseAt(takeoverAt)
+	wallNow = takeoverAt.UTC()
+	desired = lease.claimAt(wallNow)
+	current, acquired, err = st.TryAcquireCoordinationClaim(ctx, desired)
+	if err != nil {
+		return nil, err
+	}
+	if acquired {
+		return lease, nil
+	}
+	if current.OwnerToken != observedToken || !current.LeaseExpiresAt.Equal(observedExpiry) {
+		return nil, errors.New("exclusive database writer lease changed during takeover quarantine")
+	}
+	if current.LeaseExpiresAt.After(wallNow) {
+		return nil, fmt.Errorf("exclusive database writer leased by pid %d until %s", current.OwnerPID, current.LeaseExpiresAt.UTC().Format(time.RFC3339Nano))
+	}
+
+	// The store's renewal is monotonic, so using the observed expiry as the SQL
+	// cutoff makes this CAS exact for token+expiry. A renewal racing this call
+	// advances the expiry and prevents takeover even after a large wall jump.
+	taken, err := st.TakeOverCoordinationClaim(ctx, observedToken, observedExpiry, desired)
+	if err != nil {
+		return nil, err
+	}
+	if taken {
+		return lease, nil
+	}
+	return nil, errors.New("exclusive database-writer lease changed during takeover")
+}
+
+func waitMonotonic(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (l *Lease) claimAt(now time.Time) sqlitestore.CoordinationClaim {
