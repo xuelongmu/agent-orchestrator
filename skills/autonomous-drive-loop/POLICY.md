@@ -11,8 +11,13 @@ reviewed commit. Never let a recurring loop rewrite it. Procedures belong in
 - Bind each loop to one repository and pull request. Stop on an identity mismatch.
 - Re-query mutable provider and AO facts before acting. Do not act from a prior
   cycle's prompt, summary, cached HEAD, or cached status.
-- Require an external receipt before recording a mutation as successful. Reconcile
-  ambiguous mutations before retrying them.
+- Before each non-idempotent provider mutation, durably record a deterministic
+  intent and external marker. Require an external receipt before recording the
+  mutation as successful; reconcile prepared or ambiguous mutations by marker
+  and payload fingerprint before retrying them.
+- Pin both the policy file's content hash and the commit that supplied it when a
+  loop is created. On recovery, stop before acting if either pin is missing or
+  does not match the loaded policy.
 - Do not override branch protection, dismiss findings, resolve another author's
   thread, file issues, switch reviewers, or merge unless the operator has granted
   that authority.

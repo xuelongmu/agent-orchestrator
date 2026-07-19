@@ -19,11 +19,13 @@
 		"policy": {
 			"path": "skills/autonomous-drive-loop/POLICY.md",
 			"version": 1,
-			"gitCommit": ""
+			"gitCommit": "",
+			"contentSha256": ""
 		}
 	},
 	"decisions": [],
 	"dispatchLog": [],
+	"mutationLog": [],
 	"findingClassLedger": [],
 	"owedOutputs": []
 }

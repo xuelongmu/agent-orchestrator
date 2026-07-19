@@ -40,6 +40,13 @@ after a crash:
 - `dispatchLog`: append `{id, requestedAt, kind, headSha, target, findingIds,
 outcome, externalId, evidence}`. Use `outcome: "ambiguous"` when a crash makes
   delivery uncertain.
+- `mutationLog`: append write-ahead and receipt events for every non-idempotent
+  provider mutation. A prepared event is `{id, intentId, recordedAt,
+phase: "prepared", kind, target, headSha, externalMarker, payloadHash}`; a
+  terminal event reuses `intentId` with `phase: "succeeded" | "failed" |
+"reconciled"` plus the provider receipt/evidence. Derive `intentId` and
+  `externalMarker` deterministically from the loop, action kind, target, HEAD,
+  and payload hash so recovery can search for the same action.
 - `findingClassLedger`: keep one record per normalized root-cause class with
   `{classTag, invariant, rootCauseNote, occurrences[]}`. Each occurrence records
   `{findingId, round, url, file, headSha, disposition, fixCommit, issueUrl}`.
@@ -56,12 +63,18 @@ later outcome look inevitable. Never store credentials, tokens, or raw secrets.
 - Confirm the AO daemon and relevant worker/reviewer sessions are reachable.
   Prefer `ao status` and `ao session get <id>` when those sessions are involved.
 - Confirm the state parses, its repository and PR match the requested target,
-  and its policy version is understood.
+  and its policy version is understood. Require `policy.gitCommit` and
+  `policy.contentSha256` to be populated, recompute the policy file's SHA-256,
+  and confirm both the content hash and the commit which last changed the file
+  match the pinned values. Stop for operator confirmation before any action if
+  either value is missing or mismatched.
 - Inspect `owedOutputs` immediately after loading state. Deliver outstanding
   items even when the cycle's only safe action is to wait or stop and no other
   state mutation will occur.
-- Check for an `ambiguous` dispatch or decision left by a crash. Reconcile it
-  against the remote system before issuing another mutation.
+- Check for a prepared mutation without a terminal event and for an `ambiguous`
+  dispatch or decision left by a crash. Search the provider by its deterministic
+  external marker, target, and payload hash, append a reconciliation event, and
+  do not issue another mutation until its outcome is known.
 - Stop rather than guess if identity, credentials, repository, or state integrity
   is uncertain.
 
@@ -107,21 +120,36 @@ the invariant, enforce it at one chokepoint, remove redundant per-site predicate
 and treat individual findings as regression cases. Do not request another local
 symptom patch.
 
-Capture the external action's command/tool result, provider ID or URL, target
-HEAD, and timestamp. Never report success from intent alone.
+Before every non-idempotent provider mutation, derive its deterministic intent
+ID, external marker, and payload hash; append the prepared event to
+`mutationLog`; atomically persist and validate the state; then perform exactly
+that mutation. Put the marker in the provider-visible payload or idempotency-key
+field when supported. This applies to review re-triggers, issue filing, thread
+resolution, owed-output delivery, and other provider writes. If a provider
+cannot carry a marker, record the exact target and payload fingerprint and use
+both during reconciliation. Never perform the mutation if the prepared intent
+cannot be made durable.
+
+After the provider responds, append a terminal mutation event and capture the
+command/tool result, provider ID or URL, target HEAD, and timestamp. If the
+response is lost or the receipt cannot be persisted, leave the durable prepared
+intent unresolved so recovery reconciles it before any retry. Never report
+success from intent alone.
 
 ### 4. Update state from evidence
 
-Update `STATE.json` only after the action result is known. Write a complete new
-JSON document to a temporary file in the same directory, parse/validate it, keep
-the previous valid file as a backup, and atomically rename the new file. Never
-patch the live JSON in place.
+For ordinary observations and decisions, update `STATE.json` only after the
+result is known. Provider mutations are the exception: persist their prepared
+intent before acting and their terminal receipt afterward. For every state
+write, write a complete new JSON document to a temporary file in the same
+directory, parse/validate it, keep the previous valid file as a backup, and
+atomically rename the new file. Never patch the live JSON in place.
 
-If the action succeeded but the state write crashed, the next cycle must search
-the provider for the external receipt and append a reconciliation decision. Do
-not blindly repeat the action. If no valid state or backup exists, stop and ask a
-human to reconstruct the non-derivable facts; never recover them from a recurring
-prompt.
+If the action may have succeeded but its terminal receipt was not persisted, the
+next cycle must use the prepared intent's marker and payload fingerprint to
+search the provider and append a reconciliation event. Do not blindly repeat the
+action. If no valid state or backup exists, stop and ask a human to reconstruct
+the non-derivable facts; never recover them from a recurring prompt.
 
 ### 5. Deliver owed output
 
