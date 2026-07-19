@@ -63,14 +63,10 @@ func runHostedProcess(argv []string, owner io.Reader, stdout, stderr io.Writer) 
 	if err := cmd.Start(); err != nil {
 		return 126
 	}
-	wait := make(chan error, 1)
-	go func() { wait <- cmd.Wait() }()
-	var err error
-	select {
-	case err = <-wait:
-	case <-ownershipCanceled(owner):
-		killVerificationProcessGroup(cmd.Process.Pid)
-		err = <-wait
+	err, waitCleanupErr := waitVerificationProcess(cmd, owner)
+	if waitCleanupErr != nil {
+		_, _ = io.WriteString(stderr, "wait for verification process: "+waitCleanupErr.Error()+"\n")
+		return 126
 	}
 	if cleanupErr := descendants.Terminate(cmd.Process.Pid); cleanupErr != nil {
 		_, _ = io.WriteString(stderr, "terminate verification descendants: "+cleanupErr.Error()+"\n")

@@ -5,7 +5,9 @@ package verification
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -47,6 +49,18 @@ func newVerificationDescendantOwner() (*linuxVerificationDescendantOwner, error)
 }
 
 func (*linuxVerificationDescendantOwner) Close() error { return nil }
+
+func waitVerificationProcess(cmd *exec.Cmd, owner io.Reader) (error, error) {
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	select {
+	case err := <-wait:
+		return err, nil
+	case <-ownershipCanceled(owner):
+		killVerificationProcessGroup(cmd.Process.Pid)
+		return <-wait, nil
+	}
+}
 
 func (*linuxVerificationDescendantOwner) Terminate(targetPID int) error {
 	// The target leader has already been reaped by the caller. Never issue a
