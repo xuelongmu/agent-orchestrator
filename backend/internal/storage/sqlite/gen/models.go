@@ -12,6 +12,12 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
+type AgentHandoff struct {
+	SessionID domain.SessionID
+	Payload   string
+	CreatedAt time.Time
+}
+
 type CIRerunAttempt struct {
 	PRURL       string
 	HeadSha     string

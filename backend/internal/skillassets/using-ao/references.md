@@ -8,6 +8,7 @@ Natural-language-to-command mappings for common AO tasks.
 | Spawn a worker on issue N | `ao spawn --project <p> --issue N --name "<=20 chars>" --prompt "..."` |
 | Message a running agent | `ao send --session <id> --message "..."` |
 | Run a focused check outside the agent terminal | `ao verify <configured-profile>` |
+| Seal completed/ready-for-review work details | `ao handoff --changed-file <path> --verification-command "<command>" --residual-risk "<risk>"` |
 | Kill a session | `ao session kill <id>` |
 | List sessions | `ao session ls` |
 | Register a repo as a project | `ao project add --path <abs-path> --name <name>` |

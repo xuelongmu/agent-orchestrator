@@ -98,6 +98,13 @@ SELECT session_id, depends_on_session_id
 FROM session_dependencies
 ORDER BY session_id, depends_on_session_id;
 
+-- name: InsertSessionHandoff :execrows
+INSERT OR IGNORE INTO agent_handoffs (session_id, payload, created_at)
+VALUES (?, ?, ?);
+
+-- name: GetSessionHandoffPayload :one
+SELECT payload FROM agent_handoffs WHERE session_id = ?;
+
 -- name: SetPendingSubmit :execrows
 UPDATE sessions SET
     pending_submit_fingerprint = ?, pending_submit_recovery_attempted = FALSE,

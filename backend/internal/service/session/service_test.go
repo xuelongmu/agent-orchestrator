@@ -36,6 +36,8 @@ type fakeStore struct {
 	reviews                 map[string][]domain.PullRequestReview
 	threads                 map[string][]domain.PullRequestReviewThread
 	comments                map[string][]domain.PullRequestComment
+	handoffs                map[domain.SessionID]domain.AgentHandoff
+	handoffReads            int
 	contracts               map[string]string
 	contractWrites          []contractWrite
 	pendingContractDelivery map[string]domain.SessionID
@@ -63,6 +65,7 @@ func newFakeStore() *fakeStore {
 		reviews:                 map[string][]domain.PullRequestReview{},
 		threads:                 map[string][]domain.PullRequestReviewThread{},
 		comments:                map[string][]domain.PullRequestComment{},
+		handoffs:                map[domain.SessionID]domain.AgentHandoff{},
 		contracts:               map[string]string{},
 		pendingContractDelivery: map[string]domain.SessionID{},
 		pendingContractTask:     map[string]string{},
@@ -170,6 +173,96 @@ func (f *fakeStore) SetSessionPreviewURL(_ context.Context, id domain.SessionID,
 	r.UpdatedAt = updatedAt
 	f.sessions[id] = r
 	return true, nil
+}
+
+func TestSubmitHandoffIsImmutableIdempotentAndDoesNotChangeLifecycleFacts(t *testing.T) {
+	st := newFakeStore()
+	now := time.Unix(1700000000, 0).UTC()
+	record := domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Activity: domain.Activity{State: domain.ActivityActive, LastActivityAt: now}, UpdatedAt: now}
+	st.sessions[record.ID] = record
+	svc := NewWithDeps(Deps{Store: st, Clock: func() time.Time { return now.Add(time.Hour) }})
+	handoff := domain.AgentHandoff{ChangedFiles: []string{"a.go"}, VerificationCommands: []string{"go test ./x"}, ResidualRisk: "CI pending"}
+	created, err := svc.SubmitHandoff(context.Background(), record.ID, handoff)
+	if err != nil || !created {
+		t.Fatalf("first submit: created=%v err=%v", created, err)
+	}
+	created, err = svc.SubmitHandoff(context.Background(), record.ID, handoff)
+	if err != nil || created {
+		t.Fatalf("exact replay: created=%v err=%v", created, err)
+	}
+	changed := handoff
+	changed.ResidualRisk = "different"
+	if _, err := svc.SubmitHandoff(context.Background(), record.ID, changed); err == nil {
+		t.Fatal("changed replay succeeded")
+	} else {
+		var apiErr *apierr.Error
+		if !errors.As(err, &apiErr) || apiErr.Code != "HANDOFF_ALREADY_SUBMITTED" {
+			t.Fatalf("changed replay error = %v", err)
+		}
+	}
+	if got := st.sessions[record.ID]; got.Activity != record.Activity || got.IsTerminated != record.IsTerminated || !got.UpdatedAt.Equal(record.UpdatedAt) {
+		t.Fatalf("lifecycle record changed: got=%#v want=%#v", got, record)
+	}
+	view, err := svc.Get(context.Background(), record.ID)
+	if err != nil || view.Handoff == nil || !view.Handoff.Equal(handoff) {
+		t.Fatalf("read model handoff=%#v err=%v", view.Handoff, err)
+	}
+}
+
+func TestSubmitHandoffMapsCanonicalPayloadOverflowToInvalidRequest(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer"}
+	handoff := domain.AgentHandoff{
+		ChangedFiles:         make([]string, domain.MaxHandoffChangedFiles),
+		VerificationCommands: []string{},
+	}
+	for i := range handoff.ChangedFiles {
+		handoff.ChangedFiles[i] = strings.Repeat("<", domain.MaxHandoffChangedFileBytes)
+	}
+	_, err := NewWithDeps(Deps{Store: st}).SubmitHandoff(context.Background(), "mer-1", handoff)
+	var apiErr *apierr.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "HANDOFF_INVALID" {
+		t.Fatalf("SubmitHandoff() error = %v", err)
+	}
+	if len(st.handoffs) != 0 {
+		t.Fatal("invalid handoff reached persistence")
+	}
+}
+
+func (f *fakeStore) PutSessionHandoff(_ context.Context, id domain.SessionID, handoff domain.AgentHandoff, _ time.Time) (bool, error) {
+	if _, ok := f.sessions[id]; !ok {
+		return false, ports.ErrSessionNotFound
+	}
+	if existing, ok := f.handoffs[id]; ok {
+		if existing.Equal(handoff) {
+			return false, nil
+		}
+		return false, ports.ErrHandoffConflict
+	}
+	f.handoffs[id] = handoff
+	return true, nil
+}
+
+func (f *fakeStore) GetSessionHandoff(_ context.Context, id domain.SessionID) (domain.AgentHandoff, bool, error) {
+	f.handoffReads++
+	handoff, ok := f.handoffs[id]
+	return handoff, ok, nil
+}
+
+func TestListSessionsDoesNotLoadHandoffBlobsButDetailDoes(t *testing.T) {
+	st := newFakeStore()
+	now := time.Now().UTC()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}}
+	st.handoffs["mer-1"] = domain.AgentHandoff{ChangedFiles: []string{"large"}, VerificationCommands: []string{}}
+	svc := NewWithDeps(Deps{Store: st, Clock: func() time.Time { return now }})
+	listed, err := svc.List(context.Background(), ListFilter{})
+	if err != nil || len(listed) != 1 || listed[0].Handoff != nil || st.handoffReads != 0 {
+		t.Fatalf("list loaded handoff: listed=%#v reads=%d err=%v", listed, st.handoffReads, err)
+	}
+	detail, err := svc.Get(context.Background(), "mer-1")
+	if err != nil || detail.Handoff == nil || st.handoffReads != 1 {
+		t.Fatalf("detail did not lazy-load handoff: detail=%#v reads=%d err=%v", detail.Handoff, st.handoffReads, err)
+	}
 }
 
 func (f *fakeStore) GetDisplayPRFactsForSession(_ context.Context, id domain.SessionID) (domain.PRFacts, bool, error) {
