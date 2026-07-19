@@ -133,6 +133,25 @@ func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (O
 	}, nil)
 }
 
+// DeliverAutomated writes an AO-initiated message that may intentionally wake
+// a worker waiting for its next instruction, but must not cross a pending
+// decision, provider rate limit, or unsubmitted editor draft. This is stricter
+// than explicit-user Deliver and less restrictive than Nudge, which also
+// suppresses waiting_input.
+func (g *Guard) DeliverAutomated(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
+	return g.send(ctx, id, msg, automatedDeliveryRefusal, nil)
+}
+
+func automatedDeliveryRefusal(rec domain.SessionRecord) Outcome {
+	if rec.Activity.State == domain.ActivityRateLimited {
+		return SuppressedRateLimited
+	}
+	if rec.Activity.State == domain.ActivityBlocked || rec.Metadata.PendingSubmitFingerprint != "" {
+		return SuppressedAwaitingUser
+	}
+	return Sent
+}
+
 // Nudge writes an AO-initiated (unsolicited) message into the session. It
 // refuses whenever the session awaits the human in any form — blocked on a
 // decision or waiting at the prompt — and while a prior prompt is durably

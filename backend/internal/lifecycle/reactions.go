@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/scmready"
@@ -95,6 +96,15 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 	if m.guard == nil {
 		return ReviewDeliveryNoop, nil
 	}
+	for _, result := range results {
+		ready, readyErr := m.ensurePRDesignContractDelivered(ctx, workerID, result.PRURL)
+		if readyErr != nil {
+			return ReviewDeliveryNoop, readyErr
+		}
+		if !ready {
+			return ReviewDeliveryNoop, nil
+		}
+	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].PRURL != results[j].PRURL {
 			return results[i].PRURL < results[j].PRURL
@@ -106,6 +116,9 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 	var sigParts []string
 	for i, r := range results {
 		fmt.Fprintf(&msg, "\nReview %d\nPR: %s\nVerdict: %s", i+1, domain.SanitizeControlChars(r.PRURL), domain.SanitizeControlChars(string(r.Verdict)))
+		if err := m.writeDesignContractDispatch(ctx, &msg, rec.Metadata.WorkspacePath, r.PRURL); err != nil {
+			return ReviewDeliveryNoop, err
+		}
 		if r.TargetSHA != "" {
 			fmt.Fprintf(&msg, "\nHead commit: %s", domain.SanitizeControlChars(r.TargetSHA))
 		}
@@ -149,6 +162,22 @@ func writeReviewDispatchPolicy(msg *strings.Builder, r ReviewResult) {
 		fmt.Fprintf(msg, "\nKIND: SIMPLIFICATION ROUND\nThe class %q has recurred at least 3 times. Identify the invariant this class violates and enforce it at ONE chokepoint; delete the per-site predicates. Treat the individual findings as symptoms and test cases, not as a patch list.\n", domain.SanitizeControlChars(r.SimplificationClass))
 	}
 	msg.WriteString("\nAfter addressing each finding, enumerate every sibling code path with the same shape and apply the same guarantee before pushing.\n")
+}
+
+func (m *Manager) writeDesignContractDispatch(ctx context.Context, msg *strings.Builder, workspacePath, prURL string) error {
+	contract, ok, err := m.store.GetPRDesignContract(ctx, prURL)
+	if err != nil {
+		return fmt.Errorf("review dispatch: get design contract for %s: %w", prURL, err)
+	}
+	if !ok || strings.TrimSpace(contract) == "" {
+		return fmt.Errorf("review dispatch: canonical design contract for %s is missing", prURL)
+	}
+	if err := designcontract.MaterializePR(ctx, workspacePath, prURL, contract); err != nil {
+		slog.Debug("review dispatch: design contract projection skipped", "prURL", prURL, "error", err)
+	}
+	fmt.Fprintf(msg, "\nDesign contract (canonical AO state; .ao/CONTRACT.md is a read-only projection):\n%s\n", domain.SanitizeControlChars(designcontract.ForDispatch(contract)))
+	fmt.Fprintf(msg, "\nFor each fix, state which invariant it preserves. If a finding reveals a missing invariant, enforce it at one chokepoint and record the plain one-line guarantee durably with `ao contract add --pr %s --invariant \"<guarantee>\"`; never edit the workspace projection directly. AO also persists explicit reviewer invariant proposals through the finding ledger. Record the preserved or added invariant in the review-fix commit body.\n", domain.SanitizeControlChars(prURL))
+	return nil
 }
 
 func findingLedgerSummary(ledger domain.FindingLedgerSummary) string {
@@ -387,6 +416,10 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 		}
 		return nil
 	}
+	ready, err := m.ensurePRDesignContractDelivered(ctx, id, o.URL)
+	if err != nil || !ready {
+		return err
+	}
 	// A provider-confirmed recovery ends the current conflict episode. Clear its
 	// durable one-shot so the same head can be dispatched again if a later base
 	// advance makes it conflicting anew.
@@ -428,6 +461,11 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 	if o.Review == domain.ReviewChangesRequest || hasUnresolvedComments(o.Comments) {
 		comments := unresolvedReviewComments(o.Comments)
 		msg := formatReviewCommentsMessage(comments)
+		var contract strings.Builder
+		if err := m.writeDesignContractDispatch(ctx, &contract, rec.Metadata.WorkspacePath, o.URL); err != nil {
+			return err
+		}
+		msg += contract.String()
 		if ident != "your PR" {
 			msg = strings.Replace(msg, "your PR", ident, 1)
 		}
@@ -569,6 +607,10 @@ func (m *Manager) ApplyIdleReviewSnapshot(ctx context.Context, id domain.Session
 	if !o.Fetched || prURL == "" || o.PR.Merged || o.PR.Closed {
 		return nil
 	}
+	ready, err := m.ensurePRDesignContractDelivered(ctx, id, prURL)
+	if err != nil || !ready {
+		return err
+	}
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil || !ok {
 		return err
@@ -651,6 +693,11 @@ func (m *Manager) ApplyIdleReviewSnapshot(ctx context.Context, id domain.Session
 	}
 	msg := fmt.Sprintf("You still have %d unresolved review comment(s) on %s and appear to be idle. Address them now, push fixes, and resolve each addressed thread.\n\n%s",
 		len(actionable), prIdentity(prObs), formatReviewCommentsMessage(actionable))
+	var contract strings.Builder
+	if err := m.writeDesignContractDispatch(ctx, &contract, rec.Metadata.WorkspacePath, prURL); err != nil {
+		return err
+	}
+	msg += contract.String()
 	outcome, sendErr := m.guard.NudgeIdleEpisode(ctx, id, msg, rec.Activity.LastActivityAt)
 	if outcome == sessionguard.SuppressedStaleEpisode || outcome == sessionguard.SuppressedRateLimited {
 		return m.clearIdleReviewEpisodeIdentityLocked(ctx, prURL, rec.Activity.LastActivityAt)
@@ -956,6 +1003,11 @@ func (m *Manager) ApplyReviewResult(ctx context.Context, workerID domain.Session
 		return ReviewDeliveryNoop, nil
 	}
 	msg := fmt.Sprintf("[AO reviewer] AO's internal code reviewer submitted a review.\n\nPR: %s\nVerdict: %s", domain.SanitizeControlChars(r.PRURL), domain.SanitizeControlChars(string(r.Verdict)))
+	var contract strings.Builder
+	if err := m.writeDesignContractDispatch(ctx, &contract, rec.Metadata.WorkspacePath, r.PRURL); err != nil {
+		return ReviewDeliveryNoop, err
+	}
+	msg += contract.String()
 	var policy strings.Builder
 	writeReviewDispatchPolicy(&policy, r)
 	msg += policy.String()
@@ -1451,6 +1503,13 @@ const (
 )
 
 func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key, sig, msg string, maxAttempts int) (sendOnceOutcome, error) {
+	ready, err := m.ensurePRDesignContractDelivered(ctx, id, prURL)
+	if err != nil {
+		return sendOnceSuppressed, err
+	}
+	if !ready {
+		return sendOnceSuppressed, nil
+	}
 	if m.guard == nil {
 		return sendOnceAccounted, nil
 	}
@@ -1531,6 +1590,58 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 		}
 	}
 	return sendOnceAccounted, nil
+}
+
+// ensurePRDesignContractDelivered retries the durable claim barrier before any
+// actionable PR reaction. It is deliberately independent of in-memory dedup,
+// so a fresh lifecycle manager after daemon restart recovers the obligation.
+func (m *Manager) ensurePRDesignContractDelivered(ctx context.Context, id domain.SessionID, prURL string) (bool, error) {
+	if strings.TrimSpace(prURL) == "" {
+		return true, nil
+	}
+	store, ok := m.store.(designContractDeliveryStore)
+	if !ok {
+		return true, nil
+	}
+	unlockDelivery := designcontract.LockDelivery(prURL)
+	defer unlockDelivery()
+	delivery, pending, err := store.GetPendingPRDesignContractDelivery(ctx, id, prURL)
+	if err != nil || !pending {
+		return !pending, err
+	}
+	rec, exists, err := m.store.GetSession(ctx, id)
+	if err != nil || !exists || rec.IsTerminated {
+		return false, err
+	}
+	if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, delivery.Contract); err != nil {
+		slog.Debug("claim barrier: design contract projection skipped", "sessionId", id, "prURL", prURL, "error", err)
+	}
+	m.mu.Lock()
+	sender := m.automatedSender
+	m.mu.Unlock()
+	if sender == nil {
+		return false, nil
+	}
+	message := domain.SanitizeControlChars(designcontract.ClaimReadyMessage(prURL, delivery.Contract, delivery.TaskPrompt))
+	if err := sender.SendAutomated(ctx, id, message); err != nil {
+		latest, exists, readErr := m.store.GetSession(ctx, id)
+		if readErr != nil {
+			return false, readErr
+		}
+		// Unsafe pane states are expected suppression/retry conditions, not
+		// observer failures. The confirmed sender may also have just persisted
+		// PendingSubmitFingerprint after detecting an unsubmitted large draft.
+		// In every case leave the durable claim barrier pending for a safe poll.
+		if !exists || latest.IsTerminated || latest.Activity.State.PausesAutomation() || latest.Metadata.PendingSubmitFingerprint != "" {
+			return false, nil
+		}
+		return false, err
+	}
+	completed, err := store.CompletePRDesignContractDelivery(ctx, id, prURL, delivery.Token, delivery.Revision)
+	if err != nil {
+		return false, err
+	}
+	return completed, nil
 }
 
 // idleReviewFailureSession is the shared eligibility gate for broken review

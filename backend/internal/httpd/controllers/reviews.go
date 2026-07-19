@@ -57,12 +57,13 @@ type SubmitReviewItem struct {
 
 // SubmitFindingItem is one reviewer-classified blocking finding.
 type SubmitFindingItem struct {
-	File          string `json:"file,omitempty"`
-	ClassTag      string `json:"classTag" description:"Stable kebab-case root-cause class."`
-	RootCauseNote string `json:"rootCauseNote" description:"One-line invariant or root-cause explanation."`
-	ThreadID      string `json:"threadId,omitempty" description:"Provider review-thread node id."`
-	Body          string `json:"body,omitempty"`
-	OutOfScope    bool   `json:"outOfScope,omitempty" description:"Finding belongs to a subsystem outside this PR's core scope."`
+	File              string `json:"file,omitempty"`
+	ClassTag          string `json:"classTag" description:"Stable kebab-case root-cause class."`
+	RootCauseNote     string `json:"rootCauseNote" description:"One-line root-cause explanation."`
+	ProposedInvariant string `json:"proposedInvariant,omitempty" description:"Explicit durable invariant for this exact PR; omit for site symptoms and out-of-scope findings."`
+	ThreadID          string `json:"threadId,omitempty" description:"Provider review-thread node id."`
+	Body              string `json:"body,omitempty"`
+	OutOfScope        bool   `json:"outOfScope,omitempty" description:"Finding belongs to a subsystem outside this PR's core scope."`
 }
 
 // SubmitReviewInput is the body of POST /api/v1/sessions/{sessionId}/reviews/submit.
@@ -200,7 +201,7 @@ func (c *ReviewsController) submit(w http.ResponseWriter, r *http.Request) {
 func submittedFindings(items []SubmitFindingItem) []reviewsvc.SubmittedFinding {
 	out := make([]reviewsvc.SubmittedFinding, 0, len(items))
 	for _, item := range items {
-		out = append(out, reviewsvc.SubmittedFinding{File: item.File, ClassTag: item.ClassTag, RootCauseNote: item.RootCauseNote, ThreadID: item.ThreadID, Body: item.Body, OutOfScope: item.OutOfScope})
+		out = append(out, reviewsvc.SubmittedFinding{File: item.File, ClassTag: item.ClassTag, RootCauseNote: item.RootCauseNote, ProposedInvariant: item.ProposedInvariant, ThreadID: item.ThreadID, Body: item.Body, OutOfScope: item.OutOfScope})
 	}
 	return out
 }

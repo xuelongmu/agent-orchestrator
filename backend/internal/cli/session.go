@@ -103,6 +103,7 @@ type cleanupSessionsResponse struct {
 type claimPRRequest struct {
 	PR            string `json:"pr"`
 	AllowTakeover bool   `json:"allowTakeover"`
+	TaskPrompt    string `json:"taskPrompt,omitempty"`
 }
 
 type sessionPRDTO struct {
@@ -122,6 +123,7 @@ type claimPRResponse struct {
 	PRs           []sessionPRDTO `json:"prs"`
 	BranchChanged bool           `json:"branchChanged"`
 	TakenOverFrom []string       `json:"takenOverFrom"`
+	ContractReady bool           `json:"contractReady"`
 }
 
 type sessionListEntry struct {
@@ -366,6 +368,11 @@ func writeClaimPRResult(cmd *cobra.Command, res claimPRResponse) error {
 	pr := res.PRs[0]
 	if _, err := fmt.Fprintf(out, "session %s claimed PR #%d\n", res.SessionID, pr.Number); err != nil {
 		return err
+	}
+	if !res.ContractReady {
+		if _, err := fmt.Fprintln(out, "  contract: waiting for durable claim-ready delivery; do not begin PR work yet"); err != nil {
+			return err
+		}
 	}
 	if _, err := fmt.Fprintf(out, "  pr:       %s\n", pr.URL); err != nil {
 		return err

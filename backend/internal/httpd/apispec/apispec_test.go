@@ -52,6 +52,28 @@ func TestOperation_InheritsPathParameters(t *testing.T) {
 	}
 }
 
+func TestDesignContractQueryIsRequired(t *testing.T) {
+	op := apispec.Default().Operation("GET", "/api/v1/sessions/{sessionId}/design-contract")
+	if op == nil {
+		t.Fatal("expected design-contract operation")
+	}
+	params, ok := op["parameters"].([]any)
+	if !ok {
+		t.Fatalf("parameters = %#v, want slice", op["parameters"])
+	}
+	for _, raw := range params {
+		param, ok := raw.(map[string]any)
+		if !ok || param["in"] != "query" || param["name"] != "pr" {
+			continue
+		}
+		if required, _ := param["required"].(bool); !required {
+			t.Fatalf("design-contract pr parameter = %#v, want required", param)
+		}
+		return
+	}
+	t.Fatal("design-contract pr query parameter missing")
+}
+
 // TestServeYAML serves the raw embedded document; tooling fetches it
 // whole rather than reconstructing it from per-operation slices.
 func TestServeYAML(t *testing.T) {

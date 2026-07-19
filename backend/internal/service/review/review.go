@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -183,12 +184,13 @@ type SubmittedReview struct {
 // SubmittedFinding is reviewer-authored structured taxonomy for one blocking
 // finding. ClassTag is a stable kebab-case root-cause category.
 type SubmittedFinding struct {
-	File          string
-	ClassTag      string
-	RootCauseNote string
-	ThreadID      string
-	Body          string
-	OutOfScope    bool
+	File              string
+	ClassTag          string
+	RootCauseNote     string
+	ProposedInvariant string
+	ThreadID          string
+	Body              string
+	OutOfScope        bool
 }
 
 // Submit records a reviewer's result for a specific worker review pass.
@@ -474,12 +476,25 @@ func (s *Service) buildFindings(ctx context.Context, run domain.ReviewRun, submi
 			ID: fmt.Sprintf("%s:%d", run.ID, i+1), RunID: run.ID,
 			SessionID: run.SessionID, PRURL: run.PRURL, Round: round,
 			File: strings.TrimSpace(item.File), ClassTag: classTag,
-			RootCauseNote: strings.TrimSpace(item.RootCauseNote),
-			ThreadID:      strings.TrimSpace(item.ThreadID), Body: strings.TrimSpace(item.Body),
+			RootCauseNote: strings.TrimSpace(item.RootCauseNote), ProposedInvariant: strings.TrimSpace(item.ProposedInvariant),
+			ThreadID: strings.TrimSpace(item.ThreadID), Body: strings.TrimSpace(item.Body),
 			OutOfScope: item.OutOfScope, CreatedAt: s.clock(),
 		}
 		if finding.RootCauseNote == "" {
 			finding.RootCauseNote = finding.Body
+		}
+		if finding.ProposedInvariant != "" {
+			normalized, err := designcontract.NormalizeInvariant(finding.ProposedInvariant)
+			if err != nil || finding.OutOfScope {
+				reason := "out-of-scope findings cannot propose contract invariants"
+				if err != nil {
+					reason = err.Error()
+				}
+				finding.RootCauseNote = strings.TrimSpace(finding.RootCauseNote + " [Invariant proposal rejected: " + reason + ".]")
+				finding.ProposedInvariant = ""
+			} else {
+				finding.ProposedInvariant = normalized
+			}
 		}
 		findings = append(findings, finding)
 	}

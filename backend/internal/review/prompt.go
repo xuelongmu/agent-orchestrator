@@ -24,7 +24,7 @@ Post your review as a comment on the pull request, stating clearly whether it ne
 
 Prefix every finding with exactly one priority tag: [P0] for release-blocking or destructive issues, [P1] for correctness/security issues that must be fixed before merge, [P2] for worthwhile non-blocking improvements, or [P3] for minor suggestions. Report changes_requested only when at least one P0 or P1 finding remains. If there are no P0/P1 findings, report approved even when you include P2/P3 suggestions.`
 	systemPrompt += ` Do not post P2/P3 findings as inline comments: because AO posts through the PR author's account, GitHub cannot distinguish those threads from required human feedback. Keep them in the review summary body only.`
-	systemPrompt += ` For every P0/P1 finding, assign a stable lowercase kebab-case classTag describing the root-cause class (not the site-specific symptom) and a one-line rootCauseNote naming the violated invariant. Mark outOfScope only when the finding belongs to a different subsystem than the PR's core change.`
+	systemPrompt += ` For every P0/P1 finding, assign a stable lowercase kebab-case classTag describing the root-cause class (not the site-specific symptom) and a one-line rootCauseNote. Set proposedInvariant only when you are explicitly proposing a durable subsystem guarantee for this exact PR; never copy a site symptom or arbitrary finding body into it, and leave it empty for out-of-scope findings. Mark outOfScope only when the finding belongs to a different subsystem than the PR's core change.`
 
 	queueText := reviewQueueText(spec)
 	prompt = fmt.Sprintf(`Review the requested pull request(s) for worker session %s.
@@ -43,7 +43,7 @@ Do these steps in order:
    - The printed number is the review id. If the call fails on the provider, leave the id empty.
 2. After every PR has its own GitHub review from step 1, record AO's bookkeeping for those already-posted reviews using one command. Pass JSON on stdin so nothing is ever written into the worktree (a file there could be committed onto the worker's branch). Include one object per PR/run from the queue:
 
-    printf '%%s' '{ "reviews": [ { "runId": "<run-id>", "verdict": "<approved|changes_requested>", "githubReviewId": "<id-from-step-1-or-empty>", "body": "<your full review markdown>", "findings": [ { "file": "<path>", "classTag": "<root-cause-class>", "rootCauseNote": "<violated invariant>", "threadId": "<GraphQL review thread node id>", "body": "<finding text>", "outOfScope": false } ] } ] }' | ao review submit --session %s --reviews -
+    printf '%%s' '{ "reviews": [ { "runId": "<run-id>", "verdict": "<approved|changes_requested>", "githubReviewId": "<id-from-step-1-or-empty>", "body": "<your full review markdown>", "findings": [ { "file": "<path>", "classTag": "<root-cause-class>", "rootCauseNote": "<root-cause note>", "proposedInvariant": "<explicit durable invariant or empty>", "threadId": "<GraphQL review thread node id>", "body": "<finding text>", "outOfScope": false } ] } ] }' | ao review submit --session %s --reviews -
 
 For each P0/P1 inline comment, include exactly one findings entry. After posting the review, query the PR's reviewThreads with gh api graphql and map the comment to its review-thread node id for threadId. If a finding is out of scope, set outOfScope true; AO may file it as a follow-up issue and resolve that thread when project policy enables deflection. Use an empty findings array for approved reviews.
 

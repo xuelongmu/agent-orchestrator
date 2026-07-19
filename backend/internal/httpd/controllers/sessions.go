@@ -79,6 +79,8 @@ func (c *SessionsController) Register(r chi.Router) {
 	r.Get("/sessions/{sessionId}/workspace/file", c.getWorkspaceFile)
 	r.Get("/sessions/{sessionId}/pr", c.listPRs)
 	r.Post("/sessions/{sessionId}/pr/claim", c.claimPR)
+	r.Get("/sessions/{sessionId}/design-contract", c.getDesignContract)
+	r.Post("/sessions/{sessionId}/design-contract/invariants", c.addDesignContractInvariant)
 	r.Patch("/sessions/{sessionId}", c.rename)
 	r.Post("/sessions/{sessionId}/restore", c.restore)
 	r.Post("/sessions/{sessionId}/kill", c.kill)
@@ -357,16 +359,65 @@ func (c *SessionsController) claimPR(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PR_REQUIRED", "pr is required", nil)
 		return
 	}
+	if len(in.TaskPrompt) > maxPromptLen {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PROMPT_TOO_LONG", "taskPrompt is too long", nil)
+		return
+	}
 	allowTakeover := true
 	if in.AllowTakeover != nil {
 		allowTakeover = *in.AllowTakeover
 	}
-	res, err := c.Svc.ClaimPR(r.Context(), sessionID(r), in.PR, sessionsvc.ClaimPROptions{AllowTakeover: allowTakeover})
+	res, err := c.Svc.ClaimPR(r.Context(), sessionID(r), in.PR, sessionsvc.ClaimPROptions{AllowTakeover: allowTakeover, TaskPrompt: in.TaskPrompt})
 	if err != nil {
 		writeSessionPRError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, ClaimPRResponse{OK: true, SessionID: sessionID(r), PRs: sessionPRFacts(res.PRs), BranchChanged: res.BranchChanged, TakenOverFrom: nonNilSessionIDs(res.TakenOverFrom)})
+	envelope.WriteJSON(w, http.StatusOK, ClaimPRResponse{OK: true, SessionID: sessionID(r), PRs: sessionPRFacts(res.PRs), BranchChanged: res.BranchChanged, TakenOverFrom: nonNilSessionIDs(res.TakenOverFrom), ContractReady: res.ContractReady})
+}
+
+func (c *SessionsController) addDesignContractInvariant(w http.ResponseWriter, r *http.Request) {
+	writer, ok := c.Svc.(interface {
+		AddDesignContractInvariant(context.Context, domain.SessionID, string, string) (string, error)
+	})
+	if !ok {
+		apispec.NotImplemented(w, r, "POST", "/api/v1/sessions/{sessionId}/design-contract/invariants")
+		return
+	}
+	var in AddDesignContractInvariantRequest
+	if err := decodeJSON(r, &in); err != nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Invalid JSON body", nil)
+		return
+	}
+	if strings.TrimSpace(in.PR) == "" || strings.TrimSpace(in.Invariant) == "" {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "CONTRACT_INVARIANT_REQUIRED", "pr and invariant are required", nil)
+		return
+	}
+	if _, err := writer.AddDesignContractInvariant(r.Context(), sessionID(r), in.PR, in.Invariant); err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, AddDesignContractInvariantResponse{OK: true, SessionID: sessionID(r), PR: in.PR})
+}
+
+func (c *SessionsController) getDesignContract(w http.ResponseWriter, r *http.Request) {
+	reader, ok := c.Svc.(interface {
+		GetDesignContract(context.Context, domain.SessionID, string) (string, error)
+	})
+	if !ok {
+		apispec.NotImplemented(w, r, "GET", "/api/v1/sessions/{sessionId}/design-contract")
+		return
+	}
+	pr := strings.TrimSpace(r.URL.Query().Get("pr"))
+	if pr == "" {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PR_REQUIRED", "pr is required", nil)
+		return
+	}
+	contract, err := reader.GetDesignContract(r.Context(), sessionID(r), pr)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, GetDesignContractResponse{OK: true, SessionID: sessionID(r), PR: pr, Contract: contract})
 }
 
 func (c *SessionsController) rename(w http.ResponseWriter, r *http.Request) {
@@ -635,6 +686,8 @@ func writeSessionPRError(w http.ResponseWriter, r *http.Request, err error) {
 	var claimed ports.PRClaimedByActiveSessionError
 	var checkout ports.PRCheckoutError
 	switch {
+	case errors.Is(err, sessionsvc.ErrClaimTaskPromptTooLong):
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PROMPT_TOO_LONG", "taskPrompt is too long", nil)
 	case errors.Is(err, sessionsvc.ErrInvalidPRRef):
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_PR_REF", "PR reference must be a github.com PR URL or a number", nil)
 	case errors.Is(err, sessionsvc.ErrPRNotFound):

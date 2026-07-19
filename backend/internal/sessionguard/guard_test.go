@@ -35,43 +35,47 @@ func record(state domain.ActivityState, terminated bool) domain.SessionRecord {
 
 func TestGuard_OutcomeByState(t *testing.T) {
 	cases := []struct {
-		name        string
-		rec         domain.SessionRecord
-		ok          bool
-		wantDeliver Outcome
-		wantNudge   Outcome
+		name          string
+		rec           domain.SessionRecord
+		ok            bool
+		wantDeliver   Outcome
+		wantAutomated Outcome
+		wantNudge     Outcome
 	}{
-		{"active", record(domain.ActivityActive, false), true, Sent, Sent},
+		{"active", record(domain.ActivityActive, false), true, Sent, Sent, Sent},
 		{"active with pending editor input", func() domain.SessionRecord {
 			rec := record(domain.ActivityActive, false)
 			rec.Metadata.PendingSubmitFingerprint = "sha256-prompt"
 			return rec
-		}(), true, Sent, SuppressedAwaitingUser},
-		{"idle", record(domain.ActivityIdle, false), true, Sent, Sent},
+		}(), true, Sent, SuppressedAwaitingUser, SuppressedAwaitingUser},
+		{"idle", record(domain.ActivityIdle, false), true, Sent, Sent, Sent},
 		// waiting_input is the split that motivates two methods: a user message
 		// (or its Enter re-submit) belongs at an idle prompt; an unsolicited
 		// automated nudge does not.
-		{"waiting_input", record(domain.ActivityWaitingInput, false), true, Sent, SuppressedAwaitingUser},
-		{"blocked", record(domain.ActivityBlocked, false), true, SuppressedAwaitingUser, SuppressedAwaitingUser},
+		{"waiting_input", record(domain.ActivityWaitingInput, false), true, Sent, Sent, SuppressedAwaitingUser},
+		{"blocked", record(domain.ActivityBlocked, false), true, SuppressedAwaitingUser, SuppressedAwaitingUser, SuppressedAwaitingUser},
 		// Explicit user/API delivery is the intentional retry path after the
 		// provider window resets; unattended AO nudges remain parked.
-		{"rate limited", record(domain.ActivityRateLimited, false), true, Sent, SuppressedRateLimited},
+		{"rate limited", record(domain.ActivityRateLimited, false), true, Sent, SuppressedRateLimited, SuppressedRateLimited},
 		// exited is refused even without IsTerminated: the pane holds an
 		// interactive shell after agent exit, so a paste would execute there.
-		{"exited", record(domain.ActivityExited, false), true, SuppressedTerminated, SuppressedTerminated},
-		{"terminated", record(domain.ActivityIdle, true), true, SuppressedTerminated, SuppressedTerminated},
-		{"missing", domain.SessionRecord{}, false, SuppressedNotFound, SuppressedNotFound},
+		{"exited", record(domain.ActivityExited, false), true, SuppressedTerminated, SuppressedTerminated, SuppressedTerminated},
+		{"terminated", record(domain.ActivityIdle, true), true, SuppressedTerminated, SuppressedTerminated, SuppressedTerminated},
+		{"missing", domain.SessionRecord{}, false, SuppressedNotFound, SuppressedNotFound, SuppressedNotFound},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			for method, want := range map[string]Outcome{"Deliver": tc.wantDeliver, "Nudge": tc.wantNudge} {
+			for method, want := range map[string]Outcome{"Deliver": tc.wantDeliver, "DeliverAutomated": tc.wantAutomated, "Nudge": tc.wantNudge} {
 				msgr := &fakeMessenger{}
 				g := New(&fakeStore{rec: tc.rec, ok: tc.ok}, msgr, nil)
 				var got Outcome
 				var err error
-				if method == "Deliver" {
+				switch method {
+				case "Deliver":
 					got, err = g.Deliver(context.Background(), "s1", "hello")
-				} else {
+				case "DeliverAutomated":
+					got, err = g.DeliverAutomated(context.Background(), "s1", "hello")
+				default:
 					got, err = g.Nudge(context.Background(), "s1", "hello")
 				}
 				if err != nil {
@@ -92,8 +96,9 @@ func TestGuard_StoreErrorFailsClosed(t *testing.T) {
 	msgr := &fakeMessenger{}
 	g := New(&fakeStore{err: errors.New("db locked")}, msgr, nil)
 	for name, call := range map[string]func() (Outcome, error){
-		"Deliver": func() (Outcome, error) { return g.Deliver(context.Background(), "s1", "x") },
-		"Nudge":   func() (Outcome, error) { return g.Nudge(context.Background(), "s1", "x") },
+		"Deliver":          func() (Outcome, error) { return g.Deliver(context.Background(), "s1", "x") },
+		"DeliverAutomated": func() (Outcome, error) { return g.DeliverAutomated(context.Background(), "s1", "x") },
+		"Nudge":            func() (Outcome, error) { return g.Nudge(context.Background(), "s1", "x") },
 	} {
 		got, err := call()
 		if err == nil {

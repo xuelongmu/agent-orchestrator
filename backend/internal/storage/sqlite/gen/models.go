@@ -118,6 +118,17 @@ type PRComment struct {
 	IsBot     int64
 }
 
+type PRDesignContract struct {
+	PRURL                     string
+	Markdown                  string
+	PendingDeliverySessionID  sql.NullString
+	PendingDeliveryTaskPrompt string
+	PendingDeliveryToken      string
+	DeliveryRequiredAt        sql.NullTime
+	ContractRevision          int64
+	UpdatedAt                 time.Time
+}
+
 type PRReview struct {
 	PRURL       string
 	ReviewID    string
@@ -182,6 +193,7 @@ type ReviewFinding struct {
 	ThreadActionToken      string
 	ThreadActionLeaseUntil sql.NullTime
 	CreatedAt              time.Time
+	ProposedInvariant      string
 }
 
 type ReviewRun struct {
@@ -234,6 +246,12 @@ type Session struct {
 	DiagnosticHookErrorType        string
 	DiagnosticCapturedAt           sql.NullTime
 	WorkspaceKind                  string
+}
+
+type SessionDesignContractSeed struct {
+	SessionID string
+	Markdown  string
+	UpdatedAt time.Time
 }
 
 type SessionWorktree struct {

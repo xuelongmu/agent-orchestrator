@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"sort"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -34,11 +36,21 @@ var (
 	// ErrSessionWorkspaceNotGit reports that SCM branch operations are
 	// inapplicable to scratch and shared-directory sessions.
 	ErrSessionWorkspaceNotGit = errors.New("session: workspace is not git-backed")
+	// ErrClaimTaskPromptTooLong rejects withheld claim work that cannot cross
+	// the same bounded prompt boundary used for a normal spawn.
+	ErrClaimTaskPromptTooLong = errors.New("session: claim task prompt is too long")
 )
+
+// MaxClaimTaskPromptBytes is the maximum UTF-8 payload accepted for work held
+// behind a claim-ready contract barrier.
+const MaxClaimTaskPromptBytes = 4096
 
 // ClaimPROptions controls PR claim conflict behavior.
 type ClaimPROptions struct {
 	AllowTakeover bool
+	// TaskPrompt is withheld from ao spawn --claim-pr workers until the atomic
+	// ownership transaction's contract delivery barrier is lifted.
+	TaskPrompt string
 }
 
 // ClaimPRResult is the session PR read model returned after a claim.
@@ -47,6 +59,14 @@ type ClaimPRResult struct {
 	BranchChanged      bool
 	TakenOverFrom      []domain.SessionID
 	DonorWasTerminated bool
+	// ContractReady is true only after the claim-ready message containing the
+	// canonical contract reached the claimant and its durable barrier cleared.
+	ContractReady bool
+}
+
+type designContractDeliveryStore interface {
+	GetPendingPRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL string) (designcontract.PendingDelivery, bool, error)
+	CompletePRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error)
 }
 
 // ListPRs returns all PRs currently owned by a session, ordered for display.
@@ -63,6 +83,9 @@ func (s *Service) ListPRs(ctx context.Context, id domain.SessionID) ([]domain.PR
 
 // ClaimPR attaches a live GitHub PR to a worker session and persists the current SCM facts atomically.
 func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, opts ClaimPROptions) (ClaimPRResult, error) {
+	if len(opts.TaskPrompt) > MaxClaimTaskPromptBytes {
+		return ClaimPRResult{}, ErrClaimTaskPromptTooLong
+	}
 	rec, ok, err := s.store.GetSession(ctx, id)
 	if err != nil {
 		return ClaimPRResult{}, fmt.Errorf("get %s: %w", id, err)
@@ -107,7 +130,8 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 		return ClaimPRResult{}, err
 	}
 	refSpec := ports.SCMPRRef{Repo: repo, Number: number, URL: prURL}
-	if _, err := s.prClaimer.CheckPRClaim(ctx, prURL, id, opts.AllowTakeover); err != nil {
+	_, err = s.prClaimer.CheckPRClaim(ctx, prURL, id, opts.AllowTakeover)
+	if err != nil {
 		return ClaimPRResult{}, err
 	}
 	obs, err := s.fetchClaimObservation(ctx, refSpec)
@@ -134,16 +158,44 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	}
 	now := s.clock().UTC()
 	pr, checks, reviews, threads, comments := claimRowsFromSCM(id, obs, now)
-	outcome, err := s.prClaimer.ClaimPR(ctx, pr, checks, reviews, threads, comments, reviewMode, opts.AllowTakeover, workspaceBranch)
+	outcome, err := s.prClaimer.ClaimPR(ctx, pr, checks, reviews, threads, comments, reviewMode, opts.AllowTakeover, workspaceBranch, opts.TaskPrompt)
 	if err != nil {
 		return ClaimPRResult{}, err
+	}
+	contractReady := !outcome.ContractDeliveryPending
+	if outcome.ContractDeliveryPending && s.manager != nil {
+		deliveryStore, ok := s.store.(designContractDeliveryStore)
+		if !ok {
+			slog.Warn("claim PR: contract delivery acknowledgement unavailable", "sessionId", id, "prURL", prURL)
+		} else {
+			unlockDelivery := designcontract.LockDelivery(prURL)
+			delivery, pending, deliveryErr := deliveryStore.GetPendingPRDesignContractDelivery(ctx, id, prURL)
+			if deliveryErr == nil && pending {
+				// Projection is best effort: unsafe checkout state never rolls back
+				// ownership or bypasses canonical pane delivery.
+				if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, delivery.Contract); err != nil {
+					slog.Debug("claim PR: design contract projection skipped", "prURL", prURL, "error", err)
+				}
+				message := domain.SanitizeControlChars(designcontract.ClaimReadyMessage(prURL, delivery.Contract, delivery.TaskPrompt))
+				deliveryErr = s.manager.SendAutomated(ctx, id, message)
+				if deliveryErr == nil {
+					contractReady, deliveryErr = deliveryStore.CompletePRDesignContractDelivery(ctx, id, prURL, delivery.Token, delivery.Revision)
+				}
+			}
+			unlockDelivery()
+			if deliveryErr != nil || !contractReady {
+				// Ownership is already durable. Keep the delivery obligation pending;
+				// lifecycle retries it before any PR reaction after restart or polling.
+				slog.Warn("claim PR: contract delivery remains pending", "sessionId", id, "prURL", prURL, "error", deliveryErr)
+			}
+		}
 	}
 	prs, err := s.listPRFacts(ctx, id)
 	if err != nil {
 		return ClaimPRResult{}, err
 	}
 	prs = claimedFirst(prs, prURL)
-	res := ClaimPRResult{PRs: prs, BranchChanged: branchChanged, DonorWasTerminated: outcome.OwnerTerminated}
+	res := ClaimPRResult{PRs: prs, BranchChanged: branchChanged, DonorWasTerminated: outcome.OwnerTerminated, ContractReady: contractReady}
 	if outcome.PreviousOwner != "" && outcome.PreviousOwner != id {
 		res.TakenOverFrom = []domain.SessionID{outcome.PreviousOwner}
 	}

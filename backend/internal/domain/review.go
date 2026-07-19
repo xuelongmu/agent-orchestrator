@@ -70,22 +70,23 @@ type ReviewRun struct {
 // the distinct reviewed-head number for the PR. FixCommit is filled when a
 // later head is observed, preserving which commit attempted to address it.
 type ReviewFinding struct {
-	ID               string    `json:"id"`
-	RunID            string    `json:"runId"`
-	SessionID        SessionID `json:"sessionId"`
-	PRURL            string    `json:"prUrl"`
-	Round            int       `json:"round"`
-	File             string    `json:"file"`
-	ClassTag         string    `json:"classTag"`
-	RootCauseNote    string    `json:"rootCauseNote"`
-	FixCommit        string    `json:"fixCommit,omitempty"`
-	ThreadID         string    `json:"threadId,omitempty"`
-	Body             string    `json:"body,omitempty"`
-	OutOfScope       bool      `json:"outOfScope,omitempty"`
-	DeferredIssueURL string    `json:"deferredIssueUrl,omitempty"`
-	ThreadResolved   bool      `json:"threadResolved,omitempty"`
-	ThreadReplyID    string    `json:"-"`
-	CreatedAt        time.Time `json:"createdAt"`
+	ID                string    `json:"id"`
+	RunID             string    `json:"runId"`
+	SessionID         SessionID `json:"sessionId"`
+	PRURL             string    `json:"prUrl"`
+	Round             int       `json:"round"`
+	File              string    `json:"file"`
+	ClassTag          string    `json:"classTag"`
+	RootCauseNote     string    `json:"rootCauseNote"`
+	ProposedInvariant string    `json:"proposedInvariant,omitempty"`
+	FixCommit         string    `json:"fixCommit,omitempty"`
+	ThreadID          string    `json:"threadId,omitempty"`
+	Body              string    `json:"body,omitempty"`
+	OutOfScope        bool      `json:"outOfScope,omitempty"`
+	DeferredIssueURL  string    `json:"deferredIssueUrl,omitempty"`
+	ThreadResolved    bool      `json:"threadResolved,omitempty"`
+	ThreadReplyID     string    `json:"-"`
+	CreatedAt         time.Time `json:"createdAt"`
 }
 
 // FullyDeflected reports whether provider-backed deflection is durably

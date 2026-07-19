@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
@@ -30,6 +31,12 @@ type sessionStore interface {
 	// reaction-dedup map so nudges survive a daemon restart.
 	GetPRLastNudgeSignature(ctx context.Context, prURL string) (string, error)
 	UpdatePRLastNudgeSignature(ctx context.Context, prURL, payload string) error
+	GetPRDesignContract(ctx context.Context, prURL string) (string, bool, error)
+}
+
+type designContractDeliveryStore interface {
+	GetPendingPRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL string) (designcontract.PendingDelivery, bool, error)
+	CompletePRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error)
 }
 
 // simplificationEventStore is the transactional local telemetry boundary for
@@ -67,6 +74,13 @@ type diagnosticRuntime interface {
 	GetOutput(ctx context.Context, handle ports.RuntimeHandle, lines int) (string, error)
 }
 
+// automatedMessageSender is the confirmed session-manager delivery boundary.
+// Unlike the raw pane guard, it detects and durably latches unsubmitted editor
+// drafts before reporting success.
+type automatedMessageSender interface {
+	SendAutomated(ctx context.Context, id domain.SessionID, message string) error
+}
+
 const (
 	diagnosticTailLines      = 40
 	diagnosticCaptureTimeout = 750 * time.Millisecond
@@ -100,6 +114,7 @@ type Manager struct {
 	// through (see sessionguard). Nil when no messenger was wired: reaction
 	// nudges become no-ops but the reducer still runs.
 	guard             *sessionguard.Guard
+	automatedSender   automatedMessageSender
 	notifications     notificationSink
 	mergedCleaner     MergedSessionCleaner
 	completedCleaner  CompletedSessionCleaner
@@ -131,6 +146,15 @@ func (m *Manager) SetCompletedSessionCleaner(cleaner CompletedSessionCleaner) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.completedCleaner = cleaner
+}
+
+// SetAutomatedMessageSender wires the confirmed session-manager send boundary
+// used to recover durable claim-ready deliveries after initial failure or a
+// daemon restart. It must be set before observer/reaper work starts.
+func (m *Manager) SetAutomatedMessageSender(sender automatedMessageSender) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.automatedSender = sender
 }
 
 func (m *Manager) cleanupCompletedSession(ctx context.Context, id domain.SessionID) error {

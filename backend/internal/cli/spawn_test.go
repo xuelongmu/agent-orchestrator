@@ -85,6 +85,7 @@ func TestProjectAddCommand_RequiresPath(t *testing.T) {
 func TestSpawnClaimPRWiring(t *testing.T) {
 	cfg := setConfigEnv(t)
 	var requests []string
+	var spawned spawnRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		appendPrimaryRequest(&requests, r)
 		w.Header().Set("Content-Type", "application/json")
@@ -94,14 +95,17 @@ func TestSpawnClaimPRWiring(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agents/refresh":
 			_, _ = io.WriteString(w, authorizedAgentsJSON("codex"))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions":
+			if err := json.NewDecoder(r.Body).Decode(&spawned); err != nil {
+				t.Fatal(err)
+			}
 			_, _ = io.WriteString(w, `{"session":{"id":"demo-9","status":"idle"}}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-9/pr/claim":
 			var req claimPRRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
-			if req.PR != "https://github.com/aoagents/agent-orchestrator/pull/142" || req.AllowTakeover {
+			if req.PR != "https://github.com/aoagents/agent-orchestrator/pull/142" || req.AllowTakeover || req.TaskPrompt != "Fix the review" {
 				t.Fatalf("claim request = %#v", req)
 			}
-			_, _ = io.WriteString(w, `{"ok":true,"sessionId":"demo-9","prs":[{"url":"https://github.com/aoagents/agent-orchestrator/pull/142","number":142,"state":"open","ci":"passing","review":"review_required","mergeability":"mergeable","reviewComments":false,"updatedAt":"2026-06-04T12:00:00Z"}],"branchChanged":false,"takenOverFrom":[]}`)
+			_, _ = io.WriteString(w, `{"ok":true,"sessionId":"demo-9","prs":[{"url":"https://github.com/aoagents/agent-orchestrator/pull/142","number":142,"state":"open","ci":"passing","review":"review_required","mergeability":"mergeable","reviewComments":false,"updatedAt":"2026-06-04T12:00:00Z"}],"branchChanged":false,"takenOverFrom":[],"contractReady":true}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -109,12 +113,15 @@ func TestSpawnClaimPRWiring(t *testing.T) {
 	t.Cleanup(srv.Close)
 	writeRunFileFor(t, cfg, srv)
 
-	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "spawn", "--project", "demo", "--agent", "codex", "--name", "worker", "--claim-pr", "142", "--no-takeover")
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "spawn", "--project", "demo", "--agent", "codex", "--name", "worker", "--prompt", "Fix the review", "--claim-pr", "142", "--no-takeover")
 	if err != nil {
 		t.Fatalf("spawn claim-pr failed: %v stderr=%s", err, errOut)
 	}
 	if !strings.Contains(out, "claimed https://github.com/aoagents/agent-orchestrator/pull/142") {
 		t.Fatalf("output missing claimed label: %s", out)
+	}
+	if !strings.Contains(spawned.Prompt, "[AO PR CLAIM BARRIER]") || !strings.Contains(spawned.Prompt, "Do not inspect, edit") || strings.Contains(spawned.Prompt, "Fix the review") {
+		t.Fatalf("claim launch prompt did not enforce barrier: %q", spawned.Prompt)
 	}
 	want := []string{"GET /api/v1/projects/demo", "POST /api/v1/agents/refresh", "POST /api/v1/sessions", "POST /api/v1/sessions/demo-9/pr/claim"}
 	if !reflect.DeepEqual(requests, want) {
@@ -174,6 +181,13 @@ func TestSpawnNoTakeoverRequiresClaimPR(t *testing.T) {
 	_, _, err := executeCLI(t, Deps{}, "spawn", "--project", "demo", "--name", "worker", "--no-takeover")
 	if err == nil || ExitCode(err) != 2 || !strings.Contains(err.Error(), "--no-takeover requires --claim-pr") {
 		t.Fatalf("err=%v exit=%d", err, ExitCode(err))
+	}
+}
+
+func TestSpawnClaimPRRejectsOversizedTaskPromptBeforeNetwork(t *testing.T) {
+	_, _, err := executeCLI(t, Deps{}, "spawn", "--project", "demo", "--name", "worker", "--claim-pr", "142", "--prompt", strings.Repeat("é", maxPromptLen/2+1))
+	if err == nil || ExitCode(err) != 2 || !strings.Contains(err.Error(), "4096 UTF-8 bytes or fewer") {
+		t.Fatalf("err=%v exit=%d, want bounded claim prompt usage error", err, ExitCode(err))
 	}
 }
 

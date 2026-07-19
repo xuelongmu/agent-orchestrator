@@ -2,11 +2,14 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
@@ -58,11 +61,17 @@ func (s *Store) CheckPRClaim(ctx context.Context, prURL string, claimant domain.
 // ClaimPR moves (or creates) a PR row to pr.SessionID and applies the live SCM
 // observation and claimant branch metadata in the same transaction. The
 // session_id update fires the pr_session_changed CDC trigger from migration 0005.
-func (s *Store) ClaimPR(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ports.ReviewWriteMode, allowActiveTakeover bool, workspaceBranch string) (ports.ClaimOutcome, error) {
+func (s *Store) ClaimPR(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ports.ReviewWriteMode, allowActiveTakeover bool, workspaceBranch, taskPrompt string) (ports.ClaimOutcome, error) {
+	deliveryToken, err := newContractDeliveryToken()
+	if err != nil {
+		return ports.ClaimOutcome{}, err
+	}
+	unlockDelivery := designcontract.LockDelivery(pr.URL)
+	defer unlockDelivery()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	var outcome ports.ClaimOutcome
-	err := s.inTx(ctx, "claim pr", func(q *gen.Queries) error {
+	err = s.inTx(ctx, "claim pr", func(q *gen.Queries) error {
 		var err error
 		outcome, err = checkPRClaim(ctx, q, pr.URL, pr.SessionID, allowActiveTakeover)
 		if err != nil {
@@ -74,6 +83,31 @@ func (s *Store) ClaimPR(ctx context.Context, pr domain.PullRequest, checks []dom
 		}); err != nil {
 			return err
 		}
+		if err := q.EnsurePRDesignContract(ctx, gen.EnsurePRDesignContractParams{
+			PRURL: pr.URL, SessionID: string(pr.SessionID),
+			FallbackMarkdown: designcontract.BuildSeed("", ""), UpdatedAt: pr.UpdatedAt,
+		}); err != nil {
+			return err
+		}
+		outcome.DesignContract, err = q.GetPRDesignContract(ctx, pr.URL)
+		if err != nil {
+			return err
+		}
+		n, err := q.RequirePRDesignContractDelivery(ctx, gen.RequirePRDesignContractDeliveryParams{
+			SessionID:     sql.NullString{String: string(pr.SessionID), Valid: true},
+			TaskPrompt:    taskPrompt,
+			DeliveryToken: deliveryToken,
+			RequiredAt:    sql.NullTime{Time: pr.UpdatedAt, Valid: true},
+			PRURL:         pr.URL,
+		})
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return fmt.Errorf("require PR design contract delivery: updated %d contracts, want 1", n)
+		}
+		outcome.ContractDeliveryPending = true
+		outcome.ContractDeliveryToken = deliveryToken
 		if err := writePRRows(ctx, q, pr, checks, reviews, threads, comments, reviewMode, false, false); err != nil {
 			return err
 		}
@@ -88,6 +122,14 @@ func (s *Store) ClaimPR(ctx context.Context, pr domain.PullRequest, checks []dom
 		return nil
 	})
 	return outcome, err
+}
+
+func newContractDeliveryToken() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate contract delivery token: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
 }
 
 func checkPRClaim(ctx context.Context, q *gen.Queries, prURL string, claimant domain.SessionID, allowActiveTakeover bool) (ports.ClaimOutcome, error) {
@@ -131,6 +173,12 @@ func writePRRows(ctx context.Context, q *gen.Queries, pr domain.PullRequest, che
 		if err := q.UpsertPR(ctx, genPRParams(pr)); err != nil {
 			return err
 		}
+	}
+	if err := q.EnsurePRDesignContract(ctx, gen.EnsurePRDesignContractParams{
+		PRURL: pr.URL, SessionID: string(pr.SessionID),
+		FallbackMarkdown: designcontract.BuildSeed("", ""), UpdatedAt: pr.UpdatedAt,
+	}); err != nil {
+		return fmt.Errorf("ensure PR design contract: %w", err)
 	}
 	for _, c := range checks {
 		if err := q.UpsertPRCheck(ctx, genCheckParams(pr.URL, c)); err != nil {

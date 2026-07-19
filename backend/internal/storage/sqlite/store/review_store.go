@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/designcontract"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
@@ -89,10 +91,23 @@ func (s *Store) UpdateReviewRunResult(ctx context.Context, id string, status dom
 // entire finding set. A failed finding insert rolls the run back to running so
 // a retry can never observe a permanently partial complete ledger.
 func (s *Store) CompleteReviewRunWithFindings(ctx context.Context, id string, verdict domain.ReviewVerdict, body, githubReviewID, simplificationClass string, findings []domain.ReviewFinding) (bool, error) {
+	// Contract proposal appends share the same lock order as claim delivery:
+	// exact PR delivery lock, then writeMu/transaction. This prevents a sender
+	// from acknowledging bytes read immediately before a proposal append.
+	pendingRun, err := s.qr.GetReviewRun(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	unlockDelivery := designcontract.LockDelivery(pendingRun.PRURL)
+	defer unlockDelivery()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	updated := false
-	err := s.inTx(ctx, "complete review run with findings", func(q *gen.Queries) error {
+	err = s.inTx(ctx, "complete review run with findings", func(q *gen.Queries) error {
+		run, err := q.GetReviewRun(ctx, id)
+		if err != nil {
+			return err
+		}
 		n, err := q.CompleteReviewRunResult(ctx, gen.CompleteReviewRunResultParams{
 			Verdict: verdict, Body: body, GithubReviewID: githubReviewID,
 			SimplificationClass: simplificationClass, ID: id,
@@ -101,7 +116,59 @@ func (s *Store) CompleteReviewRunWithFindings(ctx context.Context, id string, ve
 			return err
 		}
 		updated = true
+		contract := ""
+		contractLoaded := false
 		for _, finding := range findings {
+			if finding.PRURL != run.PRURL || finding.SessionID != run.SessionID || finding.RunID != run.ID {
+				return fmt.Errorf("review finding %q provenance does not match run %q", finding.ID, run.ID)
+			}
+			invariant := strings.TrimSpace(finding.ProposedInvariant)
+			if invariant != "" {
+				normalized, validationErr := designcontract.NormalizeInvariant(invariant)
+				if validationErr != nil || finding.OutOfScope {
+					reason := "out-of-scope findings cannot propose contract invariants"
+					if validationErr != nil {
+						reason = validationErr.Error()
+					}
+					finding.RootCauseNote = strings.TrimSpace(finding.RootCauseNote + " [Invariant proposal rejected: " + reason + ".]")
+					finding.ProposedInvariant = ""
+					invariant = ""
+				} else {
+					invariant = normalized
+					finding.ProposedInvariant = normalized
+				}
+			}
+			if invariant != "" && !finding.OutOfScope && !contractLoaded {
+				if err := q.EnsurePRDesignContract(ctx, gen.EnsurePRDesignContractParams{
+					PRURL: run.PRURL, SessionID: string(run.SessionID),
+					FallbackMarkdown: designcontract.BuildSeed("", ""), UpdatedAt: finding.CreatedAt,
+				}); err != nil {
+					return fmt.Errorf("ensure canonical design contract for review run %q: %w", run.ID, err)
+				}
+				contract, err = q.GetPRDesignContract(ctx, run.PRURL)
+				if err != nil {
+					return fmt.Errorf("load canonical design contract for review run %q: %w", run.ID, err)
+				}
+				contractLoaded = true
+			}
+			if invariant != "" && !finding.OutOfScope && !designcontract.HasInvariant(contract, invariant) {
+				addition := designcontract.AppendInvariant("", invariant)
+				if len(contract)+len(addition) > designcontract.MaxCanonicalBytes {
+					finding.RootCauseNote = strings.TrimSpace(finding.RootCauseNote + " [Invariant proposal rejected: canonical contract capacity exceeded.]")
+					finding.ProposedInvariant = ""
+				} else {
+					n, err := q.AppendPRDesignContractInvariant(ctx, gen.AppendPRDesignContractInvariantParams{
+						Addition: addition, UpdatedAt: finding.CreatedAt, PRURL: run.PRURL,
+					})
+					if err != nil {
+						return err
+					}
+					if n != 1 {
+						return fmt.Errorf("append explicit invariant for review finding %q: updated %d contracts, want 1", finding.ID, n)
+					}
+					contract += addition
+				}
+			}
 			if err := q.InsertReviewFindingStrict(ctx, strictFindingParams(finding)); err != nil {
 				return err
 			}
@@ -300,7 +367,7 @@ func (s *Store) InsertReviewFinding(ctx context.Context, finding domain.ReviewFi
 	return s.qw.InsertReviewFinding(ctx, gen.InsertReviewFindingParams{
 		ID: finding.ID, RunID: finding.RunID, SessionID: finding.SessionID,
 		PRURL: finding.PRURL, Round: int64(finding.Round), File: finding.File,
-		ClassTag: finding.ClassTag, RootCauseNote: finding.RootCauseNote,
+		ClassTag: finding.ClassTag, RootCauseNote: finding.RootCauseNote, ProposedInvariant: finding.ProposedInvariant,
 		FixCommit: finding.FixCommit, ThreadID: finding.ThreadID, Body: finding.Body,
 		OutOfScope: boolInt64(finding.OutOfScope), DeferredIssueURL: finding.DeferredIssueURL,
 		ThreadResolved: boolInt64(finding.ThreadResolved), CreatedAt: finding.CreatedAt,
@@ -311,7 +378,7 @@ func strictFindingParams(finding domain.ReviewFinding) gen.InsertReviewFindingSt
 	return gen.InsertReviewFindingStrictParams{
 		ID: finding.ID, RunID: finding.RunID, SessionID: finding.SessionID,
 		PRURL: finding.PRURL, Round: int64(finding.Round), File: finding.File,
-		ClassTag: finding.ClassTag, RootCauseNote: finding.RootCauseNote,
+		ClassTag: finding.ClassTag, RootCauseNote: finding.RootCauseNote, ProposedInvariant: finding.ProposedInvariant,
 		FixCommit: finding.FixCommit, ThreadID: finding.ThreadID, Body: finding.Body,
 		OutOfScope: boolInt64(finding.OutOfScope), DeferredIssueURL: finding.DeferredIssueURL,
 		ThreadResolved: boolInt64(finding.ThreadResolved), ThreadReplyID: finding.ThreadReplyID,
@@ -457,7 +524,7 @@ func reviewFindingFromRow(r gen.ReviewFinding) domain.ReviewFinding {
 	return domain.ReviewFinding{
 		ID: r.ID, RunID: r.RunID, SessionID: r.SessionID, PRURL: r.PRURL,
 		Round: int(r.Round), File: r.File, ClassTag: r.ClassTag,
-		RootCauseNote: r.RootCauseNote, FixCommit: r.FixCommit,
+		RootCauseNote: r.RootCauseNote, ProposedInvariant: r.ProposedInvariant, FixCommit: r.FixCommit,
 		ThreadID: r.ThreadID, Body: r.Body, OutOfScope: r.OutOfScope != 0,
 		DeferredIssueURL: r.DeferredIssueURL, ThreadResolved: r.ThreadResolved != 0,
 		ThreadReplyID: r.ThreadReplyID,
