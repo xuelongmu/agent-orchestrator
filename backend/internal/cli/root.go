@@ -77,9 +77,10 @@ type Deps struct {
 	DoctorGitHubRESTBase string
 	Now                  func() time.Time
 	Sleep                func(time.Duration)
+	RemoveAll            func(string) error
 	// OpenStore is used only by the legacy import command, the one CLI path
-	// permitted to access SQLite directly. Dry-run uses the read-only behavior;
-	// writes must use OpenExclusiveStore so no unfenced handle escapes.
+	// permitted to access SQLite directly. Dry-run passes it a private database
+	// snapshot; writes use OpenExclusiveStore so no unfenced source handle escapes.
 	OpenStore          func(dataDir string) (*sqlite.Store, error)
 	OpenExclusiveStore func(ctx context.Context, dataDir string, ownerPID int) (*sqlite.Store, *coordination.Lease, error)
 }
@@ -100,6 +101,7 @@ func DefaultDeps() Deps {
 		DoctorGitHubRESTBase: defaultDoctorGitHubRESTBase,
 		Now:                  time.Now,
 		Sleep:                time.Sleep,
+		RemoveAll:            os.RemoveAll,
 		OpenStore:            sqlite.Open,
 		OpenExclusiveStore:   coordination.OpenExclusive,
 	}
@@ -161,6 +163,9 @@ func (d Deps) withDefaults() Deps {
 	}
 	if d.Sleep == nil {
 		d.Sleep = def.Sleep
+	}
+	if d.RemoveAll == nil {
+		d.RemoveAll = def.RemoveAll
 	}
 	return d
 }
