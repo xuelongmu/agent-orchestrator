@@ -25,6 +25,10 @@ const (
 // daemon. Payload must be allowlisted at the call site; sinks may serialize it
 // but must not mutate it.
 type TelemetryEvent struct {
+	// ID is optional for ordinary best-effort events. A non-empty ID is a
+	// durable idempotency key: sinks must reuse it as their local primary key or
+	// provider deduplication key when an event is replayed.
+	ID         string
 	Name       string
 	Source     string
 	OccurredAt time.Time
@@ -41,4 +45,12 @@ type TelemetryEvent struct {
 type EventSink interface {
 	Emit(ctx context.Context, ev TelemetryEvent)
 	Close(ctx context.Context) error
+}
+
+// DurableLocalEventSink reports whether the sink includes durable local event
+// storage. Lifecycle uses this capability before creating transactional review
+// telemetry; disabled/no-op and remote-only sinks return false.
+type DurableLocalEventSink interface {
+	EventSink
+	DurableLocalTelemetry() bool
 }

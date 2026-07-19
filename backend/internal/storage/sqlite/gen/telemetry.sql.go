@@ -15,6 +15,7 @@ const createTelemetryEvent = `-- name: CreateTelemetryEvent :exec
 INSERT INTO telemetry_event (
     id, occurred_at, name, source, level, project_id, session_id, request_id, payload_json
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (id) DO NOTHING
 `
 
 type CreateTelemetryEventParams struct {
@@ -31,6 +32,61 @@ type CreateTelemetryEventParams struct {
 
 func (q *Queries) CreateTelemetryEvent(ctx context.Context, arg CreateTelemetryEventParams) error {
 	_, err := q.db.ExecContext(ctx, createTelemetryEvent,
+		arg.ID,
+		arg.OccurredAt,
+		arg.Name,
+		arg.Source,
+		arg.Level,
+		arg.ProjectID,
+		arg.SessionID,
+		arg.RequestID,
+		arg.PayloadJson,
+	)
+	return err
+}
+
+const getTelemetryEvent = `-- name: GetTelemetryEvent :one
+SELECT id, occurred_at, name, source, level, project_id, session_id, request_id, payload_json
+FROM telemetry_event WHERE id = ?
+`
+
+func (q *Queries) GetTelemetryEvent(ctx context.Context, id string) (TelemetryEvent, error) {
+	row := q.db.QueryRowContext(ctx, getTelemetryEvent, id)
+	var i TelemetryEvent
+	err := row.Scan(
+		&i.ID,
+		&i.OccurredAt,
+		&i.Name,
+		&i.Source,
+		&i.Level,
+		&i.ProjectID,
+		&i.SessionID,
+		&i.RequestID,
+		&i.PayloadJson,
+	)
+	return i, err
+}
+
+const insertTelemetryEventStrict = `-- name: InsertTelemetryEventStrict :exec
+INSERT INTO telemetry_event (
+    id, occurred_at, name, source, level, project_id, session_id, request_id, payload_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`
+
+type InsertTelemetryEventStrictParams struct {
+	ID          string
+	OccurredAt  time.Time
+	Name        string
+	Source      string
+	Level       string
+	ProjectID   sql.NullString
+	SessionID   sql.NullString
+	RequestID   string
+	PayloadJson string
+}
+
+func (q *Queries) InsertTelemetryEventStrict(ctx context.Context, arg InsertTelemetryEventStrictParams) error {
+	_, err := q.db.ExecContext(ctx, insertTelemetryEventStrict,
 		arg.ID,
 		arg.OccurredAt,
 		arg.Name,

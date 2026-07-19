@@ -62,7 +62,7 @@ const (
 
 // ReviewResult is the already-persisted result of an AO-internal review pass.
 // Lifecycle treats it as input to the reaction reducer; its only review_run
-// mutation is claiming the simplification activity receipt before emission.
+// mutation atomically records the simplification receipt and local event.
 type ReviewResult struct {
 	RunID               string
 	BatchID             string
@@ -200,25 +200,44 @@ func (m *Manager) emitSimplificationRound(ctx context.Context, rec domain.Sessio
 	if r.SimplificationClass == "" {
 		return nil
 	}
-	receipts, ok := m.store.(simplificationDispatchStore)
-	if !ok {
-		return errors.New("lifecycle: review store does not support simplification dispatch receipts")
-	}
-	dispatchedAt := m.clock()
-	claimed, err := receipts.ClaimReviewRunSimplificationDispatch(ctx, r.RunID, r.TargetSHA, dispatchedAt)
-	if err != nil {
-		return fmt.Errorf("claim simplification dispatch for review run %q: %w", r.RunID, err)
-	}
-	if !claimed {
+	if m.telemetry == nil {
 		return nil
 	}
+	durable, ok := m.telemetry.(ports.DurableLocalEventSink)
+	if !ok {
+		return errors.New("lifecycle: simplification telemetry sink does not report local durability")
+	}
+	if !durable.DurableLocalTelemetry() {
+		// Telemetry is disabled (the production NoopSink). Do not create a local
+		// telemetry row that the user opted out of.
+		return nil
+	}
+	events, ok := m.store.(simplificationEventStore)
+	if !ok {
+		return errors.New("lifecycle: review store does not support durable simplification events")
+	}
+	dispatchedAt := m.clock()
 	projectID, sessionID := rec.ProjectID, rec.ID
-	m.emitTelemetry(ctx, ports.TelemetryEvent{
+	event := ports.TelemetryEvent{
+		ID:   simplificationTelemetryID(r.RunID, r.TargetSHA),
 		Name: "review_simplification_round", Source: "lifecycle", OccurredAt: dispatchedAt,
 		Level: ports.TelemetryLevelInfo, ProjectID: &projectID, SessionID: &sessionID,
 		Payload: map[string]any{"pr_url": r.PRURL, "class_tag": r.SimplificationClass, "findings": r.Ledger.TotalFindings, "rounds": r.Ledger.Rounds},
-	})
+	}
+	durableEvent, _, err := events.EnsureReviewRunSimplificationEvent(ctx, r.RunID, r.TargetSHA, event)
+	if err != nil {
+		return fmt.Errorf("persist simplification event for review run %q: %w", r.RunID, err)
+	}
+	// The undelivered review run is the replay trigger if the process stops
+	// after the atomic SQLite write above. Every replay carries the same ID;
+	// local SQLite ignores it and PostHog receives it as $insert_id.
+	m.emitTelemetry(ctx, durableEvent)
 	return nil
+}
+
+func simplificationTelemetryID(runID, targetSHA string) string {
+	sum := sha256.Sum256([]byte(runID + "\x00" + targetSHA))
+	return fmt.Sprintf("tev_review_simplification_%x", sum[:])
 }
 
 type reactionState struct {

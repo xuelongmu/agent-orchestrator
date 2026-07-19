@@ -21,15 +21,16 @@ type fakeStore struct {
 	sessions   map[domain.SessionID]domain.SessionRecord
 	signatures map[string]string
 
-	updateCalls  int
-	markCalls    int
-	markedIDs    []string
-	findings     []domain.ReviewFinding
-	project      domain.ProjectRecord
-	completeErr  error
-	markErr      error
-	issueClaims  map[string]string
-	threadClaims map[string]string
+	updateCalls     int
+	markCalls       int
+	markedIDs       []string
+	findings        []domain.ReviewFinding
+	project         domain.ProjectRecord
+	completeErr     error
+	markErr         error
+	telemetryEvents map[string]ports.TelemetryEvent
+	issueClaims     map[string]string
+	threadClaims    map[string]string
 }
 
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
@@ -70,10 +71,19 @@ func (f *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) 
 type fakeTelemetrySink struct{ events []ports.TelemetryEvent }
 
 func (f *fakeTelemetrySink) Emit(_ context.Context, event ports.TelemetryEvent) {
+	if event.ID != "" {
+		for _, existing := range f.events {
+			if existing.ID == event.ID {
+				return
+			}
+		}
+	}
 	f.events = append(f.events, event)
 }
 
 func (*fakeTelemetrySink) Close(context.Context) error { return nil }
+
+func (*fakeTelemetrySink) DurableLocalTelemetry() bool { return true }
 
 func (f *fakeStore) GetReviewRun(_ context.Context, id string) (domain.ReviewRun, bool, error) {
 	for _, run := range f.batchRuns {
@@ -180,23 +190,31 @@ func (f *fakeStore) MarkReviewRunDelivered(_ context.Context, id string, deliver
 	return true, nil
 }
 
-func (f *fakeStore) ClaimReviewRunSimplificationDispatch(_ context.Context, id, targetSHA string, dispatchedAt time.Time) (bool, error) {
+func (f *fakeStore) EnsureReviewRunSimplificationEvent(_ context.Context, id, targetSHA string, event ports.TelemetryEvent) (ports.TelemetryEvent, bool, error) {
+	if f.telemetryEvents == nil {
+		f.telemetryEvents = map[string]ports.TelemetryEvent{}
+	}
 	if f.run.ID == id && f.run.TargetSHA == targetSHA && f.run.Status == domain.ReviewRunComplete && f.run.SimplificationClass != "" && f.run.SimplificationDispatchedAt == nil {
-		f.run.SimplificationDispatchedAt = &dispatchedAt
+		f.run.SimplificationDispatchedAt = &event.OccurredAt
+		f.telemetryEvents[event.ID] = event
 		for i := range f.batchRuns {
 			if f.batchRuns[i].ID == id {
-				f.batchRuns[i].SimplificationDispatchedAt = &dispatchedAt
+				f.batchRuns[i].SimplificationDispatchedAt = &event.OccurredAt
 			}
 		}
-		return true, nil
+		return event, true, nil
 	}
 	for i := range f.batchRuns {
 		if f.batchRuns[i].ID == id && f.batchRuns[i].TargetSHA == targetSHA && f.batchRuns[i].Status == domain.ReviewRunComplete && f.batchRuns[i].SimplificationClass != "" && f.batchRuns[i].SimplificationDispatchedAt == nil {
-			f.batchRuns[i].SimplificationDispatchedAt = &dispatchedAt
-			return true, nil
+			f.batchRuns[i].SimplificationDispatchedAt = &event.OccurredAt
+			f.telemetryEvents[event.ID] = event
+			return event, true, nil
 		}
 	}
-	return false, nil
+	if persisted, ok := f.telemetryEvents[event.ID]; ok {
+		return persisted, false, nil
+	}
+	return ports.TelemetryEvent{}, false, nil
 }
 
 func (f *fakeStore) MarkReviewRunDeflectedReviewCleared(_ context.Context, id string, clearedAt time.Time) (bool, error) {

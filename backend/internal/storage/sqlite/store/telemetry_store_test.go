@@ -26,6 +26,11 @@ func TestTelemetryStore_CreateListAndPrune(t *testing.T) {
 	if err := s.CreateTelemetryEvent(ctx, telemetryRecord("tev_new", newAt, &projectID, &sessionID)); err != nil {
 		t.Fatalf("CreateTelemetryEvent new: %v", err)
 	}
+	duplicate := telemetryRecord("tev_new", newAt.Add(time.Minute), &projectID, &sessionID)
+	duplicate.Name = "should-not-replace-stable-event"
+	if err := s.CreateTelemetryEvent(ctx, duplicate); err != nil {
+		t.Fatalf("CreateTelemetryEvent duplicate stable id: %v", err)
+	}
 
 	rows, err := s.ListTelemetryEventsSince(ctx, oldAt.Add(-time.Second), 10)
 	if err != nil {

@@ -40,6 +40,9 @@ type LocalSQLiteSink struct {
 	lastPrune time.Time
 }
 
+// DurableLocalTelemetry reports that this sink includes SQLite persistence.
+func (*LocalSQLiteSink) DurableLocalTelemetry() bool { return true }
+
 // NewLocalSQLiteSink starts a buffered SQLite-backed telemetry sink.
 func NewLocalSQLiteSink(store localStore, log *slog.Logger) *LocalSQLiteSink {
 	s := &LocalSQLiteSink{
@@ -92,8 +95,12 @@ func (s *LocalSQLiteSink) persist(ev ports.TelemetryEvent) {
 		s.log.Warn("telemetry payload marshal failed", "name", ev.Name, "error", err)
 		return
 	}
+	id := ev.ID
+	if id == "" {
+		id = s.newID()
+	}
 	rec := sqlitestore.TelemetryEventRecord{
-		ID:          s.newID(),
+		ID:          id,
 		OccurredAt:  ev.OccurredAt.UTC(),
 		Name:        ev.Name,
 		Source:      ev.Source,

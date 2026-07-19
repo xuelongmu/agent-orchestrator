@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 func TestInsertReviewRunDuplicatePRSHAMapsToSentinel(t *testing.T) {
@@ -417,14 +418,28 @@ func TestCompleteReviewRunWithFindingsIsAtomicAndPersistsSimplificationDispatch(
 		t.Fatalf("restore simplification = %v, %v", ok, err)
 	}
 	dispatchedAt := now.Add(30 * time.Second)
-	if ok, err := s.ClaimReviewRunSimplificationDispatch(ctx, "run-1", "wrong-sha", dispatchedAt); err != nil || ok {
-		t.Fatalf("wrong-head simplification claim = %v, %v", ok, err)
+	projectID, sessionID := rec.ProjectID, rec.ID
+	event := ports.TelemetryEvent{
+		ID: "tev_review_simplification_test", Name: "review_simplification_round", Source: "lifecycle",
+		OccurredAt: dispatchedAt, Level: ports.TelemetryLevelInfo, ProjectID: &projectID, SessionID: &sessionID,
+		Payload: map[string]any{"class_tag": "missing-notify"},
 	}
-	if ok, err := s.ClaimReviewRunSimplificationDispatch(ctx, "run-1", "sha1", dispatchedAt); err != nil || !ok {
-		t.Fatalf("simplification claim = %v, %v", ok, err)
+	if _, ok, err := s.EnsureReviewRunSimplificationEvent(ctx, "run-1", "wrong-sha", event); err == nil || ok {
+		t.Fatalf("wrong-head simplification ensure = %v, %v", ok, err)
 	}
-	if ok, err := s.ClaimReviewRunSimplificationDispatch(ctx, "run-1", "sha1", dispatchedAt); err != nil || ok {
-		t.Fatalf("duplicate simplification claim = %v, %v", ok, err)
+	if _, ok, err := s.EnsureReviewRunSimplificationEvent(ctx, "run-1", "sha1", event); err != nil || !ok {
+		t.Fatalf("simplification ensure = %v, %v", ok, err)
+	}
+	replay, ok, err := s.EnsureReviewRunSimplificationEvent(ctx, "run-1", "sha1", ports.TelemetryEvent{ID: event.ID, OccurredAt: dispatchedAt.Add(time.Hour)})
+	if err != nil || ok {
+		t.Fatalf("duplicate simplification ensure = %v, %v", ok, err)
+	}
+	if replay.Name != event.Name || !replay.OccurredAt.Equal(event.OccurredAt) {
+		t.Fatalf("replayed event = %+v, want original durable intent", replay)
+	}
+	events, err := s.ListTelemetryEventsSince(ctx, dispatchedAt.Add(-time.Second), 10)
+	if err != nil || len(events) != 1 || events[0].ID != event.ID {
+		t.Fatalf("durable simplification events = %+v, %v", events, err)
 	}
 	if ok, err := s.MarkReviewRunDelivered(ctx, "run-1", now.Add(time.Minute)); err != nil || !ok {
 		t.Fatalf("deliver = %v, %v", ok, err)

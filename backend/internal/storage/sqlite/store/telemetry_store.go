@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -25,6 +27,13 @@ type TelemetryEventRecord struct {
 
 // CreateTelemetryEvent persists one telemetry event row.
 func (s *Store) CreateTelemetryEvent(ctx context.Context, rec TelemetryEventRecord) error {
+	if err := s.qw.CreateTelemetryEvent(ctx, createTelemetryEventParams(rec)); err != nil {
+		return fmt.Errorf("create telemetry event %s: %w", rec.ID, err)
+	}
+	return nil
+}
+
+func createTelemetryEventParams(rec TelemetryEventRecord) gen.CreateTelemetryEventParams {
 	arg := gen.CreateTelemetryEventParams{
 		ID:          rec.ID,
 		OccurredAt:  rec.OccurredAt.UTC(),
@@ -40,10 +49,39 @@ func (s *Store) CreateTelemetryEvent(ctx context.Context, rec TelemetryEventReco
 	if rec.SessionID != nil {
 		arg.SessionID = sql.NullString{String: string(*rec.SessionID), Valid: true}
 	}
-	if err := s.qw.CreateTelemetryEvent(ctx, arg); err != nil {
-		return fmt.Errorf("create telemetry event %s: %w", rec.ID, err)
+	return arg
+}
+
+func telemetryEventRecord(event ports.TelemetryEvent) (TelemetryEventRecord, error) {
+	payloadJSON, err := json.Marshal(event.Payload)
+	if err != nil {
+		return TelemetryEventRecord{}, fmt.Errorf("marshal telemetry event %s payload: %w", event.ID, err)
 	}
-	return nil
+	return TelemetryEventRecord{
+		ID: event.ID, OccurredAt: event.OccurredAt.UTC(), Name: event.Name,
+		Source: event.Source, Level: string(event.Level), ProjectID: event.ProjectID,
+		SessionID: event.SessionID, RequestID: event.RequestID, PayloadJSON: string(payloadJSON),
+	}, nil
+}
+
+func telemetryEventFromRow(row gen.TelemetryEvent) (ports.TelemetryEvent, error) {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(row.PayloadJson), &payload); err != nil {
+		return ports.TelemetryEvent{}, fmt.Errorf("unmarshal telemetry event %s payload: %w", row.ID, err)
+	}
+	event := ports.TelemetryEvent{
+		ID: row.ID, Name: row.Name, Source: row.Source, OccurredAt: row.OccurredAt.UTC(),
+		Level: ports.TelemetryLevel(row.Level), RequestID: row.RequestID, Payload: payload,
+	}
+	if row.ProjectID.Valid {
+		projectID := domain.ProjectID(row.ProjectID.String)
+		event.ProjectID = &projectID
+	}
+	if row.SessionID.Valid {
+		sessionID := domain.SessionID(row.SessionID.String)
+		event.SessionID = &sessionID
+	}
+	return event, nil
 }
 
 // ListTelemetryEventsSince returns telemetry rows oldest-first from a time

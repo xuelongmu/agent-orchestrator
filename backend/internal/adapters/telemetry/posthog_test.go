@@ -33,6 +33,7 @@ func TestPostHogSinkCapturesEvent(t *testing.T) {
 	projectID := domain.ProjectID("proj-1")
 	sessionID := domain.SessionID("sess-1")
 	sink.Emit(context.Background(), ports.TelemetryEvent{
+		ID:         "tev_stable_1",
 		Name:       "ao.session.spawned",
 		Source:     "session_service",
 		OccurredAt: time.Unix(1700000000, 0).UTC(),
@@ -59,6 +60,9 @@ func TestPostHogSinkCapturesEvent(t *testing.T) {
 		}
 		if props["kind"] != "worker" {
 			t.Fatalf("properties.kind = %#v, want worker", props["kind"])
+		}
+		if props["$insert_id"] != "tev_stable_1" {
+			t.Fatalf("properties.$insert_id = %#v, want stable event id", props["$insert_id"])
 		}
 		if props["project_id_hash"] == "" || props["session_id_hash"] == "" {
 			t.Fatalf("hashed ids missing from properties: %#v", props)

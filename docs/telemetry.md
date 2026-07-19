@@ -63,6 +63,16 @@ AO_TELEMETRY_POSTHOG_HOST=https://us.i.posthog.com
 
 Local daemon telemetry is retained in SQLite for 30 days.
 
+Simplification-round telemetry uses a stronger local boundary than ordinary
+best-effort events. AO transactionally inserts the local telemetry row and
+stamps the review-run receipt under one deterministic event ID derived from the
+review run and exact target SHA. The still-undelivered review run retries fanout
+after a crash; SQLite ignores the repeated ID and PostHog receives the same
+`$insert_id` for provider deduplication. The local SQLite row is therefore the
+exactly-once system of record. Remote export remains buffered and best-effort:
+AO can make retries idempotent, but cannot guarantee that an external provider
+accepts an event before the review run is ultimately stamped delivered.
+
 ## PostHog Retention And Geography Dashboard
 
 Use `ao.app.active` as the active-user event for DAU, weekly retention, and
