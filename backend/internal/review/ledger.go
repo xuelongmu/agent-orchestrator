@@ -44,7 +44,7 @@ func FindingLedger(findings []domain.ReviewFinding) domain.FindingLedgerSummary 
 func SimplificationClassForRun(findings []domain.ReviewFinding, runID string) string {
 	current := map[string]bool{}
 	for _, finding := range findings {
-		if finding.RunID == runID && !(finding.OutOfScope && finding.DeferredIssueURL != "") {
+		if finding.RunID == runID && (!finding.OutOfScope || finding.DeferredIssueURL == "") {
 			current[strings.TrimSpace(finding.ClassTag)] = true
 		}
 	}
