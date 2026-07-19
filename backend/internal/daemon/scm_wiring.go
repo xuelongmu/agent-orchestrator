@@ -12,6 +12,7 @@ import (
 	scmgithub "github.com/aoagents/agent-orchestrator/backend/internal/adapters/scm/github"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	scmobserve "github.com/aoagents/agent-orchestrator/backend/internal/observe/scm"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
@@ -19,13 +20,13 @@ import (
 // provider used by v1. Missing credentials do not fail daemon startup; the
 // observer performs a lazy credential check in its background goroutine, logs
 // one warning, and disables itself before any provider API calls.
-func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.Manager, coordinator scmobserve.ReviewCoordinator, logger *slog.Logger) <-chan struct{} {
+func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.Manager, coordinator scmobserve.ReviewCoordinator, telemetry ports.EventSink, logger *slog.Logger) <-chan struct{} {
 	provider, err := newGitHubSCMProvider(logger)
 	if err != nil {
 		logSCMProviderDisabled(logger, err)
 		return closedDone()
 	}
-	observer := scmobserve.New(provider, store, lcm, scmobserve.Config{Logger: logger, ReviewCoordinator: coordinator})
+	observer := scmobserve.New(provider, store, lcm, scmobserve.Config{Logger: logger, Telemetry: telemetry, ReviewCoordinator: coordinator})
 	return observer.Start(ctx)
 }
 

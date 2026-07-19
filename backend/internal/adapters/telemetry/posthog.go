@@ -67,6 +67,15 @@ var remotePayloadAllowlist = map[string]map[string]struct{}{
 		"status":        {},
 		"status_family": {},
 	},
+	"ao.lifecycle.poll": {
+		"duration_ms":   {},
+		"health_status": {},
+		"interval_ms":   {},
+		"operation":     {},
+		"outcome":       {},
+		"overrun_ms":    {},
+		"reason":        {},
+	},
 	"ao.onboarding.first_project_added": {
 		"has_git_remote": {},
 		"kind":           {},

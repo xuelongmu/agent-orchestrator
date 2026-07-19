@@ -104,6 +104,9 @@ type Config struct {
 	Clock func() time.Time
 	// Logger receives operational diagnostics for provider/store/lifecycle failures.
 	Logger *slog.Logger
+	// Telemetry receives poll-cycle duration and health observations. Nil disables
+	// structured emission; warning logs remain enabled for poll overruns.
+	Telemetry ports.EventSink
 	// ReviewCoordinator optionally advances the durable automatic review loop.
 	ReviewCoordinator ReviewCoordinator
 	// CacheMax bounds each in-memory ETag/review cache. Zero uses DefaultCacheMax.
@@ -166,6 +169,8 @@ type Observer struct {
 	clock func() time.Time
 	// logger receives non-fatal operational failures.
 	logger *slog.Logger
+	// telemetry receives best-effort operational observations for the poll loop.
+	telemetry ports.EventSink
 	// credentialsChecked records whether an optional provider credential gate ran.
 	credentialsChecked bool
 	// disabled is set after the credential gate reports unavailable credentials.
@@ -177,7 +182,7 @@ type Observer struct {
 // New constructs an Observer with default cadence/cache settings for zero
 // values in cfg.
 func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Observer {
-	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, reviewCoordinator: cfg.ReviewCoordinator, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, Cache: newCache(cfg.CacheMax)}
+	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, reviewCoordinator: cfg.ReviewCoordinator, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, telemetry: cfg.Telemetry, Cache: newCache(cfg.CacheMax)}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
@@ -206,18 +211,13 @@ func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Obser
 // to the next tick.
 func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 	var credentialGate sync.Once
-	poll := func(ctx context.Context) error {
-		credentialGate.Do(func() {
-			if _, err := o.checkCredentials(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				o.logger.Error("scm observer: initial credential check failed", "err", err)
-			}
-		})
-		return o.Poll(ctx)
-	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		// Keep each poll synchronous in this goroutine. Besides preserving cache
+		// mutation ordering, this is the loop's non-reentrancy guard: the next
+		// timer is not armed until the current cycle has fully completed.
+		if err := o.runStartedPoll(ctx, &credentialGate); err != nil && !errors.Is(err, context.Canceled) {
 			o.logger.Error("scm observer: initial poll failed", "err", err)
 		}
 		for {
@@ -232,13 +232,89 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 				}
 				return
 			case <-timer.C:
-				if err := poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				if err := o.runStartedPoll(ctx, &credentialGate); err != nil && !errors.Is(err, context.Canceled) {
 					o.logger.Error("scm observer: poll failed", "err", err)
 				}
 			}
 		}
 	}()
 	return done
+}
+
+// runStartedPoll measures the complete cycle driven by Start, including the
+// once-per-process lazy credential gate. That gate may shell out to gh, so
+// excluding it would under-report the time during which this serialized loop
+// cannot arm its next timer.
+func (o *Observer) runStartedPoll(ctx context.Context, credentialGate *sync.Once) error {
+	return o.runPoll(ctx, func(ctx context.Context) error {
+		credentialGate.Do(func() {
+			if _, err := o.checkCredentials(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				o.logger.Error("scm observer: initial credential check failed", "err", err)
+			}
+		})
+		return o.poll(ctx)
+	})
+}
+
+// runPoll records the duration of one serialized SCM lifecycle cycle. The Go
+// observer intentionally waits for a cycle to finish before arming the next
+// timer, rather than starting overlapping polls and dropping one at a separate
+// re-entrancy guard. A cycle that consumes more than the configured base cadence
+// is therefore the current-tree equivalent of the legacy poll-overrun skip.
+func (o *Observer) runPoll(ctx context.Context, poll func(context.Context) error) error {
+	// Keep the monotonic component returned by time.Now for duration math. UTC
+	// conversion is only needed on the emitted wall-clock timestamp.
+	startedAt := o.clock()
+	err := poll(ctx)
+	completedAt := o.clock()
+	if !errors.Is(err, context.Canceled) {
+		o.recordPollCompletion(ctx, startedAt, completedAt, err)
+	}
+	return err
+}
+
+func (o *Observer) recordPollCompletion(ctx context.Context, startedAt, completedAt time.Time, pollErr error) {
+	duration := completedAt.Sub(startedAt)
+	if duration < 0 {
+		duration = 0
+	}
+	payload := map[string]any{
+		"operation":     "lifecycle.poll",
+		"outcome":       "success",
+		"duration_ms":   duration.Milliseconds(),
+		"interval_ms":   o.tick.Milliseconds(),
+		"health_status": "ok",
+	}
+	if pollErr != nil {
+		payload["outcome"] = "failure"
+		// Poll errors already have their established error-log path in Start.
+		// Leave health classification to the notifier follow-up rather than
+		// expanding this overrun-only producer into failure alerting.
+		delete(payload, "health_status")
+	}
+
+	level := ports.TelemetryLevelInfo
+	if overrun := duration - o.tick; overrun > 0 {
+		level = ports.TelemetryLevelWarn
+		payload["reason"] = "poll_overrun"
+		payload["health_status"] = "warn"
+		payload["overrun_ms"] = overrun.Milliseconds()
+		o.logger.Warn("scm observer: poll overrun; lifecycle health degraded",
+			"reason", "poll_overrun",
+			"duration_ms", duration.Milliseconds(),
+			"interval_ms", o.tick.Milliseconds(),
+			"overrun_ms", overrun.Milliseconds())
+	}
+
+	if o.telemetry != nil {
+		o.telemetry.Emit(ctx, ports.TelemetryEvent{
+			Name:       "ao.lifecycle.poll",
+			Source:     "scm_observer",
+			OccurredAt: completedAt.UTC(),
+			Level:      level,
+			Payload:    payload,
+		})
+	}
 }
 
 func (o *Observer) nextPollDelay() time.Duration {
@@ -299,8 +375,12 @@ type persistenceOptions struct {
 	preserveLocalReviewDecision bool
 }
 
-// Poll runs one synchronous SCM observation cycle.
+// Poll runs one synchronous SCM observation cycle and records its completion.
 func (o *Observer) Poll(ctx context.Context) error {
+	return o.runPoll(ctx, o.poll)
+}
+
+func (o *Observer) poll(ctx context.Context) error {
 	now := o.clock().UTC()
 	if err := ctx.Err(); err != nil {
 		return err
