@@ -656,6 +656,19 @@ func (a afterStartAgent) GetPromptDeliveryStrategy(context.Context, ports.Launch
 	return ports.PromptDeliveryAfterStart, nil
 }
 
+type afterStartFailingCleanupAgent struct {
+	afterStartAgent
+	cleanupErr error
+}
+
+func (a afterStartFailingCleanupAgent) UninstallHooks(context.Context, string) error {
+	return a.cleanupErr
+}
+
+func (a afterStartFailingCleanupAgent) CleanupWorkspace(context.Context, ports.WorkspaceHookConfig) error {
+	return a.cleanupErr
+}
+
 type readinessAgent struct {
 	afterStartAgent
 	hints ports.PromptReadinessHints
@@ -3625,6 +3638,79 @@ func TestRestore_SkipsSharedDirectoryCleanupFenceRuntime(t *testing.T) {
 	}
 }
 
+func TestRestore_PreCreateFailuresPreserveOldRuntime(t *testing.T) {
+	t.Run("validation", func(t *testing.T) {
+		m, st, rt, _ := newManager()
+		st.setSession(domain.SessionRecord{
+			ID: "mer-1", ProjectID: "mer", IsTerminated: true, Activity: domain.Activity{State: domain.ActivityExited},
+			Metadata: domain.SessionMetadata{RuntimeHandleID: "old-runtime", Prompt: "continue"},
+		})
+		if _, err := m.Restore(ctx, "mer-1"); !errors.Is(err, ErrIncompleteHandle) {
+			t.Fatalf("restore error = %v, want ErrIncompleteHandle", err)
+		}
+		if rt.destroyed != 0 || rt.created != 0 {
+			t.Fatalf("validation failure destroy/create = %d/%d, want 0/0", rt.destroyed, rt.created)
+		}
+	})
+
+	t.Run("workspace restore", func(t *testing.T) {
+		m, st, rt, ws := newManager()
+		seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "old-runtime", Prompt: "continue"})
+		ws.createErr = errors.New("workspace unavailable")
+		if _, err := m.Restore(ctx, "mer-1"); err == nil || !strings.Contains(err.Error(), "workspace unavailable") {
+			t.Fatalf("restore error = %v, want workspace failure", err)
+		}
+		if rt.destroyed != 0 || rt.created != 0 {
+			t.Fatalf("workspace failure destroy/create = %d/%d, want 0/0", rt.destroyed, rt.created)
+		}
+	})
+
+	t.Run("agent preparation", func(t *testing.T) {
+		st := newFakeStore()
+		st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+		seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "old-runtime", Prompt: "continue"})
+		rt := &fakeRuntime{}
+		prepareErr := errors.New("hook install failed")
+		m := New(Deps{
+			Runtime:   rt,
+			Agents:    singleAgent{agent: &hookErrorCleaningAgent{hookErr: prepareErr}},
+			Workspace: &fakeWorkspace{},
+			Store:     st,
+			Messenger: &fakeMessenger{},
+			Lifecycle: &fakeLCM{store: st},
+			LookPath:  func(string) (string, error) { return "/bin/true", nil },
+		})
+		if _, err := m.Restore(ctx, "mer-1"); !errors.Is(err, prepareErr) {
+			t.Fatalf("restore error = %v, want preparation failure", err)
+		}
+		if rt.destroyed != 0 || rt.created != 0 {
+			t.Fatalf("preparation failure destroy/create = %d/%d, want 0/0", rt.destroyed, rt.created)
+		}
+	})
+}
+
+func TestRestore_DestroysOldRuntimeImmediatelyBeforeCreate(t *testing.T) {
+	m, st, rt, _ := newManager()
+	seedTerminal(st, "mer-1", domain.SessionMetadata{
+		WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "old-runtime", AgentSessionID: "agent-x",
+	})
+	var events []string
+	rt.beforeDestroy = func(handle ports.RuntimeHandle) {
+		events = append(events, "destroy:"+handle.ID)
+	}
+	rt.beforeCreate = func(ports.RuntimeConfig) {
+		events = append(events, "create")
+	}
+
+	if _, err := m.Restore(ctx, "mer-1"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"destroy:old-runtime", "create"}
+	if !reflect.DeepEqual(events, want) || rt.destroyed != 1 || rt.created != 1 {
+		t.Fatalf("restore events/destroy/create = %v/%d/%d, want %v/1/1", events, rt.destroyed, rt.created, want)
+	}
+}
+
 func TestRestoreRepairDefersDependencyWakeUntilOutcome(t *testing.T) {
 	for _, restoreFails := range []bool{false, true} {
 		name := "success_keeps_child_waiting"
@@ -3738,6 +3824,73 @@ func TestRestoreRepairAfterStartFailureWakesDependenciesExactlyOnce(t *testing.T
 	}
 	if wake.wakes != 1 || gotChild.DependencyPromotionToken == "" {
 		t.Fatalf("dependency wake/token = %d/%q, want exactly 1/reserved", wake.wakes, gotChild.DependencyPromotionToken)
+	}
+	if rt.created != 1 || rt.destroyed != 2 {
+		t.Fatalf("runtime create/destroy = %d/%d, want 1/2 (old and rolled-back replacement)", rt.created, rt.destroyed)
+	}
+}
+
+func TestRestoreRepairSharedDirAfterStartCleanupFailureWakesDependenciesExactlyOnce(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/shared", Config: testRoleAgents()}
+	parent := mkLive("parent")
+	parent.Harness = domain.HarnessClaudeCode
+	parent.Metadata.WorkspaceKind = domain.WorkspaceKindDir
+	parent.Metadata.WorkspacePath = "/shared"
+	parent.Metadata.Branch = ""
+	parent.Metadata.Prompt = "continue the task"
+	parent.Activity = domain.Activity{State: domain.ActivityExited}
+	parent.UpdatedAt = time.Now().UTC()
+	child := domain.SessionRecord{
+		ID:                   "child",
+		ProjectID:            parent.ProjectID,
+		Kind:                 domain.KindWorker,
+		Harness:              domain.HarnessClaudeCode,
+		Activity:             domain.Activity{State: domain.ActivityIdle},
+		DependencyIDs:        domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID}),
+		DependencyPreparedAt: time.Now().UTC(),
+		DependencyBasePrompt: "wait for parent",
+		Metadata:             domain.SessionMetadata{Prompt: "wait for parent"},
+	}
+	st.setSession(parent)
+	st.setSession(child)
+	prs := map[domain.SessionID][]domain.PullRequest{
+		parent.ID: {{URL: "pr1", Merged: true}},
+	}
+	lifecycleStore := &lifecycleStoreAdapter{fakeStore: st, prs: prs}
+	lcm := lifecycle.New(lifecycleStore, nil)
+	wake := &restoreRepairDependencyWake{store: st, prs: prs, parentID: parent.ID, childID: child.ID}
+	lcm.SetDependencyScheduler(wake)
+	deliveryErr := errors.New("pane unavailable")
+	cleanupErr := errors.New("shared hooks still busy")
+	rt := &fakeRuntime{}
+	m := New(Deps{
+		Runtime: rt,
+		Agents: singleAgent{agent: afterStartFailingCleanupAgent{
+			afterStartAgent: afterStartAgent{recordingAgent: &recordingAgent{}},
+			cleanupErr:      cleanupErr,
+		}},
+		Workspace: &fakeWorkspace{path: "/shared"},
+		Store:     st,
+		Messenger: &fakeMessenger{err: deliveryErr},
+		Lifecycle: lcm,
+		LookPath:  func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	_, err := m.Restore(ctx, parent.ID)
+	if !errors.Is(err, deliveryErr) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("restore joined error = %v, want delivery and cleanup failures", err)
+	}
+	gotParent := st.sessions[parent.ID]
+	gotChild := st.sessions[child.ID]
+	if !gotParent.IsTerminated || gotParent.Activity.State != domain.ActivityExited {
+		t.Fatalf("parent after shared-dir rollback = %+v, want terminal/exited", gotParent)
+	}
+	if wake.wakes != 1 || gotChild.DependencyPromotionToken == "" {
+		t.Fatalf("dependency wake/token = %d/%q, want exactly 1/reserved", wake.wakes, gotChild.DependencyPromotionToken)
+	}
+	if gotParent.Metadata.WorkspaceKind != domain.WorkspaceKindDir || gotParent.Metadata.WorkspacePath != "/shared" || gotParent.Metadata.RuntimeHandleID == "" {
+		t.Fatalf("retained shared-dir cleanup lease = %+v, want dir path and nonempty handle marker", gotParent.Metadata)
 	}
 	if rt.created != 1 || rt.destroyed != 2 {
 		t.Fatalf("runtime create/destroy = %d/%d, want 1/2 (old and rolled-back replacement)", rt.created, rt.destroyed)
@@ -7326,9 +7479,11 @@ func TestReconcile_AdoptAcrossDaemonRestart(t *testing.T) {
 	if st.num != 0 {
 		t.Fatalf("Reconcile minted %d new session(s); adoption must reuse existing ids", st.num)
 	}
-	// Adopted runtimes were never torn down.
-	if rt.destroyed != 0 {
-		t.Fatalf("adopted sessions must not be destroyed; Destroy called %d times", rt.destroyed)
+	// Adopted runtimes were never torn down. The dead worker's deterministic
+	// handle is still destroyed idempotently at the immediate pre-create
+	// boundary before it is reused.
+	if !reflect.DeepEqual(rt.destroyedIDs, []string{"w-dead"}) {
+		t.Fatalf("destroyed runtime ids = %v, want only dead worker w-dead", rt.destroyedIDs)
 	}
 	// Dead worker captured, then relaunched under its original id on this same boot.
 	if lcm.terminated["mer-3"] != 1 {

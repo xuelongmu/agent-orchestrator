@@ -1130,7 +1130,8 @@ func (m *Manager) rollbackPreparedSpawnWorkspace(ctx context.Context, rec domain
 	}
 	if err := m.cleanupAgentWorkspace(ctx, rec, ws.Path); err != nil {
 		if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
-			return errors.Join(fmt.Errorf("spawn rollback: shared directory cleanup: %w", err), m.persistSharedDirCleanupPending(ctx, rec, ws.Path))
+			_, persistErr := m.persistSharedDirCleanupPending(ctx, rec, ws.Path)
+			return errors.Join(fmt.Errorf("spawn rollback: shared directory cleanup: %w", err), persistErr)
 		}
 		m.logger.Warn("spawn rollback: agent workspace cleanup failed", "sessionID", rec.ID, "workspacePath", ws.Path, "error", err)
 	}
@@ -1182,10 +1183,10 @@ func (m *Manager) rollbackLaunchWorkspace(ctx context.Context, rec domain.Sessio
 	return nil
 }
 
-func (m *Manager) persistSharedDirCleanupPending(ctx context.Context, rec domain.SessionRecord, workspacePath string) error {
+func (m *Manager) persistSharedDirCleanupPending(ctx context.Context, rec domain.SessionRecord, workspacePath string) (bool, error) {
 	latest, ok, err := m.store.GetSession(ctx, rec.ID)
 	if err != nil {
-		return fmt.Errorf("persist shared directory cleanup: load: %w", err)
+		return false, fmt.Errorf("persist shared directory cleanup: load: %w", err)
 	}
 	if ok {
 		rec = latest
@@ -1196,14 +1197,15 @@ func (m *Manager) persistSharedDirCleanupPending(ctx context.Context, rec domain
 		rec.Metadata.RuntimeHandleID = sharedDirCleanupPendingHandle
 	}
 	if err := m.store.UpdateSession(ctx, rec); err != nil {
-		return fmt.Errorf("persist shared directory cleanup: update: %w", err)
+		return false, fmt.Errorf("persist shared directory cleanup: update: %w", err)
 	}
 	if !rec.IsTerminated {
 		if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
-			return fmt.Errorf("persist shared directory cleanup: mark terminated: %w", err)
+			return false, fmt.Errorf("persist shared directory cleanup: mark terminated: %w", err)
 		}
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 // effectiveHarness resolves the harness for a spawn: an explicit harness wins;
@@ -1770,14 +1772,6 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotFound)
 		}
 	}
-	// A terminal activity signal can precede runtime-container teardown (tmux
-	// deliberately keeps a shell alive after the agent exits). Ensure that old
-	// deterministic handle is gone before Create reuses the session id.
-	if handle := runtimeHandle(rec.Metadata); handle.ID != "" && handle.ID != sharedDirCleanupPendingHandle {
-		if err := m.destroyRuntime(ctx, handle); err != nil {
-			return domain.SessionRecord{}, fmt.Errorf("restore %s: old runtime: %w", id, err)
-		}
-	}
 	meta := rec.Metadata
 	if meta.WorkspaceKind.WithDefault() == domain.WorkspaceKindScratch {
 		rows, rowErr := m.store.ListSessionWorktrees(ctx, id)
@@ -1858,14 +1852,23 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 	env := m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
 	m.augmentAgentRuntimeEnv(agent, env)
 	if err := m.prepareWorkspace(ctx, agent, rec.ID, ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
-		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
-		return domain.SessionRecord{}, false, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
+		terminalWakeOwned, cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+		return domain.SessionRecord{}, terminalWakeOwned, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
 	}
 	argv, delivery, err := restoreArgv(ctx, agent, rec.ID, ws.Path, rec.Metadata, systemPrompt, systemPromptFile, agentConfig, rec.Kind, rec.Harness, m.dataDir)
 	if err != nil {
-		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+		terminalWakeOwned, cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, false, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
+		return domain.SessionRecord{}, terminalWakeOwned, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
+	}
+	// A terminal activity signal can precede runtime-container teardown (tmux
+	// deliberately keeps a shell alive after the agent exits). Preserve that
+	// pane through every viability/preparation check, then destroy it at the
+	// deterministic-handle reuse boundary immediately before Create.
+	if err := m.destroyRuntime(ctx, runtimeHandle(rec.Metadata)); err != nil {
+		terminalWakeOwned, cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+		m.cleanupSystemPromptDir(rec.ID)
+		return domain.SessionRecord{}, terminalWakeOwned, errors.Join(fmt.Errorf("restore %s: old runtime: %w", rec.ID, err), cleanupErr)
 	}
 	handle, err := m.runtime.Create(ctx, ports.RuntimeConfig{
 		SessionID:     rec.ID,
@@ -1874,16 +1877,16 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 		Env:           env,
 	})
 	if err != nil {
-		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+		terminalWakeOwned, cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, false, errors.Join(fmt.Errorf("restore %s: runtime: %w", rec.ID, err), cleanupErr)
+		return domain.SessionRecord{}, terminalWakeOwned, errors.Join(fmt.Errorf("restore %s: runtime: %w", rec.ID, err), cleanupErr)
 	}
 	metadata := domain.SessionMetadata{WorkspaceKind: ws.WorkspaceKind.WithDefault(), Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, AgentSessionID: rec.Metadata.AgentSessionID, Prompt: rec.Metadata.Prompt}
 	if err := m.lcm.MarkSpawned(ctx, rec.ID, metadata); err != nil {
 		_ = m.destroyRuntime(ctx, handle)
-		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+		terminalWakeOwned, cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, false, errors.Join(fmt.Errorf("restore %s: completed: %w", rec.ID, err), cleanupErr)
+		return domain.SessionRecord{}, terminalWakeOwned, errors.Join(fmt.Errorf("restore %s: completed: %w", rec.ID, err), cleanupErr)
 	}
 	if delivery == ports.PromptDeliveryAfterStart && rec.Metadata.Prompt != "" {
 		launchCfg := ports.LaunchConfig{
@@ -1899,9 +1902,8 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 		}
 		if err := m.deliverAfterStartPrompt(ctx, agent, launchCfg, handle, rec.ID, rec.Metadata.Prompt); err != nil {
 			_ = m.destroyRuntime(ctx, handle)
-			cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
-			terminalWakeOwned := false
-			if cleanupErr == nil {
+			terminalWakeOwned, cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+			if !terminalWakeOwned && cleanupErr == nil {
 				terminalWakeOwned = m.lcm.MarkTerminated(ctx, rec.ID) == nil
 			}
 			m.cleanupSystemPromptDir(rec.ID)
@@ -1912,12 +1914,13 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 	return restored, false, err
 }
 
-func (m *Manager) cleanupRestoredPreparation(ctx context.Context, rec domain.SessionRecord, agent ports.Agent, ws ports.WorkspaceInfo, env map[string]string) error {
+func (m *Manager) cleanupRestoredPreparation(ctx context.Context, rec domain.SessionRecord, agent ports.Agent, ws ports.WorkspaceInfo, env map[string]string) (bool, error) {
 	cleanupErr := m.cleanupPreparedAgentWorkspace(ctx, agent, rec.ID, ws.WorkspaceKind.WithDefault(), ws.Path, env)
 	if cleanupErr == nil || ws.WorkspaceKind.WithDefault() != domain.WorkspaceKindDir {
-		return cleanupErr
+		return false, cleanupErr
 	}
-	return errors.Join(cleanupErr, m.persistSharedDirCleanupPending(ctx, rec, ws.Path))
+	terminalWakeOwned, persistErr := m.persistSharedDirCleanupPending(ctx, rec, ws.Path)
+	return terminalWakeOwned, errors.Join(cleanupErr, persistErr)
 }
 
 func (m *Manager) getRecord(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error) {
