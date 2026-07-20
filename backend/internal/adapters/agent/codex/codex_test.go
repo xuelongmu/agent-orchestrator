@@ -42,6 +42,7 @@ func TestGetLaunchCommandBuildsCrossPlatformArgv(t *testing.T) {
 	workspace := canonicalTempDir(t)
 
 	cmd, err := plugin.GetLaunchCommand(context.Background(), ports.LaunchConfig{
+		Config:           ports.AgentConfig{Model: `  gpt-5.6-sol/high;variant="fast path"  `},
 		Permissions:      ports.PermissionModeBypassPermissions,
 		Prompt:           "-fix this",
 		SystemPromptFile: filepath.Join("tmp", "prompt with spaces.md"),
@@ -65,11 +66,41 @@ func TestGetLaunchCommandBuildsCrossPlatformArgv(t *testing.T) {
 	}
 	want = append(want,
 		"-c", `projects={`+codexTOMLConfigString(workspace)+`={trust_level="trusted"}}`,
+		"--model", `gpt-5.6-sol/high;variant="fast path"`,
 		"-c", "developer_instructions="+codexTOMLConfigString("inline wins"),
 		"--", "-fix this",
 	)
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("unexpected command\nwant: %#v\n got: %#v", want, cmd)
+	}
+}
+
+func TestGetLaunchCommandOmitsEmptyModelAndPreservesPromptBoundary(t *testing.T) {
+	plugin := &Plugin{resolvedBinary: "codex"}
+
+	for _, tc := range []struct {
+		name  string
+		model string
+	}{
+		{name: "unset", model: ""},
+		{name: "whitespace", model: " \t\r\n "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd, err := plugin.GetLaunchCommand(context.Background(), ports.LaunchConfig{
+				Config: ports.AgentConfig{Model: tc.model},
+				Prompt: "--model is prompt text",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if contains(cmd, "--model") {
+				t.Fatalf("command %#v contains --model for configured model %q", cmd, tc.model)
+			}
+			wantSuffix := []string{"--", "--model is prompt text"}
+			if !reflect.DeepEqual(cmd[len(cmd)-len(wantSuffix):], wantSuffix) {
+				t.Fatalf("command %#v does not preserve prompt boundary %#v", cmd, wantSuffix)
+			}
+		})
 	}
 }
 
@@ -490,6 +521,7 @@ func TestGetRestoreCommandReadsAgentSessionID(t *testing.T) {
 	workspace := canonicalTempDir(t)
 
 	cmd, ok, err := plugin.GetRestoreCommand(context.Background(), ports.RestoreConfig{
+		Config:           ports.AgentConfig{Model: "  gpt-5.6-sol  "},
 		Permissions:      ports.PermissionModeAuto,
 		SystemPrompt:     "restore inline wins",
 		SystemPromptFile: filepath.Join("tmp", "restore-system.md"),
@@ -519,6 +551,7 @@ func TestGetRestoreCommandReadsAgentSessionID(t *testing.T) {
 	}
 	want = append(want,
 		"-c", `projects={`+codexTOMLConfigString(workspace)+`={trust_level="trusted"}}`,
+		"--model", "gpt-5.6-sol",
 		"-c", "developer_instructions="+codexTOMLConfigString("restore inline wins"),
 		"thread-123",
 	)
