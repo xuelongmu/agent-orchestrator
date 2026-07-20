@@ -41,6 +41,9 @@ var remotePayloadAllowlist = map[string]map[string]struct{}{
 		"error_kind":   {},
 		"fingerprint":  {},
 		"operation":    {},
+		"count":        {},
+		"window_start": {},
+		"window_end":   {},
 	},
 	"ao.daemon.panic": {
 		"component":         {},
@@ -50,6 +53,9 @@ var remotePayloadAllowlist = map[string]map[string]struct{}{
 		"path":              {},
 		"panic_kind":        {},
 		"stack_fingerprint": {},
+		"count":             {},
+		"window_start":      {},
+		"window_end":        {},
 	},
 	"ao.daemon.started": {
 		"agent": {},
@@ -66,6 +72,9 @@ var remotePayloadAllowlist = map[string]map[string]struct{}{
 		"path":          {},
 		"status":        {},
 		"status_family": {},
+		"count":         {},
+		"window_start":  {},
+		"window_end":    {},
 	},
 	"ao.lifecycle.poll": {
 		"duration_ms":   {},
@@ -138,6 +147,11 @@ type PostHogSink struct {
 // DurableLocalTelemetry reports that PostHog alone is not a durable local
 // sink. Production fanout pairs it with LocalSQLiteSink.
 func (*PostHogSink) DurableLocalTelemetry() bool { return false }
+
+// InstallID returns the anonymous installation namespace used as PostHog's
+// distinct ID. Remote-only wrappers use it to build collision-free provider
+// deduplication IDs.
+func (s *PostHogSink) InstallID() string { return s.distinctID }
 
 // NewPostHogSink starts a buffered PostHog exporter with a stable install ID.
 func NewPostHogSink(dataDir, apiKey, host string, client postHogClient, log *slog.Logger) (*PostHogSink, error) {
@@ -233,8 +247,9 @@ func (s *PostHogSink) send(ev ports.TelemetryEvent) {
 
 func (s *PostHogSink) properties(ev ports.TelemetryEvent) map[string]any {
 	props := map[string]any{
-		"source": ev.Source,
-		"level":  string(ev.Level),
+		"source":                  ev.Source,
+		"level":                   string(ev.Level),
+		"$process_person_profile": false,
 	}
 	if ev.ID != "" {
 		// PostHog deduplicates capture retries by $insert_id. AO's durable

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
 	buildTelemetryContext,
+	migrateIdentifiedPostHogPersistence,
+	reserveCapture,
 	reserveDailyActiveCapture,
 	routeSurface,
 	sanitizePostHogEvent,
@@ -16,6 +18,9 @@ function memoryStorage(initial: Record<string, string> = {}) {
 		getItem: (key: string) => values.get(key) ?? null,
 		setItem: (key: string, value: string) => {
 			values.set(key, value);
+		},
+		removeItem: (key: string) => {
+			values.delete(key);
 		},
 	};
 }
@@ -247,6 +252,56 @@ describe("telemetry sanitizers", () => {
 		expect(
 			await sanitizeRendererProperties("ao.renderer.terminal_attach_failed", { reason: "something else" }),
 		).toEqual({});
+	});
+});
+
+describe("renderer capture budget", () => {
+	it("caps a per-name burst at five captures per minute", () => {
+		const storage = memoryStorage();
+		const start = Date.parse("2026-07-20T12:00:00.000Z");
+		for (let i = 0; i < 5; i += 1) {
+			expect(reserveCapture("ao.renderer.burst_test", start + i, storage)).toBe(true);
+		}
+		expect(reserveCapture("ao.renderer.burst_test", start + 5, storage)).toBe(false);
+		expect(reserveCapture("ao.renderer.burst_test", start + 60_001, storage)).toBe(true);
+	});
+
+	it("honors a persisted UTC-day ceiling after a renderer reload", () => {
+		const name = "ao.renderer.reload_loop";
+		const storage = memoryStorage({
+			"ao.telemetry.captureBudget.v1": JSON.stringify({ day: "2026-07-20", counts: { [name]: 200 } }),
+		});
+		const now = Date.parse("2026-07-20T12:00:00.000Z");
+
+		// A fresh in-memory minute window models the new renderer. The durable
+		// localStorage count still refuses another capture on the same UTC day.
+		expect(reserveCapture(name, now, storage)).toBe(false);
+		expect(reserveCapture(name, Date.parse("2026-07-21T00:00:00.000Z"), storage)).toBe(true);
+	});
+});
+
+describe("PostHog anonymity migration", () => {
+	it("removes a previously identified persisted person before initialization", () => {
+		const key = "ph_phc_test_posthog";
+		const storage = memoryStorage({
+			[key]: JSON.stringify({
+				distinct_id: "legacy-user@example.com",
+				$user_state: "identified",
+				$user_id: "legacy-user@example.com",
+			}),
+		});
+
+		expect(migrateIdentifiedPostHogPersistence(storage, "phc_test")).toBe(true);
+		expect(storage.getItem(key)).toBeNull();
+	});
+
+	it("preserves already-anonymous persistence", () => {
+		const key = "ph_phc_test_posthog";
+		const anonymous = JSON.stringify({ distinct_id: "ins_test", $user_state: "anonymous" });
+		const storage = memoryStorage({ [key]: anonymous });
+
+		expect(migrateIdentifiedPostHogPersistence(storage, "phc_test")).toBe(false);
+		expect(storage.getItem(key)).toBe(anonymous);
 	});
 });
 
