@@ -142,6 +142,17 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	if err != nil {
 		return ClaimPRResult{}, err
 	}
+	// Claims for different PRs may enrich concurrently, but one session cannot
+	// change checkout again until the preceding claim-ready delivery attempt has
+	// finished. This lock nests after the per-PR ownership lock and before the
+	// shared workspace mutation gate.
+	unlockSessionClaim := s.lockSessionClaim(id)
+	sessionClaimLocked := true
+	defer func() {
+		if sessionClaimLocked {
+			unlockSessionClaim()
+		}
+	}()
 	var (
 		branchChanged bool
 		outcome       ports.ClaimOutcome
@@ -176,10 +187,29 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 		}
 		// SQLite is canonical, but keep its best-effort workspace projection in
 		// the same mutation critical section as checkout and branch persistence.
+		// Re-read the delivery payload under its per-PR lock so an invariant append
+		// that committed after ClaimPR cannot be overwritten by outcome's older
+		// contract snapshot.
 		if outcome.ContractDeliveryPending {
-			if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, outcome.DesignContract); err != nil {
-				slog.Debug("claim PR: design contract projection skipped", "prURL", prURL, "error", err)
-			}
+			func() {
+				unlockDelivery := designcontract.LockDelivery(prURL)
+				defer unlockDelivery()
+				contract := outcome.DesignContract
+				if deliveryStore, ok := s.store.(designContractDeliveryStore); ok {
+					delivery, pending, deliveryErr := deliveryStore.GetPendingPRDesignContractDelivery(ctx, id, prURL)
+					if deliveryErr != nil {
+						slog.Debug("claim PR: design contract projection refresh skipped", "prURL", prURL, "error", deliveryErr)
+						return
+					}
+					if !pending {
+						return
+					}
+					contract = delivery.Contract
+				}
+				if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, contract); err != nil {
+					slog.Debug("claim PR: design contract projection skipped", "prURL", prURL, "error", err)
+				}
+			}()
 		}
 		return nil
 	}()
@@ -211,6 +241,11 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 			}
 		}
 	}
+	// The claim-ready pane attempt is outside the shared workspace gate but
+	// inside this session's claim lock, so another PR cannot replace checkout
+	// before the agent receives (or definitively fails to receive) this barrier.
+	unlockSessionClaim()
+	sessionClaimLocked = false
 	prs, err := s.listPRFacts(ctx, id)
 	if err != nil {
 		return ClaimPRResult{}, err

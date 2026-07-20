@@ -114,6 +114,8 @@ type Service struct {
 	orchestratorLocks   map[domain.ProjectID]*sync.Mutex
 	prClaimLocksMu      sync.Mutex
 	prClaimLocks        map[string]*sync.Mutex
+	sessionClaimLocksMu sync.Mutex
+	sessionClaimLocks   map[domain.SessionID]*sync.Mutex
 	// workspaceMutationMu preserves claim-vs-claim serialization for tests or
 	// reduced embeddings whose commander does not expose Session Manager's
 	// promotion gate. Production always uses workspaceMutations above.
@@ -172,6 +174,21 @@ func (s *Service) lockWorkspaceMutation() func() {
 	}
 	s.workspaceMutationMu.Lock()
 	return s.workspaceMutationMu.Unlock
+}
+
+func (s *Service) lockSessionClaim(id domain.SessionID) func() {
+	s.sessionClaimLocksMu.Lock()
+	if s.sessionClaimLocks == nil {
+		s.sessionClaimLocks = make(map[domain.SessionID]*sync.Mutex)
+	}
+	mu := s.sessionClaimLocks[id]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.sessionClaimLocks[id] = mu
+	}
+	s.sessionClaimLocksMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 // Spawn creates a session and returns the API-facing read model.

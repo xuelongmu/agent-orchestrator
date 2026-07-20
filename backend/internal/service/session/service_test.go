@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -766,6 +767,8 @@ type fakeCommander struct {
 	spawnedCfg              ports.SpawnConfig
 	killsAtSpawn            int
 	workspaceUnlockedOnSend *bool
+	sendEntered             chan<- domain.SessionID
+	sendRelease             <-chan struct{}
 }
 
 func (f *fakeCommander) LockWorkspaceMutation() func() {
@@ -815,6 +818,12 @@ func (f *fakeCommander) Send(_ context.Context, id domain.SessionID, message str
 	}
 	f.sent = append(f.sent, id)
 	f.sentMessages = append(f.sentMessages, message)
+	if f.sendEntered != nil {
+		f.sendEntered <- id
+	}
+	if f.sendRelease != nil {
+		<-f.sendRelease
+	}
 	return nil
 }
 func (f *fakeCommander) SendAutomated(ctx context.Context, id domain.SessionID, message string) error {
@@ -1392,6 +1401,7 @@ type fakePRClaimer struct {
 	called          *bool
 	workspaceBranch *string
 	taskPrompt      *string
+	claimHook       func()
 }
 
 type errorFreeClaimOutcome struct {
@@ -1417,6 +1427,9 @@ func (f fakePRClaimer) ClaimPR(_ context.Context, _ domain.PullRequest, _ []doma
 	}
 	if f.taskPrompt != nil {
 		*f.taskPrompt = taskPrompt
+	}
+	if f.claimHook != nil {
+		f.claimHook()
 	}
 	return f.out.ClaimOutcome, f.err
 }
@@ -1659,6 +1672,147 @@ func TestClaimPRSerializesDifferentPRCheckoutsForOneSession(t *testing.T) {
 		t.Fatal("second PR checkout did not enter after the first completed")
 	}
 	release <- struct{}{}
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestClaimPRProjectsLatestContractUnderDeliveryLock(t *testing.T) {
+	workspace := newWorkspaceRepo(t)
+	prURL := "https://github.com/acme/repo/pull/7"
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: workspace, Branch: "ao/mer-1/root"}}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+	st.pendingContractDelivery[prURL] = "mer-1"
+	st.pendingContractToken[prURL] = "claim-generation-1"
+	oldContract := designcontract.BuildSeed("7", "## Invariants\n- old claim outcome")
+	latestContract := designcontract.BuildSeed("7", "## Invariants\n- new invariant appended while claim committed")
+	st.contracts[prURL] = oldContract
+	claimPersisted := make(chan struct{})
+	allowClaimReturn := make(chan struct{})
+	outcome := ports.ClaimOutcome{DesignContract: oldContract, ContractDeliveryPending: true, ContractDeliveryToken: "claim-generation-1"}
+	svc := NewWithDeps(Deps{
+		Store: st,
+		PRClaimer: fakePRClaimer{
+			out: errorFreeClaimOutcome{outcome},
+			claimHook: func() {
+				close(claimPersisted)
+				<-allowClaimReturn
+			},
+		},
+		SCM: fakeSCM{obs: ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: prURL, Number: 7}}},
+	})
+
+	unlockDelivery := designcontract.LockDelivery(prURL)
+	deliveryLocked := true
+	defer func() {
+		if deliveryLocked {
+			unlockDelivery()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+		done <- err
+	}()
+	<-claimPersisted
+	// Model an invariant append that owns the delivery lock after the claim
+	// transaction committed but before claim-time projection starts.
+	st.contracts[prURL] = latestContract
+	close(allowClaimReturn)
+	select {
+	case err := <-done:
+		t.Fatalf("claim projection bypassed delivery lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlockDelivery()
+	deliveryLocked = false
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	projected, err := os.ReadFile(designcontract.Path(workspace))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(projected), "new invariant appended while claim committed") || strings.Contains(string(projected), "old claim outcome") {
+		t.Fatalf("claim projection did not use latest locked contract:\n%s", projected)
+	}
+}
+
+func TestClaimPRSerializesSameSessionCheckoutThroughPaneDelivery(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: t.TempDir(), Branch: "ao/mer-1/root"}}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+	observations := make(map[int]ports.SCMObservation, 2)
+	for _, number := range []int{7, 8} {
+		prURL := fmt.Sprintf("https://github.com/acme/repo/pull/%d", number)
+		observations[number] = ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: prURL, Number: number}}
+		st.pendingContractDelivery[prURL] = "mer-1"
+		st.pendingContractToken[prURL] = "claim-generation"
+		st.contracts[prURL] = designcontract.BuildSeed(strconv.Itoa(number), fmt.Sprintf("contract for PR %d", number))
+	}
+	reviewFetched := make(chan int)
+	checkoutEntered := make(chan int, 2)
+	sendEntered := make(chan domain.SessionID, 2)
+	sendRelease := make(chan struct{})
+	workspaceUnlockedOnSend := false
+	commander := &fakeCommander{
+		sendEntered:             sendEntered,
+		sendRelease:             sendRelease,
+		workspaceUnlockedOnSend: &workspaceUnlockedOnSend,
+	}
+	svc := NewWithDeps(Deps{
+		Manager:   commander,
+		Store:     st,
+		PRClaimer: fakePRClaimer{out: errorFreeClaimOutcome{ports.ClaimOutcome{DesignContract: designcontract.BuildSeed("", "claim"), ContractDeliveryPending: true, ContractDeliveryToken: "claim-generation"}}},
+		SCM: fakeSCM{
+			obsByNumber:     observations,
+			reviewFetched:   reviewFetched,
+			checkoutEntered: checkoutEntered,
+		},
+	})
+
+	done := make(chan error, 2)
+	go func() {
+		_, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+		done <- err
+	}()
+	if got := <-reviewFetched; got != 7 {
+		t.Fatalf("first review fetch = PR %d, want 7", got)
+	}
+	if got := <-checkoutEntered; got != 7 {
+		t.Fatalf("first checkout = PR %d, want 7", got)
+	}
+	<-sendEntered
+	if !workspaceUnlockedOnSend {
+		t.Fatal("first pane delivery held the shared workspace mutation gate")
+	}
+
+	go func() {
+		_, err := svc.ClaimPR(context.Background(), "mer-1", "8", ClaimPROptions{AllowTakeover: true})
+		done <- err
+	}()
+	if got := <-reviewFetched; got != 8 {
+		t.Fatalf("second review fetch = PR %d, want 8", got)
+	}
+	select {
+	case got := <-checkoutEntered:
+		t.Fatalf("PR %d checkout entered before PR 7 claim-ready delivery completed", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	sendRelease <- struct{}{}
+	select {
+	case got := <-checkoutEntered:
+		if got != 8 {
+			t.Fatalf("second checkout = PR %d, want 8", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PR 8 checkout did not resume after PR 7 delivery barrier completed")
+	}
+	<-sendEntered
+	sendRelease <- struct{}{}
 	for range 2 {
 		if err := <-done; err != nil {
 			t.Fatal(err)

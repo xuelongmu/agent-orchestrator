@@ -1288,15 +1288,16 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 	if !ok {
 		return false, nil // already gone: benign race
 	}
-	if !rec.DependencyPreparedAt.IsZero() {
+	if !rec.DependencyPreparedAt.IsZero() || rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree {
 		// A waiting dependency child can gain its workspace/runtime while Kill
-		// is running. Serialize with the entire promoted launch, then re-read
-		// the authoritative cleanup inventory before deriving handles or paths.
+		// is running, and an ordinary worktree can change branch during ClaimPR.
+		// Serialize with either mutation, then re-read the authoritative cleanup
+		// inventory before deriving handles or paths.
 		unlockWorkspaceMutation := m.LockWorkspaceMutation()
 		defer unlockWorkspaceMutation()
 		rec, ok, err = m.store.GetSession(ctx, id)
 		if err != nil {
-			return false, fmt.Errorf("kill %s: reload dependency cleanup inventory: %w", id, err)
+			return false, fmt.Errorf("kill %s: reload workspace cleanup inventory: %w", id, err)
 		}
 		if !ok {
 			return false, nil
