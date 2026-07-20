@@ -3,7 +3,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { XtermTerminal } from "./XtermTerminal";
 
 const state = vi.hoisted(() => ({
+	contextLoss: null as null | (() => void),
+	failWebglActivation: false,
+	fit: vi.fn(),
 	linkHandler: null as null | ((event: MouseEvent, uri: string) => void),
+	rendererAddonTypes: [] as string[],
+	webglDispose: vi.fn(),
 	lastTerminal: null as null | {
 		keyHandler?: (event: KeyboardEvent) => boolean;
 		wheelHandler?: (event: WheelEvent) => boolean;
@@ -52,7 +57,12 @@ vi.mock("@xterm/xterm", () => ({
 			state.lastTerminal = this;
 		}
 
-		loadAddon() {}
+		loadAddon(addon: { rendererType?: string }) {
+			if (addon.rendererType === "webgl" && state.failWebglActivation) {
+				throw new Error("WebGL activation failed");
+			}
+			if (addon.rendererType) state.rendererAddonTypes.push(addon.rendererType);
+		}
 		open(host: HTMLElement) {
 			host.appendChild(document.createElement("textarea"));
 		}
@@ -95,7 +105,9 @@ vi.mock("@xterm/xterm", () => ({
 
 vi.mock("@xterm/addon-fit", () => ({
 	FitAddon: class FakeFitAddon {
-		fit() {}
+		fit() {
+			state.fit();
+		}
 	},
 }));
 
@@ -116,13 +128,20 @@ vi.mock("@xterm/addon-web-links", () => ({
 }));
 
 vi.mock("@xterm/addon-canvas", () => ({
-	CanvasAddon: class FakeCanvasAddon {},
+	CanvasAddon: class FakeCanvasAddon {
+		rendererType = "canvas";
+	},
 }));
 
 vi.mock("@xterm/addon-webgl", () => ({
 	WebglAddon: class FakeWebglAddon {
-		onContextLoss() {}
-		dispose() {}
+		rendererType = "webgl";
+		onContextLoss(listener: () => void) {
+			state.contextLoss = listener;
+		}
+		dispose() {
+			state.webglDispose();
+		}
 	},
 }));
 
@@ -139,11 +158,45 @@ function setNavigatorPlatform(platform: string) {
 
 describe("XtermTerminal", () => {
 	beforeEach(() => {
+		state.contextLoss = null;
+		state.failWebglActivation = false;
+		state.fit.mockClear();
 		state.lastTerminal = null;
 		state.linkHandler = null;
+		state.rendererAddonTypes.length = 0;
+		state.webglDispose.mockClear();
 		setNavigatorPlatform("Linux x86_64");
 		window.ao!.clipboard.writeText = vi.fn().mockResolvedValue(undefined);
 		window.ao!.clipboard.readText = vi.fn().mockResolvedValue("");
+	});
+
+	it("switches from WebGL to canvas once after runtime context loss and requests a fit", () => {
+		render(<XtermTerminal theme="dark" />);
+
+		expect(state.rendererAddonTypes).toEqual(["webgl"]);
+		expect(state.contextLoss).toBeTypeOf("function");
+		const fitCallsBeforeLoss = state.fit.mock.calls.length;
+
+		state.contextLoss!();
+
+		expect(state.webglDispose).toHaveBeenCalledTimes(1);
+		expect(state.rendererAddonTypes).toEqual(["webgl", "canvas"]);
+		expect(state.fit).toHaveBeenCalledTimes(fitCallsBeforeLoss + 1);
+
+		state.contextLoss!();
+
+		expect(state.webglDispose).toHaveBeenCalledTimes(1);
+		expect(state.rendererAddonTypes).toEqual(["webgl", "canvas"]);
+		expect(state.fit).toHaveBeenCalledTimes(fitCallsBeforeLoss + 1);
+	});
+
+	it("falls back to canvas when startup WebGL activation fails", () => {
+		state.failWebglActivation = true;
+
+		render(<XtermTerminal theme="dark" />);
+
+		expect(state.rendererAddonTypes).toEqual(["canvas"]);
+		expect(state.fit).toHaveBeenCalled();
 	});
 
 	it("copies selected terminal text on the terminal copy shortcut", () => {
