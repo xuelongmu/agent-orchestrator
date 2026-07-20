@@ -343,19 +343,20 @@ func resolveWindowsShimEntry(shimDir, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	lower := strings.ToLower(raw)
 	for _, prefix := range []string{"%~dp0", "%dp0%"} {
-		if strings.HasPrefix(lower, prefix) {
-			rel := strings.TrimLeft(raw[len(prefix):], `/\`)
-			parts := strings.FieldsFunc(rel, func(r rune) bool { return r == '/' || r == '\\' })
-			if len(parts) == 0 {
-				return "", errors.New("empty package entry in command shim")
-			}
-			for _, part := range parts {
-				if part == "" || part == "." || part == ".." || strings.Contains(part, "%") {
-					return "", errors.New("unsafe package entry in command shim")
-				}
-			}
-			return filepath.Join(append([]string{shimDir}, parts...)...), nil
+		if !strings.HasPrefix(lower, prefix) {
+			continue
 		}
+		rel := strings.TrimLeft(raw[len(prefix):], `/\`)
+		parts := strings.FieldsFunc(rel, func(r rune) bool { return r == '/' || r == '\\' })
+		if len(parts) == 0 {
+			return "", errors.New("empty package entry in command shim")
+		}
+		for _, part := range parts {
+			if part == "" || part == "." || part == ".." || strings.Contains(part, "%") {
+				return "", errors.New("unsafe package entry in command shim")
+			}
+		}
+		return filepath.Join(append([]string{shimDir}, parts...)...), nil
 	}
 	if strings.ContainsAny(raw, "%\r\n") {
 		return "", errors.New("unexpanded variable in package entry")
