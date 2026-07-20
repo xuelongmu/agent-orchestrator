@@ -23,7 +23,7 @@ describe("stable desktop release workflow", () => {
 		expect(eligibility).not.toContain("secrets.");
 		expect(eligibility).toContain("refs/heads/$DEFAULT_BRANCH");
 		expect(eligibility).toContain("refs/tags/desktop-v$version");
-		expect(eligibility).toContain("releases?per_page=100");
+		expect(eligibility).not.toContain("releases?per_page=100");
 		expect(workflow).toContain("cancel-in-progress: false");
 	});
 
@@ -44,10 +44,22 @@ describe("stable desktop release workflow", () => {
 		);
 	});
 
-	it("stages every platform as a draft after eligibility and secret validation", () => {
+	it("seeds one exact-SHA draft behind release approval", () => {
+		const draft = job("release-draft");
+		expect(draft).toContain("needs: [release-eligibility, release-secrets]");
+		expect(draft).toContain("environment: release");
+		expect(draft).toContain("contents: write");
+		expect(draft).toContain("GH_REPO: ${{ github.repository }}");
+		expect(draft.indexOf("releases?per_page=100")).toBeLessThan(draft.indexOf("gh release create"));
+		expect(draft).toContain('grep -Fxq "$tag"');
+		expect(draft).toContain('gh release create "$tag" --draft --target "$GITHUB_SHA" --title "$tag"');
+		expect(draft.match(/gh release create/g)).toHaveLength(1);
+	});
+
+	it("stages every platform only after the draft is seeded", () => {
 		for (const name of ["release", "release-intel"]) {
 			const publisher = job(name);
-			expect(publisher).toContain("needs: [release-eligibility, release-secrets]");
+			expect(publisher).toContain("needs: release-draft");
 			expect(publisher).toContain("environment: release");
 			expect(publisher).toContain('AO_RELEASE_DRAFT: "true"');
 		}
@@ -57,7 +69,7 @@ describe("stable desktop release workflow", () => {
 
 	it("publishes only after every platform and feed upload succeeds", () => {
 		const feed = job("publish-feed");
-		expect(feed).toContain("needs: [release-eligibility, release-secrets, release, release-intel]");
+		expect(feed).toContain("needs: [release-draft, release, release-intel]");
 		expect(feed).toContain("environment: release");
 		for (const name of ["latest.yml", "latest-mac.yml", "latest-linux.yml"]) {
 			expect(feed).toContain(`dist/${name}`);

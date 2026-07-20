@@ -46,15 +46,18 @@ forked. Before the first stable release from a fork:
 3. Choose an unused stable `X.Y.Z`, stamp it in `frontend/package.json` and
    `frontend/package-lock.json` through a PR. From the merged, current default-
    branch head, either dispatch Desktop release on that branch or push exactly
-   `desktop-vX.Y.Z`. The workflow rejects stale/non-default refs, mismatched
-   tags, and an existing `vX.Y.Z` release (including a draft). It derives its
-   destination from `github.repository`, so the fork publishes only to itself.
+   `desktop-vX.Y.Z`. The read-only eligibility job rejects stale/non-default
+   refs and mismatched tags before approval. It derives the release destination
+   from `github.repository`, so the fork publishes only to itself.
 4. Approve the `release` deployment when prompted. Because secret validation,
-   platform publishing, and final feed publishing are separate environment
-   phases, GitHub may request approval again; approve every `release` deployment
-   for the run. Platform assets remain draft until all jobs and feed uploads
-   succeed. If a run leaves a failed draft, deliberately delete that release or
-   choose and stamp a new version before starting a new run.
+   draft seeding, platform publishing, and final feed publishing are separate
+   environment phases, GitHub may request approval again; approve every
+   `release` deployment for the run. The protected draft-seed job refuses an
+   existing `vX.Y.Z` release (including a draft), then creates one empty draft
+   targeted at the exact trigger SHA for all platform publishers to reuse.
+   Platform assets remain draft until all jobs and feed uploads succeed. If a
+   run leaves a failed draft, deliberately delete that release or choose and
+   stamp a new version before starting a new run.
 5. Confirm the resulting `vX.Y.Z` release is neither draft nor prerelease and
    contains `latest.yml`, `latest-mac.yml`, and `latest-linux.yml`. Inspect each
    feed's `files[].url` entries and confirm every referenced installer is an

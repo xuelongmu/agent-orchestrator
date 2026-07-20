@@ -39,21 +39,23 @@ concurrency:
 
 jobs:
   # This job deliberately has no `release` environment and consumes no secrets.
-  # It rejects stale/wrong refs and existing releases before approval or writes.
+  # It rejects stale/wrong refs before approval or any repository write.
   release-eligibility:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      release_tag: ${{ steps.check.outputs.release_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Verify release ref and version are eligible
+        id: check
         shell: bash
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -89,17 +91,7 @@ jobs:
             exit 1
           fi
 
-          release_tag="v$version"
-          release_tags="$(
-            gh api --paginate \
-              -H "Accept: application/vnd.github+json" \
-              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              --jq '.[].tag_name'
-          )"
-          if grep -Fxq "$release_tag" <<<"$release_tags"; then
-            echo "::error::Release '$release_tag' already exists (draft or published); refusing to overwrite it."
-            exit 1
-          fi
+          echo "release_tag=v$version" >> "$GITHUB_OUTPUT"
 
   # Environment secrets are checked only after required-reviewer approval.
   # Only names of missing secrets are printed; values never leave the runner.
@@ -140,8 +132,40 @@ jobs:
 
           echo "All required signing and notarization secrets are configured."
 
-  release:
+  # Seed exactly one draft after approval. This serialized, write-capable job
+  # can see existing drafts and prevents the platform publishers from racing
+  # through Forge's list-then-create path.
+  release-draft:
     needs: [release-eligibility, release-secrets]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Create empty draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release-eligibility.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          release_tags="$(
+            gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq '.[].tag_name'
+          )"
+          if grep -Fxq "$tag" <<<"$release_tags"; then
+            echo "::error::Release '$tag' already exists (draft or published); refusing to overwrite it."
+            exit 1
+          fi
+
+          gh release create "$tag" --draft --target "$GITHUB_SHA" --title "$tag"
+
+  release:
+    needs: release-draft
     strategy:
       fail-fast: false
       matrix:
@@ -279,7 +303,7 @@ jobs:
   # Runner is macos-15-intel: macos-13 is deprecated/has no capacity (multi-hour
   # queues), so this leg uses the supported Intel x64 image.
   release-intel:
-    needs: [release-eligibility, release-secrets]
+    needs: release-draft
     runs-on: macos-15-intel
     environment: release # same approval gate as the matrix release job
     permissions:
@@ -347,7 +371,7 @@ jobs:
   # succeeds, this job atomically publishes that release as stable/latest.
   # Runs once on Linux: it only hashes already-built artifacts.
   publish-feed:
-    needs: [release-eligibility, release-secrets, release, release-intel]
+    needs: [release-draft, release, release-intel]
     runs-on: ubuntu-latest
     environment: release
     permissions:
