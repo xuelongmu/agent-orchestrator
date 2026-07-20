@@ -339,23 +339,16 @@ function ExecutionContext({ project, session }: { project?: Project; session: Wo
 
 	return (
 		<Section title="Execution context">
-			<div
-				className="rounded-md border border-border bg-surface p-3"
-				data-testid="session-execution-context"
-			>
+			<div className="rounded-md border border-border bg-surface p-3" data-testid="session-execution-context">
 				<div
 					className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs"
 					title={project?.path ? `Project path: ${project.path}` : undefined}
 				>
 					<span className="font-semibold text-foreground">{project?.name ?? session.workspaceName}</span>
-					{project?.repo ? (
-						<span className="min-w-0 break-all text-muted-foreground">{project.repo}</span>
-					) : null}
+					{project?.repo ? <span className="min-w-0 break-all text-muted-foreground">{project.repo}</span> : null}
 				</div>
 				<dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-caption">
-					{project?.defaultBranch ? (
-						<ContextFact label="Base branch" value={project.defaultBranch} mono />
-					) : null}
+					{project?.defaultBranch ? <ContextFact label="Base branch" value={project.defaultBranch} mono /> : null}
 					<ContextFact label={activeRole} value={session.provider} />
 					{configuredActive && configuredActive !== session.provider ? (
 						<ContextFact label={`${activeRole} default`} value={configuredActive} />

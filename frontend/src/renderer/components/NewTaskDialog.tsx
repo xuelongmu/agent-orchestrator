@@ -11,12 +11,7 @@ import type { components } from "../../api/schema";
 import { apiClient, apiErrorMessage } from "../lib/api-client";
 import { captureRendererEvent } from "../lib/telemetry";
 import type { AgentProvider, WorkspaceKind } from "../types/workspace";
-import {
-	agentsQueryKey,
-	agentsQueryOptions,
-	refreshAgents,
-	type AgentCatalog,
-} from "../hooks/useAgentsQuery";
+import { agentsQueryKey, agentsQueryOptions, refreshAgents, type AgentCatalog } from "../hooks/useAgentsQuery";
 
 type Project = components["schemas"]["Project"];
 
@@ -67,8 +62,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 	const effectiveWorkspaceKind = workspaceKind || projectQuery.data?.config?.workspaceKind || "worktree";
 	const agentCatalog = agentsQuery.data;
 	const effectiveAgent = agent || defaultWorkerAgent || projectQuery.data?.agent || "";
-	const configuredOrchestratorAgent =
-		projectQuery.data?.config?.orchestrator?.agent || projectQuery.data?.agent || "";
+	const configuredOrchestratorAgent = projectQuery.data?.config?.orchestrator?.agent || projectQuery.data?.agent || "";
 
 	useEffect(() => {
 		if (!open) {
@@ -303,9 +297,7 @@ function ContextFact({ label, value, mono = false }: { label: string; value: str
 	return (
 		<div className="flex min-w-0 items-baseline gap-1.5">
 			<dt className="shrink-0 text-muted-foreground">{label}</dt>
-			<dd className={mono ? "truncate font-mono text-foreground" : "truncate font-medium text-foreground"}>
-				{value}
-			</dd>
+			<dd className={mono ? "truncate font-mono text-foreground" : "truncate font-medium text-foreground"}>{value}</dd>
 		</div>
 	);
 }
