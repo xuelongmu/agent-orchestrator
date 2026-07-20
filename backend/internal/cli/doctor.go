@@ -309,6 +309,10 @@ type aoPackageMetadata struct {
 }
 
 var windowsNodeAOShimRE = regexp.MustCompile(`(?im)^[\t ]*@?"%(?:~dp0|dp0%)[/\\]?node\.exe"[\t ]+"([^"\r\n]+)"[\t ]+%\*[\t ]*\r?$`)
+var windowsNpmAOShimRE = regexp.MustCompile(`(?im)^[^\r\n]*"%_prog%"[\t ]+"(%dp0%[/\\][^"\r\n]+)"[\t ]+%\*[\t ]*\r?$`)
+var windowsNpmNodeIfRE = regexp.MustCompile(`(?im)^[\t ]*if exist "%dp0%[/\\]node\.exe" \([\t ]*\r?$`)
+var windowsNpmLocalNodeRE = regexp.MustCompile(`(?im)^[\t ]*set "_prog=%dp0%[/\\]node\.exe"[\t ]*\r?$`)
+var windowsNpmPathNodeRE = regexp.MustCompile(`(?im)^[\t ]*set "_prog=node"[\t ]*\r?$`)
 var windowsLocalAbsolutePathRE = regexp.MustCompile(`^[A-Za-z]:[/\\]+[^/\\]`)
 var aoPackageVersionRE = regexp.MustCompile(`^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$`)
 var statAOPath = os.Stat
@@ -324,22 +328,36 @@ func inspectWindowsAOShim(shimPath string) (string, bool, error) {
 	if err != nil {
 		return "", false, fmt.Errorf("read command shim: %w", err)
 	}
-	matches := windowsNodeAOShimRE.FindAllStringSubmatch(string(shim), -1)
-	if len(matches) != 1 {
+	entry, requireSiblingNode, err := windowsAOShimEntry(string(shim))
+	if err != nil {
 		return "", false, errors.New("unsupported or ambiguous command shim shape")
 	}
 	shimDir := filepath.Dir(shimPath)
-	entry, err := resolveWindowsShimEntry(shimDir, matches[0][1])
+	entry, err = resolveWindowsShimEntry(shimDir, entry)
 	if err != nil {
 		return "", false, err
 	}
-	if err := requireRegularFile(filepath.Join(shimDir, "node.exe")); err != nil {
-		return "", false, fmt.Errorf("resolve native node beside shim: %w", err)
+	if requireSiblingNode {
+		if err := requireRegularFile(filepath.Join(shimDir, "node.exe")); err != nil {
+			return "", false, fmt.Errorf("resolve native node beside shim: %w", err)
+		}
 	}
 	if err := requireRegularFile(entry); err != nil {
 		return "", false, fmt.Errorf("resolve package entry: %w", err)
 	}
 	return aoPackageVersionForEntry(entry)
+}
+
+func windowsAOShimEntry(shim string) (string, bool, error) {
+	direct := windowsNodeAOShimRE.FindAllStringSubmatch(shim, -1)
+	npm := windowsNpmAOShimRE.FindAllStringSubmatch(shim, -1)
+	if len(direct) == 1 && len(npm) == 0 {
+		return direct[0][1], true, nil
+	}
+	if len(direct) != 0 || len(npm) != 1 || !windowsNpmNodeIfRE.MatchString(shim) || !windowsNpmLocalNodeRE.MatchString(shim) || !windowsNpmPathNodeRE.MatchString(shim) {
+		return "", false, errors.New("unsupported or ambiguous command shim shape")
+	}
+	return npm[0][1], false, nil
 }
 
 func resolveWindowsShimEntry(shimDir, raw string) (string, error) {

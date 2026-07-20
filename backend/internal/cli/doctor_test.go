@@ -471,6 +471,57 @@ func TestDoctorFailsLegacyWrapperDespiteLaterVersion(t *testing.T) {
 	}
 }
 
+func TestDoctorFailsNPMGeneratedLegacyShim(t *testing.T) {
+	root := t.TempDir()
+	shimDir := filepath.Join(root, "npm-bin")
+	packageDir := filepath.Join(shimDir, "node_modules", "@aoagents", "ao-cli")
+	entry := filepath.Join(packageDir, "dist", "index.js")
+	if err := os.MkdirAll(filepath.Dir(entry), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entry, []byte("// fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(packageDir, "package.json"), []byte(`{"name":"@aoagents/ao-cli","version":"0.10.1-nightly-249c","bin":{"ao":"dist/index.js"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shim := filepath.Join(shimDir, "ao.cmd")
+	content := `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@aoagents\ao-cli\dist\index.js" %*
+`
+	if err := os.WriteFile(shim, []byte(strings.ReplaceAll(content, "\n", "\r\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := &commandContext{deps: Deps{
+		Executable: func() (string, error) { return filepath.Join(root, "canonical", "ao.exe"), nil },
+		LookPath:   func(string) (string, error) { return shim, nil },
+		CommandOutput: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			t.Fatalf("doctor executed npm-generated legacy shim: %s %v", name, args)
+			return nil, nil
+		},
+	}.withDefaults()}
+
+	check := c.checkAOBinaryForPlatform(context.Background(), "windows")
+	if check.Level != doctorFail || !strings.Contains(check.Message, "0.10.1-nightly-249c") {
+		t.Fatalf("ao-binary check = %+v, want FAIL for npm-generated legacy shim", check)
+	}
+}
+
 func TestInspectWindowsAOShimRejectsUNCAndDeviceEntriesBeforeIO(t *testing.T) {
 	root := t.TempDir()
 	originalStat, originalOpen := statAOPath, openAOPath
