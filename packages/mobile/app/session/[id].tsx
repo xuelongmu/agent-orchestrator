@@ -75,8 +75,9 @@ const TERMINAL_ENHANCE_JS = `
   // While zoomed we auto-pan to keep the cursor framed, so the prompt/output
   // stays in view without chasing it by hand.
   function term() { return window.terminal; }
-  // overview is the chosen view; zoomed tracks whether it currently differs
-  // from the fit scale so a phone-sized grid keeps normal scroll gesture routing.
+  // overview is the chosen view; zoomed tracks whether the non-overview render
+  // overflows either viewport dimension so a phone-sized grid keeps normal
+  // scroll gesture routing. The scale baseline itself remains fit-to-width.
   var Z = { s: 1, min: 1, tx: 0, ty: 0, overview: false, zoomed: false, lastPan: 0 };
   function box() {
     var root = document.querySelector('.xterm');
@@ -97,6 +98,9 @@ const TERMINAL_ENHANCE_JS = `
     b.root.style.transformOrigin = 'top left';
     b.root.style.transform = 'translate(' + Z.tx + 'px,' + Z.ty + 'px) scale(' + Z.s + ')';
   }
+  function overflows(b) {
+    return b.natW * Z.s > b.contW + 0.5 || b.natH * Z.s > b.contH + 0.5;
+  }
   // Fit-to-width baseline, re-run on grid/container changes. Tracks the fit
   // scale while at overview; preserves (re-clamps) the user's zoom otherwise.
   function applyScale() {
@@ -106,7 +110,7 @@ const TERMINAL_ENHANCE_JS = `
       if (Z.overview) { Z.s = Z.min; Z.zoomed = false; Z.tx = 0; Z.ty = 0; }
       else {
         if (Z.s < Z.min) Z.s = Z.min;
-        Z.zoomed = Z.s > Z.min + 0.001;
+        Z.zoomed = overflows(b);
         if (!Z.zoomed) { Z.tx = 0; Z.ty = 0; } else clampT(b);
       }
       applyTransform(b);
@@ -118,20 +122,33 @@ const TERMINAL_ENHANCE_JS = `
   // Zoom to scale s keeping the content under screen point (ax, ay) fixed.
   function setZoom(s, ax, ay) {
     var b = box(); if (!b) return;
+    var requested = s, wasZoomed = Z.zoomed;
+    // A height-only overflow has no numeric scale range: both fit-to-width and
+    // 1:1 are scale(1). Preserve the pre-clamp pinch direction as the explicit
+    // overview/readable-mode choice instead of discarding that gesture intent.
+    var heightOnlyOverflow = Z.min >= 0.999 && b.natH * Z.s > b.contH + 0.5;
+    if (heightOnlyOverflow) {
+      if (requested < Z.min - 0.001) Z.overview = true;
+      else if (requested > 1.001) Z.overview = false;
+    }
     if (s < Z.min) s = Z.min; if (s > 1) s = 1;
     var px = (ax - Z.tx) / Z.s, py = (ay - Z.ty) / Z.s;
     Z.s = s; Z.tx = ax - px * s; Z.ty = ay - py * s;
-    Z.zoomed = s > Z.min + 0.001;
-    if (Z.min < 0.999) Z.overview = !Z.zoomed;
+    if (Z.min < 0.999) Z.overview = s <= Z.min + 0.001;
+    Z.zoomed = !Z.overview && overflows(b);
     if (!Z.zoomed) { Z.s = Z.min; Z.tx = 0; Z.ty = 0; }
     clampT(b); applyTransform(b);
+    // Pinch-in and double-tap re-enter the same cursor-framed pan mode as the
+    // initial height-overflow view, even if a recent overview gesture set the
+    // ordinary cursor-follow backoff timer.
+    if (heightOnlyOverflow && !wasZoomed && Z.zoomed) followCursor(true);
   }
   // Auto-pan so the cursor stays framed while zoomed in. Backs off for a few
   // seconds after a manual pan/pinch (never fight the finger) and only follows
   // the live screen — not while the user is reading scrollback.
-  function followCursor() {
+  function followCursor(force) {
     try {
-      if (!Z.zoomed || Date.now() - Z.lastPan < 4000) return;
+      if (!Z.zoomed || (!force && Date.now() - Z.lastPan < 4000)) return;
       var T = term(); var b = box(); if (!T || !b || !T.cols || !T.rows) return;
       var buf = T.buffer && T.buffer.active; if (!buf) return;
       if (buf.viewportY !== buf.baseY) return;
@@ -249,6 +266,7 @@ const TERMINAL_ENHANCE_JS = `
   var sX = 0, sY = 0, mode = 'idle', anchor = 0, lpTimer = 0;
   var MOVE = 10, LONGPRESS = 350, DBLTAP = 300;
   var altLines = 0;                        // wheel notches emitted to the app this gesture
+  var appScrollPx = 0;                     // unconsumed vertical drag routed to the app
   var SCROLL_STEP_PX = 24;                 // finger px per wheel notch (scale-independent)
   // Android: we drive the viewport's scrollTop directly off finger movement —
   // its native overflow-scroll doesn't respond to touch reliably in the WebView,
@@ -276,7 +294,7 @@ const TERMINAL_ENHANCE_JS = `
     }
     var t = e.touches ? e.touches[0] : e;
     sX = t.clientX; sY = t.clientY; lX = sX; lY = sY; mode = 'pending';
-    altLines = 0;
+    altLines = 0; appScrollPx = 0;
     _vp = document.querySelector('.xterm-viewport');
     startScroll = _vp ? _vp.scrollTop : 0;
     try { term() && term().clearSelection(); } catch (_) {}
@@ -311,23 +329,32 @@ const TERMINAL_ENHANCE_JS = `
     }
     if (mode === 'scroll') {
       if (appDrivesScroll()) {
-        // The app owns scrolling here (alt buffer / mouse tracking): feed it wheel
-        // notches instead of moving the (empty) xterm viewport. Content follows the
-        // finger (drag down -> older), matching the normal buffer's direction below.
-        // One notch per SCROLL_STEP_PX of travel; emit only on each boundary cross.
+        // The app owns scrolling here (alt buffer / mouse tracking). A transformed
+        // authoritative grid consumes drag distance as pan first; only edge
+        // overshoot becomes wheel input. A grid with no transform room spills the
+        // whole drag, preserving the existing app-scroll behavior.
         if (e.cancelable) e.preventDefault();
-        var moved = (t.clientY - sY) / SCROLL_STEP_PX;   // + = finger down = older
+        var appDelta = t.clientY - lY;
+        if (Z.zoomed) {
+          var bz = box();
+          if (bz) {
+            Z.tx += t.clientX - lX;
+            var appWantTy = Z.ty + appDelta;
+            Z.ty = appWantTy; clampT(bz);
+            appDelta = appWantTy - Z.ty;
+            applyTransform(bz); Z.lastPan = Date.now();
+          }
+        }
+        appScrollPx += appDelta;
+        // One notch per SCROLL_STEP_PX of unconsumed travel; emit only on each
+        // boundary cross (+ = finger down = older).
+        var moved = appScrollPx / SCROLL_STEP_PX;
         var want = moved > 0 ? Math.floor(moved) : Math.ceil(moved);
         var diff = want - altLines;
         if (diff !== 0) {
           var up = diff > 0;                             // more "older" notches -> wheel up
           for (var i = 0; i < Math.abs(diff); i++) wheelTick(up, t.clientX, t.clientY);
           altLines = want;
-        }
-        // While zoomed, the horizontal component still pans the magnified grid.
-        if (Z.zoomed) {
-          var bz = box();
-          if (bz) { Z.tx += t.clientX - lX; clampT(bz); applyTransform(bz); Z.lastPan = Date.now(); }
         }
         lX = t.clientX; lY = t.clientY;
         return;
@@ -380,8 +407,8 @@ const TERMINAL_ENHANCE_JS = `
       var now = Date.now();
       if (now - lastTap < DBLTAP && Math.abs(sX - ltX) < 40 && Math.abs(sY - ltY) < 40) {
         lastTap = 0;
-        if (Z.zoomed) setZoom(Z.min, 0, 0);
-        else { setZoom(1, sX, sY); Z.lastPan = Date.now(); }
+        if (Z.zoomed) { Z.overview = true; setZoom(Z.min, 0, 0); }
+        else { Z.overview = false; setZoom(1, sX, sY); Z.lastPan = Date.now(); }
       } else { lastTap = now; ltX = sX; ltY = sY; }
     }
     mode = 'idle';
