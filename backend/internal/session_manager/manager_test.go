@@ -1648,7 +1648,7 @@ func TestKillSerializesWithPromotedDependencyResources(t *testing.T) {
 				_, err := m.LaunchPromoted(context.Background(), waiting.ID, "owner", []domain.DependencyHandoff{{SessionID: "parent"}})
 				launchDone <- err
 			}()
-			<-createStarted // Launch owns dependencyLaunchMu with its claim persisted.
+			<-createStarted // Launch owns this session's mutation lock with its claim persisted.
 			killDone := make(chan error, 1)
 			go func() {
 				_, err := m.Kill(context.Background(), waiting.ID)
@@ -1702,7 +1702,7 @@ func TestKillSerializesWithPromotedDependencyResources(t *testing.T) {
 				_, err := m.Kill(context.Background(), waiting.ID)
 				killDone <- err
 			}()
-			<-killAtCommit // Kill owns dependencyLaunchMu before terminal commit.
+			<-killAtCommit // Kill owns this session's mutation lock before terminal commit.
 			launchDone := make(chan error, 1)
 			go func() {
 				_, err := m.LaunchPromoted(context.Background(), waiting.ID, "owner", []domain.DependencyHandoff{{SessionID: "parent"}})
@@ -1725,6 +1725,61 @@ func TestKillSerializesWithPromotedDependencyResources(t *testing.T) {
 				t.Fatalf("kill-winning launch created resources: final=%#v runtime=%d/%d workspace destroyed=%d", final, rt.created, rt.destroyed, ws.destroyed)
 			}
 		})
+	}
+}
+
+func TestKillUnrelatedDependencySessionDoesNotWaitForPromotedLaunch(t *testing.T) {
+	m, st, rt, _ := newManager()
+	runtimeStarted := make(chan struct{})
+	runtimeRelease := make(chan struct{})
+	rt.beforeCreate = func(ports.RuntimeConfig) {
+		close(runtimeStarted)
+		<-runtimeRelease
+	}
+
+	waiting := make([]domain.SessionRecord, 0, 2)
+	for _, prompt := range []string{"launching", "unrelated"} {
+		rec, err := m.Spawn(context.Background(), ports.SpawnConfig{
+			ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+			WorkspaceKind: domain.WorkspaceKindWorktree, Prompt: prompt,
+			DependsOn: []domain.SessionID{"parent"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.DependencyPromotionToken = "owner"
+		st.setSession(rec)
+		waiting = append(waiting, rec)
+	}
+
+	launchDone := make(chan error, 1)
+	go func() {
+		_, err := m.LaunchPromoted(context.Background(), waiting[0].ID, "owner", nil)
+		launchDone <- err
+	}()
+	<-runtimeStarted
+
+	killDone := make(chan error, 1)
+	go func() {
+		_, err := m.Kill(context.Background(), waiting[1].ID)
+		killDone <- err
+	}()
+	select {
+	case err := <-killDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unrelated dependency Kill waited behind promoted runtime launch")
+	}
+	got, ok, err := st.GetSession(context.Background(), waiting[1].ID)
+	if err != nil || !ok || !got.IsTerminated {
+		t.Fatalf("unrelated dependency session not terminated: ok=%v err=%v rec=%#v", ok, err, got)
+	}
+
+	close(runtimeRelease)
+	if err := <-launchDone; err != nil {
+		t.Fatalf("LaunchPromoted: %v", err)
 	}
 }
 
@@ -2974,7 +3029,7 @@ func TestKill_OrdinaryWorktreeWaitsForClaimWorkspaceMutation(t *testing.T) {
 	m, st, rt, ws := newManager()
 	st.setSession(mkLive("mer-1"))
 
-	claimUnlock := m.LockWorkspaceMutation()
+	claimUnlock := m.LockWorkspaceMutation("mer-1")
 	firstRead := make(chan struct{})
 	var readOnce sync.Once
 	st.afterGetSession = func(id domain.SessionID) {
