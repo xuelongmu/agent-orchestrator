@@ -696,6 +696,15 @@ func (a failingCleanupAgent) CleanupWorkspace(context.Context, ports.WorkspaceHo
 	return a.err
 }
 
+type failingRestoreCleanupAgent struct {
+	failingCleanupAgent
+	prepareErr error
+}
+
+func (a failingRestoreCleanupAgent) GetAgentHooks(context.Context, ports.WorkspaceHookConfig) error {
+	return a.prepareErr
+}
+
 func (a *cleaningAgent) UninstallHooks(_ context.Context, workspacePath string) error {
 	a.uninstallCalls++
 	if a.sharedLog != nil {
@@ -3676,6 +3685,62 @@ func TestRestoreRepairDefersDependencyWakeUntilOutcome(t *testing.T) {
 				t.Fatalf("successful restore parent/wake/child token = %v/%d/%q, want live/0/empty", restored.IsTerminated, wake.wakes, st.sessions[child.ID].DependencyPromotionToken)
 			}
 		})
+	}
+}
+
+func TestRestoreRepairAfterStartFailureWakesDependenciesExactlyOnce(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	parent := mkLive("parent")
+	parent.Harness = domain.HarnessClaudeCode
+	parent.Metadata.Branch = "b"
+	parent.Metadata.Prompt = "continue the task"
+	parent.Activity = domain.Activity{State: domain.ActivityExited}
+	parent.UpdatedAt = time.Now().UTC()
+	child := domain.SessionRecord{
+		ID:                   "child",
+		ProjectID:            parent.ProjectID,
+		Kind:                 domain.KindWorker,
+		Harness:              domain.HarnessClaudeCode,
+		Activity:             domain.Activity{State: domain.ActivityIdle},
+		DependencyIDs:        domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID}),
+		DependencyPreparedAt: time.Now().UTC(),
+		DependencyBasePrompt: "wait for parent",
+		Metadata:             domain.SessionMetadata{Prompt: "wait for parent"},
+	}
+	st.setSession(parent)
+	st.setSession(child)
+	prs := map[domain.SessionID][]domain.PullRequest{
+		parent.ID: {{URL: "pr1", Merged: true}},
+	}
+	lifecycleStore := &lifecycleStoreAdapter{fakeStore: st, prs: prs}
+	lcm := lifecycle.New(lifecycleStore, nil)
+	wake := &restoreRepairDependencyWake{store: st, prs: prs, parentID: parent.ID, childID: child.ID}
+	lcm.SetDependencyScheduler(wake)
+	rt := &fakeRuntime{}
+	m := New(Deps{
+		Runtime:   rt,
+		Agents:    singleAgent{agent: afterStartAgent{recordingAgent: &recordingAgent{}}},
+		Workspace: &fakeWorkspace{},
+		Store:     st,
+		Messenger: &fakeMessenger{err: errors.New("pane unavailable")},
+		Lifecycle: lcm,
+		LookPath:  func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	if _, err := m.Restore(ctx, parent.ID); err == nil || !strings.Contains(err.Error(), "pane unavailable") {
+		t.Fatalf("restore error = %v, want after-start delivery failure", err)
+	}
+	gotParent := st.sessions[parent.ID]
+	gotChild := st.sessions[child.ID]
+	if !gotParent.IsTerminated || gotParent.Activity.State != domain.ActivityExited {
+		t.Fatalf("parent after delivery rollback = %+v, want terminal/exited", gotParent)
+	}
+	if wake.wakes != 1 || gotChild.DependencyPromotionToken == "" {
+		t.Fatalf("dependency wake/token = %d/%q, want exactly 1/reserved", wake.wakes, gotChild.DependencyPromotionToken)
+	}
+	if rt.created != 1 || rt.destroyed != 2 {
+		t.Fatalf("runtime create/destroy = %d/%d, want 1/2 (old and rolled-back replacement)", rt.created, rt.destroyed)
 	}
 }
 
@@ -7323,6 +7388,74 @@ func TestReconcileReap_TerminatedAndDeadTmuxLeftAlone(t *testing.T) {
 	}
 	if rt.destroyed != 0 {
 		t.Fatalf("Destroy calls = %d, want 0", rt.destroyed)
+	}
+}
+
+func TestReconcile_RetryableSharedDirRestoreFenceNeverDestroyedAsRuntime(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/shared", Config: testRoleAgents()}
+	rec := domain.SessionRecord{
+		ID:           "dir-1",
+		ProjectID:    "mer",
+		Kind:         domain.KindWorker,
+		Harness:      domain.HarnessClaudeCode,
+		IsTerminated: true,
+		Activity:     domain.Activity{State: domain.ActivityExited},
+		Metadata: domain.SessionMetadata{
+			WorkspaceKind: domain.WorkspaceKindDir,
+			WorkspacePath: "/shared",
+			Prompt:        "continue the task",
+		},
+	}
+	st.setSession(rec)
+	st.worktrees[rec.ID] = []domain.SessionWorktreeRecord{{
+		SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, WorktreePath: "/shared", State: "removed",
+	}}
+	rt := &fakeRuntime{}
+	agent := failingRestoreCleanupAgent{
+		failingCleanupAgent: failingCleanupAgent{err: errors.New("cleanup still busy")},
+		prepareErr:          errors.New("hook install failed"),
+	}
+	m := New(Deps{
+		Runtime:   rt,
+		Agents:    singleAgent{agent: agent},
+		Workspace: &fakeWorkspace{path: "/shared"},
+		Store:     st,
+		Messenger: &fakeMessenger{},
+		Lifecycle: &fakeLCM{store: st},
+		LookPath:  func(string) (string, error) { return "/bin/true", nil },
+		Logger:    slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+	})
+
+	// The first boot restore fails after workspace preparation and persists the
+	// cleanup lease sentinel alongside the unconsumed restart marker.
+	if err := m.RestoreAll(ctx); err != nil {
+		t.Fatalf("RestoreAll: %v", err)
+	}
+	if got := st.sessions[rec.ID].Metadata.RuntimeHandleID; got != sharedDirCleanupPendingHandle {
+		t.Fatalf("failed RestoreAll handle = %q, want cleanup sentinel", got)
+	}
+	if len(st.worktrees[rec.ID]) != 1 {
+		t.Fatalf("failed RestoreAll consumed retry marker: %+v", st.worktrees[rec.ID])
+	}
+
+	// The next boot reap retries hook cleanup but must never interpret the
+	// sentinel as a runtime. Continued cleanup failure retains both durable
+	// retry inputs for a later reconciliation pass.
+	if err := m.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if slices.Contains(rt.destroyedIDs, sharedDirCleanupPendingHandle) {
+		t.Fatalf("cleanup sentinel reached runtime.Destroy: %v", rt.destroyedIDs)
+	}
+	if got := st.sessions[rec.ID]; !got.IsTerminated || got.Metadata.RuntimeHandleID != sharedDirCleanupPendingHandle {
+		t.Fatalf("retryable cleanup state = %+v, want terminal sentinel lease", got)
+	}
+	if rows := st.worktrees[rec.ID]; len(rows) != 1 || rows[0].State != "removed" {
+		t.Fatalf("retry marker after Reconcile = %+v, want one removed row", rows)
+	}
+	if rt.created != 0 {
+		t.Fatalf("failed restore attempts created %d runtimes, want 0", rt.created)
 	}
 }
 

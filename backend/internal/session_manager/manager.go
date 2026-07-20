@@ -819,14 +819,24 @@ func (m *Manager) rollbackStartedLaunchAttempt(ctx context.Context, rec domain.S
 
 func (m *Manager) destroyLaunchRuntime(ctx context.Context, handle ports.RuntimeHandle, promotionToken string) error {
 	if promotionToken == "" {
-		return m.runtime.Destroy(ctx, handle)
+		return m.destroyRuntime(ctx, handle)
 	}
 	cleanupCtx, cancel := m.promotionLifetimeContext()
 	defer cancel()
 	if err := cleanupCtx.Err(); err != nil {
 		return err
 	}
-	return m.runtime.Destroy(cleanupCtx, handle)
+	return m.destroyRuntime(cleanupCtx, handle)
+}
+
+// destroyRuntime is the only runtime teardown boundary. Durable cleanup lease
+// markers live in RuntimeHandleID for recovery but are not runtime handles and
+// must never reach the adapter.
+func (m *Manager) destroyRuntime(ctx context.Context, handle ports.RuntimeHandle) error {
+	if handle.ID == "" || handle.ID == sharedDirCleanupPendingHandle {
+		return nil
+	}
+	return m.runtime.Destroy(ctx, handle)
 }
 
 func (m *Manager) rollbackLaunchSeed(ctx context.Context, id domain.SessionID, promotionToken string) {
@@ -1393,7 +1403,7 @@ func (m *Manager) killWithMutationLock(ctx context.Context, id domain.SessionID,
 	}
 
 	if handle.ID != "" && handle.ID != sharedDirCleanupPendingHandle {
-		if err := m.runtime.Destroy(ctx, handle); err != nil {
+		if err := m.destroyRuntime(ctx, handle); err != nil {
 			if !completedNonGit || dirWorkspace {
 				return false, fmt.Errorf("kill %s: runtime: %w", id, err)
 			}
@@ -1637,7 +1647,7 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 		}
 		handle := runtimeHandle(rec.Metadata)
 		if handle.ID != "" {
-			if err := m.runtime.Destroy(ctx, handle); err != nil {
+			if err := m.destroyRuntime(ctx, handle); err != nil {
 				return fmt.Errorf("retire replacement %s: runtime: %w", id, err)
 			}
 		}
@@ -1663,7 +1673,7 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 	}
 	handle := runtimeHandle(rec.Metadata)
 	if handle.ID != "" {
-		if err := m.runtime.Destroy(ctx, handle); err != nil {
+		if err := m.destroyRuntime(ctx, handle); err != nil {
 			return fmt.Errorf("retire replacement %s: runtime: %w", id, err)
 		}
 	}
@@ -1696,7 +1706,7 @@ func (m *Manager) retireWorkspaceProjectForReplacement(ctx context.Context, rec 
 	}
 	handle := runtimeHandle(rec.Metadata)
 	if handle.ID != "" {
-		if err := m.runtime.Destroy(ctx, handle); err != nil {
+		if err := m.destroyRuntime(ctx, handle); err != nil {
 			return fmt.Errorf("retire replacement %s: runtime: %w", rec.ID, err)
 		}
 	}
@@ -1727,10 +1737,9 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	// Repairing a stale exited row creates a provisional terminal fact. Publish
 	// that completion to dependent children only if relaunch ultimately fails;
 	// MarkSpawned replaces it with the restored live generation on success.
-	repairedTerminal := false
-	restored := false
+	repairWakePending := false
 	defer func() {
-		if repairedTerminal && !restored {
+		if repairWakePending {
 			m.lcm.ReconcileDependenciesAfterRestoreFailure()
 		}
 	}()
@@ -1752,7 +1761,7 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 		if !marked {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
 		}
-		repairedTerminal = true
+		repairWakePending = true
 		rec, ok, err = m.store.GetSession(ctx, id)
 		if err != nil {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: reload terminal state: %w", id, err)
@@ -1765,7 +1774,7 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	// deliberately keeps a shell alive after the agent exits). Ensure that old
 	// deterministic handle is gone before Create reuses the session id.
 	if handle := runtimeHandle(rec.Metadata); handle.ID != "" && handle.ID != sharedDirCleanupPendingHandle {
-		if err := m.runtime.Destroy(ctx, handle); err != nil {
+		if err := m.destroyRuntime(ctx, handle); err != nil {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: old runtime: %w", id, err)
 		}
 	}
@@ -1815,28 +1824,32 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: workspace: %w", id, err)
 	}
-	restoredSession, err := m.relaunchRestoredSession(ctx, rec, project, ws)
-	if err == nil {
-		restored = true
+	restoredSession, terminalWakeOwned, err := m.relaunchRestoredSession(ctx, rec, project, ws)
+	if err == nil || terminalWakeOwned {
+		repairWakePending = false
 	}
 	return restoredSession, err
 }
 
-func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.SessionRecord, project domain.ProjectRecord, ws ports.WorkspaceInfo) (domain.SessionRecord, error) {
+// relaunchRestoredSession reports terminalWakeOwned when a rollback called
+// MarkTerminated and therefore already published the terminal outcome to the
+// dependency scheduler. Restore uses that ownership bit to avoid a second wake
+// for its provisional stale-row repair.
+func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.SessionRecord, project domain.ProjectRecord, ws ports.WorkspaceInfo) (domain.SessionRecord, bool, error) {
 	agent, ok := m.agents.Agent(rec.Harness)
 	if !ok {
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: no agent adapter for harness %q", rec.ID, rec.Harness)
+		return domain.SessionRecord{}, false, fmt.Errorf("restore %s: no agent adapter for harness %q", rec.ID, rec.Harness)
 	}
 	// The system prompt is derived, not persisted: recompute it so a restored
 	// session keeps its standing instructions across the relaunch.
 	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID)
 	if err != nil {
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: system prompt: %w", rec.ID, err)
+		return domain.SessionRecord{}, false, fmt.Errorf("restore %s: system prompt: %w", rec.ID, err)
 	}
 	systemPromptFile, err := m.prepareSystemPromptFile(rec.ID, rec.Harness, systemPrompt)
 	if err != nil {
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: system prompt file: %w", rec.ID, err)
+		return domain.SessionRecord{}, false, fmt.Errorf("restore %s: system prompt file: %w", rec.ID, err)
 	}
 
 	// Restore re-applies the project's resolved agent config so a configured
@@ -1846,13 +1859,13 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 	m.augmentAgentRuntimeEnv(agent, env)
 	if err := m.prepareWorkspace(ctx, agent, rec.ID, ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
 		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
-		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
+		return domain.SessionRecord{}, false, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
 	}
 	argv, delivery, err := restoreArgv(ctx, agent, rec.ID, ws.Path, rec.Metadata, systemPrompt, systemPromptFile, agentConfig, rec.Kind, rec.Harness, m.dataDir)
 	if err != nil {
 		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
+		return domain.SessionRecord{}, false, errors.Join(fmt.Errorf("restore %s: %w", rec.ID, err), cleanupErr)
 	}
 	handle, err := m.runtime.Create(ctx, ports.RuntimeConfig{
 		SessionID:     rec.ID,
@@ -1863,14 +1876,14 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 	if err != nil {
 		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: runtime: %w", rec.ID, err), cleanupErr)
+		return domain.SessionRecord{}, false, errors.Join(fmt.Errorf("restore %s: runtime: %w", rec.ID, err), cleanupErr)
 	}
 	metadata := domain.SessionMetadata{WorkspaceKind: ws.WorkspaceKind.WithDefault(), Branch: ws.Branch, WorkspacePath: ws.Path, RuntimeHandleID: handle.ID, AgentSessionID: rec.Metadata.AgentSessionID, Prompt: rec.Metadata.Prompt}
 	if err := m.lcm.MarkSpawned(ctx, rec.ID, metadata); err != nil {
-		_ = m.runtime.Destroy(ctx, handle)
+		_ = m.destroyRuntime(ctx, handle)
 		cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
 		m.cleanupSystemPromptDir(rec.ID)
-		return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: completed: %w", rec.ID, err), cleanupErr)
+		return domain.SessionRecord{}, false, errors.Join(fmt.Errorf("restore %s: completed: %w", rec.ID, err), cleanupErr)
 	}
 	if delivery == ports.PromptDeliveryAfterStart && rec.Metadata.Prompt != "" {
 		launchCfg := ports.LaunchConfig{
@@ -1885,16 +1898,18 @@ func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.Sessio
 			Permissions:      agentConfig.Permissions,
 		}
 		if err := m.deliverAfterStartPrompt(ctx, agent, launchCfg, handle, rec.ID, rec.Metadata.Prompt); err != nil {
-			_ = m.runtime.Destroy(ctx, handle)
+			_ = m.destroyRuntime(ctx, handle)
 			cleanupErr := m.cleanupRestoredPreparation(ctx, rec, agent, ws, env)
+			terminalWakeOwned := false
 			if cleanupErr == nil {
-				_ = m.lcm.MarkTerminated(ctx, rec.ID)
+				terminalWakeOwned = m.lcm.MarkTerminated(ctx, rec.ID) == nil
 			}
 			m.cleanupSystemPromptDir(rec.ID)
-			return domain.SessionRecord{}, errors.Join(fmt.Errorf("restore %s: deliver prompt: %w", rec.ID, err), cleanupErr)
+			return domain.SessionRecord{}, terminalWakeOwned, errors.Join(fmt.Errorf("restore %s: deliver prompt: %w", rec.ID, err), cleanupErr)
 		}
 	}
-	return m.getRecord(ctx, rec.ID)
+	restored, err := m.getRecord(ctx, rec.ID)
+	return restored, false, err
 }
 
 func (m *Manager) cleanupRestoredPreparation(ctx context.Context, rec domain.SessionRecord, agent ports.Agent, ws ports.WorkspaceInfo, env map[string]string) error {
@@ -1977,7 +1992,7 @@ func (m *Manager) cleanupNonGitShutdownResources(ctx context.Context, rec domain
 	}
 	var cleanupErrs []error
 	if handle := runtimeHandle(rec.Metadata); handle.ID != "" {
-		if err := m.runtime.Destroy(ctx, handle); err != nil {
+		if err := m.destroyRuntime(ctx, handle); err != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("runtime: %w", err))
 		}
 	}
@@ -2035,7 +2050,7 @@ func (m *Manager) saveAndTeardownOne(ctx context.Context, rec domain.SessionReco
 	// 4. Runtime teardown (best-effort; same pattern as Kill).
 	handle := runtimeHandle(rec.Metadata)
 	if destroyRuntime && handle.ID != "" {
-		if err := m.runtime.Destroy(ctx, handle); err != nil {
+		if err := m.destroyRuntime(ctx, handle); err != nil {
 			m.logger.Warn("save-teardown-all: runtime destroy failed", "sessionID", rec.ID, "error", err)
 		}
 	}
@@ -2142,7 +2157,7 @@ func (m *Manager) reconcileReap(ctx context.Context, rec domain.SessionRecord) e
 	if !alive {
 		return nil
 	}
-	if err := m.runtime.Destroy(ctx, handle); err != nil {
+	if err := m.destroyRuntime(ctx, handle); err != nil {
 		return fmt.Errorf("reconcile reap %s: destroy: %w", rec.ID, err)
 	}
 	return nil
@@ -2439,7 +2454,7 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 		}
 
 		// Step 3: relaunch the agent in the restored workspace.
-		if _, err := m.relaunchRestoredSession(ctx, rec, project, ws); err != nil {
+		if _, _, err := m.relaunchRestoredSession(ctx, rec, project, ws); err != nil {
 			// A promptless, unresumable worker is intentionally left terminated
 			// (ErrNotResumable): expected, not an operational failure, so log it
 			// quietly rather than as an error.
@@ -2653,7 +2668,7 @@ func (m *Manager) saveAndTeardownWorkspaceProject(ctx context.Context, rec domai
 	}
 	handle := runtimeHandle(rec.Metadata)
 	if destroyRuntime && handle.ID != "" {
-		if err := m.runtime.Destroy(ctx, handle); err != nil {
+		if err := m.destroyRuntime(ctx, handle); err != nil {
 			m.logger.Warn("save-teardown-all: runtime destroy failed", "sessionID", rec.ID, "error", err)
 		}
 	}
@@ -3267,7 +3282,7 @@ func (m *Manager) cleanupTerminalRecord(ctx context.Context, id domain.SessionID
 		inventoryBacked = true
 	}
 	if h := runtimeHandle(rec.Metadata); h.ID != "" {
-		_ = m.runtime.Destroy(ctx, h) // best effort; usually already gone
+		_ = m.destroyRuntime(ctx, h) // best effort; usually already gone
 	}
 	if workspaceProject {
 		if _, err := m.destroyWorkspaceProjectRows(ctx, rows); err != nil {
