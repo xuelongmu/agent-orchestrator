@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,12 +23,22 @@ type schedulerStore struct {
 	recoverCalls    int
 	readyCalls      int
 	staleCalls      int
+	readyErr        error
+	handoffErr      error
+	reserveErr      error
+	completeErr     error
+	completeLost    bool
+	releaseErr      error
+	staleErr        error
 }
 
 func (s *schedulerStore) ListReadyDependencySessions(context.Context) ([]domain.SessionID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.readyCalls++
+	if s.readyErr != nil {
+		return nil, s.readyErr
+	}
 	var ready []domain.SessionID
 	for _, id := range s.ready {
 		if !s.promoted[id] && s.tokens[id] == "" {
@@ -39,10 +50,18 @@ func (s *schedulerStore) ListReadyDependencySessions(context.Context) ([]domain.
 func (s *schedulerStore) ListDependencyHandoffs(_ context.Context, id domain.SessionID) ([]domain.DependencyHandoff, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.handoffErr != nil {
+		return nil, s.handoffErr
+	}
 	return append([]domain.DependencyHandoff(nil), s.handoffs[id]...), nil
 }
 func (s *schedulerStore) ReserveDependencyPromotion(_ context.Context, id domain.SessionID, token string, _ time.Time) (bool, error) {
 	s.mu.Lock()
+	if s.reserveErr != nil {
+		err := s.reserveErr
+		s.mu.Unlock()
+		return false, err
+	}
 	if s.promoted[id] || s.tokens[id] != "" {
 		s.mu.Unlock()
 		return false, nil
@@ -58,6 +77,12 @@ func (s *schedulerStore) ReserveDependencyPromotion(_ context.Context, id domain
 func (s *schedulerStore) CompleteDependencyPromotion(_ context.Context, id domain.SessionID, token string, _ time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.completeErr != nil {
+		return false, s.completeErr
+	}
+	if s.completeLost {
+		return false, nil
+	}
 	if s.tokens[id] != token || s.promoted[id] {
 		return false, nil
 	}
@@ -71,6 +96,9 @@ func (s *schedulerStore) ReleaseDependencyPromotion(ctx context.Context, id doma
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.releaseErr != nil {
+		return false, s.releaseErr
+	}
 	if s.tokens[id] != token || s.promoted[id] {
 		return false, nil
 	}
@@ -126,8 +154,9 @@ func (l *blockingRecoveryLauncher) LaunchPromoted(_ context.Context, id domain.S
 func (s *schedulerStore) RecoverStaleDependencyPromotions(context.Context, time.Time, time.Time) (int64, error) {
 	s.mu.Lock()
 	s.staleCalls++
+	err := s.staleErr
 	s.mu.Unlock()
-	return 0, nil
+	return 0, err
 }
 
 type schedulerLauncher struct {
@@ -456,5 +485,153 @@ func TestStartBacksOffTransientLaunchFailuresAndPromotesWithoutExternalSignal(t 
 	store.mu.Unlock()
 	if attempts != 3 || !promoted || token != "" {
 		t.Fatalf("loop outcome: attempts=%d promoted=%v token=%q", attempts, promoted, token)
+	}
+}
+
+func TestRecoveredPromotionAPIsPreserveReservationFencing(t *testing.T) {
+	store := &schedulerStore{
+		tokens:   map[domain.SessionID]string{"complete": "complete-owner", "release": "release-owner"},
+		promoted: make(map[domain.SessionID]bool),
+	}
+	scheduler := New(store, nil, nil, nil)
+	if err := scheduler.CompleteRecovered(context.Background(), "complete", "complete-owner"); err != nil {
+		t.Fatalf("CompleteRecovered: %v", err)
+	}
+	if !store.promoted["complete"] || store.tokens["complete"] != "" {
+		t.Fatalf("completed recovery state: tokens=%v promoted=%v", store.tokens, store.promoted)
+	}
+	if err := scheduler.CompleteRecovered(context.Background(), "complete", "lost-owner"); err == nil {
+		t.Fatal("lost completion token returned nil")
+	}
+	if err := scheduler.ReleaseRecovered(context.Background(), "release", "release-owner"); err != nil {
+		t.Fatalf("ReleaseRecovered: %v", err)
+	}
+	if store.tokens["release"] != "" {
+		t.Fatalf("released recovery token = %q", store.tokens["release"])
+	}
+
+	store.tokens["error"] = "owner"
+	store.completeErr = errors.New("complete failed")
+	if err := scheduler.CompleteRecovered(context.Background(), "error", "owner"); !errors.Is(err, store.completeErr) {
+		t.Fatalf("completion error = %v", err)
+	}
+	store.completeErr = nil
+	lifetime, cancel := context.WithCancel(context.Background())
+	cancel()
+	scheduler.SetLifetimeContext(lifetime)
+	if err := scheduler.ReleaseRecovered(context.Background(), "error", "owner"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("release after lease loss = %v", err)
+	}
+}
+
+func TestReconcileSurfacesStoreBoundaryFailuresWithoutLeakingClaims(t *testing.T) {
+	newStore := func() *schedulerStore {
+		return &schedulerStore{
+			ready: []domain.SessionID{"child"}, tokens: make(map[domain.SessionID]string),
+			promoted: make(map[domain.SessionID]bool), handoffs: make(map[domain.SessionID][]domain.DependencyHandoff),
+		}
+	}
+
+	t.Run("stale and ready", func(t *testing.T) {
+		store := newStore()
+		store.staleErr = errors.New("stale recovery failed")
+		store.readyErr = errors.New("ready list failed")
+		err := New(store, &schedulerLauncher{}, nil, nil).Reconcile(context.Background())
+		if !errors.Is(err, store.staleErr) || !errors.Is(err, store.readyErr) {
+			t.Fatalf("joined store errors = %v", err)
+		}
+	})
+
+	t.Run("reserve", func(t *testing.T) {
+		store := newStore()
+		store.reserveErr = errors.New("reserve failed")
+		if err := New(store, &schedulerLauncher{}, nil, nil).Reconcile(context.Background()); !errors.Is(err, store.reserveErr) {
+			t.Fatalf("reserve error = %v", err)
+		}
+	})
+
+	t.Run("handoff release", func(t *testing.T) {
+		store := newStore()
+		store.handoffErr = errors.New("handoff failed")
+		if err := New(store, &schedulerLauncher{}, nil, nil).Reconcile(context.Background()); !errors.Is(err, store.handoffErr) {
+			t.Fatalf("handoff error = %v", err)
+		}
+		if store.tokens["child"] != "" {
+			t.Fatalf("handoff failure leaked token %q", store.tokens["child"])
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		set  func(*schedulerStore)
+		want string
+	}{
+		{name: "complete error", set: func(store *schedulerStore) { store.completeErr = errors.New("complete failed") }, want: "complete failed"},
+		{name: "complete token lost", set: func(store *schedulerStore) { store.completeLost = true }, want: "reservation token was lost"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStore()
+			tc.set(store)
+			err := New(store, &schedulerLauncher{}, nil, nil).Reconcile(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("completion error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestWaitDelayAndDefaultLoopBounds(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if waitDelay(canceled, time.Hour, nil, true) || waitDelay(canceled, time.Hour, nil, false) {
+		t.Fatal("canceled waits reported ready")
+	}
+	wake := make(chan struct{}, 1)
+	wake <- struct{}{}
+	if !waitDelay(context.Background(), time.Hour, wake, true) {
+		t.Fatal("wake did not release wait")
+	}
+	if !waitDelay(context.Background(), time.Millisecond, nil, true) || !waitDelay(context.Background(), time.Millisecond, nil, false) {
+		t.Fatal("timer did not release wait")
+	}
+
+	store := &schedulerStore{tokens: make(map[domain.SessionID]string), promoted: make(map[domain.SessionID]bool)}
+	scheduler := New(store, nil, nil, nil)
+	scheduler.SetLifetimeContext(nil)
+	delaySeen := make(chan time.Duration, 1)
+	scheduler.wait = func(_ context.Context, delay time.Duration, _ <-chan struct{}, _ bool) bool {
+		delaySeen <- delay
+		return false
+	}
+	done := scheduler.Start(context.Background(), 0, 0)
+	if delay := <-delaySeen; delay != 2*time.Second {
+		t.Fatalf("default loop delay = %s", delay)
+	}
+	<-done
+}
+
+func TestReconcileLoopBackoffCapsAndNilContext(t *testing.T) {
+	store := &schedulerStore{
+		tokens: make(map[domain.SessionID]string), promoted: make(map[domain.SessionID]bool),
+		readyErr: errors.New("ready list failed"),
+	}
+	scheduler := New(store, nil, nil, nil)
+	delays := make(chan time.Duration, 3)
+	scheduler.wait = func(_ context.Context, delay time.Duration, _ <-chan struct{}, _ bool) bool {
+		delays <- delay
+		return len(delays) < cap(delays)
+	}
+	done := scheduler.Start(context.Background(), time.Millisecond, 3*time.Millisecond)
+	<-done
+
+	for i, want := range []time.Duration{time.Millisecond, 2 * time.Millisecond, 3 * time.Millisecond} {
+		if got := <-delays; got != want {
+			t.Fatalf("backoff delay %d = %s, want %s", i, got, want)
+		}
+	}
+
+	store.readyErr = nil
+	if err := scheduler.Reconcile(nil); err != nil {
+		t.Fatalf("nil-context reconcile: %v", err)
 	}
 }

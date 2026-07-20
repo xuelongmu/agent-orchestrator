@@ -25,6 +25,7 @@ var ctx = context.Background()
 
 type fakeStore struct {
 	mu                  sync.RWMutex
+	projectErr          error
 	sessions            map[domain.SessionID]domain.SessionRecord
 	pr                  map[domain.SessionID]domain.PRFacts
 	projects            map[string]domain.ProjectRecord
@@ -34,6 +35,7 @@ type fakeStore struct {
 	deleteErr           error
 	deleteWTErr         error
 	upsertWTErr         error
+	getErr              error
 	// worktrees maps session ID to its saved worktree rows (shutdown-saved marker).
 	worktrees map[domain.SessionID][]domain.SessionWorktreeRecord
 	// sharedLog, when non-nil, receives an ordered call entry for each
@@ -62,6 +64,9 @@ func newFakeStore() *fakeStore {
 	}
 }
 func (f *fakeStore) GetProject(_ context.Context, id string) (domain.ProjectRecord, bool, error) {
+	if f.projectErr != nil {
+		return domain.ProjectRecord{}, false, f.projectErr
+	}
 	r, ok := f.projects[id]
 	return r, ok, nil
 }
@@ -121,6 +126,9 @@ func (f *fakeStore) ClearPendingSubmit(_ context.Context, id domain.SessionID, f
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	if f.getErr != nil {
+		return domain.SessionRecord{}, false, f.getErr
+	}
 	r, ok := f.sessions[id]
 	return r, ok, nil
 }
@@ -217,6 +225,8 @@ type fakeLCM struct {
 	beforeDependencySuccess func(domain.SessionID)
 	beforeTerminated        func(domain.SessionID)
 	dependencyMarkCalls     int
+	resetErr                error
+	resetLost               bool
 	// terminated counts MarkTerminated calls per session id.
 	terminated map[domain.SessionID]int
 }
@@ -228,6 +238,20 @@ type fakeDependencyScheduler struct {
 	completed      []string
 	released       []string
 	reconcileErr   error
+}
+
+type startingDependencyScheduler struct {
+	*fakeDependencyScheduler
+	minDelay time.Duration
+	maxDelay time.Duration
+	done     chan struct{}
+}
+
+func (s *startingDependencyScheduler) Start(_ context.Context, minDelay, maxDelay time.Duration) <-chan struct{} {
+	s.minDelay = minDelay
+	s.maxDelay = maxDelay
+	close(s.done)
+	return s.done
 }
 
 func (s *fakeDependencyScheduler) Recover(context.Context) error {
@@ -301,6 +325,12 @@ func (l *fakeLCM) MarkDependencyLaunchSucceeded(_ context.Context, id domain.Ses
 	return true, nil
 }
 func (l *fakeLCM) ResetDependencyLaunch(_ context.Context, id domain.SessionID, token string) (bool, error) {
+	if l.resetErr != nil {
+		return false, l.resetErr
+	}
+	if l.resetLost {
+		return false, nil
+	}
 	rec := l.store.sessions[id]
 	if rec.DependencyPromotionToken != token {
 		return false, nil
@@ -540,6 +570,16 @@ type cleaningAgent struct {
 	cleanupConfigs []ports.WorkspaceHookConfig
 	uninstallCalls int
 	sharedLog      *[]string
+}
+
+type failingCleanupAgent struct {
+	fakeAgent
+	err error
+}
+
+func (a failingCleanupAgent) UninstallHooks(context.Context, string) error { return a.err }
+func (a failingCleanupAgent) CleanupWorkspace(context.Context, ports.WorkspaceHookConfig) error {
+	return a.err
 }
 
 func (a *cleaningAgent) UninstallHooks(_ context.Context, workspacePath string) error {
@@ -1102,6 +1142,224 @@ func TestDirectoryLaunchPromotedHasSingleSharedLeaseLockOwner(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("directory dependency promotion deadlocked on sharedDirMu")
+	}
+}
+
+func TestStartDependencyReconcileLoopUsesSchedulerBounds(t *testing.T) {
+	m, st, _, _ := newManager()
+	starter := &startingDependencyScheduler{
+		fakeDependencyScheduler: &fakeDependencyScheduler{store: st},
+		done:                    make(chan struct{}),
+	}
+	m.SetDependencyScheduler(starter)
+	<-m.StartDependencyReconcileLoop(context.Background())
+	if starter.minDelay != 2*time.Second || starter.maxDelay != 30*time.Second {
+		t.Fatalf("scheduler bounds = %s/%s", starter.minDelay, starter.maxDelay)
+	}
+
+	m.SetDependencyScheduler(nil)
+	select {
+	case <-m.StartDependencyReconcileLoop(context.Background()):
+	default:
+		t.Fatal("manager without a scheduler returned an open loop channel")
+	}
+}
+
+func TestDependencyRollbackFencesCleanupFailures(t *testing.T) {
+	t.Run("cleanup error type preserves cause", func(t *testing.T) {
+		cause := errors.New("cleanup failed")
+		err := dependencyLaunchCleanupError{err: cause}
+		if err.Error() != cause.Error() || !errors.Is(err, cause) || !err.RetainDependencyReservation() {
+			t.Fatalf("cleanup error lost fencing semantics: %v", err)
+		}
+	})
+
+	t.Run("lease lost", func(t *testing.T) {
+		m, _, _, _ := newManager()
+		lifetime, cancel := context.WithCancel(context.Background())
+		cancel()
+		m.lifetimeCtx = lifetime
+		err := m.rollbackLaunchWorkspace(context.Background(), domain.SessionRecord{ID: "child"}, ports.WorkspaceInfo{}, nil, "owner")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("lease-lost rollback = %v", err)
+		}
+	})
+
+	t.Run("reservation lost", func(t *testing.T) {
+		m, _, _, _ := newManager()
+		err := m.rollbackLaunchWorkspace(context.Background(), domain.SessionRecord{ID: "missing"}, ports.WorkspaceInfo{}, nil, "owner")
+		if err == nil || !strings.Contains(err.Error(), "reservation ownership lost") {
+			t.Fatalf("lost-reservation rollback = %v", err)
+		}
+	})
+
+	t.Run("workspace teardown fails", func(t *testing.T) {
+		m, st, _, ws := newManager()
+		rec := domain.SessionRecord{ID: "child", ProjectID: "mer", Harness: domain.HarnessClaudeCode, DependencyPromotionToken: "owner"}
+		st.setSession(rec)
+		ws.destroyErr = errors.New("destroy failed")
+		err := m.rollbackLaunchWorkspace(context.Background(), rec, ports.WorkspaceInfo{SessionID: rec.ID, Path: "/ws/child"}, nil, "owner")
+		var retained interface{ RetainDependencyReservation() bool }
+		if !errors.As(err, &retained) || !retained.RetainDependencyReservation() || !strings.Contains(err.Error(), "workspace teardown failed") {
+			t.Fatalf("failed rollback did not retain fence: %v", err)
+		}
+	})
+}
+
+func TestSharedDirectoryRollbackPersistsCleanupFence(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	cleanupErr := errors.New("uninstall failed")
+	agent := failingCleanupAgent{err: cleanupErr}
+	ws := &fakeWorkspace{path: "/shared"}
+	lcm := &fakeLCM{store: st}
+	m := New(Deps{
+		Runtime: &fakeRuntime{}, Agents: singleAgent{agent: agent}, Workspace: ws, Store: st,
+		Messenger: &fakeMessenger{}, Lifecycle: lcm, LookPath: func(string) (string, error) { return "/bin/true", nil },
+	})
+	rec := domain.SessionRecord{
+		ID: "dir-child", ProjectID: "mer", Harness: domain.HarnessClaudeCode,
+		Metadata: domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindDir},
+	}
+	err := m.rollbackPreparedSpawnWorkspace(context.Background(), rec, ports.WorkspaceInfo{
+		SessionID: rec.ID, ProjectID: rec.ProjectID, WorkspaceKind: domain.WorkspaceKindDir, Path: "/shared",
+	}, nil)
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("shared-directory rollback error = %v", err)
+	}
+	got, ok, getErr := st.GetSession(context.Background(), rec.ID)
+	if getErr != nil || !ok {
+		t.Fatalf("persisted cleanup record = %#v, %v, %v", got, ok, getErr)
+	}
+	if !got.IsTerminated || got.Metadata.WorkspaceKind != domain.WorkspaceKindDir || got.Metadata.WorkspacePath != "/shared" || got.Metadata.RuntimeHandleID != sharedDirCleanupPendingHandle {
+		t.Fatalf("shared-directory cleanup fence = %#v", got)
+	}
+	if lcm.terminated[rec.ID] != 1 {
+		t.Fatalf("terminal cleanup marks = %d", lcm.terminated[rec.ID])
+	}
+}
+
+func TestLaunchPromotedRejectsInvalidDurableClaims(t *testing.T) {
+	base := domain.SessionRecord{
+		ID: "child", ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		DependencyPreparedAt: time.Now().UTC(), DependencyBasePrompt: "base", DependencyPromotionToken: "owner",
+		Metadata: domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree},
+	}
+	tests := []struct {
+		name      string
+		configure func(*fakeStore, *domain.SessionRecord) ports.AgentResolver
+		want      string
+	}{
+		{name: "store error", configure: func(st *fakeStore, _ *domain.SessionRecord) ports.AgentResolver {
+			st.getErr = errors.New("read failed")
+			return fakeAgents{}
+		}, want: "read failed"},
+		{name: "missing", configure: func(_ *fakeStore, rec *domain.SessionRecord) ports.AgentResolver {
+			rec.ID = ""
+			return fakeAgents{}
+		}, want: ErrNotFound.Error()},
+		{name: "terminated", configure: func(_ *fakeStore, rec *domain.SessionRecord) ports.AgentResolver {
+			rec.IsTerminated = true
+			return fakeAgents{}
+		}, want: ErrTerminated.Error()},
+		{name: "token lost", configure: func(_ *fakeStore, rec *domain.SessionRecord) ports.AgentResolver {
+			rec.DependencyPromotionToken = "other"
+			return fakeAgents{}
+		}, want: "reservation lost"},
+		{name: "runtime bound", configure: func(_ *fakeStore, rec *domain.SessionRecord) ports.AgentResolver {
+			rec.Metadata.RuntimeHandleID = "runtime"
+			return fakeAgents{}
+		}, want: "requires liveness recovery"},
+		{name: "project read failure", configure: func(st *fakeStore, _ *domain.SessionRecord) ports.AgentResolver {
+			st.projectErr = errors.New("project read failed")
+			return fakeAgents{}
+		}, want: "project read failed"},
+		{name: "harness missing", configure: func(_ *fakeStore, _ *domain.SessionRecord) ports.AgentResolver {
+			return missingAgents{}
+		}, want: ErrUnknownHarness.Error()},
+		{name: "shared dir unsupported", configure: func(_ *fakeStore, rec *domain.SessionRecord) ports.AgentResolver {
+			rec.Metadata.WorkspaceKind = domain.WorkspaceKindDir
+			return singleAgent{agent: nonUninstallingAgent{}}
+		}, want: ErrSharedDirUnsupported.Error()},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+			rec := base
+			agents := tc.configure(st, &rec)
+			if rec.ID != "" {
+				st.setSession(rec)
+			}
+			m := New(Deps{
+				Runtime: &fakeRuntime{}, Agents: agents, Workspace: &fakeWorkspace{}, Store: st,
+				Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}, LookPath: func(string) (string, error) { return "/bin/true", nil },
+			})
+			_, err := m.LaunchPromoted(context.Background(), base.ID, "owner", nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LaunchPromoted error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRecoveredDependencyResetRetainsFenceOnBoundaryFailures(t *testing.T) {
+	base := domain.SessionRecord{
+		ID: "child", ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		DependencyPreparedAt: time.Now().UTC(), DependencyPromotionToken: "owner",
+		Metadata: domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, WorkspacePath: "/ws/child", RuntimeHandleID: "runtime"},
+	}
+	tests := []struct {
+		name      string
+		alive     bool
+		configure func(*Manager, *fakeStore, *fakeRuntime, *fakeWorkspace, *fakeLCM)
+		wantErr   string
+	}{
+		{name: "reload error", configure: func(_ *Manager, st *fakeStore, _ *fakeRuntime, _ *fakeWorkspace, _ *fakeLCM) {
+			st.getErr = errors.New("reload failed")
+		}, wantErr: "reload failed"},
+		{name: "ownership changed", configure: func(_ *Manager, st *fakeStore, _ *fakeRuntime, _ *fakeWorkspace, _ *fakeLCM) {
+			rec := st.sessions[base.ID]
+			rec.DependencyPromotionToken = "new-owner"
+			st.sessions[base.ID] = rec
+		}},
+		{name: "runtime destroy", alive: true, configure: func(_ *Manager, _ *fakeStore, rt *fakeRuntime, _ *fakeWorkspace, _ *fakeLCM) {
+			rt.destroyErr = errors.New("destroy runtime failed")
+		}, wantErr: "destroy runtime failed"},
+		{name: "workspace destroy", configure: func(_ *Manager, _ *fakeStore, _ *fakeRuntime, ws *fakeWorkspace, _ *fakeLCM) {
+			ws.destroyErr = errors.New("destroy workspace failed")
+		}, wantErr: "destroy workspace failed"},
+		{name: "reset error", configure: func(_ *Manager, _ *fakeStore, _ *fakeRuntime, _ *fakeWorkspace, lcm *fakeLCM) {
+			lcm.resetErr = errors.New("reset failed")
+		}, wantErr: "reset failed"},
+		{name: "reset ownership lost", configure: func(_ *Manager, _ *fakeStore, _ *fakeRuntime, _ *fakeWorkspace, lcm *fakeLCM) {
+			lcm.resetLost = true
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			st.setSession(base)
+			lcm := m.lcm.(*fakeLCM)
+			tc.configure(m, st, rt, ws, lcm)
+			reset, err := m.resetRecoveredDependencyLaunch(base, tc.alive)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) || reset {
+					t.Fatalf("reset = %v, %v; want error %q", reset, err, tc.wantErr)
+				}
+			} else if err != nil || reset {
+				t.Fatalf("lost ownership reset = %v, %v", reset, err)
+			}
+		})
+	}
+
+	m, st, _, _ := newManager()
+	st.setSession(base)
+	lifetime, cancel := context.WithCancel(context.Background())
+	cancel()
+	m.lifetimeCtx = lifetime
+	if reset, err := m.resetRecoveredDependencyLaunch(base, false); !errors.Is(err, context.Canceled) || reset {
+		t.Fatalf("lease-lost reset = %v, %v", reset, err)
 	}
 }
 
