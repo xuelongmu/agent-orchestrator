@@ -29,6 +29,7 @@ func (*Workspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (ports.Wo
 	return workspaceInfo(cfg, cfg.RepoPath)
 }
 
+// PlanWorkspace returns the deterministic shared-directory workspace path.
 func (*Workspace) PlanWorkspace(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
 	return workspaceInfo(cfg, cfg.RepoPath)
 }

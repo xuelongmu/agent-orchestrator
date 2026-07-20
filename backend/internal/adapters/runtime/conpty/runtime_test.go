@@ -1345,8 +1345,11 @@ func TestClientGetOutputPreservesPartialFrameAfterIdentityStatus(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		defer func() { _ = server.Close() }()
-		if typ, _, err := readRawFrame(server); err != nil || typ != MsgStatusReq {
-			done <- fmt.Errorf("status request type=%x err=%v", typ, err)
+		if typ, _, err := readRawFrame(server); err != nil {
+			done <- fmt.Errorf("status request type=%x: %w", typ, err)
+			return
+		} else if typ != MsgStatusReq {
+			done <- fmt.Errorf("status request type=%x", typ)
 			return
 		}
 		status := statusFrame(true, 1, nil, "partial-output", "generation", 99)
@@ -1355,8 +1358,11 @@ func TestClientGetOutputPreservesPartialFrameAfterIdentityStatus(t *testing.T) {
 			done <- err
 			return
 		}
-		if typ, _, err := readRawFrame(server); err != nil || typ != MsgGetOutputReq {
-			done <- fmt.Errorf("output request type=%x err=%v", typ, err)
+		if typ, _, err := readRawFrame(server); err != nil {
+			done <- fmt.Errorf("output request type=%x: %w", typ, err)
+			return
+		} else if typ != MsgGetOutputReq {
+			done <- fmt.Errorf("output request type=%x", typ)
 			return
 		}
 		response, _ := EncodeMessage(MsgGetOutputRes, []byte("answer"))

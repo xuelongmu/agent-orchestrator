@@ -54,6 +54,7 @@ func (r *Router) Create(ctx context.Context, cfg ports.WorkspaceConfig) (ports.W
 	return a.Create(ctx, cfg)
 }
 
+// PlanWorkspace delegates deterministic workspace planning to the requested kind.
 func (r *Router) PlanWorkspace(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
 	a, err := r.adapter(cfg.WorkspaceKind)
 	if err != nil {
@@ -121,6 +122,7 @@ func (r *Router) CreateWorkspaceProject(ctx context.Context, cfg ports.Workspace
 	return a.CreateWorkspaceProject(ctx, cfg)
 }
 
+// PlanWorkspaceProject delegates deterministic multi-repository planning to the worktree adapter.
 func (r *Router) PlanWorkspaceProject(ctx context.Context, cfg ports.WorkspaceProjectConfig) (ports.WorkspaceProjectInfo, error) {
 	a, ok := r.worktree.(ports.WorkspaceProjectPlanner)
 	if !ok {

@@ -584,6 +584,7 @@ func (s *Store) RecoverDependencyPromotions(ctx context.Context, updatedAt time.
 	return rows, nil
 }
 
+// RecoverStaleDependencyPromotions releases expired reservations that have not crossed the runtime boundary.
 func (s *Store) RecoverStaleDependencyPromotions(ctx context.Context, updatedAt, staleBefore time.Time) (int64, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -682,6 +683,7 @@ func (s *Store) MarkReservedDependencyLaunchSucceeded(ctx context.Context, id do
 	return rows > 0, nil
 }
 
+// ResetReservedDependencyLaunch clears launch-owned state while retaining the prepared child for retry.
 func (s *Store) ResetReservedDependencyLaunch(ctx context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

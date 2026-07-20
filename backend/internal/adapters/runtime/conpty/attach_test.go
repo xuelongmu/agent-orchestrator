@@ -146,8 +146,11 @@ func TestAttachPreservesPartialFrameAfterIdentityStatus(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		defer func() { _ = server.Close() }()
-		if typ, _, err := readRawFrame(server); err != nil || typ != MsgStatusReq {
-			done <- fmt.Errorf("status request type=%x err=%v", typ, err)
+		if typ, _, err := readRawFrame(server); err != nil {
+			done <- fmt.Errorf("status request type=%x: %w", typ, err)
+			return
+		} else if typ != MsgStatusReq {
+			done <- fmt.Errorf("status request type=%x", typ)
 			return
 		}
 		status := statusFrame(true, 1, nil, "partial-attach", "generation", 88)

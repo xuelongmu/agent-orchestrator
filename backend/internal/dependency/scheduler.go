@@ -27,35 +27,6 @@ type Store interface {
 	RecoverStaleDependencyPromotions(context.Context, time.Time, time.Time) (int64, error)
 }
 
-// Recover clears reservations abandoned by a prior daemon. The caller must
-// hold AO's process-wide exclusive coordination lease before invoking it.
-func (s *Scheduler) Recover(ctx context.Context) error {
-	s.reconcileMu.Lock()
-	defer s.reconcileMu.Unlock()
-	_, err := s.store.RecoverDependencyPromotions(ctx, s.clock())
-	return err
-}
-
-// CompleteRecovered consumes the still-owned token only after Session Manager
-// has probed and adopted the persisted runtime during boot reconciliation.
-func (s *Scheduler) CompleteRecovered(ctx context.Context, id domain.SessionID, token string) error {
-	completed, err := s.completePromotion(id, token)
-	if err != nil {
-		return err
-	}
-	if !completed {
-		return fmt.Errorf("complete recovered dependency promotion %s: reservation token was lost", id)
-	}
-	return nil
-}
-
-// ReleaseRecovered returns a dead, fully-cleaned in-flight launch to the ready
-// queue. Session Manager calls it only after its token-fenced runtime/workspace
-// cleanup and narrow metadata reset have both succeeded.
-func (s *Scheduler) ReleaseRecovered(ctx context.Context, id domain.SessionID, token string) error {
-	return s.releaseReservation(ctx, id, token)
-}
-
 // Launcher starts a child after its promotion claim has committed.
 type Launcher interface {
 	LaunchPromoted(context.Context, domain.SessionID, string, []domain.DependencyHandoff) (domain.SessionRecord, error)
@@ -81,6 +52,35 @@ type Scheduler struct {
 	// must not interpret the first signal's predicted runtime handle as an
 	// abandoned attempt while that launch is still provisioning.
 	reconcileMu sync.Mutex
+}
+
+// Recover clears reservations abandoned by a prior daemon. The caller must
+// hold AO's process-wide exclusive coordination lease before invoking it.
+func (s *Scheduler) Recover(ctx context.Context) error {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	_, err := s.store.RecoverDependencyPromotions(ctx, s.clock())
+	return err
+}
+
+// CompleteRecovered consumes the still-owned token only after Session Manager
+// has probed and adopted the persisted runtime during boot reconciliation.
+func (s *Scheduler) CompleteRecovered(ctx context.Context, id domain.SessionID, token string) error {
+	completed, err := s.completePromotion(id, token)
+	if err != nil {
+		return err
+	}
+	if !completed {
+		return fmt.Errorf("complete recovered dependency promotion %s: reservation token was lost", id)
+	}
+	return nil
+}
+
+// ReleaseRecovered returns a dead, fully-cleaned in-flight launch to the ready
+// queue. Session Manager calls it only after its token-fenced runtime/workspace
+// cleanup and narrow metadata reset have both succeeded.
+func (s *Scheduler) ReleaseRecovered(_ context.Context, id domain.SessionID, token string) error {
+	return s.releaseReservation(id, token)
 }
 
 // New constructs a scheduler. Nil clock/logger use production defaults.
@@ -229,12 +229,12 @@ func (s *Scheduler) reconcile(ctx context.Context) (bool, error) {
 		// claim cannot be omitted from this launch's prompt snapshot.
 		handoffs, err := s.store.ListDependencyHandoffs(ctx, id)
 		if err != nil {
-			releaseErr := s.releaseReservation(ctx, id, token)
+			releaseErr := s.releaseReservation(id, token)
 			reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("load dependency handoffs for %s: %w", id, err), releaseErr))
 			continue
 		}
 		if s.launcher == nil {
-			reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("promote dependency session %s: launcher is not configured", id), s.releaseReservation(ctx, id, token)))
+			reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("promote dependency session %s: launcher is not configured", id), s.releaseReservation(id, token)))
 			continue
 		}
 		if _, err := s.launcher.LaunchPromoted(ctx, id, token, handoffs); err != nil {
@@ -244,7 +244,7 @@ func (s *Scheduler) reconcile(ctx context.Context) (bool, error) {
 			if errors.As(err, &retained) && retained.RetainDependencyReservation() {
 				continue
 			}
-			if releaseErr := s.releaseReservation(ctx, id, token); releaseErr != nil {
+			if releaseErr := s.releaseReservation(id, token); releaseErr != nil {
 				reconcileErrs = append(reconcileErrs, releaseErr)
 			}
 			continue
@@ -261,7 +261,7 @@ func (s *Scheduler) reconcile(ctx context.Context) (bool, error) {
 	return retryable, errors.Join(reconcileErrs...)
 }
 
-func (s *Scheduler) releaseReservation(ctx context.Context, id domain.SessionID, token string) error {
+func (s *Scheduler) releaseReservation(id domain.SessionID, token string) error {
 	cleanupCtx, cancel := context.WithTimeout(s.lifetime, 2*time.Second)
 	defer cancel()
 	if err := cleanupCtx.Err(); err != nil {
