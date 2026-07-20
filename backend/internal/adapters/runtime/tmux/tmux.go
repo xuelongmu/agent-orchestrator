@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -27,6 +28,10 @@ const (
 	// a non-empty message, before the trailing Enter, so a large multiline paste
 	// does not absorb the Enter and leave the prompt unsubmitted (issue #2342).
 	defaultEnterDelay = 300 * time.Millisecond
+	// defaultReapGrace gives descendants a chance to release resources after
+	// SIGTERM before Destroy escalates surviving pane process sessions to
+	// SIGKILL.
+	defaultReapGrace = 5 * time.Second
 )
 
 var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -41,17 +46,20 @@ type Options struct {
 	Timeout    time.Duration // default 5s
 	ChunkSize  int           // default 16*1024
 	EnterDelay time.Duration // pause after pasting a non-empty message before pressing Enter; default defaultEnterDelay. Conpty already does this (ptyInputEnterDelay); tmux lacked it, so a large multiline paste could absorb the trailing Enter and leave the prompt unsubmitted (issue #2342).
+	ReapGrace  time.Duration // grace between SIGTERM and SIGKILL for pane descendants during Destroy; default 5s
 }
 
 // Runtime runs agent sessions inside tmux sessions, driving them via the tmux
 // CLI. It implements ports.Runtime.
 type Runtime struct {
-	binary     string
-	shell      string
-	timeout    time.Duration
-	chunkSize  int
-	enterDelay time.Duration
-	runner     runner
+	binary        string
+	shell         string
+	timeout       time.Duration
+	chunkSize     int
+	enterDelay    time.Duration
+	reapGrace     time.Duration
+	runner        runner
+	sessionReaper paneSessionReaper
 }
 
 var _ ports.Runtime = (*Runtime)(nil)
@@ -100,13 +108,25 @@ func New(opts Options) *Runtime {
 	if enterDelay <= 0 {
 		enterDelay = defaultEnterDelay
 	}
+	reapGrace := opts.ReapGrace
+	if reapGrace <= 0 {
+		reapGrace = defaultReapGrace
+	}
+	processRunner := execRunner{}
+	processes := osProcessTable{runner: processRunner, timeout: timeout}
 	return &Runtime{
 		binary:     binary,
 		shell:      shellPath,
 		timeout:    timeout,
 		chunkSize:  chunkSize,
 		enterDelay: enterDelay,
-		runner:     execRunner{},
+		reapGrace:  reapGrace,
+		runner:     processRunner,
+		sessionReaper: processSessionReaper{
+			table:   processes,
+			timeout: timeout,
+			wait:    waitContext,
+		},
 	}
 }
 
@@ -168,22 +188,277 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 	return handle, nil
 }
 
-// Destroy kills the handle's tmux session. An already-gone session is treated
-// as success (idempotent).
+// Destroy kills the handle's exact tmux session, then reaps background
+// descendants that tmux leaves in its unlinked pane process sessions. Process
+// ownership is anchored before kill-session removes the panes. Discovery and
+// reaping are best-effort; the kill-session result retains the existing error
+// and missing-session semantics.
 func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error {
 	id, err := handleID(handle)
 	if err != nil {
 		return err
 	}
-	out, err := r.run(ctx, killSessionArgs(id)...)
+	callerLive := ctx.Err() == nil
+	var anchors []sessionAnchor
+	if discoveryBudget, revalidationBudget, ok := r.paneDiscoveryBudgets(ctx); ok {
+		discoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discoveryBudget)
+		panes := r.livePaneRefs(discoveryCtx, listPaneRefsArgs(id))
+		anchors = r.sessionReaper.Anchor(discoveryCtx, panes)
+		cancel()
+		// pane_pid can exit and be reused while Anchor probes the process table.
+		// Keep only anchors still attached to the same live tmux pane and PID.
+		if len(anchors) > 0 {
+			revalidationCtx, revalidationCancel := context.WithTimeout(context.WithoutCancel(ctx), revalidationBudget)
+			anchors = revalidatedPaneAnchors(anchors, r.livePaneRefs(revalidationCtx, listPaneRefsArgs(id)))
+			revalidationCancel()
+		}
+	}
+	// Cancellation that arrives during optional discovery must not suppress the
+	// primary teardown. Detach only after confirming the caller was live on
+	// entry, and retain its original deadline (or one command timeout).
+	killCtx, killCancel := r.teardownCommandContext(ctx, callerLive)
+	defer killCancel()
+	out, err := r.run(killCtx, killSessionArgs(id)...)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && killSessionMissingOutput(string(out)) {
+			// A definitive missing-session result means teardown won the race;
+			// anchored descendants can still outlive tmux and are safe to reap.
+			r.reapAfterSurvivorCheck(ctx, anchors)
 			return nil
 		}
+		// Do not reap after an unexpected failure. The tmux session may still
+		// be alive, so signaling its anchored processes would destroy a session
+		// that Destroy failed to tear down.
+		closeAnchors(anchors)
 		return fmt.Errorf("tmux runtime: destroy session %s: %w", id, err)
 	}
+	r.reapAfterSurvivorCheck(ctx, anchors)
 	return nil
+}
+
+// paneDiscoveryBudgets gives discovery and mandatory pane revalidation separate
+// detached bounds while reserving one full command timeout for kill-session
+// whenever the caller supplied a deadline.
+func (r *Runtime) paneDiscoveryBudgets(ctx context.Context) (time.Duration, time.Duration, bool) {
+	if ctx.Err() != nil {
+		return 0, 0, false
+	}
+	budget := r.timeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= r.timeout {
+			return 0, 0, false
+		}
+		// Split all optional time up front. Anchor cannot consume the budget
+		// reserved for the required second pane observation.
+		if availablePerPhase := (remaining - r.timeout) / 2; availablePerPhase < budget {
+			budget = availablePerPhase
+		}
+	}
+	if budget <= 0 {
+		return 0, 0, false
+	}
+	return budget, budget, true
+}
+
+func (r *Runtime) teardownCommandContext(ctx context.Context, callerWasLive bool) (context.Context, context.CancelFunc) {
+	if !callerWasLive {
+		return context.WithCancel(ctx)
+	}
+	base := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(base, deadline)
+	}
+	return context.WithTimeout(base, r.timeout)
+}
+
+// livePaneRefs parses only live panes with safe PIDs. Stable pane/window IDs are
+// carried across anchoring so tmux ownership can be revalidated without using
+// the racy window_linked format flag.
+func (r *Runtime) livePaneRefs(ctx context.Context, args []string) []paneRef {
+	out, err := r.run(ctx, args...)
+	if err != nil {
+		return nil
+	}
+	var panes []paneRef
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 6 || fields[5] != "0" {
+			continue
+		}
+		serverID, serverOK := tmuxServerID(fields[0], fields[1])
+		serverPID, serverPIDErr := strconv.Atoi(fields[0])
+		pid, parseErr := strconv.Atoi(fields[4])
+		if serverOK && serverPIDErr == nil && parseErr == nil {
+			panes = append(panes, paneRef{serverID: serverID, serverPID: serverPID, paneID: fields[2], windowID: fields[3], pid: pid})
+		}
+	}
+	return safeUniquePanes(panes)
+}
+
+func revalidatedPaneAnchors(anchors []sessionAnchor, panes []paneRef) []sessionAnchor {
+	type stablePaneRef struct {
+		serverID  string
+		serverPID int
+		paneID    string
+		pid       int
+	}
+	live := make(map[stablePaneRef]paneRef, len(panes))
+	for _, pane := range panes {
+		key := stablePaneRef{serverID: pane.serverID, serverPID: pane.serverPID, paneID: pane.paneID, pid: pane.pid}
+		live[key] = pane
+	}
+	verified := make([]sessionAnchor, 0, len(anchors))
+	for _, anchor := range anchors {
+		key := stablePaneRef{serverID: anchor.pane.serverID, serverPID: anchor.pane.serverPID, paneID: anchor.pane.paneID, pid: anchor.pane.pid}
+		if pane, ok := live[key]; ok {
+			// join-pane/move-pane preserves pane identity but may change its
+			// window. Carry the live window into the post-kill survivor check.
+			anchor.pane.windowID = pane.windowID
+			verified = append(verified, anchor)
+		} else {
+			closeAnchor(&anchor)
+		}
+	}
+	return verified
+}
+
+// reapAfterSurvivorCheck fails closed unless tmux can prove which windows
+// remain after teardown. Duplicate links inside the destroyed session vanish
+// together; a link added in another session survives and excludes its anchor.
+func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionAnchor) {
+	if len(anchors) == 0 {
+		return
+	}
+	orphaned := make([]sessionAnchor, 0, len(anchors))
+	candidates := make([]sessionAnchor, 0, len(anchors))
+	for i := range anchors {
+		anchor := anchors[i]
+		exited, err := r.exactProcessExited(ctx, anchor.server)
+		if err != nil {
+			closeAnchor(&anchor)
+			continue
+		}
+		if exited {
+			// The retained server process was already gone before the survivor
+			// command. Any successful response is from a replacement server,
+			// even if PID, second-resolution start time, and object IDs collide.
+			orphaned = append(orphaned, anchor)
+		} else {
+			candidates = append(candidates, anchor)
+		}
+	}
+	if len(orphaned) == 0 && len(candidates) == 0 {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.timeout)
+	defer cancel()
+	out, err := r.run(probeCtx, listAllPaneRefsArgs()...)
+	if err != nil && !serverMissingOutput(string(out)) {
+		closeAnchors(candidates)
+		r.reapVerifiedAnchors(ctx, orphaned)
+		return
+	}
+	survivingPanes := make(map[tmuxObjectID]struct{})
+	survivingWindows := make(map[tmuxObjectID]struct{})
+	survivingServers := make(map[string]struct{})
+	if err == nil {
+		var reliable bool
+		survivingPanes, survivingWindows, survivingServers, reliable = parseSurvivingTmuxObjects(out)
+		if !reliable {
+			closeAnchors(candidates)
+			r.reapVerifiedAnchors(ctx, orphaned)
+			return
+		}
+	}
+	verified := orphaned
+	for _, anchor := range candidates {
+		if err != nil {
+			exited, probeErr := r.exactProcessExited(ctx, anchor.server)
+			if probeErr == nil && exited {
+				verified = append(verified, anchor)
+			} else {
+				// A missing socket is not proof that the exact server stopped;
+				// it may have been unlinked while a moved/linked pane survives.
+				closeAnchor(&anchor)
+			}
+			continue
+		}
+		exited, probeErr := r.exactProcessExited(ctx, anchor.server)
+		if probeErr != nil || exited {
+			// If the original server exited during the command, its output
+			// cannot be attributed to a generation without a race. Fail closed.
+			closeAnchor(&anchor)
+			continue
+		}
+		if _, attributed := survivingServers[anchor.pane.serverID]; !attributed {
+			// Successful output from only a replacement server (or an empty
+			// response) cannot prove absence in the retained original server.
+			closeAnchor(&anchor)
+			continue
+		}
+		_, paneSurvives := survivingPanes[tmuxObjectID{serverID: anchor.pane.serverID, objectID: anchor.pane.paneID}]
+		_, windowSurvives := survivingWindows[tmuxObjectID{serverID: anchor.pane.serverID, objectID: anchor.pane.windowID}]
+		if !paneSurvives && !windowSurvives {
+			verified = append(verified, anchor)
+		} else {
+			closeAnchor(&anchor)
+		}
+	}
+	r.reapVerifiedAnchors(ctx, verified)
+}
+
+func (r *Runtime) exactProcessExited(ctx context.Context, handle processHandle) (bool, error) {
+	if handle == nil {
+		return false, errors.New("missing exact process handle")
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.timeout)
+	defer cancel()
+	return handle.Exited(probeCtx)
+}
+
+func (r *Runtime) reapVerifiedAnchors(ctx context.Context, anchors []sessionAnchor) {
+	if len(anchors) > 0 {
+		r.sessionReaper.Reap(ctx, anchors, r.reapGrace)
+	}
+}
+
+type tmuxObjectID struct {
+	serverID string
+	objectID string
+}
+
+func parseSurvivingTmuxObjects(out []byte) (map[tmuxObjectID]struct{}, map[tmuxObjectID]struct{}, map[string]struct{}, bool) {
+	panes := make(map[tmuxObjectID]struct{})
+	windows := make(map[tmuxObjectID]struct{})
+	servers := make(map[string]struct{})
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 4 || fields[2] == "" || fields[3] == "" {
+			return nil, nil, nil, false
+		}
+		serverID, ok := tmuxServerID(fields[0], fields[1])
+		if !ok {
+			return nil, nil, nil, false
+		}
+		servers[serverID] = struct{}{}
+		panes[tmuxObjectID{serverID: serverID, objectID: fields[2]}] = struct{}{}
+		windows[tmuxObjectID{serverID: serverID, objectID: fields[3]}] = struct{}{}
+	}
+	return panes, windows, servers, true
+}
+
+func tmuxServerID(pidText, started string) (string, bool) {
+	pid, err := strconv.Atoi(pidText)
+	startedAt, startedErr := strconv.ParseInt(started, 10, 64)
+	if err != nil || pid <= 1 || startedErr != nil || startedAt <= 0 {
+		return "", false
+	}
+	return strconv.Itoa(pid) + "/" + strconv.FormatInt(startedAt, 10), true
 }
 
 // IsAlive reports whether the handle's session still exists via `tmux
@@ -415,10 +690,24 @@ func handleID(handle ports.RuntimeHandle) (string, error) {
 // than a transient probe failure.
 func sessionMissingOutput(out string) bool {
 	s := strings.ToLower(out)
-	return strings.Contains(s, "can't find session") ||
-		strings.Contains(s, "no server running") ||
-		strings.Contains(s, "error connecting") ||
+	return serverMissingOutput(s) ||
+		strings.Contains(s, "can't find session") ||
 		strings.Contains(s, "session not found")
+}
+
+// serverMissingOutput is the authoritative set of tmux spellings that prove
+// there is no server to own a surviving window. Other command failures are
+// ambiguous and must keep descendant reaping disabled.
+func serverMissingOutput(out string) bool {
+	s := strings.ToLower(out)
+	if strings.Contains(s, "no server running") {
+		return true
+	}
+	if !strings.Contains(s, "error connecting") {
+		return false
+	}
+	return strings.Contains(s, "no such file or directory") ||
+		strings.Contains(s, "connection refused")
 }
 
 // killSessionMissingOutput reports whether a non-zero `tmux kill-session`

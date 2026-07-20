@@ -59,10 +59,28 @@ func hasSessionArgs(id string) []string {
 
 // exactSessionTarget wraps id in tmux's exact-match prefix `=` so session-
 // selection commands (-t) target only the session with that precise name.
-// Only kill-session and has-session support this prefix; pane-targeting
-// commands (send-keys, capture-pane, set-option) use a plain session name.
+// Session-selection commands such as kill-session, has-session, and list-panes
+// support this prefix; pane-targeting commands (send-keys, capture-pane,
+// set-option) use a plain session name.
 func exactSessionTarget(id string) string {
 	return "=" + id
+}
+
+// listPaneRefsArgs captures the tmux server generation and stable object IDs
+// around process anchoring. pane_dead is included so a stale pane_pid is never
+// treated as a live owner.
+func listPaneRefsArgs(id string) []string {
+	return []string{
+		"list-panes", "-s", "-t", exactSessionTarget(id),
+		"-F", "#{pid}\t#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_dead}",
+	}
+}
+
+// listAllPaneRefsArgs is used after kill-session. A stable pane can move to a
+// different window via break/join/move-pane, while an original window can
+// survive via links. Either surviving object excludes its process anchor.
+func listAllPaneRefsArgs() []string {
+	return []string{"list-panes", "-a", "-F", "#{pid}\t#{start_time}\t#{pane_id}\t#{window_id}"}
 }
 
 // sendKeysLiteralArgs builds args for `tmux send-keys -t <id> -l <chunk>`.
