@@ -597,7 +597,7 @@ func TestWaitDelayAndDefaultLoopBounds(t *testing.T) {
 
 	store := &schedulerStore{tokens: make(map[domain.SessionID]string), promoted: make(map[domain.SessionID]bool)}
 	scheduler := New(store, nil, nil, nil)
-	scheduler.SetLifetimeContext(nil)
+	scheduler.SetLifetimeContext(context.TODO())
 	delaySeen := make(chan time.Duration, 1)
 	scheduler.wait = func(_ context.Context, delay time.Duration, _ <-chan struct{}, _ bool) bool {
 		delaySeen <- delay
@@ -631,7 +631,7 @@ func TestReconcileLoopBackoffCapsAndNilContext(t *testing.T) {
 	}
 
 	store.readyErr = nil
-	if err := scheduler.Reconcile(nil); err != nil {
+	if err := scheduler.Reconcile(context.TODO()); err != nil {
 		t.Fatalf("nil-context reconcile: %v", err)
 	}
 }
