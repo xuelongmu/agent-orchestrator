@@ -3114,18 +3114,37 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 			continue
 		}
 		ws := workspaceInfo(rec)
-		if ws.Path == "" {
-			m.cleanupSystemPromptDir(rec.ID)
+		rows, workspaceProject, rowErr := m.workspaceProjectRows(ctx, rec)
+		if rowErr != nil {
+			m.logger.Warn("cleanup: workspace rows failed", "sessionID", rec.ID, "error", rowErr)
+			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
 			continue
+		}
+		if workspaceProject {
+			// Dependency recovery may reset the session-level workspace path after
+			// preserving a dirty workspace project. The per-repo inventory remains
+			// the cleanup authority, so consult it before treating an empty root
+			// path as meaning there is nothing left to reclaim.
+			if ws.Path == "" {
+				ws.Path = workspaceProjectRootPath(rows)
+			}
+		} else if ws.Path == "" {
+			var found bool
+			ws, found, rowErr = m.recordedRootWorkspace(ctx, rec)
+			if rowErr != nil {
+				m.logger.Warn("cleanup: workspace inventory failed", "sessionID", rec.ID, "error", rowErr)
+				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
+				continue
+			}
+			if !found {
+				m.cleanupSystemPromptDir(rec.ID)
+				continue
+			}
 		}
 		if h := runtimeHandle(rec.Metadata); h.ID != "" {
 			_ = m.runtime.Destroy(ctx, h) // best effort; usually already gone
 		}
-		if rows, ok, rowErr := m.workspaceProjectRows(ctx, rec); rowErr != nil {
-			m.logger.Warn("cleanup: workspace rows failed", "sessionID", rec.ID, "error", rowErr)
-			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
-			continue
-		} else if ok {
+		if workspaceProject {
 			if _, err := m.destroyWorkspaceProjectRows(ctx, rows); err != nil {
 				if !errors.Is(err, ports.ErrWorkspaceDirty) {
 					m.logger.Warn("cleanup: workspace teardown failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
@@ -3153,6 +3172,35 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 		result.Cleaned = append(result.Cleaned, rec.ID)
 	}
 	return result, nil
+}
+
+func workspaceProjectRootPath(rows []ports.WorkspaceRepoInfo) string {
+	for _, row := range rows {
+		if row.RepoName == domain.RootWorkspaceRepoName {
+			return row.Path
+		}
+	}
+	return ""
+}
+
+// recordedRootWorkspace recovers the single-repo cleanup handle retained in
+// session_worktrees when dependency recovery has reset sessions.workspace_path.
+// Multi-repo inventories are resolved by workspaceProjectRows instead.
+func (m *Manager) recordedRootWorkspace(ctx context.Context, rec domain.SessionRecord) (ports.WorkspaceInfo, bool, error) {
+	rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
+	if err != nil {
+		return ports.WorkspaceInfo{}, false, err
+	}
+	for _, row := range rows {
+		if row.RepoName != domain.RootWorkspaceRepoName || row.WorktreePath == "" {
+			continue
+		}
+		ws := workspaceInfo(rec)
+		ws.Path = row.WorktreePath
+		ws.Branch = firstNonEmptyString(row.Branch, ws.Branch)
+		return ws, true, nil
+	}
+	return ports.WorkspaceInfo{}, false, nil
 }
 
 // cleanupSkipReason renders a workspace teardown refusal as a short

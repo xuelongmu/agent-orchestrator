@@ -3481,11 +3481,78 @@ func TestCleanup_ReportsSkippedWorkspaces(t *testing.T) {
 	}
 }
 
+func TestCleanup_ReclaimsDirtyDependencyWorkspaceFromRecordedInventory(t *testing.T) {
+	m, st, _, ws := newManager()
+	rec := domain.SessionRecord{
+		ID: "mer-1", ProjectID: "mer", Harness: domain.HarnessClaudeCode,
+		IsTerminated: true, DependencyPromotionToken: "owner",
+		Metadata: domain.SessionMetadata{
+			WorkspaceKind:   domain.WorkspaceKindWorktree,
+			WorkspacePath:   "/ws/mer-1",
+			RuntimeHandleID: "runtime",
+			Branch:          "ao/mer-1",
+		},
+	}
+	st.setSession(rec)
+	st.worktrees[rec.ID] = []domain.SessionWorktreeRecord{{
+		SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName,
+		Branch: rec.Metadata.Branch, WorktreePath: rec.Metadata.WorkspacePath, State: "active",
+	}}
+	ws.destroyErr = fmt.Errorf("dirty: %w", ports.ErrWorkspaceDirty)
+
+	reset, err := m.resetRecoveredDependencyLaunch(rec, false)
+	if err != nil || !reset {
+		t.Fatalf("reset dirty recovered dependency launch = %v, %v", reset, err)
+	}
+	resetRec := st.sessions[rec.ID]
+	if resetRec.Metadata.WorkspacePath != "" {
+		t.Fatalf("reset workspace path = %q, want empty", resetRec.Metadata.WorkspacePath)
+	}
+	if len(st.worktrees[rec.ID]) != 1 {
+		t.Fatalf("reset lost worktree inventory: %+v", st.worktrees[rec.ID])
+	}
+
+	ws.destroyErr = nil // the user made the preserved worktree clean
+	res, err := m.Cleanup(ctx, rec.ProjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Cleaned) != 1 || res.Cleaned[0] != rec.ID || len(res.Skipped) != 0 {
+		t.Fatalf("cleanup result = %+v, want recorded workspace reclaimed", res)
+	}
+	if ws.destroyed != 2 {
+		t.Fatalf("workspace destroys = %d, want dirty recovery attempt plus explicit cleanup", ws.destroyed)
+	}
+}
+
 func TestCleanup_WorkspaceProjectDestroysChildrenBeforeRoot(t *testing.T) {
 	m, st, _, ws := newManager()
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/repo/mer", Kind: domain.ProjectKindWorkspace, Config: testRoleAgents()}
 	st.workspaceRepo["mer"] = []domain.WorkspaceRepoRecord{{Name: "api", RelativePath: "api"}}
 	seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1"})
+	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
+		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, Branch: "ao/mer-1", WorktreePath: "/ws/mer-1"},
+		{SessionID: "mer-1", RepoName: "api", Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/api"},
+	}
+
+	res, err := m.Cleanup(ctx, "mer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Cleaned) != 1 || res.Cleaned[0] != "mer-1" {
+		t.Fatalf("cleaned = %v, want mer-1", res.Cleaned)
+	}
+	want := []string{"Destroy:api", "Destroy:__root__"}
+	if got := ws.calls; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("destroy order = %v, want %v", got, want)
+	}
+}
+
+func TestCleanup_WorkspaceProjectUsesInventoryWhenSessionPathWasReset(t *testing.T) {
+	m, st, _, ws := newManager()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/repo/mer", Kind: domain.ProjectKindWorkspace, Config: testRoleAgents()}
+	st.workspaceRepo["mer"] = []domain.WorkspaceRepoRecord{{Name: "api", RelativePath: "api"}}
+	seedTerminal(st, "mer-1", domain.SessionMetadata{Branch: "ao/mer-1"})
 	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
 		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, Branch: "ao/mer-1", WorktreePath: "/ws/mer-1"},
 		{SessionID: "mer-1", RepoName: "api", Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/api"},
