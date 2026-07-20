@@ -106,7 +106,10 @@ describe("SessionsBoard", () => {
 
 		const namedCard = screen.getByRole("button", { name: "Open session Named task (sess-named)" });
 		expect(within(namedCard).getByText("Named task")).toBeVisible();
-		expect(within(namedCard).getByLabelText("Session ID: sess-named")).toBeVisible();
+		const namedSessionId = within(namedCard).getByLabelText("Session ID: sess-named");
+		expect(namedSessionId).toBeVisible();
+		expect(namedSessionId).toHaveClass("text-muted-foreground");
+		expect(namedSessionId).not.toHaveClass("text-passive");
 
 		const fallbackCard = screen.getByRole("button", { name: "Open session sess-fallback" });
 		expect(within(fallbackCard).getByLabelText("Session ID: sess-fallback")).toBeVisible();

@@ -520,7 +520,7 @@ function SessionCard({
 				<div className={cn("flex min-w-0 items-center gap-2 px-3.25 pb-2.5", hasDistinctTitle && "pt-1.5")}>
 					<span
 						aria-label={`Session ID: ${session.id}`}
-						className="inline-flex min-w-0 items-baseline gap-1 font-mono text-2xs text-passive"
+						className="inline-flex min-w-0 items-baseline gap-1 font-mono text-2xs text-muted-foreground"
 						title={`Session ID: ${session.id}`}
 					>
 						<span aria-hidden="true" className="shrink-0 text-micro font-medium uppercase tracking-wide-xs">
