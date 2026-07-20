@@ -42,9 +42,11 @@ const (
 // the body leniently and simply ignores them.
 type setActivityAPIRequest struct {
 	State          string `json:"state,omitempty"`
+	Harness        string `json:"harness,omitempty"`
 	Event          string `json:"event,omitempty"`
 	ToolName       string `json:"toolName,omitempty"`
 	ToolUseID      string `json:"toolUseId,omitempty"`
+	AgentID        string `json:"agentId,omitempty"`
 	ErrorType      string `json:"errorType,omitempty"`
 	AgentSessionID string `json:"agentSessionId,omitempty"`
 }
@@ -60,14 +62,27 @@ const maxActivityMetaLen = 256
 // them (claude-code's PreToolUse/PostToolUse/PostToolUseFailure and
 // PermissionRequest payloads); adapters whose payloads lack them yield empty
 // strings and the signal degrades to today's state-only form.
-func activityMeta(payload []byte) (toolName, toolUseID, errorType string) {
+func activityMeta(payload []byte) (toolName, toolUseID, errorType, agentID string) {
 	var p struct {
 		ToolName        string `json:"tool_name"`
 		ToolUseID       string `json:"tool_use_id"`
+		ToolCallID      string `json:"tool_call_id"`
+		ToolCallIDCamel string `json:"toolCallId"`
+		AgentID         string `json:"agent_id"`
+		AgentIDCamel    string `json:"agentId"`
 		Error           string `json:"error"`
 		LegacyErrorType string `json:"error_type"`
 	}
 	_ = json.Unmarshal(payload, &p)
+	if p.ToolUseID == "" {
+		p.ToolUseID = p.ToolCallID
+	}
+	if p.ToolUseID == "" {
+		p.ToolUseID = p.ToolCallIDCamel
+	}
+	if p.AgentID == "" {
+		p.AgentID = p.AgentIDCamel
+	}
 	errorType = strings.TrimSpace(p.Error)
 	if errorType == "" {
 		errorType = strings.TrimSpace(p.LegacyErrorType)
@@ -78,10 +93,13 @@ func activityMeta(payload []byte) (toolName, toolUseID, errorType string) {
 	if len(p.ToolUseID) > maxActivityMetaLen {
 		p.ToolUseID = ""
 	}
+	if len(p.AgentID) > maxActivityMetaLen {
+		p.AgentID = ""
+	}
 	if len(errorType) > maxActivityMetaLen {
 		errorType = ""
 	}
-	return p.ToolName, p.ToolUseID, errorType
+	return p.ToolName, p.ToolUseID, errorType, p.AgentID
 }
 
 // hookAgentSessionID extracts the native resume handle shared by Agy, Copilot,
@@ -169,14 +187,21 @@ func (c *commandContext) runHook(ctx context.Context, agent, event string) error
 		return nil
 	}
 
-	toolName, toolUseID, errorType := activityMeta(payload)
+	toolName, toolUseID, errorType, agentID := activityMeta(payload)
 	path := "sessions/" + url.PathEscape(sessionID) + "/activity"
 	req := setActivityAPIRequest{
 		Event:          event,
 		ToolName:       toolName,
 		ToolUseID:      toolUseID,
+		AgentID:        agentID,
 		ErrorType:      errorType,
 		AgentSessionID: agentSessionID,
+	}
+	if agent == "kimi" {
+		switch event {
+		case "pre-tool-use", "post-tool-use", "post-tool-use-failure", "permission-request", "permission-result":
+			req.Harness = agent
+		}
 	}
 	if hasActivity {
 		req.State = string(state)

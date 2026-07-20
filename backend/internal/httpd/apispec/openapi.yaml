@@ -3410,6 +3410,10 @@ components:
       type: object
     SetActivityRequest:
       properties:
+        agentId:
+          description: Native agent scope id, for agent-scoped tool and permission
+            hooks.
+          type: string
         agentSessionId:
           description: Native agent session identifier used to resume its transcript.
           type: string
@@ -3419,6 +3423,9 @@ components:
           type: string
         event:
           description: AO hook sub-command that produced this state (e.g. post-tool-use).
+          type: string
+        harness:
+          description: Agent harness token for harness-specific hook ordering semantics.
           type: string
         state:
           description: Agent activity state reported by an agent hook. Optional for

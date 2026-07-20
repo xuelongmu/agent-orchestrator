@@ -38,6 +38,7 @@ var normalizedHookEvents = map[string]bool{
 	"post-tool-use":         true,
 	"post-tool-use-failure": true,
 	"permission-request":    true,
+	"permission-result":     true,
 	"stop":                  true,
 	"stop-failure":          true,
 	"notification":          true,

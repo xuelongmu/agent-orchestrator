@@ -1243,12 +1243,16 @@ export interface components {
             session: components["schemas"]["ControllersSessionView"];
         };
         SetActivityRequest: {
+            /** @description Native agent scope id, for agent-scoped tool and permission hooks. */
+            agentId?: string;
             /** @description Native agent session identifier used to resume its transcript. */
             agentSessionId?: string;
             /** @description Native structured hook error category, when supplied by the harness. */
             errorType?: string;
             /** @description AO hook sub-command that produced this state (e.g. post-tool-use). */
             event?: string;
+            /** @description Agent harness token for harness-specific hook ordering semantics. */
+            harness?: string;
             /**
              * @description Agent activity state reported by an agent hook. Optional for metadata-only hooks.
              * @enum {string}

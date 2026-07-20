@@ -195,7 +195,11 @@ func kimiHooksConfigBlock() string {
 	return kimiHooksSentinelStart + "\n\n" +
 		kimiHookEntry("SessionStart", "startup", "ao hooks kimi session-start") +
 		kimiHookEntry("UserPromptSubmit", "", "ao hooks kimi user-prompt-submit") +
+		kimiHookEntry("PreToolUse", "", "ao hooks kimi pre-tool-use") +
+		kimiHookEntry("PostToolUse", "", "ao hooks kimi post-tool-use") +
+		kimiHookEntry("PostToolUseFailure", "", "ao hooks kimi post-tool-use-failure") +
 		kimiHookEntry("PermissionRequest", "", "ao hooks kimi permission-request") +
+		kimiHookEntry("PermissionResult", "", "ao hooks kimi permission-result") +
 		kimiHookEntry("Stop", "", "ao hooks kimi stop") +
 		kimiHooksSentinelEnd + "\n"
 }

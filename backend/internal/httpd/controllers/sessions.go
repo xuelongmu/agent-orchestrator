@@ -569,9 +569,11 @@ func (c *SessionsController) activity(w http.ResponseWriter, r *http.Request) {
 	sig := ports.ActivitySignal{
 		Valid:          state != "",
 		State:          state,
+		Harness:        capActivityMeta(domain.SanitizeControlChars(in.Harness)),
 		Event:          capActivityMeta(domain.SanitizeControlChars(in.Event)),
 		ToolName:       capActivityMeta(domain.SanitizeControlChars(in.ToolName)),
 		ToolUseID:      capActivityMeta(domain.SanitizeControlChars(in.ToolUseID)),
+		AgentID:        capActivityMeta(domain.SanitizeControlChars(in.AgentID)),
 		ErrorType:      capActivityMeta(domain.SanitizeControlChars(in.ErrorType)),
 		AgentSessionID: agentSessionID,
 	}

@@ -1,9 +1,9 @@
 // Package activitystate holds the standard mapping from an AO hook sub-command
 // name onto an activity state. Most adapters install the same
-// session-start/user-prompt-submit/stop/permission-request callbacks and derive
-// activity identically from the event name alone; they share this deriver rather
-// than each carrying a copy. Adapters that inspect the hook payload for finer
-// grained state (claude-code, codex, droid) keep their own deriver.
+// lifecycle callbacks and derive activity identically from the event name
+// alone; they share this deriver rather than each carrying a copy. Adapters
+// that inspect the hook payload for finer grained state (claude-code, codex,
+// droid) keep their own deriver.
 package activitystate
 
 import "github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -13,19 +13,17 @@ import "github.com/aoagents/agent-orchestrator/backend/internal/domain"
 // payload is ignored: this is the name-only mapping shared by adapters whose
 // hooks report activity purely through which callback fired.
 //
-//   - session-start / user-prompt-submit → active
-//   - stop                               → idle
-//   - permission-request                 → waiting_input
+//   - session-start / user-prompt-submit                         → active
+//   - pre-tool-use / post-tool-use / post-tool-use-failure       → active
+//   - stop                                                       → idle
+//   - permission-request                                         → waiting_input
 //
-// permission-request maps to waiting_input, not blocked: none of the sharing
-// adapters install the pre/post-tool-use trio, so a blocked state could never
-// be cleared before the turn ends. waiting_input still suppresses automated
-// nudges (NeedsInput) while leaving user-initiated sends deliverable.
+// permission-request maps to waiting_input, preserving the standard adapters'
+// existing semantics: it suppresses automated nudges (NeedsInput) while
+// leaving user-initiated sends deliverable.
 func StandardDeriveActivityState(event string, _ []byte) (domain.ActivityState, bool) {
 	switch event {
-	case "session-start":
-		return domain.ActivityActive, true
-	case "user-prompt-submit":
+	case "session-start", "user-prompt-submit", "pre-tool-use", "post-tool-use", "post-tool-use-failure":
 		return domain.ActivityActive, true
 	case "stop":
 		return domain.ActivityIdle, true

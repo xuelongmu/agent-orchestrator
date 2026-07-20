@@ -101,11 +101,11 @@ func TestSessionsAPI_ActivityThreadsCorrelationFields(t *testing.T) {
 	srv := newActivityTestServer(t, rec)
 
 	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
-		`{"state":"active","event":"post-tool-use","toolName":"Bash","toolUseId":"toolu_42","errorType":"tool_failed"}`)
+		`{"state":"active","harness":"kimi","event":"post-tool-use","toolName":"Bash","toolUseId":"toolu_42","agentId":"background-1","errorType":"tool_failed"}`)
 	if status != http.StatusOK {
 		t.Fatalf("activity = %d, want 200; body=%s", status, body)
 	}
-	want := ports.ActivitySignal{Valid: true, State: domain.ActivityActive, Event: "post-tool-use", ToolName: "Bash", ToolUseID: "toolu_42", ErrorType: "tool_failed"}
+	want := ports.ActivitySignal{Valid: true, State: domain.ActivityActive, Harness: "kimi", Event: "post-tool-use", ToolName: "Bash", ToolUseID: "toolu_42", AgentID: "background-1", ErrorType: "tool_failed"}
 	if rec.gotSignal != want {
 		t.Fatalf("recorder signal = %#v, want %#v", rec.gotSignal, want)
 	}
@@ -153,12 +153,18 @@ func TestSessionsAPI_ActivityCapsOverlongCorrelationFields(t *testing.T) {
 		long[i] = 'a'
 	}
 	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
-		`{"state":"active","event":"post-tool-use","toolUseId":"`+string(long)+`"}`)
+		`{"state":"active","harness":"`+string(long)+`","event":"post-tool-use","toolUseId":"`+string(long)+`","agentId":"`+string(long)+`"}`)
 	if status != http.StatusOK {
 		t.Fatalf("activity = %d, want 200; body=%s", status, body)
 	}
 	if rec.gotSignal.ToolUseID != "" {
 		t.Fatalf("overlong toolUseId not dropped: %q", rec.gotSignal.ToolUseID)
+	}
+	if rec.gotSignal.AgentID != "" {
+		t.Fatalf("overlong agentId not dropped: %q", rec.gotSignal.AgentID)
+	}
+	if rec.gotSignal.Harness != "" {
+		t.Fatalf("overlong harness not dropped: %q", rec.gotSignal.Harness)
 	}
 	if rec.gotSignal.Event != "post-tool-use" {
 		t.Fatalf("in-bounds event dropped: %#v", rec.gotSignal)
