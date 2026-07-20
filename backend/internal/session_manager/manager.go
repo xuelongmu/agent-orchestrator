@@ -387,6 +387,17 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	if cfg.WorkspaceKind != domain.WorkspaceKindWorktree && strings.TrimSpace(cfg.Branch) != "" {
 		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: branch is only valid for worktree sessions", ErrWorkspaceKindInvalid)
 	}
+	if len(cfg.DependsOn) > 0 && cfg.WorkspaceKind == domain.WorkspaceKindWorktree {
+		if branch := dependencyAdmissionBranch(cfg, project); branch != "" {
+			validator, ok := m.workspace.(ports.WorkspaceBranchValidator)
+			if !ok {
+				return domain.SessionRecord{}, errors.New("spawn: dependency workspace adapter does not support branch validation")
+			}
+			if validateErr := validator.ValidateWorkspaceBranch(ctx, branch); validateErr != nil {
+				return domain.SessionRecord{}, fmt.Errorf("spawn: validate branch: %w", validateErr)
+			}
+		}
+	}
 	// A per-project role override picks the harness when the spawn names none,
 	// so a project can default workers to one agent and orchestrators to another.
 	cfg.Harness = effectiveHarness(cfg.Harness, cfg.Kind, project.Config)
@@ -3211,6 +3222,21 @@ func defaultSpawnBranch(id domain.SessionID, kind domain.SessionKind, prefix str
 		return "ao/" + string(id)
 	}
 	return defaultSessionBranch(id, kind, prefix)
+}
+
+// dependencyAdmissionBranch returns only branches that can be known before the
+// session row assigns an id. Explicit branches are already known. A single-repo
+// orchestrator branch depends only on the configured project prefix; worker and
+// workspace-project defaults depend on the future session id and are built from
+// storage-controlled safe components.
+func dependencyAdmissionBranch(cfg ports.SpawnConfig, project domain.ProjectRecord) string {
+	if cfg.Branch != "" {
+		return cfg.Branch
+	}
+	if cfg.Kind == domain.KindOrchestrator && project.Kind.WithDefault() != domain.ProjectKindWorkspace {
+		return defaultSpawnBranch("", cfg.Kind, sessionPrefix(project), project.Kind.WithDefault())
+	}
+	return ""
 }
 
 func buildPrompt(cfg ports.SpawnConfig) string {

@@ -203,6 +203,15 @@ type WorkspacePlanner interface {
 	PlanWorkspace(ctx context.Context, cfg WorkspaceConfig) (WorkspaceInfo, error)
 }
 
+// WorkspaceBranchValidator validates the caller-supplied branch syntax without
+// materialising a workspace or consulting repository state. Session admission
+// uses this optional capability to reject deterministic Git-ref errors before
+// a dependency-gated seed becomes durable. Operational validation failures
+// preserve their original cause so callers can retry admission later.
+type WorkspaceBranchValidator interface {
+	ValidateWorkspaceBranch(ctx context.Context, branch string) error
+}
+
 // WorkspaceProject is an optional extension for projects composed from a
 // root-as-repo parent plus child repositories. It materialises the parent
 // worktree at the session root and each child repo at its registered relative

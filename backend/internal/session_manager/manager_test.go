@@ -46,6 +46,22 @@ type fakeStore struct {
 	afterCreate func(domain.SessionRecord)
 }
 
+type claimedFakeStore struct {
+	*fakeStore
+	claimedCreates int
+	intakeStarts   int
+}
+
+func (f *claimedFakeStore) CreateClaimedSession(ctx context.Context, rec domain.SessionRecord, _ ports.TrackerIntakeClaim, _ time.Time) (domain.SessionRecord, error) {
+	f.claimedCreates++
+	return f.CreateSession(ctx, rec)
+}
+
+func (f *claimedFakeStore) MarkTrackerIntakeSpawnStarted(context.Context, ports.TrackerIntakeClaim, domain.SessionID, time.Time) (bool, error) {
+	f.intakeStarts++
+	return true, nil
+}
+
 func (f *fakeStore) SaveSessionDesignContractSeed(_ context.Context, sessionID domain.SessionID, markdown string, _ time.Time) error {
 	if f.designContractSeeds == nil {
 		f.designContractSeeds = make(map[domain.SessionID]string)
@@ -656,6 +672,8 @@ func (missingAgents) Agent(domain.AgentHarness) (ports.Agent, bool) { return nil
 type fakeWorkspace struct {
 	mu                sync.RWMutex
 	createErr         error
+	validateBranchErr error
+	validatedBranches []string
 	destroyErr        error
 	destroyed         int
 	lastCfg           ports.WorkspaceConfig
@@ -683,6 +701,18 @@ type fakeWorkspace struct {
 	createRelease        <-chan struct{}
 	projectCreateStarted chan domain.SessionID
 	projectCreateRelease <-chan struct{}
+}
+
+// workspaceWithoutBranchValidator deliberately exposes only the base workspace
+// port so admission tests can prove the optional capability fails closed.
+type workspaceWithoutBranchValidator struct{ ports.Workspace }
+
+func (w *fakeWorkspace) ValidateWorkspaceBranch(ctx context.Context, branch string) error {
+	w.validatedBranches = append(w.validatedBranches, branch)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return w.validateBranchErr
 }
 
 func (w *fakeWorkspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
@@ -1079,6 +1109,196 @@ func TestSpawn_WithDependenciesPersistsLaunchAndWaitsForPromotion(t *testing.T) 
 	}
 	if !reflect.DeepEqual(got, []domain.SessionID{"mer-parent"}) {
 		t.Fatalf("dependencies not forwarded to seed record: %#v", got)
+	}
+}
+
+func TestSpawn_WithDependenciesRejectsInvalidBranchBeforeDurableAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		projectKind domain.ProjectKind
+	}{
+		{name: "single repository", projectKind: ""},
+		{name: "workspace project", projectKind: domain.ProjectKindWorkspace},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			claimedStore := &claimedFakeStore{fakeStore: st}
+			m.store = claimedStore
+			scheduler := &fakeDependencyScheduler{store: st}
+			m.SetDependencyScheduler(scheduler)
+			project := st.projects["mer"]
+			project.Kind = tc.projectKind
+			st.projects["mer"] = project
+			ws.validateBranchErr = fmt.Errorf("%w: %q", ports.ErrWorkspaceBranchInvalid, "bad..ref")
+
+			_, err := m.Spawn(ctx, ports.SpawnConfig{
+				ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+				IssueID: "166", Branch: "bad..ref", DependsOn: []domain.SessionID{"mer-parent"},
+				IntakeClaim: &ports.TrackerIntakeClaim{ProjectID: "mer", IssueID: "166", OwnerToken: "owner"},
+			})
+			if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) || !strings.Contains(err.Error(), "bad..ref") {
+				t.Fatalf("err = %v, want clear invalid-branch error", err)
+			}
+			assertNoBranchPreflightSideEffects(t, st, rt, ws, scheduler)
+			if claimedStore.claimedCreates != 0 || claimedStore.intakeStarts != 0 {
+				t.Fatalf("invalid branch reached tracker intake mutation: creates=%d starts=%d", claimedStore.claimedCreates, claimedStore.intakeStarts)
+			}
+			if !reflect.DeepEqual(ws.validatedBranches, []string{"bad..ref"}) {
+				t.Fatalf("validated branches = %#v", ws.validatedBranches)
+			}
+		})
+	}
+}
+
+func TestSpawn_WithDependenciesRejectsInvalidDefaultOrchestratorBranchBeforeAdmission(t *testing.T) {
+	m, st, rt, ws := newManager()
+	scheduler := &fakeDependencyScheduler{store: st}
+	m.SetDependencyScheduler(scheduler)
+	project := st.projects["mer"]
+	project.Config.SessionPrefix = "bad..ref"
+	st.projects["mer"] = project
+	ws.validateBranchErr = fmt.Errorf("%w: %q", ports.ErrWorkspaceBranchInvalid, "ao/bad..ref-orchestrator")
+
+	_, err := m.Spawn(ctx, ports.SpawnConfig{
+		ProjectID: "mer", Kind: domain.KindOrchestrator, Harness: domain.HarnessClaudeCode,
+		DependsOn: []domain.SessionID{"mer-parent"},
+	})
+	if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) || !strings.Contains(err.Error(), "ao/bad..ref-orchestrator") {
+		t.Fatalf("err = %v, want invalid default orchestrator branch", err)
+	}
+	assertNoBranchPreflightSideEffects(t, st, rt, ws, scheduler)
+	if !reflect.DeepEqual(ws.validatedBranches, []string{"ao/bad..ref-orchestrator"}) {
+		t.Fatalf("validated branches = %#v", ws.validatedBranches)
+	}
+}
+
+func TestSpawn_WithDependenciesRetriesOperationalBranchValidationBeforeAdmission(t *testing.T) {
+	m, st, rt, ws := newManager()
+	scheduler := &fakeDependencyScheduler{store: st}
+	m.SetDependencyScheduler(scheduler)
+	operationalErr := errors.New("git executable is temporarily unavailable")
+	ws.validateBranchErr = operationalErr
+	cfg := ports.SpawnConfig{
+		ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		IssueID: "166", Branch: "feat/valid", DependsOn: []domain.SessionID{"mer-parent"},
+	}
+
+	_, firstErr := m.Spawn(ctx, cfg)
+	if !errors.Is(firstErr, operationalErr) {
+		t.Fatalf("err = %v, want operational preflight cause", firstErr)
+	}
+	assertNoBranchPreflightSideEffects(t, st, rt, ws, scheduler)
+	if errors.Is(firstErr, ports.ErrWorkspaceBranchInvalid) {
+		t.Fatalf("operational preflight misclassified as invalid branch: %v", firstErr)
+	}
+
+	ws.validateBranchErr = nil
+	child, err := m.Spawn(ctx, cfg)
+	if err != nil {
+		t.Fatalf("retry after operational recovery: %v", err)
+	}
+	if child.ID != "mer-1" || !child.DependencyPending() || len(st.sessions) != 1 || scheduler.reconcileCalls != 1 {
+		t.Fatalf("retry did not admit one pending child: child=%#v sessions=%#v reconcile=%d", child, st.sessions, scheduler.reconcileCalls)
+	}
+	if !reflect.DeepEqual(ws.validatedBranches, []string{"feat/valid", "feat/valid"}) {
+		t.Fatalf("preflight validation calls = %#v, want once per admission attempt", ws.validatedBranches)
+	}
+
+	child.DependencyPromotionToken = "owner"
+	st.setSession(child)
+	promoted, err := m.LaunchPromoted(ctx, child.ID, "owner", nil)
+	if err != nil {
+		t.Fatalf("promote valid explicit branch: %v", err)
+	}
+	if promoted.Metadata.Branch != "feat/valid" || ws.lastCfg.Branch != "feat/valid" || rt.created != 1 {
+		t.Fatalf("valid branch promotion = session:%#v workspace:%#v runtime creates:%d", promoted.Metadata, ws.lastCfg, rt.created)
+	}
+}
+
+func TestSpawn_WithDependenciesRejectsCanceledBranchValidationBeforeAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ctx     func() (context.Context, context.CancelFunc)
+		wantErr error
+	}{
+		{name: "canceled", ctx: func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, func() {}
+		}, wantErr: context.Canceled},
+		{name: "deadline exceeded", ctx: func() (context.Context, context.CancelFunc) {
+			return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		}, wantErr: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			scheduler := &fakeDependencyScheduler{store: st}
+			m.SetDependencyScheduler(scheduler)
+			callCtx, cancel := tc.ctx()
+			defer cancel()
+			_, err := m.Spawn(callCtx, ports.SpawnConfig{
+				ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+				IssueID: "166", Branch: "feat/valid", DependsOn: []domain.SessionID{"mer-parent"},
+			})
+			if !errors.Is(err, tc.wantErr) || errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+				t.Fatalf("err = %v, want %v without INVALID_BRANCH", err, tc.wantErr)
+			}
+			assertNoBranchPreflightSideEffects(t, st, rt, ws, scheduler)
+		})
+	}
+}
+
+func TestSpawn_WithDependenciesFailsClosedWithoutBranchValidator(t *testing.T) {
+	m, st, rt, ws := newManager()
+	scheduler := &fakeDependencyScheduler{store: st}
+	m.SetDependencyScheduler(scheduler)
+	m.workspace = workspaceWithoutBranchValidator{Workspace: ws}
+
+	_, err := m.Spawn(ctx, ports.SpawnConfig{
+		ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		IssueID: "166", Branch: "feat/valid", DependsOn: []domain.SessionID{"mer-parent"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not support branch validation") {
+		t.Fatalf("err = %v, want missing branch-validator capability", err)
+	}
+	if errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+		t.Fatalf("missing capability misclassified as invalid branch: %v", err)
+	}
+	assertNoBranchPreflightSideEffects(t, st, rt, ws, scheduler)
+}
+
+func TestSpawn_BranchPreflightScopeLeavesOrdinaryAndGeneratedBranchesUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  ports.SpawnConfig
+	}{
+		{name: "ordinary explicit branch", cfg: ports.SpawnConfig{
+			ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode, Branch: "feat/ordinary",
+		}},
+		{name: "dependent generated branch", cfg: ports.SpawnConfig{
+			ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode, DependsOn: []domain.SessionID{"mer-parent"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, _, ws := newManager()
+			ws.validateBranchErr = fmt.Errorf("%w: should not be consulted", ports.ErrWorkspaceBranchInvalid)
+			if _, err := m.Spawn(ctx, tc.cfg); err != nil {
+				t.Fatalf("spawn: %v", err)
+			}
+			if len(ws.validatedBranches) != 0 {
+				t.Fatalf("unexpected admission branch validation: %#v", ws.validatedBranches)
+			}
+		})
+	}
+}
+
+func assertNoBranchPreflightSideEffects(t *testing.T, st *fakeStore, rt *fakeRuntime, ws *fakeWorkspace, scheduler *fakeDependencyScheduler) {
+	t.Helper()
+	if st.num != 0 || len(st.sessions) != 0 || len(st.designContractSeeds) != 0 || len(st.worktrees) != 0 {
+		t.Fatalf("branch preflight reached durable state: creates=%d sessions=%#v contracts=%#v worktrees=%#v", st.num, st.sessions, st.designContractSeeds, st.worktrees)
+	}
+	if rt.created != 0 || len(ws.calls) != 0 || ws.lastCfg.SessionID != "" || ws.lastProjectCfg.SessionID != "" || scheduler.reconcileCalls != 0 {
+		t.Fatalf("branch preflight reached side effects: runtime=%d workspace=%v single=%#v project=%#v reconcile=%d", rt.created, ws.calls, ws.lastCfg, ws.lastProjectCfg, scheduler.reconcileCalls)
 	}
 }
 

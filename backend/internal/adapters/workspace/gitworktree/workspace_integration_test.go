@@ -63,6 +63,20 @@ func TestWorkspaceIntegrationCreateRestoreDestroy(t *testing.T) {
 	}
 }
 
+func TestValidateWorkspaceBranchRealGitRejectsInvalidRef(t *testing.T) {
+	git := requireGit(t)
+	ws, err := New(Options{Binary: git, ManagedRoot: t.TempDir(), RepoResolver: StaticRepoResolver{}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	for _, branch := range []string{"bad..ref", "HEAD"} {
+		err = ws.ValidateWorkspaceBranch(context.Background(), branch)
+		if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+			t.Fatalf("branch %q: err = %v, want ports.ErrWorkspaceBranchInvalid", branch, err)
+		}
+	}
+}
+
 func TestWorkspaceIntegrationDestroyRefusesLockedWorktree(t *testing.T) {
 	git := requireGit(t)
 	tmp := t.TempDir()

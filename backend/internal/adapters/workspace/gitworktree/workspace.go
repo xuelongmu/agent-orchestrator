@@ -87,6 +87,7 @@ var _ ports.Workspace = (*Workspace)(nil)
 var _ ports.WorkspaceProject = (*Workspace)(nil)
 var _ ports.WorkspacePlanner = (*Workspace)(nil)
 var _ ports.WorkspaceProjectPlanner = (*Workspace)(nil)
+var _ ports.WorkspaceBranchValidator = (*Workspace)(nil)
 
 // New builds a gitworktree Workspace, validating that ManagedRoot and
 // RepoResolver are set and resolving the root to an absolute, symlink-free path.
@@ -128,7 +129,7 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
-	if err := w.validateBranch(ctx, repo, cfg.Branch); err != nil {
+	if err := w.validateBranch(ctx, cfg.Branch); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
 	path, err := w.managedPath(cfg)
@@ -148,8 +149,11 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 
 // PlanWorkspace returns Create's deterministic managed path without adding a
 // worktree or branch.
-func (w *Workspace) PlanWorkspace(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+func (w *Workspace) PlanWorkspace(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
 	if err := validateConfig(cfg); err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+	if err := w.validateBranch(ctx, cfg.Branch); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
 	repo, err := w.repoPath(cfg.ProjectID)
@@ -261,15 +265,18 @@ func (w *Workspace) CreateWorkspaceProject(ctx context.Context, cfg ports.Worksp
 // recoverable promotion attempt. RecoverExisting requires the exact prepared
 // branch; CreateWorkspaceProject will adopt a partial prior attempt at these
 // paths rather than selecting a suffixed duplicate branch.
-func (w *Workspace) PlanWorkspaceProject(_ context.Context, cfg ports.WorkspaceProjectConfig) (ports.WorkspaceProjectInfo, error) {
+func (w *Workspace) PlanWorkspaceProject(ctx context.Context, cfg ports.WorkspaceProjectConfig) (ports.WorkspaceProjectInfo, error) {
 	if err := validateWorkspaceProjectConfig(cfg); err != nil {
+		return ports.WorkspaceProjectInfo{}, err
+	}
+	branch := firstNonEmpty(cfg.Branch, defaultSessionBranchName(cfg.SessionID))
+	if err := w.validateBranch(ctx, branch); err != nil {
 		return ports.WorkspaceProjectInfo{}, err
 	}
 	rootRepo, err := physicalAbs(cfg.RootRepoPath)
 	if err != nil {
 		return ports.WorkspaceProjectInfo{}, fmt.Errorf("gitworktree: root repo path: %w", err)
 	}
-	branch := firstNonEmpty(cfg.Branch, defaultSessionBranchName(cfg.SessionID))
 	rootPath, err := w.managedPath(ports.WorkspaceConfig{ProjectID: cfg.ProjectID, SessionID: cfg.SessionID, Kind: cfg.Kind, SessionPrefix: cfg.SessionPrefix, Branch: branch})
 	if err != nil {
 		return ports.WorkspaceProjectInfo{}, err
@@ -644,7 +651,7 @@ func (w *Workspace) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (por
 			return ports.WorkspaceInfo{}, err
 		}
 	}
-	if err := w.validateBranch(ctx, repo, cfg.Branch); err != nil {
+	if err := w.validateBranch(ctx, cfg.Branch); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
 	if err := w.addWorktree(ctx, repo, path, cfg.Branch, cfg.BaseBranch); err != nil {
@@ -748,10 +755,10 @@ func (w *Workspace) workspaceProjectBranch(ctx context.Context, repos []workspac
 }
 
 func (w *Workspace) workspaceProjectBranchFree(ctx context.Context, repos []workspaceProjectRepo, branch string) (bool, error) {
+	if err := w.validateBranch(ctx, branch); err != nil {
+		return false, err
+	}
 	for _, repo := range repos {
-		if err := w.validateBranch(ctx, repo.repoPath, branch); err != nil {
-			return false, err
-		}
 		exists, err := w.refExists(ctx, repo.repoPath, "refs/heads/"+branch)
 		if err != nil {
 			return false, err
@@ -771,10 +778,10 @@ func (w *Workspace) workspaceProjectBranchFree(ctx context.Context, repos []work
 }
 
 func (w *Workspace) workspaceProjectBranchReusable(ctx context.Context, repos []workspaceProjectRepo, branch string) (bool, error) {
+	if err := w.validateBranch(ctx, branch); err != nil {
+		return false, err
+	}
 	for _, repo := range repos {
-		if err := w.validateBranch(ctx, repo.repoPath, branch); err != nil {
-			return false, err
-		}
 		records, err := w.listRecords(ctx, repo.repoPath)
 		if err != nil {
 			return false, err
@@ -868,9 +875,37 @@ func (w *Workspace) revParse(ctx context.Context, repo, ref string) (string, err
 	return strings.TrimSpace(string(out)), nil
 }
 
-func (w *Workspace) validateBranch(ctx context.Context, repo, branch string) error {
-	if _, err := w.run(ctx, w.binary, checkRefFormatBranchArgs(repo, branch)...); err != nil {
-		return fmt.Errorf("%w: %q (%w)", ErrBranchInvalid, branch, err)
+// ValidateWorkspaceBranch checks only deterministic Git-ref syntax. It neither
+// requires nor reads a repository, so it is safe to call before a dependent
+// session has a durable id or workspace plan.
+func (w *Workspace) ValidateWorkspaceBranch(ctx context.Context, branch string) error {
+	return w.validateBranch(ctx, branch)
+}
+
+func (w *Workspace) validateBranch(ctx context.Context, branch string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("gitworktree: validate branch %q: %w", branch, err)
+	}
+	// The fully-qualified ref form below accepts refs/heads/-name and
+	// refs/heads/HEAD, while check-ref-format --branch deliberately rejects
+	// those branch shorthands. Preserve both branch-only constraints explicitly.
+	if strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("%w: %q (branch name cannot begin with '-')", ErrBranchInvalid, branch)
+	}
+	if branch == "HEAD" {
+		return fmt.Errorf("%w: %q is reserved", ErrBranchInvalid, branch)
+	}
+	if _, err := w.run(ctx, w.binary, checkRefFormatBranchArgs(branch)...); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("gitworktree: validate branch %q: %w", branch, ctxErr)
+		}
+		var exitErr interface{ ExitCode() int }
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return fmt.Errorf("%w: %q (%w)", ErrBranchInvalid, branch, err)
+		}
+		// Launch failures, signals, and Git-internal exits are operational, not
+		// proof that check-ref-format rejected the branch. Preserve their cause.
+		return fmt.Errorf("gitworktree: validate branch %q: %w", branch, err)
 	}
 	return nil
 }

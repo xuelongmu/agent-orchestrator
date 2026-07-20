@@ -225,6 +225,33 @@ func TestSpawnDependsOnWiring(t *testing.T) {
 	}
 }
 
+func TestSpawnInvalidDependentBranchSurfacesDaemonDiagnostic(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/demo":
+			_, _ = io.WriteString(w, `{"status":"ok","project":{"id":"demo","name":"Demo","path":"/repo/demo"}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agents/refresh":
+			_, _ = io.WriteString(w, authorizedAgentsJSON("codex"))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions":
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":"bad_request","code":"INVALID_BRANCH","message":"workspace: invalid branch name: \"bad..ref\""}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	_, _, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }},
+		"spawn", "--project", "demo", "--agent", "codex", "--name", "child",
+		"--branch", "bad..ref", "--depends-on", "demo-1")
+	if err == nil || !strings.Contains(err.Error(), "bad..ref") || !strings.Contains(err.Error(), "INVALID_BRANCH") {
+		t.Fatalf("err = %v, want branch and INVALID_BRANCH diagnostic", err)
+	}
+}
+
 func TestSpawnAlreadyCompleteDependencyPrintsAttachInsteadOfWaiting(t *testing.T) {
 	cfg := setConfigEnv(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

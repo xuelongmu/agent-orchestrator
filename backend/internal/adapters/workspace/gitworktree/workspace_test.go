@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -24,7 +26,7 @@ func TestCommandArgs(t *testing.T) {
 		got  []string
 		want []string
 	}{
-		{"check ref", checkRefFormatBranchArgs(repo, branch), []string{"-C", repo, "check-ref-format", "--branch", branch}},
+		{"check ref", checkRefFormatBranchArgs(branch), []string{"-C", "/", "check-ref-format", "refs/heads/" + branch}},
 		{"rev parse", revParseVerifyArgs(repo, "origin/main"), []string{"-C", repo, "rev-parse", "--verify", "--quiet", "origin/main"}},
 		{"add existing", worktreeAddBranchArgs(repo, path, branch), []string{"-C", repo, "worktree", "add", path, branch}},
 		{"add new", worktreeAddNewBranchArgs(repo, branch, path, "origin/main"), []string{"-C", repo, "worktree", "add", "-b", branch, path, "origin/main"}},
@@ -623,7 +625,7 @@ func TestCreateRejectsInvalidBranchName(t *testing.T) {
 	ws.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		joined := strings.Join(args, " ")
 		if strings.Contains(joined, "check-ref-format") {
-			return nil, errors.New("fatal: 'bad branch!!' is not a valid branch name")
+			return nil, exitCodeError(1)
 		}
 		t.Fatalf("no git beyond check-ref-format should run for an invalid branch: %v", args)
 		return nil, nil
@@ -634,6 +636,134 @@ func TestCreateRejectsInvalidBranchName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bad branch!!") {
 		t.Fatalf("err = %v, want message to include the rejected branch name", err)
+	}
+}
+
+func TestPlanningRejectsInvalidBranchName(t *testing.T) {
+	root := t.TempDir()
+	repo := t.TempDir()
+	ws, err := New(Options{ManagedRoot: root, RepoResolver: StaticRepoResolver{"proj": repo}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ws.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if !reflect.DeepEqual(args, []string{"-C", "/", "check-ref-format", "refs/heads/bad..ref"}) {
+			t.Fatalf("unexpected git invocation: %v", args)
+		}
+		return nil, exitCodeError(1)
+	}
+
+	tests := []struct {
+		name string
+		plan func() error
+	}{
+		{
+			name: "single repository",
+			plan: func() error {
+				_, err := ws.PlanWorkspace(context.Background(), ports.WorkspaceConfig{ProjectID: "proj", SessionID: "sess", Branch: "bad..ref"})
+				return err
+			},
+		},
+		{
+			name: "workspace project",
+			plan: func() error {
+				_, err := ws.PlanWorkspaceProject(context.Background(), ports.WorkspaceProjectConfig{ProjectID: "proj", SessionID: "sess", Branch: "bad..ref", RootRepoPath: repo})
+				return err
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.plan(); !errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+				t.Fatalf("err = %v, want ports.ErrWorkspaceBranchInvalid", err)
+			}
+		})
+	}
+}
+
+func TestValidateWorkspaceBranchUsesRepoIndependentInvocation(t *testing.T) {
+	ws, err := New(Options{ManagedRoot: t.TempDir(), RepoResolver: StaticRepoResolver{}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ws.run = func(_ context.Context, binary string, args ...string) ([]byte, error) {
+		if binary != "git" || !reflect.DeepEqual(args, []string{"-C", "/", "check-ref-format", "refs/heads/feat/valid"}) {
+			t.Fatalf("command = %q %v, want repo-independent check-ref-format", binary, args)
+		}
+		return nil, nil
+	}
+	if err := ws.ValidateWorkspaceBranch(context.Background(), "feat/valid"); err != nil {
+		t.Fatalf("valid branch: %v", err)
+	}
+}
+
+func TestValidateWorkspaceBranchRejectsBranchOnlyConstraintsWithoutGit(t *testing.T) {
+	ws, err := New(Options{ManagedRoot: t.TempDir(), RepoResolver: StaticRepoResolver{}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ws.run = func(context.Context, string, ...string) ([]byte, error) {
+		t.Fatal("branch-only rejection reached Git")
+		return nil, nil
+	}
+	for _, branch := range []string{"-invalid", "HEAD"} {
+		err = ws.ValidateWorkspaceBranch(context.Background(), branch)
+		if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+			t.Fatalf("branch %q: err = %v, want ports.ErrWorkspaceBranchInvalid", branch, err)
+		}
+	}
+}
+
+func TestValidateWorkspaceBranchPreservesOperationalFailures(t *testing.T) {
+	ws, err := New(Options{ManagedRoot: t.TempDir(), RepoResolver: StaticRepoResolver{"proj": t.TempDir()}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	for _, operationalErr := range []error{
+		errors.New("command runner unavailable"),
+		&exec.Error{Name: "git", Err: exec.ErrNotFound},
+		&os.PathError{Op: "fork/exec", Path: "git", Err: os.ErrPermission},
+		exitCodeError(128),
+	} {
+		ws.run = func(context.Context, string, ...string) ([]byte, error) { return nil, operationalErr }
+		err = ws.ValidateWorkspaceBranch(context.Background(), "feat/valid")
+		if err == nil || !errors.Is(err, operationalErr) {
+			t.Fatalf("err = %v, want wrapped operational failure %v", err, operationalErr)
+		}
+		if errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+			t.Fatalf("operational failure was misclassified as an invalid branch: %v", err)
+		}
+	}
+}
+
+func TestValidateWorkspaceBranchPreservesContextFailures(t *testing.T) {
+	ws, err := New(Options{ManagedRoot: t.TempDir(), RepoResolver: StaticRepoResolver{}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ws.run = func(context.Context, string, ...string) ([]byte, error) { return nil, exitCodeError(128) }
+	for _, tc := range []struct {
+		name    string
+		ctx     context.Context
+		wantErr error
+	}{
+		{name: "canceled", ctx: func() context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx
+		}(), wantErr: context.Canceled},
+		{name: "deadline exceeded", ctx: func() context.Context {
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			defer cancel()
+			return ctx
+		}(), wantErr: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ws.ValidateWorkspaceBranch(tc.ctx, "feat/valid")
+			if !errors.Is(err, tc.wantErr) || errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+				t.Fatalf("err = %v, want %v without invalid-branch sentinel", err, tc.wantErr)
+			}
+		})
 	}
 }
 
