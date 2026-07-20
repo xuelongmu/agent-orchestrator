@@ -198,6 +198,7 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 	if err != nil {
 		return err
 	}
+	callerLive := ctx.Err() == nil
 	var anchors []sessionAnchor
 	if discoveryCtx, cancel, ok := r.paneDiscoveryContext(ctx); ok {
 		panes := r.livePaneRefs(discoveryCtx, listPaneRefsArgs(id))
@@ -209,7 +210,12 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 		}
 		cancel()
 	}
-	out, err := r.run(ctx, killSessionArgs(id)...)
+	// Cancellation that arrives during optional discovery must not suppress the
+	// primary teardown. Detach only after confirming the caller was live on
+	// entry, and retain its original deadline (or one command timeout).
+	killCtx, killCancel := r.teardownCommandContext(ctx, callerLive)
+	defer killCancel()
+	out, err := r.run(killCtx, killSessionArgs(id)...)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && killSessionMissingOutput(string(out)) {
@@ -248,8 +254,22 @@ func (r *Runtime) paneDiscoveryContext(ctx context.Context) (context.Context, co
 	if budget <= 0 {
 		return nil, nil, false
 	}
-	discoveryCtx, cancel := context.WithTimeout(ctx, budget)
+	// Discovery is optional but must remain independently bounded. Detaching
+	// cancellation keeps a caller cancellation in this phase from racing away
+	// the subsequent kill-session call.
+	discoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	return discoveryCtx, cancel, true
+}
+
+func (r *Runtime) teardownCommandContext(ctx context.Context, callerWasLive bool) (context.Context, context.CancelFunc) {
+	if !callerWasLive {
+		return context.WithCancel(ctx)
+	}
+	base := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(base, deadline)
+	}
+	return context.WithTimeout(base, r.timeout)
 }
 
 // livePaneRefs parses only live panes with safe PIDs. Stable pane/window IDs are
@@ -263,12 +283,13 @@ func (r *Runtime) livePaneRefs(ctx context.Context, args []string) []paneRef {
 	var panes []paneRef
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) != 4 || fields[3] != "0" {
+		if len(fields) != 6 || fields[5] != "0" {
 			continue
 		}
-		pid, parseErr := strconv.Atoi(fields[2])
-		if parseErr == nil {
-			panes = append(panes, paneRef{paneID: fields[0], windowID: fields[1], pid: pid})
+		serverID, serverOK := tmuxServerID(fields[0], fields[1])
+		pid, parseErr := strconv.Atoi(fields[4])
+		if serverOK && parseErr == nil {
+			panes = append(panes, paneRef{serverID: serverID, paneID: fields[2], windowID: fields[3], pid: pid})
 		}
 	}
 	return safeUniquePanes(panes)
@@ -304,8 +325,8 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 		closeAnchors(anchors)
 		return
 	}
-	survivingPanes := make(map[string]struct{})
-	survivingWindows := make(map[string]struct{})
+	survivingPanes := make(map[tmuxObjectID]struct{})
+	survivingWindows := make(map[tmuxObjectID]struct{})
 	if err == nil {
 		var reliable bool
 		survivingPanes, survivingWindows, reliable = parseSurvivingTmuxObjects(out)
@@ -316,8 +337,8 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 	}
 	verified := make([]sessionAnchor, 0, len(anchors))
 	for _, anchor := range anchors {
-		_, paneSurvives := survivingPanes[anchor.pane.paneID]
-		_, windowSurvives := survivingWindows[anchor.pane.windowID]
+		_, paneSurvives := survivingPanes[tmuxObjectID{serverID: anchor.pane.serverID, objectID: anchor.pane.paneID}]
+		_, windowSurvives := survivingWindows[tmuxObjectID{serverID: anchor.pane.serverID, objectID: anchor.pane.windowID}]
 		if !paneSurvives && !windowSurvives {
 			verified = append(verified, anchor)
 		} else {
@@ -329,21 +350,39 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 	}
 }
 
-func parseSurvivingTmuxObjects(out []byte) (map[string]struct{}, map[string]struct{}, bool) {
-	panes := make(map[string]struct{})
-	windows := make(map[string]struct{})
+type tmuxObjectID struct {
+	serverID string
+	objectID string
+}
+
+func parseSurvivingTmuxObjects(out []byte) (map[tmuxObjectID]struct{}, map[tmuxObjectID]struct{}, bool) {
+	panes := make(map[tmuxObjectID]struct{})
+	windows := make(map[tmuxObjectID]struct{})
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) != 2 || fields[0] == "" || fields[1] == "" {
+		if len(fields) != 4 || fields[2] == "" || fields[3] == "" {
 			return nil, nil, false
 		}
-		panes[fields[0]] = struct{}{}
-		windows[fields[1]] = struct{}{}
+		serverID, ok := tmuxServerID(fields[0], fields[1])
+		if !ok {
+			return nil, nil, false
+		}
+		panes[tmuxObjectID{serverID: serverID, objectID: fields[2]}] = struct{}{}
+		windows[tmuxObjectID{serverID: serverID, objectID: fields[3]}] = struct{}{}
 	}
 	return panes, windows, true
+}
+
+func tmuxServerID(pidText, started string) (string, bool) {
+	pid, err := strconv.Atoi(pidText)
+	startedAt, startedErr := strconv.ParseInt(started, 10, 64)
+	if err != nil || pid <= 1 || startedErr != nil || startedAt <= 0 {
+		return "", false
+	}
+	return strconv.Itoa(pid) + "/" + strconv.FormatInt(startedAt, 10), true
 }
 
 // IsAlive reports whether the handle's session still exists via `tmux

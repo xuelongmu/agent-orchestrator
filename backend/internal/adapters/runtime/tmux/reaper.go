@@ -63,6 +63,7 @@ type sessionAnchor struct {
 }
 
 type paneRef struct {
+	serverID string
 	paneID   string
 	windowID string
 	pid      int
@@ -191,8 +192,7 @@ func (r processSessionReaper) observeAndTerm(
 	defer closeObservations(snapshot)
 	current := groupObservations(snapshot)
 	for sid, prior := range trusted {
-		witness, ok := stableWitness(current[sid], prior)
-		if !ok || r.alive(ctx, prior[witness]) != nil {
+		if _, ok := r.liveWitness(ctx, current[sid], prior); !ok {
 			closeProcessSet(prior)
 			delete(trusted, sid)
 			continue
@@ -204,7 +204,10 @@ func (r processSessionReaper) observeAndTerm(
 			}
 			handle, known := prior[identity]
 			if !known {
-				if r.alive(ctx, prior[witness]) != nil {
+				// The witness chosen at the start of this observation may have
+				// exited after TERM. Try every other exact retained member before
+				// abandoning continuity for the whole process session.
+				if _, ok := r.liveWitness(ctx, current[sid], prior); !ok {
 					closeProcessSet(prior)
 					delete(trusted, sid)
 					break
@@ -255,9 +258,9 @@ func (r processSessionReaper) signal(ctx context.Context, handle processHandle, 
 	return handle.Signal(probeCtx, signal)
 }
 
-func stableWitness(current []*processObservation, trusted processSet) (processIdentity, bool) {
+func (r processSessionReaper) liveWitness(ctx context.Context, current []*processObservation, trusted processSet) (processIdentity, bool) {
 	for _, observation := range current {
-		if _, ok := trusted[observation.identity]; ok {
+		if handle, ok := trusted[observation.identity]; ok && r.alive(ctx, handle) == nil {
 			return observation.identity, true
 		}
 	}
@@ -304,7 +307,7 @@ func safeUniquePanes(panes []paneRef) []paneRef {
 	seen := make(map[paneRef]struct{}, len(panes))
 	result := make([]paneRef, 0, len(panes))
 	for _, pane := range panes {
-		if pane.pid <= 1 || pane.paneID == "" || pane.windowID == "" {
+		if pane.pid <= 1 || pane.serverID == "" || pane.paneID == "" || pane.windowID == "" {
 			continue
 		}
 		if _, ok := seen[pane]; ok {

@@ -66,12 +66,13 @@ func exactSessionTarget(id string) string {
 	return "=" + id
 }
 
-// listPaneRefsArgs captures stable tmux object IDs around process anchoring.
-// pane_dead is included so a stale pane_pid is never treated as a live owner.
+// listPaneRefsArgs captures the tmux server generation and stable object IDs
+// around process anchoring. pane_dead is included so a stale pane_pid is never
+// treated as a live owner.
 func listPaneRefsArgs(id string) []string {
 	return []string{
 		"list-panes", "-s", "-t", exactSessionTarget(id),
-		"-F", "#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_dead}",
+		"-F", "#{pid}\t#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_dead}",
 	}
 }
 
@@ -79,7 +80,7 @@ func listPaneRefsArgs(id string) []string {
 // different window via break/join/move-pane, while an original window can
 // survive via links. Either surviving object excludes its process anchor.
 func listAllPaneRefsArgs() []string {
-	return []string{"list-panes", "-a", "-F", "#{pane_id}\t#{window_id}"}
+	return []string{"list-panes", "-a", "-F", "#{pid}\t#{start_time}\t#{pane_id}\t#{window_id}"}
 }
 
 // sendKeysLiteralArgs builds args for `tmux send-keys -t <id> -l <chunk>`.

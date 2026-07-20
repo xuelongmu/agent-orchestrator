@@ -141,10 +141,10 @@ func TestCommandBuilders(t *testing.T) {
 	if got, want := hasSessionArgs("sess-1"), []string{"has-session", "-t", "=sess-1"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("hasSessionArgs = %#v, want %#v", got, want)
 	}
-	if got, want := listPaneRefsArgs("sess-1"), []string{"list-panes", "-s", "-t", "=sess-1", "-F", "#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_dead}"}; !reflect.DeepEqual(got, want) {
+	if got, want := listPaneRefsArgs("sess-1"), []string{"list-panes", "-s", "-t", "=sess-1", "-F", "#{pid}\t#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_dead}"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("listPaneRefsArgs = %#v, want %#v", got, want)
 	}
-	if got, want := listAllPaneRefsArgs(), []string{"list-panes", "-a", "-F", "#{pane_id}\t#{window_id}"}; !reflect.DeepEqual(got, want) {
+	if got, want := listAllPaneRefsArgs(), []string{"list-panes", "-a", "-F", "#{pid}\t#{start_time}\t#{pane_id}\t#{window_id}"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("listAllPaneRefsArgs = %#v, want %#v", got, want)
 	}
 	if got, want := sendKeysLiteralArgs("sess-1", "hello"), []string{"send-keys", "-t", "sess-1", "-l", "hello"}; !reflect.DeepEqual(got, want) {
@@ -463,7 +463,7 @@ func TestDestroyArgs(t *testing.T) {
 
 func TestDestroyReapsAllDiscoveredPaneSessions(t *testing.T) {
 	r, fr := newTestRuntime(0)
-	panes := []byte("%1 @1 4242 0\n%2 @2 4243 0\n%3 @3 1 0\n%4 @4 0 0\n%1 @1 4242 0\nnoise\n")
+	panes := []byte("100 1000 %1 @1 4242 0\n100 1000 %2 @2 4243 0\n100 1000 %3 @3 1 0\n100 1000 %4 @4 0 0\n100 1000 %1 @1 4242 0\nnoise\n")
 	fr.outputs = [][]byte{panes, panes, nil, nil}
 	reaper := &recordingReaper{}
 	r.sessionReaper = reaper
@@ -474,7 +474,7 @@ func TestDestroyReapsAllDiscoveredPaneSessions(t *testing.T) {
 	if len(reaper.calls) != 1 {
 		t.Fatalf("reaper calls = %d, want 1", len(reaper.calls))
 	}
-	if got, want := reaper.anchoredPanes, []paneRef{{paneID: "%1", windowID: "@1", pid: 4242}, {paneID: "%2", windowID: "@2", pid: 4243}}; !reflect.DeepEqual(got, want) {
+	if got, want := reaper.anchoredPanes, []paneRef{{serverID: "100/1000", paneID: "%1", windowID: "@1", pid: 4242}, {serverID: "100/1000", paneID: "%2", windowID: "@2", pid: 4243}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("anchored panes = %#v, want %#v", got, want)
 	}
 	if got, want := anchorSessionIDs(reaper.calls[0].anchors), []int{4242, 4243}; !reflect.DeepEqual(got, want) {
@@ -487,8 +487,8 @@ func TestDestroyReapsAllDiscoveredPaneSessions(t *testing.T) {
 
 func TestDestroyExcludesWindowLinkedAfterDiscovery(t *testing.T) {
 	r, fr := newTestRuntime(0)
-	panes := []byte("%1 @1 4242 0\n%2 @2 4243 0\n")
-	fr.outputs = [][]byte{panes, panes, nil, []byte("%2 @2\n")}
+	panes := []byte("100 1000 %1 @1 4242 0\n100 1000 %2 @2 4243 0\n")
+	fr.outputs = [][]byte{panes, panes, nil, []byte("100 1000 %2 @2\n")}
 	reaper := &recordingReaper{}
 	r.sessionReaper = reaper
 
@@ -502,10 +502,10 @@ func TestDestroyExcludesWindowLinkedAfterDiscovery(t *testing.T) {
 
 func TestDestroyExcludesPaneMovedToAnotherWindowAfterDiscovery(t *testing.T) {
 	r, fr := newTestRuntime(0)
-	panes := []byte("%1 @1 4242 0\n")
+	panes := []byte("100 1000 %1 @1 4242 0\n")
 	// break-pane/join-pane/move-pane preserve the pane ID while changing its
 	// window. The post-kill probe must treat the stable pane as a survivor.
-	fr.outputs = [][]byte{panes, panes, nil, []byte("%1 @9\n")}
+	fr.outputs = [][]byte{panes, panes, nil, []byte("100 1000 %1 @9\n")}
 	reaper := &recordingReaper{}
 	r.sessionReaper = reaper
 
@@ -517,9 +517,26 @@ func TestDestroyExcludesPaneMovedToAnotherWindowAfterDiscovery(t *testing.T) {
 	}
 }
 
+func TestDestroyDoesNotConfuseReusedObjectIDsFromNewServerGeneration(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	panes := []byte("100 1000 %1 @1 4242 0\n")
+	// A replacement tmux server may restart pane and window IDs at %1/@1.
+	// Its distinct server PID/start generation must not exclude the old anchor.
+	fr.outputs = [][]byte{panes, panes, nil, []byte("200 2000 %1 @1\n")}
+	reaper := &recordingReaper{}
+	r.sessionReaper = reaper
+
+	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if got, want := anchorSessionIDs(reaper.calls[0].anchors), []int{4242}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("reaped session ids = %#v, want old-generation anchor %#v", got, want)
+	}
+}
+
 func TestDestroyReapsDuplicateWindowLinksWithinSameSession(t *testing.T) {
 	r, fr := newTestRuntime(0)
-	panes := []byte("%1 @1 4242 0\n%1 @1 4242 0\n")
+	panes := []byte("100 1000 %1 @1 4242 0\n100 1000 %1 @1 4242 0\n")
 	fr.outputs = [][]byte{panes, panes, nil, nil}
 	reaper := &recordingReaper{}
 	r.sessionReaper = reaper
@@ -535,10 +552,10 @@ func TestDestroyReapsDuplicateWindowLinksWithinSameSession(t *testing.T) {
 func TestDestroyRejectsPanePIDReuseBeforeAnchorCompletes(t *testing.T) {
 	r, fr := newTestRuntime(0)
 	fr.outputs = [][]byte{
-		[]byte("%1 @1 4242 0\n"),
+		[]byte("100 1000 %1 @1 4242 0\n"),
 		// The pane owner exited while Anchor ran. Even if 4242 has already been
 		// reused elsewhere, tmux's dead state invalidates the numeric PID.
-		[]byte("%1 @1 4242 1\n"),
+		[]byte("100 1000 %1 @1 4242 1\n"),
 		nil,
 	}
 	reaper := &recordingReaper{}
@@ -564,7 +581,7 @@ func TestReapAfterSurvivorCheckReapsForEveryMissingServerSpelling(t *testing.T) 
 			fr.err = &exec.ExitError{}
 			reaper := &recordingReaper{}
 			r.sessionReaper = reaper
-			pane := paneRef{paneID: "%1", windowID: "@1", pid: 4242}
+			pane := paneRef{serverID: "100/1000", paneID: "%1", windowID: "@1", pid: 4242}
 			identity := processIdentity{pid: 4242, sessionID: 4242, started: "anchored"}
 
 			r.reapAfterSurvivorCheck(context.Background(), []sessionAnchor{{
@@ -579,7 +596,7 @@ func TestReapAfterSurvivorCheckReapsForEveryMissingServerSpelling(t *testing.T) 
 
 func TestDestroyFailsClosedOnAmbiguousSurvivorVerificationError(t *testing.T) {
 	r, _ := newTestRuntime(0)
-	panes := []byte("%1 @1 4242 0\n")
+	panes := []byte("100 1000 %1 @1 4242 0\n")
 	call := 0
 	r.runner = runnerFunc(func(_ context.Context, _ []string, _ string, args ...string) ([]byte, error) {
 		call++
@@ -607,7 +624,7 @@ func TestDestroyDoesNotReapWhenKillSessionFails(t *testing.T) {
 		exitErrOn: "kill-session",
 		errOutput: []byte("permission denied"),
 		outputs: map[string][]byte{
-			"list-panes": []byte("%1 @1 4242 0\n"),
+			"list-panes": []byte("100 1000 %1 @1 4242 0\n"),
 		},
 	}
 	r.runner = fr
@@ -667,6 +684,40 @@ func TestDestroyReservesCallerDeadlineForKillSession(t *testing.T) {
 
 	if err := r.Destroy(ctx, ports.RuntimeHandle{ID: "sess-1"}); err != nil {
 		t.Fatalf("Destroy: %v", err)
+	}
+}
+
+func TestDestroyCallerCancellationDuringDiscoveryDoesNotSkipKillSession(t *testing.T) {
+	r, _ := newTestRuntime(0)
+	r.timeout = 10 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	killed := false
+	r.runner = runnerFunc(func(commandCtx context.Context, _ []string, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "list-panes":
+			cancel()
+			<-commandCtx.Done()
+			if !errors.Is(commandCtx.Err(), context.DeadlineExceeded) {
+				t.Fatalf("discovery context error = %v, want independent bound", commandCtx.Err())
+			}
+			return nil, commandCtx.Err()
+		case "kill-session":
+			if err := commandCtx.Err(); err != nil {
+				t.Fatalf("kill-session received mid-discovery cancellation: %v", err)
+			}
+			killed = true
+			return nil, nil
+		default:
+			t.Fatalf("unexpected tmux command %q", args[0])
+			return nil, nil
+		}
+	})
+
+	if err := r.Destroy(ctx, ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if !killed {
+		t.Fatal("kill-session was skipped after caller cancellation")
 	}
 }
 
@@ -840,11 +891,11 @@ func TestProcessSessionReaperAnchorsOwnedSessionBeforeTeardown(t *testing.T) {
 	reaper := newTestProcessReaper(table, &recordingSignaler{})
 
 	anchors := reaper.Anchor(context.Background(), []paneRef{
-		{paneID: "%bad0", windowID: "@0", pid: 0},
-		{paneID: "%bad1", windowID: "@1", pid: 1},
-		{paneID: "%1", windowID: "@2", pid: 4242},
-		{paneID: "%1", windowID: "@2", pid: 4242},
-		{paneID: "%2", windowID: "@3", pid: 6000},
+		{serverID: "100/1000", paneID: "%bad0", windowID: "@0", pid: 0},
+		{serverID: "100/1000", paneID: "%bad1", windowID: "@1", pid: 1},
+		{serverID: "100/1000", paneID: "%1", windowID: "@2", pid: 4242},
+		{serverID: "100/1000", paneID: "%1", windowID: "@2", pid: 4242},
+		{serverID: "100/1000", paneID: "%2", windowID: "@3", pid: 6000},
 	})
 	if got, want := anchorSessionIDs(anchors), []int{4242}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("anchor session ids = %#v, want %#v", got, want)
@@ -1091,6 +1142,42 @@ func TestProcessSessionReaperStopsWhenSessionContinuityIsLost(t *testing.T) {
 	if len(signaler.calls) != 0 {
 		t.Fatalf("signals = %#v, want none without an anchored continuity witness", signaler.calls)
 	}
+}
+
+func TestProcessSessionReaperFallsBackToAnotherExactLiveWitness(t *testing.T) {
+	leader := identity(4242, 4242, "leader")
+	child := identity(5000, 4242, "child")
+	late := identity(5001, 4242, "late")
+	all := []processIdentity{leader, child, late}
+	table := &fakeProcessTable{
+		current: map[int]processIdentity{4242: leader, 5000: child, 5001: late},
+		snapshots: []processSnapshotStep{
+			{processes: all},
+			{processes: all},
+			{processes: all},
+			{processes: all},
+			{processes: all},
+		},
+	}
+	signaler := &recordingSignaler{}
+	signaler.beforeSignal = func(target processIdentity, signal os.Signal) {
+		if target == leader && signal == syscall.SIGTERM {
+			delete(table.current, leader.pid)
+		}
+	}
+	reaper := newTestProcessReaper(table, signaler)
+	reaper.Reap(context.Background(), []sessionAnchor{anchor(table, 4242, leader, child)}, 0)
+
+	want := []signalCall{
+		{pid: child.pid, signal: syscall.SIGTERM},
+		{pid: late.pid, signal: syscall.SIGTERM},
+		{pid: child.pid, signal: syscall.SIGKILL},
+		{pid: late.pid, signal: syscall.SIGKILL},
+	}
+	if !reflect.DeepEqual(signaler.calls, want) {
+		t.Fatalf("signals = %#v, want fallback witness to retain session %#v", signaler.calls, want)
+	}
+	assertAllHandlesClosed(t, table)
 }
 
 func TestProcessSessionReaperFinishesBoundedCleanupAfterCallerCancellation(t *testing.T) {
