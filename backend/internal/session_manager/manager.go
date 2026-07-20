@@ -2614,7 +2614,7 @@ func (m *Manager) workspaceProjectRows(ctx context.Context, rec domain.SessionRe
 	if err != nil {
 		return nil, false, err
 	}
-	if len(rows) <= 1 {
+	if len(rows) == 0 || len(rows) == 1 && !sessionWorktreeRowsHavePersistedMetadata(rows) {
 		return nil, false, nil
 	}
 	project, err := m.loadProject(ctx, rec.ProjectID)
