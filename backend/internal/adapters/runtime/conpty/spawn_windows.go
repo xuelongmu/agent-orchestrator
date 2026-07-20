@@ -7,7 +7,9 @@ package conpty
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -22,7 +24,7 @@ import (
 // readyRE matches the "READY:<pid> <port>" line printed by RunHost.
 var readyRE = regexp.MustCompile(`READY:(\d+) (\d+)`)
 
-const spawnReadyTimeout = 10 * time.Second
+var spawnReadyTimeout = 10 * time.Second
 
 // maxCapturedStderr bounds how much pty-host stderr we retain for diagnostics.
 const maxCapturedStderr = 8192
@@ -62,6 +64,9 @@ func (b *boundedBuffer) String() string {
 // with a 10s timeout, then unrefs (detaches) the child. Returns the loopback
 // address and the pty-host OS PID.
 func defaultSpawnHost(ctx context.Context, sessionID, cwd string, argv []string, env map[string]string) (string, int, error) {
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return "", 0, fmt.Errorf("conpty spawn: resolve executable: %w", err)
@@ -82,7 +87,10 @@ func defaultSpawnHost(ctx context.Context, sessionID, cwd string, argv []string,
 	// controls win over ambient, project, and stripped argv assignments.
 	merged := buildHostEnvironment(os.Environ(), env, envAssignments)
 
-	cmd := exec.CommandContext(ctx, exe, args...)
+	// Cancellation is owned by the select/cleanup path below. CommandContext
+	// would add an exec.Cmd watcher that normally exits from Wait, but successful
+	// detached hosts are deliberately released and never waited by this parent.
+	cmd := exec.Command(exe, args...)
 	cmd.Dir = cwd
 	cmd.Env = merged
 
@@ -101,13 +109,45 @@ func defaultSpawnHost(ctx context.Context, sessionID, cwd string, argv []string,
 	}
 	// Capture a bounded copy of the pty-host's stderr. It writes its startup
 	// diagnostics there (listen/newConPTY failures) before exiting without
-	// printing READY; retaining them lets us report the real cause below.
+	// printing READY; retaining them lets us report the real cause below. Use an
+	// explicit pipe rather than assigning boundedBuffer directly to cmd.Stderr:
+	// exec.Cmd otherwise owns a hidden copy goroutine and pipe until Wait, but a
+	// successful detached host is released rather than waited and may run for
+	// days.
 	stderr := &boundedBuffer{max: maxCapturedStderr}
-	cmd.Stderr = stderr
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		_ = stdout.Close()
+		return "", 0, fmt.Errorf("conpty spawn: stderr pipe: %w", err)
+	}
+	cmd.Stderr = stderrWriter
 
 	if err := cmd.Start(); err != nil {
+		_ = stderrWriter.Close()
+		cleanupFailedHostLaunch(cmd, stdout)
+		_ = stderrReader.Close()
 		return "", 0, fmt.Errorf("conpty spawn: start: %w", err)
 	}
+	// The child has its duplicated write handle now; the parent owns only the
+	// read side and closes it as soon as startup succeeds or fails.
+	_ = stderrWriter.Close()
+	stderrDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(stderr, stderrReader)
+		close(stderrDone)
+	}()
+	// Until READY is accepted and the process reference is deliberately
+	// released, this launcher owns the child handle and both startup pipe read
+	// ends. Keep one cleanup path for every timeout, cancellation, scanner, and
+	// future setup error so detached launch failures cannot leak those resources.
+	launchOwned := true
+	defer func() {
+		if launchOwned {
+			cleanupFailedHostLaunch(cmd, stdout)
+			_ = stderrReader.Close()
+			<-stderrDone
+		}
+	}()
 
 	// Read READY line with a timeout.
 	readyC := make(chan struct {
@@ -132,6 +172,7 @@ func defaultSpawnHost(ctx context.Context, sessionID, cwd string, argv []string,
 				return
 			}
 		}
+		<-stderrDone
 		msg := "conpty spawn: pty-host exited without printing READY"
 		if diag := strings.TrimSpace(stderr.String()); diag != "" {
 			msg += ": " + diag
@@ -149,19 +190,44 @@ func defaultSpawnHost(ctx context.Context, sessionID, cwd string, argv []string,
 	select {
 	case r := <-readyC:
 		if r.err != nil {
-			_ = cmd.Process.Kill()
 			return "", 0, r.err
+		}
+		if r.pid != cmd.Process.Pid {
+			return "", 0, fmt.Errorf("conpty spawn: READY host pid %d does not match launched process %d", r.pid, cmd.Process.Pid)
 		}
 		// Unref: detach stdout so the child is not blocked, then release reference
 		// so our process can exit while the child keeps running.
-		stdout.Close()
-		cmd.Process.Release() // nolint: errcheck - best-effort detach
-		return r.addr, cmd.Process.Pid, nil
+		if err := stdout.Close(); err != nil {
+			return "", 0, fmt.Errorf("conpty spawn: close startup pipe: %w", err)
+		}
+		_ = stderrReader.Close()
+		<-stderrDone
+		pid := cmd.Process.Pid
+		// Release consumes the os.Process reference even if the underlying
+		// CloseHandle reports an error. The host is already durably published and
+		// controllable at this point, so do not turn that into an unowned launch.
+		_ = cmd.Process.Release()
+		launchOwned = false
+		return r.addr, pid, nil
 	case <-timer.C:
-		_ = cmd.Process.Kill()
 		return "", 0, fmt.Errorf("conpty spawn: pty-host startup timeout (%s)", spawnReadyTimeout)
 	case <-ctx.Done():
-		_ = cmd.Process.Kill()
 		return "", 0, ctx.Err()
 	}
+}
+
+func cleanupFailedHostLaunch(cmd *exec.Cmd, stdout io.Closer) {
+	_ = stdout.Close()
+	if cmd.Process == nil {
+		return
+	}
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		// Waiting after an unsuccessful kill could block forever. Release still
+		// closes our process handle; the startup pipe is already closed above.
+		_ = cmd.Process.Release()
+		return
+	}
+	// Wait releases exec.Cmd's process handle and any remaining parent-owned
+	// pipes. It is required even after Kill or an already-observed child exit.
+	_ = cmd.Wait()
 }

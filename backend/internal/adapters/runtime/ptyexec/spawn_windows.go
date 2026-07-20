@@ -29,13 +29,21 @@ func Spawn(ctx context.Context, argv, env []string, rows, cols uint16) (ports.St
 	if len(argv) == 0 {
 		return nil, errors.New("ptyexec: empty attach command")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	pty, err := winpty.New()
 	if err != nil {
 		return nil, err
 	}
+	owned := true
+	defer func() {
+		if owned {
+			_ = pty.Close()
+		}
+	}()
 	if rows > 0 && cols > 0 {
 		if err := pty.Resize(int(cols), int(rows)); err != nil {
-			_ = pty.Close()
 			return nil, err
 		}
 	}
@@ -44,7 +52,10 @@ func Spawn(ctx context.Context, argv, env []string, rows, cols uint16) (ports.St
 		cmd.Env = env
 	}
 	if err := cmd.Start(); err != nil {
-		_ = pty.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
 		return nil, err
 	}
 
@@ -53,6 +64,7 @@ func Spawn(ctx context.Context, argv, env []string, rows, cols uint16) (ports.St
 		_ = cmd.Wait()
 		close(p.waitDone)
 	}()
+	owned = false
 	return p, nil
 }
 

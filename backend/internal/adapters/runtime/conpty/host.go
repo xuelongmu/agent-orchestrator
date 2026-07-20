@@ -118,6 +118,11 @@ func (h *host) applyLargestLocked() {
 
 // run is the main event loop.
 func (h *host) run(ctx context.Context) error {
+	// The accept loop can also end because of an unexpected listener failure,
+	// not only the normal kill/cancel path. In every case Serve owns and closes
+	// the PTY, client connections, and listener before returning.
+	defer h.shutdown()
+
 	// Pump PTY output to ring + broadcast.
 	go h.pumpPTY()
 
