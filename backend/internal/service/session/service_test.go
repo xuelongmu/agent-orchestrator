@@ -57,6 +57,7 @@ type fakeStore struct {
 	pendingContractTask     map[string]string
 	pendingContractToken    map[string]string
 	pendingContractRevision map[string]int64
+	completeDeliveryResult  *bool
 	afterListOwnedPRs       func(domain.SessionID)
 	contractWriteErr        error
 	num                     int
@@ -382,6 +383,9 @@ func (f *fakeStore) GetPendingPRDesignContractDelivery(_ context.Context, sessio
 
 func (f *fakeStore) CompletePRDesignContractDelivery(_ context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error) {
 	if f.pendingContractDelivery[prURL] != sessionID || f.pendingContractToken[prURL] != deliveryToken || f.pendingContractRevision[prURL] != contractRevision {
+		return false, nil
+	}
+	if f.completeDeliveryResult != nil && !*f.completeDeliveryResult {
 		return false, nil
 	}
 	delete(f.pendingContractDelivery, prURL)
@@ -2031,6 +2035,70 @@ func TestClaimPRSendFailureKeepsDurableContractBarrierPending(t *testing.T) {
 	}
 	if res.ContractReady || st.pendingContractDelivery[prURL] != "mer-1" {
 		t.Fatalf("failed delivery cleared barrier: ready=%v pending=%q", res.ContractReady, st.pendingContractDelivery[prURL])
+	}
+}
+
+func TestClaimPRRejectsDifferentPRWhileDurableDeliveryRemainsPending(t *testing.T) {
+	incompleteAcknowledgement := false
+	for _, tc := range []struct {
+		name               string
+		sendErr            error
+		completeDeliveryOK *bool
+	}{
+		{name: "send failed", sendErr: errors.New("pane unavailable")},
+		{name: "delivery acknowledgement incomplete", completeDeliveryOK: &incompleteAcknowledgement},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			firstURL := "https://github.com/acme/repo/pull/7"
+			secondURL := "https://github.com/acme/repo/pull/8"
+			st := newFakeStore()
+			st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: t.TempDir(), Branch: "ao/mer-1/root"}}
+			st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+			st.ownedPRs["mer-1"] = []domain.PullRequest{{URL: firstURL, SessionID: "mer-1", Number: 7}}
+			st.pendingContractDelivery[firstURL] = "mer-1"
+			st.pendingContractToken[firstURL] = "claim-generation-1"
+			st.contracts[firstURL] = designcontract.BuildSeed("7", "contract for PR 7")
+			st.completeDeliveryResult = tc.completeDeliveryOK
+			checkoutCalled := false
+			outcome := ports.ClaimOutcome{
+				DesignContract:          st.contracts[firstURL],
+				ContractDeliveryPending: true,
+				ContractDeliveryToken:   st.pendingContractToken[firstURL],
+			}
+			svc := NewWithDeps(Deps{
+				Manager:   &fakeCommander{sendErr: tc.sendErr},
+				Store:     st,
+				PRClaimer: fakePRClaimer{out: errorFreeClaimOutcome{outcome}},
+				SCM: fakeSCM{
+					obsByNumber: map[int]ports.SCMObservation{
+						7: {Fetched: true, PR: ports.SCMPRObservation{URL: firstURL, Number: 7}},
+						8: {Fetched: true, PR: ports.SCMPRObservation{URL: secondURL, Number: 8}},
+					},
+					checkoutCalled: &checkoutCalled,
+				},
+			})
+
+			first, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+			if err != nil {
+				t.Fatalf("first claim returned delivery failure: %v", err)
+			}
+			if first.ContractReady || st.pendingContractDelivery[firstURL] != "mer-1" {
+				t.Fatalf("first claim barrier = ready %v pending %q", first.ContractReady, st.pendingContractDelivery[firstURL])
+			}
+			checkoutCalled = false
+
+			_, err = svc.ClaimPR(context.Background(), "mer-1", "8", ClaimPROptions{AllowTakeover: true})
+			var apiError *apierr.Error
+			if !errors.As(err, &apiError) || apiError.Kind != apierr.KindConflict || apiError.Code != "PR_CLAIM_DELIVERY_PENDING" {
+				t.Fatalf("second claim error = %v, want conflict PR_CLAIM_DELIVERY_PENDING", err)
+			}
+			if checkoutCalled {
+				t.Fatal("second PR entered checkout while first PR delivery barrier remained pending")
+			}
+			if st.pendingContractDelivery[firstURL] != "mer-1" {
+				t.Fatal("second claim cleared the first PR delivery barrier")
+			}
+		})
 	}
 }
 

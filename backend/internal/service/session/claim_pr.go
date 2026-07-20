@@ -153,6 +153,15 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 			unlockSessionClaim()
 		}
 	}()
+	// A failed or incompletely acknowledged claim-ready delivery is durable and
+	// retried by lifecycle. Do not let a different PR replace checkout before
+	// that retry delivers the earlier PR's contract and withheld task. Inspect
+	// the durable barrier outside the shared workspace gate and without taking
+	// the per-PR delivery lock, which lifecycle holds across pane I/O. A stale
+	// pending read only causes a safe, retryable rejection.
+	if err := s.rejectClaimWhileOtherDeliveryPending(ctx, id, prURL); err != nil {
+		return ClaimPRResult{}, err
+	}
 	var (
 		branchChanged bool
 		outcome       ports.ClaimOutcome
@@ -278,6 +287,34 @@ func validatePRClaimSession(rec domain.SessionRecord, exists bool) error {
 	// inventory. Never let checkout guess against that half-created state.
 	if strings.TrimSpace(rec.Metadata.WorkspacePath) == "" || strings.TrimSpace(rec.Metadata.Branch) == "" {
 		return ErrSessionNoWorkspace
+	}
+	return nil
+}
+
+func (s *Service) rejectClaimWhileOtherDeliveryPending(ctx context.Context, id domain.SessionID, targetPRURL string) error {
+	deliveryStore, ok := s.store.(designContractDeliveryStore)
+	if !ok {
+		return nil
+	}
+	prs, err := s.store.ListPRsBySession(ctx, id)
+	if err != nil {
+		return fmt.Errorf("list PRs owned by %s before claim: %w", id, err)
+	}
+	for _, pr := range prs {
+		if strings.EqualFold(pr.URL, targetPRURL) {
+			continue
+		}
+		_, pending, deliveryErr := deliveryStore.GetPendingPRDesignContractDelivery(ctx, id, pr.URL)
+		if deliveryErr != nil {
+			return fmt.Errorf("check pending PR delivery %s: %w", pr.URL, deliveryErr)
+		}
+		if pending {
+			return apierr.Conflict(
+				"PR_CLAIM_DELIVERY_PENDING",
+				"Session must receive its pending PR claim before claiming a different PR",
+				map[string]any{"pendingPrUrl": pr.URL},
+			)
+		}
 	}
 	return nil
 }
