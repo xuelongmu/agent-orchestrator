@@ -4,8 +4,10 @@ import "strings"
 
 func checkRefFormatBranchArgs(branch string) []string {
 	// check-ref-format is repository-independent. Pin Git to the filesystem root
-	// so it never consults the daemon's cwd or any target repository.
-	return []string{"-C", "/", "check-ref-format", "--branch", branch}
+	// so it never consults the daemon's cwd or any target repository. Validate a
+	// fully-qualified ref so syntax rejection uses check-ref-format's status 1;
+	// --branch reports the same rejection through Git's fatal status 128.
+	return []string{"-C", "/", "check-ref-format", "refs/heads/" + branch}
 }
 
 func revParseVerifyArgs(repo, ref string) []string {

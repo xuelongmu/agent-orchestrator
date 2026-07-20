@@ -26,7 +26,7 @@ func TestCommandArgs(t *testing.T) {
 		got  []string
 		want []string
 	}{
-		{"check ref", checkRefFormatBranchArgs(branch), []string{"-C", "/", "check-ref-format", "--branch", branch}},
+		{"check ref", checkRefFormatBranchArgs(branch), []string{"-C", "/", "check-ref-format", "refs/heads/" + branch}},
 		{"rev parse", revParseVerifyArgs(repo, "origin/main"), []string{"-C", repo, "rev-parse", "--verify", "--quiet", "origin/main"}},
 		{"add existing", worktreeAddBranchArgs(repo, path, branch), []string{"-C", repo, "worktree", "add", path, branch}},
 		{"add new", worktreeAddNewBranchArgs(repo, branch, path, "origin/main"), []string{"-C", repo, "worktree", "add", "-b", branch, path, "origin/main"}},
@@ -647,7 +647,7 @@ func TestPlanningRejectsInvalidBranchName(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	ws.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
-		if !reflect.DeepEqual(args, []string{"-C", "/", "check-ref-format", "--branch", "bad..ref"}) {
+		if !reflect.DeepEqual(args, []string{"-C", "/", "check-ref-format", "refs/heads/bad..ref"}) {
 			t.Fatalf("unexpected git invocation: %v", args)
 		}
 		return nil, exitCodeError(1)
@@ -687,13 +687,28 @@ func TestValidateWorkspaceBranchUsesRepoIndependentInvocation(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	ws.run = func(_ context.Context, binary string, args ...string) ([]byte, error) {
-		if binary != "git" || !reflect.DeepEqual(args, []string{"-C", "/", "check-ref-format", "--branch", "feat/valid"}) {
+		if binary != "git" || !reflect.DeepEqual(args, []string{"-C", "/", "check-ref-format", "refs/heads/feat/valid"}) {
 			t.Fatalf("command = %q %v, want repo-independent check-ref-format", binary, args)
 		}
 		return nil, nil
 	}
 	if err := ws.ValidateWorkspaceBranch(context.Background(), "feat/valid"); err != nil {
 		t.Fatalf("valid branch: %v", err)
+	}
+}
+
+func TestValidateWorkspaceBranchRejectsLeadingDashWithoutGit(t *testing.T) {
+	ws, err := New(Options{ManagedRoot: t.TempDir(), RepoResolver: StaticRepoResolver{}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ws.run = func(context.Context, string, ...string) ([]byte, error) {
+		t.Fatal("leading-dash branch reached Git")
+		return nil, nil
+	}
+	err = ws.ValidateWorkspaceBranch(context.Background(), "-invalid")
+	if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+		t.Fatalf("err = %v, want ports.ErrWorkspaceBranchInvalid", err)
 	}
 }
 

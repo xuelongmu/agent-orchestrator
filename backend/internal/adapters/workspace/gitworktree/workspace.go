@@ -883,6 +883,15 @@ func (w *Workspace) ValidateWorkspaceBranch(ctx context.Context, branch string) 
 }
 
 func (w *Workspace) validateBranch(ctx context.Context, branch string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("gitworktree: validate branch %q: %w", branch, err)
+	}
+	// The fully-qualified ref form below accepts refs/heads/-name, while
+	// check-ref-format --branch deliberately rejects branch shorthands that
+	// begin with a dash. Preserve that branch-only constraint explicitly.
+	if strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("%w: %q (branch name cannot begin with '-')", ErrBranchInvalid, branch)
+	}
 	if _, err := w.run(ctx, w.binary, checkRefFormatBranchArgs(branch)...); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("gitworktree: validate branch %q: %w", branch, ctxErr)
