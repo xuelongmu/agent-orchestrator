@@ -68,6 +68,10 @@ func sessionCommandServer(t *testing.T) (*httptest.Server, *sessionRequestLog) {
 			}
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/demo-1":
 			_, _ = io.WriteString(w, `{"session":`+sessionJSON("demo-1", "demo", "worker", "working", false)+`}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/demo-waiting":
+			_, _ = io.WriteString(w, `{"session":`+sessionJSON("demo-waiting", "demo", "worker", "idle", false)+`}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/demo-promoted":
+			_, _ = io.WriteString(w, `{"session":`+sessionJSON("demo-promoted", "demo", "worker", "idle", false)+`}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/demo":
 			_, _ = io.WriteString(w, `{"status":"ok","project":{"id":"demo","name":"Demo","path":"/repo/demo","repo":"https://github.com/aoagents/agent-orchestrator","defaultBranch":"main"}}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-1/pr/claim":
@@ -125,6 +129,12 @@ func sessionJSON(id, project, kind, status string, terminated bool) string {
 			"verificationCommands": []string{"go test ./internal/session_manager", "npm --prefix frontend test -- SessionInspector"},
 			"residualRisk":         "CI validates Linux.\nWindows ConPTY was focused locally.",
 		}
+	}
+	if id == "demo-waiting" || id == "demo-promoted" {
+		payload["dependsOn"] = []string{"demo-parent", "demo-api"}
+	}
+	if id == "demo-waiting" {
+		payload["dependencyPending"] = true
 	}
 	b, _ := json.Marshal(payload)
 	return string(b)
@@ -210,6 +220,9 @@ func TestSessionGet_SuccessWithProjectScope(t *testing.T) {
 	if !strings.Contains(out, "diagnostic: runtime_probe_failed") || !strings.Contains(out, "  | probe timed out") || !strings.Contains(out, "  | retrying") {
 		t.Fatalf("session diagnostic missing from get output:\n%s", out)
 	}
+	if strings.Contains(out, "waiting on:") || strings.Contains(out, "depends on:") {
+		t.Fatalf("session without prerequisites rendered a dependency row:\n%s", out)
+	}
 	want := []string{"GET /api/v1/sessions/demo-1"}
 	if got := log.all(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("requests = %#v, want %#v", got, want)
@@ -241,6 +254,81 @@ func TestSessionGet_JSONOutputDecodes(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Session.Handoff, wantHandoff) {
 		t.Fatalf("session get --json lost exact handoff: got=%#v want=%#v\noutput=%s", got.Session.Handoff, wantHandoff, out)
+	}
+}
+
+func TestSessionGet_DependencyStateFixtures(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, _ := sessionCommandServer(t)
+	writeRunFileFor(t, cfg, srv)
+
+	for _, tc := range []struct {
+		name           string
+		id             string
+		pending        bool
+		humanRow       string
+		forbiddenLabel string
+	}{
+		{
+			name:           "waiting",
+			id:             "demo-waiting",
+			pending:        true,
+			humanRow:       "waiting on: demo-parent, demo-api",
+			forbiddenLabel: "depends on:",
+		},
+		{
+			name:           "promoted",
+			id:             "demo-promoted",
+			pending:        false,
+			humanRow:       "depends on: demo-parent, demo-api",
+			forbiddenLabel: "waiting on:",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			humanOut, errOut, err := executeCLI(t, Deps{
+				ProcessAlive: func(int) bool { return true },
+			}, "session", "get", tc.id)
+			if err != nil {
+				t.Fatalf("session get failed: %v\nstderr=%s", err, errOut)
+			}
+			if !strings.Contains(humanOut, tc.humanRow) {
+				t.Fatalf("dependency row %q missing from get output:\n%s", tc.humanRow, humanOut)
+			}
+			if strings.Contains(humanOut, tc.forbiddenLabel) {
+				t.Fatalf("dependency label %q unexpectedly present in get output:\n%s", tc.forbiddenLabel, humanOut)
+			}
+
+			out, errOut, err := executeCLI(t, Deps{
+				ProcessAlive: func(int) bool { return true },
+			}, "session", "get", tc.id, "--json")
+			if err != nil {
+				t.Fatalf("session get --json failed: %v\nstderr=%s", err, errOut)
+			}
+			var got sessionResponse
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("session get --json output is not decodable: %v\noutput=%s", err, out)
+			}
+			if want := []string{"demo-parent", "demo-api"}; !reflect.DeepEqual(got.Session.DependsOn, want) {
+				t.Fatalf("dependsOn = %#v, want %#v\noutput=%s", got.Session.DependsOn, want, out)
+			}
+			if got.Session.DependencyPending != tc.pending {
+				t.Fatalf("dependencyPending = %t, want %t\noutput=%s", got.Session.DependencyPending, tc.pending, out)
+			}
+			var raw struct {
+				Session struct {
+					DependencyPending *bool `json:"dependencyPending"`
+				} `json:"session"`
+			}
+			if err := json.Unmarshal([]byte(out), &raw); err != nil {
+				t.Fatalf("session get --json output is not decodable for key-presence check: %v\noutput=%s", err, out)
+			}
+			if raw.Session.DependencyPending == nil {
+				t.Fatalf("dependencyPending key missing from JSON output:\n%s", out)
+			}
+			if *raw.Session.DependencyPending != tc.pending {
+				t.Fatalf("dependencyPending JSON value = %t, want %t\noutput=%s", *raw.Session.DependencyPending, tc.pending, out)
+			}
+		})
 	}
 }
 
