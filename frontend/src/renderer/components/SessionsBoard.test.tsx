@@ -53,6 +53,66 @@ describe("SessionsBoard", () => {
 		expect(screen.queryByText(/reload agents/i)).not.toBeInTheDocument();
 	});
 
+	it("distinguishes identical titles by session ID on live and terminated cards", async () => {
+		workspaceQueryMock.mockReturnValue({
+			data: [
+				workspaceWithSessions([
+					boardSession({ id: "fireddd.github.io-4", title: "Verify the nav fix", status: "no_signal" }),
+					terminatedSession({ id: "fireddd.github.io-3", title: "Verify the nav fix" }),
+				]),
+			],
+			isError: false,
+			isSuccess: true,
+		});
+
+		renderBoard("p1");
+
+		const liveCard = screen.getByRole("button", {
+			name: "Open session Verify the nav fix (fireddd.github.io-4)",
+		});
+		expect(within(liveCard).getByLabelText("Session ID: fireddd.github.io-4")).toBeVisible();
+		await userEvent.click(within(liveCard).getByLabelText("Session ID: fireddd.github.io-4"));
+		expect(navigateMock).toHaveBeenLastCalledWith({
+			to: "/projects/$projectId/sessions/$sessionId",
+			params: { projectId: "p1", sessionId: "fireddd.github.io-4" },
+		});
+
+		await userEvent.click(screen.getByRole("button", { name: /done \/ terminated/i }));
+		const terminatedCard = screen.getByRole("button", {
+			name: "Open session Verify the nav fix (fireddd.github.io-3)",
+		});
+		expect(screen.getAllByText("Verify the nav fix")).toHaveLength(2);
+		expect(within(terminatedCard).getByLabelText("Session ID: fireddd.github.io-3")).toBeVisible();
+		fireEvent.keyDown(terminatedCard, { key: "Enter" });
+		expect(navigateMock).toHaveBeenLastCalledWith({
+			to: "/projects/$projectId/sessions/$sessionId",
+			params: { projectId: "p1", sessionId: "fireddd.github.io-3" },
+		});
+	});
+
+	it("shows explicit ID metadata for titled and ID-fallback sessions without duplicating the fallback", () => {
+		workspaceQueryMock.mockReturnValue({
+			data: [
+				workspaceWithSessions([
+					boardSession({ id: "sess-named", title: "Named task" }),
+					boardSession({ id: "sess-fallback", title: "sess-fallback", status: "no_signal" }),
+				]),
+			],
+			isError: false,
+			isSuccess: true,
+		});
+
+		renderBoard("p1");
+
+		const namedCard = screen.getByRole("button", { name: "Open session Named task (sess-named)" });
+		expect(within(namedCard).getByText("Named task")).toBeVisible();
+		expect(within(namedCard).getByLabelText("Session ID: sess-named")).toBeVisible();
+
+		const fallbackCard = screen.getByRole("button", { name: "Open session sess-fallback" });
+		expect(within(fallbackCard).getByLabelText("Session ID: sess-fallback")).toBeVisible();
+		expect(within(fallbackCard).getAllByText("sess-fallback")).toHaveLength(1);
+	});
+
 	it("labels an idle session as Idle, not Working", () => {
 		workspaceQueryMock.mockReturnValue({
 			data: [
@@ -384,7 +444,7 @@ describe("SessionsBoard", () => {
 		expect(screen.getByText("ao/dead-worker")).toBeInTheDocument();
 		expect(screen.getByText("github:INT-17")).toBeInTheDocument();
 		expect(screen.getByLabelText("#42 merged")).toHaveTextContent("PR#42merged");
-		expect(screen.getByRole("button", { name: "Restore dead worker" })).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Restore dead worker (s-dead)" })).toBeInTheDocument();
 	});
 
 	it("restores a terminated session, refreshes workspace data, and opens the restored terminal", async () => {
@@ -397,7 +457,7 @@ describe("SessionsBoard", () => {
 		const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue(undefined);
 
 		await userEvent.click(screen.getByRole("button", { name: /done \/ terminated/i }));
-		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker" }));
+		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker (s-dead)" }));
 
 		await waitFor(() =>
 			expect(postMock).toHaveBeenCalledWith("/api/v1/sessions/{sessionId}/restore", {
@@ -427,10 +487,10 @@ describe("SessionsBoard", () => {
 		renderBoard("p1");
 
 		await userEvent.click(screen.getByRole("button", { name: /done \/ terminated/i }));
-		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker" }));
+		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker (s-dead)" }));
 
-		const restoringButton = screen.getByRole("button", { name: "Restore dead worker" });
-		const otherButton = screen.getByRole("button", { name: "Restore other worker" });
+		const restoringButton = screen.getByRole("button", { name: "Restore dead worker (s-dead)" });
+		const otherButton = screen.getByRole("button", { name: "Restore other worker (s-other)" });
 		expect(restoringButton).toHaveClass("opacity-100");
 		expect(otherButton).toBeDisabled();
 		expect(otherButton).toHaveClass("opacity-0");
@@ -451,7 +511,7 @@ describe("SessionsBoard", () => {
 		renderBoard("p1");
 
 		await userEvent.click(screen.getByRole("button", { name: /done \/ terminated/i }));
-		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker" }));
+		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker (s-dead)" }));
 
 		expect(await screen.findByText("Session can no longer be restored")).toBeInTheDocument();
 	});
@@ -467,7 +527,7 @@ describe("SessionsBoard", () => {
 		renderBoard("p1");
 
 		await userEvent.click(screen.getByRole("button", { name: /done \/ terminated/i }));
-		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker" }));
+		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker (s-dead)" }));
 
 		expect(await screen.findByText("Unable to restore session")).toBeInTheDocument();
 		expect(navigateMock).not.toHaveBeenCalled();
@@ -516,7 +576,7 @@ describe("SessionsBoard", () => {
 		const view = renderBoardWithClient(queryClient, "p1");
 
 		await userEvent.click(screen.getByRole("button", { name: /done \/ terminated/i }));
-		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker" }));
+		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker (s-dead)" }));
 
 		view.rerender(
 			<QueryClientProvider client={queryClient}>
@@ -555,7 +615,7 @@ describe("SessionsBoard", () => {
 		const view = renderBoardWithClient(queryClient, "p1");
 
 		await userEvent.click(screen.getByRole("button", { name: /done \/ terminated/i }));
-		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker" }));
+		await userEvent.click(screen.getByRole("button", { name: "Restore dead worker (s-dead)" }));
 
 		view.rerender(
 			<QueryClientProvider client={queryClient}>
@@ -581,7 +641,7 @@ describe("SessionsBoard", () => {
 
 		await userEvent.click(screen.getByRole("button", { name: /done \/ terminated/i }));
 
-		expect(screen.queryByRole("button", { name: "Restore merged worker" })).not.toBeInTheDocument();
+		expect(screen.queryByRole("button", { name: "Restore merged worker (s-merged)" })).not.toBeInTheDocument();
 
 		await userEvent.click(screen.getByText("merged worker"));
 
@@ -599,6 +659,23 @@ function workspaceWithSessions(sessions: WorkspaceSession[]): WorkspaceSummary {
 		name: "radic",
 		path: "/tmp/radic",
 		sessions,
+	};
+}
+
+function boardSession(overrides: Partial<WorkspaceSession> = {}): WorkspaceSession {
+	return {
+		id: "s-live",
+		workspaceId: "p1",
+		workspaceName: "radic",
+		title: "live worker",
+		provider: "claude-code",
+		kind: "worker",
+		branch: "ao/live-worker",
+		status: "working",
+		activity: { state: "active", lastActivityAt: "2026-01-01T00:00:00Z" },
+		updatedAt: "2026-01-01T00:00:00Z",
+		prs: [],
+		...overrides,
 	};
 }
 

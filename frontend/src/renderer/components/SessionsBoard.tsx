@@ -468,6 +468,8 @@ function SessionCard({
 	const issueId = canonicalTrackerIssueId(session.issueId);
 	const branch = session.branch || "";
 	const showBranch = branch !== "" && !sameLabel(branch, session.title) && !sameLabel(branch, session.id);
+	const hasDistinctTitle = session.title !== session.id;
+	const identityLabel = sessionIdentityLabel(session);
 	const prSummaries = sessionPRDisplaySummaries(session, useSessionScmSummary(session.id).data);
 	const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
 		if (!interactive || !onOpen) return;
@@ -478,6 +480,7 @@ function SessionCard({
 	};
 	const cardBodyProps = interactive
 		? {
+				"aria-label": `Open session ${identityLabel}`,
 				onClick: onOpen,
 				onKeyDown: handleKeyDown,
 				role: "button",
@@ -509,16 +512,26 @@ function SessionCard({
 						{agentLabel(session.provider)}
 					</span>
 				</div>
-				<div
-					className={cn(
-						"px-3.25 text-control font-medium leading-snug tracking-tight text-foreground",
-						showBranch ? "pb-2" : "pb-3",
-						"line-clamp-2 overflow-hidden",
-					)}
-				>
-					{session.title}
+				{hasDistinctTitle && (
+					<div className="line-clamp-2 overflow-hidden px-3.25 text-control font-medium leading-snug tracking-tight text-foreground">
+						{session.title}
+					</div>
+				)}
+				<div className={cn("flex min-w-0 items-center gap-2 px-3.25 pb-2.5", hasDistinctTitle && "pt-1.5")}>
+					<span
+						aria-label={`Session ID: ${session.id}`}
+						className="inline-flex min-w-0 items-baseline gap-1 font-mono text-2xs text-passive"
+						title={`Session ID: ${session.id}`}
+					>
+						<span aria-hidden="true" className="shrink-0 text-micro font-medium uppercase tracking-wide-xs">
+							ID
+						</span>
+						<span aria-hidden="true" className="truncate">
+							{session.id}
+						</span>
+					</span>
+					{showBranch && <span className="ml-auto truncate font-mono text-2xs text-passive">{branch}</span>}
 				</div>
-				{showBranch && <div className="px-3.25 pb-2.5 font-mono text-2xs text-passive">{branch}</div>}
 			</div>
 			{restoreError && (
 				<div className="border-t border-border px-3.25 py-1.5 text-2xs text-destructive">{restoreError}</div>
@@ -539,8 +552,8 @@ function SessionCard({
 			</div>
 			{restoreAction && (
 				<button
-					aria-label={`Restore ${session.title}`}
-					title={`Restore ${session.title}`}
+					aria-label={`Restore ${identityLabel}`}
+					title={`Restore ${identityLabel}`}
 					className={cn(
 						"absolute bottom-1.5 right-2 z-10 inline-flex h-control-xs items-center justify-center rounded-sm border border-accent bg-accent px-2.5 text-2xs font-semibold text-accent-foreground opacity-0 shadow-sm transition-opacity duration-normal ease-out disabled:cursor-not-allowed",
 						!isRestoreDisabled &&
@@ -618,6 +631,10 @@ function sameLabel(a: string, b: string): boolean {
 			.replace(/^(feat|fix|chore|refactor|session)\//, "")
 			.replace(/[^a-z0-9]+/g, "");
 	return normalize(a) === normalize(b);
+}
+
+function sessionIdentityLabel(session: WorkspaceSession): string {
+	return session.title === session.id ? session.id : `${session.title} (${session.id})`;
 }
 
 function agentLabel(provider: WorkspaceSession["provider"]): string {
