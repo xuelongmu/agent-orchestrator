@@ -6,6 +6,7 @@ package review
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -19,6 +20,11 @@ import (
 	reviewcore "github.com/aoagents/agent-orchestrator/backend/internal/review"
 )
 
+// errRunSuperseded marks a run that became terminal before its result arrived.
+// SubmitMany skips this expected per-run race while continuing to surface all
+// other submission failures.
+var errRunSuperseded = errors.New("review: run is no longer running")
+
 // ErrInvalid and ErrNotFound re-export the engine sentinels so the HTTP
 // controller maps service failures to 422/404 without importing the core.
 var (
@@ -31,7 +37,7 @@ var (
 type Manager interface {
 	Trigger(ctx context.Context, workerID domain.SessionID) (reviewcore.TriggerResult, error)
 	Cancel(ctx context.Context, workerID domain.SessionID) (reviewcore.CancelResult, error)
-	Submit(ctx context.Context, workerID domain.SessionID, runID string, verdict domain.ReviewVerdict, body, githubReviewID string) (domain.ReviewRun, error)
+	SubmitOne(ctx context.Context, workerID domain.SessionID, review SubmittedReview) (domain.ReviewRun, error)
 	SubmitMany(ctx context.Context, workerID domain.SessionID, reviews []SubmittedReview) ([]domain.ReviewRun, error)
 	List(ctx context.Context, workerID domain.SessionID) (reviewcore.SessionReviews, error)
 }
@@ -196,12 +202,18 @@ type SubmittedFinding struct {
 
 // Submit records a reviewer's result for a specific worker review pass.
 func (s *Service) Submit(ctx context.Context, workerID domain.SessionID, runID string, verdict domain.ReviewVerdict, body, githubReviewID string) (domain.ReviewRun, error) {
-	runs, err := s.SubmitMany(ctx, workerID, []SubmittedReview{{
+	return s.SubmitOne(ctx, workerID, SubmittedReview{
 		RunID:          runID,
 		Verdict:        verdict,
 		Body:           body,
 		GithubReviewID: githubReviewID,
-	}})
+	})
+}
+
+// SubmitOne records one structured result while preserving the singular API's
+// error contract when the run was already superseded.
+func (s *Service) SubmitOne(ctx context.Context, workerID domain.SessionID, review SubmittedReview) (domain.ReviewRun, error) {
+	runs, err := s.SubmitMany(ctx, workerID, []SubmittedReview{review})
 	if err != nil {
 		return domain.ReviewRun{}, err
 	}
@@ -228,6 +240,9 @@ func (s *Service) SubmitMany(ctx context.Context, workerID domain.SessionID, rev
 	for _, review := range reviews {
 		run, err := s.submitOne(ctx, workerID, review)
 		if err != nil {
+			if errors.Is(err, errRunSuperseded) {
+				continue
+			}
 			return nil, err
 		}
 		runs = append(runs, run)
@@ -304,7 +319,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 			return domain.ReviewRun{}, err
 		}
 		if !updated {
-			return domain.ReviewRun{}, fmt.Errorf("%w: review run %q is not running", ErrInvalid, runID)
+			return domain.ReviewRun{}, fmt.Errorf("%w: review run %q is not running", errRunSuperseded, runID)
 		}
 		run.Status = domain.ReviewRunComplete
 		run.Verdict = verdict
@@ -324,7 +339,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 	case domain.ReviewRunDelivered:
 		return run, nil
 	default:
-		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q is not running", ErrInvalid, runID)
+		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q is not running", errRunSuperseded, runID)
 	}
 	if err := s.deflectOutOfScope(ctx, run); err != nil {
 		return domain.ReviewRun{}, err

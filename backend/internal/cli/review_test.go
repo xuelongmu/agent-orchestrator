@@ -104,6 +104,23 @@ func TestReviewSubmitAcceptsUnderscoreFlags(t *testing.T) {
 	}
 }
 
+func TestReviewSubmitSingularSupersededReturnsError(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, _ := reviewServer(t, http.StatusUnprocessableEntity, `{"error":"unprocessable","code":"REVIEW_INVALID","message":"review run is not running"}`)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, aliveDeps(), "review", "submit", "mer-1", "--run", "run-1", "--verdict", "approved")
+	if err == nil {
+		t.Fatal("expected stale singular submit to fail")
+	}
+	if ExitCode(err) != 1 {
+		t.Fatalf("exit code = %d, want 1", ExitCode(err))
+	}
+	if strings.Contains(out, "recorded") || (!strings.Contains(err.Error(), "REVIEW_INVALID") && !strings.Contains(errOut, "REVIEW_INVALID")) {
+		t.Fatalf("stale submit reported success or hid daemon error: stdout=%q stderr=%q err=%v", out, errOut, err)
+	}
+}
+
 func TestReviewSubmitBatchReadsReviewsFromStdin(t *testing.T) {
 	cfg := setConfigEnv(t)
 	srv, capture := reviewServer(t, http.StatusOK, `{"reviews":[{"id":"run-1","verdict":"changes_requested"},{"id":"run-2","verdict":"approved"}]}`)
@@ -127,6 +144,22 @@ func TestReviewSubmitBatchReadsReviewsFromStdin(t *testing.T) {
 	}
 	if req.RunID != "" || req.Verdict != "" {
 		t.Fatalf("batch request should not also set legacy fields: %+v", req)
+	}
+}
+
+func TestReviewSubmitBatchPreservesAuthoritativeEmptyCount(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, _ := reviewServer(t, http.StatusOK, `{"reviews":[]}`)
+	writeRunFileFor(t, cfg, srv)
+
+	deps := aliveDeps()
+	deps.In = strings.NewReader(`[{"runId":"run-1","verdict":"approved"},{"runId":"run-2","verdict":"approved"}]`)
+	out, errOut, err := executeCLI(t, deps, "review", "submit", "mer-1", "--reviews", "-")
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+	}
+	if !strings.Contains(out, "recorded 0 review(s) for mer-1") {
+		t.Fatalf("stdout = %q", out)
 	}
 }
 

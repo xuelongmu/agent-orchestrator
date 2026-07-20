@@ -186,7 +186,17 @@ func (c *ReviewsController) submit(w http.ResponseWriter, r *http.Request) {
 			Findings:       submittedFindings(in.Findings),
 		})
 	}
-	runs, err := c.Svc.SubmitMany(r.Context(), sessionID(r), reviews)
+	var runs []domain.ReviewRun
+	var err error
+	if len(in.Reviews) > 0 {
+		runs, err = c.Svc.SubmitMany(r.Context(), sessionID(r), reviews)
+	} else {
+		var run domain.ReviewRun
+		run, err = c.Svc.SubmitOne(r.Context(), sessionID(r), reviews[0])
+		if err == nil {
+			runs = []domain.ReviewRun{run}
+		}
+	}
 	if err != nil {
 		writeReviewError(w, r, err)
 		return

@@ -167,7 +167,9 @@ func (c *commandContext) submitReviewBatch(cmd *cobra.Command, session string, o
 		return err
 	}
 	count := len(res.Reviews)
-	if count == 0 {
+	// Older response shapes may omit reviews entirely; an explicit empty array
+	// is authoritative and means every submitted run was already superseded.
+	if res.Reviews == nil {
 		count = len(reviews)
 	}
 	_, err = fmt.Fprintf(cmd.OutOrStdout(), "recorded %d review(s) for %s\n", count, session)
