@@ -32,7 +32,7 @@ func executeWithDeps(deps Deps, args []string) error {
 	cmd.SetArgs(args)
 	err := cmd.Execute()
 	if err != nil && ExitCode(err) == 2 {
-		(&commandContext{deps: deps}).emitCLIUsageError(context.Background(), args, err)
+		(&commandContext{deps: deps}).emitCLIUsageError(context.Background(), cmd, args, err)
 	}
 	return err
 }
@@ -247,8 +247,8 @@ func (c *commandContext) emitCLIInvoked(ctx context.Context, cmd *cobra.Command)
 	})
 }
 
-func (c *commandContext) emitCLIUsageError(ctx context.Context, args []string, err error) {
-	command, commandPath := usageErrorCommand(args)
+func (c *commandContext) emitCLIUsageError(ctx context.Context, root *cobra.Command, args []string, err error) {
+	command, commandPath := usageErrorCommand(root, args)
 	reqCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	_ = c.postLoopbackJSON(reqCtx, "/internal/telemetry/cli-usage-error", map[string]string{
@@ -258,20 +258,43 @@ func (c *commandContext) emitCLIUsageError(ctx context.Context, args []string, e
 	})
 }
 
-func usageErrorCommand(args []string) (string, string) {
-	tokens := []string{"ao"}
+// usageErrorCommand reconstructs only the registered portion of a failed
+// invocation. Everything after the first unknown positional token is replaced
+// at the source so URLs, paths, and free text cannot enter telemetry payloads.
+func usageErrorCommand(root *cobra.Command, args []string) (string, string) {
+	command := root.Name()
+	commandPath := root.Name()
+	current := root
 	for _, arg := range args {
 		if strings.HasPrefix(arg, "-") {
 			break
 		}
-		tokens = append(tokens, arg)
-	}
-	commandPath := strings.Join(tokens, " ")
-	command := "ao"
-	if len(tokens) > 1 {
-		command = tokens[len(tokens)-1]
+
+		next := directSubcommand(current, arg)
+		if next == nil {
+			commandPath += " <unknown>"
+			if current == root {
+				command = "<unknown>"
+			}
+			break
+		}
+
+		// Use the canonical name even when arg is an alias. This mirrors
+		// CommandPath on successful invocations and never forwards raw input.
+		command = next.Name()
+		commandPath += " " + command
+		current = next
 	}
 	return command, commandPath
+}
+
+func directSubcommand(parent *cobra.Command, token string) *cobra.Command {
+	for _, child := range parent.Commands() {
+		if child.Name() == token || child.HasAlias(token) {
+			return child
+		}
+	}
+	return nil
 }
 
 func noArgs(cmd *cobra.Command, args []string) error {

@@ -114,6 +114,11 @@ var remotePayloadAllowlist = map[string]map[string]struct{}{
 	},
 }
 
+const (
+	maxRemoteStringLength = 256
+	maxCommandTokenLength = 64
+)
+
 type postHogClient interface {
 	Do(req *http.Request) (*http.Response, error)
 }
@@ -262,18 +267,37 @@ func sanitizeRemotePayload(name string, payload map[string]any) map[string]any {
 		if !ok {
 			continue
 		}
-		if safe, ok := sanitizeRemoteValue(value); ok {
+		if safe, ok := sanitizeRemoteValue(key, value); ok {
 			sanitized[key] = safe
 		}
 	}
 	return sanitized
 }
 
-func sanitizeRemoteValue(v any) (any, bool) {
+func sanitizeRemoteValue(key string, v any) (any, bool) {
 	switch value := v.(type) {
 	case string:
 		value = strings.TrimSpace(value)
-		return value, value != ""
+		if value == "" {
+			return nil, false
+		}
+		// Command metadata is expected to have been derived from Cobra's command
+		// tree. Enforce its bounded shape again at the remote sink so a future
+		// emitter cannot forward URLs, paths, flags, or prose verbatim.
+		switch key {
+		case "command":
+			if !isRemoteCommandToken(value) {
+				return "<unknown>", true
+			}
+		case "command_path":
+			if !isRemoteCommandPath(value) {
+				return "ao <unknown>", true
+			}
+		}
+		if len(value) > maxRemoteStringLength {
+			value = value[:maxRemoteStringLength]
+		}
+		return value, true
 	case bool:
 		return value, true
 	case int:
@@ -309,6 +333,48 @@ func sanitizeRemoteValue(v any) (any, bool) {
 	default:
 		return nil, false
 	}
+}
+
+func isRemoteCommandPath(value string) bool {
+	if len(value) > maxRemoteStringLength {
+		return false
+	}
+	tokens := strings.Split(value, " ")
+	if len(tokens) == 0 || tokens[0] != "ao" {
+		return false
+	}
+	for i, token := range tokens {
+		if token == "<unknown>" {
+			if i != len(tokens)-1 {
+				return false
+			}
+			continue
+		}
+		if !isRemoteCommandToken(token) {
+			return false
+		}
+	}
+	return true
+}
+
+func isRemoteCommandToken(value string) bool {
+	if value == "<unknown>" {
+		return true
+	}
+	if value == "" || len(value) > maxCommandTokenLength {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c >= 'a' && c <= 'z' {
+			continue
+		}
+		if i > 0 && ((c >= '0' && c <= '9') || c == '-' || c == '_') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func loadOrCreateInstallID(dataDir string) (string, error) {
