@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -117,7 +118,11 @@ func TestDoctorLegacyShadowSkipsInvocationTelemetry(t *testing.T) {
 
 func TestUsageErrorEmitsCLIUsageTelemetryBestEffort(t *testing.T) {
 	cfg := setConfigEnv(t)
-	called := make(chan string, 1)
+	type telemetryRequest struct {
+		path    string
+		payload map[string]string
+	}
+	called := make(chan telemetryRequest, 1)
 	if err := runfile.Write(cfg.runFile, runfile.Info{PID: os.Getpid(), Port: 3001, StartedAt: time.Unix(100, 0).UTC()}); err != nil {
 		t.Fatal(err)
 	}
@@ -125,21 +130,36 @@ func TestUsageErrorEmitsCLIUsageTelemetryBestEffort(t *testing.T) {
 	deps := Deps{
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.URL.Path == "/internal/telemetry/cli-usage-error" {
-				called <- req.URL.Path
+				defer req.Body.Close()
+				var payload map[string]string
+				if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+					t.Fatalf("decode telemetry request: %v", err)
+				}
+				called <- telemetryRequest{path: req.URL.Path, payload: payload}
 				return jsonResponse(http.StatusAccepted, ""), nil
 			}
 			return jsonResponse(http.StatusNotFound, ""), nil
 		})},
 		ProcessAlive: func(pid int) bool { return pid == os.Getpid() },
 	}
-	err := executeWithDeps(deps, []string{"status", "extra"})
+	const raw = "https://gitlab.com/internal/repo/-/merge_requests/9"
+	err := executeWithDeps(deps, []string{"status", raw})
 	if err == nil {
 		t.Fatal("expected usage error")
 	}
 	select {
-	case path := <-called:
-		if path != "/internal/telemetry/cli-usage-error" {
-			t.Fatalf("telemetry path = %q, want /internal/telemetry/cli-usage-error", path)
+	case request := <-called:
+		if request.path != "/internal/telemetry/cli-usage-error" {
+			t.Fatalf("telemetry path = %q, want /internal/telemetry/cli-usage-error", request.path)
+		}
+		if got := request.payload["command"]; got != "status" {
+			t.Fatalf("telemetry command = %q, want status", got)
+		}
+		if got := request.payload["commandPath"]; got != "ao status <unknown>" {
+			t.Fatalf("telemetry commandPath = %q, want ao status <unknown>", got)
+		}
+		if strings.Contains(request.payload["command"], raw) || strings.Contains(request.payload["commandPath"], raw) {
+			t.Fatalf("raw argument leaked into telemetry payload: %#v", request.payload)
 		}
 	default:
 		t.Fatal("usage error did not emit CLI usage telemetry")
