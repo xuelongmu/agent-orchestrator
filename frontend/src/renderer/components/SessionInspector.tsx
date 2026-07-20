@@ -262,6 +262,22 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 
 	return (
 		<div role="tabpanel">
+			{session.dependencyPending ? (
+				<Section title="Dependencies">
+					<div
+						className="rounded-md border border-warning/35 bg-warning/8 p-3"
+						data-testid="dependency-pending"
+						role="status"
+					>
+						<div className="text-xs font-semibold text-warning">Waiting on dependencies</div>
+						<p className="mt-1 text-caption text-muted-foreground">
+							Blocked until all declared prerequisites complete
+							{session.dependsOn?.length ? `: ${session.dependsOn.join(", ")}` : "."}
+						</p>
+					</div>
+				</Section>
+			) : null}
+
 			<Section title={prSectionTitle}>
 				{prSummaries.length === 0 ? (
 					<p className={inspectorEmptyClass}>

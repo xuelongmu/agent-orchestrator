@@ -85,6 +85,8 @@ type commandRunner func(ctx context.Context, binary string, args ...string) ([]b
 
 var _ ports.Workspace = (*Workspace)(nil)
 var _ ports.WorkspaceProject = (*Workspace)(nil)
+var _ ports.WorkspacePlanner = (*Workspace)(nil)
+var _ ports.WorkspaceProjectPlanner = (*Workspace)(nil)
 
 // New builds a gitworktree Workspace, validating that ManagedRoot and
 // RepoResolver are set and resolving the root to an absolute, symlink-free path.
@@ -144,6 +146,23 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, WorkspaceKind: domain.WorkspaceKindWorktree, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}, nil
 }
 
+// PlanWorkspace returns Create's deterministic managed path without adding a
+// worktree or branch.
+func (w *Workspace) PlanWorkspace(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+	if err := validateConfig(cfg); err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+	repo, err := w.repoPath(cfg.ProjectID)
+	if err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+	path, err := w.managedPath(cfg)
+	if err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, WorkspaceKind: domain.WorkspaceKindWorktree, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}, nil
+}
+
 // CreateWorkspaceProject materialises a root-as-repo workspace session: the
 // parent repo worktree is created at the session root, then each registered
 // child repo is created at its relative path inside that root. All repos share
@@ -195,14 +214,24 @@ func (w *Workspace) CreateWorkspaceProject(ctx context.Context, cfg ports.Worksp
 			baseBranch:   firstNonEmpty(child.BaseBranch, cfg.BaseBranch),
 		})
 	}
-	branch, err := w.workspaceProjectBranch(ctx, repos, firstNonEmpty(cfg.Branch, defaultSessionBranchName(cfg.SessionID)))
+	requestedBranch := firstNonEmpty(cfg.Branch, defaultSessionBranchName(cfg.SessionID))
+	branch := requestedBranch
+	if cfg.RecoverExisting {
+		if reusable, err := w.workspaceProjectBranchReusable(ctx, repos, requestedBranch); err != nil {
+			return ports.WorkspaceProjectInfo{}, err
+		} else if !reusable {
+			return ports.WorkspaceProjectInfo{}, fmt.Errorf("%w: %q is checked out outside this session workspace", ErrBranchCheckedOutElsewhere, requestedBranch)
+		}
+	} else {
+		branch, err = w.workspaceProjectBranch(ctx, repos, requestedBranch)
+	}
 	if err != nil {
 		return ports.WorkspaceProjectInfo{}, err
 	}
 	created := make([]workspaceProjectRepo, 0, len(repos))
 	out := ports.WorkspaceProjectInfo{Worktrees: make([]ports.WorkspaceRepoInfo, 0, len(repos))}
 	for _, repo := range repos {
-		baseSHA, err := w.createWorkspaceProjectRepo(ctx, repo, branch)
+		baseSHA, err := w.createWorkspaceProjectRepo(ctx, repo, branch, cfg.RecoverExisting)
 		if err != nil {
 			for i := len(created) - 1; i >= 0; i-- {
 				_ = w.forceDestroyPath(ctx, created[i].repoPath, created[i].outputPath)
@@ -224,6 +253,43 @@ func (w *Workspace) CreateWorkspaceProject(ctx context.Context, cfg ports.Worksp
 		if repo.name == domain.RootWorkspaceRepoName {
 			out.Root = ports.WorkspaceInfo{Path: repo.outputPath, Branch: branch, WorkspaceKind: domain.WorkspaceKindWorktree, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}
 		}
+	}
+	return out, nil
+}
+
+// PlanWorkspaceProject returns every deterministic repo path used by a
+// recoverable promotion attempt. RecoverExisting requires the exact prepared
+// branch; CreateWorkspaceProject will adopt a partial prior attempt at these
+// paths rather than selecting a suffixed duplicate branch.
+func (w *Workspace) PlanWorkspaceProject(_ context.Context, cfg ports.WorkspaceProjectConfig) (ports.WorkspaceProjectInfo, error) {
+	if err := validateWorkspaceProjectConfig(cfg); err != nil {
+		return ports.WorkspaceProjectInfo{}, err
+	}
+	rootRepo, err := physicalAbs(cfg.RootRepoPath)
+	if err != nil {
+		return ports.WorkspaceProjectInfo{}, fmt.Errorf("gitworktree: root repo path: %w", err)
+	}
+	branch := firstNonEmpty(cfg.Branch, defaultSessionBranchName(cfg.SessionID))
+	rootPath, err := w.managedPath(ports.WorkspaceConfig{ProjectID: cfg.ProjectID, SessionID: cfg.SessionID, Kind: cfg.Kind, SessionPrefix: cfg.SessionPrefix, Branch: branch})
+	if err != nil {
+		return ports.WorkspaceProjectInfo{}, err
+	}
+	out := ports.WorkspaceProjectInfo{Root: ports.WorkspaceInfo{Path: rootPath, Branch: branch, WorkspaceKind: domain.WorkspaceKindWorktree, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: rootRepo}}
+	out.Worktrees = append(out.Worktrees, ports.WorkspaceRepoInfo{RepoName: domain.RootWorkspaceRepoName, RepoPath: rootRepo, Path: rootPath, Branch: branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID})
+	for _, child := range cfg.Repos {
+		repoPath, err := physicalAbs(child.RepoPath)
+		if err != nil {
+			return ports.WorkspaceProjectInfo{}, fmt.Errorf("gitworktree: child repo %q path: %w", child.Name, err)
+		}
+		rel, err := cleanRelativePath(child.RelativePath)
+		if err != nil {
+			return ports.WorkspaceProjectInfo{}, fmt.Errorf("gitworktree: child repo %q: %w", child.Name, err)
+		}
+		outPath, err := w.validateManagedPath(filepath.Join(rootPath, filepath.FromSlash(rel)))
+		if err != nil {
+			return ports.WorkspaceProjectInfo{}, fmt.Errorf("gitworktree: child repo %q path: %w", child.Name, err)
+		}
+		out.Worktrees = append(out.Worktrees, ports.WorkspaceRepoInfo{RepoName: child.Name, RepoPath: repoPath, Path: outPath, Branch: branch, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RelativePath: rel})
 	}
 	return out, nil
 }
@@ -704,7 +770,49 @@ func (w *Workspace) workspaceProjectBranchFree(ctx context.Context, repos []work
 	return true, nil
 }
 
-func (w *Workspace) createWorkspaceProjectRepo(ctx context.Context, repo workspaceProjectRepo, branch string) (string, error) {
+func (w *Workspace) workspaceProjectBranchReusable(ctx context.Context, repos []workspaceProjectRepo, branch string) (bool, error) {
+	for _, repo := range repos {
+		if err := w.validateBranch(ctx, repo.repoPath, branch); err != nil {
+			return false, err
+		}
+		records, err := w.listRecords(ctx, repo.repoPath)
+		if err != nil {
+			return false, err
+		}
+		if conflict, ok := findWorktreeByBranch(records, branch); ok && filepath.Clean(conflict.Path) != filepath.Clean(repo.outputPath) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (w *Workspace) createWorkspaceProjectRepo(ctx context.Context, repo workspaceProjectRepo, branch string, recoverExisting bool) (string, error) {
+	if recoverExisting {
+		records, err := w.listRecords(ctx, repo.repoPath)
+		if err != nil {
+			return "", err
+		}
+		if existing, ok := findWorktree(records, repo.outputPath); ok {
+			if existing.Branch != "" && existing.Branch != branch {
+				return "", fmt.Errorf("gitworktree: workspace repo %q path %q has branch %q, want %q", repo.name, repo.outputPath, existing.Branch, branch)
+			}
+			return w.revParse(ctx, repo.repoPath, branch)
+		}
+		localBranch, err := w.refExists(ctx, repo.repoPath, "refs/heads/"+branch)
+		if err != nil {
+			return "", err
+		}
+		if localBranch {
+			baseSHA, err := w.revParse(ctx, repo.repoPath, branch)
+			if err != nil {
+				return "", err
+			}
+			if _, err := w.run(ctx, w.binary, worktreeAddBranchArgs(repo.repoPath, repo.outputPath, branch)...); err != nil {
+				return "", fmt.Errorf("gitworktree: workspace repo %q add existing branch %q: %w", repo.name, branch, err)
+			}
+			return baseSHA, nil
+		}
+	}
 	baseRef, err := w.resolveBaseRef(ctx, repo.repoPath, branch, repo.baseBranch)
 	if err != nil {
 		if errors.Is(err, errNoBaseRef) {

@@ -51,6 +51,46 @@ func (f *fakeStore) UpdateSession(_ context.Context, rec domain.SessionRecord) e
 func (f *fakeStore) UpdateSessionLifecycle(ctx context.Context, _, after domain.SessionRecord) error {
 	return f.UpdateSession(ctx, after)
 }
+func (f *fakeStore) MarkReservedDependencySpawned(_ context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, updatedAt time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok || rec.IsTerminated || !rec.DependencyPromotedAt.IsZero() || rec.DependencyPromotionToken != token {
+		return false, nil
+	}
+	rec.Metadata = metadata
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: updatedAt}
+	rec.UpdatedAt = updatedAt
+	f.sessions[id] = rec
+	return true, nil
+}
+func (f *fakeStore) PrepareReservedDependencyWorkspace(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, _ []domain.SessionWorktreeRecord, updatedAt time.Time) (bool, error) {
+	return f.MarkReservedDependencySpawned(ctx, id, token, metadata, updatedAt)
+}
+func (f *fakeStore) MarkReservedDependencyLaunchSucceeded(_ context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok || rec.IsTerminated || !rec.DependencyPromotedAt.IsZero() || rec.DependencyPromotionToken != token || rec.Metadata.RuntimeHandleID == "" {
+		return false, nil
+	}
+	rec.DependencyLaunchSucceededAt = updatedAt
+	f.sessions[id] = rec
+	return true, nil
+}
+func (f *fakeStore) ResetReservedDependencyLaunch(_ context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok || !rec.DependencyPromotedAt.IsZero() || rec.DependencyPromotionToken != token {
+		return false, nil
+	}
+	rec.Metadata.WorkspacePath = ""
+	rec.Metadata.RuntimeHandleID = ""
+	rec.Metadata.AgentSessionID = ""
+	rec.Metadata.Prompt = rec.DependencyBasePrompt
+	rec.DependencyLaunchSucceededAt = time.Time{}
+	if !rec.IsTerminated {
+		rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: updatedAt}
+	}
+	rec.UpdatedAt = updatedAt
+	f.sessions[id] = rec
+	return true, nil
+}
 func (f *fakeStore) GetPRLastNudgeSignature(_ context.Context, prURL string) (string, error) {
 	return f.signatures[prURL], nil
 }

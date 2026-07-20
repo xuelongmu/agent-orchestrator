@@ -826,6 +826,7 @@ export interface components {
             branch?: string;
             /** Format: date-time */
             createdAt: string;
+            dependencyPending?: boolean;
             dependsOn?: string[];
             diagnostic?: components["schemas"]["LifecycleDiagnostic"];
             displayName?: string;

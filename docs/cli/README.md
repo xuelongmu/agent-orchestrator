@@ -85,9 +85,13 @@ path and never removes that shared directory. Set the per-project default with
 `ao project set-config <id> --workspace <kind>`; an explicit spawn flag wins.
 
 `ao spawn --depends-on <session-id>` records a prerequisite edge in the same
-project. Repeat the flag or pass a comma-separated list for multiple parents
-(maximum 32). AO rejects missing, self, cross-project, and cyclic edges. Part 1
-only records and displays this graph; it does not delay or schedule the child.
+project and queues the child without creating its workspace or runtime. Repeat
+the flag or pass a comma-separated list for multiple parents (maximum 32). AO
+rejects missing, self, cross-project, and cyclic edges. Once every parent has an
+explicit sealed handoff, or is lifecycle-terminal with a fully merged PR set,
+AO claims the child exactly once, injects the ordered parent handoffs into its
+task prompt, and launches it.
+`--depends-on` cannot be combined with the immediate `--claim-pr` flow.
 
 `ao preview` resolves its session from the `AO_SESSION_ID` environment variable
 (it is meant to run inside a session), not a flag. With no argument it

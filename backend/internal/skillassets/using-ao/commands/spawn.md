@@ -14,7 +14,7 @@ ao spawn [flags]
 |---|---|---|
 | `--branch string` | Branch for the session worktree | `ao/<session-id>/root` |
 | `--claim-pr string` | Immediately claim an existing PR for the spawned session | - |
-| `--depends-on strings` | Record prerequisite session ids (repeat or comma-separate, maximum 32) | - |
+| `--depends-on strings` | Wait for prerequisite sessions before launch (repeat or comma-separate, maximum 32) | - |
 | `--harness string` | Agent harness to use (see list below) | Project `worker.agent`; required if the project has none |
 | `--issue string` | Issue id to associate with the session | - |
 | `--name string` | Display name shown in the sidebar (max 20 characters) | Required |
@@ -38,8 +38,10 @@ ao spawn --project agent-orchestrator --issue 142 --name "fix-session-leak" --pr
 ao spawn --project agent-orchestrator --name "review-pr-88" --claim-pr 88 --harness claude-code
 ```
 
-Dependency edges are same-project, durable metadata only in Part 1; they do not
-delay or schedule the spawned session:
+Dependency edges are same-project and durable. AO creates a queued child, then
+launches it exactly once after every parent has an explicit sealed handoff or is
+lifecycle-terminal with a fully merged PR set, with structured parent
+handoffs appended to the task prompt. Do not combine this with `--claim-pr`:
 
 ```bash
 ao spawn --project agent-orchestrator --name "api-client" --depends-on agent-orchestrator-12 --prompt "Build the client after the API task."

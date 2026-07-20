@@ -81,14 +81,40 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.RunFilePath != "/tmp/ao-test-running.json" {
 		t.Errorf("RunFilePath = %q, want /tmp/ao-test-running.json", cfg.RunFilePath)
 	}
-	if cfg.DataDir != "/tmp/ao-test-data" {
-		t.Errorf("DataDir = %q, want /tmp/ao-test-data", cfg.DataDir)
+	wantDataDir, err := filepath.Abs("/tmp/ao-test-data")
+	if err != nil {
+		t.Fatalf("Abs data dir: %v", err)
+	}
+	if cfg.DataDir != wantDataDir {
+		t.Errorf("DataDir = %q, want %q", cfg.DataDir, wantDataDir)
 	}
 	if !cfg.Telemetry.Events || cfg.Telemetry.Metrics {
 		t.Fatalf("Telemetry toggles = %+v", cfg.Telemetry)
 	}
 	if cfg.Telemetry.Remote != TelemetryRemotePostHog || cfg.Telemetry.PostHogKey != "phc_test" || cfg.Telemetry.PostHogHost != "https://eu.i.posthog.com" {
 		t.Fatalf("Telemetry remote = %+v", cfg.Telemetry)
+	}
+}
+
+func TestLoadCanonicalizesRelativeDataDir(t *testing.T) {
+	root := t.TempDir()
+	oldCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldCWD) })
+	t.Setenv("AO_DATA_DIR", filepath.Join("relative", "state"))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "relative", "state")
+	if cfg.DataDir != want || !filepath.IsAbs(cfg.DataDir) {
+		t.Fatalf("DataDir = %q, want canonical absolute %q", cfg.DataDir, want)
 	}
 }
 

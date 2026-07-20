@@ -6,6 +6,7 @@ package conpty
 import (
 	"context"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -45,4 +46,50 @@ func stripEnvAssignments(argv []string) (assignments, rest []string) {
 		return nil, argv
 	}
 	return argv[1:i], argv[i:]
+}
+
+// buildHostEnvironment merges a detached host's environment using Windows'
+// case-insensitive key semantics. The runtime-owned registry namespace and
+// host generation are authoritative: project env and leading `env KEY=VALUE`
+// launch prefixes cannot shadow them with alternate casing or later entries.
+func buildHostEnvironment(base []string, env map[string]string, assignments []string) []string {
+	merged := make([]string, 0, len(base)+len(env)+len(assignments))
+	index := make(map[string]int, len(base)+len(env)+len(assignments))
+	apply := func(entry string, allowReserved bool) {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			merged = append(merged, entry)
+			return
+		}
+		if isReservedHostEnvKey(key) && !allowReserved {
+			return
+		}
+		folded := strings.ToUpper(key)
+		if i, exists := index[folded]; exists {
+			merged[i] = entry
+			return
+		}
+		index[folded] = len(merged)
+		merged = append(merged, entry)
+	}
+	for _, entry := range base {
+		// Ambient control values are replaced only by the exact authoritative
+		// values copied into env by Runtime.Create.
+		apply(entry, false)
+	}
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if isReservedHostEnvKey(key) && key != dataDirEnv && key != hostGenerationEnv {
+			continue
+		}
+		apply(key+"="+env[key], true)
+	}
+	for _, assignment := range assignments {
+		apply(assignment, false)
+	}
+	return merged
 }

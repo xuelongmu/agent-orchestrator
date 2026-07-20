@@ -78,8 +78,27 @@ type SessionRecord struct {
 	// DependencyIDs is the internal, comparable encoding of declared dependency
 	// ids. The API read model exposes DependsOn as a slice. Keeping the durable
 	// record comparable preserves lifecycle snapshot/CAS invariants.
-	DependencyIDs string   `json:"-"`
-	Activity      Activity `json:"activity"`
+	DependencyIDs string `json:"-"`
+	// DependencyPromotedAt is the durable exactly-once launch claim for a
+	// dependency-gated session. It is intentionally not a display status.
+	DependencyPromotedAt time.Time `json:"-"`
+	DependencyPreparedAt time.Time `json:"-"`
+	DependencyBasePrompt string    `json:"-"`
+	// DependencyBranchPrefix/Suffix are create-time-only inputs that let the
+	// store resolve an id-derived default branch inside the same transaction
+	// that inserts the child, its launch prompt, and its dependency edges.
+	DependencyBranchPrefix string `json:"-"`
+	DependencyBranchSuffix string `json:"-"`
+	// DependencyPromotionToken fences the in-flight external launch. A new
+	// daemon holding the exclusive store lease clears an abandoned token before
+	// retrying; completion accepts only the reserving token.
+	DependencyPromotionToken     string    `json:"-"`
+	DependencyPromotionClaimedAt time.Time `json:"-"`
+	// DependencyLaunchSucceededAt is the token-fenced external-launch commit
+	// point. A runtime handle without this marker is an interrupted attempt that
+	// recovery must tear down rather than adopt as successfully launched.
+	DependencyLaunchSucceededAt time.Time `json:"-"`
+	Activity                    Activity  `json:"activity"`
 	// FirstSignalAt is when the FIRST agent hook callback arrived for the
 	// current spawn/restore: raw signal receipt, independent of the derived
 	// activity state. Zero means no hook has ever reported, which deriveStatus
@@ -96,18 +115,30 @@ type SessionRecord struct {
 	UpdatedAt  time.Time            `json:"updatedAt"`
 }
 
+// DependencyPending reports whether this session has declared prerequisites
+// but has not yet consumed its durable promotion claim.
+func (s SessionRecord) DependencyPending() bool {
+	return s.DependencyIDs != "" && s.DependencyPromotedAt.IsZero() && !s.IsTerminated
+}
+
 // Session is the read-model returned across the API boundary: a SessionRecord
 // plus the derived display Status.
 type Session struct {
 	SessionRecord
 	Status           SessionStatus `json:"status" enum:"working,pr_open,draft,ci_failed,review_pending,changes_requested,approved,mergeable,merged,needs_input,rate_limited,idle,terminated,no_signal"`
 	TerminalHandleID string        `json:"terminalHandleId,omitempty"`
+	// DependencyPending is the durable launch-gate fact after synchronous
+	// dependency reconciliation. Clients must use this instead of inferring
+	// waiting state from the presence of DependsOn edges.
+	DependencyPending bool `json:"dependencyPending,omitempty"`
 	// Handoff is the immutable structured completion summary explicitly
-	// submitted by this session's agent. It has no lifecycle semantics.
+	// submitted by this session's agent. Sealing it can satisfy dependency
+	// scheduling, but it never terminates or otherwise mutates this session's
+	// lifecycle facts.
 	Handoff *AgentHandoff `json:"handoff,omitempty"`
 	// DependsOn is the deduplicated, declared prerequisite graph for this
-	// session. Part 1 is read-only metadata: it does not gate launch or status;
-	// scheduling enforcement follows in Part 2.
+	// session. The graph is read-only over the API; the daemon scheduler gates
+	// and promotes the child from durable completion facts.
 	DependsOn []SessionID `json:"dependsOn,omitempty"`
 	// PRs are the session's attributed pull requests (one session can own many).
 	// They feed status derivation and are surfaced on the API read model. Not

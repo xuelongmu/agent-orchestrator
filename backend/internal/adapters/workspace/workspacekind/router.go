@@ -21,6 +21,8 @@ type Router struct {
 
 var _ ports.Workspace = (*Router)(nil)
 var _ ports.WorkspaceProject = (*Router)(nil)
+var _ ports.WorkspacePlanner = (*Router)(nil)
+var _ ports.WorkspaceProjectPlanner = (*Router)(nil)
 
 // New constructs a workspace-kind router from all supported adapters.
 func New(worktree, scratch, dir ports.Workspace) (*Router, error) {
@@ -50,6 +52,19 @@ func (r *Router) Create(ctx context.Context, cfg ports.WorkspaceConfig) (ports.W
 		return ports.WorkspaceInfo{}, err
 	}
 	return a.Create(ctx, cfg)
+}
+
+// PlanWorkspace delegates deterministic workspace planning to the requested kind.
+func (r *Router) PlanWorkspace(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+	a, err := r.adapter(cfg.WorkspaceKind)
+	if err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+	planner, ok := a.(ports.WorkspacePlanner)
+	if !ok {
+		return ports.WorkspaceInfo{}, errors.New("workspace router: adapter does not support deterministic planning")
+	}
+	return planner.PlanWorkspace(ctx, cfg)
 }
 
 // Restore delegates workspace restoration to the persisted kind.
@@ -105,6 +120,15 @@ func (r *Router) CreateWorkspaceProject(ctx context.Context, cfg ports.Workspace
 		return ports.WorkspaceProjectInfo{}, errors.New("workspace router: worktree adapter does not support workspace projects")
 	}
 	return a.CreateWorkspaceProject(ctx, cfg)
+}
+
+// PlanWorkspaceProject delegates deterministic multi-repository planning to the worktree adapter.
+func (r *Router) PlanWorkspaceProject(ctx context.Context, cfg ports.WorkspaceProjectConfig) (ports.WorkspaceProjectInfo, error) {
+	a, ok := r.worktree.(ports.WorkspaceProjectPlanner)
+	if !ok {
+		return ports.WorkspaceProjectInfo{}, errors.New("workspace router: worktree adapter does not support deterministic workspace-project planning")
+	}
+	return a.PlanWorkspaceProject(ctx, cfg)
 }
 
 // DestroyWorkspaceProject preserves the existing multi-repository worktree

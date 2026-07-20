@@ -320,6 +320,7 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	s := svc.sessions["ao-1"]
 	s.Metadata = domain.SessionMetadata{Branch: "qa/modal-worker", WorkspacePath: "/tmp/private-worktree", RuntimeHandleID: "runtime-1", Prompt: "private prompt"}
 	s.DependsOn = []domain.SessionID{"ao-parent"}
+	s.DependencyPending = true
 	s.Diagnostic = &domain.LifecycleDiagnostic{Trigger: domain.DiagnosticRuntimeProbeFailed, TerminalTail: "probe timed out", CapturedAt: time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)}
 	svc.sessions["ao-1"] = s
 	srv := newSessionTestServer(t, svc)
@@ -343,6 +344,9 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	}
 	if !reflect.DeepEqual(list.Sessions[0].DependsOn, []domain.SessionID{"ao-parent"}) {
 		t.Fatalf("dependsOn = %#v", list.Sessions[0].DependsOn)
+	}
+	if !list.Sessions[0].DependencyPending {
+		t.Fatalf("dependencyPending = false, want durable waiting fact")
 	}
 	var rawList struct {
 		Sessions []map[string]any `json:"sessions"`
@@ -989,17 +993,18 @@ func TestSessionsAPI_CleanupWithoutProjectFilter(t *testing.T) {
 }
 
 type sessionBody struct {
-	ID               string                      `json:"id"`
-	ProjectID        string                      `json:"projectId"`
-	IssueID          string                      `json:"issueId"`
-	Kind             string                      `json:"kind"`
-	Harness          string                      `json:"harness"`
-	DisplayName      string                      `json:"displayName"`
-	Branch           string                      `json:"branch"`
-	Status           string                      `json:"status"`
-	TerminalHandleID string                      `json:"terminalHandleId"`
-	Diagnostic       *domain.LifecycleDiagnostic `json:"diagnostic"`
-	DependsOn        []domain.SessionID          `json:"dependsOn"`
+	ID                string                      `json:"id"`
+	ProjectID         string                      `json:"projectId"`
+	IssueID           string                      `json:"issueId"`
+	Kind              string                      `json:"kind"`
+	Harness           string                      `json:"harness"`
+	DisplayName       string                      `json:"displayName"`
+	Branch            string                      `json:"branch"`
+	Status            string                      `json:"status"`
+	TerminalHandleID  string                      `json:"terminalHandleId"`
+	Diagnostic        *domain.LifecycleDiagnostic `json:"diagnostic"`
+	DependsOn         []domain.SessionID          `json:"dependsOn"`
+	DependencyPending bool                        `json:"dependencyPending"`
 }
 
 func TestSessionsAPI_PRRoutes(t *testing.T) {

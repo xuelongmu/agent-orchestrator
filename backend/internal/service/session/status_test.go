@@ -57,6 +57,7 @@ func TestServiceDerivesStatusFromSessionFactsAndPR(t *testing.T) {
 		// A live session whose hook-capable agent never signaled is no_signal
 		// once the grace passes — never a confident idle.
 		{"no-signal-after-grace", silentRec(2 * noSignalGrace), nil, false, domain.StatusNoSignal},
+		{"dependency-waiting-stays-idle", domain.SessionRecord{DependencyIDs: domain.EncodeSessionDependencyIDs([]domain.SessionID{"parent"}), Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: statusNow.Add(-2 * noSignalGrace)}}, nil, false, domain.StatusIdle},
 		// A hook-less harness can never signal: its silence stays idle forever
 		// instead of degrading into a false "needs you".
 		{"hookless-silent-stays-idle", silentRec(2 * noSignalGrace), nil, true, domain.StatusIdle},

@@ -57,6 +57,38 @@ func (q *Queries) ClearPendingSubmit(ctx context.Context, arg ClearPendingSubmit
 	return result.RowsAffected()
 }
 
+const completeDependencyPromotion = `-- name: CompleteDependencyPromotion :execrows
+UPDATE sessions
+SET dependency_promoted_at = ?, dependency_promotion_token = '',
+    dependency_promotion_claimed_at = NULL, updated_at = ?
+WHERE id = ?
+  AND dependency_promoted_at IS NULL
+  AND dependency_promotion_token = ?
+  AND is_terminated = FALSE
+  AND runtime_handle_id <> ''
+  AND dependency_launch_succeeded_at IS NOT NULL
+`
+
+type CompleteDependencyPromotionParams struct {
+	DependencyPromotedAt     sql.NullTime
+	UpdatedAt                time.Time
+	ID                       domain.SessionID
+	DependencyPromotionToken string
+}
+
+func (q *Queries) CompleteDependencyPromotion(ctx context.Context, arg CompleteDependencyPromotionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, completeDependencyPromotion,
+		arg.DependencyPromotedAt,
+		arg.UpdatedAt,
+		arg.ID,
+		arg.DependencyPromotionToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const getSession = `-- name: GetSession :one
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
@@ -64,7 +96,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     pending_submit_fingerprint, pending_submit_recovery_attempted,
     merged_cleanup_pending, merged_cleanup_pr_url,
     diagnostic_trigger, diagnostic_terminal_tail, diagnostic_hook_error_type,
-    diagnostic_captured_at, workspace_kind
+    diagnostic_captured_at, workspace_kind, dependency_promoted_at, dependency_prepared_at, dependency_base_prompt,
+    dependency_promotion_token, dependency_promotion_claimed_at, dependency_launch_succeeded_at
 FROM sessions WHERE id = ?
 `
 
@@ -101,6 +134,12 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (Session,
 		&i.DiagnosticHookErrorType,
 		&i.DiagnosticCapturedAt,
 		&i.WorkspaceKind,
+		&i.DependencyPromotedAt,
+		&i.DependencyPreparedAt,
+		&i.DependencyBasePrompt,
+		&i.DependencyPromotionToken,
+		&i.DependencyPromotionClaimedAt,
+		&i.DependencyLaunchSucceededAt,
 	)
 	return i, err
 }
@@ -124,8 +163,9 @@ INSERT INTO sessions (
     preview_url, preview_revision, pending_submit_fingerprint,
     pending_submit_recovery_attempted, diagnostic_trigger,
     diagnostic_terminal_tail, diagnostic_hook_error_type,
-    diagnostic_captured_at, merged_cleanup_pending, merged_cleanup_pr_url, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    diagnostic_captured_at, merged_cleanup_pending, merged_cleanup_pr_url,
+    dependency_prepared_at, dependency_base_prompt, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 type InsertSessionParams struct {
@@ -156,6 +196,8 @@ type InsertSessionParams struct {
 	DiagnosticCapturedAt           sql.NullTime
 	MergedCleanupPending           bool
 	MergedCleanupPRURL             string
+	DependencyPreparedAt           sql.NullTime
+	DependencyBasePrompt           string
 	CreatedAt                      time.Time
 	UpdatedAt                      time.Time
 }
@@ -189,6 +231,8 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 		arg.DiagnosticCapturedAt,
 		arg.MergedCleanupPending,
 		arg.MergedCleanupPRURL,
+		arg.DependencyPreparedAt,
+		arg.DependencyBasePrompt,
 		arg.CreatedAt,
 		arg.UpdatedAt,
 	)
@@ -265,7 +309,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     pending_submit_fingerprint, pending_submit_recovery_attempted,
     merged_cleanup_pending, merged_cleanup_pr_url,
     diagnostic_trigger, diagnostic_terminal_tail, diagnostic_hook_error_type,
-    diagnostic_captured_at, workspace_kind
+    diagnostic_captured_at, workspace_kind, dependency_promoted_at, dependency_prepared_at, dependency_base_prompt,
+    dependency_promotion_token, dependency_promotion_claimed_at, dependency_launch_succeeded_at
 FROM sessions ORDER BY project_id, num
 `
 
@@ -308,10 +353,115 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]Session, error) {
 			&i.DiagnosticHookErrorType,
 			&i.DiagnosticCapturedAt,
 			&i.WorkspaceKind,
+			&i.DependencyPromotedAt,
+			&i.DependencyPreparedAt,
+			&i.DependencyBasePrompt,
+			&i.DependencyPromotionToken,
+			&i.DependencyPromotionClaimedAt,
+			&i.DependencyLaunchSucceededAt,
 		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDependencyHandoffPayloads = `-- name: ListDependencyHandoffPayloads :many
+SELECT edge.depends_on_session_id, COALESCE(handoff.payload, '') AS payload
+FROM session_dependencies edge
+LEFT JOIN agent_handoffs handoff ON handoff.session_id = edge.depends_on_session_id
+WHERE edge.session_id = ?
+ORDER BY edge.depends_on_session_id
+`
+
+type ListDependencyHandoffPayloadsRow struct {
+	DependsOnSessionID domain.SessionID
+	Payload            string
+}
+
+func (q *Queries) ListDependencyHandoffPayloads(ctx context.Context, sessionID domain.SessionID) ([]ListDependencyHandoffPayloadsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listDependencyHandoffPayloads, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDependencyHandoffPayloadsRow{}
+	for rows.Next() {
+		var i ListDependencyHandoffPayloadsRow
+		if err := rows.Scan(&i.DependsOnSessionID, &i.Payload); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReadyDependencySessions = `-- name: ListReadyDependencySessions :many
+SELECT child.id
+FROM sessions child
+WHERE child.dependency_promoted_at IS NULL
+  AND child.dependency_prepared_at IS NOT NULL
+  AND child.dependency_promotion_token = ''
+  AND child.is_terminated = FALSE
+  AND EXISTS (
+      SELECT 1 FROM session_dependencies edge
+      WHERE edge.session_id = child.id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM session_dependencies edge
+      JOIN sessions parent ON parent.id = edge.depends_on_session_id
+      WHERE edge.session_id = child.id
+        AND NOT (
+            EXISTS (
+                SELECT 1 FROM agent_handoffs handoff
+                WHERE handoff.session_id = parent.id
+            )
+            OR (
+              parent.is_terminated = TRUE
+              AND EXISTS (
+                    SELECT 1 FROM pr merged_pr
+                    WHERE merged_pr.session_id = parent.id
+                      AND merged_pr.is_merged = TRUE
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM pr open_pr
+                    WHERE open_pr.session_id = parent.id
+                      AND open_pr.is_merged = FALSE
+                      AND open_pr.is_closed = FALSE
+              )
+            )
+        )
+      )
+ORDER BY child.project_id, child.num
+`
+
+func (q *Queries) ListReadyDependencySessions(ctx context.Context) ([]domain.SessionID, error) {
+	rows, err := q.db.QueryContext(ctx, listReadyDependencySessions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []domain.SessionID{}
+	for rows.Next() {
+		var id domain.SessionID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -359,7 +509,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     pending_submit_fingerprint, pending_submit_recovery_attempted,
     merged_cleanup_pending, merged_cleanup_pr_url,
     diagnostic_trigger, diagnostic_terminal_tail, diagnostic_hook_error_type,
-    diagnostic_captured_at, workspace_kind
+    diagnostic_captured_at, workspace_kind, dependency_promoted_at, dependency_prepared_at, dependency_base_prompt,
+    dependency_promotion_token, dependency_promotion_claimed_at, dependency_launch_succeeded_at
 FROM sessions WHERE project_id = ? ORDER BY num
 `
 
@@ -402,6 +553,12 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID domain.Pr
 			&i.DiagnosticHookErrorType,
 			&i.DiagnosticCapturedAt,
 			&i.WorkspaceKind,
+			&i.DependencyPromotedAt,
+			&i.DependencyPreparedAt,
+			&i.DependencyBasePrompt,
+			&i.DependencyPromotionToken,
+			&i.DependencyPromotionClaimedAt,
+			&i.DependencyLaunchSucceededAt,
 		); err != nil {
 			return nil, err
 		}
@@ -416,6 +573,78 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID domain.Pr
 	return items, nil
 }
 
+const markReservedDependencyLaunchSucceeded = `-- name: MarkReservedDependencyLaunchSucceeded :execrows
+UPDATE sessions
+SET dependency_launch_succeeded_at = ?, updated_at = ?
+WHERE id = ?
+  AND dependency_promoted_at IS NULL
+  AND dependency_promotion_token = ?
+  AND is_terminated = FALSE
+  AND runtime_handle_id <> ''
+`
+
+type MarkReservedDependencyLaunchSucceededParams struct {
+	DependencyLaunchSucceededAt sql.NullTime
+	UpdatedAt                   time.Time
+	ID                          domain.SessionID
+	DependencyPromotionToken    string
+}
+
+func (q *Queries) MarkReservedDependencyLaunchSucceeded(ctx context.Context, arg MarkReservedDependencyLaunchSucceededParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markReservedDependencyLaunchSucceeded,
+		arg.DependencyLaunchSucceededAt,
+		arg.UpdatedAt,
+		arg.ID,
+		arg.DependencyPromotionToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const markReservedDependencySpawned = `-- name: MarkReservedDependencySpawned :execrows
+UPDATE sessions
+SET workspace_kind = ?, branch = ?, workspace_path = ?, runtime_handle_id = ?,
+    prompt = ?, activity_state = 'idle', activity_last_at = ?, first_signal_at = NULL,
+    diagnostic_trigger = '', diagnostic_terminal_tail = '', diagnostic_hook_error_type = '',
+    diagnostic_captured_at = NULL, updated_at = ?
+WHERE id = ?
+  AND dependency_promoted_at IS NULL
+  AND dependency_promotion_token = ?
+  AND is_terminated = FALSE
+`
+
+type MarkReservedDependencySpawnedParams struct {
+	WorkspaceKind            string
+	Branch                   string
+	WorkspacePath            string
+	RuntimeHandleID          string
+	Prompt                   string
+	ActivityLastAt           time.Time
+	UpdatedAt                time.Time
+	ID                       domain.SessionID
+	DependencyPromotionToken string
+}
+
+func (q *Queries) MarkReservedDependencySpawned(ctx context.Context, arg MarkReservedDependencySpawnedParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markReservedDependencySpawned,
+		arg.WorkspaceKind,
+		arg.Branch,
+		arg.WorkspacePath,
+		arg.RuntimeHandleID,
+		arg.Prompt,
+		arg.ActivityLastAt,
+		arg.UpdatedAt,
+		arg.ID,
+		arg.DependencyPromotionToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const nextSessionNum = `-- name: NextSessionNum :one
 SELECT COALESCE(MAX(num), 0) + 1 AS next FROM sessions WHERE project_id = ?
 `
@@ -425,6 +654,66 @@ func (q *Queries) NextSessionNum(ctx context.Context, projectID domain.ProjectID
 	var next int64
 	err := row.Scan(&next)
 	return next, err
+}
+
+const recoverDependencyPromotions = `-- name: RecoverDependencyPromotions :execrows
+UPDATE sessions
+SET dependency_promotion_token = '', dependency_promotion_claimed_at = NULL, updated_at = ?
+WHERE dependency_promoted_at IS NULL
+  AND dependency_promotion_token <> ''
+  AND runtime_handle_id = ''
+`
+
+func (q *Queries) RecoverDependencyPromotions(ctx context.Context, updatedAt time.Time) (int64, error) {
+	result, err := q.db.ExecContext(ctx, recoverDependencyPromotions, updatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const recoverStaleDependencyPromotions = `-- name: RecoverStaleDependencyPromotions :execrows
+UPDATE sessions
+SET dependency_promotion_token = '', dependency_promotion_claimed_at = NULL, updated_at = ?
+WHERE dependency_promoted_at IS NULL
+  AND dependency_promotion_token <> ''
+  AND runtime_handle_id = ''
+  AND dependency_promotion_claimed_at < ?
+`
+
+type RecoverStaleDependencyPromotionsParams struct {
+	UpdatedAt                    time.Time
+	DependencyPromotionClaimedAt sql.NullTime
+}
+
+func (q *Queries) RecoverStaleDependencyPromotions(ctx context.Context, arg RecoverStaleDependencyPromotionsParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, recoverStaleDependencyPromotions, arg.UpdatedAt, arg.DependencyPromotionClaimedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const releaseDependencyPromotion = `-- name: ReleaseDependencyPromotion :execrows
+UPDATE sessions
+SET dependency_promotion_token = '', dependency_promotion_claimed_at = NULL, updated_at = ?
+WHERE id = ?
+  AND dependency_promoted_at IS NULL
+  AND dependency_promotion_token = ?
+`
+
+type ReleaseDependencyPromotionParams struct {
+	UpdatedAt                time.Time
+	ID                       domain.SessionID
+	DependencyPromotionToken string
+}
+
+func (q *Queries) ReleaseDependencyPromotion(ctx context.Context, arg ReleaseDependencyPromotionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, releaseDependencyPromotion, arg.UpdatedAt, arg.ID, arg.DependencyPromotionToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const renameSession = `-- name: RenameSession :execrows
@@ -439,6 +728,100 @@ type RenameSessionParams struct {
 
 func (q *Queries) RenameSession(ctx context.Context, arg RenameSessionParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, renameSession, arg.DisplayName, arg.UpdatedAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const reserveDependencyPromotion = `-- name: ReserveDependencyPromotion :execrows
+UPDATE sessions
+SET dependency_promotion_token = ?, dependency_promotion_claimed_at = ?, updated_at = ?
+WHERE sessions.id = ?
+  AND sessions.dependency_promoted_at IS NULL
+  AND sessions.dependency_prepared_at IS NOT NULL
+  AND sessions.dependency_promotion_token = ''
+  AND sessions.is_terminated = FALSE
+  AND EXISTS (
+      SELECT 1 FROM session_dependencies edge
+      WHERE edge.session_id = sessions.id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM session_dependencies edge
+      JOIN sessions parent ON parent.id = edge.depends_on_session_id
+      WHERE edge.session_id = sessions.id
+        AND NOT (
+            EXISTS (
+                SELECT 1 FROM agent_handoffs handoff
+                WHERE handoff.session_id = parent.id
+            )
+            OR (
+              parent.is_terminated = TRUE
+              AND EXISTS (
+                    SELECT 1 FROM pr merged_pr
+                    WHERE merged_pr.session_id = parent.id
+                      AND merged_pr.is_merged = TRUE
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM pr open_pr
+                    WHERE open_pr.session_id = parent.id
+                      AND open_pr.is_merged = FALSE
+                      AND open_pr.is_closed = FALSE
+              )
+            )
+        )
+      )
+`
+
+type ReserveDependencyPromotionParams struct {
+	DependencyPromotionToken     string
+	DependencyPromotionClaimedAt sql.NullTime
+	UpdatedAt                    time.Time
+	ID                           domain.SessionID
+}
+
+func (q *Queries) ReserveDependencyPromotion(ctx context.Context, arg ReserveDependencyPromotionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, reserveDependencyPromotion,
+		arg.DependencyPromotionToken,
+		arg.DependencyPromotionClaimedAt,
+		arg.UpdatedAt,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const resetReservedDependencyLaunch = `-- name: ResetReservedDependencyLaunch :execrows
+UPDATE sessions
+SET workspace_path = '', runtime_handle_id = '', agent_session_id = '',
+    prompt = dependency_base_prompt,
+    dependency_launch_succeeded_at = NULL,
+    activity_state = CASE WHEN is_terminated THEN activity_state ELSE 'idle' END,
+    activity_last_at = CASE WHEN is_terminated THEN activity_last_at ELSE ? END,
+    first_signal_at = CASE WHEN is_terminated THEN first_signal_at ELSE NULL END,
+    updated_at = ?
+WHERE id = ?
+  AND dependency_promoted_at IS NULL
+  AND dependency_promotion_token = ?
+`
+
+type ResetReservedDependencyLaunchParams struct {
+	ActivityLastAt           time.Time
+	UpdatedAt                time.Time
+	ID                       domain.SessionID
+	DependencyPromotionToken string
+}
+
+func (q *Queries) ResetReservedDependencyLaunch(ctx context.Context, arg ResetReservedDependencyLaunchParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, resetReservedDependencyLaunch,
+		arg.ActivityLastAt,
+		arg.UpdatedAt,
+		arg.ID,
+		arg.DependencyPromotionToken,
+	)
 	if err != nil {
 		return 0, err
 	}

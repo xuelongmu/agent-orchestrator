@@ -442,7 +442,10 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 			return err
 		}
 		if done {
-			return m.cleanupMergedSession(ctx, id, o.URL)
+			if err := m.cleanupMergedSession(ctx, id, o.URL); err != nil {
+				return err
+			}
+			return m.reconcileDependencies()
 		}
 		return nil
 	}

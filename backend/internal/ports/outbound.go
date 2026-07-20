@@ -195,6 +195,14 @@ type Workspace interface {
 	ApplyPreserved(ctx context.Context, info WorkspaceInfo, ref string) error
 }
 
+// WorkspacePlanner returns the deterministic ownership metadata that Create
+// will use, without performing external filesystem/git side effects. Promotion
+// fencing persists this plan before calling Create so crash recovery can clean
+// a workspace created immediately after the durable claim.
+type WorkspacePlanner interface {
+	PlanWorkspace(ctx context.Context, cfg WorkspaceConfig) (WorkspaceInfo, error)
+}
+
 // WorkspaceProject is an optional extension for projects composed from a
 // root-as-repo parent plus child repositories. It materialises the parent
 // worktree at the session root and each child repo at its registered relative
@@ -202,6 +210,13 @@ type Workspace interface {
 type WorkspaceProject interface {
 	CreateWorkspaceProject(ctx context.Context, cfg WorkspaceProjectConfig) (WorkspaceProjectInfo, error)
 	DestroyWorkspaceProject(ctx context.Context, info WorkspaceProjectInfo) error
+}
+
+// WorkspaceProjectPlanner is the multi-repository equivalent of
+// WorkspacePlanner. Every returned worktree path and branch must match the
+// subsequent CreateWorkspaceProject call for the same configuration.
+type WorkspaceProjectPlanner interface {
+	PlanWorkspaceProject(ctx context.Context, cfg WorkspaceProjectConfig) (WorkspaceProjectInfo, error)
 }
 
 // Workspace-level sentinels surfaced through Create/Restore/Destroy so callers
@@ -279,6 +294,10 @@ type WorkspaceProjectConfig struct {
 	RootRepoPath  string
 	BaseBranch    string
 	Repos         []WorkspaceProjectRepoConfig
+	// RecoverExisting makes the session-specific branch/path idempotently
+	// adoptable after an interrupted dependency promotion. Ordinary interactive
+	// creation keeps the existing free-branch suffix behavior.
+	RecoverExisting bool
 }
 
 // WorkspaceProjectRepoConfig describes one registered child repo in a

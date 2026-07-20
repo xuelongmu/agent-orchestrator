@@ -3,7 +3,9 @@ package conpty
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -16,7 +18,7 @@ import (
 func runtimeForFixture(id string, f *serveFixture) *Runtime {
 	r := New(Options{})
 	r.mu.Lock()
-	r.sessions[id] = &hostSession{addr: f.addr, pid: f.pty.PID()}
+	r.sessions[id] = &hostSession{addr: f.addr, pid: f.hostPID, generation: f.generation}
 	r.mu.Unlock()
 	return r
 }
@@ -61,8 +63,8 @@ func TestAttachReplaysScrollback(t *testing.T) {
 	defer f.cancel()
 	f.ring.Append([]byte("scrollback-line\n"))
 
-	r := runtimeForFixture("sess", f)
-	s, err := r.Attach(context.Background(), nameHandle("sess"), 0, 0)
+	r := runtimeForFixture(f.sessionID, f)
+	s, err := r.Attach(context.Background(), nameHandle(f.sessionID), 0, 0)
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -80,8 +82,8 @@ func TestAttachWriteReachesPTY(t *testing.T) {
 	f := startServe(t, 301)
 	defer f.cancel()
 
-	r := runtimeForFixture("sess", f)
-	s, err := r.Attach(context.Background(), nameHandle("sess"), 0, 0)
+	r := runtimeForFixture(f.sessionID, f)
+	s, err := r.Attach(context.Background(), nameHandle(f.sessionID), 0, 0)
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -106,9 +108,9 @@ func TestAttachResizeReachesPTY(t *testing.T) {
 	f := startServe(t, 302)
 	defer f.cancel()
 
-	r := runtimeForFixture("sess", f)
+	r := runtimeForFixture(f.sessionID, f)
 	// Attach with a birth size: the implementation sends an initial MsgResize.
-	s, err := r.Attach(context.Background(), nameHandle("sess"), 40, 132)
+	s, err := r.Attach(context.Background(), nameHandle(f.sessionID), 40, 132)
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -136,6 +138,45 @@ func TestAttachResizeReachesPTY(t *testing.T) {
 	f.pty.resizeMu.Lock()
 	defer f.pty.resizeMu.Unlock()
 	t.Fatalf("resizes did not reach pty as expected: %+v", f.pty.resizes)
+}
+
+func TestAttachPreservesPartialFrameAfterIdentityStatus(t *testing.T) {
+	client, server := net.Pipe()
+	withDialHost(t, func(string, time.Duration) (net.Conn, error) { return client, nil })
+	done := make(chan error, 1)
+	go func() {
+		defer func() { _ = server.Close() }()
+		if typ, _, err := readRawFrame(server); err != nil {
+			done <- fmt.Errorf("status request type=%x: %w", typ, err)
+			return
+		} else if typ != MsgStatusReq {
+			done <- fmt.Errorf("status request type=%x", typ)
+			return
+		}
+		status := statusFrame(true, 1, nil, "partial-attach", "generation", 88)
+		terminal, _ := EncodeMessage(MsgTerminalData, []byte("fragment-preserved"))
+		if _, err := server.Write(append(status, terminal[:3]...)); err != nil {
+			done <- err
+			return
+		}
+		_, err := server.Write(terminal[3:])
+		done <- err
+	}()
+	r := New(Options{})
+	r.mu.Lock()
+	r.sessions["partial-attach"] = &hostSession{addr: "pipe", pid: 88, generation: "generation"}
+	r.mu.Unlock()
+	stream, err := r.Attach(context.Background(), nameHandle("partial-attach"), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if got := readUntil(t, stream, "fragment-preserved", 2*time.Second); !bytes.Contains([]byte(got), []byte("fragment-preserved")) {
+		t.Fatalf("partial terminal frame was lost: %q", got)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestAttachUnknownSession: Attach to a session with no resolvable addr errors.

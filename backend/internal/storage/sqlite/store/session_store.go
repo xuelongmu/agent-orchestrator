@@ -44,6 +44,9 @@ func (s *Store) CreateSession(ctx context.Context, rec domain.SessionRecord) (do
 		return domain.SessionRecord{}, fmt.Errorf("next session num for %s: %w", rec.ProjectID, err)
 	}
 	rec.ID = domain.SessionID(fmt.Sprintf("%s-%d", rec.ProjectID, num))
+	if !rec.DependencyPreparedAt.IsZero() && rec.Metadata.Branch == "" && rec.DependencyBranchPrefix != "" {
+		rec.Metadata.Branch = rec.DependencyBranchPrefix + string(rec.ID) + rec.DependencyBranchSuffix
+	}
 	if err := validateDependencies(ctx, tx, rec.ID, rec.ProjectID, deps); err != nil {
 		return domain.SessionRecord{}, err
 	}
@@ -97,6 +100,9 @@ func (s *Store) CreateClaimedSession(ctx context.Context, rec domain.SessionReco
 			return fmt.Errorf("next session num for %s: %w", rec.ProjectID, err)
 		}
 		rec.ID = domain.SessionID(fmt.Sprintf("%s-%d", rec.ProjectID, num))
+		if !rec.DependencyPreparedAt.IsZero() && rec.Metadata.Branch == "" && rec.DependencyBranchPrefix != "" {
+			rec.Metadata.Branch = rec.DependencyBranchPrefix + string(rec.ID) + rec.DependencyBranchSuffix
+		}
 		if err := validateDependencies(ctx, conn, rec.ID, rec.ProjectID, deps); err != nil {
 			return err
 		}
@@ -510,6 +516,211 @@ func (s *Store) withDependencies(ctx context.Context, records []domain.SessionRe
 	return records, nil
 }
 
+// ListReadyDependencySessions returns unclaimed children for which every
+// parent has an explicit handoff or terminal merged-PR completion fact.
+func (s *Store) ListReadyDependencySessions(ctx context.Context) ([]domain.SessionID, error) {
+	ids, err := s.qr.ListReadyDependencySessions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list ready dependency sessions: %w", err)
+	}
+	return ids, nil
+}
+
+// ReserveDependencyPromotion atomically fences one launch attempt with token.
+func (s *Store) ReserveDependencyPromotion(ctx context.Context, id domain.SessionID, token string, claimedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.ReserveDependencyPromotion(ctx, gen.ReserveDependencyPromotionParams{
+		DependencyPromotionToken:     token,
+		DependencyPromotionClaimedAt: timeToNullTime(claimedAt),
+		UpdatedAt:                    claimedAt,
+		ID:                           id,
+	})
+	if err != nil {
+		return false, fmt.Errorf("reserve dependency promotion for %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// CompleteDependencyPromotion consumes only the matching reservation. The DB
+// trigger emits one activity event atomically with this successful completion.
+func (s *Store) CompleteDependencyPromotion(ctx context.Context, id domain.SessionID, token string, promotedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.CompleteDependencyPromotion(ctx, gen.CompleteDependencyPromotionParams{
+		DependencyPromotedAt:     timeToNullTime(promotedAt),
+		UpdatedAt:                promotedAt,
+		ID:                       id,
+		DependencyPromotionToken: token,
+	})
+	if err != nil {
+		return false, fmt.Errorf("complete dependency promotion for %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// ReleaseDependencyPromotion makes a failed, fenced launch retryable without
+// accepting a stale poller's token.
+func (s *Store) ReleaseDependencyPromotion(ctx context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.ReleaseDependencyPromotion(ctx, gen.ReleaseDependencyPromotionParams{UpdatedAt: updatedAt, ID: id, DependencyPromotionToken: token})
+	if err != nil {
+		return false, fmt.Errorf("release dependency promotion for %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// RecoverDependencyPromotions clears abandoned reservations. The daemon calls
+// this only after acquiring the process-wide exclusive SQLite coordination
+// lease, so no prior owner can still be launching the fenced children.
+func (s *Store) RecoverDependencyPromotions(ctx context.Context, updatedAt time.Time) (int64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.RecoverDependencyPromotions(ctx, updatedAt)
+	if err != nil {
+		return 0, fmt.Errorf("recover dependency promotions: %w", err)
+	}
+	return rows, nil
+}
+
+// RecoverStaleDependencyPromotions releases expired reservations that have not crossed the runtime boundary.
+func (s *Store) RecoverStaleDependencyPromotions(ctx context.Context, updatedAt, staleBefore time.Time) (int64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.RecoverStaleDependencyPromotions(ctx, gen.RecoverStaleDependencyPromotionsParams{
+		UpdatedAt:                    updatedAt,
+		DependencyPromotionClaimedAt: timeToNullTime(staleBefore),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("recover stale dependency promotions: %w", err)
+	}
+	return rows, nil
+}
+
+// MarkReservedDependencySpawned is the narrow persistence CAS used only by
+// lifecycle.Manager.MarkDependencySpawned. It cannot clear termination or
+// overwrite unrelated lifecycle metadata from a stale session snapshot.
+func (s *Store) MarkReservedDependencySpawned(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, updatedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.MarkReservedDependencySpawned(ctx, gen.MarkReservedDependencySpawnedParams{
+		WorkspaceKind:            string(metadata.WorkspaceKind.WithDefault()),
+		Branch:                   metadata.Branch,
+		WorkspacePath:            metadata.WorkspacePath,
+		RuntimeHandleID:          metadata.RuntimeHandleID,
+		Prompt:                   metadata.Prompt,
+		ActivityLastAt:           updatedAt,
+		UpdatedAt:                updatedAt,
+		ID:                       id,
+		DependencyPromotionToken: token,
+	})
+	if err != nil {
+		return false, fmt.Errorf("mark reserved dependency %s spawned: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// PrepareReservedDependencyWorkspace atomically persists the deterministic
+// workspace/runtime ownership claim and every multi-repo cleanup row before
+// any external workspace creation begins.
+func (s *Store) PrepareReservedDependencyWorkspace(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, worktrees []domain.SessionWorktreeRecord, updatedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin prepare dependency workspace %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := s.qw.WithTx(tx)
+	rows, err := q.MarkReservedDependencySpawned(ctx, gen.MarkReservedDependencySpawnedParams{
+		WorkspaceKind:            string(metadata.WorkspaceKind.WithDefault()),
+		Branch:                   metadata.Branch,
+		WorkspacePath:            metadata.WorkspacePath,
+		RuntimeHandleID:          metadata.RuntimeHandleID,
+		Prompt:                   metadata.Prompt,
+		ActivityLastAt:           updatedAt,
+		UpdatedAt:                updatedAt,
+		ID:                       id,
+		DependencyPromotionToken: token,
+	})
+	if err != nil {
+		return false, fmt.Errorf("prepare reserved dependency workspace %s: %w", id, err)
+	}
+	if rows != 1 {
+		return false, nil
+	}
+	for _, row := range worktrees {
+		state := row.State
+		if state == "" {
+			state = "active"
+		}
+		if err := q.UpsertSessionWorktree(ctx, gen.UpsertSessionWorktreeParams{SessionID: id, RepoName: row.RepoName, Branch: row.Branch, BaseSha: row.BaseSHA, WorktreePath: row.WorktreePath, PreservedRef: row.PreservedRef, State: state}); err != nil {
+			return false, fmt.Errorf("prepare dependency workspace %s repo %s: %w", id, row.RepoName, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit prepare dependency workspace %s: %w", id, err)
+	}
+	return true, nil
+}
+
+// MarkReservedDependencyLaunchSucceeded commits the external-launch boundary
+// only after runtime creation and prompt delivery have both succeeded. Recovery
+// never adopts a runtime-backed reservation without this marker.
+func (s *Store) MarkReservedDependencyLaunchSucceeded(ctx context.Context, id domain.SessionID, token string, succeededAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.MarkReservedDependencyLaunchSucceeded(ctx, gen.MarkReservedDependencyLaunchSucceededParams{
+		DependencyLaunchSucceededAt: timeToNullTime(succeededAt),
+		UpdatedAt:                   succeededAt,
+		ID:                          id,
+		DependencyPromotionToken:    token,
+	})
+	if err != nil {
+		return false, fmt.Errorf("mark reserved dependency %s launch succeeded: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// ResetReservedDependencyLaunch clears launch-owned state while retaining the prepared child for retry.
+func (s *Store) ResetReservedDependencyLaunch(ctx context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.ResetReservedDependencyLaunch(ctx, gen.ResetReservedDependencyLaunchParams{
+		ActivityLastAt:           updatedAt,
+		UpdatedAt:                updatedAt,
+		ID:                       id,
+		DependencyPromotionToken: token,
+	})
+	if err != nil {
+		return false, fmt.Errorf("reset reserved dependency launch for %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// ListDependencyHandoffs returns ordered prerequisite completion context for a
+// child. Missing payloads are preserved as nil (merged-PR completion).
+func (s *Store) ListDependencyHandoffs(ctx context.Context, id domain.SessionID) ([]domain.DependencyHandoff, error) {
+	rows, err := s.qr.ListDependencyHandoffPayloads(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("list dependency handoffs for %s: %w", id, err)
+	}
+	out := make([]domain.DependencyHandoff, 0, len(rows))
+	for _, row := range rows {
+		item := domain.DependencyHandoff{SessionID: row.DependsOnSessionID}
+		if row.Payload != "" {
+			handoff, err := domain.DecodeAgentHandoff(row.Payload)
+			if err != nil {
+				return nil, fmt.Errorf("decode dependency handoff for %s: %w", row.DependsOnSessionID, err)
+			}
+			item.Handoff = &handoff
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
 func mapSessionRows(rows []gen.Session) []domain.SessionRecord {
 	out := make([]domain.SessionRecord, 0, len(rows))
 	for _, r := range rows {
@@ -531,9 +742,15 @@ func rowToRecord(row gen.Session) domain.SessionRecord {
 			State:          row.ActivityState,
 			LastActivityAt: row.ActivityLastAt,
 		},
-		FirstSignalAt: nullTimeToTime(row.FirstSignalAt),
-		IsTerminated:  row.IsTerminated,
-		Diagnostic:    diagnostic,
+		FirstSignalAt:                nullTimeToTime(row.FirstSignalAt),
+		IsTerminated:                 row.IsTerminated,
+		DependencyPromotedAt:         nullTimeToTime(row.DependencyPromotedAt),
+		DependencyPreparedAt:         nullTimeToTime(row.DependencyPreparedAt),
+		DependencyBasePrompt:         row.DependencyBasePrompt,
+		DependencyPromotionToken:     row.DependencyPromotionToken,
+		DependencyPromotionClaimedAt: nullTimeToTime(row.DependencyPromotionClaimedAt),
+		DependencyLaunchSucceededAt:  nullTimeToTime(row.DependencyLaunchSucceededAt),
+		Diagnostic:                   diagnostic,
 		Metadata: domain.SessionMetadata{
 			WorkspaceKind:                  domain.WorkspaceKind(row.WorkspaceKind),
 			Branch:                         row.Branch,
@@ -581,6 +798,8 @@ func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams
 		PendingSubmitRecoveryAttempted: pendingAttempted,
 		MergedCleanupPending:           rec.Metadata.MergedCleanupPending,
 		MergedCleanupPRURL:             rec.Metadata.MergedCleanupPRURL,
+		DependencyPreparedAt:           timeToNullTime(rec.DependencyPreparedAt),
+		DependencyBasePrompt:           rec.DependencyBasePrompt,
 		DiagnosticTrigger:              diagnosticTrigger,
 		DiagnosticTerminalTail:         diagnosticTail,
 		DiagnosticHookErrorType:        diagnosticErrorType,

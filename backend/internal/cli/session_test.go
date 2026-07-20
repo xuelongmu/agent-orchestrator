@@ -120,6 +120,11 @@ func sessionJSON(id, project, kind, status string, terminated bool) string {
 		payload["diagnostic"] = map[string]any{
 			"trigger": "runtime_probe_failed", "terminalTail": "probe timed out\nretrying", "capturedAt": "2026-06-02T12:00:00Z",
 		}
+		payload["handoff"] = map[string]any{
+			"changedFiles":         []string{"backend/internal/session_manager/manager.go", "frontend/src/renderer/components/SessionInspector.tsx"},
+			"verificationCommands": []string{"go test ./internal/session_manager", "npm --prefix frontend test -- SessionInspector"},
+			"residualRisk":         "CI validates Linux.\nWindows ConPTY was focused locally.",
+		}
 	}
 	b, _ := json.Marshal(payload)
 	return string(b)
@@ -228,6 +233,14 @@ func TestSessionGet_JSONOutputDecodes(t *testing.T) {
 	}
 	if got.Session.ID != "demo-1" || got.Session.ProjectID != "demo" || got.Session.Status != "working" {
 		t.Fatalf("unexpected session JSON: %#v", got.Session)
+	}
+	wantHandoff := &sessionHandoffDTO{
+		ChangedFiles:         []string{"backend/internal/session_manager/manager.go", "frontend/src/renderer/components/SessionInspector.tsx"},
+		VerificationCommands: []string{"go test ./internal/session_manager", "npm --prefix frontend test -- SessionInspector"},
+		ResidualRisk:         "CI validates Linux.\nWindows ConPTY was focused locally.",
+	}
+	if !reflect.DeepEqual(got.Session.Handoff, wantHandoff) {
+		t.Fatalf("session get --json lost exact handoff: got=%#v want=%#v\noutput=%s", got.Session.Handoff, wantHandoff, out)
 	}
 }
 

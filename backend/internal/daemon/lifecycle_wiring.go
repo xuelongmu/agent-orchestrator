@@ -16,6 +16,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/scratch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/workspacekind"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/dependency"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/observe/reaper"
@@ -83,7 +84,7 @@ type sessionLifecycle interface {
 // store + LCM, the per-session agent resolver, and the agent messenger. The
 // returned service is mounted at httpd APIDeps.Sessions. It also returns the
 // manager so the caller can wire Reconcile into the boot sequence.
-func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlite.Store, lcm *lifecycle.Manager, messenger ports.AgentMessenger, telemetry ports.EventSink, log *slog.Logger, capabilities ...sessionmanager.VerificationCapabilityIssuer) (*sessionsvc.Service, *reviewsvc.Service, sessionLifecycle, error) {
+func startSession(lifetimeCtx context.Context, cfg config.Config, runtime runtimeselect.Runtime, store *sqlite.Store, lcm *lifecycle.Manager, messenger ports.AgentMessenger, telemetry ports.EventSink, log *slog.Logger, capabilities ...sessionmanager.VerificationCapabilityIssuer) (*sessionsvc.Service, *reviewsvc.Service, sessionLifecycle, error) {
 	defaultAgent := cfg.Agent
 	if defaultAgent == "" {
 		defaultAgent = config.DefaultAgent
@@ -126,13 +127,18 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 		DataDir:                  cfg.DataDir,
 		Logger:                   log,
 		VerificationCapabilities: capabilityIssuer,
+		LifetimeContext:          lifetimeCtx,
 	})
+	dependencyScheduler := dependency.New(store, mgr, nil, log)
+	dependencyScheduler.SetLifetimeContext(lifetimeCtx)
+	mgr.SetDependencyScheduler(dependencyScheduler)
 	// Lifecycle decides when a session's PR set is complete; Session Manager
 	// owns the runtime/worktree/agent teardown that follows. Wire the late-bound
 	// edge here before daemon startup launches the SCM observer's first poll.
 	lcm.SetMergedSessionCleaner(mgr)
 	lcm.SetCompletedSessionCleaner(mgr)
 	lcm.SetAutomatedMessageSender(mgr)
+	lcm.SetDependencyScheduler(dependencyScheduler)
 	scmProvider, err := newGitHubSCMProvider(log)
 	if err != nil {
 		logSCMProviderDisabled(log, err)
@@ -150,12 +156,13 @@ func startSession(cfg config.Config, runtime runtimeselect.Runtime, store *sqlit
 		tracker = t
 	}
 	sessionSvc := sessionsvc.NewWithDeps(sessionsvc.Deps{
-		Manager:   mgr,
-		Store:     store,
-		PRClaimer: store,
-		SCM:       scmProvider,
-		Tracker:   tracker,
-		Telemetry: telemetry,
+		Manager:             mgr,
+		Store:               store,
+		PRClaimer:           store,
+		SCM:                 scmProvider,
+		Tracker:             tracker,
+		Telemetry:           telemetry,
+		DependencyScheduler: dependencyScheduler,
 		// no_signal only makes sense for harnesses whose adapters install
 		// activity hooks; the deriver registry is the source of truth for that.
 		SignalCapable: activitydispatch.SupportsHarness,

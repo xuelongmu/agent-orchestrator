@@ -205,7 +205,7 @@ func TestSpawnDependsOnWiring(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Fatal(err)
 			}
-			_, _ = io.WriteString(w, `{"session":{"id":"demo-3","status":"idle"}}`)
+			_, _ = io.WriteString(w, `{"session":{"id":"demo-3","status":"idle","dependencyPending":true}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -213,12 +213,42 @@ func TestSpawnDependsOnWiring(t *testing.T) {
 	t.Cleanup(srv.Close)
 	writeRunFileFor(t, cfg, srv)
 
-	_, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "spawn", "--project", "demo", "--agent", "codex", "--name", "child", "--depends-on", "demo-1,demo-2", "--depends-on", "demo-1")
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "spawn", "--project", "demo", "--agent", "codex", "--name", "child", "--depends-on", "demo-1,demo-2", "--depends-on", "demo-1")
 	if err != nil {
 		t.Fatalf("spawn failed: %v stderr=%s", err, errOut)
 	}
 	if want := []string{"demo-1", "demo-2"}; !reflect.DeepEqual(req.DependsOn, want) {
 		t.Fatalf("dependsOn = %#v, want %#v", req.DependsOn, want)
+	}
+	if !strings.Contains(out, "waiting on: demo-1, demo-2") || strings.Contains(out, "attach with:") {
+		t.Fatalf("pending spawn output = %q", out)
+	}
+}
+
+func TestSpawnAlreadyCompleteDependencyPrintsAttachInsteadOfWaiting(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/demo":
+			_, _ = io.WriteString(w, `{"status":"ok","project":{"id":"demo","name":"Demo","path":"/repo/demo"}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agents/refresh":
+			_, _ = io.WriteString(w, authorizedAgentsJSON("codex"))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions":
+			_, _ = io.WriteString(w, `{"session":{"id":"demo-3","status":"idle","dependencyPending":false}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "spawn", "--project", "demo", "--agent", "codex", "--name", "child", "--depends-on", "demo-1")
+	if err != nil {
+		t.Fatalf("spawn failed: %v stderr=%s", err, errOut)
+	}
+	if strings.Contains(out, "waiting on:") || !strings.Contains(out, "attach with:") {
+		t.Fatalf("already-promoted spawn output = %q", out)
 	}
 }
 
@@ -238,14 +268,14 @@ func TestNormalizeSpawnDependencies(t *testing.T) {
 	}
 }
 
-func TestSpawnHelpDescribesDependenciesAsReadOnly(t *testing.T) {
+func TestSpawnHelpDescribesAutomaticDependencyLaunch(t *testing.T) {
 	cmd := newSpawnCommand(&commandContext{})
 	flag := cmd.Flags().Lookup("depends-on")
-	if flag == nil || !strings.Contains(flag.Usage, "read-only prerequisite") {
+	if flag == nil || !strings.Contains(flag.Usage, "before launch") {
 		t.Fatalf("--depends-on help = %#v", flag)
 	}
-	if !strings.Contains(cmd.Long, "does not delay launch") {
-		t.Fatalf("spawn long help promises scheduling semantics: %q", cmd.Long)
+	if !strings.Contains(cmd.Long, "queues the session") {
+		t.Fatalf("spawn long help omits scheduling semantics: %q", cmd.Long)
 	}
 }
 

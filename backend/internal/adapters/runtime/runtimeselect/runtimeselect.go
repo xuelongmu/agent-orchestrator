@@ -30,9 +30,13 @@ var _ Runtime = (*conpty.Runtime)(nil)
 
 // New returns the per-platform runtime: tmux on Darwin/Linux, conpty on Windows.
 // log is accepted for signature stability with callers but is currently unused.
-func New(_ *slog.Logger) Runtime {
+func New(_ *slog.Logger, dataDirs ...string) Runtime {
 	if runtime.GOOS != "windows" {
 		return tmux.New(tmux.Options{})
 	}
-	return conpty.New(conpty.Options{})
+	var dataDir string
+	if len(dataDirs) > 0 {
+		dataDir = dataDirs[0]
+	}
+	return conpty.New(conpty.Options{DataDir: dataDir})
 }

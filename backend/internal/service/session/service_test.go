@@ -27,6 +27,16 @@ func (f *fakeTelemetrySink) Emit(_ context.Context, ev ports.TelemetryEvent) {
 }
 func (f *fakeTelemetrySink) Close(context.Context) error { return nil }
 
+type fakeDependencyReconciler struct {
+	calls int
+	err   error
+}
+
+func (f *fakeDependencyReconciler) Reconcile(context.Context) error {
+	f.calls++
+	return f.err
+}
+
 type fakeStore struct {
 	sessions                map[domain.SessionID]domain.SessionRecord
 	pr                      map[domain.SessionID]domain.PRFacts
@@ -180,7 +190,8 @@ func TestSubmitHandoffIsImmutableIdempotentAndDoesNotChangeLifecycleFacts(t *tes
 	now := time.Unix(1700000000, 0).UTC()
 	record := domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Activity: domain.Activity{State: domain.ActivityActive, LastActivityAt: now}, UpdatedAt: now}
 	st.sessions[record.ID] = record
-	svc := NewWithDeps(Deps{Store: st, Clock: func() time.Time { return now.Add(time.Hour) }})
+	scheduler := &fakeDependencyReconciler{}
+	svc := NewWithDeps(Deps{Store: st, Clock: func() time.Time { return now.Add(time.Hour) }, DependencyScheduler: scheduler})
 	handoff := domain.AgentHandoff{ChangedFiles: []string{"a.go"}, VerificationCommands: []string{"go test ./x"}, ResidualRisk: "CI pending"}
 	created, err := svc.SubmitHandoff(context.Background(), record.ID, handoff)
 	if err != nil || !created {
@@ -203,9 +214,28 @@ func TestSubmitHandoffIsImmutableIdempotentAndDoesNotChangeLifecycleFacts(t *tes
 	if got := st.sessions[record.ID]; got.Activity != record.Activity || got.IsTerminated != record.IsTerminated || !got.UpdatedAt.Equal(record.UpdatedAt) {
 		t.Fatalf("lifecycle record changed: got=%#v want=%#v", got, record)
 	}
+	if scheduler.calls != 2 {
+		t.Fatalf("sealed handoff reconciliation calls = %d, want first submit plus exact replay", scheduler.calls)
+	}
 	view, err := svc.Get(context.Background(), record.ID)
 	if err != nil || view.Handoff == nil || !view.Handoff.Equal(handoff) {
 		t.Fatalf("read model handoff=%#v err=%v", view.Handoff, err)
+	}
+}
+
+func TestSubmitHandoffReturnsSealedSuccessWhenPostCommitReconcileFails(t *testing.T) {
+	st := newFakeStore()
+	record := domain.SessionRecord{ID: "mer-1", ProjectID: "mer"}
+	st.sessions[record.ID] = record
+	scheduler := &fakeDependencyReconciler{err: errors.New("transient list-ready failure")}
+	svc := NewWithDeps(Deps{Store: st, DependencyScheduler: scheduler})
+	handoff := domain.AgentHandoff{ChangedFiles: []string{"a.go"}, VerificationCommands: []string{"go test ./..."}, ResidualRisk: "none"}
+	created, err := svc.SubmitHandoff(context.Background(), record.ID, handoff)
+	if err != nil || !created {
+		t.Fatalf("post-commit scheduler failure escaped sealed handoff: created=%v err=%v", created, err)
+	}
+	if got, ok := st.handoffs[record.ID]; !ok || !got.Equal(handoff) {
+		t.Fatalf("sealed handoff was not durable: %#v", st.handoffs)
 	}
 }
 
@@ -262,6 +292,29 @@ func TestListSessionsDoesNotLoadHandoffBlobsButDetailDoes(t *testing.T) {
 	detail, err := svc.Get(context.Background(), "mer-1")
 	if err != nil || detail.Handoff == nil || st.handoffReads != 1 {
 		t.Fatalf("detail did not lazy-load handoff: detail=%#v reads=%d err=%v", detail.Handoff, st.handoffReads, err)
+	}
+}
+
+func TestSessionReadModelExposesDurableDependencyPendingFact(t *testing.T) {
+	st := newFakeStore()
+	now := time.Now().UTC()
+	rec := domain.SessionRecord{
+		ID: "mer-2", ProjectID: "mer",
+		DependencyIDs:        domain.EncodeSessionDependencyIDs([]domain.SessionID{"mer-1"}),
+		DependencyPreparedAt: now, DependencyBasePrompt: "base",
+		Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
+	}
+	st.sessions[rec.ID] = rec
+	svc := NewWithDeps(Deps{Store: st, Clock: func() time.Time { return now }})
+	pending, err := svc.Get(context.Background(), rec.ID)
+	if err != nil || !pending.DependencyPending {
+		t.Fatalf("pending read model = %#v err=%v", pending, err)
+	}
+	rec.DependencyPromotedAt = now.Add(time.Second)
+	st.sessions[rec.ID] = rec
+	promoted, err := svc.Get(context.Background(), rec.ID)
+	if err != nil || promoted.DependencyPending {
+		t.Fatalf("promoted read model = %#v err=%v", promoted, err)
 	}
 }
 
