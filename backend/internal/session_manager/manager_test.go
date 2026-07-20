@@ -12,12 +12,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -51,6 +53,72 @@ type claimedFakeStore struct {
 	*fakeStore
 	claimedCreates int
 	intakeStarts   int
+}
+
+type lifecycleStoreAdapter struct {
+	*fakeStore
+	prs map[domain.SessionID][]domain.PullRequest
+}
+
+type restoreRepairDependencyWake struct {
+	store    *fakeStore
+	prs      map[domain.SessionID][]domain.PullRequest
+	parentID domain.SessionID
+	childID  domain.SessionID
+	wakes    int
+}
+
+func (s *restoreRepairDependencyWake) Wake() {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	s.wakes++
+	parent := s.store.sessions[s.parentID]
+	child := s.store.sessions[s.childID]
+	dependencyIDs, err := domain.DecodeSessionDependencyIDs(child.DependencyIDs)
+	if err != nil || !slices.Contains(dependencyIDs, s.parentID) || !parent.IsTerminated {
+		return
+	}
+	merged := false
+	for _, pr := range s.prs[s.parentID] {
+		merged = merged || pr.Merged
+	}
+	if merged {
+		child.DependencyPromotionToken = "reserved-after-parent-completion"
+		s.store.sessions[s.childID] = child
+	}
+}
+
+func (s *lifecycleStoreAdapter) UpdateSessionLifecycle(_ context.Context, before, after domain.SessionRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current, ok := s.sessions[before.ID]; ok && current == before {
+		s.sessions[after.ID] = after
+	}
+	return nil
+}
+func (*lifecycleStoreAdapter) MarkReservedDependencySpawned(context.Context, domain.SessionID, string, domain.SessionMetadata, time.Time) (bool, error) {
+	return false, nil
+}
+func (*lifecycleStoreAdapter) PrepareReservedDependencyWorkspace(context.Context, domain.SessionID, string, domain.SessionMetadata, []domain.SessionWorktreeRecord, time.Time) (bool, error) {
+	return false, nil
+}
+func (*lifecycleStoreAdapter) MarkReservedDependencyLaunchSucceeded(context.Context, domain.SessionID, string, time.Time) (bool, error) {
+	return false, nil
+}
+func (*lifecycleStoreAdapter) ResetReservedDependencyLaunch(context.Context, domain.SessionID, string, bool, time.Time) (bool, error) {
+	return false, nil
+}
+func (s *lifecycleStoreAdapter) ListPRsBySession(_ context.Context, id domain.SessionID) ([]domain.PullRequest, error) {
+	return s.prs[id], nil
+}
+func (*lifecycleStoreAdapter) GetPRLastNudgeSignature(context.Context, string) (string, error) {
+	return "", nil
+}
+func (*lifecycleStoreAdapter) UpdatePRLastNudgeSignature(context.Context, string, string) error {
+	return nil
+}
+func (*lifecycleStoreAdapter) GetPRDesignContract(context.Context, string) (string, bool, error) {
+	return "", false, nil
 }
 
 func (f *claimedFakeStore) CreateClaimedSession(ctx context.Context, rec domain.SessionRecord, _ ports.TrackerIntakeClaim, _ time.Time) (domain.SessionRecord, error) {
@@ -386,6 +454,26 @@ func (l *fakeLCM) MarkTerminated(_ context.Context, id domain.SessionID) error {
 	l.store.sessions[id] = rec
 	return nil
 }
+func (l *fakeLCM) MarkTerminatedIfExitedForRestore(_ context.Context, id domain.SessionID) (bool, error) {
+	if l.beforeTerminated != nil {
+		l.beforeTerminated(id)
+	}
+	rec := l.store.sessions[id]
+	if rec.IsTerminated {
+		return true, nil
+	}
+	if rec.Activity.State != domain.ActivityExited {
+		return false, nil
+	}
+	if l.terminated == nil {
+		l.terminated = map[domain.SessionID]int{}
+	}
+	l.terminated[id]++
+	rec.IsTerminated = true
+	l.store.sessions[id] = rec
+	return true, nil
+}
+func (*fakeLCM) ReconcileDependenciesAfterRestoreFailure() {}
 
 type fakeRuntime struct {
 	createErr          error
@@ -568,6 +656,19 @@ func (a afterStartAgent) GetPromptDeliveryStrategy(context.Context, ports.Launch
 	return ports.PromptDeliveryAfterStart, nil
 }
 
+type afterStartFailingCleanupAgent struct {
+	afterStartAgent
+	cleanupErr error
+}
+
+func (a afterStartFailingCleanupAgent) UninstallHooks(context.Context, string) error {
+	return a.cleanupErr
+}
+
+func (a afterStartFailingCleanupAgent) CleanupWorkspace(context.Context, ports.WorkspaceHookConfig) error {
+	return a.cleanupErr
+}
+
 type readinessAgent struct {
 	afterStartAgent
 	hints ports.PromptReadinessHints
@@ -606,6 +707,15 @@ type failingCleanupAgent struct {
 func (a failingCleanupAgent) UninstallHooks(context.Context, string) error { return a.err }
 func (a failingCleanupAgent) CleanupWorkspace(context.Context, ports.WorkspaceHookConfig) error {
 	return a.err
+}
+
+type failingRestoreCleanupAgent struct {
+	failingCleanupAgent
+	prepareErr error
+}
+
+func (a failingRestoreCleanupAgent) GetAgentHooks(context.Context, ports.WorkspaceHookConfig) error {
+	return a.prepareErr
 }
 
 func (a *cleaningAgent) UninstallHooks(_ context.Context, workspacePath string) error {
@@ -3036,11 +3146,10 @@ func TestKill_OrdinaryWorktreeWaitsForClaimWorkspaceMutation(t *testing.T) {
 	st.setSession(mkLive("mer-1"))
 
 	claimUnlock := m.LockWorkspaceMutation("mer-1")
-	firstRead := make(chan struct{})
-	var readOnce sync.Once
-	st.afterGetSession = func(id domain.SessionID) {
+	killGateAttempt := make(chan struct{})
+	m.workspaceMutationLockAttempt = func(id domain.SessionID) {
 		if id == "mer-1" {
-			readOnce.Do(func() { close(firstRead) })
+			close(killGateAttempt)
 		}
 	}
 	destroyEntered := make(chan struct{}, 1)
@@ -3051,11 +3160,16 @@ func TestKill_OrdinaryWorktreeWaitsForClaimWorkspaceMutation(t *testing.T) {
 		_, err := m.Kill(context.Background(), "mer-1")
 		killDone <- err
 	}()
-	<-firstRead
+	select {
+	case <-killGateAttempt:
+	case <-time.After(time.Second):
+		claimUnlock()
+		t.Fatal("Kill did not attempt to enter the workspace mutation gate")
+	}
 	select {
 	case <-destroyEntered:
 		t.Fatal("ordinary worktree Kill destroyed the runtime during ClaimPR workspace mutation")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	if ws.destroyed != 0 {
 		t.Fatalf("ordinary worktree Kill destroyed workspace during claim: %d", ws.destroyed)
@@ -3122,10 +3236,17 @@ func TestCleanupMergedSession_TearsDownReservedSessionWithoutLifecycleReentry(t 
 	rec := mkLive("mer-1")
 	rec.IsTerminated = true
 	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
+	rec.Metadata.MergedCleanupPending = true
+	rec.Metadata.MergedCleanupPRURL = "pr1"
+	rec.UpdatedAt = time.Now()
 	st.sessions["mer-1"] = rec
 
-	if err := m.CleanupMergedSession(ctx, "mer-1"); err != nil {
+	cleaned, err := m.CleanupMergedSession(ctx, "mer-1", ports.MergedCleanupLease{RuntimeHandleID: rec.Metadata.RuntimeHandleID, PRURL: "pr1", SessionUpdatedAt: rec.UpdatedAt})
+	if err != nil {
 		t.Fatalf("CleanupMergedSession: %v", err)
+	}
+	if !cleaned {
+		t.Fatal("CleanupMergedSession did not claim the matching reservation")
 	}
 	if rt.destroyed != 1 || ws.destroyed != 1 {
 		t.Fatalf("cleanup destroyed runtime/workspace = %d/%d, want 1/1", rt.destroyed, ws.destroyed)
@@ -3287,11 +3408,18 @@ func TestCleanupMergedSession_PreservesDirtyWorkspaceWithoutLifecycleReentry(t *
 	rec := mkLive("mer-1")
 	rec.IsTerminated = true
 	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
+	rec.Metadata.MergedCleanupPending = true
+	rec.Metadata.MergedCleanupPRURL = "pr1"
+	rec.UpdatedAt = time.Now()
 	st.sessions["mer-1"] = rec
 	ws.destroyErr = fmt.Errorf("gitworktree: refusing to remove: %w", ports.ErrWorkspaceDirty)
 
-	if err := m.CleanupMergedSession(ctx, "mer-1"); err != nil {
+	cleaned, err := m.CleanupMergedSession(ctx, "mer-1", ports.MergedCleanupLease{RuntimeHandleID: rec.Metadata.RuntimeHandleID, PRURL: "pr1", SessionUpdatedAt: rec.UpdatedAt})
+	if err != nil {
 		t.Fatalf("CleanupMergedSession: %v", err)
+	}
+	if !cleaned {
+		t.Fatal("CleanupMergedSession did not claim the matching reservation")
 	}
 	if rt.destroyed != 1 || ws.destroyed != 1 {
 		t.Fatalf("cleanup attempts runtime/workspace = %d/%d, want 1/1", rt.destroyed, ws.destroyed)
@@ -3453,6 +3581,639 @@ func TestRestore_ReopensTerminal(t *testing.T) {
 	}
 	if rt.created != 1 {
 		t.Fatal("restore should relaunch")
+	}
+}
+
+func TestRestore_RepairsExitedSessionMissingTerminalFact(t *testing.T) {
+	m, st, rt, ws := newManager()
+	rec := mkLive("mer-1")
+	rec.Metadata.Branch = "b"
+	rec.Metadata.AgentSessionID = "agent-x"
+	rec.Activity = domain.Activity{State: domain.ActivityExited}
+	st.sessions[rec.ID] = rec
+	rt.aliveByHandle = map[string]bool{rec.Metadata.RuntimeHandleID: true}
+
+	restored, err := m.Restore(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.IsTerminated || restored.Activity.State != domain.ActivityIdle {
+		t.Fatalf("restored record = %+v, want live and idle", restored)
+	}
+	if got := m.lcm.(*fakeLCM).terminated[rec.ID]; got != 1 {
+		t.Fatalf("terminal repairs = %d, want 1", got)
+	}
+	if rt.destroyed != 1 || ws.destroyed != 0 || rt.created != 1 {
+		t.Fatalf("teardown/relaunch calls: runtime destroy=%d workspace destroy=%d runtime create=%d, want 1/0/1", rt.destroyed, ws.destroyed, rt.created)
+	}
+}
+
+func TestRestore_SkipsSharedDirectoryCleanupFenceRuntime(t *testing.T) {
+	m, st, rt, ws := newManager()
+	rec := domain.SessionRecord{
+		ID:           "dir-1",
+		ProjectID:    "mer",
+		Harness:      domain.HarnessClaudeCode,
+		IsTerminated: true,
+		Activity:     domain.Activity{State: domain.ActivityExited},
+		Metadata: domain.SessionMetadata{
+			WorkspaceKind:   domain.WorkspaceKindDir,
+			WorkspacePath:   "/shared",
+			RuntimeHandleID: sharedDirCleanupPendingHandle,
+			AgentSessionID:  "agent-x",
+		},
+	}
+	st.setSession(rec)
+	ws.path = "/shared"
+
+	restored, err := m.Restore(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(rt.destroyedIDs, sharedDirCleanupPendingHandle) {
+		t.Fatalf("Restore passed internal shared-directory cleanup fence to runtime.Destroy: %v", rt.destroyedIDs)
+	}
+	if rt.destroyed != 0 || rt.created != 1 || restored.Metadata.RuntimeHandleID != "h1" {
+		t.Fatalf("restore teardown/create/handle = %d/%d/%q, want 0/1/h1", rt.destroyed, rt.created, restored.Metadata.RuntimeHandleID)
+	}
+}
+
+func TestRestore_PreCreateFailuresPreserveOldRuntime(t *testing.T) {
+	t.Run("validation", func(t *testing.T) {
+		m, st, rt, _ := newManager()
+		st.setSession(domain.SessionRecord{
+			ID: "mer-1", ProjectID: "mer", IsTerminated: true, Activity: domain.Activity{State: domain.ActivityExited},
+			Metadata: domain.SessionMetadata{RuntimeHandleID: "old-runtime", Prompt: "continue"},
+		})
+		if _, err := m.Restore(ctx, "mer-1"); !errors.Is(err, ErrIncompleteHandle) {
+			t.Fatalf("restore error = %v, want ErrIncompleteHandle", err)
+		}
+		if rt.destroyed != 0 || rt.created != 0 {
+			t.Fatalf("validation failure destroy/create = %d/%d, want 0/0", rt.destroyed, rt.created)
+		}
+	})
+
+	t.Run("workspace restore", func(t *testing.T) {
+		m, st, rt, ws := newManager()
+		seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "old-runtime", Prompt: "continue"})
+		ws.createErr = errors.New("workspace unavailable")
+		if _, err := m.Restore(ctx, "mer-1"); err == nil || !strings.Contains(err.Error(), "workspace unavailable") {
+			t.Fatalf("restore error = %v, want workspace failure", err)
+		}
+		if rt.destroyed != 0 || rt.created != 0 {
+			t.Fatalf("workspace failure destroy/create = %d/%d, want 0/0", rt.destroyed, rt.created)
+		}
+	})
+
+	t.Run("agent preparation", func(t *testing.T) {
+		st := newFakeStore()
+		st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+		seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "old-runtime", Prompt: "continue"})
+		rt := &fakeRuntime{}
+		prepareErr := errors.New("hook install failed")
+		m := New(Deps{
+			Runtime:   rt,
+			Agents:    singleAgent{agent: &hookErrorCleaningAgent{hookErr: prepareErr}},
+			Workspace: &fakeWorkspace{},
+			Store:     st,
+			Messenger: &fakeMessenger{},
+			Lifecycle: &fakeLCM{store: st},
+			LookPath:  func(string) (string, error) { return "/bin/true", nil },
+		})
+		if _, err := m.Restore(ctx, "mer-1"); !errors.Is(err, prepareErr) {
+			t.Fatalf("restore error = %v, want preparation failure", err)
+		}
+		if rt.destroyed != 0 || rt.created != 0 {
+			t.Fatalf("preparation failure destroy/create = %d/%d, want 0/0", rt.destroyed, rt.created)
+		}
+	})
+}
+
+func TestRestore_DestroysOldRuntimeImmediatelyBeforeCreate(t *testing.T) {
+	m, st, rt, _ := newManager()
+	seedTerminal(st, "mer-1", domain.SessionMetadata{
+		WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "old-runtime", AgentSessionID: "agent-x",
+	})
+	var events []string
+	rt.beforeDestroy = func(handle ports.RuntimeHandle) {
+		events = append(events, "destroy:"+handle.ID)
+	}
+	rt.beforeCreate = func(ports.RuntimeConfig) {
+		events = append(events, "create")
+	}
+
+	if _, err := m.Restore(ctx, "mer-1"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"destroy:old-runtime", "create"}
+	if !reflect.DeepEqual(events, want) || rt.destroyed != 1 || rt.created != 1 {
+		t.Fatalf("restore events/destroy/create = %v/%d/%d, want %v/1/1", events, rt.destroyed, rt.created, want)
+	}
+}
+
+func TestRestoreRepairDefersDependencyWakeUntilOutcome(t *testing.T) {
+	for _, restoreFails := range []bool{false, true} {
+		name := "success_keeps_child_waiting"
+		if restoreFails {
+			name = "failure_wakes_child"
+		}
+		t.Run(name, func(t *testing.T) {
+			m, st, rt, _ := newManager()
+			parent := mkLive("parent")
+			parent.Harness = domain.HarnessClaudeCode
+			parent.Metadata.Branch = "b"
+			parent.Metadata.AgentSessionID = "agent-x"
+			parent.Activity = domain.Activity{State: domain.ActivityExited}
+			parent.UpdatedAt = time.Now().UTC()
+			child := domain.SessionRecord{
+				ID:                   "child",
+				ProjectID:            parent.ProjectID,
+				Kind:                 domain.KindWorker,
+				Harness:              domain.HarnessClaudeCode,
+				Activity:             domain.Activity{State: domain.ActivityIdle},
+				DependencyIDs:        domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID}),
+				DependencyPreparedAt: time.Now().UTC(),
+				DependencyBasePrompt: "wait for parent",
+				Metadata:             domain.SessionMetadata{Prompt: "wait for parent"},
+			}
+			st.setSession(parent)
+			st.setSession(child)
+			prs := map[domain.SessionID][]domain.PullRequest{
+				parent.ID: {{URL: "pr1", Merged: true}},
+			}
+			lifecycleStore := &lifecycleStoreAdapter{fakeStore: st, prs: prs}
+			lcm := lifecycle.New(lifecycleStore, nil)
+			wake := &restoreRepairDependencyWake{store: st, prs: prs, parentID: parent.ID, childID: child.ID}
+			lcm.SetDependencyScheduler(wake)
+			m.lcm = lcm
+			if restoreFails {
+				rt.createErr = errors.New("runtime unavailable")
+			}
+
+			restored, err := m.Restore(ctx, parent.ID)
+			if restoreFails {
+				if err == nil || !strings.Contains(err.Error(), "runtime unavailable") {
+					t.Fatalf("restore error = %v, want runtime failure", err)
+				}
+				if wake.wakes != 1 || st.sessions[child.ID].DependencyPromotionToken == "" {
+					t.Fatalf("failed restore dependency wake/token = %d/%q, want 1/reserved", wake.wakes, st.sessions[child.ID].DependencyPromotionToken)
+				}
+				if !st.sessions[parent.ID].IsTerminated {
+					t.Fatalf("failed restore left parent live: %+v", st.sessions[parent.ID])
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+			if restored.IsTerminated || wake.wakes != 0 || st.sessions[child.ID].DependencyPromotionToken != "" {
+				t.Fatalf("successful restore parent/wake/child token = %v/%d/%q, want live/0/empty", restored.IsTerminated, wake.wakes, st.sessions[child.ID].DependencyPromotionToken)
+			}
+		})
+	}
+}
+
+func TestRestoreRepairAfterStartFailureWakesDependenciesExactlyOnce(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	parent := mkLive("parent")
+	parent.Harness = domain.HarnessClaudeCode
+	parent.Metadata.Branch = "b"
+	parent.Metadata.Prompt = "continue the task"
+	parent.Activity = domain.Activity{State: domain.ActivityExited}
+	parent.UpdatedAt = time.Now().UTC()
+	child := domain.SessionRecord{
+		ID:                   "child",
+		ProjectID:            parent.ProjectID,
+		Kind:                 domain.KindWorker,
+		Harness:              domain.HarnessClaudeCode,
+		Activity:             domain.Activity{State: domain.ActivityIdle},
+		DependencyIDs:        domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID}),
+		DependencyPreparedAt: time.Now().UTC(),
+		DependencyBasePrompt: "wait for parent",
+		Metadata:             domain.SessionMetadata{Prompt: "wait for parent"},
+	}
+	st.setSession(parent)
+	st.setSession(child)
+	prs := map[domain.SessionID][]domain.PullRequest{
+		parent.ID: {{URL: "pr1", Merged: true}},
+	}
+	lifecycleStore := &lifecycleStoreAdapter{fakeStore: st, prs: prs}
+	lcm := lifecycle.New(lifecycleStore, nil)
+	wake := &restoreRepairDependencyWake{store: st, prs: prs, parentID: parent.ID, childID: child.ID}
+	lcm.SetDependencyScheduler(wake)
+	rt := &fakeRuntime{}
+	m := New(Deps{
+		Runtime:   rt,
+		Agents:    singleAgent{agent: afterStartAgent{recordingAgent: &recordingAgent{}}},
+		Workspace: &fakeWorkspace{},
+		Store:     st,
+		Messenger: &fakeMessenger{err: errors.New("pane unavailable")},
+		Lifecycle: lcm,
+		LookPath:  func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	if _, err := m.Restore(ctx, parent.ID); err == nil || !strings.Contains(err.Error(), "pane unavailable") {
+		t.Fatalf("restore error = %v, want after-start delivery failure", err)
+	}
+	gotParent := st.sessions[parent.ID]
+	gotChild := st.sessions[child.ID]
+	if !gotParent.IsTerminated || gotParent.Activity.State != domain.ActivityExited {
+		t.Fatalf("parent after delivery rollback = %+v, want terminal/exited", gotParent)
+	}
+	if wake.wakes != 1 || gotChild.DependencyPromotionToken == "" {
+		t.Fatalf("dependency wake/token = %d/%q, want exactly 1/reserved", wake.wakes, gotChild.DependencyPromotionToken)
+	}
+	if rt.created != 1 || rt.destroyed != 2 {
+		t.Fatalf("runtime create/destroy = %d/%d, want 1/2 (old and rolled-back replacement)", rt.created, rt.destroyed)
+	}
+}
+
+func TestRestoreRepairSharedDirAfterStartCleanupFailureWakesDependenciesExactlyOnce(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/shared", Config: testRoleAgents()}
+	parent := mkLive("parent")
+	parent.Harness = domain.HarnessClaudeCode
+	parent.Metadata.WorkspaceKind = domain.WorkspaceKindDir
+	parent.Metadata.WorkspacePath = "/shared"
+	parent.Metadata.Branch = ""
+	parent.Metadata.Prompt = "continue the task"
+	parent.Activity = domain.Activity{State: domain.ActivityExited}
+	parent.UpdatedAt = time.Now().UTC()
+	child := domain.SessionRecord{
+		ID:                   "child",
+		ProjectID:            parent.ProjectID,
+		Kind:                 domain.KindWorker,
+		Harness:              domain.HarnessClaudeCode,
+		Activity:             domain.Activity{State: domain.ActivityIdle},
+		DependencyIDs:        domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID}),
+		DependencyPreparedAt: time.Now().UTC(),
+		DependencyBasePrompt: "wait for parent",
+		Metadata:             domain.SessionMetadata{Prompt: "wait for parent"},
+	}
+	st.setSession(parent)
+	st.setSession(child)
+	prs := map[domain.SessionID][]domain.PullRequest{
+		parent.ID: {{URL: "pr1", Merged: true}},
+	}
+	lifecycleStore := &lifecycleStoreAdapter{fakeStore: st, prs: prs}
+	lcm := lifecycle.New(lifecycleStore, nil)
+	wake := &restoreRepairDependencyWake{store: st, prs: prs, parentID: parent.ID, childID: child.ID}
+	lcm.SetDependencyScheduler(wake)
+	deliveryErr := errors.New("pane unavailable")
+	cleanupErr := errors.New("shared hooks still busy")
+	rt := &fakeRuntime{}
+	m := New(Deps{
+		Runtime: rt,
+		Agents: singleAgent{agent: afterStartFailingCleanupAgent{
+			afterStartAgent: afterStartAgent{recordingAgent: &recordingAgent{}},
+			cleanupErr:      cleanupErr,
+		}},
+		Workspace: &fakeWorkspace{path: "/shared"},
+		Store:     st,
+		Messenger: &fakeMessenger{err: deliveryErr},
+		Lifecycle: lcm,
+		LookPath:  func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	_, err := m.Restore(ctx, parent.ID)
+	if !errors.Is(err, deliveryErr) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("restore joined error = %v, want delivery and cleanup failures", err)
+	}
+	gotParent := st.sessions[parent.ID]
+	gotChild := st.sessions[child.ID]
+	if !gotParent.IsTerminated || gotParent.Activity.State != domain.ActivityExited {
+		t.Fatalf("parent after shared-dir rollback = %+v, want terminal/exited", gotParent)
+	}
+	if wake.wakes != 1 || gotChild.DependencyPromotionToken == "" {
+		t.Fatalf("dependency wake/token = %d/%q, want exactly 1/reserved", wake.wakes, gotChild.DependencyPromotionToken)
+	}
+	if gotParent.Metadata.WorkspaceKind != domain.WorkspaceKindDir || gotParent.Metadata.WorkspacePath != "/shared" || gotParent.Metadata.RuntimeHandleID == "" {
+		t.Fatalf("retained shared-dir cleanup lease = %+v, want dir path and nonempty handle marker", gotParent.Metadata)
+	}
+	if rt.created != 1 || rt.destroyed != 2 {
+		t.Fatalf("runtime create/destroy = %d/%d, want 1/2 (old and rolled-back replacement)", rt.created, rt.destroyed)
+	}
+}
+
+func TestRestore_RefusesExitedSessionThatRecoveredBeforeTerminalClaim(t *testing.T) {
+	m, st, rt, _ := newManager()
+	rec := mkLive("mer-1")
+	rec.Metadata.Branch = "b"
+	rec.Activity = domain.Activity{State: domain.ActivityExited}
+	st.sessions[rec.ID] = rec
+	m.lcm.(*fakeLCM).beforeTerminated = func(id domain.SessionID) {
+		recovered := st.sessions[id]
+		recovered.Activity = domain.Activity{State: domain.ActivityActive}
+		st.sessions[id] = recovered
+	}
+
+	if _, err := m.Restore(ctx, rec.ID); !errors.Is(err, ErrNotRestorable) {
+		t.Fatalf("restore error = %v, want ErrNotRestorable", err)
+	}
+	if st.sessions[rec.ID].IsTerminated || rt.destroyed != 0 || rt.created != 0 {
+		t.Fatalf("recovered live session was changed: record=%+v destroy=%d create=%d", st.sessions[rec.ID], rt.destroyed, rt.created)
+	}
+}
+
+func TestRestore_SerializesConcurrentTransitions(t *testing.T) {
+	m, st, rt, _ := newManager()
+	seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "h1", AgentSessionID: "agent-x"})
+	firstDestroyStarted := make(chan struct{})
+	secondDestroyStarted := make(chan struct{})
+	releaseFirstDestroy := make(chan struct{})
+	var destroyCallsMu sync.Mutex
+	destroyCalls := 0
+	rt.beforeDestroy = func(ports.RuntimeHandle) {
+		destroyCallsMu.Lock()
+		destroyCalls++
+		call := destroyCalls
+		destroyCallsMu.Unlock()
+		switch call {
+		case 1:
+			close(firstDestroyStarted)
+			<-releaseFirstDestroy
+		case 2:
+			close(secondDestroyStarted)
+		}
+	}
+
+	results := make(chan error, 2)
+	go func() {
+		_, err := m.Restore(context.Background(), "mer-1")
+		results <- err
+	}()
+	<-firstDestroyStarted
+	contenderGateAttempt := make(chan struct{})
+	m.workspaceMutationLockAttempt = func(id domain.SessionID) {
+		if id == "mer-1" {
+			close(contenderGateAttempt)
+		}
+	}
+	go func() {
+		_, err := m.Restore(context.Background(), "mer-1")
+		results <- err
+	}()
+	select {
+	case <-contenderGateAttempt:
+	case <-time.After(time.Second):
+		close(releaseFirstDestroy)
+		t.Fatal("concurrent restore did not attempt to enter the session mutation gate")
+	}
+	concurrentTeardown := false
+	select {
+	case <-secondDestroyStarted:
+		concurrentTeardown = true
+	default:
+	}
+	close(releaseFirstDestroy)
+
+	var succeeded, refused int
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrNotRestorable):
+			refused++
+		default:
+			t.Fatalf("restore error = %v", err)
+		}
+	}
+	if concurrentTeardown {
+		t.Fatal("concurrent restore reached runtime teardown before the first transition completed")
+	}
+	if succeeded != 1 || refused != 1 || rt.destroyed != 1 || rt.created != 1 {
+		t.Fatalf("restore outcomes: success=%d refused=%d destroy=%d create=%d, want 1/1/1/1", succeeded, refused, rt.destroyed, rt.created)
+	}
+	if got := st.sessions["mer-1"]; got.IsTerminated || got.Activity.State != domain.ActivityIdle {
+		t.Fatalf("replacement session = %+v, want live and idle", got)
+	}
+}
+
+func TestRestore_SerializesWithKillSoStaleTeardownCannotKillReplacement(t *testing.T) {
+	m, st, rt, _ := newManager()
+	seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "h1", AgentSessionID: "agent-x"})
+	firstDestroyStarted := make(chan struct{})
+	secondDestroyStarted := make(chan struct{})
+	releaseFirstDestroy := make(chan struct{})
+	var destroyCallsMu sync.Mutex
+	destroyCalls := 0
+	rt.beforeDestroy = func(ports.RuntimeHandle) {
+		destroyCallsMu.Lock()
+		destroyCalls++
+		call := destroyCalls
+		destroyCallsMu.Unlock()
+		switch call {
+		case 1:
+			close(firstDestroyStarted)
+			<-releaseFirstDestroy
+		case 2:
+			close(secondDestroyStarted)
+		}
+	}
+
+	killResult := make(chan error, 1)
+	go func() {
+		_, err := m.Kill(context.Background(), "mer-1")
+		killResult <- err
+	}()
+	<-firstDestroyStarted
+	contenderGateAttempt := make(chan struct{})
+	m.workspaceMutationLockAttempt = func(id domain.SessionID) {
+		if id == "mer-1" {
+			close(contenderGateAttempt)
+		}
+	}
+	restoreResult := make(chan error, 1)
+	go func() {
+		_, err := m.Restore(context.Background(), "mer-1")
+		restoreResult <- err
+	}()
+	select {
+	case <-contenderGateAttempt:
+	case <-time.After(time.Second):
+		close(releaseFirstDestroy)
+		t.Fatal("restore did not attempt to enter the session mutation gate")
+	}
+	concurrentTeardown := false
+	select {
+	case <-secondDestroyStarted:
+		concurrentTeardown = true
+	default:
+	}
+	close(releaseFirstDestroy)
+	if err := <-killResult; err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	if err := <-restoreResult; err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if concurrentTeardown {
+		t.Fatal("restore reached runtime teardown while kill still owned the transition")
+	}
+	if rt.destroyed != 2 || rt.created != 1 {
+		t.Fatalf("runtime destroy/create = %d/%d, want 2/1", rt.destroyed, rt.created)
+	}
+	if got := st.sessions["mer-1"]; got.IsTerminated || got.Activity.State != domain.ActivityIdle {
+		t.Fatalf("replacement session = %+v, want live and idle", got)
+	}
+}
+
+func TestRestore_SerializesWithCleanupSoStaleTeardownCannotKillReplacement(t *testing.T) {
+	m, st, rt, _ := newManager()
+	seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "h1", AgentSessionID: "agent-x"})
+	firstDestroyStarted := make(chan struct{})
+	secondDestroyStarted := make(chan struct{})
+	releaseFirstDestroy := make(chan struct{})
+	var destroyCallsMu sync.Mutex
+	destroyCalls := 0
+	rt.beforeDestroy = func(ports.RuntimeHandle) {
+		destroyCallsMu.Lock()
+		destroyCalls++
+		call := destroyCalls
+		destroyCallsMu.Unlock()
+		switch call {
+		case 1:
+			close(firstDestroyStarted)
+			<-releaseFirstDestroy
+		case 2:
+			close(secondDestroyStarted)
+		}
+	}
+
+	cleanupResult := make(chan CleanupResult, 1)
+	cleanupErr := make(chan error, 1)
+	go func() {
+		result, err := m.Cleanup(context.Background(), "mer")
+		cleanupResult <- result
+		cleanupErr <- err
+	}()
+	<-firstDestroyStarted
+	contenderGateAttempt := make(chan struct{})
+	m.workspaceMutationLockAttempt = func(id domain.SessionID) {
+		if id == "mer-1" {
+			close(contenderGateAttempt)
+		}
+	}
+	restoreResult := make(chan error, 1)
+	go func() {
+		_, err := m.Restore(context.Background(), "mer-1")
+		restoreResult <- err
+	}()
+	select {
+	case <-contenderGateAttempt:
+	case <-time.After(time.Second):
+		close(releaseFirstDestroy)
+		t.Fatal("restore did not attempt to enter the session mutation gate")
+	}
+	concurrentTeardown := false
+	select {
+	case <-secondDestroyStarted:
+		concurrentTeardown = true
+	default:
+	}
+	close(releaseFirstDestroy)
+	if err := <-cleanupErr; err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	result := <-cleanupResult
+	if len(result.Cleaned) != 1 || result.Cleaned[0] != "mer-1" || len(result.Skipped) != 0 {
+		t.Fatalf("cleanup result = %+v, want mer-1 cleaned", result)
+	}
+	if err := <-restoreResult; err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if concurrentTeardown {
+		t.Fatal("restore reached runtime teardown while cleanup still owned the transition")
+	}
+	if rt.destroyed != 2 || rt.created != 1 {
+		t.Fatalf("runtime destroy/create = %d/%d, want 2/1", rt.destroyed, rt.created)
+	}
+	if got := st.sessions["mer-1"]; got.IsTerminated || got.Activity.State != domain.ActivityIdle {
+		t.Fatalf("replacement session = %+v, want live and idle", got)
+	}
+}
+
+func TestMergedCleanup_RevalidatesReservationAfterRestore(t *testing.T) {
+	for _, retry := range []bool{false, true} {
+		name := "initial_cleanup"
+		if retry {
+			name = "retry_cleanup"
+		}
+		t.Run(name, func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			rec := mkLive("mer-1")
+			rec.Metadata.Branch = "b"
+			rec.Metadata.AgentSessionID = "agent-x"
+			rec.UpdatedAt = time.Now().UTC()
+			if retry {
+				rec.IsTerminated = true
+				rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: rec.UpdatedAt}
+				rec.Metadata.MergedCleanupPending = true
+				rec.Metadata.MergedCleanupPRURL = "pr1"
+			}
+			st.setSession(rec)
+			lifecycleStore := &lifecycleStoreAdapter{
+				fakeStore: st,
+				prs:       map[domain.SessionID][]domain.PullRequest{rec.ID: {{URL: "pr1", Merged: true}}},
+			}
+			lcm := lifecycle.New(lifecycleStore, nil)
+			lcm.SetMergedSessionCleaner(m)
+			m.lcm = lcm
+
+			cleanupGateAttempt := make(chan struct{})
+			releaseCleanupGate := make(chan struct{})
+			m.workspaceMutationLockAttempt = func(id domain.SessionID) {
+				if id == rec.ID {
+					close(cleanupGateAttempt)
+					<-releaseCleanupGate
+				}
+			}
+			cleanupDone := make(chan error, 1)
+			go func() {
+				if retry {
+					cleanupDone <- lcm.RetryMergedCleanup(context.Background(), rec.ID)
+					return
+				}
+				cleanupDone <- lcm.ApplyPRObservation(context.Background(), rec.ID, ports.PRObservation{Fetched: true, URL: "pr1", Merged: true})
+			}()
+			select {
+			case <-cleanupGateAttempt:
+			case <-time.After(time.Second):
+				close(releaseCleanupGate)
+				t.Fatal("merged cleanup did not attempt to enter the session mutation gate")
+			}
+			reserved := st.sessions[rec.ID]
+			if !reserved.IsTerminated || !reserved.Metadata.MergedCleanupPending {
+				close(releaseCleanupGate)
+				t.Fatalf("cleanup reached the gate without a terminal reservation: %+v", reserved)
+			}
+
+			// The cleanup contender is paused immediately before the gate. Let
+			// Restore own the transition and publish a new runtime generation.
+			m.workspaceMutationLockAttempt = nil
+			restored, err := m.Restore(context.Background(), rec.ID)
+			if err != nil {
+				close(releaseCleanupGate)
+				t.Fatalf("restore: %v", err)
+			}
+			close(releaseCleanupGate)
+			if err := <-cleanupDone; err != nil {
+				t.Fatalf("merged cleanup: %v", err)
+			}
+
+			if restored.IsTerminated || restored.Activity.State != domain.ActivityIdle || restored.Metadata.MergedCleanupPending {
+				t.Fatalf("restored replacement = %+v, want live without the stale cleanup latch", restored)
+			}
+			if rt.destroyed != 1 || rt.created != 1 || ws.destroyed != 0 {
+				t.Fatalf("cleanup touched replacement: runtime destroy/create=%d/%d workspace destroy=%d, want 1/1/0", rt.destroyed, rt.created, ws.destroyed)
+			}
+			if got := st.sessions[rec.ID]; got.IsTerminated || got.Metadata.MergedCleanupPending || got.Metadata.RuntimeHandleID != "h1" {
+				t.Fatalf("durable replacement was changed by delayed cleanup: %+v", got)
+			}
+		})
 	}
 }
 
@@ -6718,9 +7479,11 @@ func TestReconcile_AdoptAcrossDaemonRestart(t *testing.T) {
 	if st.num != 0 {
 		t.Fatalf("Reconcile minted %d new session(s); adoption must reuse existing ids", st.num)
 	}
-	// Adopted runtimes were never torn down.
-	if rt.destroyed != 0 {
-		t.Fatalf("adopted sessions must not be destroyed; Destroy called %d times", rt.destroyed)
+	// Adopted runtimes were never torn down. The dead worker's deterministic
+	// handle is still destroyed idempotently at the immediate pre-create
+	// boundary before it is reused.
+	if !reflect.DeepEqual(rt.destroyedIDs, []string{"w-dead"}) {
+		t.Fatalf("destroyed runtime ids = %v, want only dead worker w-dead", rt.destroyedIDs)
 	}
 	// Dead worker captured, then relaunched under its original id on this same boot.
 	if lcm.terminated["mer-3"] != 1 {
@@ -6780,6 +7543,74 @@ func TestReconcileReap_TerminatedAndDeadTmuxLeftAlone(t *testing.T) {
 	}
 	if rt.destroyed != 0 {
 		t.Fatalf("Destroy calls = %d, want 0", rt.destroyed)
+	}
+}
+
+func TestReconcile_RetryableSharedDirRestoreFenceNeverDestroyedAsRuntime(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/shared", Config: testRoleAgents()}
+	rec := domain.SessionRecord{
+		ID:           "dir-1",
+		ProjectID:    "mer",
+		Kind:         domain.KindWorker,
+		Harness:      domain.HarnessClaudeCode,
+		IsTerminated: true,
+		Activity:     domain.Activity{State: domain.ActivityExited},
+		Metadata: domain.SessionMetadata{
+			WorkspaceKind: domain.WorkspaceKindDir,
+			WorkspacePath: "/shared",
+			Prompt:        "continue the task",
+		},
+	}
+	st.setSession(rec)
+	st.worktrees[rec.ID] = []domain.SessionWorktreeRecord{{
+		SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, WorktreePath: "/shared", State: "removed",
+	}}
+	rt := &fakeRuntime{}
+	agent := failingRestoreCleanupAgent{
+		failingCleanupAgent: failingCleanupAgent{err: errors.New("cleanup still busy")},
+		prepareErr:          errors.New("hook install failed"),
+	}
+	m := New(Deps{
+		Runtime:   rt,
+		Agents:    singleAgent{agent: agent},
+		Workspace: &fakeWorkspace{path: "/shared"},
+		Store:     st,
+		Messenger: &fakeMessenger{},
+		Lifecycle: &fakeLCM{store: st},
+		LookPath:  func(string) (string, error) { return "/bin/true", nil },
+		Logger:    slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+	})
+
+	// The first boot restore fails after workspace preparation and persists the
+	// cleanup lease sentinel alongside the unconsumed restart marker.
+	if err := m.RestoreAll(ctx); err != nil {
+		t.Fatalf("RestoreAll: %v", err)
+	}
+	if got := st.sessions[rec.ID].Metadata.RuntimeHandleID; got != sharedDirCleanupPendingHandle {
+		t.Fatalf("failed RestoreAll handle = %q, want cleanup sentinel", got)
+	}
+	if len(st.worktrees[rec.ID]) != 1 {
+		t.Fatalf("failed RestoreAll consumed retry marker: %+v", st.worktrees[rec.ID])
+	}
+
+	// The next boot reap retries hook cleanup but must never interpret the
+	// sentinel as a runtime. Continued cleanup failure retains both durable
+	// retry inputs for a later reconciliation pass.
+	if err := m.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if slices.Contains(rt.destroyedIDs, sharedDirCleanupPendingHandle) {
+		t.Fatalf("cleanup sentinel reached runtime.Destroy: %v", rt.destroyedIDs)
+	}
+	if got := st.sessions[rec.ID]; !got.IsTerminated || got.Metadata.RuntimeHandleID != sharedDirCleanupPendingHandle {
+		t.Fatalf("retryable cleanup state = %+v, want terminal sentinel lease", got)
+	}
+	if rows := st.worktrees[rec.ID]; len(rows) != 1 || rows[0].State != "removed" {
+		t.Fatalf("retry marker after Reconcile = %+v, want one removed row", rows)
+	}
+	if rt.created != 0 {
+		t.Fatalf("failed restore attempts created %d runtimes, want 0", rt.created)
 	}
 }
 

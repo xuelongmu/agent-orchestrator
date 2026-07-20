@@ -2,9 +2,19 @@ package ports
 
 import (
 	"errors"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
+
+// MergedCleanupLease fences lifecycle-owned resource teardown to the exact
+// terminal reservation and runtime generation observed before external I/O.
+// SessionUpdatedAt snapshots the lifecycle generation that owns the latch.
+type MergedCleanupLease struct {
+	RuntimeHandleID  string
+	PRURL            string
+	SessionUpdatedAt time.Time
+}
 
 // ErrSessionNotFound reports an observation for an unknown session id.
 var ErrSessionNotFound = errors.New("session not found")

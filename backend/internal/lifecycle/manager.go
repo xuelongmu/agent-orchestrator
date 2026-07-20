@@ -69,9 +69,10 @@ type notificationSink interface {
 // whose pull requests reached the lifecycle completion bar. It is a
 // resource-only callback: implementations must not call back into lifecycle.
 // Lifecycle durably reserves the terminal state before invoking it and clears
-// the replay latch only after it succeeds.
+// the replay latch only after it succeeds. cleaned=false means the reservation
+// lease no longer owns the authoritative session generation.
 type MergedSessionCleaner interface {
-	CleanupMergedSession(ctx context.Context, id domain.SessionID) error
+	CleanupMergedSession(ctx context.Context, id domain.SessionID, lease ports.MergedCleanupLease) (bool, error)
 }
 
 // CompletedSessionCleaner tears down ephemeral or shared external resources
@@ -866,6 +867,10 @@ func (m *Manager) MarkSpawned(ctx context.Context, id domain.SessionID, metadata
 	// a stale "signals worked once" fact.
 	rec.FirstSignalAt = time.Time{}
 	rec.Diagnostic = nil
+	// A restore starts a new runtime generation. Any delayed merged-cleanup
+	// callback belongs to the prior terminal generation and must lose its latch.
+	rec.Metadata.MergedCleanupPending = false
+	rec.Metadata.MergedCleanupPRURL = ""
 	rec.Metadata = mergeMetadata(rec.Metadata, metadata)
 	rec.UpdatedAt = now
 	return m.store.UpdateSession(ctx, rec)
@@ -926,6 +931,36 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 	return m.reconcileDependencies()
 }
 
+// MarkTerminatedIfExitedForRestore repairs the terminal fact only while the
+// latest authoritative activity is still exited. It deliberately defers the
+// dependency wake: a successful restore immediately makes the parent live
+// again, while Restore calls ReconcileDependenciesAfterRestoreFailure when the
+// repaired terminal fact becomes the final outcome.
+func (m *Manager) MarkTerminatedIfExitedForRestore(ctx context.Context, id domain.SessionID) (bool, error) {
+	eligible := false
+	err := m.mutate(ctx, id, func(cur domain.SessionRecord, _ time.Time) (domain.SessionRecord, bool) {
+		if cur.IsTerminated {
+			eligible = true
+			return cur, false
+		}
+		if cur.Activity.State != domain.ActivityExited {
+			return cur, false
+		}
+		eligible = true
+		cur.IsTerminated = true
+		delete(m.flights, id)
+		return cur, true
+	})
+	return eligible, err
+}
+
+// ReconcileDependenciesAfterRestoreFailure publishes a provisional restore
+// repair as the final terminal outcome. The scheduler re-reads authoritative
+// parent state before reserving any child.
+func (m *Manager) ReconcileDependenciesAfterRestoreFailure() {
+	_ = m.reconcileDependencies()
+}
+
 // markTerminatedUnlessRateLimited atomically applies an automated terminal
 // transition only when the session is not parked on a provider usage limit.
 // Explicit user-owned teardown continues to use MarkTerminated.
@@ -953,46 +988,60 @@ func (m *Manager) markTerminatedUnlessRateLimited(ctx context.Context, id domain
 // provider usage-limit park. It intentionally keeps MergedCleanupPending set:
 // external teardown happens after this write and may need replay after a
 // failure or daemon restart.
-func (m *Manager) reserveMergedCleanup(ctx context.Context, id domain.SessionID) error {
+func (m *Manager) reserveMergedCleanup(ctx context.Context, id domain.SessionID) (ports.MergedCleanupLease, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
-		return err
+		return ports.MergedCleanupLease{}, false, err
 	}
 	if !ok {
-		return fmt.Errorf("%w: %s", ports.ErrSessionNotFound, id)
+		return ports.MergedCleanupLease{}, false, fmt.Errorf("%w: %s", ports.ErrSessionNotFound, id)
 	}
 	if cur.Activity.State == domain.ActivityRateLimited {
-		return errMergedCleanupRateLimited
+		return ports.MergedCleanupLease{}, false, errMergedCleanupRateLimited
 	}
 	if !cur.Metadata.MergedCleanupPending {
-		return nil
+		return ports.MergedCleanupLease{}, false, nil
 	}
-	if cur.IsTerminated && cur.Activity.State == domain.ActivityExited {
-		return nil
+	if !cur.IsTerminated || cur.Activity.State != domain.ActivityExited {
+		before := cur
+		now := m.clock()
+		cur.IsTerminated = true
+		cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
+		cur = applyPendingSubmitInvariant(cur)
+		cur.UpdatedAt = now
+		delete(m.flights, id)
+		if err := m.store.UpdateSessionLifecycle(ctx, before, cur); err != nil {
+			return ports.MergedCleanupLease{}, false, err
+		}
 	}
-	before := cur
-	now := m.clock()
-	cur.IsTerminated = true
-	cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
-	cur = applyPendingSubmitInvariant(cur)
-	cur.UpdatedAt = now
-	delete(m.flights, id)
-	return m.store.UpdateSessionLifecycle(ctx, before, cur)
+	return mergedCleanupLease(cur), true, nil
 }
 
-// markMergedCleanupComplete is the only write that clears the durable replay
-// latch. The terminal reservation remains intact.
-func (m *Manager) markMergedCleanupComplete(ctx context.Context, id domain.SessionID) error {
-	return m.mutate(ctx, id, func(cur domain.SessionRecord, _ time.Time) (domain.SessionRecord, bool) {
-		if !cur.Metadata.MergedCleanupPending && cur.Metadata.MergedCleanupPRURL == "" {
+// markMergedCleanupComplete clears the durable replay latch after teardown.
+// The terminal reservation remains intact. MarkSpawned separately clears an
+// obsolete latch when an explicit restore publishes a new runtime generation.
+func (m *Manager) markMergedCleanupComplete(ctx context.Context, id domain.SessionID, lease ports.MergedCleanupLease) (bool, error) {
+	completed := false
+	err := m.mutate(ctx, id, func(cur domain.SessionRecord, _ time.Time) (domain.SessionRecord, bool) {
+		if !cur.IsTerminated || !cur.Metadata.MergedCleanupPending || cur.Metadata.MergedCleanupPRURL != lease.PRURL || !cur.UpdatedAt.Equal(lease.SessionUpdatedAt) {
 			return cur, false
 		}
+		completed = true
 		cur.Metadata.MergedCleanupPending = false
 		cur.Metadata.MergedCleanupPRURL = ""
 		return cur, true
 	})
+	return completed, err
+}
+
+func mergedCleanupLease(rec domain.SessionRecord) ports.MergedCleanupLease {
+	return ports.MergedCleanupLease{
+		RuntimeHandleID:  rec.Metadata.RuntimeHandleID,
+		PRURL:            rec.Metadata.MergedCleanupPRURL,
+		SessionUpdatedAt: rec.UpdatedAt,
+	}
 }
 
 func (m *Manager) captureSignalDiagnostic(ctx context.Context, id domain.SessionID, s ports.ActivitySignal) *domain.LifecycleDiagnostic {
