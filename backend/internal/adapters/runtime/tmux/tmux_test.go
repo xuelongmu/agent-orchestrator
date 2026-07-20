@@ -475,7 +475,7 @@ func TestDestroyReapsAllDiscoveredPaneSessions(t *testing.T) {
 	r, fr := newTestRuntime(0)
 	panes := []byte("100 1000 %1 @1 4242 0\n100 1000 %2 @2 4243 0\n100 1000 %3 @3 1 0\n100 1000 %4 @4 0 0\n100 1000 %1 @1 4242 0\nnoise\n")
 	fr.outputs = [][]byte{panes, panes, nil, nil}
-	reaper := &recordingReaper{}
+	reaper := &recordingReaper{serverExited: true}
 	r.sessionReaper = reaper
 
 	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
@@ -531,7 +531,7 @@ func TestDestroyRevalidatesPaneMovedWithinTargetSession(t *testing.T) {
 	r, fr := newTestRuntime(0)
 	before := []byte("100 1000 %1 @1 4242 0\n")
 	afterMove := []byte("100 1000 %1 @9 4242 0\n")
-	fr.outputs = [][]byte{before, afterMove, nil, nil}
+	fr.outputs = [][]byte{before, afterMove, nil, []byte("100 1000 %9 @10\n")}
 	reaper := &recordingReaper{}
 	r.sessionReaper = reaper
 
@@ -549,8 +549,9 @@ func TestDestroyRevalidatesPaneMovedWithinTargetSession(t *testing.T) {
 func TestDestroyDoesNotConfuseReusedObjectIDsFromNewServerGeneration(t *testing.T) {
 	r, fr := newTestRuntime(0)
 	panes := []byte("100 1000 %1 @1 4242 0\n")
-	// A replacement tmux server may restart pane and window IDs at %1/@1.
-	// Its distinct server PID/start generation must not exclude the old anchor.
+	// The original exact server and its linked/moved pane remain live, but a
+	// replacement server owns the socket and restarts pane/window IDs at %1/@1.
+	// Replacement-only output cannot prove the old pane disappeared.
 	fr.outputs = [][]byte{panes, panes, nil, []byte("200 2000 %1 @1\n")}
 	reaper := &recordingReaper{}
 	r.sessionReaper = reaper
@@ -558,8 +559,23 @@ func TestDestroyDoesNotConfuseReusedObjectIDsFromNewServerGeneration(t *testing.
 	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
-	if got, want := anchorSessionIDs(reaper.calls[0].anchors), []int{4242}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("reaped session ids = %#v, want old-generation anchor %#v", got, want)
+	if len(reaper.calls) != 0 {
+		t.Fatalf("reaper calls = %#v, want fail-closed replacement-only output", reaper.calls)
+	}
+}
+
+func TestDestroyFailsClosedOnEmptySuccessfulProbeWhileOriginalServerLives(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	panes := []byte("100 1000 %1 @1 4242 0\n")
+	fr.outputs = [][]byte{panes, panes, nil, nil}
+	reaper := &recordingReaper{}
+	r.sessionReaper = reaper
+
+	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if len(reaper.calls) != 0 {
+		t.Fatalf("reaper calls = %#v, want fail-closed unattributed empty output", reaper.calls)
 	}
 }
 
@@ -585,7 +601,7 @@ func TestDestroyReapsDuplicateWindowLinksWithinSameSession(t *testing.T) {
 	r, fr := newTestRuntime(0)
 	panes := []byte("100 1000 %1 @1 4242 0\n100 1000 %1 @1 4242 0\n")
 	fr.outputs = [][]byte{panes, panes, nil, nil}
-	reaper := &recordingReaper{}
+	reaper := &recordingReaper{serverExited: true}
 	r.sessionReaper = reaper
 
 	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
@@ -816,7 +832,7 @@ func TestDestroyGivesPaneRevalidationAnIndependentBudget(t *testing.T) {
 			if listCalls <= 2 {
 				return panes, nil
 			}
-			return nil, nil
+			return []byte("100 1000 %9 @9\n"), nil
 		case "kill-session":
 			if err := commandCtx.Err(); err != nil {
 				t.Fatalf("kill-session received exhausted context: %v", err)

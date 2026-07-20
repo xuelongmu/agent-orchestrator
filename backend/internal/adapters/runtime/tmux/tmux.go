@@ -362,9 +362,10 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 	}
 	survivingPanes := make(map[tmuxObjectID]struct{})
 	survivingWindows := make(map[tmuxObjectID]struct{})
+	survivingServers := make(map[string]struct{})
 	if err == nil {
 		var reliable bool
-		survivingPanes, survivingWindows, reliable = parseSurvivingTmuxObjects(out)
+		survivingPanes, survivingWindows, survivingServers, reliable = parseSurvivingTmuxObjects(out)
 		if !reliable {
 			closeAnchors(candidates)
 			r.reapVerifiedAnchors(ctx, orphaned)
@@ -388,6 +389,12 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 		if probeErr != nil || exited {
 			// If the original server exited during the command, its output
 			// cannot be attributed to a generation without a race. Fail closed.
+			closeAnchor(&anchor)
+			continue
+		}
+		if _, attributed := survivingServers[anchor.pane.serverID]; !attributed {
+			// Successful output from only a replacement server (or an empty
+			// response) cannot prove absence in the retained original server.
 			closeAnchor(&anchor)
 			continue
 		}
@@ -422,25 +429,27 @@ type tmuxObjectID struct {
 	objectID string
 }
 
-func parseSurvivingTmuxObjects(out []byte) (map[tmuxObjectID]struct{}, map[tmuxObjectID]struct{}, bool) {
+func parseSurvivingTmuxObjects(out []byte) (map[tmuxObjectID]struct{}, map[tmuxObjectID]struct{}, map[string]struct{}, bool) {
 	panes := make(map[tmuxObjectID]struct{})
 	windows := make(map[tmuxObjectID]struct{})
+	servers := make(map[string]struct{})
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		fields := strings.Fields(line)
 		if len(fields) != 4 || fields[2] == "" || fields[3] == "" {
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
 		serverID, ok := tmuxServerID(fields[0], fields[1])
 		if !ok {
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
+		servers[serverID] = struct{}{}
 		panes[tmuxObjectID{serverID: serverID, objectID: fields[2]}] = struct{}{}
 		windows[tmuxObjectID{serverID: serverID, objectID: fields[3]}] = struct{}{}
 	}
-	return panes, windows, true
+	return panes, windows, servers, true
 }
 
 func tmuxServerID(pidText, started string) (string, bool) {
