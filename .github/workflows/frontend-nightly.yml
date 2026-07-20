@@ -42,7 +42,7 @@ jobs:
         if: steps.check.outputs.should_build == 'true'
         shell: bash
         run: |
-          latest_stable="$(git tag --list 'desktop-v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n1)"
+          latest_stable="$(git tag --list 'desktop-v*' --sort=-version:refname | awk '/^desktop-v[0-9]+\.[0-9]+\.[0-9]+$/' | head -n1)"
           latest_stable="${latest_stable:-desktop-v0.0.0}"
           short_sha="$(git rev-parse --short HEAD)"
           version="$(node frontend/scripts/nightly-version.mjs "$latest_stable" "$short_sha")"

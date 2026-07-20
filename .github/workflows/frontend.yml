@@ -16,6 +16,7 @@ on:
     paths:
       - "frontend/**"
       - ".github/workflows/frontend.yml"
+      - ".github/workflows/frontend-nightly.yml"
 
 permissions:
   contents: read

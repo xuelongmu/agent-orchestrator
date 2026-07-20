@@ -1,9 +1,12 @@
 // @vitest-environment node
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 const workflow = readFileSync(new URL("../../.github/workflows/frontend-nightly.yml", import.meta.url), "utf8");
+const shellIntegrationAvailable =
+	spawnSync("bash", ["--version"], { stdio: "ignore" }).status === 0 &&
+	spawnSync("git", ["--version"], { stdio: "ignore" }).status === 0;
 
 function latestStableLookup() {
 	const lines = workflow.split(/\r?\n/);
@@ -13,6 +16,12 @@ function latestStableLookup() {
 		.slice(start, start + 2)
 		.map((line) => line.trim())
 		.join("\n");
+}
+
+function exactStableTagPattern() {
+	const match = latestStableLookup().match(/\|\s+awk '\/(.+)\/'\s+\|/);
+	expect(match, "missing exact stable-tag filter").not.toBeNull();
+	return new RegExp(match[1]);
 }
 
 function runLookup(tags = []) {
@@ -38,11 +47,30 @@ printf '%s' "$latest_stable"
 }
 
 describe("desktop nightly stable-tag lookup", () => {
-	it("uses the explicit zero-version fallback when no stable tag exists", () => {
+	it("portably restricts candidates to exact stable tags", () => {
+		const lookup = latestStableLookup();
+		const candidates = [
+			"desktop-v1.9.0",
+			"desktop-v1.10.0",
+			"desktop-v99.0.0-nightly.202607201330",
+			"desktop-v999.0.0oops",
+		];
+
+		expect(candidates.filter((tag) => exactStableTagPattern().test(tag))).toEqual([
+			"desktop-v1.9.0",
+			"desktop-v1.10.0",
+		]);
+		expect(lookup).toContain("--sort=-version:refname");
+		expect(lookup).toContain('latest_stable="${latest_stable:-desktop-v0.0.0}"');
+	});
+
+	it.skipIf(!shellIntegrationAvailable)("uses the explicit zero-version fallback when no stable tag exists", () => {
 		expect(runLookup()).toBe("desktop-v0.0.0");
 	});
 
-	it("keeps version ordering when stable tags exist", () => {
-		expect(runLookup(["desktop-v1.9.0", "desktop-v1.10.0"])).toBe("desktop-v1.10.0");
+	it.skipIf(!shellIntegrationAvailable)("keeps ordering while rejecting prerelease and malformed tags", () => {
+		expect(
+			runLookup(["desktop-v1.9.0", "desktop-v1.10.0", "desktop-v99.0.0-nightly.202607201330", "desktop-v999.0.0oops"]),
+		).toBe("desktop-v1.10.0");
 	});
 });
