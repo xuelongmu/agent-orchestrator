@@ -11,7 +11,7 @@ import (
 
 const testCommand = "ao hooks test session-start"
 
-func TestInstallMigratesLegacyBareCommandAndPreservesSettings(t *testing.T) {
+func TestInstallPreservesLegacyBareUserCommandAndSettings(t *testing.T) {
 	workspace, hooksPath, manager := newTestManager(t)
 	legacy := map[string]any{
 		"type":    "command",
@@ -49,18 +49,15 @@ func TestInstallMigratesLegacyBareCommandAndPreservesSettings(t *testing.T) {
 	if len(groups) != 2 {
 		t.Fatalf("SessionStart group count = %d, want 2", len(groups))
 	}
-	migrated := groups[0].(map[string]any)
-	if migrated["matcher"] != "" {
-		t.Fatalf("migrated matcher = %#v, want empty string", migrated["matcher"])
-	}
-	if got := migrated["hooks"].([]any); len(got) != 1 || !reflect.DeepEqual(got[0], legacy) {
-		t.Fatalf("migrated hooks = %#v, want original entry %#v", got, legacy)
+	if !reflect.DeepEqual(groups[0], legacy) {
+		t.Fatalf("legacy user command changed: got %#v, want %#v", groups[0], legacy)
 	}
 	assertCommandCount(t, groups, testCommand, 1)
 }
 
 func TestInstallPreservesMixedValidAndLegacyEntryOrdering(t *testing.T) {
 	workspace, hooksPath, manager := newTestManager(t)
+	legacy := map[string]any{"type": "command", "command": "second", "legacyField": "keep"}
 	writeJSON(t, hooksPath, map[string]any{
 		"hooks": map[string]any{
 			"SessionStart": []any{
@@ -71,7 +68,7 @@ func TestInstallPreservesMixedValidAndLegacyEntryOrdering(t *testing.T) {
 						map[string]any{"type": "command", "command": "first", "entryField": "keep"},
 					},
 				},
-				map[string]any{"type": "command", "command": "second", "legacyField": "keep"},
+				legacy,
 			},
 		},
 	})
@@ -95,12 +92,8 @@ func TestInstallPreservesMixedValidAndLegacyEntryOrdering(t *testing.T) {
 	if firstHooks[0].(map[string]any)["entryField"] != "keep" {
 		t.Fatalf("valid hook field was lost: %#v", firstHooks[0])
 	}
-	second := groups[1].(map[string]any)
-	if second["matcher"] != "" || second["hooks"].([]any)[0].(map[string]any)["command"] != "second" {
-		t.Fatalf("legacy entry moved or was not migrated: %#v", second)
-	}
-	if second["hooks"].([]any)[0].(map[string]any)["legacyField"] != "keep" {
-		t.Fatalf("legacy hook field was lost: %#v", second)
+	if !reflect.DeepEqual(groups[1], legacy) {
+		t.Fatalf("legacy user entry moved or changed: got %#v, want %#v", groups[1], legacy)
 	}
 }
 
@@ -153,7 +146,7 @@ func TestInstallHandlesNullTopLevelHooks(t *testing.T) {
 
 func TestInstallNormalizesLegacyCommandsInUnmanagedEvents(t *testing.T) {
 	workspace, hooksPath, manager := newTestManager(t)
-	legacy := map[string]any{"type": "command", "command": "user-other", "custom": "keep"}
+	legacy := map[string]any{"type": "command", "command": "ao hooks test other", "custom": "keep"}
 	malformed := map[string]any{"type": "command", "command": "opaque-event"}
 	writeJSON(t, hooksPath, map[string]any{
 		"hooks": map[string]any{
@@ -200,6 +193,30 @@ func TestInstallPreservesHybridCommandEntries(t *testing.T) {
 	}
 	if !reflect.DeepEqual(groups[:len(hybrids)], hybrids) {
 		t.Fatalf("hybrid entries changed:\ngot  %#v\nwant %#v", groups[:len(hybrids)], hybrids)
+	}
+	assertCommandCount(t, groups, testCommand, 1)
+}
+
+func TestInstallPreservesLegacyCommandsWithInvalidMatchers(t *testing.T) {
+	workspace, hooksPath, manager := newTestManager(t)
+	entries := []any{
+		map[string]any{"type": "command", "command": testCommand, "matcher": float64(42), "custom": "keep-number"},
+		map[string]any{"type": "command", "command": "ao hooks test null-matcher", "matcher": nil, "custom": "keep-null"},
+	}
+	writeJSON(t, hooksPath, map[string]any{
+		"hooks": map[string]any{"SessionStart": entries},
+	})
+
+	if err := manager.Install(context.Background(), workspace); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+
+	groups := sessionStartGroups(t, hooksPath)
+	if len(groups) != len(entries)+1 {
+		t.Fatalf("SessionStart entry count = %d, want %d", len(groups), len(entries)+1)
+	}
+	if !reflect.DeepEqual(groups[:len(entries)], entries) {
+		t.Fatalf("invalid-matcher entries changed:\ngot  %#v\nwant %#v", groups[:len(entries)], entries)
 	}
 	assertCommandCount(t, groups, testCommand, 1)
 }
@@ -301,6 +318,169 @@ func TestInstallNormalizesExistingLegacyAOCommandWithoutDuplicate(t *testing.T) 
 	hook := group["hooks"].([]any)[0].(map[string]any)
 	if hook["custom"] != "keep" {
 		t.Fatalf("legacy AO hook fields were lost: %#v", hook)
+	}
+}
+
+func TestInstallDeduplicatesLegacyAndMatchedAOCommands(t *testing.T) {
+	workspace, hooksPath, manager := newTestManager(t)
+	writeJSON(t, hooksPath, map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{"type": "command", "command": testCommand, "source": "legacy"},
+				map[string]any{
+					"matcher": "startup",
+					"hooks": []any{
+						map[string]any{"type": "command", "command": testCommand, "source": "matched"},
+						map[string]any{"type": "command", "command": "user-sibling", "custom": "keep"},
+					},
+				},
+			},
+		},
+	})
+
+	if err := manager.Install(context.Background(), workspace); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+
+	groups := sessionStartGroups(t, hooksPath)
+	assertCommandCount(t, groups, testCommand, 1)
+	assertCommandCount(t, groups, "user-sibling", 1)
+	if len(groups) != 2 {
+		t.Fatalf("deduplicated group count = %d, want 2", len(groups))
+	}
+	matchedHooks := groups[1].(map[string]any)["hooks"].([]any)
+	if len(matchedHooks) != 1 || matchedHooks[0].(map[string]any)["custom"] != "keep" {
+		t.Fatalf("co-located user hook changed or was removed: %#v", matchedHooks)
+	}
+}
+
+func TestInstallLeavesLegacyUserCommandAllSources(t *testing.T) {
+	workspace, hooksPath, manager := newTestManager(t)
+	writeJSON(t, hooksPath, map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{map[string]any{
+				"type": "command", "command": "user-session-start", "custom": "keep",
+			}},
+		},
+	})
+
+	if err := manager.Install(context.Background(), workspace); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+
+	groups := sessionStartGroups(t, hooksPath)
+	if len(groups) != 2 {
+		t.Fatalf("SessionStart group count = %d, want 2", len(groups))
+	}
+	legacy := groups[0].(map[string]any)
+	if legacy["command"] != "user-session-start" || legacy["custom"] != "keep" {
+		t.Fatalf("legacy user hook changed: %#v", legacy)
+	}
+	if _, hasMatcher := legacy["matcher"]; hasMatcher {
+		t.Fatalf("legacy user hook gained a matcher: %#v", legacy)
+	}
+	assertCommandCount(t, groups, testCommand, 1)
+}
+
+func TestUninstallRemovesLegacyBareAOCommand(t *testing.T) {
+	workspace, hooksPath, manager := newTestManager(t)
+	writeJSON(t, hooksPath, map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{"type": "command", "command": testCommand},
+				map[string]any{"type": "command", "command": "user-session-start", "custom": "keep"},
+			},
+		},
+	})
+
+	if err := manager.Uninstall(context.Background(), workspace); err != nil {
+		t.Fatalf("Uninstall() error = %v", err)
+	}
+
+	groups := sessionStartGroups(t, hooksPath)
+	assertCommandCount(t, groups, testCommand, 0)
+	if len(groups) != 1 {
+		t.Fatalf("SessionStart group count = %d, want 1", len(groups))
+	}
+	hook := groups[0].(map[string]any)
+	if hook["command"] != "user-session-start" || hook["custom"] != "keep" {
+		t.Fatalf("remaining user hook changed: %#v", hook)
+	}
+	if _, hasMatcher := hook["matcher"]; hasMatcher {
+		t.Fatalf("remaining user hook gained a matcher: %#v", hook)
+	}
+}
+
+func TestAreInstalledWithLegacyBareCommands(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		command   string
+		installed bool
+	}{
+		{name: "AO command", command: testCommand, installed: true},
+		{name: "user command", command: "user-session-start", installed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace, hooksPath, manager := newTestManager(t)
+			writeJSON(t, hooksPath, map[string]any{
+				"hooks": map[string]any{
+					"SessionStart": []any{map[string]any{
+						"type": "command", "command": tc.command, "custom": "keep",
+					}},
+				},
+			})
+			before, err := os.ReadFile(hooksPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			installed, err := manager.AreInstalled(context.Background(), workspace)
+			if err != nil {
+				t.Fatalf("AreInstalled() error = %v", err)
+			}
+			if installed != tc.installed {
+				t.Fatalf("AreInstalled() = %v, want %v", installed, tc.installed)
+			}
+			after, err := os.ReadFile(hooksPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(before) {
+				t.Fatalf("AreInstalled changed file\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
+	}
+}
+
+func TestInstallUninstallRestoresUserEntries(t *testing.T) {
+	workspace, hooksPath, manager := newTestManager(t)
+	original := map[string]any{
+		"custom": map[string]any{"keep": true},
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{"type": "command", "command": "user-bare", "bareField": "keep"},
+				map[string]any{
+					"matcher":    "startup",
+					"groupField": "keep",
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "user-grouped", "hookField": "keep"},
+					},
+				},
+			},
+			"OtherEvent": []any{map[string]any{"type": "command", "command": "user-other", "custom": "keep"}},
+		},
+	}
+	writeJSON(t, hooksPath, original)
+
+	if err := manager.Install(context.Background(), workspace); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if err := manager.Uninstall(context.Background(), workspace); err != nil {
+		t.Fatalf("Uninstall() error = %v", err)
+	}
+
+	if got := readJSONObject(t, hooksPath); !reflect.DeepEqual(got, original) {
+		t.Fatalf("Install/Uninstall did not restore user config:\ngot  %#v\nwant %#v", got, original)
 	}
 }
 
