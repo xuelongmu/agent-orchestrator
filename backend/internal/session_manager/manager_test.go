@@ -3055,11 +3055,10 @@ func TestKill_OrdinaryWorktreeWaitsForClaimWorkspaceMutation(t *testing.T) {
 	st.setSession(mkLive("mer-1"))
 
 	claimUnlock := m.LockWorkspaceMutation("mer-1")
-	firstRead := make(chan struct{})
-	var readOnce sync.Once
-	st.afterGetSession = func(id domain.SessionID) {
+	killGateAttempt := make(chan struct{})
+	m.workspaceMutationLockAttempt = func(id domain.SessionID) {
 		if id == "mer-1" {
-			readOnce.Do(func() { close(firstRead) })
+			close(killGateAttempt)
 		}
 	}
 	destroyEntered := make(chan struct{}, 1)
@@ -3070,11 +3069,16 @@ func TestKill_OrdinaryWorktreeWaitsForClaimWorkspaceMutation(t *testing.T) {
 		_, err := m.Kill(context.Background(), "mer-1")
 		killDone <- err
 	}()
-	<-firstRead
+	select {
+	case <-killGateAttempt:
+	case <-time.After(time.Second):
+		claimUnlock()
+		t.Fatal("Kill did not attempt to enter the workspace mutation gate")
+	}
 	select {
 	case <-destroyEntered:
 		t.Fatal("ordinary worktree Kill destroyed the runtime during ClaimPR workspace mutation")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	if ws.destroyed != 0 {
 		t.Fatalf("ordinary worktree Kill destroyed workspace during claim: %d", ws.destroyed)
@@ -3516,6 +3520,225 @@ func TestRestore_RefusesExitedSessionThatRecoveredBeforeTerminalClaim(t *testing
 	}
 	if st.sessions[rec.ID].IsTerminated || rt.destroyed != 0 || rt.created != 0 {
 		t.Fatalf("recovered live session was changed: record=%+v destroy=%d create=%d", st.sessions[rec.ID], rt.destroyed, rt.created)
+	}
+}
+
+func TestRestore_SerializesConcurrentTransitions(t *testing.T) {
+	m, st, rt, _ := newManager()
+	seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "h1", AgentSessionID: "agent-x"})
+	firstDestroyStarted := make(chan struct{})
+	secondDestroyStarted := make(chan struct{})
+	releaseFirstDestroy := make(chan struct{})
+	var destroyCallsMu sync.Mutex
+	destroyCalls := 0
+	rt.beforeDestroy = func(ports.RuntimeHandle) {
+		destroyCallsMu.Lock()
+		destroyCalls++
+		call := destroyCalls
+		destroyCallsMu.Unlock()
+		switch call {
+		case 1:
+			close(firstDestroyStarted)
+			<-releaseFirstDestroy
+		case 2:
+			close(secondDestroyStarted)
+		}
+	}
+
+	results := make(chan error, 2)
+	go func() {
+		_, err := m.Restore(context.Background(), "mer-1")
+		results <- err
+	}()
+	<-firstDestroyStarted
+	contenderGateAttempt := make(chan struct{})
+	m.workspaceMutationLockAttempt = func(id domain.SessionID) {
+		if id == "mer-1" {
+			close(contenderGateAttempt)
+		}
+	}
+	go func() {
+		_, err := m.Restore(context.Background(), "mer-1")
+		results <- err
+	}()
+	select {
+	case <-contenderGateAttempt:
+	case <-time.After(time.Second):
+		close(releaseFirstDestroy)
+		t.Fatal("concurrent restore did not attempt to enter the session mutation gate")
+	}
+	concurrentTeardown := false
+	select {
+	case <-secondDestroyStarted:
+		concurrentTeardown = true
+	default:
+	}
+	close(releaseFirstDestroy)
+
+	var succeeded, refused int
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrNotRestorable):
+			refused++
+		default:
+			t.Fatalf("restore error = %v", err)
+		}
+	}
+	if concurrentTeardown {
+		t.Fatal("concurrent restore reached runtime teardown before the first transition completed")
+	}
+	if succeeded != 1 || refused != 1 || rt.destroyed != 1 || rt.created != 1 {
+		t.Fatalf("restore outcomes: success=%d refused=%d destroy=%d create=%d, want 1/1/1/1", succeeded, refused, rt.destroyed, rt.created)
+	}
+	if got := st.sessions["mer-1"]; got.IsTerminated || got.Activity.State != domain.ActivityIdle {
+		t.Fatalf("replacement session = %+v, want live and idle", got)
+	}
+}
+
+func TestRestore_SerializesWithKillSoStaleTeardownCannotKillReplacement(t *testing.T) {
+	m, st, rt, _ := newManager()
+	seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "h1", AgentSessionID: "agent-x"})
+	firstDestroyStarted := make(chan struct{})
+	secondDestroyStarted := make(chan struct{})
+	releaseFirstDestroy := make(chan struct{})
+	var destroyCallsMu sync.Mutex
+	destroyCalls := 0
+	rt.beforeDestroy = func(ports.RuntimeHandle) {
+		destroyCallsMu.Lock()
+		destroyCalls++
+		call := destroyCalls
+		destroyCallsMu.Unlock()
+		switch call {
+		case 1:
+			close(firstDestroyStarted)
+			<-releaseFirstDestroy
+		case 2:
+			close(secondDestroyStarted)
+		}
+	}
+
+	killResult := make(chan error, 1)
+	go func() {
+		_, err := m.Kill(context.Background(), "mer-1")
+		killResult <- err
+	}()
+	<-firstDestroyStarted
+	contenderGateAttempt := make(chan struct{})
+	m.workspaceMutationLockAttempt = func(id domain.SessionID) {
+		if id == "mer-1" {
+			close(contenderGateAttempt)
+		}
+	}
+	restoreResult := make(chan error, 1)
+	go func() {
+		_, err := m.Restore(context.Background(), "mer-1")
+		restoreResult <- err
+	}()
+	select {
+	case <-contenderGateAttempt:
+	case <-time.After(time.Second):
+		close(releaseFirstDestroy)
+		t.Fatal("restore did not attempt to enter the session mutation gate")
+	}
+	concurrentTeardown := false
+	select {
+	case <-secondDestroyStarted:
+		concurrentTeardown = true
+	default:
+	}
+	close(releaseFirstDestroy)
+	if err := <-killResult; err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	if err := <-restoreResult; err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if concurrentTeardown {
+		t.Fatal("restore reached runtime teardown while kill still owned the transition")
+	}
+	if rt.destroyed != 2 || rt.created != 1 {
+		t.Fatalf("runtime destroy/create = %d/%d, want 2/1", rt.destroyed, rt.created)
+	}
+	if got := st.sessions["mer-1"]; got.IsTerminated || got.Activity.State != domain.ActivityIdle {
+		t.Fatalf("replacement session = %+v, want live and idle", got)
+	}
+}
+
+func TestRestore_SerializesWithCleanupSoStaleTeardownCannotKillReplacement(t *testing.T) {
+	m, st, rt, _ := newManager()
+	seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "b", RuntimeHandleID: "h1", AgentSessionID: "agent-x"})
+	firstDestroyStarted := make(chan struct{})
+	secondDestroyStarted := make(chan struct{})
+	releaseFirstDestroy := make(chan struct{})
+	var destroyCallsMu sync.Mutex
+	destroyCalls := 0
+	rt.beforeDestroy = func(ports.RuntimeHandle) {
+		destroyCallsMu.Lock()
+		destroyCalls++
+		call := destroyCalls
+		destroyCallsMu.Unlock()
+		switch call {
+		case 1:
+			close(firstDestroyStarted)
+			<-releaseFirstDestroy
+		case 2:
+			close(secondDestroyStarted)
+		}
+	}
+
+	cleanupResult := make(chan CleanupResult, 1)
+	cleanupErr := make(chan error, 1)
+	go func() {
+		result, err := m.Cleanup(context.Background(), "mer")
+		cleanupResult <- result
+		cleanupErr <- err
+	}()
+	<-firstDestroyStarted
+	contenderGateAttempt := make(chan struct{})
+	m.workspaceMutationLockAttempt = func(id domain.SessionID) {
+		if id == "mer-1" {
+			close(contenderGateAttempt)
+		}
+	}
+	restoreResult := make(chan error, 1)
+	go func() {
+		_, err := m.Restore(context.Background(), "mer-1")
+		restoreResult <- err
+	}()
+	select {
+	case <-contenderGateAttempt:
+	case <-time.After(time.Second):
+		close(releaseFirstDestroy)
+		t.Fatal("restore did not attempt to enter the session mutation gate")
+	}
+	concurrentTeardown := false
+	select {
+	case <-secondDestroyStarted:
+		concurrentTeardown = true
+	default:
+	}
+	close(releaseFirstDestroy)
+	if err := <-cleanupErr; err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	result := <-cleanupResult
+	if len(result.Cleaned) != 1 || result.Cleaned[0] != "mer-1" || len(result.Skipped) != 0 {
+		t.Fatalf("cleanup result = %+v, want mer-1 cleaned", result)
+	}
+	if err := <-restoreResult; err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if concurrentTeardown {
+		t.Fatal("restore reached runtime teardown while cleanup still owned the transition")
+	}
+	if rt.destroyed != 2 || rt.created != 1 {
+		t.Fatalf("runtime destroy/create = %d/%d, want 2/1", rt.destroyed, rt.created)
+	}
+	if got := st.sessions["mer-1"]; got.IsTerminated || got.Activity.State != domain.ActivityIdle {
+		t.Fatalf("replacement session = %+v, want live and idle", got)
 	}
 }
 

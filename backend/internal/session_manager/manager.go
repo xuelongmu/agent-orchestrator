@@ -241,17 +241,20 @@ type Manager struct {
 	lifetimeCtx context.Context
 	// sharedDirMu serializes the durable lease check with dir spawn/restore so
 	// concurrent requests cannot both observe the project directory as free.
-	// workspaceMutationLocks serialize dependency external launch/recovery
-	// cleanup and PR-claim checkout with Kill for the same session. Entries are
+	// workspaceMutationLocks serialize dependency external launch/recovery,
+	// PR-claim checkout, restore, and teardown for the same session. Entries are
 	// reference-counted so unrelated sessions can mutate their private
 	// workspaces concurrently without growing this map forever. A session lock
 	// is always acquired before sharedDirMu (and therefore before lifecycle.mu).
 	workspaceMutationLocksMu sync.Mutex
 	workspaceMutationLocks   map[domain.SessionID]*sessionMutationLock
-	sharedDirMu              sync.Mutex
-	cleanupRetryMu           sync.Mutex
-	cleanupRetries           map[domain.SessionID]string
-	cleanupRetryDelay        time.Duration
+	// workspaceMutationLockAttempt is a test seam invoked immediately before
+	// waiting on a session gate. Production leaves it nil.
+	workspaceMutationLockAttempt func(domain.SessionID)
+	sharedDirMu                  sync.Mutex
+	cleanupRetryMu               sync.Mutex
+	cleanupRetries               map[domain.SessionID]string
+	cleanupRetryDelay            time.Duration
 }
 
 type sessionMutationLock struct {
@@ -267,7 +270,8 @@ func (m *Manager) SetDependencyScheduler(scheduler dependencyReconciler) {
 
 // LockWorkspaceMutation enters one session's external workspace mutation gate.
 // Session-service PR claims share this with dependency promotion, recovery,
-// and Kill so checkout cannot observe a half-created promoted workspace.
+// restore, and teardown so no operation observes or destroys half-transitioned
+// runtime/workspace ownership.
 // Callers must invoke the returned unlock function exactly once.
 func (m *Manager) LockWorkspaceMutation(id domain.SessionID) func() {
 	m.workspaceMutationLocksMu.Lock()
@@ -282,6 +286,9 @@ func (m *Manager) LockWorkspaceMutation(id domain.SessionID) func() {
 	lock.refs++
 	m.workspaceMutationLocksMu.Unlock()
 
+	if m.workspaceMutationLockAttempt != nil {
+		m.workspaceMutationLockAttempt(id)
+	}
 	lock.mu.Lock()
 	return func() {
 		lock.mu.Unlock()
@@ -1326,32 +1333,25 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	return m.kill(ctx, id, true)
 }
 
-// kill owns external resource teardown. markTerminated is false only for the
-// merged-cleanup callback: lifecycle has already persisted a terminal
-// reservation and performs no callback from this resource-only path. That
-// durable reservation atomically excludes a later rate-limit transition.
+// kill serializes and owns one session's external resource teardown.
 func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated bool) (bool, error) {
+	unlockWorkspaceMutation := m.LockWorkspaceMutation(id)
+	defer unlockWorkspaceMutation()
+	return m.killWithMutationLock(ctx, id, markTerminated)
+}
+
+// killWithMutationLock performs teardown while its caller owns the session's
+// mutation gate. markTerminated is false only for lifecycle-owned cleanup,
+// where the durable terminal reservation was already persisted. Keeping this
+// helper non-locking lets cleanup hold the gate across its eligibility read
+// without recursively deadlocking the per-session mutex.
+func (m *Manager) killWithMutationLock(ctx context.Context, id domain.SessionID, markTerminated bool) (bool, error) {
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return false, fmt.Errorf("kill %s: %w", id, err)
 	}
 	if !ok {
 		return false, nil // already gone: benign race
-	}
-	if !rec.DependencyPreparedAt.IsZero() || rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindWorktree {
-		// A waiting dependency child can gain its workspace/runtime while Kill
-		// is running, and an ordinary worktree can change branch during ClaimPR.
-		// Serialize with either mutation, then re-read the authoritative cleanup
-		// inventory before deriving handles or paths.
-		unlockWorkspaceMutation := m.LockWorkspaceMutation(id)
-		defer unlockWorkspaceMutation()
-		rec, ok, err = m.store.GetSession(ctx, id)
-		if err != nil {
-			return false, fmt.Errorf("kill %s: reload workspace cleanup inventory: %w", id, err)
-		}
-		if !ok {
-			return false, nil
-		}
 	}
 	dirWorkspace := rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir
 	expectedHandleID := rec.Metadata.RuntimeHandleID
@@ -1508,6 +1508,8 @@ func (m *Manager) CleanupCompletedSession(ctx context.Context, id domain.Session
 }
 
 func (m *Manager) cleanupCompletedSessionOwned(ctx context.Context, id domain.SessionID, expectedLease string) error {
+	unlockWorkspaceMutation := m.LockWorkspaceMutation(id)
+	defer unlockWorkspaceMutation()
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return fmt.Errorf("cleanup completed session %s: %w", id, err)
@@ -1518,7 +1520,7 @@ func (m *Manager) cleanupCompletedSessionOwned(ctx context.Context, id domain.Se
 	if expectedLease != "" && rec.Metadata.RuntimeHandleID != expectedLease {
 		return nil
 	}
-	if _, err := m.kill(ctx, id, false); err != nil {
+	if _, err := m.killWithMutationLock(ctx, id, false); err != nil {
 		m.scheduleCleanupRetry(id, rec.Metadata.RuntimeHandleID)
 		return fmt.Errorf("cleanup completed session %s: %w", id, err)
 	}
@@ -1597,6 +1599,8 @@ func (m *Manager) ensureSharedDirAvailable(ctx context.Context, projectID domain
 // This deliberately does not write a session_worktrees row: those rows are
 // boot-restore markers, and a replaced orchestrator must stay terminated.
 func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID) error {
+	unlockWorkspaceMutation := m.LockWorkspaceMutation(id)
+	defer unlockWorkspaceMutation()
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return fmt.Errorf("retire replacement %s: %w", id, err)
@@ -1605,7 +1609,7 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 		return nil
 	}
 	if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
-		if _, err := m.kill(ctx, id, true); err != nil {
+		if _, err := m.killWithMutationLock(ctx, id, true); err != nil {
 			return fmt.Errorf("retire replacement %s: shared directory teardown: %w", id, err)
 		}
 		return nil
@@ -1701,6 +1705,8 @@ func (m *Manager) retireWorkspaceProjectForReplacement(ctx context.Context, rec 
 // before any durable session write, so a failure never resurrects the row or destroys
 // the worktree (it may hold the agent's prior work).
 func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error) {
+	unlockWorkspaceMutation := m.LockWorkspaceMutation(id)
+	defer unlockWorkspaceMutation()
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, err)
@@ -3171,86 +3177,95 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 	}
 	result := CleanupResult{Cleaned: make([]domain.SessionID, 0, len(recs)), Skipped: []CleanupSkip{}}
 	for _, rec := range recs {
-		if !rec.IsTerminated {
-			continue
+		cleaned, reason := m.cleanupTerminalRecord(ctx, rec.ID)
+		if reason != "" {
+			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: reason})
 		}
-		if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
-			if _, err := m.kill(ctx, rec.ID, false); err != nil {
-				m.logger.Warn("cleanup: shared directory teardown failed", "sessionID", rec.ID, "error", err)
-				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "shared directory teardown failed"})
-				continue
-			}
+		if cleaned {
 			result.Cleaned = append(result.Cleaned, rec.ID)
-			continue
 		}
-		ws := workspaceInfo(rec)
-		inventoryBacked := false
-		rows, workspaceProject, rowErr := m.workspaceProjectRows(ctx, rec)
-		if rowErr != nil {
-			m.logger.Warn("cleanup: workspace rows failed", "sessionID", rec.ID, "error", rowErr)
-			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
-			continue
-		}
-		if workspaceProject {
-			// Dependency recovery may reset the session-level workspace path after
-			// preserving a dirty workspace project. The per-repo inventory remains
-			// the cleanup authority, so consult it before treating an empty root
-			// path as meaning there is nothing left to reclaim.
-			if ws.Path == "" {
-				ws.Path = workspaceProjectRootPath(rows)
-			}
-		} else if ws.Path == "" {
-			var found bool
-			ws, found, rowErr = m.recordedRootWorkspace(ctx, rec)
-			if rowErr != nil {
-				m.logger.Warn("cleanup: workspace inventory failed", "sessionID", rec.ID, "error", rowErr)
-				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
-				continue
-			}
-			if !found {
-				m.cleanupSystemPromptDir(rec.ID)
-				continue
-			}
-			inventoryBacked = true
-		}
-		if h := runtimeHandle(rec.Metadata); h.ID != "" {
-			_ = m.runtime.Destroy(ctx, h) // best effort; usually already gone
-		}
-		if workspaceProject {
-			if _, err := m.destroyWorkspaceProjectRows(ctx, rows); err != nil {
-				if !errors.Is(err, ports.ErrWorkspaceDirty) {
-					m.logger.Warn("cleanup: workspace teardown failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
-				}
-				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: cleanupSkipReason(err)})
-				continue
-			}
-			m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
-		} else if err := m.workspace.Destroy(ctx, ws); err != nil {
-			if !errors.Is(err, ports.ErrWorkspaceDirty) {
-				// The public reason stays a fixed string (the raw error carries
-				// internal filesystem paths); the full cause lands here.
-				m.logger.Warn("cleanup: workspace teardown failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
-			}
-			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: cleanupSkipReason(err)})
-			continue
-		} else {
-			if err := m.cleanupAgentWorkspace(ctx, rec, ws.Path); err != nil {
-				m.logger.Warn("cleanup: agent workspace cleanup failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
-				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "agent workspace cleanup failed"})
-				continue
-			}
-			if inventoryBacked {
-				if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
-					m.logger.Warn("cleanup: consume workspace inventory failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
-					result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
-					continue
-				}
-			}
-		}
-		m.cleanupSystemPromptDir(rec.ID)
-		result.Cleaned = append(result.Cleaned, rec.ID)
 	}
 	return result, nil
+}
+
+func (m *Manager) cleanupTerminalRecord(ctx context.Context, id domain.SessionID) (bool, string) {
+	unlockWorkspaceMutation := m.LockWorkspaceMutation(id)
+	defer unlockWorkspaceMutation()
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		m.logger.Warn("cleanup: reload session failed", "sessionID", id, "error", err)
+		return false, "workspace teardown failed"
+	}
+	if !ok || !rec.IsTerminated {
+		return false, ""
+	}
+	if rec.Metadata.WorkspaceKind.WithDefault() == domain.WorkspaceKindDir {
+		if _, err := m.killWithMutationLock(ctx, rec.ID, false); err != nil {
+			m.logger.Warn("cleanup: shared directory teardown failed", "sessionID", rec.ID, "error", err)
+			return false, "shared directory teardown failed"
+		}
+		return true, ""
+	}
+	ws := workspaceInfo(rec)
+	inventoryBacked := false
+	rows, workspaceProject, rowErr := m.workspaceProjectRows(ctx, rec)
+	if rowErr != nil {
+		m.logger.Warn("cleanup: workspace rows failed", "sessionID", rec.ID, "error", rowErr)
+		return false, "workspace teardown failed"
+	}
+	if workspaceProject {
+		// Dependency recovery may reset the session-level workspace path after
+		// preserving a dirty workspace project. The per-repo inventory remains
+		// the cleanup authority, so consult it before treating an empty root
+		// path as meaning there is nothing left to reclaim.
+		if ws.Path == "" {
+			ws.Path = workspaceProjectRootPath(rows)
+		}
+	} else if ws.Path == "" {
+		var found bool
+		ws, found, rowErr = m.recordedRootWorkspace(ctx, rec)
+		if rowErr != nil {
+			m.logger.Warn("cleanup: workspace inventory failed", "sessionID", rec.ID, "error", rowErr)
+			return false, "workspace teardown failed"
+		}
+		if !found {
+			m.cleanupSystemPromptDir(rec.ID)
+			return false, ""
+		}
+		inventoryBacked = true
+	}
+	if h := runtimeHandle(rec.Metadata); h.ID != "" {
+		_ = m.runtime.Destroy(ctx, h) // best effort; usually already gone
+	}
+	if workspaceProject {
+		if _, err := m.destroyWorkspaceProjectRows(ctx, rows); err != nil {
+			if !errors.Is(err, ports.ErrWorkspaceDirty) {
+				m.logger.Warn("cleanup: workspace teardown failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
+			}
+			return false, cleanupSkipReason(err)
+		}
+		m.cleanupAgentWorkspaceBestEffort(ctx, rec, ws.Path)
+	} else if err := m.workspace.Destroy(ctx, ws); err != nil {
+		if !errors.Is(err, ports.ErrWorkspaceDirty) {
+			// The public reason stays a fixed string (the raw error carries
+			// internal filesystem paths); the full cause lands here.
+			m.logger.Warn("cleanup: workspace teardown failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
+		}
+		return false, cleanupSkipReason(err)
+	} else {
+		if err := m.cleanupAgentWorkspace(ctx, rec, ws.Path); err != nil {
+			m.logger.Warn("cleanup: agent workspace cleanup failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
+			return false, "agent workspace cleanup failed"
+		}
+		if inventoryBacked {
+			if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
+				m.logger.Warn("cleanup: consume workspace inventory failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
+				return false, "workspace teardown failed"
+			}
+		}
+	}
+	m.cleanupSystemPromptDir(rec.ID)
+	return true, ""
 }
 
 func workspaceProjectRootPath(rows []ports.WorkspaceRepoInfo) string {
