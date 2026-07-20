@@ -131,6 +131,26 @@ afterEach(() => {
 });
 
 describe("SessionInspector tabs", () => {
+	it("shows dependency blocking and clears it when the live session update is promoted", () => {
+		const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+		const pending = session([], { dependsOn: ["parent-a", "parent-b"], dependencyPending: true });
+		const rendered = render(
+			<QueryClientProvider client={client}>
+				<SessionInspector session={pending} />
+			</QueryClientProvider>,
+		);
+
+		expect(screen.getByRole("status")).toHaveTextContent("Waiting on dependencies");
+		expect(screen.getByRole("status")).toHaveTextContent("parent-a, parent-b");
+
+		rendered.rerender(
+			<QueryClientProvider client={client}>
+				<SessionInspector session={{ ...pending, dependencyPending: false }} />
+			</QueryClientProvider>,
+		);
+		expect(screen.queryByTestId("dependency-pending")).not.toBeInTheDocument();
+	});
+
 	it("lazy-loads the selected session handoff omitted from session lists", async () => {
 		getMock.mockImplementation(async (path: string) => {
 			if (path === "/api/v1/sessions/{sessionId}") {

@@ -60,8 +60,9 @@ type spawnRequest struct {
 
 type spawnResult struct {
 	Session struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
+		ID                string `json:"id"`
+		Status            string `json:"status"`
+		DependencyPending bool   `json:"dependencyPending"`
 	} `json:"session"`
 }
 
@@ -80,7 +81,7 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			"The session runs the chosen agent in a\n" +
 			"git worktree, ephemeral scratch directory, or shared project directory. " +
 			"Register the project first with `ao project add`. " +
-			"--depends-on declares read-only prerequisite graph metadata; it does not delay launch.",
+			"--depends-on queues the session until every prerequisite completes.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !validWorkspaceKind(opts.workspaceKind) {
@@ -91,6 +92,9 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			}
 			if opts.noTakeover && opts.claimPR == "" {
 				return usageError{fmt.Errorf("--no-takeover requires --claim-pr")}
+			}
+			if opts.claimPR != "" && len(opts.dependsOn) > 0 {
+				return usageError{fmt.Errorf("--claim-pr cannot be combined with --depends-on")}
 			}
 			if opts.claimPR != "" && len(opts.prompt) > maxPromptLen {
 				return usageError{fmt.Errorf("--prompt must be %d UTF-8 bytes or fewer with --claim-pr", maxPromptLen)}
@@ -170,6 +174,10 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			if _, err := fmt.Fprintf(out, "spawned session %s (%s)%s\n", res.Session.ID, res.Session.Status, claimLabel); err != nil {
 				return err
 			}
+			if res.Session.DependencyPending {
+				_, err = fmt.Fprintf(out, "waiting on: %s (AO will launch it automatically when all prerequisites complete)\n", strings.Join(dependsOn, ", "))
+				return err
+			}
 			// Print a copy-pasteable attach hint for the selected runtime.
 			// On Darwin/Linux: tmux attach-session using the sanitised session name.
 			// On Windows: ConPTY has no user-facing attach CLI; use the AO dashboard.
@@ -199,7 +207,7 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 	f.StringVar(&opts.prompt, "prompt", "", "Initial prompt for the agent")
 	f.StringVar(&opts.issue, "issue", "", "Issue id to associate with the session")
 	f.StringVar(&opts.name, "name", "", "Display name shown in the sidebar (default: derived from --prompt, max 20 characters)")
-	f.StringSliceVar(&opts.dependsOn, "depends-on", nil, "Declare a read-only prerequisite session id (repeat or comma-separate; maximum 32)")
+	f.StringSliceVar(&opts.dependsOn, "depends-on", nil, "Wait for a prerequisite session id before launch (repeat or comma-separate; maximum 32)")
 	f.StringVar(&opts.claimPR, "claim-pr", "", "Immediately claim an existing PR for the spawned session")
 	f.BoolVar(&opts.noTakeover, "no-takeover", false, "Refuse if another active session owns the claimed PR (requires --claim-pr)")
 	f.BoolVar(&opts.skipAgentCheck, "skip-agent-check", false, "Skip advisory agent catalog install/auth preflight before spawning")

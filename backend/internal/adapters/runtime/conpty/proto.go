@@ -33,9 +33,20 @@ type ResizePayload struct {
 
 // StatusPayload is the JSON body for MsgStatusRes.
 type StatusPayload struct {
-	Alive    bool `json:"alive"`
-	PID      int  `json:"pid"`
-	ExitCode *int `json:"exitCode,omitempty"`
+	Alive      bool   `json:"alive"`
+	PID        int    `json:"pid"`
+	HostPID    int    `json:"hostPid"`
+	SessionID  string `json:"sessionId"`
+	Generation string `json:"generation"`
+	ExitCode   *int   `json:"exitCode,omitempty"`
+}
+
+// KillPayload binds a destructive request to the host identity previously
+// proven by StatusPayload. A reused loopback endpoint cannot be killed using a
+// stale registry record for another session generation.
+type KillPayload struct {
+	SessionID  string `json:"sessionId"`
+	Generation string `json:"generation"`
 }
 
 // GetOutputReq is the JSON body for MsgGetOutputReq.

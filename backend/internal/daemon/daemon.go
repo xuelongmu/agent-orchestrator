@@ -121,7 +121,7 @@ func Run() error {
 	// attach Stream and liveness; the CDC broadcaster feeds the session-state channel. The manager
 	// is handed to httpd, which mounts it at /mux. Raw PTY bytes never flow
 	// through the CDC change_log -- only session-state events do.
-	runtimeAdapter := runtimeselect.New(log)
+	runtimeAdapter := runtimeselect.New(log, cfg.DataDir)
 	termMgr := terminal.NewManager(runtimeAdapter, cdcPipe.Broadcaster, log)
 	defer termMgr.Close()
 
@@ -143,7 +143,7 @@ func Run() error {
 	// selected runtime, a gitworktree workspace, the per-session agent resolver
 	// (AO_AGENT validated here for compatibility), and the agent messenger, then mount it
 	// on the API.
-	sessionSvc, reviewSvc, sessMgr, err := startSession(cfg, runtimeAdapter, store, lcStack.LCM, messenger, telemetrySink, log, verificationCapabilities)
+	sessionSvc, reviewSvc, sessMgr, err := startSession(ctx, cfg, runtimeAdapter, store, lcStack.LCM, messenger, telemetrySink, log, verificationCapabilities)
 	if err != nil {
 		stop()
 		lcStack.Stop()
@@ -232,6 +232,12 @@ func Run() error {
 	if reconcileErr := sessMgr.Reconcile(ctx); reconcileErr != nil {
 		log.Error("reconcile sessions on boot failed", "err", reconcileErr)
 	}
+	var dependencyDone <-chan struct{}
+	if starter, ok := sessMgr.(interface {
+		StartDependencyReconcileLoop(context.Context) <-chan struct{}
+	}); ok {
+		dependencyDone = starter.StartDependencyReconcileLoop(ctx)
+	}
 
 	// ponytail: 5s tolerates a brief frontend restart; tune if dev hot-reload trips it.
 	const supervisorGrace = 5 * time.Second
@@ -263,6 +269,9 @@ func Run() error {
 	// via defer) avoids the LIFO trap where a Stop() that blocks on ctx-cancel
 	// runs before the cancel: a non-signal exit path would hang otherwise.
 	stop()
+	if dependencyDone != nil {
+		<-dependencyDone
+	}
 	<-previewDone
 	lcStack.Stop()
 	lanStopCtx, lanCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)

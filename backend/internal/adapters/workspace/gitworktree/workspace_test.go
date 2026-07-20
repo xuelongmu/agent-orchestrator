@@ -256,7 +256,7 @@ func TestCreateWorkspaceProjectRepoPrunesStaleRegisteredWorktree(t *testing.T) {
 		name:       "api",
 		repoPath:   repo,
 		outputPath: output,
-	}, "feature/test")
+	}, "feature/test", false)
 	if err != nil {
 		t.Fatalf("createWorkspaceProjectRepo: %v", err)
 	}

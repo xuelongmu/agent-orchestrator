@@ -30,10 +30,12 @@ type ptyConn interface {
 
 // ServeConfig carries everything the host needs.
 type ServeConfig struct {
-	SessionID string
-	Listener  net.Listener // caller provides (loopback); engine owns Accept loop
-	PTY       ptyConn
-	Ring      *Ring
+	SessionID  string
+	Generation string
+	HostPID    int
+	Listener   net.Listener // caller provides (loopback); engine owns Accept loop
+	PTY        ptyConn
+	Ring       *Ring
 }
 
 // Serve runs the host event loop until the listener closes or Shutdown is
@@ -202,7 +204,7 @@ func (h *host) pumpPTY() {
 
 	code, _ := h.cfg.PTY.ExitCode()
 	pid := h.cfg.PTY.PID()
-	h.broadcast(statusFrame(false, pid, &code))
+	h.broadcast(statusFrame(false, pid, &code, h.cfg.SessionID, h.cfg.Generation, h.cfg.HostPID))
 	// Keep-alive: do NOT shutdown here. The host stays up so clients can
 	// still connect and read scrollback.
 }
@@ -336,17 +338,23 @@ func (h *host) handleClientMsg(conn net.Conn, msgType byte, payload []byte) {
 		if exited {
 			codePtr = &code
 		}
-		h.sendTo(conn, statusFrame(alive, pid, codePtr))
+		h.sendTo(conn, statusFrame(alive, pid, codePtr, h.cfg.SessionID, h.cfg.Generation, h.cfg.HostPID))
 
 	case MsgKillReq:
-		// Trigger graceful shutdown; returns immediately (idempotent).
-		go h.shutdown()
+		var request KillPayload
+		if json.Unmarshal(payload, &request) == nil &&
+			request.SessionID == h.cfg.SessionID &&
+			request.Generation != "" &&
+			request.Generation == h.cfg.Generation {
+			// Trigger graceful shutdown only for the exact host generation.
+			go h.shutdown()
+		}
 	}
 }
 
 // statusFrame builds a MsgStatusRes frame.
-func statusFrame(alive bool, pid int, exitCode *int) []byte {
-	sp := StatusPayload{Alive: alive, PID: pid, ExitCode: exitCode}
+func statusFrame(alive bool, pid int, exitCode *int, sessionID, generation string, hostPID int) []byte {
+	sp := StatusPayload{Alive: alive, PID: pid, HostPID: hostPID, SessionID: sessionID, Generation: generation, ExitCode: exitCode}
 	b, _ := json.Marshal(sp)
 	frame, _ := EncodeMessage(MsgStatusRes, b) // b is small JSON, never overflows uint32
 	return frame

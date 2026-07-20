@@ -29,6 +29,7 @@ type Workspace struct {
 }
 
 var _ ports.Workspace = (*Workspace)(nil)
+var _ ports.WorkspacePlanner = (*Workspace)(nil)
 
 // New constructs a scratch adapter rooted at managedRoot.
 func New(managedRoot string) (*Workspace, error) {
@@ -56,25 +57,40 @@ func New(managedRoot string) (*Workspace, error) {
 	return &Workspace{managedRoot: root, managedRootInfo: rootInfo, removeAll: os.RemoveAll}, nil
 }
 
-// Create makes a new empty directory for the requested session.
-func (w *Workspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+// PlanWorkspace returns Create's deterministic per-session path without
+// materializing it.
+func (w *Workspace) PlanWorkspace(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
 	if err := validateConfig(cfg); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
-	projectRoot, err := w.projectRoot(cfg.ProjectID, true)
-	if err != nil {
-		return ports.WorkspaceInfo{}, err
-	}
-	path, err := os.MkdirTemp(projectRoot, string(cfg.SessionID)+"-")
-	if err != nil {
-		return ports.WorkspaceInfo{}, fmt.Errorf("scratch: create workspace: %w", err)
-	}
 	return ports.WorkspaceInfo{
-		Path:          filepath.Clean(path),
+		Path:          filepath.Clean(filepath.Join(w.managedRoot, string(cfg.ProjectID), string(cfg.SessionID))),
 		WorkspaceKind: domain.WorkspaceKindScratch,
 		SessionID:     cfg.SessionID,
 		ProjectID:     cfg.ProjectID,
 	}, nil
+}
+
+// Create materializes or adopts the deterministic per-session directory.
+func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+	planned, err := w.PlanWorkspace(ctx, cfg)
+	if err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+	if _, err := w.projectRoot(cfg.ProjectID, true); err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+	if err := os.Mkdir(planned.Path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return ports.WorkspaceInfo{}, fmt.Errorf("scratch: create workspace: %w", err)
+	}
+	info, err := os.Lstat(planned.Path)
+	if err != nil {
+		return ports.WorkspaceInfo{}, fmt.Errorf("scratch: inspect workspace: %w", err)
+	}
+	if isLinkLike(info) || !info.IsDir() {
+		return ports.WorkspaceInfo{}, fmt.Errorf("%w: workspace %q is not a real directory", ErrUnsafePath, planned.Path)
+	}
+	return planned, nil
 }
 
 // Restore reattaches an existing scratch directory after validating that it is
@@ -182,11 +198,18 @@ func (w *Workspace) validateOwnedPath(projectID domain.ProjectID, sessionID doma
 	}
 	clean := filepath.Clean(path)
 	expectedProjectRoot := filepath.Clean(filepath.Join(w.managedRoot, string(projectID)))
-	if filepath.Clean(filepath.Dir(clean)) != expectedProjectRoot || !strings.HasPrefix(filepath.Base(clean), string(sessionID)+"-") {
+	base := filepath.Base(clean)
+	if filepath.Clean(filepath.Dir(clean)) != expectedProjectRoot || (base != string(sessionID) && !strings.HasPrefix(base, string(sessionID)+"-")) {
 		return "", fmt.Errorf("%w: %q is not owned by project %s session %s", ErrUnsafePath, clean, projectID, sessionID)
 	}
 	projectRoot, err := w.projectRoot(projectID, false)
 	if err != nil {
+		// Planning intentionally does not materialize the project directory. A
+		// crash before Create must therefore make Destroy of the durable planned
+		// path an idempotent no-op rather than retaining the promotion forever.
+		if errors.Is(err, os.ErrNotExist) {
+			return clean, nil
+		}
 		return "", err
 	}
 	if expectedProjectRoot != projectRoot {

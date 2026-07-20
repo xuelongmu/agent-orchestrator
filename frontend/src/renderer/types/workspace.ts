@@ -149,6 +149,8 @@ export type WorkspaceSession = {
 	issueId?: string;
 	/** Session ids that this session declares as prerequisites. */
 	dependsOn?: string[];
+	/** True only while prerequisite gating still prevents runtime launch. */
+	dependencyPending?: boolean;
 	provider: AgentProvider;
 	kind?: SessionKind;
 	workspaceKind?: WorkspaceKind;

@@ -31,6 +31,14 @@ type AgentHandoff struct {
 	ResidualRisk         string   `json:"residualRisk" description:"Remaining risk, bounded by the server to 8192 UTF-8 bytes."`
 }
 
+// DependencyHandoff is the scheduler-facing completion context from one
+// prerequisite. Handoff is nil when completion was established by merged PR
+// facts without an explicit structured handoff.
+type DependencyHandoff struct {
+	SessionID SessionID
+	Handoff   *AgentHandoff
+}
+
 // Equal compares the exact typed payload. Order, whitespace, and repeated
 // entries are significant so an exact replay is idempotent while any changed
 // submission is rejected.

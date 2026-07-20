@@ -152,7 +152,7 @@ func TestWiring_StartSessionBuildsSessionService(t *testing.T) {
 
 	rt := runtimeselect.New(nil)
 	messenger := newSessionMessenger(store, rt, log)
-	svc, reviewSvc, lc, err := startSession(cfg, rt, store, lcm, messenger, telemetryadapter.NoopSink{}, log)
+	svc, reviewSvc, lc, err := startSession(context.Background(), cfg, rt, store, lcm, messenger, telemetryadapter.NoopSink{}, log)
 	if err != nil {
 		t.Fatalf("startSession: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestStartSession_SpawnDoesNotPanicWhenNoTrackerToken(t *testing.T) {
 	cfg := config.Config{DataDir: t.TempDir()}
 	rt := runtimeselect.New(nil)
 	messenger := newSessionMessenger(store, rt, log)
-	svc, _, _, err := startSession(cfg, rt, store, lcm, messenger, telemetryadapter.NoopSink{}, log)
+	svc, _, _, err := startSession(context.Background(), cfg, rt, store, lcm, messenger, telemetryadapter.NoopSink{}, log)
 	if err != nil {
 		t.Fatalf("startSession: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestStartTrackerIntake_RunsEvenWithoutEnabledProjects(t *testing.T) {
 	cfg := config.Config{DataDir: t.TempDir()}
 	rt := runtimeselect.New(nil)
 	messenger := newSessionMessenger(store, rt, log)
-	svc, _, _, err := startSession(cfg, rt, store, lcm, messenger, telemetryadapter.NoopSink{}, log)
+	svc, _, _, err := startSession(context.Background(), cfg, rt, store, lcm, messenger, telemetryadapter.NoopSink{}, log)
 	if err != nil {
 		t.Fatalf("startSession: %v", err)
 	}

@@ -22,6 +22,10 @@ type sessionStore interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	UpdateSession(ctx context.Context, rec domain.SessionRecord) error
 	UpdateSessionLifecycle(ctx context.Context, before, after domain.SessionRecord) error
+	MarkReservedDependencySpawned(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, updatedAt time.Time) (bool, error)
+	PrepareReservedDependencyWorkspace(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, worktrees []domain.SessionWorktreeRecord, updatedAt time.Time) (bool, error)
+	MarkReservedDependencyLaunchSucceeded(ctx context.Context, id domain.SessionID, token string, succeededAt time.Time) (bool, error)
+	ResetReservedDependencyLaunch(ctx context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error)
 	// ListPRsBySession returns every PR row tracked for the session. The
 	// reducer reads it to apply the multi-PR completion rule (terminate only
 	// when no open PR remains and at least one merged) and to suppress
@@ -91,6 +95,10 @@ type automatedMessageSender interface {
 	SendAutomated(ctx context.Context, id domain.SessionID, message string) error
 }
 
+type dependencyReconciler interface {
+	Wake()
+}
+
 const (
 	diagnosticTailLines      = 40
 	diagnosticCaptureTimeout = 750 * time.Millisecond
@@ -123,12 +131,13 @@ type Manager struct {
 	// guard is the shared pane-write primitive every reaction nudge goes
 	// through (see sessionguard). Nil when no messenger was wired: reaction
 	// nudges become no-ops but the reducer still runs.
-	guard             *sessionguard.Guard
-	automatedSender   automatedMessageSender
-	notifications     notificationSink
-	mergedCleaner     MergedSessionCleaner
-	completedCleaner  CompletedSessionCleaner
-	diagnosticRuntime diagnosticRuntime
+	guard               *sessionguard.Guard
+	automatedSender     automatedMessageSender
+	notifications       notificationSink
+	mergedCleaner       MergedSessionCleaner
+	completedCleaner    CompletedSessionCleaner
+	diagnosticRuntime   diagnosticRuntime
+	dependencyScheduler dependencyReconciler
 
 	mu        sync.Mutex
 	window    time.Duration
@@ -165,6 +174,26 @@ func (m *Manager) SetAutomatedMessageSender(sender automatedMessageSender) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.automatedSender = sender
+}
+
+// SetDependencyScheduler wires the cross-session reconciler after daemon
+// construction. Lifecycle only invokes it after it has decided completion; the
+// scheduler never participates in terminal-state decisions.
+func (m *Manager) SetDependencyScheduler(scheduler dependencyReconciler) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dependencyScheduler = scheduler
+}
+
+func (m *Manager) reconcileDependencies(ctx context.Context) error {
+	m.mu.Lock()
+	scheduler := m.dependencyScheduler
+	m.mu.Unlock()
+	if scheduler == nil {
+		return nil
+	}
+	scheduler.Wake()
+	return nil
 }
 
 func (m *Manager) cleanupCompletedSession(ctx context.Context, id domain.SessionID) error {
@@ -270,7 +299,10 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 	if err != nil || !terminated {
 		return err
 	}
-	return m.cleanupCompletedSession(ctx, id)
+	if err := m.cleanupCompletedSession(ctx, id); err != nil {
+		return err
+	}
+	return m.reconcileDependencies(ctx)
 }
 
 // ApplyActivitySignal records an authoritative agent activity signal and any
@@ -306,7 +338,10 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 		delete(m.flights, id)
 		m.mu.Unlock()
 		if s.Valid && s.State == domain.ActivityExited {
-			return m.cleanupCompletedSession(ctx, id)
+			if err := m.cleanupCompletedSession(ctx, id); err != nil {
+				return err
+			}
+			return m.reconcileDependencies(ctx)
 		}
 		return nil
 	}
@@ -430,6 +465,9 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	m.emitNotification(ctx, intent)
 	if next.Activity.State == domain.ActivityExited {
 		if err := m.cleanupCompletedSession(ctx, id); err != nil {
+			return err
+		}
+		if err := m.reconcileDependencies(ctx); err != nil {
 			return err
 		}
 	}
@@ -670,10 +708,44 @@ func (m *Manager) MarkSpawned(ctx context.Context, id domain.SessionID, metadata
 	return m.store.UpdateSession(ctx, rec)
 }
 
+// MarkDependencySpawned is the lifecycle-owned, token-fenced launch transition
+// for a promoted child. Unlike MarkSpawned it never writes is_terminated, and a
+// concurrent Kill/terminal transition makes the CAS lose rather than allowing
+// the launch path to resurrect the child.
+func (m *Manager) MarkDependencySpawned(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.MarkReservedDependencySpawned(ctx, id, token, metadata, m.clock())
+}
+
+// PrepareDependencyWorkspace atomically publishes every deterministic cleanup
+// input before the launcher performs external workspace side effects.
+func (m *Manager) PrepareDependencyWorkspace(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, worktrees []domain.SessionWorktreeRecord) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.PrepareReservedDependencyWorkspace(ctx, id, token, metadata, worktrees, m.clock())
+}
+
+// MarkDependencyLaunchSucceeded is the final token-fenced launch transition.
+// It records no lifecycle state and loses to concurrent termination.
+func (m *Manager) MarkDependencyLaunchSucceeded(ctx context.Context, id domain.SessionID, token string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.MarkReservedDependencyLaunchSucceeded(ctx, id, token, m.clock())
+}
+
+// ResetDependencyLaunch clears only resources previously committed under the
+// same promotion token after an owned post-start delivery failure.
+func (m *Manager) ResetDependencyLaunch(ctx context.Context, id domain.SessionID, token string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.ResetReservedDependencyLaunch(ctx, id, token, m.clock())
+}
+
 // MarkTerminated marks a session terminated without tearing down external resources.
 func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error {
 	diagnostic := m.captureDiagnostic(ctx, id, domain.DiagnosticTerminated, "")
-	return m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
+	err := m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
 		if cur.IsTerminated {
 			return cur, false
 		}
@@ -685,6 +757,10 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 		delete(m.flights, id) // runs under m.mu (mutate holds it)
 		return cur, true
 	})
+	if err != nil {
+		return err
+	}
+	return m.reconcileDependencies(ctx)
 }
 
 // markTerminatedUnlessRateLimited atomically applies an automated terminal
@@ -692,7 +768,7 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 // Explicit user-owned teardown continues to use MarkTerminated.
 func (m *Manager) markTerminatedUnlessRateLimited(ctx context.Context, id domain.SessionID) error {
 	diagnostic := m.captureDiagnostic(ctx, id, domain.DiagnosticTerminated, "")
-	return m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
+	err := m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
 		if cur.IsTerminated || cur.Activity.State == domain.ActivityRateLimited {
 			return cur, false
 		}
@@ -704,6 +780,10 @@ func (m *Manager) markTerminatedUnlessRateLimited(ctx context.Context, id domain
 		delete(m.flights, id)
 		return cur, true
 	})
+	if err != nil {
+		return err
+	}
+	return m.reconcileDependencies(ctx)
 }
 
 // reserveMergedCleanup atomically linearizes automated cleanup against a

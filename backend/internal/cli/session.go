@@ -53,6 +53,16 @@ type sessionDTO struct {
 	UpdatedAt    time.Time          `json:"updatedAt"`
 	Status       string             `json:"status"`
 	Diagnostic   *sessionDiagnostic `json:"diagnostic,omitempty"`
+	Handoff      *sessionHandoffDTO `json:"handoff,omitempty"`
+}
+
+// sessionHandoffDTO mirrors the detail-only immutable handoff API shape. It is
+// intentionally present on session get so dependency prompt omission markers
+// can direct agents to `ao session get <id> --json` without losing payload.
+type sessionHandoffDTO struct {
+	ChangedFiles         []string `json:"changedFiles"`
+	VerificationCommands []string `json:"verificationCommands"`
+	ResidualRisk         string   `json:"residualRisk"`
 }
 
 type sessionDiagnostic struct {

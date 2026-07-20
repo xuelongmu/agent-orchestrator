@@ -49,6 +49,27 @@ func TestCreateRestoreAndDestroy(t *testing.T) {
 	}
 }
 
+func TestPlannedWorkspaceDestroyIsIdempotentBeforeCreate(t *testing.T) {
+	w, err := New(filepath.Join(t.TempDir(), "scratch"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned, err := w.PlanWorkspace(context.Background(), ports.WorkspaceConfig{ProjectID: "ao", SessionID: "ao-1", WorkspaceKind: domain.WorkspaceKindScratch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Destroy(context.Background(), planned); err != nil {
+		t.Fatalf("cleanup after crash before Create: %v", err)
+	}
+	created, err := w.Create(context.Background(), ports.WorkspaceConfig{ProjectID: "ao", SessionID: "ao-1", WorkspaceKind: domain.WorkspaceKindScratch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Path != planned.Path {
+		t.Fatalf("retry path = %q, want durable plan %q", created.Path, planned.Path)
+	}
+}
+
 func TestDestroyRetriesTransientRemovalFailure(t *testing.T) {
 	ws, err := New(t.TempDir())
 	if err != nil {

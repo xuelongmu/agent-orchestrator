@@ -50,6 +50,11 @@ func deriveStatus(rec domain.SessionRecord, prs []domain.PRFacts, now time.Time,
 	if rec.Activity.State == domain.ActivityActive {
 		return domain.StatusWorking
 	}
+	// A dependency-gated session has intentionally not launched yet, so absent
+	// hooks are not evidence of a broken signal pipeline.
+	if rec.DependencyPending() {
+		return domain.StatusIdle
+	}
 
 	// No hook callback has ever arrived for this spawn/restore even though the
 	// harness has a hook pipeline. The seeded LastActivityAt marks the launch,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,10 @@ type commander interface {
 	RollbackSpawn(ctx context.Context, id domain.SessionID) (deleted, killed bool, err error)
 }
 
+type dependencyReconciler interface {
+	Reconcile(context.Context) error
+}
+
 // RollbackOutcome reports what happened in a rollback: either the seed row was
 // deleted, or the partially-spawned session was killed (runtime+workspace torn
 // down, row marked terminated).
@@ -95,6 +100,7 @@ type Service struct {
 	tracker             ports.Tracker
 	clock               func() time.Time
 	telemetry           ports.EventSink
+	dependencyScheduler dependencyReconciler
 	orchestratorLocksMu sync.Mutex
 	orchestratorLocks   map[domain.ProjectID]*sync.Mutex
 	prClaimLocksMu      sync.Mutex
@@ -122,6 +128,8 @@ type Deps struct {
 	Tracker   ports.Tracker
 	Clock     func() time.Time
 	Telemetry ports.EventSink
+	// DependencyScheduler reconciles children after a completion handoff seals.
+	DependencyScheduler dependencyReconciler
 	// SignalCapable gates the no_signal status downgrade per harness; daemon
 	// wiring passes activitydispatch.SupportsHarness. Left nil, no session is
 	// ever downgraded to no_signal.
@@ -130,7 +138,7 @@ type Deps struct {
 
 // NewWithDeps wires a session service with optional PR-claim dependencies.
 func NewWithDeps(d Deps) *Service {
-	s := &Service{manager: d.Manager, store: d.Store, prClaimer: d.PRClaimer, scm: d.SCM, tracker: d.Tracker, clock: d.Clock, signalCapable: d.SignalCapable, telemetry: d.Telemetry}
+	s := &Service{manager: d.Manager, store: d.Store, prClaimer: d.PRClaimer, scm: d.SCM, tracker: d.Tracker, clock: d.Clock, signalCapable: d.SignalCapable, telemetry: d.Telemetry, dependencyScheduler: d.DependencyScheduler}
 	if s.prClaimer == nil {
 		if w, ok := d.Store.(ports.PRClaimer); ok {
 			s.prClaimer = w
@@ -553,8 +561,8 @@ func (s *Service) Get(ctx context.Context, id domain.SessionID) (domain.Session,
 }
 
 // SubmitHandoff persists an agent's immutable structured completion summary.
-// This explicit submission boundary deliberately does not report activity,
-// terminate the session, or trigger dependency scheduling.
+// This explicit submission boundary does not report activity or terminate the
+// parent. It does reconcile children after the immutable payload is durable.
 func (s *Service) SubmitHandoff(ctx context.Context, id domain.SessionID, handoff domain.AgentHandoff) (bool, error) {
 	if err := domain.ValidateAgentHandoff(handoff); err != nil {
 		return false, apierr.Invalid("HANDOFF_INVALID", err.Error(), nil)
@@ -562,6 +570,11 @@ func (s *Service) SubmitHandoff(ctx context.Context, id domain.SessionID, handof
 	created, err := s.store.PutSessionHandoff(ctx, id, handoff, s.now())
 	switch {
 	case err == nil:
+		if s.dependencyScheduler != nil {
+			if reconcileErr := s.dependencyScheduler.Reconcile(ctx); reconcileErr != nil {
+				slog.Error("handoff: post-commit dependency reconciliation failed; periodic reconciliation will retry", "sessionID", id, "error", reconcileErr)
+			}
+		}
 		return created, nil
 	case errors.Is(err, ports.ErrSessionNotFound):
 		return false, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
@@ -650,7 +663,7 @@ func (s *Service) toSession(ctx context.Context, rec domain.SessionRecord, inclu
 			handoffView = &handoff
 		}
 	}
-	return domain.Session{SessionRecord: rec, Status: deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness)), TerminalHandleID: rec.Metadata.RuntimeHandleID, Handoff: handoffView, DependsOn: dependsOn, PRs: prs}, nil
+	return domain.Session{SessionRecord: rec, Status: deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness)), TerminalHandleID: rec.Metadata.RuntimeHandleID, DependencyPending: rec.DependencyPending(), Handoff: handoffView, DependsOn: dependsOn, PRs: prs}, nil
 }
 
 // now tolerates a zero-value Service (tests construct the struct literally

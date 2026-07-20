@@ -11,6 +11,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/conpty/ptyregistry"
 )
 
 // RunHost is the "ao pty-host" entrypoint. argv is everything after the
@@ -34,6 +37,11 @@ func RunHost(args []string, stdout io.Writer) int {
 	cwd := args[1]
 	shellCmd := args[2]
 	shellArgs := args[3:]
+	generation := os.Getenv(hostGenerationEnv)
+	if generation == "" {
+		fmt.Fprintf(os.Stderr, "pty-host [%s]: %s is required\n", sessionID, hostGenerationEnv)
+		return 1
+	}
 
 	// Bind before creating the PTY so we can report READY atomically.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -55,8 +63,14 @@ func RunHost(args []string, stdout io.Writer) int {
 		fmt.Fprintf(os.Stderr, "pty-host [%s]: newConPTY: %v\n", sessionID, err)
 		return 1
 	}
+	if err := ptyregistry.Register(ptyregistry.Entry{SessionID: sessionID, PtyHostPID: os.Getpid(), PipePath: ln.Addr().String(), RegisteredAt: time.Now().UTC().Format(time.RFC3339Nano), Generation: generation}); err != nil {
+		_ = pty.Close()
+		_ = ln.Close()
+		fmt.Fprintf(os.Stderr, "pty-host [%s]: publish registry: %v\n", sessionID, err)
+		return 1
+	}
 
-	// Print READY after both the listener and the PTY are up.
+	// Print READY only after listener, PTY, and durable discovery are all ready.
 	_, _ = fmt.Fprintf(stdout, "READY:%d %d\n", pty.PID(), port)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -76,10 +90,12 @@ func RunHost(args []string, stdout io.Writer) int {
 
 	ring := NewRing()
 	cfg := ServeConfig{
-		SessionID: sessionID,
-		Listener:  ln,
-		PTY:       pty,
-		Ring:      ring,
+		SessionID:  sessionID,
+		Generation: generation,
+		HostPID:    os.Getpid(),
+		Listener:   ln,
+		PTY:        pty,
+		Ring:       ring,
 	}
 
 	if err := Serve(ctx, cfg); err != nil {

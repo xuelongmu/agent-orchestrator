@@ -807,6 +807,19 @@ flowchart TD
 
 ```
 
+### Windows pty-host recovery identity
+
+Each newly launched Windows `pty-host` publishes a per-creation generation in
+the durable registry and returns that generation, the AO session id, and the
+host process id from the loopback status handshake. Recovery does not cache an
+endpoint, send input, or terminate a process until those values match. This is
+deliberately fail-closed for registry entries migrated from the previous
+generationless protocol: a surviving old host remains registered and is
+reported as a probe failure, rather than being treated as dead or killed by PID.
+During this one-version upgrade boundary, stop the old `pty-host` manually (for
+example in Task Manager) and then restart/restore the AO session; the daemon
+will not force-kill or automatically adopt an identity-less host.
+
 ### Attach Flow
 
 ```mermaid

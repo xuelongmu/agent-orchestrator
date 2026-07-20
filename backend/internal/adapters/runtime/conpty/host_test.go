@@ -186,12 +186,15 @@ func (tc *testClient) close() { _ = tc.conn.Close() }
 // ---------------------------------------------------------------------------
 
 type serveFixture struct {
-	pty    *fakePTY
-	ring   *Ring
-	ln     net.Listener
-	addr   string
-	cancel context.CancelFunc
-	done   chan error
+	pty        *fakePTY
+	ring       *Ring
+	ln         net.Listener
+	addr       string
+	sessionID  string
+	generation string
+	hostPID    int
+	cancel     context.CancelFunc
+	done       chan error
 }
 
 func startServe(t *testing.T, pid int) *serveFixture {
@@ -204,21 +207,28 @@ func startServe(t *testing.T, pid int) *serveFixture {
 	ring := NewRing()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	sessionID := fmt.Sprintf("test-%d", pid)
+	generation := fmt.Sprintf("generation-%d", pid)
 	go func() {
 		done <- Serve(ctx, ServeConfig{
-			SessionID: fmt.Sprintf("test-%d", pid),
-			Listener:  ln,
-			PTY:       pty,
-			Ring:      ring,
+			SessionID:  sessionID,
+			Generation: generation,
+			HostPID:    pid,
+			Listener:   ln,
+			PTY:        pty,
+			Ring:       ring,
 		})
 	}()
 	return &serveFixture{
-		pty:    pty,
-		ring:   ring,
-		ln:     ln,
-		addr:   ln.Addr().String(),
-		cancel: cancel,
-		done:   done,
+		pty:        pty,
+		ring:       ring,
+		ln:         ln,
+		addr:       ln.Addr().String(),
+		sessionID:  sessionID,
+		generation: generation,
+		hostPID:    pid,
+		cancel:     cancel,
+		done:       done,
 	}
 }
 
@@ -663,7 +673,8 @@ func TestKillReq(t *testing.T) {
 
 	c := newTestClient(t, f.addr)
 
-	if err := c.send(MsgKillReq, nil); err != nil {
+	payload, _ := json.Marshal(KillPayload{SessionID: f.sessionID, Generation: f.generation})
+	if err := c.send(MsgKillReq, payload); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 

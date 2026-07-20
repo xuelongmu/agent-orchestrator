@@ -72,6 +72,50 @@ func (f *fakeStore) UpdateSessionLifecycle(ctx context.Context, _, after domain.
 	return f.UpdateSession(ctx, after)
 }
 
+func (f *fakeStore) MarkReservedDependencySpawned(_ context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, updatedAt time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok || rec.IsTerminated || rec.DependencyPromotionToken != token {
+		return false, nil
+	}
+	rec.Metadata = metadata
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: updatedAt}
+	rec.UpdatedAt = updatedAt
+	f.sessions[id] = rec
+	return true, nil
+}
+
+func (f *fakeStore) PrepareReservedDependencyWorkspace(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, _ []domain.SessionWorktreeRecord, updatedAt time.Time) (bool, error) {
+	return f.MarkReservedDependencySpawned(ctx, id, token, metadata, updatedAt)
+}
+
+func (f *fakeStore) MarkReservedDependencyLaunchSucceeded(_ context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok || rec.IsTerminated || rec.DependencyPromotionToken != token || rec.Metadata.RuntimeHandleID == "" {
+		return false, nil
+	}
+	rec.DependencyLaunchSucceededAt = updatedAt
+	f.sessions[id] = rec
+	return true, nil
+}
+
+func (f *fakeStore) ResetReservedDependencyLaunch(_ context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok || rec.DependencyPromotionToken != token {
+		return false, nil
+	}
+	rec.Metadata.WorkspacePath = ""
+	rec.Metadata.RuntimeHandleID = ""
+	rec.Metadata.AgentSessionID = ""
+	rec.Metadata.Prompt = rec.DependencyBasePrompt
+	rec.DependencyLaunchSucceededAt = time.Time{}
+	if !rec.IsTerminated {
+		rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: updatedAt}
+	}
+	rec.UpdatedAt = updatedAt
+	f.sessions[id] = rec
+	return true, nil
+}
+
 func (f *fakeStore) GetPRLastNudgeSignature(_ context.Context, prURL string) (string, error) {
 	return f.signatures[prURL], nil
 }
@@ -143,6 +187,12 @@ type fakeAutomatedSender struct {
 	msgs         []string
 	err          error
 	beforeReturn func()
+}
+
+type fakeDependencyScheduler struct{ calls int }
+
+func (s *fakeDependencyScheduler) Wake() {
+	s.calls++
 }
 
 type guardedAutomatedSender struct {
@@ -413,6 +463,8 @@ func working(id domain.SessionID) domain.SessionRecord {
 
 func TestRuntimeObservation_InferredDeathSetsTerminated(t *testing.T) {
 	m, st, _ := newManager()
+	scheduler := &fakeDependencyScheduler{}
+	m.SetDependencyScheduler(scheduler)
 	cleaner := &retryCompletedCleaner{}
 	m.SetCompletedSessionCleaner(cleaner)
 	rec := working("mer-1")
@@ -428,10 +480,15 @@ func TestRuntimeObservation_InferredDeathSetsTerminated(t *testing.T) {
 	if cleaner.calls != 1 {
 		t.Fatalf("completed cleanup calls = %d, want 1", cleaner.calls)
 	}
+	if scheduler.calls != 1 {
+		t.Fatalf("dependency reconciles = %d, want 1 after runtime-owned terminal completion", scheduler.calls)
+	}
 }
 
 func TestActivityExitedRetriesCompletedCleanup(t *testing.T) {
 	m, st, _ := newManager()
+	scheduler := &fakeDependencyScheduler{}
+	m.SetDependencyScheduler(scheduler)
 	rec := working("mer-1")
 	st.sessions[rec.ID] = rec
 	cleaner := &retryCompletedCleaner{err: errors.New("workspace busy")}
@@ -451,6 +508,9 @@ func TestActivityExitedRetriesCompletedCleanup(t *testing.T) {
 	}
 	if cleaner.calls != 2 {
 		t.Fatalf("completed cleanup calls = %d, want 2", cleaner.calls)
+	}
+	if scheduler.calls != 1 {
+		t.Fatalf("dependency reconciles = %d, want only after successful exit cleanup", scheduler.calls)
 	}
 }
 
@@ -1363,6 +1423,8 @@ func TestPendingClaimContractAutomatedRetryWaitsForSafePaneState(t *testing.T) {
 
 func TestPRObservation_MergedTerminatesWithoutNudge(t *testing.T) {
 	m, st, msg := newManager()
+	scheduler := &fakeDependencyScheduler{}
+	m.SetDependencyScheduler(scheduler)
 	st.sessions["mer-1"] = working("mer-1")
 	st.prs["mer-1"] = []domain.PullRequest{{URL: "pr1", Merged: true}}
 	if err := m.ApplyPRObservation(ctx, "mer-1", ports.PRObservation{Fetched: true, URL: "pr1", Merged: true}); err != nil {
@@ -1374,6 +1436,30 @@ func TestPRObservation_MergedTerminatesWithoutNudge(t *testing.T) {
 	}
 	if len(msg.msgs) != 0 {
 		t.Fatalf("merged PR should not send nudge, got %v", msg.msgs)
+	}
+	if scheduler.calls != 1 {
+		t.Fatalf("dependency reconciles = %d, want 1 after terminal completion", scheduler.calls)
+	}
+}
+
+func TestMarkDependencySpawnedCannotResurrectConcurrentTermination(t *testing.T) {
+	m, st, _ := newManager()
+	rec := working("mer-2")
+	rec.DependencyPromotionToken = "owner"
+	st.sessions[rec.ID] = rec
+
+	// Deterministically commit the terminal transition before the launch CAS,
+	// modeling Kill winning after runtime creation but before MarkSpawned.
+	terminated := rec
+	terminated.IsTerminated = true
+	terminated.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now().UTC()}
+	st.sessions[rec.ID] = terminated
+	marked, err := m.MarkDependencySpawned(ctx, rec.ID, "owner", domain.SessionMetadata{RuntimeHandleID: "owned-runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked || !st.sessions[rec.ID].IsTerminated || st.sessions[rec.ID].Metadata.RuntimeHandleID != "" {
+		t.Fatalf("terminal session resurrected: marked=%v rec=%#v", marked, st.sessions[rec.ID])
 	}
 }
 

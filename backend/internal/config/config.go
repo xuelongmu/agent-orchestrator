@@ -294,7 +294,11 @@ func resolveRunFilePath() (string, error) {
 // directory as the run-file.
 func resolveDataDir() (string, error) {
 	if p, ok := os.LookupEnv("AO_DATA_DIR"); ok && p != "" {
-		return p, nil
+		absolute, err := filepath.Abs(p)
+		if err != nil {
+			return "", fmt.Errorf("resolve AO_DATA_DIR %q: %w", p, err)
+		}
+		return filepath.Clean(absolute), nil
 	}
 	stateDir, err := defaultStateDir()
 	if err != nil {

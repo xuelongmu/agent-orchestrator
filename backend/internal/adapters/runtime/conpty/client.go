@@ -6,6 +6,7 @@ package conpty
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"syscall"
 	"time"
@@ -29,8 +30,17 @@ const (
 	isAliveTimeout   = 2 * time.Second
 )
 
+type hostIdentityMismatchError struct {
+	got  StatusPayload
+	want StatusPayload
+}
+
+func (e *hostIdentityMismatchError) Error() string {
+	return fmt.Sprintf("conpty: host identity mismatch: got session=%q generation=%q hostPid=%d; want session=%q generation=%q hostPid=%d", e.got.SessionID, e.got.Generation, e.got.HostPID, e.want.SessionID, e.want.Generation, e.want.HostPID)
+}
+
 // dialHost opens a TCP connection to addr with a deadline. Callers close it.
-func dialHost(addr string, timeout time.Duration) (net.Conn, error) {
+var dialHost = func(addr string, timeout time.Duration) (net.Conn, error) {
 	return net.DialTimeout("tcp", addr, timeout)
 }
 
@@ -38,8 +48,8 @@ func dialHost(addr string, timeout time.Duration) (net.Conn, error) {
 // MsgTerminalInput frame with 15ms gaps, then pauses long enough for the paste
 // to settle (1s for payloads over 512 runes, 300ms otherwise) and sends "\r".
 // Mirrors ptyHostSendMessage from pty-client.ts.
-func clientSendMessage(addr, message string) error {
-	conn, err := dialHost(addr, dialTimeout)
+func clientSendMessage(addr, sessionID, generation string, hostPID int, message string) error {
+	conn, _, _, err := dialVerifiedHost(addr, sessionID, generation, hostPID)
 	if err != nil {
 		return err
 	}
@@ -87,8 +97,8 @@ func inputEnterDelay(runes int) time.Duration {
 	return ptyInputEnterDelay
 }
 
-func clientSendInput(addr, input string) error {
-	conn, err := dialHost(addr, dialTimeout)
+func clientSendInput(addr, sessionID, generation string, hostPID int, input string) error {
+	conn, _, _, err := dialVerifiedHost(addr, sessionID, generation, hostPID)
 	if err != nil {
 		return err
 	}
@@ -104,10 +114,10 @@ func clientSendInput(addr, input string) error {
 // clientGetOutput sends MsgGetOutputReq and reads frames until MsgGetOutputRes.
 // Returns "" on timeout or connection failure (no error), matching the TS.
 // lines <= 0 is handled by the caller (runtime.go rejects it before calling).
-func clientGetOutput(addr string, lines int) (string, error) {
-	conn, err := dialHost(addr, getOutputTimeout)
+func clientGetOutput(addr, sessionID, generation string, hostPID, lines int) (string, error) {
+	conn, _, residual, err := dialVerifiedHost(addr, sessionID, generation, hostPID)
 	if err != nil {
-		return "", nil // ponytail: connect failure -> "" like the TS
+		return "", err
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -128,6 +138,7 @@ func clientGetOutput(addr string, lines int) (string, error) {
 			}
 		}
 	})
+	parser.Feed(residual)
 
 	buf := make([]byte, 4096)
 	for {
@@ -166,7 +177,7 @@ func clientGetOutput(addr string, lines int) (string, error) {
 // When unsure, we prefer transient (return the error) rather than reporting
 // death. Mirrors ptyHostIsAlive from pty-client.ts on the alive path: host
 // reachable == alive, regardless of the inner agent's alive field.
-func clientIsAlive(addr string) (alive bool, transientErr error) {
+func clientIsAlive(addr, sessionID, generation string, hostPID int) (alive bool, transientErr error) {
 	conn, err := dialHost(addr, isAliveTimeout)
 	if err != nil {
 		// A dial timeout is transient (the loopback hiccupped). A refused
@@ -181,53 +192,71 @@ func clientIsAlive(addr string) (alive bool, transientErr error) {
 		return false, err
 	}
 	defer func() { _ = conn.Close() }()
+	_, _, err = verifyHostConn(conn, sessionID, generation, hostPID)
+	return err == nil, err
+}
 
-	_ = conn.SetDeadline(time.Now().Add(isAliveTimeout))
-
-	statusReqFrame, _ := EncodeMessage(MsgStatusReq, nil) // nil payload, never overflows
-	if _, err := conn.Write(statusReqFrame); err != nil {
-		// We connected, then the write failed: connected-then-failed I/O is
-		// transient (the host may still be up; the conn was disrupted).
-		return false, err
+// dialVerifiedHost binds every operation to the identity returned on the same
+// TCP connection. A loopback port reused after registry resolution cannot
+// receive input, output, attach, or kill traffic for another generation.
+func dialVerifiedHost(addr, sessionID, generation string, hostPID int) (net.Conn, [][]byte, []byte, error) {
+	conn, err := dialHost(addr, dialTimeout)
+	if err != nil {
+		return nil, nil, nil, err
 	}
+	prefetched, residual, err := verifyHostConn(conn, sessionID, generation, hostPID)
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, nil, err
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, prefetched, residual, nil
+}
 
-	aliveC := make(chan bool, 1)
+func verifyHostConn(conn net.Conn, sessionID, generation string, hostPID int) ([][]byte, []byte, error) {
+	_ = conn.SetDeadline(time.Now().Add(isAliveTimeout))
+	statusReqFrame, _ := EncodeMessage(MsgStatusReq, nil)
+	if _, err := conn.Write(statusReqFrame); err != nil {
+		return nil, nil, err
+	}
+	var prefetched [][]byte
+	var status *StatusPayload
+	var statusErr error
 	parser := NewMessageParser(func(msgType byte, payload []byte) {
-		if msgType == MsgStatusRes {
+		switch msgType {
+		case MsgTerminalData:
+			prefetched = append(prefetched, append([]byte(nil), payload...))
+		case MsgStatusRes:
 			var sp StatusPayload
-			ok := json.Unmarshal(payload, &sp) == nil
-			select {
-			case aliveC <- ok:
-			default:
+			if err := json.Unmarshal(payload, &sp); err != nil {
+				statusErr = fmt.Errorf("conpty: malformed host identity: %w", err)
+				return
 			}
+			if sp.SessionID == "" || sp.Generation == "" || sp.HostPID == 0 {
+				statusErr = fmt.Errorf("conpty: missing host identity: session=%q generation=%q hostPid=%d", sp.SessionID, sp.Generation, sp.HostPID)
+				return
+			}
+			if sp.SessionID != sessionID || sp.Generation != generation || sp.HostPID != hostPID {
+				statusErr = &hostIdentityMismatchError{got: sp, want: StatusPayload{SessionID: sessionID, Generation: generation, HostPID: hostPID}}
+				return
+			}
+			status = &sp
 		}
 	})
-
 	buf := make([]byte, 4096)
-	var lastErr error
-	for {
+	for status == nil && statusErr == nil {
 		n, err := conn.Read(buf)
 		if n > 0 {
 			parser.Feed(buf[:n])
 		}
-		select {
-		case result := <-aliveC:
-			return result, nil
-		default:
-		}
-		if err != nil {
-			lastErr = err
-			break
+		if err != nil && status == nil && statusErr == nil {
+			return nil, nil, err
 		}
 	}
-	select {
-	case result := <-aliveC:
-		return result, nil
-	default:
-		// Connected but never got a STATUS_RES: read timeout or mid-read EOF.
-		// lastErr is the error that broke the read loop (always non-nil here).
-		return false, lastErr
+	if statusErr != nil {
+		return nil, nil, statusErr
 	}
+	return prefetched, append([]byte(nil), parser.buf...), nil
 }
 
 // isTimeout reports whether err is a network timeout (dial timeout or
@@ -249,16 +278,22 @@ func isConnRefused(err error) bool {
 	return errors.Is(err, wsaeconnrefused)
 }
 
-// clientKill sends MsgKillReq best-effort. Connect failure is a no-op
-// (host already dead). Mirrors ptyHostKill from pty-client.ts.
-func clientKill(addr string) error {
-	conn, err := dialHost(addr, isAliveTimeout)
+// clientKill verifies identity and sends MsgKillReq on the same connection.
+func clientKill(addr, sessionID, generation string, hostPID int) error {
+	conn, _, _, err := dialVerifiedHost(addr, sessionID, generation, hostPID)
 	if err != nil {
-		return nil // already dead
+		return err
 	}
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(isAliveTimeout))
-	killFrame, _ := EncodeMessage(MsgKillReq, nil) // nil payload, never overflows
-	_, _ = conn.Write(killFrame)
-	return nil
+	payload, err := json.Marshal(KillPayload{SessionID: sessionID, Generation: generation})
+	if err != nil {
+		return err
+	}
+	killFrame, err := EncodeMessage(MsgKillReq, payload)
+	if err != nil {
+		return err
+	}
+	_, err = conn.Write(killFrame)
+	return err
 }

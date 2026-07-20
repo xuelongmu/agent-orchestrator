@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -228,6 +229,255 @@ func TestSessionDependenciesRoundTripDeduped(t *testing.T) {
 	}
 	if gotIDs := decodeDependencyIDs(t, listed[1].DependencyIDs); !reflect.DeepEqual(gotIDs, []domain.SessionID{parent.ID}) {
 		t.Fatalf("listed dependsOn = %#v", gotIDs)
+	}
+}
+
+func TestDependencyPromotionRequiresCompletionAndClaimsOnceWithActivityEvent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ao")
+	parent, err := s.CreateSession(ctx, sampleRecord("ao"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	childRecord := sampleRecord("ao")
+	childRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID})
+	childRecord.DependencyPreparedAt = childRecord.CreatedAt
+	childRecord.DependencyBasePrompt = "build child"
+	child, err := s.CreateSession(ctx, childRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := s.ListReadyDependencySessions(ctx); err != nil || len(ready) != 0 {
+		t.Fatalf("ready before completion = %#v, err=%v", ready, err)
+	}
+	handoff := domain.AgentHandoff{ChangedFiles: []string{"parent.go"}, VerificationCommands: []string{"go test ./parent"}, ResidualRisk: "none"}
+	if created, err := s.PutSessionHandoff(ctx, parent.ID, handoff, time.Now().UTC()); err != nil || !created {
+		t.Fatalf("put handoff = %v, %v", created, err)
+	}
+	ready, err := s.ListReadyDependencySessions(ctx)
+	if err != nil || !reflect.DeepEqual(ready, []domain.SessionID{child.ID}) {
+		t.Fatalf("ready after completion = %#v, err=%v", ready, err)
+	}
+	parents, err := s.ListDependencyHandoffs(ctx, child.ID)
+	if err != nil || len(parents) != 1 || parents[0].Handoff == nil || !parents[0].Handoff.Equal(handoff) {
+		t.Fatalf("parent handoffs = %#v, err=%v", parents, err)
+	}
+	promotedAt := time.Now().UTC().Add(time.Second).Truncate(time.Millisecond)
+	if claimed, err := s.ReserveDependencyPromotion(ctx, child.ID, "owner-a", promotedAt); err != nil || !claimed {
+		t.Fatalf("first claim = %v, %v", claimed, err)
+	}
+	if claimed, err := s.ReserveDependencyPromotion(ctx, child.ID, "owner-b", promotedAt.Add(time.Second)); err != nil || claimed {
+		t.Fatalf("replay claim = %v, %v", claimed, err)
+	}
+	if completed, err := s.CompleteDependencyPromotion(ctx, child.ID, "owner-b", promotedAt); err != nil || completed {
+		t.Fatalf("stale token completion = %v, %v", completed, err)
+	}
+	spawnedMetadata := child.Metadata
+	spawnedMetadata.RuntimeHandleID = "runtime-child"
+	spawnedMetadata.Prompt = "build child with handoffs"
+	if marked, err := s.MarkReservedDependencySpawned(ctx, child.ID, "owner-a", spawnedMetadata, promotedAt); err != nil || !marked {
+		t.Fatalf("mark spawned = %v, %v", marked, err)
+	}
+	if marked, err := s.MarkReservedDependencyLaunchSucceeded(ctx, child.ID, "owner-a", promotedAt); err != nil || !marked {
+		t.Fatalf("mark launch succeeded = %v, %v", marked, err)
+	}
+	if completed, err := s.CompleteDependencyPromotion(ctx, child.ID, "owner-a", promotedAt); err != nil || !completed {
+		t.Fatalf("owner completion = %v, %v", completed, err)
+	}
+	got, ok, err := s.GetSession(ctx, child.ID)
+	if err != nil || !ok || !got.DependencyPromotedAt.Equal(promotedAt) {
+		t.Fatalf("promoted child = %#v ok=%v err=%v", got, ok, err)
+	}
+	events, err := s.EventsAfter(ctx, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	promotions := 0
+	for _, event := range events {
+		if event.SessionID == string(child.ID) && strings.Contains(string(event.Payload), `"dependencyPromoted":true`) {
+			promotions++
+		}
+	}
+	if promotions != 1 {
+		t.Fatalf("promotion activity events = %d; events=%#v", promotions, events)
+	}
+}
+
+func TestDependencyReadyFromLifecycleTerminalMergedPRWithoutHandoff(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ao")
+	parent, err := s.CreateSession(ctx, sampleRecord("ao"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	childRecord := sampleRecord("ao")
+	childRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID})
+	childRecord.DependencyPreparedAt = childRecord.CreatedAt
+	childRecord.DependencyBasePrompt = "base"
+	childRecord.Metadata = domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, Branch: "ao/child/root", Prompt: "base"}
+	child, err := s.CreateSession(ctx, childRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WritePR(ctx, domain.PullRequest{URL: "https://example.test/pr/1", SessionID: parent.ID, Number: 1, Merged: true, UpdatedAt: time.Now().UTC()}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := s.ListReadyDependencySessions(ctx); err != nil || len(ready) != 0 {
+		t.Fatalf("merged PR without lifecycle terminal became ready: %v, %v", ready, err)
+	}
+	parent.IsTerminated = true
+	parent.Activity.State = domain.ActivityExited
+	if err := s.UpdateSession(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := s.ListReadyDependencySessions(ctx); err != nil || !reflect.DeepEqual(ready, []domain.SessionID{child.ID}) {
+		t.Fatalf("terminal merged parent did not satisfy dependency: %v, %v", ready, err)
+	}
+	handoffs, err := s.ListDependencyHandoffs(ctx, child.ID)
+	if err != nil || len(handoffs) != 1 || handoffs[0].Handoff != nil {
+		t.Fatalf("missing handoff was not explicit nil context: %#v, %v", handoffs, err)
+	}
+	// Model completion facts changing after the scheduler's read but before its
+	// reservation write. The reservation CAS must re-check every parent rather
+	// than trusting the stale ready list.
+	if err := s.WritePR(ctx, domain.PullRequest{URL: "https://example.test/pr/2", SessionID: parent.ID, Number: 2, UpdatedAt: time.Now().UTC()}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := s.ReserveDependencyPromotion(ctx, child.ID, "stale-ready", time.Now().UTC()); err != nil || claimed {
+		t.Fatalf("reservation accepted stale parent completion: %v, %v", claimed, err)
+	}
+}
+
+func TestDependencyChildCreationAtomicallyPersistsPreparedLaunchInputs(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ao")
+	parent, err := s.CreateSession(ctx, sampleRecord("ao"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	childRecord := sampleRecord("ao")
+	childRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID})
+	childRecord.DependencyPreparedAt = now
+	childRecord.DependencyBasePrompt = "immutable base"
+	childRecord.DependencyBranchPrefix = "ao/"
+	childRecord.DependencyBranchSuffix = "/root"
+	childRecord.Metadata = domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, Prompt: "immutable base"}
+	child, err := s.CreateSession(ctx, childRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetSession(ctx, child.ID)
+	if err != nil || !ok {
+		t.Fatalf("get child: ok=%v err=%v", ok, err)
+	}
+	if got.DependencyPreparedAt.IsZero() || got.DependencyBasePrompt != "immutable base" || got.Metadata.Prompt != "immutable base" || got.Metadata.Branch != "ao/"+string(child.ID)+"/root" {
+		t.Fatalf("committed child exposed partial launch inputs: %#v", got)
+	}
+	if got.Metadata.RuntimeHandleID != "" || !got.DependencyPromotedAt.IsZero() {
+		t.Fatalf("prepared child launched during create: %#v", got)
+	}
+}
+
+func TestDependencyLaunchCASLosesToConcurrentTermination(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ao")
+	parent, err := s.CreateSession(ctx, sampleRecord("ao"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSessionHandoff(ctx, parent.ID, domain.AgentHandoff{ChangedFiles: []string{}, VerificationCommands: []string{}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	childRecord := sampleRecord("ao")
+	childRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID})
+	childRecord.DependencyPreparedAt = childRecord.CreatedAt
+	childRecord.DependencyBasePrompt = "base"
+	childRecord.Metadata = domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, Branch: "ao/child/root", Prompt: "base"}
+	child, err := s.CreateSession(ctx, childRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := s.ReserveDependencyPromotion(ctx, child.ID, "owner", time.Now().UTC()); err != nil || !claimed {
+		t.Fatalf("reserve = %v, %v", claimed, err)
+	}
+	terminated, ok, err := s.GetSession(ctx, child.ID)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	terminated.IsTerminated = true
+	terminated.Activity.State = domain.ActivityExited
+	if err := s.UpdateSession(ctx, terminated); err != nil {
+		t.Fatal(err)
+	}
+	metadata := child.Metadata
+	metadata.RuntimeHandleID = "new-runtime"
+	metadata.WorkspacePath = "/owned-workspace"
+	metadata.Prompt = "rendered"
+	if marked, err := s.MarkReservedDependencySpawned(ctx, child.ID, "owner", metadata, time.Now().UTC()); err != nil || marked {
+		t.Fatalf("terminal-losing CAS = %v, %v", marked, err)
+	}
+	if reset, err := s.ResetReservedDependencyLaunch(ctx, child.ID, "owner", time.Now().UTC()); err != nil || !reset {
+		t.Fatalf("terminal cleanup reset = %v, %v", reset, err)
+	}
+	got, _, err := s.GetSession(ctx, child.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.IsTerminated || got.Activity.State != domain.ActivityExited || got.Metadata.RuntimeHandleID != "" || got.Metadata.WorkspacePath != "" || got.Metadata.Prompt != "base" {
+		t.Fatalf("launch CAS resurrected or overwrote terminal child: %#v", got)
+	}
+}
+
+func TestStaleDependencyReservationRecoveryNeverClearsRuntimeBackedFence(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ao")
+	parent, err := s.CreateSession(ctx, sampleRecord("ao"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSessionHandoff(ctx, parent.ID, domain.AgentHandoff{ChangedFiles: []string{}, VerificationCommands: []string{}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	childRecord := sampleRecord("ao")
+	childRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID})
+	childRecord.DependencyPreparedAt = childRecord.CreatedAt
+	childRecord.DependencyBasePrompt = "base"
+	childRecord.Metadata = domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, Branch: "ao/child/root", Prompt: "base"}
+	child, err := s.CreateSession(ctx, childRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimedAt := time.Now().UTC().Add(-time.Hour)
+	if claimed, err := s.ReserveDependencyPromotion(ctx, child.ID, "stale", claimedAt); err != nil || !claimed {
+		t.Fatalf("reserve stale = %v, %v", claimed, err)
+	}
+	if recovered, err := s.RecoverStaleDependencyPromotions(ctx, time.Now().UTC(), time.Now().UTC().Add(-30*time.Minute)); err != nil || recovered != 1 {
+		t.Fatalf("recover handleless reservation = %d, %v", recovered, err)
+	}
+	if ready, err := s.ListReadyDependencySessions(ctx); err != nil || !reflect.DeepEqual(ready, []domain.SessionID{child.ID}) {
+		t.Fatalf("recovered child not retryable: ready=%v err=%v", ready, err)
+	}
+	if claimed, err := s.ReserveDependencyPromotion(ctx, child.ID, "runtime-owner", claimedAt); err != nil || !claimed {
+		t.Fatalf("reserve runtime owner = %v, %v", claimed, err)
+	}
+	metadata := child.Metadata
+	metadata.RuntimeHandleID = "runtime-boundary"
+	metadata.WorkspacePath = "/owned"
+	if marked, err := s.MarkReservedDependencySpawned(ctx, child.ID, "runtime-owner", metadata, claimedAt); err != nil || !marked {
+		t.Fatalf("mark runtime boundary = %v, %v", marked, err)
+	}
+	if recovered, err := s.RecoverStaleDependencyPromotions(ctx, time.Now().UTC(), time.Now().UTC().Add(-30*time.Minute)); err != nil || recovered != 0 {
+		t.Fatalf("runtime-backed fence recovered without probe = %d, %v", recovered, err)
+	}
+	got, _, err := s.GetSession(ctx, child.ID)
+	if err != nil || got.DependencyPromotionToken != "runtime-owner" {
+		t.Fatalf("runtime-backed token = %q err=%v", got.DependencyPromotionToken, err)
 	}
 }
 

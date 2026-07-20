@@ -366,6 +366,11 @@ func SessionName(id string) string {
 	return sanitizedSessionName(id)
 }
 
+// ExpectedHandle returns Create's deterministic handle before external launch.
+func (r *Runtime) ExpectedHandle(id domain.SessionID) ports.RuntimeHandle {
+	return ports.RuntimeHandle{ID: SessionName(string(id))}
+}
+
 func sanitizedSessionName(raw string) string {
 	var b strings.Builder
 	lastDash := false

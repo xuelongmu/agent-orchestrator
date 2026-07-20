@@ -268,6 +268,12 @@ type Session struct {
 	DiagnosticHookErrorType        string
 	DiagnosticCapturedAt           sql.NullTime
 	WorkspaceKind                  string
+	DependencyPromotedAt           sql.NullTime
+	DependencyPreparedAt           sql.NullTime
+	DependencyBasePrompt           string
+	DependencyPromotionToken       string
+	DependencyPromotionClaimedAt   sql.NullTime
+	DependencyLaunchSucceededAt    sql.NullTime
 }
 
 type SessionDependency struct {
