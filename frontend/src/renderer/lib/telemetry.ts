@@ -101,9 +101,8 @@ export function reserveCapture(
 				? { ...(parsed.counts as Record<string, unknown>) }
 				: {};
 		const storedCount = counts[name];
-		const count = typeof storedCount === "number" && Number.isFinite(storedCount)
-			? Math.max(0, Math.floor(storedCount))
-			: 0;
+		const count =
+			typeof storedCount === "number" && Number.isFinite(storedCount) ? Math.max(0, Math.floor(storedCount)) : 0;
 		if (count >= EVENTS_PER_NAME_PER_DAY) return false;
 		counts[name] = count + 1;
 		storage.setItem(CAPTURE_BUDGET_STORAGE_KEY, JSON.stringify({ day, counts }));
@@ -467,7 +466,10 @@ export async function initTelemetry(): Promise<boolean> {
 			},
 		});
 		if (reserveCapture("ao.renderer.loaded", Date.now(), storage)) {
-			posthog.capture("ao.renderer.loaded", withTelemetryContext(await sanitizeRendererProperties("ao.renderer.loaded")));
+			posthog.capture(
+				"ao.renderer.loaded",
+				withTelemetryContext(await sanitizeRendererProperties("ao.renderer.loaded")),
+			);
 		}
 		return true;
 	})().catch(() => false);
