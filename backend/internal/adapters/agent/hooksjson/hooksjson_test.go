@@ -19,7 +19,10 @@ func TestInstallMigratesLegacyBareCommandAndPreservesSettings(t *testing.T) {
 		"timeout": float64(7),
 		"custom":  map[string]any{"owner": "user"},
 	}
-	otherEvent := []any{map[string]any{"type": "command", "command": "leave unchanged"}}
+	otherEvent := []any{map[string]any{
+		"matcher": "other",
+		"hooks":   []any{map[string]any{"type": "command", "command": "leave unchanged"}},
+	}}
 	writeJSON(t, hooksPath, map[string]any{
 		"theme":  "dark",
 		"custom": map[string]any{"enabled": true},
@@ -129,6 +132,78 @@ func TestInstallIsIdempotent(t *testing.T) {
 	assertCommandCount(t, sessionStartGroups(t, hooksPath), testCommand, 1)
 }
 
+func TestInstallHandlesNullTopLevelHooks(t *testing.T) {
+	workspace, hooksPath, manager := newTestManager(t)
+	writeJSON(t, hooksPath, map[string]any{
+		"theme": "dark",
+		"hooks": nil,
+	})
+
+	if err := manager.Install(context.Background(), workspace); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+
+	settings := readJSONObject(t, hooksPath)
+	if settings["theme"] != "dark" {
+		t.Fatalf("unrelated setting changed: %#v", settings)
+	}
+	groups := settings["hooks"].(map[string]any)["SessionStart"].([]any)
+	assertCommandCount(t, groups, testCommand, 1)
+}
+
+func TestInstallNormalizesLegacyCommandsInUnmanagedEvents(t *testing.T) {
+	workspace, hooksPath, manager := newTestManager(t)
+	legacy := map[string]any{"type": "command", "command": "user-other", "custom": "keep"}
+	malformed := map[string]any{"type": "command", "command": "opaque-event"}
+	writeJSON(t, hooksPath, map[string]any{
+		"hooks": map[string]any{
+			"OtherEvent":     []any{legacy},
+			"MalformedEvent": malformed,
+		},
+	})
+
+	if err := manager.Install(context.Background(), workspace); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+
+	hooks := readJSONObject(t, hooksPath)["hooks"].(map[string]any)
+	otherGroups := hooks["OtherEvent"].([]any)
+	if len(otherGroups) != 1 {
+		t.Fatalf("OtherEvent group count = %d, want 1", len(otherGroups))
+	}
+	group := otherGroups[0].(map[string]any)
+	if group["matcher"] != "" || !reflect.DeepEqual(group["hooks"].([]any), []any{legacy}) {
+		t.Fatalf("unmanaged legacy event was not normalized: %#v", group)
+	}
+	if !reflect.DeepEqual(hooks["MalformedEvent"], malformed) {
+		t.Fatalf("malformed unmanaged event changed: got %#v, want %#v", hooks["MalformedEvent"], malformed)
+	}
+}
+
+func TestInstallPreservesHybridCommandEntries(t *testing.T) {
+	workspace, hooksPath, manager := newTestManager(t)
+	hybrids := []any{
+		map[string]any{"type": "command", "command": "user-null", "hooks": nil, "custom": "keep-null"},
+		map[string]any{"type": "command", "command": "user-string", "hooks": "not-an-array", "custom": "keep-string"},
+	}
+	writeJSON(t, hooksPath, map[string]any{
+		"hooks": map[string]any{"SessionStart": hybrids},
+	})
+
+	if err := manager.Install(context.Background(), workspace); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+
+	groups := sessionStartGroups(t, hooksPath)
+	if len(groups) != len(hybrids)+1 {
+		t.Fatalf("SessionStart entry count = %d, want %d", len(groups), len(hybrids)+1)
+	}
+	if !reflect.DeepEqual(groups[:len(hybrids)], hybrids) {
+		t.Fatalf("hybrid entries changed:\ngot  %#v\nwant %#v", groups[:len(hybrids)], hybrids)
+	}
+	assertCommandCount(t, groups, testCommand, 1)
+}
+
 func TestInstallPreservesMalformedAndNonCommandEntries(t *testing.T) {
 	workspace, hooksPath, manager := newTestManager(t)
 	original := []any{
@@ -213,7 +288,11 @@ func TestInstallNormalizesExistingLegacyAOCommandWithoutDuplicate(t *testing.T) 
 		t.Fatalf("SessionStart group count = %d, want 1", len(groups))
 	}
 	assertCommandCount(t, groups, testCommand, 1)
-	hook := groups[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)
+	group := groups[0].(map[string]any)
+	if group["matcher"] != "startup" {
+		t.Fatalf("legacy AO hook matcher = %#v, want startup", group["matcher"])
+	}
+	hook := group["hooks"].([]any)[0].(map[string]any)
 	if hook["custom"] != "keep" {
 		t.Fatalf("legacy AO hook fields were lost: %#v", hook)
 	}
