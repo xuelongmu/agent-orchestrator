@@ -1189,7 +1189,12 @@ func (m *Manager) notificationIntentForSCM(rec domain.SessionRecord, o ports.SCM
 		base.Type = domain.NotificationPRClosedUnmerged
 		return &base
 	}
-	if rec.IsTerminated || rec.Activity.State.NeedsInput() || !scmObservationIsReadyToMerge(o) {
+	// Merge readiness deliberately has a narrower bot-review policy than agent
+	// feedback routing. Do not change that provider policy here, but also do not
+	// tell the user a PR is ready in the same observation that routes actionable
+	// anchored feedback to its worker.
+	if rec.IsTerminated || rec.Activity.State.NeedsInput() || !scmObservationIsReadyToMerge(o) ||
+		hasUnresolvedComments(scmToPRObservation(o).Comments) {
 		return nil
 	}
 	base.Type = domain.NotificationReadyToMerge
@@ -1253,11 +1258,15 @@ func scmToPRObservation(o ports.SCMObservation) ports.PRObservation {
 		})
 	}
 	for _, th := range o.Review.Threads {
-		if th.Resolved || th.IsBot {
+		if th.Resolved {
 			continue
 		}
+		anchored := strings.TrimSpace(th.Path) != "" && th.Line > 0
 		for _, c := range th.Comments {
-			if c.IsBot {
+			// Thread bot-ness is aggregate metadata and may describe a bot-started
+			// thread that later receives human feedback. Suppress only bot-authored
+			// chatter without an anchor; human comments are always actionable.
+			if c.IsBot && !anchored {
 				continue
 			}
 			pr.Comments = append(pr.Comments, ports.PRCommentObservation{
