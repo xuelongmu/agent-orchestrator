@@ -741,6 +741,161 @@ func TestListNeverAdoptsCorruptAggregateFromAmbiguousNamespace(t *testing.T) {
 	}
 }
 
+func TestRecreatedActiveLegacyAggregateWinsOverStaleQuarantine(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(t.TempDir(), "migrated", "data")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_RUN_FILE", "")
+	withFakePidAlive(t, func(int) bool { return true })
+	legacyPath := filepath.Join(home, ".ao", "windows-pty-hosts.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte("partial-[{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ListAt(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if paths := quarantinedAggregatePaths(legacyPath); len(paths) != 1 {
+		t.Fatalf("quarantined legacy paths = %v, want one", paths)
+	}
+	recreated := Entry{SessionID: "recreated", PtyHostPID: 31, PipePath: "127.0.0.1:31", RegisteredAt: nowRFC3339()}
+	writeRegistryFixture(t, legacyPath, []Entry{recreated})
+
+	got, ok, err := LookupAt(dataDir, recreated.SessionID)
+	if err != nil || !ok || got.PtyHostPID != recreated.PtyHostPID {
+		t.Fatalf("recreated active legacy lookup = %+v, %v, %v", got, ok, err)
+	}
+	if paths := quarantinedAggregatePaths(legacyPath); len(paths) != 1 {
+		t.Fatalf("stale quarantine was unexpectedly removed: %v", paths)
+	}
+}
+
+func TestConfiguredActiveAggregateWinsOverUnrelatedLegacyQuarantine(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(t.TempDir(), "configured", "data")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_RUN_FILE", "")
+	withFakePidAlive(t, func(int) bool { return true })
+	legacyPath := filepath.Join(home, ".ao", "windows-pty-hosts.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte("partial-[{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ListAt(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	configuredPath, err := registryFileFor(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured := Entry{SessionID: "configured-active", PtyHostPID: 41, PipePath: "127.0.0.1:41", RegisteredAt: nowRFC3339()}
+	writeRegistryFixture(t, configuredPath, []Entry{configured})
+
+	got, ok, err := LookupAt(dataDir, configured.SessionID)
+	if err != nil || !ok || got.PtyHostPID != configured.PtyHostPID {
+		t.Fatalf("configured active lookup = %+v, %v, %v", got, ok, err)
+	}
+	if _, ok, err := LookupAt(dataDir, "configured-missing"); err != nil || ok {
+		t.Fatalf("unrelated legacy quarantine fenced configured miss: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestNullAggregateIsQuarantinedAndFailsClosed(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AO_RUN_FILE", filepath.Join(dataDir, "running.json"))
+	withFakePidAlive(t, func(int) bool { return true })
+	valid := Entry{SessionID: "keyed", PtyHostPID: 51, PipePath: "127.0.0.1:51", RegisteredAt: nowRFC3339(), Generation: "keyed-generation"}
+	if err := RegisterAt(dataDir, valid); err != nil {
+		t.Fatal(err)
+	}
+	aggregatePath, err := registryFileFor(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aggregatePath, []byte("null"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ListAt(dataDir)
+	if err != nil || len(got) != 1 || got[0].SessionID != valid.SessionID {
+		t.Fatalf("ListAt = %v, %v; want healthy keyed entry", got, err)
+	}
+	if paths := quarantinedAggregatePaths(aggregatePath); len(paths) != 1 {
+		t.Fatalf("null aggregate quarantine paths = %v, want one", paths)
+	}
+	if _, err := LookupAllAt(dataDir, "legacy-null"); err == nil {
+		t.Fatal("null aggregate was silently treated as an empty registry")
+	}
+}
+
+func TestBracketDataDirQuarantineDiscoveryIsolationAndClear(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "ao[data]")
+	siblingDir := filepath.Join(root, "aod") // would match the old [data] glob pattern
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_DATA_DIR", dataDir)
+	t.Setenv("AO_RUN_FILE", filepath.Join(dataDir, "running.json"))
+	withFakePidAlive(t, func(int) bool { return true })
+	valid := Entry{SessionID: "bracket-keyed", PtyHostPID: 61, PipePath: "127.0.0.1:61", RegisteredAt: nowRFC3339(), Generation: "bracket-generation"}
+	if err := Register(valid); err != nil {
+		t.Fatal(err)
+	}
+	aggregatePath, err := registryFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblingAggregate := filepath.Join(siblingDir, filepath.Base(aggregatePath))
+	if err := os.MkdirAll(siblingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	siblingQuarantine := siblingAggregate + ".corrupt-sibling"
+	if err := os.WriteFile(siblingQuarantine, []byte("sibling"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A sibling that only matches via glob metacharacter expansion must not
+	// fence this literal bracket-containing namespace.
+	if _, ok, err := Lookup("before-local-corruption"); err != nil || ok {
+		t.Fatalf("sibling quarantine affected literal namespace: ok=%v err=%v", ok, err)
+	}
+	if err := os.WriteFile(aggregatePath, []byte("partial-[{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		got, err := List()
+		if err != nil || len(got) != 1 || got[0].SessionID != valid.SessionID {
+			t.Fatalf("List iteration %d = %v, %v", i, got, err)
+		}
+	}
+	if paths := quarantinedAggregatePaths(aggregatePath); len(paths) != 1 {
+		t.Fatalf("literal namespace quarantine paths = %v, want one", paths)
+	}
+	if _, ok, err := Lookup("after-local-corruption"); err == nil || ok {
+		t.Fatalf("literal namespace keyed miss did not fail closed: ok=%v err=%v", ok, err)
+	}
+
+	if err := Clear(); err != nil {
+		t.Fatal(err)
+	}
+	if paths := quarantinedAggregatePaths(aggregatePath); len(paths) != 0 {
+		t.Fatalf("Clear retained literal namespace quarantine: %v", paths)
+	}
+	if _, err := os.Stat(siblingQuarantine); err != nil {
+		t.Fatalf("Clear mutated sibling quarantine: %v", err)
+	}
+	if _, ok, err := Lookup("after-clear"); err != nil || ok {
+		t.Fatalf("cleared literal namespace remained fenced: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestLookupNewestGenerationUsesNanosecondTimestamp(t *testing.T) {
 	dataDir := t.TempDir()
 	withFakePidAlive(t, func(int) bool { return true })
