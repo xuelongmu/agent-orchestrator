@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -27,6 +28,10 @@ const (
 	// a non-empty message, before the trailing Enter, so a large multiline paste
 	// does not absorb the Enter and leave the prompt unsubmitted (issue #2342).
 	defaultEnterDelay = 300 * time.Millisecond
+	// defaultReapGrace gives descendants a chance to release resources after
+	// SIGTERM before Destroy escalates surviving pane process sessions to
+	// SIGKILL.
+	defaultReapGrace = 5 * time.Second
 )
 
 var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -41,17 +46,20 @@ type Options struct {
 	Timeout    time.Duration // default 5s
 	ChunkSize  int           // default 16*1024
 	EnterDelay time.Duration // pause after pasting a non-empty message before pressing Enter; default defaultEnterDelay. Conpty already does this (ptyInputEnterDelay); tmux lacked it, so a large multiline paste could absorb the trailing Enter and leave the prompt unsubmitted (issue #2342).
+	ReapGrace  time.Duration // grace between SIGTERM and SIGKILL for pane descendants during Destroy; default 5s
 }
 
 // Runtime runs agent sessions inside tmux sessions, driving them via the tmux
 // CLI. It implements ports.Runtime.
 type Runtime struct {
-	binary     string
-	shell      string
-	timeout    time.Duration
-	chunkSize  int
-	enterDelay time.Duration
-	runner     runner
+	binary        string
+	shell         string
+	timeout       time.Duration
+	chunkSize     int
+	enterDelay    time.Duration
+	reapGrace     time.Duration
+	runner        runner
+	sessionReaper paneSessionReaper
 }
 
 var _ ports.Runtime = (*Runtime)(nil)
@@ -100,13 +108,26 @@ func New(opts Options) *Runtime {
 	if enterDelay <= 0 {
 		enterDelay = defaultEnterDelay
 	}
+	reapGrace := opts.ReapGrace
+	if reapGrace <= 0 {
+		reapGrace = defaultReapGrace
+	}
+	processRunner := execRunner{}
+	processes := osProcessTable{runner: processRunner, timeout: timeout}
 	return &Runtime{
 		binary:     binary,
 		shell:      shellPath,
 		timeout:    timeout,
 		chunkSize:  chunkSize,
 		enterDelay: enterDelay,
-		runner:     execRunner{},
+		reapGrace:  reapGrace,
+		runner:     processRunner,
+		sessionReaper: processSessionReaper{
+			table:    processes,
+			signaler: osProcessSignaler{},
+			timeout:  timeout,
+			wait:     waitContext,
+		},
 	}
 }
 
@@ -168,14 +189,24 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 	return handle, nil
 }
 
-// Destroy kills the handle's tmux session. An already-gone session is treated
-// as success (idempotent).
+// Destroy kills the handle's exact tmux session, then reaps background
+// descendants that tmux leaves in its unlinked pane process sessions. Process
+// ownership is anchored before kill-session removes the panes. Discovery and
+// reaping are best-effort; the kill-session result retains the existing error
+// and missing-session semantics.
 func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error {
 	id, err := handleID(handle)
 	if err != nil {
 		return err
 	}
+	var anchors []sessionAnchor
+	if discoveryCtx, cancel, ok := r.paneDiscoveryContext(ctx); ok {
+		panePIDs := r.ownedPanePIDs(discoveryCtx, id)
+		anchors = r.sessionReaper.Anchor(discoveryCtx, panePIDs)
+		cancel()
+	}
 	out, err := r.run(ctx, killSessionArgs(id)...)
+	r.sessionReaper.Reap(ctx, anchors, r.reapGrace)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && killSessionMissingOutput(string(out)) {
@@ -184,6 +215,52 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 		return fmt.Errorf("tmux runtime: destroy session %s: %w", id, err)
 	}
 	return nil
+}
+
+// paneDiscoveryContext reserves one full command timeout for the primary
+// kill-session call whenever the caller supplied a deadline. Optional ownership
+// discovery is skipped when no such reserve remains.
+func (r *Runtime) paneDiscoveryContext(ctx context.Context) (context.Context, context.CancelFunc, bool) {
+	if ctx.Err() != nil {
+		return nil, nil, false
+	}
+	budget := r.timeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= r.timeout {
+			return nil, nil, false
+		}
+		if available := remaining - r.timeout; available < budget {
+			budget = available
+		}
+	}
+	if budget <= 0 {
+		return nil, nil, false
+	}
+	discoveryCtx, cancel := context.WithTimeout(ctx, budget)
+	return discoveryCtx, cancel, true
+}
+
+// ownedPanePIDs captures pane leaders from unlinked windows only. A linked
+// window survives kill-session through its other session and must never have
+// its still-active processes reaped by this Destroy.
+func (r *Runtime) ownedPanePIDs(ctx context.Context, id string) []int {
+	out, err := r.run(ctx, listPaneOwnersArgs(id)...)
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[1] != "0" {
+			continue
+		}
+		pid, parseErr := strconv.Atoi(fields[0])
+		if parseErr == nil {
+			pids = append(pids, pid)
+		}
+	}
+	return safeUniquePIDs(pids)
 }
 
 // IsAlive reports whether the handle's session still exists via `tmux
