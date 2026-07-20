@@ -83,6 +83,7 @@ vi.mock("./SessionFilesView", () => ({
 	),
 }));
 const browserDestroy = vi.hoisted(() => vi.fn());
+const browserRemeasure = vi.hoisted(() => vi.fn());
 vi.mock("../hooks/useBrowserView", () => ({
 	useBrowserView: () => ({
 		viewId: "browser:sess-1",
@@ -95,6 +96,7 @@ vi.mock("../hooks/useBrowserView", () => ({
 			isLoading: false,
 		},
 		slotRef: vi.fn(),
+		remeasure: browserRemeasure,
 		navigate: vi.fn(),
 		goBack: vi.fn(),
 		goForward: vi.fn(),
@@ -209,6 +211,7 @@ describe("SessionView", () => {
 		useUiStore.setState({ isInspectorOpen: true });
 		panels.clear();
 		browserDestroy.mockReset();
+		browserRemeasure.mockReset();
 	});
 
 	// Regression: react-resizable-panels v4 treats bare numeric sizes as PIXELS
@@ -298,6 +301,16 @@ describe("SessionView", () => {
 		act(() => entry.onResize?.({ asPercentage: 12.4, inPixels: 160 }));
 		expect(useUiStore.getState().isInspectorOpen).toBe(false);
 		expect(window.localStorage.getItem("ao.inspector.split")).toBeNull();
+	});
+
+	it("re-measures the browser overlay while the inspector divider is dragged", () => {
+		render(<SessionView sessionId="sess-1" />);
+		const entry = panels.get("inspector")!;
+		screen.getByTestId("resize-handle").setAttribute("data-separator", "active");
+
+		act(() => entry.onResize?.({ asPercentage: 24, inPixels: 320 }));
+
+		expect(browserRemeasure).toHaveBeenCalledTimes(1);
 	});
 
 	it("restores the persisted split width", () => {

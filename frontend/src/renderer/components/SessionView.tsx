@@ -186,6 +186,10 @@ export function SessionView({ sessionId }: SessionViewProps) {
 	// with the expand()/collapse() effect above.
 	const handleInspectorResize = useCallback(
 		(size: PanelSize) => {
+			// The native overlay is positioned independently from the DOM. The
+			// panel callback is the reliable signal that divider geometry changed,
+			// even when the slot's ResizeObserver misses the change.
+			browserView.remeasure();
 			if (inspectorSeparatorRef.current?.getAttribute("data-separator") !== "active") return;
 			const open = useUiStore.getState().isInspectorOpen;
 			if (size.asPercentage > 0) {
@@ -195,7 +199,7 @@ export function SessionView({ sessionId }: SessionViewProps) {
 				toggleInspector();
 			}
 		},
-		[toggleInspector],
+		[browserView.remeasure, toggleInspector],
 	);
 
 	if (!session && !workspaceQuery.isLoading) {

@@ -34,6 +34,8 @@ export type BrowserViewModel = {
 	mirrorUrl: string;
 	mirrorStream: MediaStream | null;
 	slotRef: (node: HTMLDivElement | null) => void;
+	/** Schedule a fresh native-overlay measurement after its slot layout changes. */
+	remeasure: () => void;
 	navigate: (url: string) => Promise<void>;
 	goBack: () => Promise<void>;
 	goForward: () => Promise<void>;
@@ -489,6 +491,7 @@ export function useBrowserView({
 		mirrorUrl,
 		mirrorStream,
 		slotRef,
+		remeasure: scheduleSettleMeasure,
 		navigate,
 		goBack: () => (hasNativeBrowser ? withView((id) => window.ao!.browser.goBack(id)) : Promise.resolve()),
 		goForward: () => (hasNativeBrowser ? withView((id) => window.ao!.browser.goForward(id)) : Promise.resolve()),
