@@ -54,6 +54,8 @@ type recordingReaper struct {
 	anchoredPanes []paneRef
 	calls         []reaperCall
 	serverExited  bool
+	serverExitErr error
+	anchorHook    func(context.Context)
 }
 
 type reaperCall struct {
@@ -62,14 +64,17 @@ type reaperCall struct {
 	grace       time.Duration
 }
 
-func (r *recordingReaper) Anchor(_ context.Context, panes []paneRef) []sessionAnchor {
+func (r *recordingReaper) Anchor(ctx context.Context, panes []paneRef) []sessionAnchor {
+	if r.anchorHook != nil {
+		r.anchorHook(ctx)
+	}
 	r.anchoredPanes = append([]paneRef(nil), panes...)
 	anchors := make([]sessionAnchor, 0, len(panes))
 	for _, pane := range panes {
 		identity := processIdentity{pid: pane.pid, sessionID: pane.pid, started: "anchored"}
 		anchors = append(anchors, sessionAnchor{
 			pane:      pane,
-			server:    &fakeProcessHandle{identity: processIdentity{pid: pane.serverPID, sessionID: pane.serverPID, started: "server"}, exited: r.serverExited},
+			server:    &fakeProcessHandle{identity: processIdentity{pid: pane.serverPID, sessionID: pane.serverPID, started: "server"}, exited: r.serverExited, exitErr: r.serverExitErr},
 			sessionID: pane.pid,
 			members:   processSet{identity: &fakeProcessHandle{identity: identity}},
 		})
@@ -522,6 +527,25 @@ func TestDestroyExcludesPaneMovedToAnotherWindowAfterDiscovery(t *testing.T) {
 	}
 }
 
+func TestDestroyRevalidatesPaneMovedWithinTargetSession(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	before := []byte("100 1000 %1 @1 4242 0\n")
+	afterMove := []byte("100 1000 %1 @9 4242 0\n")
+	fr.outputs = [][]byte{before, afterMove, nil, nil}
+	reaper := &recordingReaper{}
+	r.sessionReaper = reaper
+
+	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if len(reaper.calls) != 1 || len(reaper.calls[0].anchors) != 1 {
+		t.Fatalf("reaper calls = %#v, want moved pane anchor", reaper.calls)
+	}
+	if got := reaper.calls[0].anchors[0].pane.windowID; got != "@9" {
+		t.Fatalf("revalidated window ID = %q, want @9", got)
+	}
+}
+
 func TestDestroyDoesNotConfuseReusedObjectIDsFromNewServerGeneration(t *testing.T) {
 	r, fr := newTestRuntime(0)
 	panes := []byte("100 1000 %1 @1 4242 0\n")
@@ -592,7 +616,7 @@ func TestDestroyRejectsPanePIDReuseBeforeAnchorCompletes(t *testing.T) {
 	}
 }
 
-func TestReapAfterSurvivorCheckReapsForEveryMissingServerSpelling(t *testing.T) {
+func TestReapAfterSurvivorCheckReapsForEveryMissingServerSpellingWhenExactServerExited(t *testing.T) {
 	for name, output := range map[string]string{
 		"no server running":       "no server running on /tmp/tmux-1000/default",
 		"socket missing":          "error connecting to /tmp/tmux-1000/default (No such file or directory)",
@@ -606,7 +630,7 @@ func TestReapAfterSurvivorCheckReapsForEveryMissingServerSpelling(t *testing.T) 
 			r.sessionReaper = reaper
 			pane := paneRef{serverID: "100/1000", serverPID: 100, paneID: "%1", windowID: "@1", pid: 4242}
 			identity := processIdentity{pid: 4242, sessionID: 4242, started: "anchored"}
-			server := &fakeProcessHandle{identity: processIdentity{pid: 100, sessionID: 100, started: "server"}}
+			server := &fakeProcessHandle{identity: processIdentity{pid: 100, sessionID: 100, started: "server"}, exited: true}
 
 			r.reapAfterSurvivorCheck(context.Background(), []sessionAnchor{{
 				pane: pane, server: server, sessionID: 4242, members: processSet{identity: &fakeProcessHandle{identity: identity}},
@@ -615,6 +639,72 @@ func TestReapAfterSurvivorCheckReapsForEveryMissingServerSpelling(t *testing.T) 
 				t.Fatalf("reaper calls = %#v, want one after definitive missing-server output", reaper.calls)
 			}
 		})
+	}
+}
+
+func TestReapAfterSurvivorCheckFailsClosedForMissingSocketWithoutExactServerExit(t *testing.T) {
+	spellings := map[string]string{
+		"no server running":       "no server running on /tmp/tmux-1000/default",
+		"socket missing":          "error connecting to /tmp/tmux-1000/default (No such file or directory)",
+		"socket without listener": "error connecting to /tmp/tmux-1000/default (Connection refused)",
+	}
+	states := map[string]int{"server live": -1, "post-missing probe ambiguous": 2}
+	for spelling, output := range spellings {
+		for state, errorOnCall := range states {
+			t.Run(spelling+"/"+state, func(t *testing.T) {
+				r, fr := newTestRuntime(0)
+				fr.outputs = [][]byte{[]byte(output)}
+				fr.err = &exec.ExitError{}
+				reaper := &recordingReaper{}
+				r.sessionReaper = reaper
+				identity := processIdentity{pid: 4242, sessionID: 4242, started: "anchored"}
+				server := &fakeProcessHandle{
+					identity:      processIdentity{pid: 100, sessionID: 100, started: "server"},
+					exitErr:       errors.New("pidfd probe unavailable"),
+					exitErrOnCall: errorOnCall,
+				}
+
+				r.reapAfterSurvivorCheck(context.Background(), []sessionAnchor{{
+					pane:   paneRef{serverID: "100/1000", serverPID: 100, paneID: "%1", windowID: "@1", pid: 4242},
+					server: server, sessionID: 4242, members: processSet{identity: &fakeProcessHandle{identity: identity}},
+				}})
+				if len(reaper.calls) != 0 {
+					t.Fatalf("reaper calls = %#v, want fail-closed without exact server exit", reaper.calls)
+				}
+			})
+		}
+	}
+}
+
+func TestDestroyMissingSocketDoesNotReapLinkedPaneWhileExactServerLives(t *testing.T) {
+	r, _ := newTestRuntime(0)
+	panes := []byte("100 1000 %1 @1 4242 0\n")
+	listCalls := 0
+	r.runner = runnerFunc(func(_ context.Context, _ []string, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "list-panes":
+			listCalls++
+			if listCalls <= 2 {
+				return panes, nil
+			}
+			// The target link is gone and the socket path is unavailable, but
+			// the retained exact server (and linked pane elsewhere) is live.
+			return []byte("error connecting to /tmp/tmux-1000/default (No such file or directory)"), &exec.ExitError{}
+		case "kill-session":
+			return nil, nil
+		default:
+			t.Fatalf("unexpected tmux command %q", args[0])
+			return nil, nil
+		}
+	})
+	reaper := &recordingReaper{}
+	r.sessionReaper = reaper
+
+	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if len(reaper.calls) != 0 {
+		t.Fatalf("reaper calls = %#v, want no signals while exact server remains live", reaper.calls)
 	}
 }
 
@@ -711,6 +801,48 @@ func TestDestroyReservesCallerDeadlineForKillSession(t *testing.T) {
 	}
 }
 
+func TestDestroyGivesPaneRevalidationAnIndependentBudget(t *testing.T) {
+	r, _ := newTestRuntime(0)
+	r.timeout = 10 * time.Millisecond
+	panes := []byte("100 1000 %1 @1 4242 0\n")
+	listCalls := 0
+	r.runner = runnerFunc(func(commandCtx context.Context, _ []string, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "list-panes":
+			listCalls++
+			if err := commandCtx.Err(); err != nil {
+				t.Fatalf("list-panes call %d started with expired context: %v", listCalls, err)
+			}
+			if listCalls <= 2 {
+				return panes, nil
+			}
+			return nil, nil
+		case "kill-session":
+			if err := commandCtx.Err(); err != nil {
+				t.Fatalf("kill-session received exhausted context: %v", err)
+			}
+			return nil, nil
+		default:
+			t.Fatalf("unexpected tmux command %q", args[0])
+			return nil, nil
+		}
+	})
+	reaper := &recordingReaper{anchorHook: func(anchorCtx context.Context) {
+		<-anchorCtx.Done()
+	}}
+	r.sessionReaper = reaper
+
+	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if listCalls != 3 {
+		t.Fatalf("list-panes calls = %d, want discovery, revalidation, and survivor probe", listCalls)
+	}
+	if len(reaper.calls) != 1 {
+		t.Fatalf("reaper calls = %#v, want anchor preserved after slow Anchor", reaper.calls)
+	}
+}
+
 func TestDestroyCallerCancellationDuringDiscoveryDoesNotSkipKillSession(t *testing.T) {
 	r, _ := newTestRuntime(0)
 	r.timeout = 10 * time.Millisecond
@@ -758,10 +890,13 @@ type signalCall struct {
 }
 
 type fakeProcessHandle struct {
-	identity processIdentity
-	table    *fakeProcessTable
-	closed   bool
-	exited   bool
+	identity      processIdentity
+	table         *fakeProcessTable
+	closed        bool
+	exited        bool
+	exitErr       error
+	exitCalls     int
+	exitErrOnCall int
 }
 
 func (h *fakeProcessHandle) Alive(ctx context.Context) error {
@@ -789,6 +924,10 @@ func (h *fakeProcessHandle) Exited(ctx context.Context) (bool, error) {
 	}
 	if h == nil || h.closed {
 		return false, errors.New("process handle closed")
+	}
+	h.exitCalls++
+	if h.exitErr != nil && (h.exitErrOnCall == 0 || h.exitErrOnCall == h.exitCalls) {
+		return false, h.exitErr
 	}
 	if h.exited {
 		return true, nil

@@ -5,6 +5,7 @@ package tmux
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -82,7 +83,12 @@ func (h *linuxProcessHandle) Exited(ctx context.Context) (bool, error) {
 	if h == nil || h.closed || h.fd < 0 {
 		return false, fmt.Errorf("process handle is closed")
 	}
-	fds := []unix.PollFd{{Fd: int32(h.fd), Events: unix.POLLIN}}
+	if h.fd > math.MaxInt32 {
+		return false, fmt.Errorf("process handle fd %d exceeds poll range", h.fd)
+	}
+	// #nosec G115 -- h.fd is nonnegative and bounded by MaxInt32 above.
+	pollFD := int32(h.fd)
+	fds := []unix.PollFd{{Fd: pollFD, Events: unix.POLLIN}}
 	ready, err := unix.Poll(fds, 0)
 	if err != nil {
 		return false, err

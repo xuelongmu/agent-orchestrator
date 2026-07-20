@@ -200,15 +200,18 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 	}
 	callerLive := ctx.Err() == nil
 	var anchors []sessionAnchor
-	if discoveryCtx, cancel, ok := r.paneDiscoveryContext(ctx); ok {
+	if discoveryBudget, revalidationBudget, ok := r.paneDiscoveryBudgets(ctx); ok {
+		discoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discoveryBudget)
 		panes := r.livePaneRefs(discoveryCtx, listPaneRefsArgs(id))
 		anchors = r.sessionReaper.Anchor(discoveryCtx, panes)
+		cancel()
 		// pane_pid can exit and be reused while Anchor probes the process table.
 		// Keep only anchors still attached to the same live tmux pane and PID.
 		if len(anchors) > 0 {
-			anchors = revalidatedPaneAnchors(anchors, r.livePaneRefs(discoveryCtx, listPaneRefsArgs(id)))
+			revalidationCtx, revalidationCancel := context.WithTimeout(context.WithoutCancel(ctx), revalidationBudget)
+			anchors = revalidatedPaneAnchors(anchors, r.livePaneRefs(revalidationCtx, listPaneRefsArgs(id)))
+			revalidationCancel()
 		}
-		cancel()
 	}
 	// Cancellation that arrives during optional discovery must not suppress the
 	// primary teardown. Detach only after confirming the caller was live on
@@ -234,31 +237,29 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 	return nil
 }
 
-// paneDiscoveryContext reserves one full command timeout for the primary
-// kill-session call whenever the caller supplied a deadline. Optional ownership
-// discovery is skipped when no such reserve remains.
-func (r *Runtime) paneDiscoveryContext(ctx context.Context) (context.Context, context.CancelFunc, bool) {
+// paneDiscoveryBudgets gives discovery and mandatory pane revalidation separate
+// detached bounds while reserving one full command timeout for kill-session
+// whenever the caller supplied a deadline.
+func (r *Runtime) paneDiscoveryBudgets(ctx context.Context) (time.Duration, time.Duration, bool) {
 	if ctx.Err() != nil {
-		return nil, nil, false
+		return 0, 0, false
 	}
 	budget := r.timeout
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if remaining <= r.timeout {
-			return nil, nil, false
+			return 0, 0, false
 		}
-		if available := remaining - r.timeout; available < budget {
-			budget = available
+		// Split all optional time up front. Anchor cannot consume the budget
+		// reserved for the required second pane observation.
+		if availablePerPhase := (remaining - r.timeout) / 2; availablePerPhase < budget {
+			budget = availablePerPhase
 		}
 	}
 	if budget <= 0 {
-		return nil, nil, false
+		return 0, 0, false
 	}
-	// Discovery is optional but must remain independently bounded. Detaching
-	// cancellation keeps a caller cancellation in this phase from racing away
-	// the subsequent kill-session call.
-	discoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
-	return discoveryCtx, cancel, true
+	return budget, budget, true
 }
 
 func (r *Runtime) teardownCommandContext(ctx context.Context, callerWasLive bool) (context.Context, context.CancelFunc) {
@@ -297,13 +298,24 @@ func (r *Runtime) livePaneRefs(ctx context.Context, args []string) []paneRef {
 }
 
 func revalidatedPaneAnchors(anchors []sessionAnchor, panes []paneRef) []sessionAnchor {
-	live := make(map[paneRef]struct{}, len(panes))
+	type stablePaneRef struct {
+		serverID  string
+		serverPID int
+		paneID    string
+		pid       int
+	}
+	live := make(map[stablePaneRef]paneRef, len(panes))
 	for _, pane := range panes {
-		live[pane] = struct{}{}
+		key := stablePaneRef{serverID: pane.serverID, serverPID: pane.serverPID, paneID: pane.paneID, pid: pane.pid}
+		live[key] = pane
 	}
 	verified := make([]sessionAnchor, 0, len(anchors))
 	for _, anchor := range anchors {
-		if _, ok := live[anchor.pane]; ok {
+		key := stablePaneRef{serverID: anchor.pane.serverID, serverPID: anchor.pane.serverPID, paneID: anchor.pane.paneID, pid: anchor.pane.pid}
+		if pane, ok := live[key]; ok {
+			// join-pane/move-pane preserves pane identity but may change its
+			// window. Carry the live window into the post-kill survivor check.
+			anchor.pane.windowID = pane.windowID
 			verified = append(verified, anchor)
 		} else {
 			closeAnchor(&anchor)
@@ -362,7 +374,14 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 	verified := orphaned
 	for _, anchor := range candidates {
 		if err != nil {
-			verified = append(verified, anchor)
+			exited, probeErr := r.exactProcessExited(ctx, anchor.server)
+			if probeErr == nil && exited {
+				verified = append(verified, anchor)
+			} else {
+				// A missing socket is not proof that the exact server stopped;
+				// it may have been unlinked while a moved/linked pane survives.
+				closeAnchor(&anchor)
+			}
 			continue
 		}
 		exited, probeErr := r.exactProcessExited(ctx, anchor.server)
