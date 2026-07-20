@@ -270,6 +270,8 @@ func (l *fakeLCM) MarkDependencySpawned(_ context.Context, id domain.SessionID, 
 	if l.beforeDependencyMark != nil {
 		l.beforeDependencyMark(id)
 	}
+	l.store.mu.Lock()
+	defer l.store.mu.Unlock()
 	rec := l.store.sessions[id]
 	if rec.IsTerminated || rec.DependencyPromotionToken != token {
 		return false, nil
