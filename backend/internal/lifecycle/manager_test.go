@@ -223,12 +223,12 @@ type retryMergedCleaner struct {
 	calls int
 }
 
-func (c *retryMergedCleaner) CleanupMergedSession(ctx context.Context, id domain.SessionID) error {
+func (c *retryMergedCleaner) CleanupMergedSession(ctx context.Context, id domain.SessionID, lease ports.MergedCleanupLease) (bool, error) {
 	c.calls++
 	if c.err != nil {
-		return c.err
+		return false, c.err
 	}
-	return nil
+	return true, nil
 }
 
 type retryCompletedCleaner struct {
@@ -247,14 +247,14 @@ type blockingMergedCleaner struct {
 	calls   int
 }
 
-func (c *blockingMergedCleaner) CleanupMergedSession(ctx context.Context, id domain.SessionID) error {
+func (c *blockingMergedCleaner) CleanupMergedSession(ctx context.Context, id domain.SessionID, lease ports.MergedCleanupLease) (bool, error) {
 	c.calls++
 	close(c.entered)
 	select {
 	case <-c.release:
-		return nil
+		return true, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return false, ctx.Err()
 	}
 }
 

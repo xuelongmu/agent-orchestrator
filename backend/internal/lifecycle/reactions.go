@@ -945,31 +945,33 @@ func (m *Manager) cleanupMergedSession(ctx context.Context, id domain.SessionID,
 	if !shouldClean {
 		return nil
 	}
-	err := m.runMergedCleanup(ctx, id)
+	_, err := m.runMergedCleanup(ctx, id)
 	if errors.Is(err, errMergedCleanupRateLimited) {
 		return nil
 	}
 	return err
 }
 
-func (m *Manager) runMergedCleanup(ctx context.Context, id domain.SessionID) error {
+func (m *Manager) runMergedCleanup(ctx context.Context, id domain.SessionID) (bool, error) {
 	// Persist the terminal reservation before external I/O. A concurrent
 	// rate-limit hook therefore has a deterministic winner: if it lands first,
 	// reservation refuses cleanup; if reservation lands first, the hook sees a
 	// terminal row and cannot rewrite it. The durable pending latch remains set
 	// until resource cleanup succeeds, so a daemon restart can replay failures.
-	if err := m.reserveMergedCleanup(ctx, id); err != nil {
-		return err
+	lease, eligible, err := m.reserveMergedCleanup(ctx, id)
+	if err != nil || !eligible {
+		return false, err
 	}
 	m.mu.Lock()
 	cleaner := m.mergedCleaner
 	m.mu.Unlock()
 	if cleaner != nil {
-		if err := cleaner.CleanupMergedSession(ctx, id); err != nil {
-			return err
+		cleaned, err := cleaner.CleanupMergedSession(ctx, id, lease)
+		if err != nil || !cleaned {
+			return false, err
 		}
 	}
-	return m.markMergedCleanupComplete(ctx, id)
+	return m.markMergedCleanupComplete(ctx, id, lease)
 }
 
 // RetryMergedCleanup replays a durable cleanup latch discovered by the SCM
@@ -988,11 +990,15 @@ func (m *Manager) RetryMergedCleanup(ctx context.Context, id domain.SessionID) e
 	if err != nil {
 		return err
 	}
-	if err := m.runMergedCleanup(ctx, id); err != nil {
+	completed, err := m.runMergedCleanup(ctx, id)
+	if err != nil {
 		if errors.Is(err, errMergedCleanupRateLimited) {
 			return nil
 		}
 		return err
+	}
+	if !completed {
+		return nil
 	}
 	m.emitNotification(ctx, intent)
 	return nil

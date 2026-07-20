@@ -69,9 +69,9 @@ type scmMergedCleaner struct {
 	calls []domain.SessionID
 }
 
-func (c *scmMergedCleaner) CleanupMergedSession(ctx context.Context, id domain.SessionID) error {
+func (c *scmMergedCleaner) CleanupMergedSession(ctx context.Context, id domain.SessionID, lease ports.MergedCleanupLease) (bool, error) {
 	c.calls = append(c.calls, id)
-	return c.lcm.MarkTerminated(ctx, id)
+	return true, c.lcm.MarkTerminated(ctx, id)
 }
 
 func (s *scmMessengerSpy) Send(_ context.Context, id domain.SessionID, msg string) error {

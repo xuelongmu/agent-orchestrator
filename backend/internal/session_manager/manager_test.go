@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -51,6 +52,44 @@ type claimedFakeStore struct {
 	*fakeStore
 	claimedCreates int
 	intakeStarts   int
+}
+
+type lifecycleStoreAdapter struct {
+	*fakeStore
+	prs map[domain.SessionID][]domain.PullRequest
+}
+
+func (s *lifecycleStoreAdapter) UpdateSessionLifecycle(_ context.Context, before, after domain.SessionRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current, ok := s.sessions[before.ID]; ok && current == before {
+		s.sessions[after.ID] = after
+	}
+	return nil
+}
+func (*lifecycleStoreAdapter) MarkReservedDependencySpawned(context.Context, domain.SessionID, string, domain.SessionMetadata, time.Time) (bool, error) {
+	return false, nil
+}
+func (*lifecycleStoreAdapter) PrepareReservedDependencyWorkspace(context.Context, domain.SessionID, string, domain.SessionMetadata, []domain.SessionWorktreeRecord, time.Time) (bool, error) {
+	return false, nil
+}
+func (*lifecycleStoreAdapter) MarkReservedDependencyLaunchSucceeded(context.Context, domain.SessionID, string, time.Time) (bool, error) {
+	return false, nil
+}
+func (*lifecycleStoreAdapter) ResetReservedDependencyLaunch(context.Context, domain.SessionID, string, bool, time.Time) (bool, error) {
+	return false, nil
+}
+func (s *lifecycleStoreAdapter) ListPRsBySession(_ context.Context, id domain.SessionID) ([]domain.PullRequest, error) {
+	return s.prs[id], nil
+}
+func (*lifecycleStoreAdapter) GetPRLastNudgeSignature(context.Context, string) (string, error) {
+	return "", nil
+}
+func (*lifecycleStoreAdapter) UpdatePRLastNudgeSignature(context.Context, string, string) error {
+	return nil
+}
+func (*lifecycleStoreAdapter) GetPRDesignContract(context.Context, string) (string, bool, error) {
+	return "", false, nil
 }
 
 func (f *claimedFakeStore) CreateClaimedSession(ctx context.Context, rec domain.SessionRecord, _ ports.TrackerIntakeClaim, _ time.Time) (domain.SessionRecord, error) {
@@ -3145,10 +3184,17 @@ func TestCleanupMergedSession_TearsDownReservedSessionWithoutLifecycleReentry(t 
 	rec := mkLive("mer-1")
 	rec.IsTerminated = true
 	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
+	rec.Metadata.MergedCleanupPending = true
+	rec.Metadata.MergedCleanupPRURL = "pr1"
+	rec.UpdatedAt = time.Now()
 	st.sessions["mer-1"] = rec
 
-	if err := m.CleanupMergedSession(ctx, "mer-1"); err != nil {
+	cleaned, err := m.CleanupMergedSession(ctx, "mer-1", ports.MergedCleanupLease{RuntimeHandleID: rec.Metadata.RuntimeHandleID, PRURL: "pr1", SessionUpdatedAt: rec.UpdatedAt})
+	if err != nil {
 		t.Fatalf("CleanupMergedSession: %v", err)
+	}
+	if !cleaned {
+		t.Fatal("CleanupMergedSession did not claim the matching reservation")
 	}
 	if rt.destroyed != 1 || ws.destroyed != 1 {
 		t.Fatalf("cleanup destroyed runtime/workspace = %d/%d, want 1/1", rt.destroyed, ws.destroyed)
@@ -3310,11 +3356,18 @@ func TestCleanupMergedSession_PreservesDirtyWorkspaceWithoutLifecycleReentry(t *
 	rec := mkLive("mer-1")
 	rec.IsTerminated = true
 	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
+	rec.Metadata.MergedCleanupPending = true
+	rec.Metadata.MergedCleanupPRURL = "pr1"
+	rec.UpdatedAt = time.Now()
 	st.sessions["mer-1"] = rec
 	ws.destroyErr = fmt.Errorf("gitworktree: refusing to remove: %w", ports.ErrWorkspaceDirty)
 
-	if err := m.CleanupMergedSession(ctx, "mer-1"); err != nil {
+	cleaned, err := m.CleanupMergedSession(ctx, "mer-1", ports.MergedCleanupLease{RuntimeHandleID: rec.Metadata.RuntimeHandleID, PRURL: "pr1", SessionUpdatedAt: rec.UpdatedAt})
+	if err != nil {
 		t.Fatalf("CleanupMergedSession: %v", err)
+	}
+	if !cleaned {
+		t.Fatal("CleanupMergedSession did not claim the matching reservation")
 	}
 	if rt.destroyed != 1 || ws.destroyed != 1 {
 		t.Fatalf("cleanup attempts runtime/workspace = %d/%d, want 1/1", rt.destroyed, ws.destroyed)
@@ -3739,6 +3792,87 @@ func TestRestore_SerializesWithCleanupSoStaleTeardownCannotKillReplacement(t *te
 	}
 	if got := st.sessions["mer-1"]; got.IsTerminated || got.Activity.State != domain.ActivityIdle {
 		t.Fatalf("replacement session = %+v, want live and idle", got)
+	}
+}
+
+func TestMergedCleanup_RevalidatesReservationAfterRestore(t *testing.T) {
+	for _, retry := range []bool{false, true} {
+		name := "initial_cleanup"
+		if retry {
+			name = "retry_cleanup"
+		}
+		t.Run(name, func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			rec := mkLive("mer-1")
+			rec.Metadata.Branch = "b"
+			rec.Metadata.AgentSessionID = "agent-x"
+			rec.UpdatedAt = time.Now().UTC()
+			if retry {
+				rec.IsTerminated = true
+				rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: rec.UpdatedAt}
+				rec.Metadata.MergedCleanupPending = true
+				rec.Metadata.MergedCleanupPRURL = "pr1"
+			}
+			st.setSession(rec)
+			lifecycleStore := &lifecycleStoreAdapter{
+				fakeStore: st,
+				prs:       map[domain.SessionID][]domain.PullRequest{rec.ID: {{URL: "pr1", Merged: true}}},
+			}
+			lcm := lifecycle.New(lifecycleStore, nil)
+			lcm.SetMergedSessionCleaner(m)
+			m.lcm = lcm
+
+			cleanupGateAttempt := make(chan struct{})
+			releaseCleanupGate := make(chan struct{})
+			m.workspaceMutationLockAttempt = func(id domain.SessionID) {
+				if id == rec.ID {
+					close(cleanupGateAttempt)
+					<-releaseCleanupGate
+				}
+			}
+			cleanupDone := make(chan error, 1)
+			go func() {
+				if retry {
+					cleanupDone <- lcm.RetryMergedCleanup(context.Background(), rec.ID)
+					return
+				}
+				cleanupDone <- lcm.ApplyPRObservation(context.Background(), rec.ID, ports.PRObservation{Fetched: true, URL: "pr1", Merged: true})
+			}()
+			select {
+			case <-cleanupGateAttempt:
+			case <-time.After(time.Second):
+				close(releaseCleanupGate)
+				t.Fatal("merged cleanup did not attempt to enter the session mutation gate")
+			}
+			reserved := st.sessions[rec.ID]
+			if !reserved.IsTerminated || !reserved.Metadata.MergedCleanupPending {
+				close(releaseCleanupGate)
+				t.Fatalf("cleanup reached the gate without a terminal reservation: %+v", reserved)
+			}
+
+			// The cleanup contender is paused immediately before the gate. Let
+			// Restore own the transition and publish a new runtime generation.
+			m.workspaceMutationLockAttempt = nil
+			restored, err := m.Restore(context.Background(), rec.ID)
+			if err != nil {
+				close(releaseCleanupGate)
+				t.Fatalf("restore: %v", err)
+			}
+			close(releaseCleanupGate)
+			if err := <-cleanupDone; err != nil {
+				t.Fatalf("merged cleanup: %v", err)
+			}
+
+			if restored.IsTerminated || restored.Activity.State != domain.ActivityIdle || restored.Metadata.MergedCleanupPending {
+				t.Fatalf("restored replacement = %+v, want live without the stale cleanup latch", restored)
+			}
+			if rt.destroyed != 1 || rt.created != 1 || ws.destroyed != 0 {
+				t.Fatalf("cleanup touched replacement: runtime destroy/create=%d/%d workspace destroy=%d, want 1/1/0", rt.destroyed, rt.created, ws.destroyed)
+			}
+			if got := st.sessions[rec.ID]; got.IsTerminated || got.Metadata.MergedCleanupPending || got.Metadata.RuntimeHandleID != "h1" {
+				t.Fatalf("durable replacement was changed by delayed cleanup: %+v", got)
+			}
+		})
 	}
 }
 

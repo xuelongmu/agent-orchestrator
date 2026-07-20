@@ -1493,11 +1493,27 @@ func (m *Manager) clearCompletedRuntimeHandleIfOwned(ctx context.Context, id dom
 // session. Lifecycle durably reserves and owns the terminal state before this
 // callback, so this path must not call back into lifecycle. A dirty worktree is
 // deliberately preserved while the runtime and restore marker are removed.
-func (m *Manager) CleanupMergedSession(ctx context.Context, id domain.SessionID) error {
-	if _, err := m.kill(ctx, id, false); err != nil {
-		return fmt.Errorf("cleanup merged session %s: %w", id, err)
+func (m *Manager) CleanupMergedSession(ctx context.Context, id domain.SessionID, lease ports.MergedCleanupLease) (bool, error) {
+	unlockWorkspaceMutation := m.LockWorkspaceMutation(id)
+	defer unlockWorkspaceMutation()
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return false, fmt.Errorf("cleanup merged session %s: reload: %w", id, err)
 	}
-	return nil
+	if !ok || !mergedCleanupLeaseMatches(rec, lease) {
+		return false, nil
+	}
+	if _, err := m.killWithMutationLock(ctx, id, false); err != nil {
+		return false, fmt.Errorf("cleanup merged session %s: %w", id, err)
+	}
+	return true, nil
+}
+
+func mergedCleanupLeaseMatches(rec domain.SessionRecord, lease ports.MergedCleanupLease) bool {
+	return rec.IsTerminated && rec.Metadata.MergedCleanupPending &&
+		rec.Metadata.MergedCleanupPRURL == lease.PRURL &&
+		rec.Metadata.RuntimeHandleID == lease.RuntimeHandleID &&
+		rec.UpdatedAt.Equal(lease.SessionUpdatedAt)
 }
 
 // CleanupCompletedSession tears down resources that must not survive natural
