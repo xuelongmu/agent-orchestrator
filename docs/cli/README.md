@@ -24,15 +24,15 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 
 ### Daemon control
 
-| Command                       | Purpose                                                                                                                           |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `ao start`                    | Start the daemon in the background and wait for `/readyz`.                                                                        |
-| `ao stop`                     | Gracefully stop the daemon via loopback `POST /shutdown` after verifying daemon identity.                                         |
-| `ao status` / `--json`        | Report daemon state from `running.json`, process liveness, `/healthz`, and `/readyz`.                                             |
-| `ao doctor` / `--json`        | Check config, data directory, DB-file presence, daemon state, `git`, and (on Darwin/Linux) `tmux`; on Windows conpty is built in. |
-| `ao completion <shell>`       | Generate completions for `bash`, `zsh`, `fish`, or `powershell`.                                                                  |
-| `ao version` / `ao --version` | Print build metadata.                                                                                                             |
-| `ao daemon`                   | Hidden internal daemon entrypoint used by `ao start`.                                                                             |
+| Command                       | Purpose                                                                                                                               |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `ao start`                    | Start the daemon in the background and wait for `/readyz`.                                                                            |
+| `ao stop`                     | Gracefully stop the daemon via loopback `POST /shutdown` after verifying daemon identity.                                             |
+| `ao status` / `--json`        | Report daemon state from `running.json`, process liveness, `/healthz`, and `/readyz`.                                                 |
+| `ao doctor` / `--json`        | Check config/state, daemon, tools, harnesses, and AO executable identity; on Windows a proven legacy Node/npm AO shadow is a failure. |
+| `ao completion <shell>`       | Generate completions for `bash`, `zsh`, `fish`, or `powershell`.                                                                      |
+| `ao version` / `ao --version` | Print build metadata.                                                                                                                 |
+| `ao daemon`                   | Hidden internal daemon entrypoint used by `ao start`.                                                                                 |
 
 ### Product commands
 
@@ -130,6 +130,11 @@ The CLI and daemon share the same environment-driven config:
 | `AO_VERIFY_CONFIG_FILE` | unset                | Absolute operator-owned verification policy loaded at daemon startup. |
 
 The daemon always binds `127.0.0.1`.
+
+On Windows, run doctor through the desktop's bundled Go binary when a bare
+`ao` may resolve to an old fnm/npm shim. See the
+[Windows runtime cutover guide](../windows-runtime-cutover.md) for canonical
+paths, read-only inventory commands, state-root verification, and rollback.
 
 ## Manual smoke test
 

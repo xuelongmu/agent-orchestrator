@@ -95,6 +95,26 @@ func TestVersionEmitsCLIInvocationBestEffort(t *testing.T) {
 	}
 }
 
+func TestDoctorLegacyShadowSkipsInvocationTelemetry(t *testing.T) {
+	requests := 0
+	root := NewRootCommand(Deps{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return jsonResponse(http.StatusInternalServerError, ""), nil
+		})},
+	})
+	doctor, _, err := root.Find([]string{"doctor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := root.PersistentPreRunE(doctor, nil); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 {
+		t.Fatalf("doctor pre-run made %d telemetry request(s), want none", requests)
+	}
+}
+
 func TestUsageErrorEmitsCLIUsageTelemetryBestEffort(t *testing.T) {
 	cfg := setConfigEnv(t)
 	called := make(chan string, 1)

@@ -17,6 +17,7 @@ Start with [architecture.md](architecture.md) for the current backend model and
 | [cli/README.md](cli/README.md)                                 | CLI commands and daemon control surface.                                                                              |
 | [worker-daemon-threat-model.md](worker-daemon-threat-model.md) | Same-user worker/daemon trust boundary, platform access assumptions, and hostile-worker scope decision.               |
 | [verification.md](verification.md)                             | Operator-owned verification policy, session authorization, process ownership, cancellation, and data-dir logs.        |
+| [windows-runtime-cutover.md](windows-runtime-cutover.md)       | Inventory, detection, safe cutover, retained legacy state, and rollback for shadowing Windows AO installs.            |
 | [STATUS.md](STATUS.md)                                         | What is shipped on `main` today and what is still in flight.                                                          |
 | [stack.md](stack.md)                                           | Accepted library/runtime choices, pending stack decisions, and dependencies explicitly avoided for V1.                |
 
