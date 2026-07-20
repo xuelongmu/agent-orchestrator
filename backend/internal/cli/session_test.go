@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -68,6 +69,10 @@ func sessionCommandServer(t *testing.T) (*httptest.Server, *sessionRequestLog) {
 			}
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/demo-1":
 			_, _ = io.WriteString(w, `{"session":`+sessionJSON("demo-1", "demo", "worker", "working", false)+`}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/demo-waiting":
+			_, _ = io.WriteString(w, `{"session":`+sessionJSON("demo-waiting", "demo", "worker", "idle", false)+`}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/demo-promoted":
+			_, _ = io.WriteString(w, `{"session":`+sessionJSON("demo-promoted", "demo", "worker", "idle", false)+`}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/demo":
 			_, _ = io.WriteString(w, `{"status":"ok","project":{"id":"demo","name":"Demo","path":"/repo/demo","repo":"https://github.com/aoagents/agent-orchestrator","defaultBranch":"main"}}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-1/pr/claim":
@@ -125,6 +130,12 @@ func sessionJSON(id, project, kind, status string, terminated bool) string {
 			"verificationCommands": []string{"go test ./internal/session_manager", "npm --prefix frontend test -- SessionInspector"},
 			"residualRisk":         "CI validates Linux.\nWindows ConPTY was focused locally.",
 		}
+	}
+	if id == "demo-waiting" || id == "demo-promoted" {
+		payload["dependsOn"] = []string{"demo-parent", "demo-api"}
+	}
+	if id == "demo-waiting" {
+		payload["dependencyPending"] = true
 	}
 	b, _ := json.Marshal(payload)
 	return string(b)
@@ -241,6 +252,53 @@ func TestSessionGet_JSONOutputDecodes(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Session.Handoff, wantHandoff) {
 		t.Fatalf("session get --json lost exact handoff: got=%#v want=%#v\noutput=%s", got.Session.Handoff, wantHandoff, out)
+	}
+}
+
+func TestSessionGet_DependencyStateFixtures(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, _ := sessionCommandServer(t)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{
+		ProcessAlive: func(int) bool { return true },
+	}, "session", "get", "demo-waiting")
+	if err != nil {
+		t.Fatalf("session get failed: %v\nstderr=%s", err, errOut)
+	}
+	if !strings.Contains(out, "dependencies: demo-parent, demo-api (pending)") {
+		t.Fatalf("pending prerequisites missing from get output:\n%s", out)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		id      string
+		pending bool
+	}{
+		{name: "waiting", id: "demo-waiting", pending: true},
+		{name: "promoted", id: "demo-promoted", pending: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, errOut, err := executeCLI(t, Deps{
+				ProcessAlive: func(int) bool { return true },
+			}, "session", "get", tc.id, "--json")
+			if err != nil {
+				t.Fatalf("session get --json failed: %v\nstderr=%s", err, errOut)
+			}
+			var got sessionResponse
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("session get --json output is not decodable: %v\noutput=%s", err, out)
+			}
+			if want := []string{"demo-parent", "demo-api"}; !reflect.DeepEqual(got.Session.DependsOn, want) {
+				t.Fatalf("dependsOn = %#v, want %#v\noutput=%s", got.Session.DependsOn, want, out)
+			}
+			if got.Session.DependencyPending != tc.pending {
+				t.Fatalf("dependencyPending = %t, want %t\noutput=%s", got.Session.DependencyPending, tc.pending, out)
+			}
+			if !strings.Contains(out, fmt.Sprintf(`"dependencyPending": %t`, tc.pending)) {
+				t.Fatalf("dependencyPending missing from JSON output:\n%s", out)
+			}
+		})
 	}
 }
 

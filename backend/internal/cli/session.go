@@ -41,19 +41,23 @@ type sessionRenameRequest struct {
 }
 
 type sessionDTO struct {
-	ID           string             `json:"id"`
-	ProjectID    string             `json:"projectId"`
-	IssueID      string             `json:"issueId,omitempty"`
-	Kind         string             `json:"kind"`
-	Harness      string             `json:"harness,omitempty"`
-	DisplayName  string             `json:"displayName,omitempty"`
-	Activity     sessionActivity    `json:"activity"`
-	IsTerminated bool               `json:"isTerminated"`
-	CreatedAt    time.Time          `json:"createdAt"`
-	UpdatedAt    time.Time          `json:"updatedAt"`
-	Status       string             `json:"status"`
-	Diagnostic   *sessionDiagnostic `json:"diagnostic,omitempty"`
-	Handoff      *sessionHandoffDTO `json:"handoff,omitempty"`
+	ID           string          `json:"id"`
+	ProjectID    string          `json:"projectId"`
+	IssueID      string          `json:"issueId,omitempty"`
+	Kind         string          `json:"kind"`
+	Harness      string          `json:"harness,omitempty"`
+	DisplayName  string          `json:"displayName,omitempty"`
+	Activity     sessionActivity `json:"activity"`
+	IsTerminated bool            `json:"isTerminated"`
+	CreatedAt    time.Time       `json:"createdAt"`
+	UpdatedAt    time.Time       `json:"updatedAt"`
+	Status       string          `json:"status"`
+	DependsOn    []string        `json:"dependsOn,omitempty"`
+	// DependencyPending intentionally does not use omitempty so JSON output
+	// distinguishes a promoted session from one that is still waiting.
+	DependencyPending bool               `json:"dependencyPending"`
+	Diagnostic        *sessionDiagnostic `json:"diagnostic,omitempty"`
+	Handoff           *sessionHandoffDTO `json:"handoff,omitempty"`
 }
 
 // sessionHandoffDTO mirrors the detail-only immutable handoff API shape. It is
@@ -750,6 +754,7 @@ func writeSessionDetails(cmd *cobra.Command, sess sessionDTO) error {
 		{"activity", sess.Activity.State},
 		{"harness", sess.Harness},
 		{"issue", sess.IssueID},
+		{"dependencies", sessionDependencies(sess)},
 		{"terminated", fmt.Sprintf("%t", sess.IsTerminated)},
 	}
 	for _, field := range fields {
@@ -776,6 +781,17 @@ func writeSessionDetails(cmd *cobra.Command, sess sessionDTO) error {
 		}
 	}
 	return nil
+}
+
+func sessionDependencies(sess sessionDTO) string {
+	if len(sess.DependsOn) == 0 {
+		return ""
+	}
+	dependencies := strings.Join(sess.DependsOn, ", ")
+	if sess.DependencyPending {
+		return dependencies + " (pending)"
+	}
+	return dependencies
 }
 
 func writeDiagnostic(out io.Writer, diagnostic *sessionDiagnostic, indent string) error {
