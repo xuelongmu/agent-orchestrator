@@ -1253,11 +1253,15 @@ func scmToPRObservation(o ports.SCMObservation) ports.PRObservation {
 		})
 	}
 	for _, th := range o.Review.Threads {
-		if th.Resolved || th.IsBot {
+		if th.Resolved {
 			continue
 		}
+		anchored := strings.TrimSpace(th.Path) != "" && th.Line > 0
 		for _, c := range th.Comments {
-			if c.IsBot {
+			// Keep suppressing general bot chatter, but route bot feedback that
+			// points at a concrete file and line through the normal bounded,
+			// semantically deduplicated review nudge path.
+			if (th.IsBot || c.IsBot) && !anchored {
 				continue
 			}
 			pr.Comments = append(pr.Comments, ports.PRCommentObservation{

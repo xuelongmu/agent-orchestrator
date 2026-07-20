@@ -1138,6 +1138,86 @@ func TestSCMObservationProjectsToExistingPRReactions(t *testing.T) {
 	}
 }
 
+func TestSCMObservation_AnchoredBotReviewNudgesAgent(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	o := botReviewObservation("frontend/src/App.tsx", 42, false)
+	if err := m.ApplySCMObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 || !strings.Contains(msg.msgs[0], "frontend/src/App.tsx:42") || !strings.Contains(msg.msgs[0], "Avoid deriving state") {
+		t.Fatalf("want anchored bot review nudge, got %v", msg.msgs)
+	}
+}
+
+func TestSCMObservation_UnanchoredBotReviewIsSuppressed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		line int
+	}{
+		{name: "missing file", line: 42},
+		{name: "missing line", path: "frontend/src/App.tsx"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, msg := newManager()
+			st.sessions["mer-1"] = working("mer-1")
+			if err := m.ApplySCMObservation(ctx, "mer-1", botReviewObservation(tc.path, tc.line, false)); err != nil {
+				t.Fatal(err)
+			}
+			if len(msg.msgs) != 0 {
+				t.Fatalf("unanchored bot chatter produced nudges: %v", msg.msgs)
+			}
+		})
+	}
+}
+
+func TestSCMObservation_ResolvedAnchoredBotReviewIsSuppressed(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	if err := m.ApplySCMObservation(ctx, "mer-1", botReviewObservation("frontend/src/App.tsx", 42, true)); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 {
+		t.Fatalf("resolved bot review produced nudges: %v", msg.msgs)
+	}
+}
+
+func TestSCMObservation_AnchoredBotReviewNudgeDoesNotDuplicate(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	o := botReviewObservation("frontend/src/App.tsx", 42, false)
+	if err := m.ApplySCMObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	// Provider links can refresh without changing the actionable feedback;
+	// semantic dedup must still treat this as the same review nudge.
+	o.Review.Threads[0].Comments[0].URL = "https://github.com/o/r/pull/1#discussion_r1-refreshed"
+	if err := m.ApplySCMObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("identical anchored bot review nudged %d times, want 1: %v", len(msg.msgs), msg.msgs)
+	}
+}
+
+func botReviewObservation(path string, line int, resolved bool) ports.SCMObservation {
+	return ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "pr1", Number: 1, HeadSHA: "c1"},
+		Review: ports.SCMReviewObservation{
+			Decision: string(domain.ReviewRequired),
+			Threads: []ports.SCMReviewThreadObservation{{
+				ID: "bot-thread", Path: path, Line: line, Resolved: resolved, IsBot: true,
+				Comments: []ports.SCMReviewCommentObservation{{
+					ID: "bot-comment", Author: "react-doctor[bot]", Body: "Avoid deriving state in an effect.",
+					URL: "https://github.com/o/r/pull/1#discussion_r1", IsBot: true,
+				}},
+			}},
+		},
+	}
+}
+
 func TestSCMObservation_MissingSessionIsIgnored(t *testing.T) {
 	st := newFakeStore()
 	m := New(st, nil)
