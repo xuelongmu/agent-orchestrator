@@ -35,7 +35,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { type DaemonLaunchSpec, resolveDaemonLaunch } from "./shared/daemon-launch";
+import { evaluateDaemonIdentity, type DaemonLaunchSpec, resolveDaemonLaunch } from "./shared/daemon-launch";
 import { createListenPortScanner, defaultRunFilePath, parseRunFile, type RunFileInfo } from "./shared/daemon-discovery";
 import type { DaemonStatus } from "./shared/daemon-status";
 import { attachAppShortcuts } from "./main/app-shortcuts";
@@ -47,6 +47,7 @@ import {
 	resolveDaemonFromPort,
 	resolveDaemonFromRunFile,
 } from "./shared/daemon-attach";
+import { resolveDevDaemonConfig } from "./shared/dev-daemon-config";
 import { shouldReplacePortHolder } from "./shared/daemon-takeover";
 import { buildDaemonEnv, resolveShellEnv, type ShellRunner } from "./shared/shell-env";
 import { DEFAULT_POSTHOG_HOST, DEFAULT_POSTHOG_PROJECT_KEY } from "./shared/posthog-config";
@@ -160,13 +161,7 @@ const IMPORT_SCAN_SKIP_DIRS = new Set([
 ]);
 
 const isDev = !app.isPackaged;
-
-// Dev mode uses a separate port and state subdirectory so it never collides with
-// a concurrently running installed-app daemon. The subdir also isolates supervise.sock
-// on Unix (backend derives it as dir(RunFilePath)/supervise.sock) and the named pipe
-// on Windows (supervisorPipeFromRunFile derives it from the same dir basename).
-const DEV_DAEMON_PORT = 3002;
-const DEV_STATE_SUBDIR = "dev"; // ~/.ao/dev/
+const devDaemonConfig = resolveDevDaemonConfig(process.env, os.homedir());
 
 // Height (px) of the custom Windows title bar. Must stay in sync with the Window
 // Controls Overlay height passed to BrowserWindow and the .window-titlebar height
@@ -407,7 +402,7 @@ const DAEMON_PROBE_TIMEOUT_MS = 2_000;
 
 function runFilePath(): string | null {
 	if (process.env.AO_RUN_FILE) return process.env.AO_RUN_FILE;
-	if (isDev) return path.join(os.homedir(), ".ao", DEV_STATE_SUBDIR, "running.json");
+	if (isDev) return devDaemonConfig.runFilePath;
 	return defaultRunFilePath(process.platform, process.env, os.homedir());
 }
 
@@ -492,13 +487,17 @@ function daemonEnv(): NodeJS.ProcessEnv {
 	// supervisor on attach (headless `ao start` daemons get no AO_OWNER and stay
 	// unlinked, preserving their persistence across app quit).
 	const ownerTag = { AO_OWNER: "app" };
-	// In dev mode, inject isolation defaults so the dev daemon never collides with
-	// the installed app. User-set env vars take priority (checked first).
+	// Dev shares the installed app's daemon and state by default. Explicit
+	// isolation injects sandbox defaults; user-set values still take priority.
 	const devExtras: Record<string, string> = {};
-	if (isDev) {
-		if (!process.env.AO_PORT) devExtras.AO_PORT = String(DEV_DAEMON_PORT);
-		if (!process.env.AO_RUN_FILE) devExtras.AO_RUN_FILE = runFilePath() ?? "";
-		if (!process.env.AO_DATA_DIR) devExtras.AO_DATA_DIR = path.join(os.homedir(), ".ao", DEV_STATE_SUBDIR, "data");
+	if (isDev && devDaemonConfig.isIsolated) {
+		if (!process.env.AO_PORT) devExtras.AO_PORT = String(devDaemonConfig.port);
+		if (!process.env.AO_RUN_FILE && devDaemonConfig.runFilePath) {
+			devExtras.AO_RUN_FILE = devDaemonConfig.runFilePath;
+		}
+		if (!process.env.AO_DATA_DIR && devDaemonConfig.dataDir) {
+			devExtras.AO_DATA_DIR = devDaemonConfig.dataDir;
+		}
 	}
 	// Windows keeps the old behavior exactly: no shell probe, no unix PATH floor.
 	if (process.platform === "win32") {
@@ -541,28 +540,11 @@ async function readDaemonProbe(port: number, endpoint: "healthz" | "readyz"): Pr
 }
 
 function daemonIdentityError(launch: DaemonLaunchSpec, probe: DaemonProbe): string | null {
-	if (launch.source === "dev") {
-		const cwdMatches = probe.workingDirectory ? samePath(probe.workingDirectory, launch.cwd) : false;
-		const executableMatches = probe.executablePath ? pathInside(probe.executablePath, launch.cwd) : false;
-		if (!probe.workingDirectory && !probe.executablePath) {
-			return "An older AO daemon is already running, but it does not report its checkout identity. Stop it and restart this app.";
-		}
-		if (!cwdMatches && !executableMatches) {
-			const actual = probe.workingDirectory ?? probe.executablePath ?? "an unknown location";
-			return `Another AO daemon is already running from ${actual}; expected this checkout at ${launch.cwd}. Stop the other daemon before using this checkout.`;
-		}
-		return null;
-	}
-
-	if (launch.source === "bundled") {
-		if (!probe.executablePath) {
-			return "An older AO daemon is already running, but it does not report its binary path. Stop it and restart this app.";
-		}
-		if (!samePath(probe.executablePath, launch.command)) {
-			return `Another AO daemon is already running from ${probe.executablePath}; expected ${launch.command}. Stop the other daemon before using this app.`;
-		}
-	}
-	return null;
+	return evaluateDaemonIdentity(launch, probe, {
+		enforceDevCheckout: devDaemonConfig.isIsolated,
+		samePath,
+		pathInside,
+	});
 }
 
 /**
@@ -764,11 +746,10 @@ async function startDaemon(explicitStart = false): Promise<DaemonStatus> {
 	return daemonStartPromise;
 }
 
-// The port this Electron instance expects the daemon to bind. In dev mode a
-// separate port isolates the dev daemon from the installed-app daemon.
-// AO_PORT always wins if set explicitly.
+// The port this Electron instance expects the daemon to bind. Dev shares the
+// installed-app default unless ISOLATE_DEV=true; AO_PORT always wins.
 function resolvedDaemonPort(): number {
-	return isDev && !process.env.AO_PORT ? DEV_DAEMON_PORT : expectedDaemonPort(process.env);
+	return isDev ? devDaemonConfig.port : expectedDaemonPort(process.env);
 }
 
 async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
