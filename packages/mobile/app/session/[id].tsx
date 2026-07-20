@@ -68,14 +68,16 @@ const TERMINAL_ENHANCE_JS = `
 
   // ---- Zoom & pan -----------------------------------------------------------
   // The daemon may hold the grid wider than the phone (a co-viewing desktop
-  // drives the size). The resting view shrinks the whole grid uniformly to fit
-  // the width (overview — may be tiny). Pinch zooms between that fit scale and
-  // 1:1 (crisp, readable); while zoomed, one finger pans the viewport (vertical
+  // drives the size). Start at 1:1 so text stays readable, with the fit-to-width
+  // overview still available by pinching out or double-tapping. While zoomed,
+  // one finger pans the viewport (vertical
   // overshoot spills into scrollback) and double-tap toggles overview <-> 1:1.
   // While zoomed we auto-pan to keep the cursor framed, so the prompt/output
   // stays in view without chasing it by hand.
   function term() { return window.terminal; }
-  var Z = { s: 1, min: 1, tx: 0, ty: 0, zoomed: false, lastPan: 0 };
+  // overview is the chosen view; zoomed tracks whether it currently differs
+  // from the fit scale so a phone-sized grid keeps normal scroll gesture routing.
+  var Z = { s: 1, min: 1, tx: 0, ty: 0, overview: false, zoomed: false, lastPan: 0 };
   function box() {
     var root = document.querySelector('.xterm');
     var screen = document.querySelector('.xterm-screen');
@@ -101,9 +103,16 @@ const TERMINAL_ENHANCE_JS = `
     try {
       var b = box(); if (!b || !b.natW || !b.contW) return;
       Z.min = Math.min(1, b.contW / b.natW);
-      if (!Z.zoomed) { Z.s = Z.min; Z.tx = 0; Z.ty = 0; }
-      else { if (Z.s < Z.min) Z.s = Z.min; clampT(b); }
+      if (Z.overview) { Z.s = Z.min; Z.zoomed = false; Z.tx = 0; Z.ty = 0; }
+      else {
+        if (Z.s < Z.min) Z.s = Z.min;
+        Z.zoomed = Z.s > Z.min + 0.001;
+        if (!Z.zoomed) { Z.tx = 0; Z.ty = 0; } else clampT(b);
+      }
       applyTransform(b);
+      // Let resize/layout (and the resize handler's pinBottom) settle before
+      // framing an idle cursor that did not emit a cursor-move event.
+      if (Z.zoomed) setTimeout(followCursor, 0);
     } catch (_) {}
   }
   // Zoom to scale s keeping the content under screen point (ax, ay) fixed.
@@ -113,6 +122,7 @@ const TERMINAL_ENHANCE_JS = `
     var px = (ax - Z.tx) / Z.s, py = (ay - Z.ty) / Z.s;
     Z.s = s; Z.tx = ax - px * s; Z.ty = ay - py * s;
     Z.zoomed = s > Z.min + 0.001;
+    if (Z.min < 0.999) Z.overview = !Z.zoomed;
     if (!Z.zoomed) { Z.s = Z.min; Z.tx = 0; Z.ty = 0; }
     clampT(b); applyTransform(b);
   }
@@ -142,7 +152,7 @@ const TERMINAL_ENHANCE_JS = `
   (function wire() {
     if (window.terminal && window.terminal.onResize && window.fitAddon) {
       // The grid changes only when the daemon tells RN the authoritative size and
-      // RN calls resize(); re-fit-to-width and pin on every such change.
+      // RN calls resize(); re-apply the current zoom and pin on every such change.
       window.terminal.onResize(function () { setTimeout(function () { applyScale(); pinBottom(); }, 0); });
       // Throttled cursor-follow: cursor moves fire in bursts while output streams.
       if (window.terminal.onCursorMove) {
