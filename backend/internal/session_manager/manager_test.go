@@ -43,7 +43,8 @@ type fakeStore struct {
 	sharedLog *[]string
 	// afterCreate simulates a reconciliation poll at the first externally
 	// visible creation boundary.
-	afterCreate func(domain.SessionRecord)
+	afterCreate     func(domain.SessionRecord)
+	afterGetSession func(domain.SessionID)
 }
 
 type claimedFakeStore struct {
@@ -141,11 +142,15 @@ func (f *fakeStore) ClearPendingSubmit(_ context.Context, id domain.SessionID, f
 }
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
 	f.mu.RLock()
-	defer f.mu.RUnlock()
 	if f.getErr != nil {
+		f.mu.RUnlock()
 		return domain.SessionRecord{}, false, f.getErr
 	}
 	r, ok := f.sessions[id]
+	f.mu.RUnlock()
+	if f.afterGetSession != nil {
+		f.afterGetSession(id)
+	}
 	return r, ok, nil
 }
 
@@ -2953,6 +2958,50 @@ func TestKill_TearsDownRuntimeAndWorkspace(t *testing.T) {
 		t.Fatal("kill should destroy runtime and workspace")
 	}
 	requireNoPromptDir(t, dataDir, "mer-1")
+}
+
+func TestKill_OrdinaryWorktreeWaitsForClaimWorkspaceMutation(t *testing.T) {
+	m, st, rt, ws := newManager()
+	st.setSession(mkLive("mer-1"))
+
+	claimUnlock := m.LockWorkspaceMutation()
+	firstRead := make(chan struct{})
+	var readOnce sync.Once
+	st.afterGetSession = func(id domain.SessionID) {
+		if id == "mer-1" {
+			readOnce.Do(func() { close(firstRead) })
+		}
+	}
+	destroyEntered := make(chan struct{}, 1)
+	rt.beforeDestroy = func(ports.RuntimeHandle) { destroyEntered <- struct{}{} }
+
+	killDone := make(chan error, 1)
+	go func() {
+		_, err := m.Kill(context.Background(), "mer-1")
+		killDone <- err
+	}()
+	<-firstRead
+	select {
+	case <-destroyEntered:
+		t.Fatal("ordinary worktree Kill destroyed the runtime during ClaimPR workspace mutation")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if ws.destroyed != 0 {
+		t.Fatalf("ordinary worktree Kill destroyed workspace during claim: %d", ws.destroyed)
+	}
+
+	claimUnlock()
+	select {
+	case err := <-killDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ordinary worktree Kill did not resume after ClaimPR workspace mutation")
+	}
+	if rt.destroyed != 1 || ws.destroyed != 1 {
+		t.Fatalf("post-claim Kill destroyed runtime/workspace = %d/%d, want 1/1", rt.destroyed, ws.destroyed)
+	}
 }
 
 // TestKill_TerminatesIncompleteHandle: a session whose runtime handle or

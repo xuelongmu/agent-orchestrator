@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
 type fakeTelemetrySink struct{ events []ports.TelemetryEvent }
@@ -54,6 +57,7 @@ type fakeStore struct {
 	pendingContractTask     map[string]string
 	pendingContractToken    map[string]string
 	pendingContractRevision map[string]int64
+	completeDeliveryResult  *bool
 	afterListOwnedPRs       func(domain.SessionID)
 	contractWriteErr        error
 	num                     int
@@ -379,6 +383,9 @@ func (f *fakeStore) GetPendingPRDesignContractDelivery(_ context.Context, sessio
 
 func (f *fakeStore) CompletePRDesignContractDelivery(_ context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error) {
 	if f.pendingContractDelivery[prURL] != sessionID || f.pendingContractToken[prURL] != deliveryToken || f.pendingContractRevision[prURL] != contractRevision {
+		return false, nil
+	}
+	if f.completeDeliveryResult != nil && !*f.completeDeliveryResult {
 		return false, nil
 	}
 	delete(f.pendingContractDelivery, prURL)
@@ -748,20 +755,29 @@ func TestSessionRenameMissingSessionReturnsNotFound(t *testing.T) {
 // fakeCommander records Kill/Spawn calls so a test can assert the
 // clean-orchestrator ordering without wiring a real session engine.
 type fakeCommander struct {
-	killed          []domain.SessionID
-	retired         []domain.SessionID
-	sent            []domain.SessionID
-	sentMessages    []string
-	cleanupProjects []domain.ProjectID
-	killErr         error
-	retireErr       error
-	sendErr         error
-	cleanupErr      error
-	spawnErr        error
-	spawnRecord     domain.SessionRecord
-	spawned         bool
-	spawnedCfg      ports.SpawnConfig
-	killsAtSpawn    int
+	workspaceMutationMu     sync.Mutex
+	killed                  []domain.SessionID
+	retired                 []domain.SessionID
+	sent                    []domain.SessionID
+	sentMessages            []string
+	cleanupProjects         []domain.ProjectID
+	killErr                 error
+	retireErr               error
+	sendErr                 error
+	cleanupErr              error
+	spawnErr                error
+	spawnRecord             domain.SessionRecord
+	spawned                 bool
+	spawnedCfg              ports.SpawnConfig
+	killsAtSpawn            int
+	workspaceUnlockedOnSend *bool
+	sendEntered             chan<- domain.SessionID
+	sendRelease             <-chan struct{}
+}
+
+func (f *fakeCommander) LockWorkspaceMutation() func() {
+	f.workspaceMutationMu.Lock()
+	return f.workspaceMutationMu.Unlock
 }
 
 func (f *fakeCommander) Spawn(_ context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, error) {
@@ -797,8 +813,21 @@ func (f *fakeCommander) Send(_ context.Context, id domain.SessionID, message str
 	if f.sendErr != nil {
 		return f.sendErr
 	}
+	if f.workspaceUnlockedOnSend != nil {
+		acquired := f.workspaceMutationMu.TryLock()
+		*f.workspaceUnlockedOnSend = acquired
+		if acquired {
+			f.workspaceMutationMu.Unlock()
+		}
+	}
 	f.sent = append(f.sent, id)
 	f.sentMessages = append(f.sentMessages, message)
+	if f.sendEntered != nil {
+		f.sendEntered <- id
+	}
+	if f.sendRelease != nil {
+		<-f.sendRelease
+	}
 	return nil
 }
 func (f *fakeCommander) SendAutomated(ctx context.Context, id domain.SessionID, message string) error {
@@ -1386,6 +1415,7 @@ type fakePRClaimer struct {
 	called          *bool
 	workspaceBranch *string
 	taskPrompt      *string
+	claimHook       func()
 }
 
 type errorFreeClaimOutcome struct {
@@ -1412,11 +1442,15 @@ func (f fakePRClaimer) ClaimPR(_ context.Context, _ domain.PullRequest, _ []doma
 	if f.taskPrompt != nil {
 		*f.taskPrompt = taskPrompt
 	}
+	if f.claimHook != nil {
+		f.claimHook()
+	}
 	return f.out.ClaimOutcome, f.err
 }
 
 type fakeSCM struct {
 	obs             ports.SCMObservation
+	obsByNumber     map[int]ports.SCMObservation
 	review          ports.SCMReviewObservation
 	fetchErr        error
 	reviewErr       error
@@ -1424,6 +1458,9 @@ type fakeSCM struct {
 	checkoutErr     error
 	checkoutCalled  *bool
 	checkoutBranch  *string
+	reviewFetched   chan<- int
+	checkoutEntered chan<- int
+	checkoutRelease <-chan struct{}
 }
 
 func (f fakeSCM) ParseRepository(remote string) (ports.SCMRepo, bool) {
@@ -1434,9 +1471,14 @@ func (f fakeSCM) ParseRepository(remote string) (ports.SCMRepo, bool) {
 	return ports.SCMRepo{Provider: "github", Host: "github.com", Owner: owner, Name: repo, Repo: owner + "/" + repo}, true
 }
 
-func (f fakeSCM) FetchPullRequests(context.Context, []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+func (f fakeSCM) FetchPullRequests(_ context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error) {
 	if f.fetchErr != nil {
 		return nil, f.fetchErr
+	}
+	if len(refs) > 0 && f.obsByNumber != nil {
+		if obs, ok := f.obsByNumber[refs[0].Number]; ok {
+			return []ports.SCMObservation{obs}, nil
+		}
 	}
 	if !f.obs.Fetched && f.obs.PR.URL == "" && f.obs.PR.Number == 0 {
 		return nil, nil
@@ -1444,16 +1486,25 @@ func (f fakeSCM) FetchPullRequests(context.Context, []ports.SCMPRRef) ([]ports.S
 	return []ports.SCMObservation{f.obs}, nil
 }
 
-func (f fakeSCM) FetchReviewThreads(context.Context, ports.SCMPRRef) (ports.SCMReviewObservation, error) {
+func (f fakeSCM) FetchReviewThreads(_ context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error) {
+	if f.reviewFetched != nil {
+		f.reviewFetched <- ref.Number
+	}
 	return f.review, f.reviewErr
 }
 
-func (f fakeSCM) CheckoutPullRequest(_ context.Context, _ ports.SCMPRRef, _ ports.SCMPRObservation, _ string, workspaceBranch string) (bool, error) {
+func (f fakeSCM) CheckoutPullRequest(_ context.Context, ref ports.SCMPRRef, _ ports.SCMPRObservation, _ string, workspaceBranch string) (bool, error) {
 	if f.checkoutCalled != nil {
 		*f.checkoutCalled = true
 	}
 	if f.checkoutBranch != nil {
 		*f.checkoutBranch = workspaceBranch
+	}
+	if f.checkoutEntered != nil {
+		f.checkoutEntered <- ref.Number
+	}
+	if f.checkoutRelease != nil {
+		<-f.checkoutRelease
 	}
 	return f.checkoutChanged, f.checkoutErr
 }
@@ -1474,7 +1525,7 @@ func TestClaimPRRejectsNonGitWorkspace(t *testing.T) {
 
 func TestClaimPRPreflightsActiveOwnerBeforeCheckout(t *testing.T) {
 	st := newFakeStore()
-	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws"}}
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws", Branch: "ao/mer-1/root"}}
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
 	preflightCalled, checkoutCalled := false, false
 	svc := NewWithDeps(Deps{
@@ -1497,7 +1548,7 @@ func TestClaimPRPreflightsActiveOwnerBeforeCheckout(t *testing.T) {
 
 func TestClaimPRChecksOutExactHeadBeforePersistingClaim(t *testing.T) {
 	st := newFakeStore()
-	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws"}}
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws", Branch: "ao/mer-1/root"}}
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
 	checkoutErr := errors.New("workspace HEAD deadbeef does not match PR head abc123")
 	claimCalled := false
@@ -1523,7 +1574,7 @@ func TestClaimPRChecksOutExactHeadBeforePersistingClaim(t *testing.T) {
 
 func TestClaimPRUsesAndPersistsSessionPrivateBranch(t *testing.T) {
 	st := newFakeStore()
-	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws"}}
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws", Branch: "ao/mer-1/root"}}
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
 	var checkoutBranch, persistedBranch string
 	svc := NewWithDeps(Deps{
@@ -1544,6 +1595,376 @@ func TestClaimPRUsesAndPersistsSessionPrivateBranch(t *testing.T) {
 	}
 }
 
+func TestClaimPRWaitsForDependencyWorkspaceMutation(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws", Branch: "ao/mer-1/root"}}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+	manager := sessionmanager.New(sessionmanager.Deps{})
+	unlockPromotion := manager.LockWorkspaceMutation()
+	reviewFetched := make(chan int)
+	checkoutEntered := make(chan int, 1)
+	svc := NewWithDeps(Deps{
+		Manager:   manager,
+		Store:     st,
+		PRClaimer: fakePRClaimer{},
+		SCM: fakeSCM{
+			obs:             ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: "https://github.com/acme/repo/pull/7", Number: 7}},
+			reviewFetched:   reviewFetched,
+			checkoutEntered: checkoutEntered,
+		},
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+		done <- err
+	}()
+	if got := <-reviewFetched; got != 7 {
+		t.Fatalf("review fetch = PR %d, want 7", got)
+	}
+	select {
+	case got := <-checkoutEntered:
+		t.Fatalf("checkout for PR %d entered during dependency workspace mutation", got)
+	default:
+	}
+	unlockPromotion()
+	select {
+	case got := <-checkoutEntered:
+		if got != 7 {
+			t.Fatalf("checkout = PR %d, want 7", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("checkout did not resume after dependency workspace mutation")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClaimPRSerializesDifferentPRCheckoutsForOneSession(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws", Branch: "ao/mer-1/root"}}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+	entered := make(chan int, 2)
+	release := make(chan struct{})
+	observations := map[int]ports.SCMObservation{}
+	for _, number := range []int{7, 8} {
+		observations[number] = ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: fmt.Sprintf("https://github.com/acme/repo/pull/%d", number), Number: number}}
+	}
+	svc := NewWithDeps(Deps{
+		Manager:   sessionmanager.New(sessionmanager.Deps{}),
+		Store:     st,
+		PRClaimer: fakePRClaimer{},
+		SCM: fakeSCM{
+			obsByNumber:     observations,
+			checkoutEntered: entered,
+			checkoutRelease: release,
+		},
+	})
+
+	done := make(chan error, 2)
+	for _, number := range []string{"7", "8"} {
+		go func(ref string) {
+			_, err := svc.ClaimPR(context.Background(), "mer-1", ref, ClaimPROptions{AllowTakeover: true})
+			done <- err
+		}(number)
+	}
+	first := <-entered
+	select {
+	case second := <-entered:
+		t.Fatalf("PR %d checkout overlapped PR %d", second, first)
+	case <-time.After(50 * time.Millisecond):
+	}
+	release <- struct{}{}
+	var second int
+	select {
+	case second = <-entered:
+		if second == first {
+			t.Fatalf("second checkout repeated PR %d", second)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second PR checkout did not enter after the first completed")
+	}
+	release <- struct{}{}
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestClaimPRProjectsLatestContractUnderDeliveryLock(t *testing.T) {
+	workspace := newWorkspaceRepo(t)
+	prURL := "https://github.com/acme/repo/pull/7"
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: workspace, Branch: "ao/mer-1/root"}}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+	st.pendingContractDelivery[prURL] = "mer-1"
+	st.pendingContractToken[prURL] = "claim-generation-1"
+	oldContract := designcontract.BuildSeed("7", "## Invariants\n- old claim outcome")
+	latestContract := designcontract.BuildSeed("7", "## Invariants\n- new invariant appended while claim committed")
+	st.contracts[prURL] = oldContract
+	claimPersisted := make(chan struct{})
+	allowClaimReturn := make(chan struct{})
+	outcome := ports.ClaimOutcome{DesignContract: oldContract, ContractDeliveryPending: true, ContractDeliveryToken: "claim-generation-1"}
+	svc := NewWithDeps(Deps{
+		Store: st,
+		PRClaimer: fakePRClaimer{
+			out: errorFreeClaimOutcome{outcome},
+			claimHook: func() {
+				close(claimPersisted)
+				<-allowClaimReturn
+			},
+		},
+		SCM: fakeSCM{obs: ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: prURL, Number: 7}}},
+	})
+
+	unlockDelivery := designcontract.LockDelivery(prURL)
+	deliveryLocked := true
+	defer func() {
+		if deliveryLocked {
+			unlockDelivery()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+		done <- err
+	}()
+	<-claimPersisted
+	// Model an invariant append that owns the delivery lock after the claim
+	// transaction committed but before claim-time projection starts.
+	st.contracts[prURL] = latestContract
+	close(allowClaimReturn)
+	select {
+	case err := <-done:
+		t.Fatalf("claim projection bypassed delivery lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlockDelivery()
+	deliveryLocked = false
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	projected, err := os.ReadFile(designcontract.Path(workspace))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(projected), "new invariant appended while claim committed") || strings.Contains(string(projected), "old claim outcome") {
+		t.Fatalf("claim projection did not use latest locked contract:\n%s", projected)
+	}
+}
+
+func TestClaimPRSerializesSameSessionCheckoutThroughPaneDelivery(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: t.TempDir(), Branch: "ao/mer-1/root"}}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+	observations := make(map[int]ports.SCMObservation, 2)
+	for _, number := range []int{7, 8} {
+		prURL := fmt.Sprintf("https://github.com/acme/repo/pull/%d", number)
+		observations[number] = ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: prURL, Number: number}}
+		st.pendingContractDelivery[prURL] = "mer-1"
+		st.pendingContractToken[prURL] = "claim-generation"
+		st.contracts[prURL] = designcontract.BuildSeed(strconv.Itoa(number), fmt.Sprintf("contract for PR %d", number))
+	}
+	reviewFetched := make(chan int)
+	checkoutEntered := make(chan int, 2)
+	sendEntered := make(chan domain.SessionID, 2)
+	sendRelease := make(chan struct{})
+	workspaceUnlockedOnSend := false
+	commander := &fakeCommander{
+		sendEntered:             sendEntered,
+		sendRelease:             sendRelease,
+		workspaceUnlockedOnSend: &workspaceUnlockedOnSend,
+	}
+	svc := NewWithDeps(Deps{
+		Manager:   commander,
+		Store:     st,
+		PRClaimer: fakePRClaimer{out: errorFreeClaimOutcome{ports.ClaimOutcome{DesignContract: designcontract.BuildSeed("", "claim"), ContractDeliveryPending: true, ContractDeliveryToken: "claim-generation"}}},
+		SCM: fakeSCM{
+			obsByNumber:     observations,
+			reviewFetched:   reviewFetched,
+			checkoutEntered: checkoutEntered,
+		},
+	})
+
+	done := make(chan error, 2)
+	go func() {
+		_, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+		done <- err
+	}()
+	if got := <-reviewFetched; got != 7 {
+		t.Fatalf("first review fetch = PR %d, want 7", got)
+	}
+	if got := <-checkoutEntered; got != 7 {
+		t.Fatalf("first checkout = PR %d, want 7", got)
+	}
+	<-sendEntered
+	if !workspaceUnlockedOnSend {
+		t.Fatal("first pane delivery held the shared workspace mutation gate")
+	}
+
+	go func() {
+		_, err := svc.ClaimPR(context.Background(), "mer-1", "8", ClaimPROptions{AllowTakeover: true})
+		done <- err
+	}()
+	if got := <-reviewFetched; got != 8 {
+		t.Fatalf("second review fetch = PR %d, want 8", got)
+	}
+	select {
+	case got := <-checkoutEntered:
+		t.Fatalf("PR %d checkout entered before PR 7 claim-ready delivery completed", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	sendRelease <- struct{}{}
+	select {
+	case got := <-checkoutEntered:
+		if got != 8 {
+			t.Fatalf("second checkout = PR %d, want 8", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PR 8 checkout did not resume after PR 7 delivery barrier completed")
+	}
+	<-sendEntered
+	sendRelease <- struct{}{}
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestClaimPRRevalidatesSessionInsideWorkspaceMutation(t *testing.T) {
+	now := time.Now().UTC()
+	cases := []struct {
+		name   string
+		mutate func(*fakeStore)
+		want   error
+		code   string
+	}{
+		{"missing", func(st *fakeStore) { delete(st.sessions, "mer-1") }, nil, "SESSION_NOT_FOUND"},
+		{"terminated", func(st *fakeStore) {
+			rec := st.sessions["mer-1"]
+			rec.IsTerminated = true
+			st.sessions["mer-1"] = rec
+		}, nil, "SESSION_TERMINATED"},
+		{"dependency pending", func(st *fakeStore) {
+			rec := st.sessions["mer-1"]
+			rec.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{"mer-parent"})
+			rec.DependencyPreparedAt = now
+			st.sessions["mer-1"] = rec
+		}, ErrSessionDependencyPending, ""},
+		{"incomplete promotion", func(st *fakeStore) {
+			rec := st.sessions["mer-1"]
+			rec.DependencyPromotionToken = "promotion-owner"
+			st.sessions["mer-1"] = rec
+		}, ErrSessionDependencyPending, ""},
+		{"branchless", func(st *fakeStore) {
+			rec := st.sessions["mer-1"]
+			rec.Metadata.Branch = ""
+			st.sessions["mer-1"] = rec
+		}, ErrSessionNoWorkspace, ""},
+		{"empty path", func(st *fakeStore) {
+			rec := st.sessions["mer-1"]
+			rec.Metadata.WorkspacePath = ""
+			st.sessions["mer-1"] = rec
+		}, ErrSessionNoWorkspace, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws", Branch: "ao/mer-1/root"}}
+			st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+			manager := sessionmanager.New(sessionmanager.Deps{})
+			unlockMutation := manager.LockWorkspaceMutation()
+			reviewFetched := make(chan int)
+			checkoutCalled, claimCalled := false, false
+			svc := NewWithDeps(Deps{
+				Manager:   manager,
+				Store:     st,
+				PRClaimer: fakePRClaimer{called: &claimCalled},
+				SCM: fakeSCM{
+					obs:            ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: "https://github.com/acme/repo/pull/7", Number: 7}},
+					reviewFetched:  reviewFetched,
+					checkoutCalled: &checkoutCalled,
+				},
+			})
+			done := make(chan error, 1)
+			go func() {
+				_, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+				done <- err
+			}()
+			<-reviewFetched
+			tc.mutate(st)
+			unlockMutation()
+			err := <-done
+			if tc.want != nil && !errors.Is(err, tc.want) {
+				t.Fatalf("error = %v, want %v", err, tc.want)
+			}
+			if tc.code != "" {
+				var apiError *apierr.Error
+				if !errors.As(err, &apiError) || apiError.Code != tc.code {
+					t.Fatalf("error = %#v, want API code %s", err, tc.code)
+				}
+			}
+			if checkoutCalled || claimCalled {
+				t.Fatalf("invalid revalidated session reached checkout=%v claim=%v", checkoutCalled, claimCalled)
+			}
+		})
+	}
+}
+
+func TestClaimPRConvergesCheckoutAndDurableBranchMetadata(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	now := time.Now().UTC()
+	workspace := t.TempDir()
+	if err := st.UpsertProject(ctx, domain.ProjectRecord{ID: "mer", Path: workspace, RepoOriginURL: "https://github.com/acme/repo", RegisteredAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := st.CreateSession(ctx, domain.SessionRecord{
+		ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessCodex,
+		Activity:  domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
+		Metadata:  domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, WorkspacePath: workspace, Branch: "ao/mer-seed/root"},
+		CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSessionWorktree(ctx, domain.SessionWorktreeRecord{SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, Branch: rec.Metadata.Branch, BaseSHA: "base", WorktreePath: workspace}); err != nil {
+		t.Fatal(err)
+	}
+	var checkoutBranch string
+	svc := NewWithDeps(Deps{
+		Store:     st,
+		PRClaimer: st,
+		SCM: fakeSCM{
+			obs:             ports.SCMObservation{Fetched: true, PR: ports.SCMPRObservation{URL: "https://github.com/acme/repo/pull/7", Number: 7, HeadSHA: "abc123"}},
+			checkoutChanged: true,
+			checkoutBranch:  &checkoutBranch,
+		},
+	})
+	if _, err := svc.ClaimPR(ctx, rec.ID, "7", ClaimPROptions{AllowTakeover: true}); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("ao/claim/%s/pr-7/root", rec.ID)
+	claimedSession, ok, err := st.GetSession(ctx, rec.ID)
+	if err != nil || !ok {
+		t.Fatalf("get claimed session: ok=%v err=%v", ok, err)
+	}
+	claimedWorktree, ok, err := st.GetSessionWorktree(ctx, rec.ID, domain.RootWorkspaceRepoName)
+	if err != nil || !ok {
+		t.Fatalf("get claimed root worktree: ok=%v err=%v", ok, err)
+	}
+	if checkoutBranch != want || claimedSession.Metadata.Branch != want || claimedWorktree.Branch != want {
+		t.Fatalf("branch convergence: checkout=%q session=%q root-worktree=%q want=%q", checkoutBranch, claimedSession.Metadata.Branch, claimedWorktree.Branch, want)
+	}
+}
+
 func TestClaimPRRejectsOversizedTaskPromptBeforeStoreAccess(t *testing.T) {
 	svc := NewWithDeps(Deps{Store: newFakeStore()})
 	_, err := svc.ClaimPR(context.Background(), "missing", "7", ClaimPROptions{TaskPrompt: strings.Repeat("é", MaxClaimTaskPromptBytes/2+1)})
@@ -1556,7 +1977,7 @@ func TestClaimPRReplacementUsesFinalAtomicOwnerAndNudgesCanonicalContract(t *tes
 	replacementWorkspace := t.TempDir()
 	want := "# Design Contract\n\n## Invariants\n- Preserve the final owner's rounds.\x1b[31m\x00\u0085\n"
 	st := newFakeStore()
-	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: replacementWorkspace}}
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: replacementWorkspace, Branch: "ao/mer-1/root"}}
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
 	preflight := ports.ClaimOutcome{PreviousOwner: "mer-A", OwnerTerminated: true}
 	prURL := "https://github.com/acme/repo/pull/7"
@@ -1565,7 +1986,8 @@ func TestClaimPRReplacementUsesFinalAtomicOwnerAndNudgesCanonicalContract(t *tes
 	st.pendingContractDelivery[prURL] = "mer-1"
 	st.pendingContractToken[prURL] = token
 	st.contracts[prURL] = want
-	commander := &fakeCommander{}
+	workspaceUnlockedOnSend := false
+	commander := &fakeCommander{workspaceUnlockedOnSend: &workspaceUnlockedOnSend}
 	var persistedTask string
 	taskPrompt := "Fix the review without losing predecessor invariants."
 	st.pendingContractTask[prURL] = taskPrompt
@@ -1586,6 +2008,9 @@ func TestClaimPRReplacementUsesFinalAtomicOwnerAndNudgesCanonicalContract(t *tes
 	if !res.ContractReady || st.pendingContractDelivery[prURL] != "" {
 		t.Fatalf("contract delivery barrier = ready %v pending %q", res.ContractReady, st.pendingContractDelivery[prURL])
 	}
+	if !workspaceUnlockedOnSend {
+		t.Fatal("claim-ready pane delivery ran while the workspace mutation gate was held")
+	}
 	if persistedTask != taskPrompt || len(commander.sentMessages) != 1 || !strings.Contains(commander.sentMessages[0], "Preserve the final owner's rounds") || !strings.Contains(commander.sentMessages[0], taskPrompt) || strings.Contains(commander.sentMessages[0], "mer-A") {
 		t.Fatalf("claim-time contract nudge = %v", commander.sentMessages)
 	}
@@ -1599,7 +2024,7 @@ func TestClaimPRReplacementUsesFinalAtomicOwnerAndNudgesCanonicalContract(t *tes
 func TestClaimPRSendFailureKeepsDurableContractBarrierPending(t *testing.T) {
 	prURL := "https://github.com/acme/repo/pull/7"
 	st := newFakeStore()
-	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: t.TempDir()}}
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: t.TempDir(), Branch: "ao/mer-1/root"}}
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
 	st.pendingContractDelivery[prURL] = "mer-1"
 	token := "claim-generation-1"
@@ -1623,10 +2048,74 @@ func TestClaimPRSendFailureKeepsDurableContractBarrierPending(t *testing.T) {
 	}
 }
 
+func TestClaimPRRejectsDifferentPRWhileDurableDeliveryRemainsPending(t *testing.T) {
+	incompleteAcknowledgement := false
+	for _, tc := range []struct {
+		name               string
+		sendErr            error
+		completeDeliveryOK *bool
+	}{
+		{name: "send failed", sendErr: errors.New("pane unavailable")},
+		{name: "delivery acknowledgement incomplete", completeDeliveryOK: &incompleteAcknowledgement},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			firstURL := "https://github.com/acme/repo/pull/7"
+			secondURL := "https://github.com/acme/repo/pull/8"
+			st := newFakeStore()
+			st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: t.TempDir(), Branch: "ao/mer-1/root"}}
+			st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
+			st.ownedPRs["mer-1"] = []domain.PullRequest{{URL: firstURL, SessionID: "mer-1", Number: 7}}
+			st.pendingContractDelivery[firstURL] = "mer-1"
+			st.pendingContractToken[firstURL] = "claim-generation-1"
+			st.contracts[firstURL] = designcontract.BuildSeed("7", "contract for PR 7")
+			st.completeDeliveryResult = tc.completeDeliveryOK
+			checkoutCalled := false
+			outcome := ports.ClaimOutcome{
+				DesignContract:          st.contracts[firstURL],
+				ContractDeliveryPending: true,
+				ContractDeliveryToken:   st.pendingContractToken[firstURL],
+			}
+			svc := NewWithDeps(Deps{
+				Manager:   &fakeCommander{sendErr: tc.sendErr},
+				Store:     st,
+				PRClaimer: fakePRClaimer{out: errorFreeClaimOutcome{outcome}},
+				SCM: fakeSCM{
+					obsByNumber: map[int]ports.SCMObservation{
+						7: {Fetched: true, PR: ports.SCMPRObservation{URL: firstURL, Number: 7}},
+						8: {Fetched: true, PR: ports.SCMPRObservation{URL: secondURL, Number: 8}},
+					},
+					checkoutCalled: &checkoutCalled,
+				},
+			})
+
+			first, err := svc.ClaimPR(context.Background(), "mer-1", "7", ClaimPROptions{AllowTakeover: true})
+			if err != nil {
+				t.Fatalf("first claim returned delivery failure: %v", err)
+			}
+			if first.ContractReady || st.pendingContractDelivery[firstURL] != "mer-1" {
+				t.Fatalf("first claim barrier = ready %v pending %q", first.ContractReady, st.pendingContractDelivery[firstURL])
+			}
+			checkoutCalled = false
+
+			_, err = svc.ClaimPR(context.Background(), "mer-1", "8", ClaimPROptions{AllowTakeover: true})
+			var apiError *apierr.Error
+			if !errors.As(err, &apiError) || apiError.Kind != apierr.KindConflict || apiError.Code != "PR_CLAIM_DELIVERY_PENDING" {
+				t.Fatalf("second claim error = %v, want conflict PR_CLAIM_DELIVERY_PENDING", err)
+			}
+			if checkoutCalled {
+				t.Fatal("second PR entered checkout while first PR delivery barrier remained pending")
+			}
+			if st.pendingContractDelivery[firstURL] != "mer-1" {
+				t.Fatal("second claim cleared the first PR delivery barrier")
+			}
+		})
+	}
+}
+
 func TestClaimPRMapsObserverAndStoreErrors(t *testing.T) {
 	st := newFakeStore()
 	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
-	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws"}}
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws", Branch: "ao/mer-1/root"}}
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
 
 	cases := []struct {
