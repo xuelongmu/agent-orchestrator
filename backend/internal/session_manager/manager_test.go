@@ -227,6 +227,7 @@ type fakeLCM struct {
 	dependencyMarkCalls     int
 	resetErr                error
 	resetLost               bool
+	resetCalls              int
 	// terminated counts MarkTerminated calls per session id.
 	terminated map[domain.SessionID]int
 }
@@ -325,6 +326,7 @@ func (l *fakeLCM) MarkDependencyLaunchSucceeded(_ context.Context, id domain.Ses
 	return true, nil
 }
 func (l *fakeLCM) ResetDependencyLaunch(_ context.Context, id domain.SessionID, token string) (bool, error) {
+	l.resetCalls++
 	if l.resetErr != nil {
 		return false, l.resetErr
 	}
@@ -1309,32 +1311,37 @@ func TestRecoveredDependencyResetRetainsFenceOnBoundaryFailures(t *testing.T) {
 		DependencyPreparedAt: time.Now().UTC(), DependencyPromotionToken: "owner",
 		Metadata: domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, WorkspacePath: "/ws/child", RuntimeHandleID: "runtime"},
 	}
+	reloadErr := errors.New("reload failed")
+	runtimeDestroyErr := errors.New("destroy runtime failed")
+	workspaceDestroyErr := errors.New("destroy workspace failed")
+	resetErr := errors.New("reset failed")
 	tests := []struct {
 		name      string
 		alive     bool
 		configure func(*Manager, *fakeStore, *fakeRuntime, *fakeWorkspace, *fakeLCM)
-		wantErr   string
+		wantErr   error
+		wantReset int
 	}{
 		{name: "reload error", configure: func(_ *Manager, st *fakeStore, _ *fakeRuntime, _ *fakeWorkspace, _ *fakeLCM) {
-			st.getErr = errors.New("reload failed")
-		}, wantErr: "reload failed"},
+			st.getErr = reloadErr
+		}, wantErr: reloadErr},
 		{name: "ownership changed", configure: func(_ *Manager, st *fakeStore, _ *fakeRuntime, _ *fakeWorkspace, _ *fakeLCM) {
 			rec := st.sessions[base.ID]
 			rec.DependencyPromotionToken = "new-owner"
 			st.sessions[base.ID] = rec
 		}},
 		{name: "runtime destroy", alive: true, configure: func(_ *Manager, _ *fakeStore, rt *fakeRuntime, _ *fakeWorkspace, _ *fakeLCM) {
-			rt.destroyErr = errors.New("destroy runtime failed")
-		}, wantErr: "destroy runtime failed"},
+			rt.destroyErr = runtimeDestroyErr
+		}, wantErr: runtimeDestroyErr},
 		{name: "workspace destroy", configure: func(_ *Manager, _ *fakeStore, _ *fakeRuntime, ws *fakeWorkspace, _ *fakeLCM) {
-			ws.destroyErr = errors.New("destroy workspace failed")
-		}, wantErr: "destroy workspace failed"},
+			ws.destroyErr = workspaceDestroyErr
+		}, wantErr: workspaceDestroyErr},
 		{name: "reset error", configure: func(_ *Manager, _ *fakeStore, _ *fakeRuntime, _ *fakeWorkspace, lcm *fakeLCM) {
-			lcm.resetErr = errors.New("reset failed")
-		}, wantErr: "reset failed"},
+			lcm.resetErr = resetErr
+		}, wantErr: resetErr, wantReset: 1},
 		{name: "reset ownership lost", configure: func(_ *Manager, _ *fakeStore, _ *fakeRuntime, _ *fakeWorkspace, lcm *fakeLCM) {
 			lcm.resetLost = true
-		}},
+		}, wantReset: 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1342,13 +1349,25 @@ func TestRecoveredDependencyResetRetainsFenceOnBoundaryFailures(t *testing.T) {
 			st.setSession(base)
 			lcm := m.lcm.(*fakeLCM)
 			tc.configure(m, st, rt, ws, lcm)
+			st.mu.RLock()
+			before := st.sessions[base.ID]
+			st.mu.RUnlock()
 			reset, err := m.resetRecoveredDependencyLaunch(base, tc.alive)
-			if tc.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) || reset {
-					t.Fatalf("reset = %v, %v; want error %q", reset, err, tc.wantErr)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) || reset {
+					t.Fatalf("reset = %v, %v; want cause %v", reset, err, tc.wantErr)
 				}
 			} else if err != nil || reset {
 				t.Fatalf("lost ownership reset = %v, %v", reset, err)
+			}
+			st.mu.RLock()
+			after := st.sessions[base.ID]
+			st.mu.RUnlock()
+			if after.DependencyPromotionToken != before.DependencyPromotionToken || !reflect.DeepEqual(after.Metadata, before.Metadata) {
+				t.Fatalf("boundary failure mutated persisted fence metadata: before=%#v after=%#v", before, after)
+			}
+			if lcm.resetCalls != tc.wantReset {
+				t.Fatalf("ResetDependencyLaunch calls = %d, want %d", lcm.resetCalls, tc.wantReset)
 			}
 		})
 	}
@@ -1360,6 +1379,15 @@ func TestRecoveredDependencyResetRetainsFenceOnBoundaryFailures(t *testing.T) {
 	m.lifetimeCtx = lifetime
 	if reset, err := m.resetRecoveredDependencyLaunch(base, false); !errors.Is(err, context.Canceled) || reset {
 		t.Fatalf("lease-lost reset = %v, %v", reset, err)
+	}
+	st.mu.RLock()
+	after := st.sessions[base.ID]
+	st.mu.RUnlock()
+	if after.DependencyPromotionToken != base.DependencyPromotionToken || !reflect.DeepEqual(after.Metadata, base.Metadata) {
+		t.Fatalf("lease loss mutated persisted fence metadata: before=%#v after=%#v", base, after)
+	}
+	if calls := m.lcm.(*fakeLCM).resetCalls; calls != 0 {
+		t.Fatalf("ResetDependencyLaunch called %d times after lease loss", calls)
 	}
 }
 

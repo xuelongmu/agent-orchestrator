@@ -561,20 +561,31 @@ func TestReconcileSurfacesStoreBoundaryFailuresWithoutLeakingClaims(t *testing.T
 		}
 	})
 
+	completeErr := errors.New("complete failed")
 	for _, tc := range []struct {
-		name string
-		set  func(*schedulerStore)
-		want string
+		name      string
+		set       func(*schedulerStore)
+		wantCause error
+		wantText  string
 	}{
-		{name: "complete error", set: func(store *schedulerStore) { store.completeErr = errors.New("complete failed") }, want: "complete failed"},
-		{name: "complete token lost", set: func(store *schedulerStore) { store.completeLost = true }, want: "reservation token was lost"},
+		{name: "complete error", set: func(store *schedulerStore) { store.completeErr = completeErr }, wantCause: completeErr},
+		{name: "complete token lost", set: func(store *schedulerStore) { store.completeLost = true }, wantText: "reservation token was lost"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newStore()
 			tc.set(store)
 			err := New(store, &schedulerLauncher{}, nil, nil).Reconcile(context.Background())
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("completion error = %v, want %q", err, tc.want)
+			if tc.wantCause != nil && !errors.Is(err, tc.wantCause) {
+				t.Fatalf("completion error = %v, want cause %v", err, tc.wantCause)
+			}
+			if tc.wantText != "" && (err == nil || !strings.Contains(err.Error(), tc.wantText)) {
+				t.Fatalf("completion error = %v, want %q", err, tc.wantText)
+			}
+			store.mu.Lock()
+			token, promoted := store.tokens["child"], store.promoted["child"]
+			store.mu.Unlock()
+			if token == "" || promoted {
+				t.Fatalf("completion failure dropped fence: token=%q promoted=%v", token, promoted)
 			}
 		})
 	}
@@ -599,6 +610,13 @@ func TestWaitDelayAndDefaultLoopBounds(t *testing.T) {
 	scheduler := New(store, nil, nil, nil)
 	//nolint:staticcheck // Intentionally exercise the nil-context fallback.
 	scheduler.SetLifetimeContext(nil)
+	store.tokens["fenced"] = "owner"
+	if err := scheduler.ReleaseRecovered(context.Background(), "fenced", "owner"); err != nil {
+		t.Fatalf("nil lifetime fallback did not permit detached cleanup: %v", err)
+	}
+	if store.tokens["fenced"] != "" {
+		t.Fatalf("nil lifetime fallback left reservation fenced: %q", store.tokens["fenced"])
+	}
 	delaySeen := make(chan time.Duration, 1)
 	scheduler.wait = func(_ context.Context, delay time.Duration, _ <-chan struct{}, _ bool) bool {
 		delaySeen <- delay
