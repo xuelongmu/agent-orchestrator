@@ -245,27 +245,33 @@ func TestInstallPreservesMalformedAndNonCommandEntries(t *testing.T) {
 }
 
 func TestInstallRejectsMalformedEventWithoutChangingFile(t *testing.T) {
-	workspace, hooksPath, manager := newTestManager(t)
-	writeJSON(t, hooksPath, map[string]any{
-		"custom": "keep",
-		"hooks": map[string]any{
-			"SessionStart": map[string]any{"type": "command", "command": "not-an-array"},
-		},
-	})
-	before, err := os.ReadFile(hooksPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	for name, malformed := range map[string]any{
+		"object": map[string]any{"type": "command", "command": "not-an-array"},
+		"null":   nil,
+		"string": "not-an-array",
+	} {
+		t.Run(name, func(t *testing.T) {
+			workspace, hooksPath, manager := newTestManager(t)
+			writeJSON(t, hooksPath, map[string]any{
+				"custom": "keep",
+				"hooks":  map[string]any{"SessionStart": malformed},
+			})
+			before, err := os.ReadFile(hooksPath)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	if err := manager.Install(context.Background(), workspace); err == nil {
-		t.Fatal("Install() error = nil, want malformed event error")
-	}
-	after, err := os.ReadFile(hooksPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(after) != string(before) {
-		t.Fatalf("malformed event changed file\nbefore:\n%s\nafter:\n%s", before, after)
+			if err := manager.Install(context.Background(), workspace); err == nil {
+				t.Fatal("Install() error = nil, want malformed event error")
+			}
+			after, err := os.ReadFile(hooksPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(before) {
+				t.Fatalf("malformed event changed file\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
 	}
 }
 

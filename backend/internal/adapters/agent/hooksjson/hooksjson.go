@@ -274,6 +274,10 @@ func parseEvent(rawHooks map[string]json.RawMessage, event string, target *[]Mat
 	if !ok {
 		return nil
 	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return fmt.Errorf("parse %s hooks: expected array", event)
+	}
 	if err := json.Unmarshal(data, target); err != nil {
 		return fmt.Errorf("parse %s hooks: %w", event, err)
 	}
@@ -286,6 +290,10 @@ func parseEvent(rawHooks map[string]json.RawMessage, event string, target *[]Mat
 // attempts to install its hook into that event.
 func normalizeLegacyEvents(rawHooks map[string]json.RawMessage) error {
 	for event, data := range rawHooks {
+		trimmed := bytes.TrimSpace(data)
+		if len(trimmed) == 0 || trimmed[0] != '[' {
+			continue
+		}
 		var groups []MatcherGroup
 		if err := json.Unmarshal(data, &groups); err != nil {
 			continue
