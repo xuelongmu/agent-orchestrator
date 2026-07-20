@@ -79,6 +79,69 @@ func TestKimiDelayedPermissionResultAfterStopStaysIdle(t *testing.T) {
 	}
 }
 
+func TestKimiPermissionResultRequiresMatchingToolID(t *testing.T) {
+	tests := []struct {
+		name             string
+		permissionToolID string
+		resultToolID     string
+	}{
+		{"missing permission id", "", "call_42"},
+		{"missing result id", "call_42", ""},
+		{"unmatched result id", "call_42", "call_99"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, st, _ := newManager()
+			seedSignaled(st, "mer-1", domain.ActivityIdle)
+			applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_42")
+			applyKimiHook(t, m, "mer-1", "permission-request", "Shell", tt.permissionToolID)
+			applyKimiHook(t, m, "mer-1", "permission-result", "Shell", tt.resultToolID)
+
+			if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
+				t.Fatalf("state after uncorrelated permission-result = %q, want waiting_input", got)
+			}
+		})
+	}
+}
+
+func TestKimiPermissionResultCannotCrossClearSameTurn(t *testing.T) {
+	m, st, _ := newManager()
+	seedSignaled(st, "mer-1", domain.ActivityIdle)
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_a")
+	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_a")
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_b")
+	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_b")
+
+	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_a")
+	if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
+		t.Fatalf("state after stale result A = %q, want waiting_input for B", got)
+	}
+	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_b")
+	if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
+		t.Fatalf("state after matching result B = %q, want active", got)
+	}
+}
+
+func TestKimiPermissionResultCannotCrossTurnBoundary(t *testing.T) {
+	m, st, _ := newManager()
+	seedSignaled(st, "mer-1", domain.ActivityIdle)
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_a")
+	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_a")
+	applyKimiHook(t, m, "mer-1", "stop", "", "")
+	applyKimiHook(t, m, "mer-1", "user-prompt-submit", "", "")
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_b")
+	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_b")
+
+	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_a")
+	if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
+		t.Fatalf("state after prior-turn result A = %q, want waiting_input for B", got)
+	}
+	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_b")
+	if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
+		t.Fatalf("state after matching result B = %q, want active", got)
+	}
+}
+
 // blockOnDialog drives a session into blocked through the real signal path:
 // the blocking tool's pre-tool-use, then permission-request naming that tool.
 func blockOnDialog(t *testing.T, m *Manager, st *fakeStore, id domain.SessionID, toolName, toolUseID string) {

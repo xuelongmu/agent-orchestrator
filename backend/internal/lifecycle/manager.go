@@ -496,6 +496,10 @@ type toolFlight struct {
 	// NOT be mistaken for the approval). Either way, empty means nothing
 	// tool-shaped may clear the block and it lifts only at a turn boundary.
 	blockedCandidate string
+	// pendingPermission is the tool-use id from the latest waiting-input
+	// permission request, but only when that id matched an in-flight pre-tool
+	// signal. A permission result must match it exactly to clear the wait.
+	pendingPermission string
 }
 
 // maxInflightTools caps a session's in-flight map so lost posts cannot grow
@@ -509,13 +513,12 @@ func isToolUseEvent(event string) bool {
 	return event == "pre-tool-use" || event == "post-tool-use" || event == "post-tool-use-failure"
 }
 
-// isDeferredCompletionEvent reports observation-only callbacks that may be
+// isDeferredToolCompletionEvent reports observation-only callbacks that may be
 // delivered after the awaited Stop callback. Their prerequisite callbacks
-// (pre-tool-use or permission-request) already made an in-turn session
-// non-idle, so a completion callback cannot legitimately start work from an
-// idle state.
-func isDeferredCompletionEvent(event string) bool {
-	return event == "post-tool-use" || event == "post-tool-use-failure" || event == "permission-result"
+// already made an in-turn session non-idle, so a completion callback cannot
+// legitimately start work from an idle state.
+func isDeferredToolCompletionEvent(event string) bool {
+	return event == "post-tool-use" || event == "post-tool-use-failure"
 }
 
 // isTurnBoundaryEvent reports the events that reliably mean the pending
@@ -555,6 +558,7 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 			f := ensure()
 			if len(f.inflight) >= maxInflightTools {
 				f.inflight = map[string]string{}
+				f.pendingPermission = ""
 			}
 			f.inflight[s.ToolUseID] = s.ToolName
 		}
@@ -562,10 +566,29 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 		if fl != nil {
 			delete(fl.inflight, s.ToolUseID)
 		}
+	case "permission-request":
+		if s.State == domain.ActivityWaitingInput && fl != nil {
+			// A newer request supersedes any prior approval correlation. Only a
+			// request that names a currently in-flight tool can be cleared by a
+			// later permission-result.
+			fl.pendingPermission = ""
+			if s.ToolUseID != "" {
+				if _, ok := fl.inflight[s.ToolUseID]; ok {
+					fl.pendingPermission = s.ToolUseID
+				}
+			}
+		}
 	}
 
 	switch {
-	case cur == domain.ActivityIdle && isDeferredCompletionEvent(s.Event):
+	case s.Event == "permission-result":
+		if cur != domain.ActivityWaitingInput || fl == nil || s.ToolUseID == "" || s.ToolUseID != fl.pendingPermission {
+			return suppressed
+		}
+		fl.pendingPermission = ""
+		return s
+
+	case cur == domain.ActivityIdle && isDeferredToolCompletionEvent(s.Event):
 		if fl != nil && len(fl.inflight) == 0 {
 			delete(m.flights, id)
 		}
