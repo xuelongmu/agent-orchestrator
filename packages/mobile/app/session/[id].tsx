@@ -75,7 +75,9 @@ const TERMINAL_ENHANCE_JS = `
   // While zoomed we auto-pan to keep the cursor framed, so the prompt/output
   // stays in view without chasing it by hand.
   function term() { return window.terminal; }
-  var Z = { s: 1, min: 1, tx: 0, ty: 0, zoomed: true, lastPan: 0 };
+  // overview is the chosen view; zoomed tracks whether it currently differs
+  // from the fit scale so a phone-sized grid keeps normal scroll gesture routing.
+  var Z = { s: 1, min: 1, tx: 0, ty: 0, overview: false, zoomed: false, lastPan: 0 };
   function box() {
     var root = document.querySelector('.xterm');
     var screen = document.querySelector('.xterm-screen');
@@ -101,8 +103,12 @@ const TERMINAL_ENHANCE_JS = `
     try {
       var b = box(); if (!b || !b.natW || !b.contW) return;
       Z.min = Math.min(1, b.contW / b.natW);
-      if (!Z.zoomed) { Z.s = Z.min; Z.tx = 0; Z.ty = 0; }
-      else { if (Z.s < Z.min) Z.s = Z.min; clampT(b); }
+      if (Z.overview) { Z.s = Z.min; Z.zoomed = false; Z.tx = 0; Z.ty = 0; }
+      else {
+        if (Z.s < Z.min) Z.s = Z.min;
+        Z.zoomed = Z.s > Z.min + 0.001;
+        if (!Z.zoomed) { Z.tx = 0; Z.ty = 0; } else clampT(b);
+      }
       applyTransform(b);
     } catch (_) {}
   }
@@ -113,6 +119,7 @@ const TERMINAL_ENHANCE_JS = `
     var px = (ax - Z.tx) / Z.s, py = (ay - Z.ty) / Z.s;
     Z.s = s; Z.tx = ax - px * s; Z.ty = ay - py * s;
     Z.zoomed = s > Z.min + 0.001;
+    if (Z.min < 0.999) Z.overview = !Z.zoomed;
     if (!Z.zoomed) { Z.s = Z.min; Z.tx = 0; Z.ty = 0; }
     clampT(b); applyTransform(b);
   }
