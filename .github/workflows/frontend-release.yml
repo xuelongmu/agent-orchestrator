@@ -133,8 +133,8 @@ jobs:
           echo "All required signing and notarization secrets are configured."
 
   # Seed exactly one draft after approval. This serialized, write-capable job
-  # can see existing drafts and prevents the platform publishers from racing
-  # through Forge's list-then-create path.
+  # can see existing drafts/tags and prevents the platform publishers from
+  # racing through Forge's list-then-create path.
   release-draft:
     needs: [release-eligibility, release-secrets]
     runs-on: ubuntu-latest
@@ -159,6 +159,17 @@ jobs:
           )"
           if grep -Fxq "$tag" <<<"$release_tags"; then
             echo "::error::Release '$tag' already exists (draft or published); refusing to overwrite it."
+            exit 1
+          fi
+
+          matching_refs="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+              --jq '.[].ref'
+          )"
+          if grep -Fxq "refs/tags/$tag" <<<"$matching_refs"; then
+            echo "::error::Git tag 'refs/tags/$tag' already exists; refusing to reuse it for a different release target."
             exit 1
           fi
 

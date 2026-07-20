@@ -54,10 +54,12 @@ forked. Before the first stable release from a fork:
    environment phases, GitHub may request approval again; approve every
    `release` deployment for the run. The protected draft-seed job refuses an
    existing `vX.Y.Z` release (including a draft), then creates one empty draft
-   targeted at the exact trigger SHA for all platform publishers to reuse.
-   Platform assets remain draft until all jobs and feed uploads succeed. If a
-   run leaves a failed draft, deliberately delete that release or choose and
-   stamp a new version before starting a new run.
+   targeted at the exact trigger SHA for all platform publishers to reuse. It
+   also refuses an existing `refs/tags/vX.Y.Z`, because GitHub would otherwise
+   ignore the requested target and reuse that tag. Platform assets remain draft
+   until all jobs and feed uploads succeed. Before retrying a failed version,
+   deliberately delete both its draft/release and its `vX.Y.Z` tag; otherwise,
+   choose and stamp a new version.
 5. Confirm the resulting `vX.Y.Z` release is neither draft nor prerelease and
    contains `latest.yml`, `latest-mac.yml`, and `latest-linux.yml`. Inspect each
    feed's `files[].url` entries and confirm every referenced installer is an

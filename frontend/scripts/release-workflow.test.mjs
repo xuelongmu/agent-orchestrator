@@ -52,6 +52,8 @@ describe("stable desktop release workflow", () => {
 		expect(draft).toContain("GH_REPO: ${{ github.repository }}");
 		expect(draft.indexOf("releases?per_page=100")).toBeLessThan(draft.indexOf("gh release create"));
 		expect(draft).toContain('grep -Fxq "$tag"');
+		expect(draft.indexOf("git/matching-refs/tags/$tag")).toBeLessThan(draft.indexOf("gh release create"));
+		expect(draft).toContain('grep -Fxq "refs/tags/$tag"');
 		expect(draft).toContain('gh release create "$tag" --draft --target "$GITHUB_SHA" --title "$tag"');
 		expect(draft.match(/gh release create/g)).toHaveLength(1);
 	});
