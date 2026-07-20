@@ -21,6 +21,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/gitexclude"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/hookutil"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -94,6 +95,12 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 // gitignore check offers to add this same pattern interactively; AO records it
 // in Git's local info/exclude instead, then --no-gitignore suppresses the prompt.
 func (p *Plugin) PreLaunch(ctx context.Context, cfg ports.LaunchConfig) error {
+	return p.preLaunch(ctx, cfg, nil)
+}
+
+// preLaunch exposes the shared-exclude lock's confirmed-contention boundary to
+// the concurrency regression test without changing the adapter capability.
+func (p *Plugin) preLaunch(ctx context.Context, cfg ports.LaunchConfig, onLockContention func()) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -103,9 +110,50 @@ func (p *Plugin) PreLaunch(ctx context.Context, cfg ports.LaunchConfig) error {
 
 	excludePath, err := gitExcludePath(ctx, cfg.WorkspacePath)
 	if err != nil {
+		hasGitMarker, markerErr := workspaceHasGitMarker(cfg.WorkspacePath)
+		if markerErr != nil {
+			return fmt.Errorf("classify workspace after Git resolution failed: %v: %w", err, markerErr)
+		}
+		if !hasGitMarker {
+			return nil
+		}
 		return err
 	}
-	return appendLocalExclude(excludePath, aiderArtifactIgnorePattern)
+	return gitexclude.EnsurePattern(excludePath, aiderArtifactIgnorePattern, "# agent-orchestrator Aider session files", onLockContention)
+}
+
+// workspaceHasGitMarker distinguishes a genuine non-repository scratch
+// workspace from a repository Git could not read. It walks ancestors because
+// cfg.WorkspacePath may name a subdirectory, and Lstat treats linked-worktree
+// .git files (including malformed ones) as repository markers without parsing
+// locale-dependent Git stderr.
+func workspaceHasGitMarker(workspacePath string) (bool, error) {
+	path, err := filepath.EvalSymlinks(workspacePath)
+	if err != nil {
+		return false, fmt.Errorf("resolve workspace path %q: %w", workspacePath, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, fmt.Errorf("stat workspace path %q: %w", path, err)
+	}
+	if !info.IsDir() {
+		return false, fmt.Errorf("workspace path %q is not a directory", path)
+	}
+
+	for {
+		_, err := os.Lstat(filepath.Join(path, ".git"))
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("inspect Git metadata under %q: %w", path, err)
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return false, nil
+		}
+		path = parent
+	}
 }
 
 func gitExcludePath(ctx context.Context, workspacePath string) (string, error) {
@@ -123,38 +171,6 @@ func gitExcludePath(ctx context.Context, workspacePath string) (string, error) {
 		path = filepath.Join(workspacePath, path)
 	}
 	return filepath.Clean(path), nil
-}
-
-func appendLocalExclude(path, pattern string) error {
-	data, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("read Aider artifact exclude %q: %w", path, err)
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.TrimSpace(line) == pattern {
-			return nil
-		}
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return fmt.Errorf("create Aider artifact exclude directory: %w", err)
-	}
-	prefix := ""
-	if len(data) > 0 && data[len(data)-1] != '\n' {
-		prefix = "\n"
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("open Aider artifact exclude %q: %w", path, err)
-	}
-	if _, err := f.WriteString(prefix + pattern + "\n"); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("write Aider artifact exclude %q: %w", path, err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close Aider artifact exclude %q: %w", path, err)
-	}
-	return nil
 }
 
 // GetPromptDeliveryStrategy reports that AO should inject prompted Aider tasks

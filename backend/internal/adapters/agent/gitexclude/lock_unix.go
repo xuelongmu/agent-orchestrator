@@ -1,6 +1,6 @@
 //go:build !windows
 
-package copilot
+package gitexclude
 
 import (
 	"errors"
@@ -9,7 +9,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func lockCopilotExclude(path string, onContention func()) (func(), error) {
+// Acquire locks path until the returned function is called.
+func Acquire(path string, onContention func()) (func(), error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // repository-common lock file
 	if err != nil {
 		return nil, err
@@ -22,7 +23,7 @@ func lockCopilotExclude(path string, onContention func()) (func(), error) {
 			}
 		}
 		if err == nil {
-			return unlockCopilotExclude(file), nil
+			return unlock(file), nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) {
 			_ = file.Close()
@@ -40,10 +41,10 @@ func lockCopilotExclude(path string, onContention func()) (func(), error) {
 		_ = file.Close()
 		return nil, err
 	}
-	return unlockCopilotExclude(file), nil
+	return unlock(file), nil
 }
 
-func unlockCopilotExclude(file *os.File) func() {
+func unlock(file *os.File) func() {
 	return func() {
 		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
 		_ = file.Close()

@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/gitexclude"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -191,8 +193,12 @@ func TestGetLaunchCommandMapsPermissionModes(t *testing.T) {
 }
 
 func TestPreLaunchLocallyIgnoresAllAiderArtifacts(t *testing.T) {
-	workspace := t.TempDir()
-	runGit(t, workspace, "init", "--quiet")
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	workspace := filepath.Join(repo, "nested", "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	excludePath := strings.TrimSpace(runGit(t, workspace, "rev-parse", "--git-path", "info/exclude"))
 	if !filepath.IsAbs(excludePath) {
@@ -240,6 +246,145 @@ func TestPreLaunchLocallyIgnoresAllAiderArtifacts(t *testing.T) {
 	}
 	if status := runGit(t, workspace, "status", "--porcelain", "--untracked-files=all"); status != "" {
 		t.Fatalf("Aider artifacts dirtied worktree: %q", status)
+	}
+}
+
+func TestPreLaunchNonGitWorkspaceIsNoOp(t *testing.T) {
+	workspace := t.TempDir()
+	if err := (&Plugin{}).PreLaunch(context.Background(), ports.LaunchConfig{WorkspacePath: workspace}); err != nil {
+		t.Fatalf("PreLaunch in scratch workspace: %v", err)
+	}
+	entries, err := os.ReadDir(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("PreLaunch mutated scratch workspace: %#v", entries)
+	}
+}
+
+func TestPreLaunchMalformedGitMetadataFails(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, ".git"), []byte("gitdir: missing-git-dir\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Plugin{}).PreLaunch(context.Background(), ports.LaunchConfig{WorkspacePath: workspace}); err == nil {
+		t.Fatal("PreLaunch with malformed Git metadata succeeded, want error")
+	}
+}
+
+func TestPreLaunchLinkedWorktreeUsesGitResolvedExclude(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	runGit(t, repo, "config", "user.name", "AO Test")
+	runGit(t, repo, "config", "user.email", "ao-test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "README.md")
+	runGit(t, repo, "commit", "--quiet", "-m", "test fixture")
+
+	linked := filepath.Join(t.TempDir(), "linked")
+	runGit(t, repo, "worktree", "add", "--quiet", "-b", "aider-linked-test", linked)
+	if err := (&Plugin{}).PreLaunch(context.Background(), ports.LaunchConfig{WorkspacePath: linked}); err != nil {
+		t.Fatal(err)
+	}
+
+	excludePath := runGit(t, linked, "rev-parse", "--git-path", "info/exclude")
+	data, err := os.ReadFile(excludePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), aiderArtifactIgnorePattern) {
+		t.Fatalf("linked-worktree exclude missing %q: %q", aiderArtifactIgnorePattern, data)
+	}
+	if err := os.WriteFile(filepath.Join(linked, ".aider.chat.history.md"), []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if status := runGit(t, linked, "status", "--porcelain", "--untracked-files=all"); status != "" {
+		t.Fatalf("Aider artifact dirtied linked worktree: %q", status)
+	}
+}
+
+func TestPreLaunchSerializesLinkedWorktreeAndOtherAdapterExcludeUpdates(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	runGit(t, repo, "config", "user.name", "AO Test")
+	runGit(t, repo, "config", "user.email", "ao-test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "README.md")
+	runGit(t, repo, "commit", "--quiet", "-m", "test fixture")
+
+	linkedRoot := t.TempDir()
+	linkedAider := filepath.Join(linkedRoot, "aider")
+	linkedOther := filepath.Join(linkedRoot, "other")
+	runGit(t, repo, "worktree", "add", "--quiet", "-b", "aider-lock-test", linkedAider)
+	runGit(t, repo, "worktree", "add", "--quiet", "-b", "other-lock-test", linkedOther)
+	excludePath := runGit(t, linkedAider, "rev-parse", "--git-path", "info/exclude")
+	otherExclude := runGit(t, linkedOther, "rev-parse", "--git-path", "info/exclude")
+	if otherExclude != excludePath {
+		t.Fatalf("linked worktrees resolved different excludes: %q != %q", otherExclude, excludePath)
+	}
+	if err := os.WriteFile(excludePath, []byte("# existing\n/user-entry\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	unlock, err := gitexclude.Acquire(excludePath+".ao.lock", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
+
+	blocked := make(chan struct{}, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		errs <- (&Plugin{}).preLaunch(context.Background(), ports.LaunchConfig{WorkspacePath: linkedAider}, func() {
+			blocked <- struct{}{}
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		errs <- gitexclude.EnsurePattern(otherExclude, "/.github/agents/ao-test.agent.md", "# agent-orchestrator Copilot session files", func() {
+			blocked <- struct{}{}
+		})
+	}()
+	for range 2 {
+		<-blocked
+	}
+	if data, err := os.ReadFile(excludePath); err != nil {
+		t.Fatal(err)
+	} else if string(data) != "# existing\n/user-entry\n" {
+		t.Fatalf("exclude changed while common lock was held:\n%s", data)
+	}
+
+	unlock()
+	locked = false
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	data, err := os.ReadFile(excludePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"/user-entry", aiderArtifactIgnorePattern, "/.github/agents/ao-test.agent.md"} {
+		if count := strings.Count(string(data), want+"\n"); count != 1 {
+			t.Fatalf("exclude entry %q count = %d, want 1:\n%s", want, count, data)
+		}
 	}
 }
 
