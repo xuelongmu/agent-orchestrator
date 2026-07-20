@@ -56,7 +56,7 @@ func (p *Plugin) Manifest() adapters.Manifest {
 
 // GetLaunchCommand builds the argv to start an interactive Aider session:
 //
-//	aider [permission flags] --no-check-update --no-stream --no-pretty [--read <context file>]
+//	aider [permission flags] --no-check-update --no-stream --no-pretty --no-gitignore [--read <context file>]
 //
 // Prompted tasks are delivered after startup by the session manager rather than
 // via `-m`. Aider's `-m <prompt>` mode is one-shot: it runs the message and then
@@ -66,7 +66,8 @@ func (p *Plugin) Manifest() adapters.Manifest {
 // supplied with --read as read-only context so the agent can see the standing
 // instructions, but this is context fallback rather than system-message
 // replacement. The --no-check-update --no-stream --no-pretty flags keep the
-// terminal output stable in AO's captured-output context.
+// terminal output stable in AO's captured-output context, while --no-gitignore
+// prevents Aider from prompting to add its files to the worktree's .gitignore.
 func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (cmd []string, err error) {
 	binary, err := p.aiderBinary(ctx)
 	if err != nil {
@@ -75,7 +76,7 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 
 	cmd = []string{binary}
 	appendApprovalFlags(&cmd, cfg.Permissions)
-	cmd = append(cmd, "--no-check-update", "--no-stream", "--no-pretty")
+	cmd = append(cmd, "--no-check-update", "--no-stream", "--no-pretty", "--no-gitignore")
 	if cfg.SystemPromptFile != "" {
 		cmd = append(cmd, "--read", cfg.SystemPromptFile)
 	}

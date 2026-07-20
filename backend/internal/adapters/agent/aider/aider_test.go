@@ -58,7 +58,7 @@ func TestGetLaunchCommandOmitsPromptForInteractiveDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := []string{"aider", "--no-check-update", "--no-stream", "--no-pretty"}
+	want := []string{"aider", "--no-check-update", "--no-stream", "--no-pretty", "--no-gitignore"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("unexpected command\nwant: %#v\n got: %#v", want, cmd)
 	}
@@ -76,7 +76,7 @@ func TestGetLaunchCommandOmitsPromptFlagWhenEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := []string{"aider", "--no-check-update", "--no-stream", "--no-pretty"}
+	want := []string{"aider", "--no-check-update", "--no-stream", "--no-pretty", "--no-gitignore"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("cmd = %#v, want %#v", cmd, want)
 	}
@@ -87,14 +87,14 @@ func TestGetLaunchCommandOmitsPromptFlagWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestGetLaunchCommandAlwaysAppendsStableOutputFlags(t *testing.T) {
+func TestGetLaunchCommandAlwaysAppendsStableFlags(t *testing.T) {
 	p := &Plugin{resolvedBinary: "aider"}
 	cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{Prompt: "do the thing"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for _, want := range []string{"--no-check-update", "--no-stream", "--no-pretty"} {
+	for _, want := range []string{"--no-check-update", "--no-stream", "--no-pretty", "--no-gitignore"} {
 		found := false
 		for _, arg := range cmd {
 			if arg == want {
@@ -103,7 +103,7 @@ func TestGetLaunchCommandAlwaysAppendsStableOutputFlags(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Fatalf("cmd = %#v missing stable output flag %q", cmd, want)
+			t.Fatalf("cmd = %#v missing stable launch flag %q", cmd, want)
 		}
 	}
 }
@@ -191,7 +191,7 @@ func TestGetLaunchCommandSystemPromptFileUsesReadOnlyContext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := []string{"aider", "--no-check-update", "--no-stream", "--no-pretty", "--read", "/tmp/system.md"}
+	want := []string{"aider", "--no-check-update", "--no-stream", "--no-pretty", "--no-gitignore", "--read", "/tmp/system.md"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("cmd = %#v, want %#v", cmd, want)
 	}
@@ -207,7 +207,7 @@ func TestGetLaunchCommandInlineSystemPromptIsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := []string{"aider", "--no-check-update", "--no-stream", "--no-pretty"}
+	want := []string{"aider", "--no-check-update", "--no-stream", "--no-pretty", "--no-gitignore"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("cmd = %#v, want %#v", cmd, want)
 	}
