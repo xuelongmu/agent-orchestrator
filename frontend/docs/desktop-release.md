@@ -38,17 +38,24 @@ forked. Before the first stable release from a fork:
 
 1. In the fork's Settings > Environments, create `release`, enable required
    reviewers, and choose the operators allowed to approve publishing.
-2. Add these six **repository Actions secrets** (not environment secrets, since
-   the ungated preflight must read them before approval): `CSC_LINK`,
+2. Add these six secrets to the **`release` environment**: `CSC_LINK`,
    `CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`,
-   `APPLE_API_ISSUER`, and `APPLE_SIGNING_IDENTITY`. The workflow fails before
-   any publishing job starts if even one is absent, without printing values.
+   `APPLE_API_ISSUER`, and `APPLE_SIGNING_IDENTITY`. After approval, the
+   protected secret-validation job fails before any publishing starts if even
+   one is absent, without printing values.
 3. Choose an unused stable `X.Y.Z`, stamp it in `frontend/package.json` and
-   `frontend/package-lock.json` through a PR, and run Desktop release from the
-   merged `main` commit (either dispatch it or push `desktop-vX.Y.Z`). Approve
-   the `release` deployment when prompted. The workflow derives its destination
-   from `github.repository`, so the fork publishes only to itself.
-4. Confirm the resulting `vX.Y.Z` release is neither draft nor prerelease and
+   `frontend/package-lock.json` through a PR. From the merged, current default-
+   branch head, either dispatch Desktop release on that branch or push exactly
+   `desktop-vX.Y.Z`. The workflow rejects stale/non-default refs, mismatched
+   tags, and an existing `vX.Y.Z` release (including a draft). It derives its
+   destination from `github.repository`, so the fork publishes only to itself.
+4. Approve the `release` deployment when prompted. Because secret validation,
+   platform publishing, and final feed publishing are separate environment
+   phases, GitHub may request approval again; approve every `release` deployment
+   for the run. Platform assets remain draft until all jobs and feed uploads
+   succeed. If a run leaves a failed draft, deliberately delete that release or
+   choose and stamp a new version before starting a new run.
+5. Confirm the resulting `vX.Y.Z` release is neither draft nor prerelease and
    contains `latest.yml`, `latest-mac.yml`, and `latest-linux.yml`. Inspect each
    feed's `files[].url` entries and confirm every referenced installer is an
    asset on that release, then dispatch Release latest guard and require it to
@@ -122,9 +129,11 @@ Then wait (roughly 30 minutes; macOS notarization dominates):
 gh run watch $run_id -R AgentWrapper/agent-orchestrator --exit-status --interval 60
 ```
 
-The workflow retries transient macOS sign/notary flakes on its own. The
-release publishes as non-draft, non-prerelease automatically (`draft: false`
-in `forge.config.ts`), so it becomes `latest` as soon as publish succeeds.
+The workflow retries transient macOS sign/notary flakes on its own. Every
+platform publishes into a draft; after all platform, alias, and updater-feed
+uploads succeed, the final feed job marks it non-draft, non-prerelease, and
+`latest` in one release update. A failed run therefore never replaces the
+current public stable release.
 
 ### 5. Attach release notes
 
@@ -194,12 +203,12 @@ in `frontend-release.yml`.
 
 ## Signing infrastructure (reference)
 
-macOS signing + notarization is driven by repository Actions secrets consumed by
+macOS signing + notarization is driven by `release` environment secrets consumed by
 `.github/actions/macos-signing-setup`: `CSC_LINK` (base64 `.p12`),
 `CSC_KEY_PASSWORD`, `APPLE_SIGNING_IDENTITY`, and the notarytool API key trio
 `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`. These are
-not inherited by forks; configure all six as described above. The stable
-release preflight requires the complete set before protected publishing jobs
-can start. The in-app auto-updater (`update-electron-app` in `src/main.ts`,
+not inherited by forks; configure all six as described above. Protected secret
+validation requires the complete set before publishing jobs can start. The
+in-app auto-updater (`update-electron-app` in `src/main.ts`,
 active only when `app.isPackaged`) updates installed apps from the Releases
 feed. Windows code-signing is still a follow-up (issue #401).

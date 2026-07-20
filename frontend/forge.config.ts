@@ -148,7 +148,9 @@ const config: ForgeConfig = {
 			config: {
 				repository: parseReleaseRepo(process.env.AO_RELEASE_REPO),
 				prerelease: process.env.AO_RELEASE_PRERELEASE === "true",
-				draft: false,
+				// Stable CI stages every platform in a draft and publishes only after
+				// the feed job succeeds. Unset remains false for nightly/dev callers.
+				draft: process.env.AO_RELEASE_DRAFT === "true",
 			},
 		},
 	],
