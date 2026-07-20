@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const reapGraceSlices = 4
+const (
+	reapPollingPasses = 4
+	reapGraceSlices   = reapPollingPasses + 1
+)
 
 // paneSessionReaper is the process-mutation boundary used by Destroy. Tests
 // inject a recorder so Destroy tests never signal host processes.
@@ -17,42 +20,46 @@ type paneSessionReaper interface {
 	Reap(ctx context.Context, anchors []sessionAnchor, grace time.Duration)
 }
 
-type processTable interface {
-	Identity(ctx context.Context, pid int) (processIdentity, error)
-	Snapshot(ctx context.Context, sessionIDs map[int]struct{}) ([]processIdentity, error)
-}
-
 type processSessionReaper struct {
-	table    processTable
-	signaler processSignaler
-	timeout  time.Duration
-	wait     func(context.Context, time.Duration) bool
+	table   processTable
+	timeout time.Duration
+	wait    func(context.Context, time.Duration) bool
 }
 
-type processSignaler interface {
-	Signal(ctx context.Context, expected processIdentity, signal os.Signal) error
+type processTable interface {
+	Open(ctx context.Context, pid int) (processObservation, error)
+	Snapshot(ctx context.Context, sessionIDs map[int]struct{}) ([]processObservation, error)
 }
 
-type osProcessSignaler struct{}
+// processHandle owns an exact kernel process reference. Signal must deliver
+// through that reference rather than resolving a numeric PID again.
+type processHandle interface {
+	Alive(ctx context.Context) error
+	Signal(ctx context.Context, signal os.Signal) error
+	Close() error
+}
 
-// processIdentity combines the kernel session membership with a platform
-// process-start token. Both are re-read immediately before every signal.
 type processIdentity struct {
 	pid       int
 	sessionID int
 	started   string
 }
 
-type identitySet map[processIdentity]struct{}
-type sessionSet map[int]identitySet
+type processObservation struct {
+	identity processIdentity
+	handle   processHandle
+}
 
-// sessionAnchor records durable evidence gathered while the tmux pane still
-// exists. A later pass only manages the SID while at least one exact member can
-// carry this evidence forward, which bounds both PID and SID reuse.
+type processSet map[processIdentity]processHandle
+type sessionSet map[int]processSet
+type identitySet map[processIdentity]struct{}
+
+// sessionAnchor owns every process handle in members until it is either
+// excluded by tmux survivor verification or transferred to Reap.
 type sessionAnchor struct {
 	pane      paneRef
 	sessionID int
-	members   identitySet
+	members   processSet
 }
 
 type paneRef struct {
@@ -61,22 +68,25 @@ type paneRef struct {
 	pid      int
 }
 
-// Anchor proves that each pane PID is its POSIX session leader, snapshots that
-// session before tmux tears it down, then revalidates the leader. Failed probes
-// only disable the best-effort reap for that pane.
+// Anchor opens exact handles while the tmux pane still exists, snapshots its
+// POSIX session, and retains those handles across kill-session and delivery.
+// Any incomplete platform or process probe disables cleanup for that pane.
 func (r processSessionReaper) Anchor(ctx context.Context, panes []paneRef) []sessionAnchor {
-	leaders := make(map[int]processIdentity)
+	leaders := make(map[int]processObservation)
 	owners := make(map[int]paneRef)
 	leaderOrder := make([]int, 0, len(panes))
 	for _, pane := range safeUniquePanes(panes) {
-		identity, err := r.identity(ctx, pane.pid)
-		if err != nil || identity.pid != pane.pid || identity.sessionID != pane.pid || identity.started == "" {
+		leader, err := r.open(ctx, pane.pid)
+		if err != nil || !safeIdentity(leader.identity) || leader.identity.pid != pane.pid || leader.identity.sessionID != pane.pid {
+			closeObservation(leader)
 			continue
 		}
-		if _, exists := leaders[pane.pid]; !exists {
+		if old, exists := leaders[pane.pid]; exists {
+			closeObservation(old)
+		} else {
 			leaderOrder = append(leaderOrder, pane.pid)
 		}
-		leaders[pane.pid] = identity
+		leaders[pane.pid] = leader
 		owners[pane.pid] = pane
 	}
 	if len(leaders) == 0 {
@@ -89,47 +99,54 @@ func (r processSessionReaper) Anchor(ctx context.Context, panes []paneRef) []ses
 	}
 	snapshot, err := r.snapshot(ctx, wanted)
 	if err != nil {
+		closeObservations(snapshot)
+		closeObservationMap(leaders)
 		return nil
 	}
-	members := make(sessionSet, len(leaders))
-	for _, process := range snapshot {
-		if _, ok := wanted[process.sessionID]; !ok || !safeIdentity(process) {
-			continue
-		}
-		if members[process.sessionID] == nil {
-			members[process.sessionID] = make(identitySet)
-		}
-		members[process.sessionID][process] = struct{}{}
-	}
-
+	members := observationsBySession(snapshot)
 	anchors := make([]sessionAnchor, 0, len(leaders))
 	for _, sid := range leaderOrder {
 		leader := leaders[sid]
-		if _, present := members[sid][leader]; !present {
+		set := members[sid]
+		snapshotLeader, present := set[leader.identity]
+		if !present || r.alive(ctx, leader.handle) != nil {
 			continue
 		}
-		current, err := r.identity(ctx, leader.pid)
-		if err != nil || current != leader {
-			continue
-		}
-		anchors = append(anchors, sessionAnchor{pane: owners[sid], sessionID: sid, members: members[sid]})
+		_ = snapshotLeader.Close()
+		set[leader.identity] = leader.handle
+		leader.handle = nil
+		delete(leaders, sid)
+		delete(members, sid)
+		anchors = append(anchors, sessionAnchor{pane: owners[sid], sessionID: sid, members: set})
 	}
+	closeObservationMap(leaders)
+	closeSessionSet(members)
 	return anchors
 }
 
-// Reap terminates anchored pane descendants. Cleanup deliberately outlives
-// caller cancellation once kill-session has run, but remains bounded. The grace
-// budget is split across four observations. Each snapshot and identity probe
-// receives its own timeout; the grace interval never consumes their budgets.
-// A child first seen in the final observation still gets one bounded slice
-// before the exact-handle KILL pass.
+// Reap uses four grace observations plus one final observation after the
+// fourth wait. The five waits share the requested grace, so a child appearing
+// in the last polling interval is TERM-ed, receives bounded grace, and is then
+// escalated. Every snapshot receives its own timeout. Exact handles remain open
+// from observation through all delivery attempts and are closed on return.
 func (r processSessionReaper) Reap(ctx context.Context, anchors []sessionAnchor, grace time.Duration) {
 	trusted := make(sessionSet, len(anchors))
-	for _, anchor := range anchors {
+	for i := range anchors {
+		anchor := &anchors[i]
 		if anchor.sessionID > 1 && len(anchor.members) > 0 {
-			trusted[anchor.sessionID] = cloneIdentitySet(anchor.members)
+			if _, duplicate := trusted[anchor.sessionID]; duplicate {
+				closeProcessSet(anchor.members)
+				anchor.members = nil
+				continue
+			}
+			trusted[anchor.sessionID] = anchor.members
+			anchor.members = nil
+		} else {
+			closeProcessSet(anchor.members)
+			anchor.members = nil
 		}
 	}
+	defer closeSessionSet(trusted)
 	if len(trusted) == 0 {
 		return
 	}
@@ -137,112 +154,146 @@ func (r processSessionReaper) Reap(ctx context.Context, anchors []sessionAnchor,
 	cleanupCtx := context.WithoutCancel(ctx)
 	termed := make(identitySet)
 	termOrder := make([]processIdentity, 0)
-	for pass := 0; pass < reapGraceSlices; pass++ {
-		snapshot, snapshotErr := r.snapshot(cleanupCtx, sessionIDs(trusted))
-		if snapshotErr != nil {
-			return
-		}
-		termOrder = r.termNew(cleanupCtx, snapshot, trusted, termed, termOrder)
-		if len(trusted) == 0 {
+	for pass := 0; pass < reapPollingPasses; pass++ {
+		if !r.observeAndTerm(cleanupCtx, trusted, termed, &termOrder) {
 			return
 		}
 		if !r.wait(cleanupCtx, graceSlice(grace, pass)) {
 			return
 		}
 	}
-	for _, process := range termOrder {
-		if _, ok := trusted[process.sessionID][process]; ok {
-			_ = r.signalExact(cleanupCtx, process, syscall.SIGKILL)
+	// This observation closes the old tail hole: it runs after the fourth
+	// grace wait, not before it.
+	if !r.observeAndTerm(cleanupCtx, trusted, termed, &termOrder) {
+		return
+	}
+	if !r.wait(cleanupCtx, graceSlice(grace, reapGraceSlices-1)) {
+		return
+	}
+	for _, identity := range termOrder {
+		if handle := trusted[identity.sessionID][identity]; handle != nil {
+			_ = r.signal(cleanupCtx, handle, syscall.SIGKILL)
 		}
 	}
 }
 
-// termNew advances continuity one snapshot at a time. A previously trusted
-// exact identity must still exist for a session to stay active. Newly observed
-// members are only trusted after that witness and the target have both been
-// revalidated immediately before TERM.
-func (r processSessionReaper) termNew(
+func (r processSessionReaper) observeAndTerm(
 	ctx context.Context,
-	snapshot []processIdentity,
 	trusted sessionSet,
 	termed identitySet,
-	termOrder []processIdentity,
-) []processIdentity {
-	bySession := groupProcesses(snapshot)
+	termOrder *[]processIdentity,
+) bool {
+	snapshot, err := r.snapshot(ctx, sessionIDs(trusted))
+	if err != nil {
+		closeObservations(snapshot)
+		return false
+	}
+	defer closeObservations(snapshot)
+	current := groupObservations(snapshot)
 	for sid, prior := range trusted {
-		witness, ok := stableWitness(bySession[sid], prior)
-		if !ok || !r.matches(ctx, witness) {
+		witness, ok := stableWitness(current[sid], prior)
+		if !ok || r.alive(ctx, prior[witness]) != nil {
+			closeProcessSet(prior)
 			delete(trusted, sid)
 			continue
 		}
-		for _, process := range bySession[sid] {
-			if _, done := termed[process]; done {
+		for _, observation := range current[sid] {
+			identity := observation.identity
+			if _, done := termed[identity]; done {
 				continue
 			}
-			if _, known := prior[process]; !known && !r.matches(ctx, witness) {
-				delete(trusted, sid)
-				break
+			handle, known := prior[identity]
+			if !known {
+				if r.alive(ctx, prior[witness]) != nil {
+					closeProcessSet(prior)
+					delete(trusted, sid)
+					break
+				}
+				handle = observation.handle
 			}
-			if r.signalExact(ctx, process, syscall.SIGTERM) != nil {
+			if r.signal(ctx, handle, syscall.SIGTERM) != nil {
 				continue
 			}
-			prior[process] = struct{}{}
-			termed[process] = struct{}{}
-			termOrder = append(termOrder, process)
+			if !known {
+				prior[identity] = handle
+				observation.handle = nil
+			}
+			termed[identity] = struct{}{}
+			*termOrder = append(*termOrder, identity)
 		}
 	}
-	return termOrder
+	return len(trusted) > 0
 }
 
-func (r processSessionReaper) matches(ctx context.Context, expected processIdentity) bool {
-	if !safeIdentity(expected) {
-		return false
-	}
-	current, err := r.identity(ctx, expected.pid)
-	return err == nil && current == expected
-}
-
-func (r processSessionReaper) signalExact(ctx context.Context, expected processIdentity, signal os.Signal) error {
-	if !safeIdentity(expected) {
-		return fmt.Errorf("unsafe process identity")
-	}
-	if !r.matches(ctx, expected) {
-		return fmt.Errorf("process identity changed")
-	}
+func (r processSessionReaper) open(ctx context.Context, pid int) (processObservation, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	return r.signaler.Signal(probeCtx, expected, signal)
+	return r.table.Open(probeCtx, pid)
 }
 
-func (r processSessionReaper) identity(ctx context.Context, pid int) (processIdentity, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, r.timeout)
-	defer cancel()
-	return r.table.Identity(probeCtx, pid)
-}
-
-func (r processSessionReaper) snapshot(ctx context.Context, wanted map[int]struct{}) ([]processIdentity, error) {
+func (r processSessionReaper) snapshot(ctx context.Context, wanted map[int]struct{}) ([]processObservation, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 	return r.table.Snapshot(probeCtx, wanted)
 }
 
-func stableWitness(current []processIdentity, trusted identitySet) (processIdentity, bool) {
-	for _, process := range current {
-		if _, ok := trusted[process]; ok {
-			return process, true
+func (r processSessionReaper) alive(ctx context.Context, handle processHandle) error {
+	if handle == nil {
+		return fmt.Errorf("missing process handle")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	return handle.Alive(probeCtx)
+}
+
+func (r processSessionReaper) signal(ctx context.Context, handle processHandle, signal os.Signal) error {
+	if handle == nil {
+		return fmt.Errorf("missing process handle")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	return handle.Signal(probeCtx, signal)
+}
+
+func stableWitness(current []*processObservation, trusted processSet) (processIdentity, bool) {
+	for _, observation := range current {
+		if _, ok := trusted[observation.identity]; ok {
+			return observation.identity, true
 		}
 	}
 	return processIdentity{}, false
 }
 
-func groupProcesses(processes []processIdentity) map[int][]processIdentity {
-	grouped := make(map[int][]processIdentity)
-	for _, process := range processes {
-		if safeIdentity(process) {
-			grouped[process.sessionID] = append(grouped[process.sessionID], process)
+func groupObservations(processes []processObservation) map[int][]*processObservation {
+	grouped := make(map[int][]*processObservation)
+	for i := range processes {
+		observation := &processes[i]
+		if safeIdentity(observation.identity) && observation.handle != nil {
+			grouped[observation.identity.sessionID] = append(grouped[observation.identity.sessionID], observation)
 		}
 	}
 	return grouped
+}
+
+func observationsBySession(processes []processObservation) sessionSet {
+	sets := make(sessionSet)
+	for i := range processes {
+		observation := &processes[i]
+		identity := observation.identity
+		if !safeIdentity(identity) || observation.handle == nil {
+			continue
+		}
+		if sets[identity.sessionID] == nil {
+			sets[identity.sessionID] = make(processSet)
+		}
+		if _, duplicate := sets[identity.sessionID][identity]; duplicate {
+			continue
+		}
+		sets[identity.sessionID][identity] = observation.handle
+		observation.handle = nil
+	}
+	closeObservations(processes)
+	return sets
 }
 
 func safeIdentity(process processIdentity) bool {
@@ -273,12 +324,49 @@ func sessionIDs(values sessionSet) map[int]struct{} {
 	return set
 }
 
-func cloneIdentitySet(source identitySet) identitySet {
-	clone := make(identitySet, len(source))
-	for identity := range source {
-		clone[identity] = struct{}{}
+func closeAnchors(anchors []sessionAnchor) {
+	for i := range anchors {
+		closeProcessSet(anchors[i].members)
+		anchors[i].members = nil
 	}
-	return clone
+}
+
+func closeSessionSet(sessions sessionSet) {
+	for sid, set := range sessions {
+		closeProcessSet(set)
+		delete(sessions, sid)
+	}
+}
+
+func closeProcessSet(set processSet) {
+	for identity, handle := range set {
+		if handle != nil {
+			_ = handle.Close()
+		}
+		delete(set, identity)
+	}
+}
+
+func closeObservation(observation processObservation) {
+	if observation.handle != nil {
+		_ = observation.handle.Close()
+	}
+}
+
+func closeObservations(observations []processObservation) {
+	for i := range observations {
+		if observations[i].handle != nil {
+			_ = observations[i].handle.Close()
+			observations[i].handle = nil
+		}
+	}
+}
+
+func closeObservationMap(observations map[int]processObservation) {
+	for pid, observation := range observations {
+		closeObservation(observation)
+		delete(observations, pid)
+	}
 }
 
 func graceSlice(grace time.Duration, pass int) time.Duration {

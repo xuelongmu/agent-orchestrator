@@ -75,11 +75,11 @@ func listPaneRefsArgs(id string) []string {
 	}
 }
 
-// listAllWindowIDsArgs is used after kill-session. A window linked anywhere
-// else survives the teardown and remains owned by tmux, so its process anchor
-// must be excluded from best-effort reaping.
-func listAllWindowIDsArgs() []string {
-	return []string{"list-panes", "-a", "-F", "#{window_id}"}
+// listAllPaneRefsArgs is used after kill-session. A stable pane can move to a
+// different window via break/join/move-pane, while an original window can
+// survive via links. Either surviving object excludes its process anchor.
+func listAllPaneRefsArgs() []string {
+	return []string{"list-panes", "-a", "-F", "#{pane_id}\t#{window_id}"}
 }
 
 // sendKeysLiteralArgs builds args for `tmux send-keys -t <id> -l <chunk>`.

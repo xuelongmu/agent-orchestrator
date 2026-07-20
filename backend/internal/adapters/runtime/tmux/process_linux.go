@@ -13,16 +13,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// platformProcessIdentity combines the kernel SID with /proc's start-time
-// tick. The latter is the kernel process generation, not ps's second-resolution
-// rendered timestamp.
-func platformProcessIdentity(pid int) (processIdentity, error) {
+type linuxProcessHandle struct {
+	fd     int
+	closed bool
+}
+
+// platformOpenProcess opens the pidfd before reading any numeric-PID metadata
+// and returns that exact fd to the caller. The fd remains the delivery target;
+// /proc starttime is descriptive continuity metadata, never a signal authority.
+func platformOpenProcess(pid int) (processObservation, error) {
 	fd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {
-		return processIdentity{}, fmt.Errorf("open pidfd for %d: %w", pid, err)
+		return processObservation{}, fmt.Errorf("open pidfd for %d: %w", pid, err)
 	}
-	defer func() { _ = unix.Close(fd) }()
-	return linuxIdentityWithPIDFD(pid, fd)
+	identity, err := linuxIdentityWithPIDFD(pid, fd)
+	if err != nil {
+		_ = unix.Close(fd)
+		return processObservation{}, err
+	}
+	return processObservation{identity: identity, handle: &linuxProcessHandle{fd: fd}}, nil
 }
 
 func linuxIdentityWithPIDFD(pid, fd int) (processIdentity, error) {
@@ -54,30 +63,38 @@ func linuxIdentityWithPIDFD(pid, fd int) (processIdentity, error) {
 	return processIdentity{pid: pid, sessionID: sid, started: fields[19]}, nil
 }
 
-// Signal binds delivery to a pidfd, making PID reuse between validation and
-// delivery harmless: the kernel signals only the retained process generation.
-func (osProcessSignaler) Signal(ctx context.Context, expected processIdentity, signal os.Signal) error {
+func (h *linuxProcessHandle) Alive(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	fd, err := unix.PidfdOpen(expected.pid, 0)
-	if err != nil {
-		return err
+	if h == nil || h.closed || h.fd < 0 {
+		return fmt.Errorf("process handle is closed")
 	}
-	defer func() { _ = unix.Close(fd) }()
-	current, err := linuxIdentityWithPIDFD(expected.pid, fd)
-	if err != nil {
-		return err
-	}
-	if current != expected {
-		return fmt.Errorf("process identity changed")
-	}
+	return unix.PidfdSendSignal(h.fd, 0, nil, 0)
+}
+
+// Signal delivers through the retained pidfd, so numeric PID reuse after
+// discovery cannot redirect the signal to another process.
+func (h *linuxProcessHandle) Signal(ctx context.Context, signal os.Signal) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if h == nil || h.closed || h.fd < 0 {
+		return fmt.Errorf("process handle is closed")
 	}
 	sig, ok := signal.(syscall.Signal)
 	if !ok {
 		return fmt.Errorf("unsupported signal %T", signal)
 	}
-	return unix.PidfdSendSignal(fd, sig, nil, 0)
+	return unix.PidfdSendSignal(h.fd, sig, nil, 0)
+}
+
+func (h *linuxProcessHandle) Close() error {
+	if h == nil || h.closed {
+		return nil
+	}
+	h.closed = true
+	fd := h.fd
+	h.fd = -1
+	return unix.Close(fd)
 }

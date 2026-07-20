@@ -123,10 +123,9 @@ func New(opts Options) *Runtime {
 		reapGrace:  reapGrace,
 		runner:     processRunner,
 		sessionReaper: processSessionReaper{
-			table:    processes,
-			signaler: osProcessSignaler{},
-			timeout:  timeout,
-			wait:     waitContext,
+			table:   processes,
+			timeout: timeout,
+			wait:    waitContext,
 		},
 	}
 }
@@ -222,6 +221,7 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 		// Do not reap after an unexpected failure. The tmux session may still
 		// be alive, so signaling its anchored processes would destroy a session
 		// that Destroy failed to tear down.
+		closeAnchors(anchors)
 		return fmt.Errorf("tmux runtime: destroy session %s: %w", id, err)
 	}
 	r.reapAfterSurvivorCheck(ctx, anchors)
@@ -283,6 +283,8 @@ func revalidatedPaneAnchors(anchors []sessionAnchor, panes []paneRef) []sessionA
 	for _, anchor := range anchors {
 		if _, ok := live[anchor.pane]; ok {
 			verified = append(verified, anchor)
+		} else {
+			closeProcessSet(anchor.members)
 		}
 	}
 	return verified
@@ -297,25 +299,51 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 	}
 	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.timeout)
 	defer cancel()
-	out, err := r.run(probeCtx, listAllWindowIDsArgs()...)
+	out, err := r.run(probeCtx, listAllPaneRefsArgs()...)
 	if err != nil && !serverMissingOutput(string(out)) {
+		closeAnchors(anchors)
 		return
 	}
-	surviving := make(map[string]struct{})
+	survivingPanes := make(map[string]struct{})
+	survivingWindows := make(map[string]struct{})
 	if err == nil {
-		for _, windowID := range strings.Fields(string(out)) {
-			surviving[windowID] = struct{}{}
+		var reliable bool
+		survivingPanes, survivingWindows, reliable = parseSurvivingTmuxObjects(out)
+		if !reliable {
+			closeAnchors(anchors)
+			return
 		}
 	}
 	verified := make([]sessionAnchor, 0, len(anchors))
 	for _, anchor := range anchors {
-		if _, survives := surviving[anchor.pane.windowID]; !survives {
+		_, paneSurvives := survivingPanes[anchor.pane.paneID]
+		_, windowSurvives := survivingWindows[anchor.pane.windowID]
+		if !paneSurvives && !windowSurvives {
 			verified = append(verified, anchor)
+		} else {
+			closeProcessSet(anchor.members)
 		}
 	}
 	if len(verified) > 0 {
 		r.sessionReaper.Reap(ctx, verified, r.reapGrace)
 	}
+}
+
+func parseSurvivingTmuxObjects(out []byte) (map[string]struct{}, map[string]struct{}, bool) {
+	panes := make(map[string]struct{})
+	windows := make(map[string]struct{})
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] == "" || fields[1] == "" {
+			return nil, nil, false
+		}
+		panes[fields[0]] = struct{}{}
+		windows[fields[1]] = struct{}{}
+	}
+	return panes, windows, true
 }
 
 // IsAlive reports whether the handle's session still exists via `tmux

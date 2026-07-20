@@ -5,35 +5,27 @@ package tmux
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
-
-	"golang.org/x/sys/unix"
 )
 
-func TestDarwinProcessIdentityUsesNumericGetsidAndStartIdentity(t *testing.T) {
-	ctx := context.Background()
-	pid := os.Getpid()
+func TestDarwinFailsClosedInsteadOfNumericPIDDelivery(t *testing.T) {
 	table := osProcessTable{runner: execRunner{}, timeout: defaultTimeout}
-	identity, err := table.Identity(ctx, pid)
-	if err != nil {
-		t.Fatalf("Identity(%d): %v", pid, err)
+	observation, err := table.Open(context.Background(), os.Getpid())
+	if err == nil {
+		closeObservation(observation)
+		t.Fatal("Open unexpectedly returned a delivery handle; Darwin kill(2) would re-resolve a reusable numeric PID")
 	}
-	wantSID, err := unix.Getsid(pid)
-	if err != nil {
-		t.Fatalf("unix.Getsid(%d): %v", pid, err)
+	if !strings.Contains(err.Error(), "exact process signal handles are unavailable on darwin") {
+		t.Fatalf("Open error = %v, want explicit fail-closed limitation", err)
 	}
-	if identity.pid != pid || identity.sessionID != wantSID || identity.started == "" {
-		t.Fatalf("identity = %#v, want pid=%d sid=%d and a kernel start token", identity, pid, wantSID)
-	}
+}
 
-	snapshot, err := table.Snapshot(ctx, map[int]struct{}{wantSID: {}})
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
+func TestDarwinReuseAtDeliveryHasNoSignalPath(t *testing.T) {
+	// Opening is the only route to process delivery. Refusing it before any
+	// kqueue poll/kill sequence makes a reuse in that former gap signal-free.
+	if observation, err := platformOpenProcess(4242); err == nil {
+		closeObservation(observation)
+		t.Fatal("platformOpenProcess unexpectedly exposed numeric-PID delivery")
 	}
-	for _, process := range snapshot {
-		if process == identity {
-			return
-		}
-	}
-	t.Fatalf("current identity %#v missing from numeric-SID snapshot", identity)
 }

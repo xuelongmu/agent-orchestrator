@@ -13,19 +13,19 @@ type osProcessTable struct {
 	timeout time.Duration
 }
 
-// Identity uses platform kernel APIs for both session membership and the
-// process generation token. It never relies on ps lstart's one-second clock.
-func (table osProcessTable) Identity(ctx context.Context, pid int) (processIdentity, error) {
+// Open retains the strongest platform process handle from discovery through
+// delivery. Callers own the returned handle and must close it.
+func (table osProcessTable) Open(ctx context.Context, pid int) (processObservation, error) {
 	if pid <= 1 {
-		return processIdentity{}, fmt.Errorf("unsafe pid %d", pid)
+		return processObservation{}, fmt.Errorf("unsafe pid %d", pid)
 	}
 	if err := ctx.Err(); err != nil {
-		return processIdentity{}, err
+		return processObservation{}, err
 	}
-	return platformProcessIdentity(pid)
+	return platformOpenProcess(pid)
 }
 
-func (table osProcessTable) Snapshot(ctx context.Context, sessionIDs map[int]struct{}) ([]processIdentity, error) {
+func (table osProcessTable) Snapshot(ctx context.Context, sessionIDs map[int]struct{}) ([]processObservation, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, table.timeout)
 	defer cancel()
 	out, err := table.runner.Run(probeCtx, nil, "ps", "-axo", "pid=")
@@ -35,18 +35,25 @@ func (table osProcessTable) Snapshot(ctx context.Context, sessionIDs map[int]str
 	if err != nil {
 		return nil, err
 	}
-	processes := make([]processIdentity, 0)
+	processes := make([]processObservation, 0)
 	for _, line := range strings.Split(string(out), "\n") {
 		if err := probeCtx.Err(); err != nil {
+			closeObservations(processes)
 			return nil, err
 		}
 		pid, parseErr := strconv.Atoi(strings.TrimSpace(line))
 		if parseErr != nil || pid <= 1 {
 			continue
 		}
-		identity, identityErr := table.Identity(probeCtx, pid)
-		if _, wanted := sessionIDs[identity.sessionID]; identityErr == nil && wanted {
-			processes = append(processes, identity)
+		observation, identityErr := table.Open(probeCtx, pid)
+		if identityErr != nil {
+			closeObservation(observation)
+			continue
+		}
+		if _, wanted := sessionIDs[observation.identity.sessionID]; wanted {
+			processes = append(processes, observation)
+		} else {
+			_ = observation.handle.Close()
 		}
 	}
 	return processes, nil
