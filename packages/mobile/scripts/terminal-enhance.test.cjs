@@ -4,23 +4,20 @@ const { resolve } = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-function loadEnhancement({
-	naturalWidth,
-	naturalHeight,
-	viewportWidth,
-	viewportHeight,
-	bufferType = "normal",
-}) {
+function loadEnhancement({ naturalWidth, naturalHeight, viewportWidth, viewportHeight, bufferType = "normal" }) {
 	const source = readFileSync(resolve(__dirname, "../app/session/[id].tsx"), "utf8");
 	const match = source.match(/const TERMINAL_ENHANCE_JS = `([\s\S]*?)`;\r?\n/);
 	assert.ok(match, "terminal enhancement source was not found");
 
 	const listeners = new Map();
+	let wheelEvents = 0;
 	const root = {
 		offsetWidth: naturalWidth,
 		offsetHeight: naturalHeight,
 		style: {},
-		dispatchEvent() {},
+		dispatchEvent() {
+			wheelEvents++;
+		},
 	};
 	const screen = {
 		offsetWidth: naturalWidth,
@@ -96,7 +93,7 @@ function loadEnhancement({
 	// Initialization timers run eagerly above; gesture timers stay pending so a
 	// synthetic drag does not also become a synthetic long press.
 	context.setTimeout = () => 1;
-	return { listeners, root };
+	return { listeners, root, wheelEvents: () => wheelEvents };
 }
 
 function pinch(listeners, startDistance, endDistance) {
@@ -220,7 +217,7 @@ test("height-only double-tap still returns from overview to cursor-framed pan", 
 });
 
 test("height-only alternate-screen drags pan before routing overshoot to the app", () => {
-	const { listeners, root } = loadEnhancement({
+	const { listeners, root, wheelEvents } = loadEnhancement({
 		naturalWidth: 300,
 		naturalHeight: 1200,
 		viewportWidth: 320,
@@ -230,4 +227,5 @@ test("height-only alternate-screen drags pan before routing overshoot to the app
 
 	assert.equal(dragIsIntercepted(listeners), true);
 	assert.equal(root.style.transform, "translate(0px,-468px) scale(1)");
+	assert.equal(wheelEvents(), 0);
 });
