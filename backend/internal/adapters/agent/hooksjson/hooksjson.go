@@ -12,6 +12,7 @@
 package hooksjson
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -28,6 +29,8 @@ type HookEntry struct {
 	Type    string `json:"type"`
 	Command string `json:"command"`
 	Timeout int    `json:"timeout,omitempty"`
+
+	raw json.RawMessage
 }
 
 // MatcherGroup is a set of hooks sharing one matcher. Matcher is a pointer so it
@@ -36,6 +39,11 @@ type HookEntry struct {
 type MatcherGroup struct {
 	Matcher *string     `json:"matcher,omitempty"`
 	Hooks   []HookEntry `json:"hooks"`
+
+	raw   json.RawMessage
+	valid bool
+
+	matcherChanged bool
 }
 
 // HookSpec describes one hook AO installs: the native event it attaches to, its
@@ -82,6 +90,9 @@ func (m Manager) Install(ctx context.Context, workspacePath string) error {
 	if err != nil {
 		return fmt.Errorf("%s.GetAgentHooks: %w", m.Label, err)
 	}
+	if err := m.normalizeLegacyEvents(rawHooks); err != nil {
+		return fmt.Errorf("%s.GetAgentHooks: %w", m.Label, err)
+	}
 
 	for event, specs := range m.groupByEvent() {
 		var groups []MatcherGroup
@@ -89,10 +100,8 @@ func (m Manager) Install(ctx context.Context, workspacePath string) error {
 			return fmt.Errorf("%s.GetAgentHooks: %w", m.Label, err)
 		}
 		for _, spec := range specs {
-			if !commandExists(groups, spec.Command) {
-				entry := HookEntry{Type: "command", Command: spec.Command, Timeout: m.Timeout}
-				groups = addHook(groups, entry, spec.Matcher)
-			}
+			entry := HookEntry{Type: "command", Command: spec.Command, Timeout: m.Timeout}
+			groups = ensureHookMatcher(groups, entry, spec.Matcher)
 		}
 		if err := marshalEvent(rawHooks, event, groups); err != nil {
 			return fmt.Errorf("%s.GetAgentHooks: %w", m.Label, err)
@@ -132,6 +141,7 @@ func (m Manager) Uninstall(ctx context.Context, workspacePath string) error {
 		if err := parseEvent(rawHooks, event, &groups); err != nil {
 			return fmt.Errorf("%s.UninstallHooks: %w", m.Label, err)
 		}
+		normalizeLegacyGroups(groups, m.legacyMatcher(event), m.CommandPrefix)
 		groups = removeManaged(groups, m.CommandPrefix)
 		if err := marshalEvent(rawHooks, event, groups); err != nil {
 			return fmt.Errorf("%s.UninstallHooks: %w", m.Label, err)
@@ -168,6 +178,7 @@ func (m Manager) AreInstalled(ctx context.Context, workspacePath string) (bool, 
 		if err := parseEvent(rawHooks, event, &groups); err != nil {
 			return false, fmt.Errorf("%s.AreHooksInstalled: %w", m.Label, err)
 		}
+		normalizeLegacyGroups(groups, m.legacyMatcher(event), m.CommandPrefix)
 		for _, group := range groups {
 			for _, hook := range group.Hooks {
 				if strings.HasPrefix(hook.Command, m.CommandPrefix) {
@@ -202,6 +213,20 @@ func (m Manager) managedEvents() []string {
 	return events
 }
 
+// legacyMatcher returns the matcher used when wrapping a bare command for an
+// event. A configured matcher takes precedence (notably SessionStart's
+// "startup"); events without one use the legacy format's empty matcher.
+func (m Manager) legacyMatcher(event string) *string {
+	matcher := ""
+	for _, spec := range m.Managed {
+		if spec.Event == event && spec.Matcher != nil {
+			matcher = *spec.Matcher
+			break
+		}
+	}
+	return &matcher
+}
+
 // readHooksFile loads the file into a top-level raw map plus the decoded "hooks"
 // sub-map, preserving every key AO doesn't manage. A missing or empty file
 // yields empty maps.
@@ -225,6 +250,9 @@ func readHooksFile(hooksPath string) (topLevel, rawHooks map[string]json.RawMess
 	if hooksRaw, ok := topLevel["hooks"]; ok {
 		if err := json.Unmarshal(hooksRaw, &rawHooks); err != nil {
 			return nil, nil, fmt.Errorf("parse hooks in %s: %w", hooksPath, err)
+		}
+		if rawHooks == nil {
+			rawHooks = map[string]json.RawMessage{}
 		}
 	}
 	return topLevel, rawHooks, nil
@@ -262,10 +290,46 @@ func parseEvent(rawHooks map[string]json.RawMessage, event string, target *[]Mat
 	if !ok {
 		return nil
 	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return fmt.Errorf("parse %s hooks: expected array", event)
+	}
 	if err := json.Unmarshal(data, target); err != nil {
 		return fmt.Errorf("parse %s hooks: %w", event, err)
 	}
 	return nil
+}
+
+// normalizeLegacyEvents repairs AO-owned bare command entries in every valid
+// event array, not just events AO manages. User commands and malformed event
+// values stay opaque; a managed malformed event will still produce a normal
+// parse error when AO attempts to install its hook into that event.
+func (m Manager) normalizeLegacyEvents(rawHooks map[string]json.RawMessage) error {
+	for event, data := range rawHooks {
+		trimmed := bytes.TrimSpace(data)
+		if len(trimmed) == 0 || trimmed[0] != '[' {
+			continue
+		}
+		var groups []MatcherGroup
+		if err := json.Unmarshal(data, &groups); err != nil {
+			continue
+		}
+		changed := normalizeLegacyGroups(groups, m.legacyMatcher(event), m.CommandPrefix)
+		if changed {
+			if err := marshalEvent(rawHooks, event, groups); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeLegacyGroups(groups []MatcherGroup, matcher *string, commandPrefix string) bool {
+	changed := false
+	for i := range groups {
+		changed = groups[i].normalizeLegacyCommand(matcher, commandPrefix) || changed
+	}
+	return changed
 }
 
 func marshalEvent(rawHooks map[string]json.RawMessage, event string, groups []MatcherGroup) error {
@@ -281,27 +345,85 @@ func marshalEvent(rawHooks map[string]json.RawMessage, event string, groups []Ma
 	return nil
 }
 
-func commandExists(groups []MatcherGroup, command string) bool {
-	for _, group := range groups {
-		for _, hook := range group.Hooks {
-			if hook.Command == command {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // addHook appends hook to the group with a matching matcher, creating that group
 // if none matches.
 func addHook(groups []MatcherGroup, hook HookEntry, matcher *string) []MatcherGroup {
 	for i, group := range groups {
-		if matchersEqual(group.Matcher, matcher) {
+		if group.isMatcherGroup() && matchersEqual(group.Matcher, matcher) {
 			groups[i].Hooks = append(groups[i].Hooks, hook)
 			return groups
 		}
 	}
-	return append(groups, MatcherGroup{Matcher: matcher, Hooks: []HookEntry{hook}})
+	return append(groups, MatcherGroup{Matcher: matcher, Hooks: []HookEntry{hook}, valid: true})
+}
+
+// ensureHookMatcher keeps an existing managed command when it is already under
+// the configured matcher. If it exists under another matcher (including a
+// normalized legacy bare command's empty matcher), it moves that entry rather
+// than duplicating it, retaining any unknown fields on the original entry.
+func ensureHookMatcher(groups []MatcherGroup, hook HookEntry, matcher *string) []MatcherGroup {
+	canonicalGroup, canonicalHook := -1, -1
+	canonicalMatches := false
+	for groupIndex, group := range groups {
+		if !group.isMatcherGroup() {
+			continue
+		}
+		for hookIndex, existing := range group.Hooks {
+			if existing.Command != hook.Command {
+				continue
+			}
+			matches := matchersEqual(group.Matcher, matcher)
+			if canonicalGroup == -1 || matches && !canonicalMatches {
+				canonicalGroup, canonicalHook = groupIndex, hookIndex
+				canonicalMatches = matches
+			}
+		}
+	}
+	if canonicalGroup == -1 {
+		return addHook(groups, hook, matcher)
+	}
+
+	canonicalEntry := groups[canonicalGroup].Hooks[canonicalHook]
+	result := make([]MatcherGroup, 0, len(groups))
+	canonicalResultGroup := -1
+	for groupIndex, group := range groups {
+		if !group.isMatcherGroup() {
+			result = append(result, group)
+			continue
+		}
+		kept := make([]HookEntry, 0, len(group.Hooks))
+		for hookIndex, existing := range group.Hooks {
+			if existing.Command != hook.Command || groupIndex == canonicalGroup && hookIndex == canonicalHook {
+				kept = append(kept, existing)
+			}
+		}
+		if len(kept) == 0 {
+			continue
+		}
+		group.Hooks = kept
+		if groupIndex == canonicalGroup {
+			canonicalResultGroup = len(result)
+		}
+		result = append(result, group)
+	}
+
+	if canonicalMatches {
+		return result
+	}
+	if len(result[canonicalResultGroup].Hooks) == 1 {
+		result[canonicalResultGroup].Matcher = matcher
+		result[canonicalResultGroup].matcherChanged = true
+		return result
+	}
+
+	group := &result[canonicalResultGroup]
+	for hookIndex, existing := range group.Hooks {
+		if existing.Command == hook.Command {
+			group.Hooks = append(group.Hooks[:hookIndex], group.Hooks[hookIndex+1:]...)
+			break
+		}
+	}
+	return addHook(result, canonicalEntry, matcher)
 }
 
 // removeManaged strips AO hook entries (matched by command prefix) from every
@@ -310,6 +432,10 @@ func addHook(groups []MatcherGroup, hook HookEntry, matcher *string) []MatcherGr
 func removeManaged(groups []MatcherGroup, prefix string) []MatcherGroup {
 	result := make([]MatcherGroup, 0, len(groups))
 	for _, group := range groups {
+		if !group.isMatcherGroup() {
+			result = append(result, group)
+			continue
+		}
 		kept := make([]HookEntry, 0, len(group.Hooks))
 		for _, hook := range group.Hooks {
 			if !strings.HasPrefix(hook.Command, prefix) {
@@ -329,4 +455,191 @@ func matchersEqual(a, b *string) bool {
 		return a == nil && b == nil
 	}
 	return *a == *b
+}
+
+// UnmarshalJSON retains the original hook entry so fields unknown to AO survive
+// an install. Hook entries are never edited in place: AO either keeps/removes an
+// existing entry or appends a newly constructed one.
+func (h *HookEntry) UnmarshalJSON(data []byte) error {
+	h.Type = ""
+	h.Command = ""
+	h.Timeout = 0
+	h.raw = append(h.raw[:0], data...)
+
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("decode hook entry: %w", err)
+	}
+	if fields == nil {
+		return nil
+	}
+	_ = json.Unmarshal(fields["type"], &h.Type)
+	_ = json.Unmarshal(fields["command"], &h.Command)
+	_ = json.Unmarshal(fields["timeout"], &h.Timeout)
+	return nil
+}
+
+// MarshalJSON returns existing entries verbatim at the JSON-value level. New
+// AO entries have no raw representation and use the public wire fields.
+func (h HookEntry) MarshalJSON() ([]byte, error) {
+	if h.raw != nil {
+		return h.raw, nil
+	}
+	type wire HookEntry
+	return json.Marshal(wire(h))
+}
+
+// UnmarshalJSON distinguishes valid matcher groups from other array values.
+// Invalid and non-command values are retained as opaque JSON rather than being
+// coerced into a zero-value group and subsequently written as {"hooks":null}.
+func (g *MatcherGroup) UnmarshalJSON(data []byte) error {
+	g.Matcher = nil
+	g.Hooks = nil
+	g.raw = append(g.raw[:0], data...)
+	g.valid = false
+	g.matcherChanged = false
+
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("decode matcher group: %w", err)
+	}
+	if fields == nil {
+		return nil
+	}
+	hooksRaw, ok := fields["hooks"]
+	if !ok {
+		return nil
+	}
+	if hooksRaw = bytes.TrimSpace(hooksRaw); len(hooksRaw) == 0 || hooksRaw[0] != '[' {
+		return nil
+	}
+	var hooks []HookEntry
+	if err := json.Unmarshal(hooksRaw, &hooks); err != nil {
+		return fmt.Errorf("decode matcher group hooks: %w", err)
+	}
+
+	var matcher *string
+	if matcherRaw, ok := fields["matcher"]; ok {
+		matcherRaw = bytes.TrimSpace(matcherRaw)
+		if string(matcherRaw) != "null" {
+			if len(matcherRaw) == 0 || matcherRaw[0] != '"' {
+				return nil
+			}
+			var value string
+			if err := json.Unmarshal(matcherRaw, &value); err != nil {
+				return fmt.Errorf("decode matcher group matcher: %w", err)
+			}
+			matcher = &value
+		}
+	}
+	g.Matcher = matcher
+	g.Hooks = hooks
+	g.valid = true
+	return nil
+}
+
+// MarshalJSON overlays the possibly updated hook list on a parsed matcher
+// group, preserving unknown group fields. Opaque invalid values are emitted
+// unchanged; newly created groups use the public wire fields.
+func (g MatcherGroup) MarshalJSON() ([]byte, error) {
+	if !g.valid {
+		if g.raw != nil {
+			return g.raw, nil
+		}
+		return marshalNewMatcherGroup(g)
+	}
+	if g.raw == nil {
+		return marshalNewMatcherGroup(g)
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(g.raw, &fields); err != nil {
+		return nil, err
+	}
+	hooks, err := json.Marshal(g.Hooks)
+	if err != nil {
+		return nil, err
+	}
+	fields["hooks"] = hooks
+	if g.matcherChanged {
+		if g.Matcher == nil {
+			delete(fields, "matcher")
+		} else {
+			matcher, err := json.Marshal(*g.Matcher)
+			if err != nil {
+				return nil, err
+			}
+			fields["matcher"] = matcher
+		}
+	}
+	return json.Marshal(fields)
+}
+
+func marshalNewMatcherGroup(g MatcherGroup) ([]byte, error) {
+	fields := map[string]any{"hooks": g.Hooks}
+	if g.Matcher != nil {
+		fields["matcher"] = *g.Matcher
+	}
+	return json.Marshal(fields)
+}
+
+func (g MatcherGroup) isMatcherGroup() bool {
+	return g.valid || g.raw == nil
+}
+
+// normalizeLegacyCommand wraps an old AO-owned bare command in a matcher group.
+// Its original JSON becomes the group's sole hook entry, so custom fields are
+// retained. User, malformed, and non-command array values remain opaque.
+func (g *MatcherGroup) normalizeLegacyCommand(defaultMatcher *string, commandPrefix string) bool {
+	if g.valid || g.raw == nil {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(g.raw, &fields); err != nil || fields == nil {
+		return false
+	}
+	if _, hasHooks := fields["hooks"]; hasHooks {
+		return false
+	}
+	var hookType, command string
+	if err := json.Unmarshal(fields["type"], &hookType); err != nil || hookType != "command" {
+		return false
+	}
+	if err := json.Unmarshal(fields["command"], &command); err != nil {
+		return false
+	}
+	if !strings.HasPrefix(command, commandPrefix) {
+		return false
+	}
+
+	matcher := ""
+	if defaultMatcher != nil {
+		matcher = *defaultMatcher
+	}
+	if matcherRaw, ok := fields["matcher"]; ok {
+		matcherRaw = bytes.TrimSpace(matcherRaw)
+		if len(matcherRaw) == 0 || matcherRaw[0] != '"' {
+			return false
+		}
+		if err := json.Unmarshal(matcherRaw, &matcher); err != nil {
+			return false
+		}
+	}
+	var hook HookEntry
+	if err := json.Unmarshal(g.raw, &hook); err != nil {
+		return false
+	}
+	g.raw = nil
+	g.Matcher = &matcher
+	g.Hooks = []HookEntry{hook}
+	g.valid = true
+	return true
 }
