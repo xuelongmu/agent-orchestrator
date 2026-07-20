@@ -910,6 +910,29 @@ func TestSubmitManySkipsSupersededRunAndDeliversSiblings(t *testing.T) {
 	}
 }
 
+func TestSubmitManyAcceptsAllSupersededRuns(t *testing.T) {
+	st := &fakeStore{batchRuns: []domain.ReviewRun{
+		{ID: "run-1", SessionID: "mer-1", Status: domain.ReviewRunFailed},
+		{ID: "run-2", SessionID: "mer-1", Status: domain.ReviewRunCancelled},
+	}}
+	reducer := &fakeReducer{outcome: lifecycle.ReviewDeliverySent}
+	svc := New(nil, st, WithLifecycleReducer(reducer))
+
+	runs, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{
+		{RunID: "run-1", Verdict: domain.VerdictApproved},
+		{RunID: "run-2", Verdict: domain.VerdictApproved},
+	})
+	if err != nil {
+		t.Fatalf("SubmitMany: %v", err)
+	}
+	if len(runs) != 0 || reducer.calls != 0 || reducer.batchCalls != 0 {
+		t.Fatalf("all-superseded batch should be an empty no-op: runs=%+v reducer=%+v", runs, reducer)
+	}
+	if _, err := svc.Submit(context.Background(), "mer-1", "run-1", domain.VerdictApproved, "", ""); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("single-run submit error = %v, want ErrInvalid", err)
+	}
+}
+
 func TestSubmitBatchApprovedOnlySendsNothing(t *testing.T) {
 	st := &fakeStore{
 		ok:  true,

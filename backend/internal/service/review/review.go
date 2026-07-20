@@ -241,9 +241,6 @@ func (s *Service) SubmitMany(ctx context.Context, workerID domain.SessionID, rev
 		}
 		runs = append(runs, run)
 	}
-	if len(runs) == 0 {
-		return nil, fmt.Errorf("%w: no submittable review runs in submission", ErrInvalid)
-	}
 	if s.lifecycle == nil {
 		return runs, nil
 	}
