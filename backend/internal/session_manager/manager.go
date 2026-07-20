@@ -115,7 +115,7 @@ type lifecycleRecorder interface {
 	MarkDependencySpawned(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata) (bool, error)
 	PrepareDependencyWorkspace(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, worktrees []domain.SessionWorktreeRecord) (bool, error)
 	MarkDependencyLaunchSucceeded(ctx context.Context, id domain.SessionID, token string) (bool, error)
-	ResetDependencyLaunch(ctx context.Context, id domain.SessionID, token string) (bool, error)
+	ResetDependencyLaunch(ctx context.Context, id domain.SessionID, token string, preserveWorktrees bool) (bool, error)
 	MarkTerminated(ctx context.Context, id domain.SessionID) error
 }
 
@@ -543,7 +543,7 @@ func (m *Manager) launchCreatedSession(ctx context.Context, cfg ports.SpawnConfi
 			return domain.SessionRecord{}, fmt.Errorf("spawn %s: plan dependency workspace: %w", id, planErr)
 		}
 		metadata := domain.SessionMetadata{WorkspaceKind: plannedWorkspace.WorkspaceKind.WithDefault(), Branch: plannedWorkspace.Branch, WorkspacePath: plannedWorkspace.Path, RuntimeHandleID: predictedHandle.ID, Prompt: prompt}
-		prepared, prepareErr := m.lcm.PrepareDependencyWorkspace(ctx, id, promotionToken, metadata, dependencyWorkspaceRows(plannedWorkspaceProject))
+		prepared, prepareErr := m.lcm.PrepareDependencyWorkspace(ctx, id, promotionToken, metadata, dependencyWorkspaceRows(plannedWorkspace, plannedWorkspaceProject))
 		if prepareErr != nil || !prepared {
 			if prepareErr == nil {
 				prepareErr = errors.New("dependency promotion reservation lost or session terminated")
@@ -750,7 +750,7 @@ func (m *Manager) resetPromotedLaunch(id domain.SessionID, token string) error {
 	if err := cleanupCtx.Err(); err != nil {
 		return err
 	}
-	reset, err := m.lcm.ResetDependencyLaunch(cleanupCtx, id, token)
+	reset, err := m.lcm.ResetDependencyLaunch(cleanupCtx, id, token, false)
 	if err != nil {
 		return err
 	}
@@ -1037,8 +1037,17 @@ func (m *Manager) planSessionWorkspace(ctx context.Context, project domain.Proje
 	return info.Root, &info, nil
 }
 
-func dependencyWorkspaceRows(info *ports.WorkspaceProjectInfo) []domain.SessionWorktreeRecord {
+func dependencyWorkspaceRows(root ports.WorkspaceInfo, info *ports.WorkspaceProjectInfo) []domain.SessionWorktreeRecord {
 	if info == nil {
+		if root.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
+			return nil
+		}
+		return []domain.SessionWorktreeRecord{{
+			SessionID: root.SessionID, RepoName: domain.RootWorkspaceRepoName,
+			Branch: root.Branch, WorktreePath: root.Path, State: "active",
+		}}
+	}
+	if len(info.Worktrees) == 0 {
 		return nil
 	}
 	rows := make([]domain.SessionWorktreeRecord, 0, len(info.Worktrees))
@@ -1382,8 +1391,15 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 	} else if ws.Path != "" {
 		if err := m.workspace.Destroy(ctx, ws); err != nil {
 			if errors.Is(err, ports.ErrWorkspaceDirty) {
-				if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
-					m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
+				// A runtime-bound dependency promotion still owns this worktree
+				// inventory. Keep its active root row so recovery can reset the
+				// launch fence without stranding a dirty worktree after it clears
+				// the session-level workspace path. Ordinary killed sessions still
+				// discard shutdown-restore markers to prevent resurrection.
+				if rec.DependencyPromotionToken == "" {
+					if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
+						m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
+					}
 				}
 				if markTerminated {
 					if err := m.lcm.MarkTerminated(ctx, id); err != nil {
@@ -2207,7 +2223,7 @@ func (m *Manager) resetRecoveredDependencyLaunch(observed domain.SessionRecord, 
 			return false, fmt.Errorf("reconcile %s: clean dead dependency agent workspace: %w", latest.ID, err)
 		}
 	}
-	reset, err := m.lcm.ResetDependencyLaunch(cleanupCtx, latest.ID, latest.DependencyPromotionToken)
+	reset, err := m.lcm.ResetDependencyLaunch(cleanupCtx, latest.ID, latest.DependencyPromotionToken, workspacePreserved)
 	if err != nil {
 		return false, fmt.Errorf("reconcile %s: reset dead dependency launch: %w", latest.ID, err)
 	}
@@ -3114,18 +3130,39 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 			continue
 		}
 		ws := workspaceInfo(rec)
-		if ws.Path == "" {
-			m.cleanupSystemPromptDir(rec.ID)
+		inventoryBacked := false
+		rows, workspaceProject, rowErr := m.workspaceProjectRows(ctx, rec)
+		if rowErr != nil {
+			m.logger.Warn("cleanup: workspace rows failed", "sessionID", rec.ID, "error", rowErr)
+			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
 			continue
+		}
+		if workspaceProject {
+			// Dependency recovery may reset the session-level workspace path after
+			// preserving a dirty workspace project. The per-repo inventory remains
+			// the cleanup authority, so consult it before treating an empty root
+			// path as meaning there is nothing left to reclaim.
+			if ws.Path == "" {
+				ws.Path = workspaceProjectRootPath(rows)
+			}
+		} else if ws.Path == "" {
+			var found bool
+			ws, found, rowErr = m.recordedRootWorkspace(ctx, rec)
+			if rowErr != nil {
+				m.logger.Warn("cleanup: workspace inventory failed", "sessionID", rec.ID, "error", rowErr)
+				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
+				continue
+			}
+			if !found {
+				m.cleanupSystemPromptDir(rec.ID)
+				continue
+			}
+			inventoryBacked = true
 		}
 		if h := runtimeHandle(rec.Metadata); h.ID != "" {
 			_ = m.runtime.Destroy(ctx, h) // best effort; usually already gone
 		}
-		if rows, ok, rowErr := m.workspaceProjectRows(ctx, rec); rowErr != nil {
-			m.logger.Warn("cleanup: workspace rows failed", "sessionID", rec.ID, "error", rowErr)
-			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
-			continue
-		} else if ok {
+		if workspaceProject {
 			if _, err := m.destroyWorkspaceProjectRows(ctx, rows); err != nil {
 				if !errors.Is(err, ports.ErrWorkspaceDirty) {
 					m.logger.Warn("cleanup: workspace teardown failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
@@ -3148,11 +3185,47 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 				result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "agent workspace cleanup failed"})
 				continue
 			}
+			if inventoryBacked {
+				if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
+					m.logger.Warn("cleanup: consume workspace inventory failed", "sessionID", rec.ID, "path", ws.Path, "error", err)
+					result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "workspace teardown failed"})
+					continue
+				}
+			}
 		}
 		m.cleanupSystemPromptDir(rec.ID)
 		result.Cleaned = append(result.Cleaned, rec.ID)
 	}
 	return result, nil
+}
+
+func workspaceProjectRootPath(rows []ports.WorkspaceRepoInfo) string {
+	for _, row := range rows {
+		if row.RepoName == domain.RootWorkspaceRepoName {
+			return row.Path
+		}
+	}
+	return ""
+}
+
+// recordedRootWorkspace recovers the single-repo cleanup handle retained in
+// session_worktrees when dependency recovery has reset sessions.workspace_path.
+// Multi-repo inventories are resolved by workspaceProjectRows instead.
+func (m *Manager) recordedRootWorkspace(ctx context.Context, rec domain.SessionRecord) (ports.WorkspaceInfo, bool, error) {
+	rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
+	if err != nil {
+		return ports.WorkspaceInfo{}, false, err
+	}
+	for _, row := range rows {
+		if row.RepoName != domain.RootWorkspaceRepoName || row.WorktreePath == "" {
+			continue
+		}
+		ws := workspaceInfo(rec)
+		ws.Path = row.WorktreePath
+		ws.Branch = firstNonEmptyString(row.Branch, ws.Branch)
+		return ws, true, nil
+	}
+	return ports.WorkspaceInfo{}, false, nil
 }
 
 // cleanupSkipReason renders a workspace teardown refusal as a short

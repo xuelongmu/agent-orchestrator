@@ -346,7 +346,7 @@ func (l *fakeLCM) MarkDependencyLaunchSucceeded(_ context.Context, id domain.Ses
 	l.store.sessions[id] = rec
 	return true, nil
 }
-func (l *fakeLCM) ResetDependencyLaunch(_ context.Context, id domain.SessionID, token string) (bool, error) {
+func (l *fakeLCM) ResetDependencyLaunch(_ context.Context, id domain.SessionID, token string, preserveWorktrees bool) (bool, error) {
 	l.resetCalls++
 	if l.resetErr != nil {
 		return false, l.resetErr
@@ -367,6 +367,9 @@ func (l *fakeLCM) ResetDependencyLaunch(_ context.Context, id domain.SessionID, 
 		rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now().UTC()}
 	}
 	l.store.sessions[id] = rec
+	if !preserveWorktrees {
+		delete(l.store.worktrees, id)
+	}
 	return true, nil
 }
 func (l *fakeLCM) MarkTerminated(_ context.Context, id domain.SessionID) error {
@@ -1574,6 +1577,10 @@ func TestRecoveredDependencyResetRetainsFenceOnBoundaryFailures(t *testing.T) {
 			st.setSession(base)
 			lcm := m.lcm.(*fakeLCM)
 			tc.configure(m, st, rt, ws, lcm)
+			st.worktrees[base.ID] = []domain.SessionWorktreeRecord{{
+				SessionID: base.ID, RepoName: domain.RootWorkspaceRepoName,
+				WorktreePath: base.Metadata.WorkspacePath, State: "active",
+			}}
 			st.mu.RLock()
 			before := st.sessions[base.ID]
 			st.mu.RUnlock()
@@ -1593,6 +1600,9 @@ func TestRecoveredDependencyResetRetainsFenceOnBoundaryFailures(t *testing.T) {
 			}
 			if lcm.resetCalls != tc.wantReset {
 				t.Fatalf("ResetDependencyLaunch calls = %d, want %d", lcm.resetCalls, tc.wantReset)
+			}
+			if rows := st.worktrees[base.ID]; len(rows) != 1 {
+				t.Fatalf("failed or stale reset consumed fenced inventory: %+v", rows)
 			}
 		})
 	}
@@ -3481,11 +3491,90 @@ func TestCleanup_ReportsSkippedWorkspaces(t *testing.T) {
 	}
 }
 
+func TestCleanup_ReclaimsDirtyDependencyWorkspaceFromRecordedInventory(t *testing.T) {
+	m, st, _, ws := newManager()
+	scheduler := &fakeDependencyScheduler{store: st}
+	m.SetDependencyScheduler(scheduler)
+	waiting, err := m.Spawn(ctx, ports.SpawnConfig{
+		ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		WorkspaceKind: domain.WorkspaceKindWorktree, Prompt: "base", DependsOn: []domain.SessionID{"parent"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting.DependencyPromotionToken = "owner"
+	st.setSession(waiting)
+	promoted, err := m.LaunchPromoted(ctx, waiting.ID, "owner", []domain.DependencyHandoff{{SessionID: "parent"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows := st.worktrees[promoted.ID]; len(rows) != 1 || rows[0].RepoName != domain.RootWorkspaceRepoName || rows[0].WorktreePath != promoted.Metadata.WorkspacePath {
+		t.Fatalf("single-repo promotion inventory = %+v, want durable root cleanup row", rows)
+	}
+
+	ws.destroyErr = fmt.Errorf("dirty: %w", ports.ErrWorkspaceDirty)
+	freed, err := m.Kill(ctx, promoted.ID)
+	if err != nil || freed {
+		t.Fatalf("kill dirty promoted dependency = %v, %v; want preserved", freed, err)
+	}
+	if rows := st.worktrees[promoted.ID]; len(rows) != 1 {
+		t.Fatalf("dirty kill lost dependency worktree inventory: %+v", rows)
+	}
+	if err := m.RecoverPromotedDependencyLaunches(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resetRec := st.sessions[promoted.ID]
+	if resetRec.Metadata.WorkspacePath != "" {
+		t.Fatalf("reset workspace path = %q, want empty", resetRec.Metadata.WorkspacePath)
+	}
+	if len(st.worktrees[promoted.ID]) != 1 {
+		t.Fatalf("reset lost worktree inventory: %+v", st.worktrees[promoted.ID])
+	}
+
+	ws.destroyErr = nil // the user made the preserved worktree clean
+	res, err := m.Cleanup(ctx, promoted.ProjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Cleaned) != 1 || res.Cleaned[0] != promoted.ID || len(res.Skipped) != 0 {
+		t.Fatalf("cleanup result = %+v, want recorded workspace reclaimed", res)
+	}
+	if ws.destroyed != 3 {
+		t.Fatalf("workspace destroys = %d, want dirty Kill, recovery, and explicit cleanup", ws.destroyed)
+	}
+	if rows := st.worktrees[promoted.ID]; len(rows) != 0 {
+		t.Fatalf("successful explicit cleanup retained stale inventory: %+v", rows)
+	}
+}
+
 func TestCleanup_WorkspaceProjectDestroysChildrenBeforeRoot(t *testing.T) {
 	m, st, _, ws := newManager()
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/repo/mer", Kind: domain.ProjectKindWorkspace, Config: testRoleAgents()}
 	st.workspaceRepo["mer"] = []domain.WorkspaceRepoRecord{{Name: "api", RelativePath: "api"}}
 	seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1"})
+	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
+		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, Branch: "ao/mer-1", WorktreePath: "/ws/mer-1"},
+		{SessionID: "mer-1", RepoName: "api", Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/api"},
+	}
+
+	res, err := m.Cleanup(ctx, "mer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Cleaned) != 1 || res.Cleaned[0] != "mer-1" {
+		t.Fatalf("cleaned = %v, want mer-1", res.Cleaned)
+	}
+	want := []string{"Destroy:api", "Destroy:__root__"}
+	if got := ws.calls; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("destroy order = %v, want %v", got, want)
+	}
+}
+
+func TestCleanup_WorkspaceProjectUsesInventoryWhenSessionPathWasReset(t *testing.T) {
+	m, st, _, ws := newManager()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/repo/mer", Kind: domain.ProjectKindWorkspace, Config: testRoleAgents()}
+	st.workspaceRepo["mer"] = []domain.WorkspaceRepoRecord{{Name: "api", RelativePath: "api"}}
+	seedTerminal(st, "mer-1", domain.SessionMetadata{Branch: "ao/mer-1"})
 	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
 		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, Branch: "ao/mer-1", WorktreePath: "/ws/mer-1"},
 		{SessionID: "mer-1", RepoName: "api", Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/api"},

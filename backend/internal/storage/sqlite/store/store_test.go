@@ -421,7 +421,7 @@ func TestDependencyLaunchCASLosesToConcurrentTermination(t *testing.T) {
 	if marked, err := s.MarkReservedDependencySpawned(ctx, child.ID, "owner", metadata, time.Now().UTC()); err != nil || marked {
 		t.Fatalf("terminal-losing CAS = %v, %v", marked, err)
 	}
-	if reset, err := s.ResetReservedDependencyLaunch(ctx, child.ID, "owner", time.Now().UTC()); err != nil || !reset {
+	if reset, err := s.ResetReservedDependencyLaunch(ctx, child.ID, "owner", false, time.Now().UTC()); err != nil || !reset {
 		t.Fatalf("terminal cleanup reset = %v, %v", reset, err)
 	}
 	got, _, err := s.GetSession(ctx, child.ID)
@@ -430,6 +430,69 @@ func TestDependencyLaunchCASLosesToConcurrentTermination(t *testing.T) {
 	}
 	if !got.IsTerminated || got.Activity.State != domain.ActivityExited || got.Metadata.RuntimeHandleID != "" || got.Metadata.WorkspacePath != "" || got.Metadata.Prompt != "base" {
 		t.Fatalf("launch CAS resurrected or overwrote terminal child: %#v", got)
+	}
+}
+
+func TestDependencyWorkspaceInventoryFollowsPromotionFence(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ao")
+	parent, err := s.CreateSession(ctx, sampleRecord("ao"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSessionHandoff(ctx, parent.ID, domain.AgentHandoff{ChangedFiles: []string{}, VerificationCommands: []string{}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	childRecord := sampleRecord("ao")
+	childRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID})
+	childRecord.DependencyPreparedAt = childRecord.CreatedAt
+	childRecord.DependencyBasePrompt = "base"
+	childRecord.Metadata = domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, Branch: "ao/child/root", Prompt: "base"}
+	child, err := s.CreateSession(ctx, childRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := s.ReserveDependencyPromotion(ctx, child.ID, "owner", time.Now().UTC()); err != nil || !claimed {
+		t.Fatalf("reserve = %v, %v", claimed, err)
+	}
+	metadata := child.Metadata
+	metadata.WorkspacePath = "/ws/child"
+	metadata.RuntimeHandleID = "runtime"
+	root := domain.SessionWorktreeRecord{
+		SessionID: child.ID, RepoName: domain.RootWorkspaceRepoName,
+		Branch: metadata.Branch, WorktreePath: metadata.WorkspacePath, State: "active",
+	}
+
+	if prepared, err := s.PrepareReservedDependencyWorkspace(ctx, child.ID, "stale", metadata, []domain.SessionWorktreeRecord{root}, time.Now().UTC()); err != nil || prepared {
+		t.Fatalf("stale prepare = %v, %v", prepared, err)
+	}
+	if rows, err := s.ListSessionWorktrees(ctx, child.ID); err != nil || len(rows) != 0 {
+		t.Fatalf("stale prepare wrote inventory: rows=%+v err=%v", rows, err)
+	}
+	if prepared, err := s.PrepareReservedDependencyWorkspace(ctx, child.ID, "owner", metadata, []domain.SessionWorktreeRecord{root}, time.Now().UTC()); err != nil || !prepared {
+		t.Fatalf("owned prepare = %v, %v", prepared, err)
+	}
+	if reset, err := s.ResetReservedDependencyLaunch(ctx, child.ID, "stale", false, time.Now().UTC()); err != nil || reset {
+		t.Fatalf("stale reset = %v, %v", reset, err)
+	}
+	if rows, err := s.ListSessionWorktrees(ctx, child.ID); err != nil || len(rows) != 1 {
+		t.Fatalf("stale reset consumed owned inventory: rows=%+v err=%v", rows, err)
+	}
+	if reset, err := s.ResetReservedDependencyLaunch(ctx, child.ID, "owner", true, time.Now().UTC()); err != nil || !reset {
+		t.Fatalf("dirty owned reset = %v, %v", reset, err)
+	}
+	if rows, err := s.ListSessionWorktrees(ctx, child.ID); err != nil || len(rows) != 1 {
+		t.Fatalf("dirty owned reset lost inventory: rows=%+v err=%v", rows, err)
+	}
+	if prepared, err := s.PrepareReservedDependencyWorkspace(ctx, child.ID, "owner", metadata, []domain.SessionWorktreeRecord{root}, time.Now().UTC()); err != nil || !prepared {
+		t.Fatalf("owned reprepare = %v, %v", prepared, err)
+	}
+	if reset, err := s.ResetReservedDependencyLaunch(ctx, child.ID, "owner", false, time.Now().UTC()); err != nil || !reset {
+		t.Fatalf("clean owned reset = %v, %v", reset, err)
+	}
+	if rows, err := s.ListSessionWorktrees(ctx, child.ID); err != nil || len(rows) != 0 {
+		t.Fatalf("clean owned reset retained inventory: rows=%+v err=%v", rows, err)
 	}
 }
 
