@@ -42,6 +42,11 @@ var readEntryData = os.ReadFile
 // never proof that no detached hosts exist.
 var readAggregateData = os.ReadFile
 
+// readQuarantineDir is replaceable in tests so directory enumeration failures
+// can be covered without changing filesystem ACLs process-wide. A failed
+// enumeration cannot safely prove that no quarantine marker exists.
+var readQuarantineDir = os.ReadDir
+
 // removeEntryFile is replaceable in tests to deterministically interleave a
 // same-session republish with pruning/unregister. Generation-specific paths
 // ensure removing an observed generation can never remove its replacement.
@@ -163,7 +168,11 @@ func readRawFor(dataDir string) (entries []Entry, legacyPath string, migrateLega
 	// A quarantined configured aggregate proves this namespace was initialized.
 	// Do not accidentally import the default store merely because quarantine
 	// moved the configured upgrade artifact out of its active filename.
-	if hasQuarantinedAggregate(path) {
+	hasQuarantine, err := hasQuarantinedAggregate(path)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if hasQuarantine {
 		return entries, "", false, nil
 	}
 
@@ -178,8 +187,14 @@ func readRawFor(dataDir string) (entries []Entry, legacyPath string, migrateLega
 	// A stale quarantine does not override a valid active aggregate recreated by
 	// a downgraded or still-running old daemon. Read the supported active format
 	// first; only fence legacy fallback when that active path remains absent.
-	if _, statErr := os.Stat(legacyPath); errors.Is(statErr, os.ErrNotExist) && hasQuarantinedAggregate(legacyPath) {
-		return entries, "", false, nil
+	if _, statErr := os.Stat(legacyPath); errors.Is(statErr, os.ErrNotExist) {
+		hasQuarantine, quarantineErr := hasQuarantinedAggregate(legacyPath)
+		if quarantineErr != nil {
+			return nil, "", false, quarantineErr
+		}
+		if hasQuarantine {
+			return entries, "", false, nil
+		}
 	}
 	if len(legacy) == 0 {
 		return entries, "", false, nil
@@ -488,7 +503,11 @@ func quarantineAggregate(path string) (string, error) {
 		if err := os.Rename(path, quarantinePath); err == nil {
 			return quarantinePath, nil
 		} else if errors.Is(err, os.ErrNotExist) {
-			if paths := quarantinedAggregatePaths(path); len(paths) > 0 {
+			paths, readErr := quarantinedAggregatePaths(path)
+			if readErr != nil {
+				return "", errors.Join(err, readErr)
+			}
+			if len(paths) > 0 {
 				return paths[0], nil
 			}
 			return "", err
@@ -499,12 +518,15 @@ func quarantineAggregate(path string) (string, error) {
 	return "", fmt.Errorf("ptyregistry: quarantine corrupt aggregate %q: no available quarantine path", path)
 }
 
-func quarantinedAggregatePaths(path string) []string {
+func quarantinedAggregatePaths(path string) ([]string, error) {
 	dir := filepath.Dir(path)
 	prefix := filepath.Base(path) + ".corrupt-"
-	entries, err := os.ReadDir(dir)
+	entries, err := readQuarantineDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("ptyregistry: read quarantine directory %q: %w", dir, err)
 	}
 	paths := make([]string, 0, 1)
 	for _, entry := range entries {
@@ -514,11 +536,12 @@ func quarantinedAggregatePaths(path string) []string {
 		paths = append(paths, filepath.Join(dir, entry.Name()))
 	}
 	sort.Strings(paths)
-	return paths
+	return paths, nil
 }
 
-func hasQuarantinedAggregate(path string) bool {
-	return len(quarantinedAggregatePaths(path)) > 0
+func hasQuarantinedAggregate(path string) (bool, error) {
+	paths, err := quarantinedAggregatePaths(path)
+	return len(paths) > 0, err
 }
 
 // quarantinedAggregateLookupError retains fail-closed recovery for the legacy
@@ -529,7 +552,10 @@ func quarantinedAggregateLookupError(dataDir string) error {
 	if err != nil {
 		return err
 	}
-	paths := quarantinedAggregatePaths(configured)
+	paths, err := quarantinedAggregatePaths(configured)
+	if err != nil {
+		return err
+	}
 	legacy, legacyErr := legacyRegistryFile()
 	if legacyErr != nil {
 		return legacyErr
@@ -540,7 +566,11 @@ func quarantinedAggregateLookupError(dataDir string) error {
 	_, configuredStatErr := os.Stat(configured)
 	configuredActive := configuredStatErr == nil || !errors.Is(configuredStatErr, os.ErrNotExist)
 	if !configuredActive && shouldMigrateLegacy(configured, legacy) && !sameRegistryPath(configured, legacy) {
-		paths = append(paths, quarantinedAggregatePaths(legacy)...)
+		legacyPaths, err := quarantinedAggregatePaths(legacy)
+		if err != nil {
+			return err
+		}
+		paths = append(paths, legacyPaths...)
 	}
 	if len(paths) == 0 {
 		return nil
@@ -677,7 +707,11 @@ func Clear() error {
 	if err != nil {
 		return err
 	}
-	for _, path := range quarantinedAggregatePaths(configured) {
+	configuredQuarantines, err := quarantinedAggregatePaths(configured)
+	if err != nil {
+		return err
+	}
+	for _, path := range configuredQuarantines {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -689,7 +723,11 @@ func Clear() error {
 	if !shouldMigrateLegacy(configured, legacy) {
 		return nil
 	}
-	for _, path := range quarantinedAggregatePaths(legacy) {
+	legacyQuarantines, err := quarantinedAggregatePaths(legacy)
+	if err != nil {
+		return err
+	}
+	for _, path := range legacyQuarantines {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

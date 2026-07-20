@@ -20,6 +20,22 @@ func withFakePidAlive(t *testing.T, fn func(pid int) bool) {
 	t.Cleanup(func() { pidAlive = orig })
 }
 
+func withReadQuarantineDir(t *testing.T, fn func(string) ([]os.DirEntry, error)) {
+	t.Helper()
+	original := readQuarantineDir
+	readQuarantineDir = fn
+	t.Cleanup(func() { readQuarantineDir = original })
+}
+
+func mustQuarantinedAggregatePaths(t *testing.T, path string) []string {
+	t.Helper()
+	paths, err := quarantinedAggregatePaths(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return paths
+}
+
 // setupHome points HOME at a temp dir and returns the expected registry path.
 func setupHome(t *testing.T) string {
 	t.Helper()
@@ -433,7 +449,7 @@ func TestConfiguredAggregateFailuresRetainFence(t *testing.T) {
 				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("corrupt aggregate remained active after quarantine: %v", err)
 				}
-				if paths := quarantinedAggregatePaths(path); len(paths) != 1 {
+				if paths := mustQuarantinedAggregatePaths(t, path); len(paths) != 1 {
 					t.Fatalf("quarantined aggregate paths = %v, want one", paths)
 				}
 			} else {
@@ -662,7 +678,7 @@ func TestListQuarantinesCorruptAggregateAndReturnsHealthyKeyedEntries(t *testing
 	if err != nil || len(got) != 1 || got[0].SessionID != valid.SessionID {
 		t.Fatalf("ListAt = %v, %v; want healthy keyed entry", got, err)
 	}
-	if paths := quarantinedAggregatePaths(aggregatePath); len(paths) != 1 {
+	if paths := mustQuarantinedAggregatePaths(t, aggregatePath); len(paths) != 1 {
 		t.Fatalf("quarantined aggregate paths = %v, want one", paths)
 	}
 	if _, err := LookupAllAt(dataDir, "legacy-only"); err == nil {
@@ -702,7 +718,7 @@ func TestListQuarantinesCorruptMigratingLegacyAlongsideHealthyKeyedEntries(t *te
 	if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("corrupt migrating legacy aggregate remained active: %v", err)
 	}
-	if paths := quarantinedAggregatePaths(legacyPath); len(paths) != 1 {
+	if paths := mustQuarantinedAggregatePaths(t, legacyPath); len(paths) != 1 {
 		t.Fatalf("quarantined legacy aggregate paths = %v, want one", paths)
 	}
 	if _, err := LookupAllAt(dataDir, "legacy-only"); err == nil {
@@ -736,7 +752,7 @@ func TestListNeverAdoptsCorruptAggregateFromAmbiguousNamespace(t *testing.T) {
 	if _, err := os.Stat(defaultAggregate); err != nil {
 		t.Fatalf("isolated namespace mutated ambiguous default aggregate: %v", err)
 	}
-	if paths := quarantinedAggregatePaths(defaultAggregate); len(paths) != 0 {
+	if paths := mustQuarantinedAggregatePaths(t, defaultAggregate); len(paths) != 0 {
 		t.Fatalf("isolated namespace quarantined another owner's aggregate: %v", paths)
 	}
 }
@@ -758,7 +774,7 @@ func TestRecreatedActiveLegacyAggregateWinsOverStaleQuarantine(t *testing.T) {
 	if _, err := ListAt(dataDir); err != nil {
 		t.Fatal(err)
 	}
-	if paths := quarantinedAggregatePaths(legacyPath); len(paths) != 1 {
+	if paths := mustQuarantinedAggregatePaths(t, legacyPath); len(paths) != 1 {
 		t.Fatalf("quarantined legacy paths = %v, want one", paths)
 	}
 	recreated := Entry{SessionID: "recreated", PtyHostPID: 31, PipePath: "127.0.0.1:31", RegisteredAt: nowRFC3339()}
@@ -768,7 +784,7 @@ func TestRecreatedActiveLegacyAggregateWinsOverStaleQuarantine(t *testing.T) {
 	if err != nil || !ok || got.PtyHostPID != recreated.PtyHostPID {
 		t.Fatalf("recreated active legacy lookup = %+v, %v, %v", got, ok, err)
 	}
-	if paths := quarantinedAggregatePaths(legacyPath); len(paths) != 1 {
+	if paths := mustQuarantinedAggregatePaths(t, legacyPath); len(paths) != 1 {
 		t.Fatalf("stale quarantine was unexpectedly removed: %v", paths)
 	}
 }
@@ -826,7 +842,7 @@ func TestNullAggregateIsQuarantinedAndFailsClosed(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0].SessionID != valid.SessionID {
 		t.Fatalf("ListAt = %v, %v; want healthy keyed entry", got, err)
 	}
-	if paths := quarantinedAggregatePaths(aggregatePath); len(paths) != 1 {
+	if paths := mustQuarantinedAggregatePaths(t, aggregatePath); len(paths) != 1 {
 		t.Fatalf("null aggregate quarantine paths = %v, want one", paths)
 	}
 	if _, err := LookupAllAt(dataDir, "legacy-null"); err == nil {
@@ -875,7 +891,7 @@ func TestBracketDataDirQuarantineDiscoveryIsolationAndClear(t *testing.T) {
 			t.Fatalf("List iteration %d = %v, %v", i, got, err)
 		}
 	}
-	if paths := quarantinedAggregatePaths(aggregatePath); len(paths) != 1 {
+	if paths := mustQuarantinedAggregatePaths(t, aggregatePath); len(paths) != 1 {
 		t.Fatalf("literal namespace quarantine paths = %v, want one", paths)
 	}
 	if _, ok, err := Lookup("after-local-corruption"); err == nil || ok {
@@ -885,7 +901,7 @@ func TestBracketDataDirQuarantineDiscoveryIsolationAndClear(t *testing.T) {
 	if err := Clear(); err != nil {
 		t.Fatal(err)
 	}
-	if paths := quarantinedAggregatePaths(aggregatePath); len(paths) != 0 {
+	if paths := mustQuarantinedAggregatePaths(t, aggregatePath); len(paths) != 0 {
 		t.Fatalf("Clear retained literal namespace quarantine: %v", paths)
 	}
 	if _, err := os.Stat(siblingQuarantine); err != nil {
@@ -893,6 +909,138 @@ func TestBracketDataDirQuarantineDiscoveryIsolationAndClear(t *testing.T) {
 	}
 	if _, ok, err := Lookup("after-clear"); err != nil || ok {
 		t.Fatalf("cleared literal namespace remained fenced: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestLookupFailsClosedWhenQuarantineDirectoryIsUnreadable(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AO_RUN_FILE", filepath.Join(dataDir, "running.json"))
+	withFakePidAlive(t, func(int) bool { return true })
+	entry := Entry{SessionID: "healthy", PtyHostPID: 71, PipePath: "127.0.0.1:71", RegisteredAt: nowRFC3339(), Generation: "healthy-generation"}
+	if err := RegisterAt(dataDir, entry); err != nil {
+		t.Fatal(err)
+	}
+	aggregatePath, err := registryFileFor(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantinePath := aggregatePath + ".corrupt-existing"
+	if err := os.WriteFile(quarantinePath, []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	withReadQuarantineDir(t, func(dir string) ([]os.DirEntry, error) {
+		if sameRegistryPath(dir, dataDir) {
+			return nil, os.ErrPermission
+		}
+		return os.ReadDir(dir)
+	})
+
+	got, ok, err := LookupAt(dataDir, entry.SessionID)
+	if err != nil || !ok || got.Generation != entry.Generation {
+		t.Fatalf("healthy keyed lookup = %+v, %v, %v", got, ok, err)
+	}
+	if _, _, err := LookupAt(dataDir, "missing"); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("keyed miss error = %v, want permission error", err)
+	}
+	if _, err := os.Stat(quarantinePath); err != nil {
+		t.Fatalf("lookup mutated unreadable quarantine: %v", err)
+	}
+}
+
+func TestLegacyMigrationFailsClosedWhenQuarantineDirectoryIsUnreadable(t *testing.T) {
+	home := t.TempDir()
+	dataDir := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AO_RUN_FILE", "")
+	legacyPath := filepath.Join(home, ".ao", "windows-pty-hosts.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	quarantinePath := legacyPath + ".corrupt-existing"
+	if err := os.WriteFile(quarantinePath, []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	withReadQuarantineDir(t, func(dir string) ([]os.DirEntry, error) {
+		if sameRegistryPath(dir, filepath.Dir(legacyPath)) {
+			return nil, os.ErrPermission
+		}
+		return os.ReadDir(dir)
+	})
+
+	if _, err := ListAt(dataDir); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("migration error = %v, want permission error", err)
+	}
+	if _, err := os.Stat(quarantinePath); err != nil {
+		t.Fatalf("migration mutated unreadable quarantine: %v", err)
+	}
+}
+
+func TestQuarantineRenameRaceDirectoryReadHandling(t *testing.T) {
+	t.Run("missing directory", func(t *testing.T) {
+		aggregatePath := filepath.Join(t.TempDir(), "missing", "windows-pty-hosts.json")
+		if paths := mustQuarantinedAggregatePaths(t, aggregatePath); len(paths) != 0 {
+			t.Fatalf("missing quarantine directory paths = %v, want none", paths)
+		}
+	})
+
+	t.Run("existing marker", func(t *testing.T) {
+		aggregatePath := filepath.Join(t.TempDir(), "windows-pty-hosts.json")
+		quarantinePath := aggregatePath + ".corrupt-existing"
+		if err := os.WriteFile(quarantinePath, []byte("corrupt"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := quarantineAggregate(aggregatePath)
+		if err != nil || !sameRegistryPath(got, quarantinePath) {
+			t.Fatalf("quarantine rename-race recovery = %q, %v; want %q", got, err, quarantinePath)
+		}
+	})
+
+	t.Run("directory read failure", func(t *testing.T) {
+		aggregatePath := filepath.Join(t.TempDir(), "windows-pty-hosts.json")
+		quarantinePath := aggregatePath + ".corrupt-existing"
+		if err := os.WriteFile(quarantinePath, []byte("corrupt"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		withReadQuarantineDir(t, func(string) ([]os.DirEntry, error) {
+			return nil, os.ErrPermission
+		})
+		if _, err := quarantineAggregate(aggregatePath); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("quarantine rename-race error = %v, want permission error", err)
+		}
+		if _, err := os.Stat(quarantinePath); err != nil {
+			t.Fatalf("rename-race recovery mutated unreadable quarantine: %v", err)
+		}
+	})
+}
+
+func TestClearReturnsQuarantineDirectoryReadFailure(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AO_DATA_DIR", dataDir)
+	t.Setenv("AO_RUN_FILE", filepath.Join(dataDir, "running.json"))
+	aggregatePath, err := registryFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantinePath := aggregatePath + ".corrupt-existing"
+	if err := os.WriteFile(quarantinePath, []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	withReadQuarantineDir(t, func(dir string) ([]os.DirEntry, error) {
+		if sameRegistryPath(dir, dataDir) {
+			return nil, os.ErrPermission
+		}
+		return os.ReadDir(dir)
+	})
+
+	if err := Clear(); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("Clear error = %v, want permission error", err)
+	}
+	if _, err := os.Stat(quarantinePath); err != nil {
+		t.Fatalf("Clear reported success semantics after retaining quarantine: %v", err)
 	}
 }
 
