@@ -883,6 +883,33 @@ func TestSubmitManySendsCombinedChangesRequested(t *testing.T) {
 	}
 }
 
+func TestSubmitManySkipsSupersededRunAndDeliversSiblings(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	st := &fakeStore{
+		batchRuns: []domain.ReviewRun{
+			{ID: "run-1", SessionID: "mer-1", BatchID: "batch-1", PRURL: "pr1", TargetSHA: "sha1", Status: domain.ReviewRunRunning},
+			{ID: "run-2", SessionID: "mer-1", BatchID: "batch-1", PRURL: "pr2", TargetSHA: "sha2", Status: domain.ReviewRunFailed},
+		},
+		prs: []domain.PullRequest{{URL: "pr1", HeadSHA: "sha1"}, {URL: "pr2", HeadSHA: "sha2new"}},
+	}
+	reducer := &fakeReducer{outcome: lifecycle.ReviewDeliverySent}
+	svc := New(nil, st, WithLifecycleReducer(reducer), WithClock(func() time.Time { return now }))
+
+	runs, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{
+		{RunID: "run-1", Verdict: domain.VerdictChangesRequested, Body: "fix pr1"},
+		{RunID: "run-2", Verdict: domain.VerdictChangesRequested, Body: "stale feedback"},
+	})
+	if err != nil {
+		t.Fatalf("SubmitMany must not fail when a sibling run was superseded: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ID != "run-1" || runs[0].Status != domain.ReviewRunDelivered {
+		t.Fatalf("runs = %+v, want only run-1 delivered", runs)
+	}
+	if reducer.batchCalls != 1 || len(reducer.gotBatch) != 1 || reducer.gotBatch[0].RunID != "run-1" {
+		t.Fatalf("valid sibling was not delivered: batchCalls=%d got=%+v", reducer.batchCalls, reducer.gotBatch)
+	}
+}
+
 func TestSubmitBatchApprovedOnlySendsNothing(t *testing.T) {
 	st := &fakeStore{
 		ok:  true,
