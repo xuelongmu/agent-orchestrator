@@ -11,6 +11,7 @@ import (
 const (
 	reapPollingPasses = 4
 	reapGraceSlices   = reapPollingPasses + 1
+	reapObservations  = reapGraceSlices + 1
 )
 
 // paneSessionReaper is the process-mutation boundary used by Destroy. Tests
@@ -35,6 +36,7 @@ type processTable interface {
 // through that reference rather than resolving a numeric PID again.
 type processHandle interface {
 	Alive(ctx context.Context) error
+	Exited(ctx context.Context) (bool, error)
 	Signal(ctx context.Context, signal os.Signal) error
 	Close() error
 }
@@ -54,19 +56,21 @@ type processSet map[processIdentity]processHandle
 type sessionSet map[int]processSet
 type identitySet map[processIdentity]struct{}
 
-// sessionAnchor owns every process handle in members until it is either
-// excluded by tmux survivor verification or transferred to Reap.
+// sessionAnchor owns its exact tmux server handle and every member handle until
+// it is either excluded by survivor verification or transferred to Reap.
 type sessionAnchor struct {
 	pane      paneRef
+	server    processHandle
 	sessionID int
 	members   processSet
 }
 
 type paneRef struct {
-	serverID string
-	paneID   string
-	windowID string
-	pid      int
+	serverID  string
+	serverPID int
+	paneID    string
+	windowID  string
+	pid       int
 }
 
 // Anchor opens exact handles while the tmux pane still exists, snapshots its
@@ -74,23 +78,33 @@ type paneRef struct {
 // Any incomplete platform or process probe disables cleanup for that pane.
 func (r processSessionReaper) Anchor(ctx context.Context, panes []paneRef) []sessionAnchor {
 	leaders := make(map[int]processObservation)
+	servers := make(map[int]processObservation)
 	owners := make(map[int]paneRef)
 	leaderOrder := make([]int, 0, len(panes))
 	for _, pane := range safeUniquePanes(panes) {
+		server, err := r.open(ctx, pane.serverPID)
+		if err != nil || !safeIdentity(server.identity) || server.identity.pid != pane.serverPID {
+			closeObservation(server)
+			continue
+		}
 		leader, err := r.open(ctx, pane.pid)
 		if err != nil || !safeIdentity(leader.identity) || leader.identity.pid != pane.pid || leader.identity.sessionID != pane.pid {
+			closeObservation(server)
 			closeObservation(leader)
 			continue
 		}
 		if old, exists := leaders[pane.pid]; exists {
 			closeObservation(old)
+			closeObservation(servers[pane.pid])
 		} else {
 			leaderOrder = append(leaderOrder, pane.pid)
 		}
 		leaders[pane.pid] = leader
+		servers[pane.pid] = server
 		owners[pane.pid] = pane
 	}
 	if len(leaders) == 0 {
+		closeObservationMap(servers)
 		return nil
 	}
 
@@ -102,38 +116,46 @@ func (r processSessionReaper) Anchor(ctx context.Context, panes []paneRef) []ses
 	if err != nil {
 		closeObservations(snapshot)
 		closeObservationMap(leaders)
+		closeObservationMap(servers)
 		return nil
 	}
 	members := observationsBySession(snapshot)
 	anchors := make([]sessionAnchor, 0, len(leaders))
 	for _, sid := range leaderOrder {
 		leader := leaders[sid]
+		server := servers[sid]
 		set := members[sid]
 		snapshotLeader, present := set[leader.identity]
-		if !present || r.alive(ctx, leader.handle) != nil {
+		if !present || r.alive(ctx, leader.handle) != nil || r.alive(ctx, server.handle) != nil {
 			continue
 		}
 		_ = snapshotLeader.Close()
 		set[leader.identity] = leader.handle
 		leader.handle = nil
 		delete(leaders, sid)
+		delete(servers, sid)
 		delete(members, sid)
-		anchors = append(anchors, sessionAnchor{pane: owners[sid], sessionID: sid, members: set})
+		anchors = append(anchors, sessionAnchor{pane: owners[sid], server: server.handle, sessionID: sid, members: set})
 	}
 	closeObservationMap(leaders)
+	closeObservationMap(servers)
 	closeSessionSet(members)
 	return anchors
 }
 
-// Reap uses four grace observations plus one final observation after the
-// fourth wait. The five waits share the requested grace, so a child appearing
-// in the last polling interval is TERM-ed, receives bounded grace, and is then
-// escalated. Every snapshot receives its own timeout. Exact handles remain open
-// from observation through all delivery attempts and are closed on return.
+// Reap uses one observation before each of five grace slices, then one final
+// observation immediately before escalation. A child appearing during the last
+// wait is therefore TERM-ed and included in the validated KILL set without an
+// unobserved sleep after the final snapshot. Every snapshot receives its own
+// timeout. Exact handles remain open through delivery and are closed on return.
 func (r processSessionReaper) Reap(ctx context.Context, anchors []sessionAnchor, grace time.Duration) {
 	trusted := make(sessionSet, len(anchors))
 	for i := range anchors {
 		anchor := &anchors[i]
+		if anchor.server != nil {
+			_ = anchor.server.Close()
+			anchor.server = nil
+		}
 		if anchor.sessionID > 1 && len(anchor.members) > 0 {
 			if _, duplicate := trusted[anchor.sessionID]; duplicate {
 				closeProcessSet(anchor.members)
@@ -155,7 +177,7 @@ func (r processSessionReaper) Reap(ctx context.Context, anchors []sessionAnchor,
 	cleanupCtx := context.WithoutCancel(ctx)
 	termed := make(identitySet)
 	termOrder := make([]processIdentity, 0)
-	for pass := 0; pass < reapPollingPasses; pass++ {
+	for pass := 0; pass < reapGraceSlices; pass++ {
 		if !r.observeAndTerm(cleanupCtx, trusted, termed, &termOrder) {
 			return
 		}
@@ -163,12 +185,9 @@ func (r processSessionReaper) Reap(ctx context.Context, anchors []sessionAnchor,
 			return
 		}
 	}
-	// This observation closes the old tail hole: it runs after the fourth
-	// grace wait, not before it.
+	// No grace sleep follows this final observation, so the tail cannot hide a
+	// new child from both TERM and the validated escalation set.
 	if !r.observeAndTerm(cleanupCtx, trusted, termed, &termOrder) {
-		return
-	}
-	if !r.wait(cleanupCtx, graceSlice(grace, reapGraceSlices-1)) {
 		return
 	}
 	for _, identity := range termOrder {
@@ -307,7 +326,7 @@ func safeUniquePanes(panes []paneRef) []paneRef {
 	seen := make(map[paneRef]struct{}, len(panes))
 	result := make([]paneRef, 0, len(panes))
 	for _, pane := range panes {
-		if pane.pid <= 1 || pane.serverID == "" || pane.paneID == "" || pane.windowID == "" {
+		if pane.pid <= 1 || pane.serverPID <= 1 || pane.serverID == "" || pane.paneID == "" || pane.windowID == "" {
 			continue
 		}
 		if _, ok := seen[pane]; ok {
@@ -329,9 +348,17 @@ func sessionIDs(values sessionSet) map[int]struct{} {
 
 func closeAnchors(anchors []sessionAnchor) {
 	for i := range anchors {
-		closeProcessSet(anchors[i].members)
-		anchors[i].members = nil
+		closeAnchor(&anchors[i])
 	}
+}
+
+func closeAnchor(anchor *sessionAnchor) {
+	if anchor.server != nil {
+		_ = anchor.server.Close()
+		anchor.server = nil
+	}
+	closeProcessSet(anchor.members)
+	anchor.members = nil
 }
 
 func closeSessionSet(sessions sessionSet) {

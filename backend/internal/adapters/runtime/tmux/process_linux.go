@@ -73,6 +73,32 @@ func (h *linuxProcessHandle) Alive(ctx context.Context) error {
 	return unix.PidfdSendSignal(h.fd, 0, nil, 0)
 }
 
+// Exited observes the retained pidfd itself. Unlike a numeric PID lookup, a
+// readable pidfd cannot be redirected to a replacement process after reuse.
+func (h *linuxProcessHandle) Exited(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if h == nil || h.closed || h.fd < 0 {
+		return false, fmt.Errorf("process handle is closed")
+	}
+	fds := []unix.PollFd{{Fd: int32(h.fd), Events: unix.POLLIN}}
+	ready, err := unix.Poll(fds, 0)
+	if err != nil {
+		return false, err
+	}
+	if ready == 0 {
+		return false, nil
+	}
+	if fds[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0 {
+		return true, nil
+	}
+	if fds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
+		return false, fmt.Errorf("poll pidfd: revents %#x", fds[0].Revents)
+	}
+	return false, nil
+}
+
 // Signal delivers through the retained pidfd, so numeric PID reuse after
 // discovery cannot redirect the signal to another process.
 func (h *linuxProcessHandle) Signal(ctx context.Context, signal os.Signal) error {

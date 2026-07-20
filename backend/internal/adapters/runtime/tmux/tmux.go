@@ -287,9 +287,10 @@ func (r *Runtime) livePaneRefs(ctx context.Context, args []string) []paneRef {
 			continue
 		}
 		serverID, serverOK := tmuxServerID(fields[0], fields[1])
+		serverPID, serverPIDErr := strconv.Atoi(fields[0])
 		pid, parseErr := strconv.Atoi(fields[4])
-		if serverOK && parseErr == nil {
-			panes = append(panes, paneRef{serverID: serverID, paneID: fields[2], windowID: fields[3], pid: pid})
+		if serverOK && serverPIDErr == nil && parseErr == nil {
+			panes = append(panes, paneRef{serverID: serverID, serverPID: serverPID, paneID: fields[2], windowID: fields[3], pid: pid})
 		}
 	}
 	return safeUniquePanes(panes)
@@ -305,7 +306,7 @@ func revalidatedPaneAnchors(anchors []sessionAnchor, panes []paneRef) []sessionA
 		if _, ok := live[anchor.pane]; ok {
 			verified = append(verified, anchor)
 		} else {
-			closeProcessSet(anchor.members)
+			closeAnchor(&anchor)
 		}
 	}
 	return verified
@@ -318,11 +319,33 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 	if len(anchors) == 0 {
 		return
 	}
+	orphaned := make([]sessionAnchor, 0, len(anchors))
+	candidates := make([]sessionAnchor, 0, len(anchors))
+	for i := range anchors {
+		anchor := anchors[i]
+		exited, err := r.exactProcessExited(ctx, anchor.server)
+		if err != nil {
+			closeAnchor(&anchor)
+			continue
+		}
+		if exited {
+			// The retained server process was already gone before the survivor
+			// command. Any successful response is from a replacement server,
+			// even if PID, second-resolution start time, and object IDs collide.
+			orphaned = append(orphaned, anchor)
+		} else {
+			candidates = append(candidates, anchor)
+		}
+	}
+	if len(orphaned) == 0 && len(candidates) == 0 {
+		return
+	}
 	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.timeout)
 	defer cancel()
 	out, err := r.run(probeCtx, listAllPaneRefsArgs()...)
 	if err != nil && !serverMissingOutput(string(out)) {
-		closeAnchors(anchors)
+		closeAnchors(candidates)
+		r.reapVerifiedAnchors(ctx, orphaned)
 		return
 	}
 	survivingPanes := make(map[tmuxObjectID]struct{})
@@ -331,22 +354,47 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 		var reliable bool
 		survivingPanes, survivingWindows, reliable = parseSurvivingTmuxObjects(out)
 		if !reliable {
-			closeAnchors(anchors)
+			closeAnchors(candidates)
+			r.reapVerifiedAnchors(ctx, orphaned)
 			return
 		}
 	}
-	verified := make([]sessionAnchor, 0, len(anchors))
-	for _, anchor := range anchors {
+	verified := orphaned
+	for _, anchor := range candidates {
+		if err != nil {
+			verified = append(verified, anchor)
+			continue
+		}
+		exited, probeErr := r.exactProcessExited(ctx, anchor.server)
+		if probeErr != nil || exited {
+			// If the original server exited during the command, its output
+			// cannot be attributed to a generation without a race. Fail closed.
+			closeAnchor(&anchor)
+			continue
+		}
 		_, paneSurvives := survivingPanes[tmuxObjectID{serverID: anchor.pane.serverID, objectID: anchor.pane.paneID}]
 		_, windowSurvives := survivingWindows[tmuxObjectID{serverID: anchor.pane.serverID, objectID: anchor.pane.windowID}]
 		if !paneSurvives && !windowSurvives {
 			verified = append(verified, anchor)
 		} else {
-			closeProcessSet(anchor.members)
+			closeAnchor(&anchor)
 		}
 	}
-	if len(verified) > 0 {
-		r.sessionReaper.Reap(ctx, verified, r.reapGrace)
+	r.reapVerifiedAnchors(ctx, verified)
+}
+
+func (r *Runtime) exactProcessExited(ctx context.Context, handle processHandle) (bool, error) {
+	if handle == nil {
+		return false, errors.New("missing exact process handle")
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.timeout)
+	defer cancel()
+	return handle.Exited(probeCtx)
+}
+
+func (r *Runtime) reapVerifiedAnchors(ctx context.Context, anchors []sessionAnchor) {
+	if len(anchors) > 0 {
+		r.sessionReaper.Reap(ctx, anchors, r.reapGrace)
 	}
 }
 

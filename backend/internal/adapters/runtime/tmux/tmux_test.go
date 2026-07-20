@@ -53,6 +53,7 @@ func (f *fakeRunner) Run(_ context.Context, env []string, name string, args ...s
 type recordingReaper struct {
 	anchoredPanes []paneRef
 	calls         []reaperCall
+	serverExited  bool
 }
 
 type reaperCall struct {
@@ -68,6 +69,7 @@ func (r *recordingReaper) Anchor(_ context.Context, panes []paneRef) []sessionAn
 		identity := processIdentity{pid: pane.pid, sessionID: pane.pid, started: "anchored"}
 		anchors = append(anchors, sessionAnchor{
 			pane:      pane,
+			server:    &fakeProcessHandle{identity: processIdentity{pid: pane.serverPID, sessionID: pane.serverPID, started: "server"}, exited: r.serverExited},
 			sessionID: pane.pid,
 			members:   processSet{identity: &fakeProcessHandle{identity: identity}},
 		})
@@ -82,6 +84,9 @@ func (r *recordingReaper) Reap(ctx context.Context, anchors []sessionAnchor, gra
 		grace:       grace,
 	})
 	for _, anchor := range anchors {
+		if anchor.server != nil {
+			_ = anchor.server.Close()
+		}
 		for _, handle := range anchor.members {
 			_ = handle.Close()
 		}
@@ -474,7 +479,7 @@ func TestDestroyReapsAllDiscoveredPaneSessions(t *testing.T) {
 	if len(reaper.calls) != 1 {
 		t.Fatalf("reaper calls = %d, want 1", len(reaper.calls))
 	}
-	if got, want := reaper.anchoredPanes, []paneRef{{serverID: "100/1000", paneID: "%1", windowID: "@1", pid: 4242}, {serverID: "100/1000", paneID: "%2", windowID: "@2", pid: 4243}}; !reflect.DeepEqual(got, want) {
+	if got, want := reaper.anchoredPanes, []paneRef{{serverID: "100/1000", serverPID: 100, paneID: "%1", windowID: "@1", pid: 4242}, {serverID: "100/1000", serverPID: 100, paneID: "%2", windowID: "@2", pid: 4243}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("anchored panes = %#v, want %#v", got, want)
 	}
 	if got, want := anchorSessionIDs(reaper.calls[0].anchors), []int{4242, 4243}; !reflect.DeepEqual(got, want) {
@@ -534,6 +539,24 @@ func TestDestroyDoesNotConfuseReusedObjectIDsFromNewServerGeneration(t *testing.
 	}
 }
 
+func TestDestroyUsesExactServerHandleWhenGenerationTextCollides(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	panes := []byte("100 1000 %1 @1 4242 0\n")
+	// The replacement server reuses the numeric PID within the same second as
+	// well as tmux's restarted object IDs. Only the retained old server handle
+	// distinguishes this output from a surviving object in the old server.
+	fr.outputs = [][]byte{panes, panes, nil, []byte("100 1000 %1 @1\n")}
+	reaper := &recordingReaper{serverExited: true}
+	r.sessionReaper = reaper
+
+	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if got, want := anchorSessionIDs(reaper.calls[0].anchors), []int{4242}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("reaped session ids = %#v, want exact old-server anchor %#v", got, want)
+	}
+}
+
 func TestDestroyReapsDuplicateWindowLinksWithinSameSession(t *testing.T) {
 	r, fr := newTestRuntime(0)
 	panes := []byte("100 1000 %1 @1 4242 0\n100 1000 %1 @1 4242 0\n")
@@ -581,11 +604,12 @@ func TestReapAfterSurvivorCheckReapsForEveryMissingServerSpelling(t *testing.T) 
 			fr.err = &exec.ExitError{}
 			reaper := &recordingReaper{}
 			r.sessionReaper = reaper
-			pane := paneRef{serverID: "100/1000", paneID: "%1", windowID: "@1", pid: 4242}
+			pane := paneRef{serverID: "100/1000", serverPID: 100, paneID: "%1", windowID: "@1", pid: 4242}
 			identity := processIdentity{pid: 4242, sessionID: 4242, started: "anchored"}
+			server := &fakeProcessHandle{identity: processIdentity{pid: 100, sessionID: 100, started: "server"}}
 
 			r.reapAfterSurvivorCheck(context.Background(), []sessionAnchor{{
-				pane: pane, sessionID: 4242, members: processSet{identity: &fakeProcessHandle{identity: identity}},
+				pane: pane, server: server, sessionID: 4242, members: processSet{identity: &fakeProcessHandle{identity: identity}},
 			}})
 			if len(reaper.calls) != 1 {
 				t.Fatalf("reaper calls = %#v, want one after definitive missing-server output", reaper.calls)
@@ -737,6 +761,7 @@ type fakeProcessHandle struct {
 	identity processIdentity
 	table    *fakeProcessTable
 	closed   bool
+	exited   bool
 }
 
 func (h *fakeProcessHandle) Alive(ctx context.Context) error {
@@ -746,6 +771,9 @@ func (h *fakeProcessHandle) Alive(ctx context.Context) error {
 	if h == nil || h.closed {
 		return errors.New("process handle closed")
 	}
+	if h.exited {
+		return errors.New("retained process exited")
+	}
 	if h.table != nil {
 		current, ok := h.table.current[h.identity.pid]
 		if !ok || current != h.identity {
@@ -753,6 +781,23 @@ func (h *fakeProcessHandle) Alive(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (h *fakeProcessHandle) Exited(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if h == nil || h.closed {
+		return false, errors.New("process handle closed")
+	}
+	if h.exited {
+		return true, nil
+	}
+	if h.table != nil {
+		current, ok := h.table.current[h.identity.pid]
+		return !ok || current != h.identity, nil
+	}
+	return false, nil
 }
 
 func (h *fakeProcessHandle) Signal(ctx context.Context, signal os.Signal) error {
@@ -879,11 +924,12 @@ func assertAllHandlesClosed(t *testing.T, table *fakeProcessTable) {
 }
 
 func TestProcessSessionReaperAnchorsOwnedSessionBeforeTeardown(t *testing.T) {
+	server := identity(100, 100, "server-start")
 	leader := identity(4242, 4242, "leader-start")
 	child := identity(5000, 4242, "child-start")
 	notLeader := identity(6000, 4242, "not-a-session-leader")
 	table := &fakeProcessTable{
-		current: map[int]processIdentity{4242: leader, 6000: notLeader},
+		current: map[int]processIdentity{100: server, 4242: leader, 6000: notLeader},
 		snapshots: []processSnapshotStep{{
 			processes: []processIdentity{leader, child},
 		}},
@@ -891,11 +937,11 @@ func TestProcessSessionReaperAnchorsOwnedSessionBeforeTeardown(t *testing.T) {
 	reaper := newTestProcessReaper(table, &recordingSignaler{})
 
 	anchors := reaper.Anchor(context.Background(), []paneRef{
-		{serverID: "100/1000", paneID: "%bad0", windowID: "@0", pid: 0},
-		{serverID: "100/1000", paneID: "%bad1", windowID: "@1", pid: 1},
-		{serverID: "100/1000", paneID: "%1", windowID: "@2", pid: 4242},
-		{serverID: "100/1000", paneID: "%1", windowID: "@2", pid: 4242},
-		{serverID: "100/1000", paneID: "%2", windowID: "@3", pid: 6000},
+		{serverID: "100/1000", serverPID: 100, paneID: "%bad0", windowID: "@0", pid: 0},
+		{serverID: "100/1000", serverPID: 100, paneID: "%bad1", windowID: "@1", pid: 1},
+		{serverID: "100/1000", serverPID: 100, paneID: "%1", windowID: "@2", pid: 4242},
+		{serverID: "100/1000", serverPID: 100, paneID: "%1", windowID: "@2", pid: 4242},
+		{serverID: "100/1000", serverPID: 100, paneID: "%2", windowID: "@3", pid: 6000},
 	})
 	if got, want := anchorSessionIDs(anchors), []int{4242}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("anchor session ids = %#v, want %#v", got, want)
@@ -903,7 +949,7 @@ func TestProcessSessionReaperAnchorsOwnedSessionBeforeTeardown(t *testing.T) {
 	if _, ok := anchors[0].members[child]; !ok {
 		t.Fatalf("anchor members = %#v, want pre-teardown child %#v", anchors[0].members, child)
 	}
-	if got, want := table.openCalls, []int{4242, 6000}; !reflect.DeepEqual(got, want) {
+	if got, want := table.openCalls, []int{100, 4242, 100, 6000}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("open calls = %#v, want one retained handle per pane leader %#v", got, want)
 	}
 	closeAnchors(anchors)
@@ -962,6 +1008,7 @@ func TestProcessSessionReaperRetainsExactHandleThroughEscalation(t *testing.T) {
 	table := &fakeProcessTable{
 		current: map[int]processIdentity{5000: process},
 		snapshots: []processSnapshotStep{
+			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
@@ -1042,6 +1089,7 @@ func TestProcessSessionReaperResnapshotsAndReapsLateChild(t *testing.T) {
 			{processes: []processIdentity{original, late}},
 			{processes: []processIdentity{original, late}},
 			{processes: []processIdentity{original, late}},
+			{processes: []processIdentity{original, late}},
 		},
 	}
 	signaler := &recordingSignaler{}
@@ -1083,8 +1131,9 @@ func TestProcessSessionReaperEscalatesChildAppearingAfterFourthSnapshot(t *testi
 			{processes: []processIdentity{original}},
 			{processes: []processIdentity{original}},
 			{processes: []processIdentity{original}},
-			// This is the final observation, after the fourth wait.
+			// This fifth observation runs after the fourth wait.
 			{processes: []processIdentity{original, late}, current: map[int]processIdentity{5000: original, 5001: late}},
+			{processes: []processIdentity{original, late}},
 		},
 	}
 	signaler := &recordingSignaler{}
@@ -1101,6 +1150,44 @@ func TestProcessSessionReaperEscalatesChildAppearingAfterFourthSnapshot(t *testi
 	}
 }
 
+func TestProcessSessionReaperObservesChildCreatedDuringFinalGraceWait(t *testing.T) {
+	original := identity(5000, 4242, "original")
+	late := identity(5001, 4242, "final-wait")
+	unrelated := identity(6000, 9999, "unrelated")
+	table := &fakeProcessTable{
+		current: map[int]processIdentity{5000: original},
+		snapshots: []processSnapshotStep{
+			{processes: []processIdentity{original}},
+			{processes: []processIdentity{original}},
+			{processes: []processIdentity{original}},
+			{processes: []processIdentity{original}},
+			{processes: []processIdentity{original}},
+			{processes: []processIdentity{original, late, unrelated}},
+		},
+	}
+	signaler := &recordingSignaler{}
+	reaper := newTestProcessReaper(table, signaler)
+	waits := 0
+	reaper.wait = func(ctx context.Context, _ time.Duration) bool {
+		waits++
+		if waits == reapGraceSlices {
+			table.current = map[int]processIdentity{5000: original, 5001: late, 6000: unrelated}
+		}
+		return ctx.Err() == nil
+	}
+	reaper.Reap(context.Background(), []sessionAnchor{anchor(table, 4242, original)}, 5*time.Second)
+
+	want := []signalCall{
+		{pid: original.pid, signal: syscall.SIGTERM},
+		{pid: late.pid, signal: syscall.SIGTERM},
+		{pid: original.pid, signal: syscall.SIGKILL},
+		{pid: late.pid, signal: syscall.SIGKILL},
+	}
+	if !reflect.DeepEqual(signaler.calls, want) {
+		t.Fatalf("signals = %#v, want final-wait child only %#v", signaler.calls, want)
+	}
+}
+
 func TestProcessSessionReaperBudgetsEverySlowProbe(t *testing.T) {
 	process := identity(5000, 4242, "original")
 	table := &fakeProcessTable{
@@ -1113,14 +1200,15 @@ func TestProcessSessionReaperBudgetsEverySlowProbe(t *testing.T) {
 			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
+			{processes: []processIdentity{process}},
 		},
 	}
 	signaler := &recordingSignaler{}
 	reaper := newTestProcessReaper(table, signaler)
 	reaper.timeout = 5 * time.Millisecond
 	reaper.Reap(context.Background(), []sessionAnchor{anchor(table, 4242, process)}, 0)
-	if table.snapshotCalls != reapGraceSlices {
-		t.Fatalf("snapshot calls = %d, want %d independently budgeted probes", table.snapshotCalls, reapGraceSlices)
+	if table.snapshotCalls != reapObservations {
+		t.Fatalf("snapshot calls = %d, want %d independently budgeted probes", table.snapshotCalls, reapObservations)
 	}
 	want := []signalCall{{pid: 5000, signal: syscall.SIGTERM}, {pid: 5000, signal: syscall.SIGKILL}}
 	if !reflect.DeepEqual(signaler.calls, want) {
@@ -1157,6 +1245,7 @@ func TestProcessSessionReaperFallsBackToAnotherExactLiveWitness(t *testing.T) {
 			{processes: all},
 			{processes: all},
 			{processes: all},
+			{processes: all},
 		},
 	}
 	signaler := &recordingSignaler{}
@@ -1185,6 +1274,7 @@ func TestProcessSessionReaperFinishesBoundedCleanupAfterCallerCancellation(t *te
 	table := &fakeProcessTable{
 		current: map[int]processIdentity{5000: process},
 		snapshots: []processSnapshotStep{
+			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
