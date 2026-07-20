@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -920,7 +921,28 @@ func hasURLScheme(raw string) bool {
 }
 
 func previewFileURL(r *http.Request, id domain.SessionID, entry string) (string, error) {
+	if !isLoopbackPreviewHost(r.Host) {
+		u := url.URL{
+			Scheme: "http",
+			Host:   r.Host,
+			Path:   "/api/v1/sessions/" + string(id) + "/preview/files/" + entry,
+		}
+		return u.String(), nil
+	}
 	return previewutil.FileURL("http://"+r.Host, id, entry)
+}
+
+func isLoopbackPreviewHost(rawHost string) bool {
+	host := rawHost
+	if parsedHost, _, err := net.SplitHostPort(rawHost); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func sessionView(s domain.Session) SessionView {

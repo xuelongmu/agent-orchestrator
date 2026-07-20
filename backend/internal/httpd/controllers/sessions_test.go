@@ -334,6 +334,28 @@ func doPreviewOriginMethod(t *testing.T, srv *httptest.Server, method, previewUR
 	return body, resp.StatusCode, resp.Header
 }
 
+func doRequestWithHost(t *testing.T, srv *httptest.Server, host, method, requestPath, body string) ([]byte, int) {
+	t.Helper()
+	req, err := http.NewRequest(method, srv.URL+requestPath, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Host = host
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	return responseBody, resp.StatusCode
+}
+
 func TestSessionsRoutes_DefaultToStubsWithoutService(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, log, nil, httpd.APIDeps{}, httpd.ControlDeps{}))
@@ -509,6 +531,40 @@ func TestSessionsAPI_PreviewDiscoversAndServesStaticIndex(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "styles.css") {
 		t.Fatalf("preview body did not serve index: %s", body)
+	}
+}
+
+func TestSessionsAPI_PreviewPreservesLANReachableHost(t *testing.T) {
+	svc := newFakeSessionService()
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "index.html"), []byte("preview"), 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	s := svc.sessions["ao-1"]
+	s.Metadata = domain.SessionMetadata{WorkspacePath: workspace}
+	svc.sessions["ao-1"] = s
+	srv := newSessionTestServer(t, svc)
+	const lanHost = "192.168.1.20:3002"
+	const wantURL = "http://192.168.1.20:3002/api/v1/sessions/ao-1/preview/files/index.html"
+
+	body, status := doRequestWithHost(t, srv, lanHost, http.MethodGet, "/api/v1/sessions/ao-1/preview", "")
+	if status != http.StatusOK {
+		t.Fatalf("discover preview = %d, want 200; body=%s", status, body)
+	}
+	var discovered struct {
+		PreviewURL string `json:"previewUrl"`
+	}
+	mustJSON(t, body, &discovered)
+	if discovered.PreviewURL != wantURL {
+		t.Fatalf("discovered preview URL = %q, want LAN-reachable %q", discovered.PreviewURL, wantURL)
+	}
+
+	body, status = doRequestWithHost(t, srv, lanHost, http.MethodPost, "/api/v1/sessions/ao-1/preview", `{"url":"index.html"}`)
+	if status != http.StatusOK {
+		t.Fatalf("set preview = %d, want 200; body=%s", status, body)
+	}
+	if got := svc.sessions["ao-1"].Metadata.PreviewURL; got != wantURL {
+		t.Fatalf("persisted preview URL = %q, want LAN-reachable %q", got, wantURL)
 	}
 }
 
