@@ -71,7 +71,17 @@ func RunHost(args []string, stdout io.Writer) int {
 	}
 
 	// Print READY only after listener, PTY, and durable discovery are all ready.
-	_, _ = fmt.Fprintf(stdout, "READY:%d %d\n", pty.PID(), port)
+	// A broken startup pipe means the parent cannot adopt this host, so close all
+	// owned launch resources and remove this exact generation instead of leaving
+	// an orphaned runtime behind.
+	if _, err := fmt.Fprintf(stdout, "READY:%d %d\n", os.Getpid(), port); err != nil {
+		_ = pty.Close()
+		_ = ln.Close()
+		dataDir, _ := os.LookupEnv(dataDirEnv)
+		_ = ptyregistry.UnregisterGenerationAt(dataDir, sessionID, generation)
+		fmt.Fprintf(os.Stderr, "pty-host [%s]: publish READY: %v\n", sessionID, err)
+		return 1
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -79,6 +89,7 @@ func RunHost(args []string, stdout io.Writer) int {
 	// Install signal handlers so SIGTERM/SIGINT trigger graceful shutdown.
 	sigC := make(chan os.Signal, 1)
 	signal.Notify(sigC, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigC)
 	go func() {
 		select {
 		case sig := <-sigC:

@@ -7,11 +7,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"golang.org/x/sys/windows"
 )
 
 func TestSpawnWindowsStreamsOutput(t *testing.T) {
@@ -35,6 +38,34 @@ func TestSpawnWindowsRejectsEmptyCommand(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "empty attach command") {
 		t.Fatalf("expected empty attach command error, got %v", err)
 	}
+}
+
+func TestSpawnWindowsRejectsCanceledContextBeforeAllocatingPTY(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := Spawn(ctx, []string{"cmd.exe", "/C", "exit", "0"}, nil, 0, 0)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Spawn error = %v, want context.Canceled", err)
+	}
+}
+
+func TestSpawnWindowsRepeatedStartFailuresReleaseConPTYHandles(t *testing.T) {
+	missingCommand := filepath.Join(t.TempDir(), "missing-attach.exe")
+	_, _ = Spawn(context.Background(), []string{missingCommand}, nil, 24, 80)
+	before := processHandleCount(t)
+	for i := 0; i < 32; i++ {
+		if _, err := Spawn(context.Background(), []string{missingCommand}, nil, 24, 80); err == nil {
+			t.Fatalf("iteration %d unexpectedly succeeded", i)
+		}
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if count := processHandleCount(t); count <= before+16 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("caller handle count grew across repeated attach setup failures: before=%d after=%d", before, processHandleCount(t))
 }
 
 func TestConPTYCloseIsIdempotent(t *testing.T) {
@@ -98,4 +129,15 @@ func readPTYUntil(t *testing.T, p ports.Stream, marker string, timeout time.Dura
 		t.Fatal("timed out reading PTY output")
 		return ""
 	}
+}
+
+func processHandleCount(t *testing.T) uint32 {
+	t.Helper()
+	var count uint32
+	proc := windows.NewLazySystemDLL("kernel32.dll").NewProc("GetProcessHandleCount")
+	ok, _, callErr := proc.Call(uintptr(windows.CurrentProcess()), uintptr(unsafe.Pointer(&count)))
+	if ok == 0 {
+		t.Fatalf("GetProcessHandleCount: %v", callErr)
+	}
+	return count
 }

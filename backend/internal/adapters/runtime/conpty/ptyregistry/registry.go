@@ -47,6 +47,17 @@ var readAggregateData = os.ReadFile
 // ensure removing an observed generation can never remove its replacement.
 var removeEntryFile = os.Remove
 
+// corruptAggregateError distinguishes durable parse corruption from transient
+// read failures. Only corruption is safe to quarantine: an unreadable file may
+// become readable again and must remain at its authoritative path.
+type corruptAggregateError struct {
+	path string
+	err  error
+}
+
+func (e *corruptAggregateError) Error() string { return e.err.Error() }
+func (e *corruptAggregateError) Unwrap() error { return e.err }
+
 // registryFile resolves windows-pty-hosts.json under AO_DATA_DIR when set so
 // isolated daemon stores also have isolated crash-recovery registries. The
 // default remains ~/.ao/windows-pty-hosts.json for compatibility with existing
@@ -113,18 +124,18 @@ func readRawFile(path string) ([]Entry, error) {
 	}
 	var parsed []json.RawMessage
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return nil, fmt.Errorf("ptyregistry: parse aggregate %q: %w", path, err)
+		return nil, &corruptAggregateError{path: path, err: fmt.Errorf("ptyregistry: parse aggregate %q: %w", path, err)}
 	}
 	out := make([]Entry, 0, len(parsed))
 	for index, raw := range parsed {
 		var e Entry
 		if err := json.Unmarshal(raw, &e); err != nil {
-			return nil, fmt.Errorf("ptyregistry: parse aggregate entry %q: %w", path, err)
+			return nil, &corruptAggregateError{path: path, err: fmt.Errorf("ptyregistry: parse aggregate entry %q: %w", path, err)}
 		}
 		// A syntactically valid but partial entry is still an uncertain live
 		// host, not proof of absence. Fail closed and retain the aggregate.
 		if e.SessionID == "" || e.PtyHostPID == 0 || e.PipePath == "" {
-			return nil, fmt.Errorf("ptyregistry: parse aggregate entry %q at index %d: session id, host pid, and pipe path are required", path, index)
+			return nil, &corruptAggregateError{path: path, err: fmt.Errorf("ptyregistry: parse aggregate entry %q at index %d: session id, host pid, and pipe path are required", path, index)}
 		}
 		out = append(out, e)
 	}
@@ -146,10 +157,19 @@ func readRawFor(dataDir string) (entries []Entry, legacyPath string, migrateLega
 	if _, err := os.Stat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
 		return entries, "", false, nil
 	}
+	// A quarantined configured aggregate proves this namespace was initialized.
+	// Do not accidentally import the default store merely because quarantine
+	// moved the configured upgrade artifact out of its active filename.
+	if hasQuarantinedAggregate(path) {
+		return entries, "", false, nil
+	}
 
 	legacyPath, err = legacyRegistryFile()
 	if err != nil || !shouldMigrateLegacy(path, legacyPath) {
 		return entries, "", false, err
+	}
+	if hasQuarantinedAggregate(legacyPath) {
+		return entries, "", false, nil
 	}
 	legacy, err := readRawFile(legacyPath)
 	if err != nil {
@@ -325,7 +345,19 @@ func ListAt(dataDir string) ([]Entry, error) {
 	// aggregate file is removed.
 	legacy, legacyPath, migrateLegacy, err := readRawFor(dataDir)
 	if err != nil {
-		return nil, err
+		var corruption *corruptAggregateError
+		if !errors.As(err, &corruption) {
+			return nil, err
+		}
+		// Generation-keyed entries are independently authoritative. Preserve the
+		// corrupt aggregate under a quarantine name so namespace-wide listing can
+		// continue, while keyed misses below still fail closed on its presence.
+		if _, quarantineErr := quarantineAggregate(corruption.path); quarantineErr != nil {
+			return nil, errors.Join(err, quarantineErr)
+		}
+		legacy = nil
+		legacyPath = ""
+		migrateLegacy = false
 	}
 	for _, entry := range legacy {
 		if _, exists := byID[entry.SessionID]; exists || !pidAlive(entry.PtyHostPID) {
@@ -410,6 +442,9 @@ func LookupAllAt(dataDir, sessionID string) ([]Entry, error) {
 		sort.Slice(selected, func(i, j int) bool { return newerEntry(selected[i], selected[j]) })
 		return selected, nil
 	}
+	if err := quarantinedAggregateLookupError(dataDir); err != nil {
+		return nil, err
+	}
 
 	// Compatibility fallback for the pre-per-session aggregate. Publish only
 	// the requested entry; leave aggregate-wide migration/cleanup to ListAt so
@@ -438,6 +473,56 @@ func LookupAllAt(dataDir, sessionID string) ([]Entry, error) {
 	}
 	sort.Slice(selected, func(i, j int) bool { return newerEntry(selected[i], selected[j]) })
 	return selected, nil
+}
+
+func quarantineAggregate(path string) (string, error) {
+	for attempt := 0; attempt < 4; attempt++ {
+		quarantinePath := fmt.Sprintf("%s.corrupt-%d-%d", path, time.Now().UnixNano(), attempt)
+		if err := os.Rename(path, quarantinePath); err == nil {
+			return quarantinePath, nil
+		} else if errors.Is(err, os.ErrNotExist) {
+			if paths := quarantinedAggregatePaths(path); len(paths) > 0 {
+				return paths[0], nil
+			}
+			return "", err
+		} else if !errors.Is(err, os.ErrExist) {
+			return "", fmt.Errorf("ptyregistry: quarantine corrupt aggregate %q: %w", path, err)
+		}
+	}
+	return "", fmt.Errorf("ptyregistry: quarantine corrupt aggregate %q: no available quarantine path", path)
+}
+
+func quarantinedAggregatePaths(path string) []string {
+	paths, _ := filepath.Glob(path + ".corrupt-*")
+	sort.Strings(paths)
+	return paths
+}
+
+func hasQuarantinedAggregate(path string) bool {
+	return len(quarantinedAggregatePaths(path)) > 0
+}
+
+// quarantinedAggregateLookupError retains fail-closed recovery for the legacy
+// sessions whose identities could only exist inside a corrupt aggregate. A
+// healthy keyed entry returns before this check and remains usable.
+func quarantinedAggregateLookupError(dataDir string) error {
+	configured, err := registryFileFor(dataDir)
+	if err != nil {
+		return err
+	}
+	paths := quarantinedAggregatePaths(configured)
+	legacy, legacyErr := legacyRegistryFile()
+	if legacyErr != nil {
+		return legacyErr
+	}
+	if shouldMigrateLegacy(configured, legacy) && !sameRegistryPath(configured, legacy) {
+		paths = append(paths, quarantinedAggregatePaths(legacy)...)
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	sort.Strings(paths)
+	return fmt.Errorf("ptyregistry: legacy aggregate data is corrupt and quarantined at %q", paths[0])
 }
 
 func registryDirFor(dataDir string) (string, error) {
@@ -568,12 +653,22 @@ func Clear() error {
 	if err != nil {
 		return err
 	}
+	for _, path := range quarantinedAggregatePaths(configured) {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	legacy, err := legacyRegistryFile()
 	if err != nil {
 		return err
 	}
 	if !shouldMigrateLegacy(configured, legacy) {
 		return nil
+	}
+	for _, path := range quarantinedAggregatePaths(legacy) {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	if err := os.Remove(legacy); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err

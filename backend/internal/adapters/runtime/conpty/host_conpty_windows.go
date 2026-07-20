@@ -36,10 +36,15 @@ func newConPTY(cwd, shellCmd string, shellArgs []string) (ptyConn, error) {
 		_ = p.Close()
 		return nil, fmt.Errorf("conpty: expected ConPty on windows, got %T", p)
 	}
+	owned := true
+	defer func() {
+		if owned {
+			_ = cp.Close()
+		}
+	}()
 
 	// Set an initial size matching node-pty defaults from pty-host.ts.
 	if err := cp.Resize(220, 50); err != nil {
-		_ = cp.Close()
 		return nil, fmt.Errorf("conpty: initial resize: %w", err)
 	}
 
@@ -49,7 +54,10 @@ func newConPTY(cwd, shellCmd string, shellArgs []string) (ptyConn, error) {
 	cmd.Env = os.Environ()
 
 	if err := cmd.Start(); err != nil {
-		_ = cp.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
 		return nil, fmt.Errorf("conpty: start command: %w", err)
 	}
 
@@ -60,6 +68,7 @@ func newConPTY(cwd, shellCmd string, shellArgs []string) (ptyConn, error) {
 	}
 
 	go c.wait()
+	owned = false
 	return c, nil
 }
 

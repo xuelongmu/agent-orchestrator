@@ -719,3 +719,19 @@ func TestShutdownViaCtxCancel(t *testing.T) {
 		t.Fatal("expected pty.Close() on ctx cancel")
 	}
 }
+
+func TestUnexpectedListenerCloseReleasesPTY(t *testing.T) {
+	f := startServe(t, 108)
+
+	if err := f.ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.waitDone(t)
+
+	f.pty.closeMu.Lock()
+	closed := f.pty.closed
+	f.pty.closeMu.Unlock()
+	if !closed {
+		t.Fatal("expected pty.Close on accept-loop exit")
+	}
+}
