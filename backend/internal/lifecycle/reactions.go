@@ -1263,10 +1263,10 @@ func scmToPRObservation(o ports.SCMObservation) ports.PRObservation {
 		}
 		anchored := strings.TrimSpace(th.Path) != "" && th.Line > 0
 		for _, c := range th.Comments {
-			// Keep suppressing general bot chatter, but route bot feedback that
-			// points at a concrete file and line through the normal bounded,
-			// semantically deduplicated review nudge path.
-			if (th.IsBot || c.IsBot) && !anchored {
+			// Thread bot-ness is aggregate metadata and may describe a bot-started
+			// thread that later receives human feedback. Suppress only bot-authored
+			// chatter without an anchor; human comments are always actionable.
+			if c.IsBot && !anchored {
 				continue
 			}
 			pr.Comments = append(pr.Comments, ports.PRCommentObservation{

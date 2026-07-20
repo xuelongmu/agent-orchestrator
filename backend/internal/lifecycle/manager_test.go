@@ -1197,6 +1197,40 @@ func TestSCMObservation_UnanchoredBotReviewIsSuppressed(t *testing.T) {
 	}
 }
 
+func TestSCMObservation_ReviewRoutingUsesPerCommentBotIdentity(t *testing.T) {
+	for _, anchored := range []bool{false, true} {
+		for _, threadBot := range []bool{false, true} {
+			for _, commentBot := range []bool{false, true} {
+				name := fmt.Sprintf("anchored=%t/thread_bot=%t/comment_bot=%t", anchored, threadBot, commentBot)
+				t.Run(name, func(t *testing.T) {
+					path, line := "", 0
+					if anchored {
+						path, line = "frontend/src/App.tsx", 42
+					}
+					o := botReviewObservation(path, line, false)
+					o.Review.Threads[0].IsBot = threadBot
+					o.Review.Threads[0].Comments[0].IsBot = commentBot
+					if !commentBot {
+						o.Review.Threads[0].Comments[0].Author = "alice"
+					}
+					m, st, msg := newManager()
+					st.sessions["mer-1"] = working("mer-1")
+					if err := m.ApplySCMObservation(ctx, "mer-1", o); err != nil {
+						t.Fatal(err)
+					}
+					want := 0
+					if anchored || !commentBot {
+						want = 1
+					}
+					if len(msg.msgs) != want {
+						t.Fatalf("review nudges = %d, want %d: %v", len(msg.msgs), want, msg.msgs)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestSCMObservation_ResolvedAnchoredBotReviewIsSuppressed(t *testing.T) {
 	m, st, msg := newManager()
 	st.sessions["mer-1"] = working("mer-1")
