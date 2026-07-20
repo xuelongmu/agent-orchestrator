@@ -85,7 +85,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 
 	const submit = async (event: FormEvent<HTMLFormElement>) => {
 		event.preventDefault();
-		if (!projectId || isSubmitting) return;
+		if (!projectId || !projectQuery.data || isSubmitting) return;
 
 		const cleanTitle = title.trim();
 		const cleanPrompt = prompt.trim();
@@ -151,32 +151,33 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 					</div>
 
 					<form onSubmit={submit} className="space-y-4 px-5 py-4">
-						{projectQuery.data ? (
-							<div
-								className="rounded-md border border-border bg-surface px-3 py-2.5 text-xs"
-								data-testid="task-execution-context"
-							>
-								<div
-									className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5"
-									title={`Project path: ${projectQuery.data.path}`}
-								>
-									<span className="font-semibold text-foreground">{projectQuery.data.name}</span>
-									<span className="min-w-0 break-all text-muted-foreground">{projectQuery.data.repo}</span>
+						<div
+							aria-busy={projectQuery.isPending}
+							aria-label="Task execution context"
+							className="rounded-md border border-border bg-surface px-3 py-2.5 text-xs"
+							data-testid="task-execution-context"
+							role="group"
+						>
+							{projectQuery.data ? (
+								<TaskExecutionContext
+									agentCatalog={agentCatalog}
+									orchestratorAgent={configuredOrchestratorAgent}
+									project={projectQuery.data}
+									workerAgent={effectiveAgent}
+								/>
+							) : projectQuery.isPending ? (
+								<p className="text-muted-foreground" role="status">
+									Loading project context…
+								</p>
+							) : (
+								<div role="alert">
+									<p className="font-medium text-destructive">Project context unavailable.</p>
+									<p className="mt-0.5 text-caption text-muted-foreground">
+										{projectQuery.error instanceof Error ? projectQuery.error.message : "Project lookup failed."}
+									</p>
 								</div>
-								<dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-caption">
-									<ContextFact label="Base branch" value={projectQuery.data.defaultBranch} mono />
-									{effectiveAgent ? (
-										<ContextFact label="Worker" value={agentDisplayName(effectiveAgent, agentCatalog)} />
-									) : null}
-									{configuredOrchestratorAgent ? (
-										<ContextFact
-											label="Orchestrator"
-											value={agentDisplayName(configuredOrchestratorAgent, agentCatalog)}
-										/>
-									) : null}
-								</dl>
-							</div>
-						) : null}
+							)}
+						</div>
 
 						<div className="space-y-1.5">
 							<label className="text-xs font-medium text-muted-foreground" htmlFor={titleId}>
@@ -281,7 +282,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 									Cancel
 								</Button>
 							</Dialog.Close>
-							<Button type="submit" disabled={isSubmitting || !projectId}>
+							<Button type="submit" disabled={isSubmitting || !projectId || !projectQuery.data}>
 								{isSubmitting ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : null}
 								{isSubmitting ? "Starting..." : "Start task"}
 							</Button>
@@ -291,6 +292,67 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 			</Dialog.Portal>
 		</Dialog.Root>
 	);
+}
+
+function TaskExecutionContext({
+	agentCatalog,
+	orchestratorAgent,
+	project,
+	workerAgent,
+}: {
+	agentCatalog?: AgentCatalog;
+	orchestratorAgent: string;
+	project: Project;
+	workerAgent: string;
+}) {
+	const repositories = projectRepositories(project);
+	return (
+		<>
+			<div className="font-semibold text-foreground">{project.name}</div>
+			<RepositoryList repositories={repositories} />
+			<dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-caption">
+				<ContextFact label="Base branch" value={project.defaultBranch} mono />
+				{workerAgent ? <ContextFact label="Worker" value={agentDisplayName(workerAgent, agentCatalog)} /> : null}
+				{orchestratorAgent ? (
+					<ContextFact label="Orchestrator" value={agentDisplayName(orchestratorAgent, agentCatalog)} />
+				) : null}
+			</dl>
+			<ProjectPath path={project.path} />
+		</>
+	);
+}
+
+function RepositoryList({ repositories }: { repositories: string[] }) {
+	if (repositories.length === 0) return null;
+	return (
+		<div className="mt-1 flex min-w-0 items-start gap-1.5 text-caption">
+			<span className="shrink-0 text-muted-foreground">
+				{repositories.length === 1 ? "Repository" : "Repositories"}
+			</span>
+			<ul aria-label="Repositories" className="min-w-0 space-y-0.5 text-foreground">
+				{repositories.map((repository) => (
+					<li className="break-all" key={repository}>
+						{repository}
+					</li>
+				))}
+			</ul>
+		</div>
+	);
+}
+
+function ProjectPath({ path }: { path: string }) {
+	return (
+		<div className="mt-2 flex min-w-0 items-start gap-1.5 border-t border-border pt-2 text-caption">
+			<span className="shrink-0 text-muted-foreground">Path</span>
+			<code className="break-all font-mono text-2xs text-muted-foreground">{path}</code>
+		</div>
+	);
+}
+
+function projectRepositories(project: Project): string[] {
+	return [
+		...new Set([project.repo, ...(project.workspaceRepos ?? []).map((repository) => repository.repo)].filter(Boolean)),
+	];
 }
 
 function ContextFact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {

@@ -140,13 +140,46 @@ describe("SessionInspector tabs", () => {
 		renderWithQuery(<SessionInspector session={session([])} />);
 
 		await screen.findByText("github.com/acme/my-app");
-		const context = within(screen.getByTestId("session-execution-context"));
+		const context = within(screen.getByRole("group", { name: "Session execution context" }));
 		expect(context.getByText("my-app")).toBeInTheDocument();
 		expect(context.getByText("github.com/acme/my-app")).toBeInTheDocument();
 		expect(context.getByText("main")).toBeInTheDocument();
 		expect(context.getByText("claude-code")).toBeInTheDocument();
 		expect(context.getByText("codex")).toBeInTheDocument();
-		expect(context.getByText("my-app").closest("[title]")).toHaveAttribute("title", "Project path: /repo");
+		expect(context.getByText("Path")).toBeInTheDocument();
+		expect(context.getByText("/repo", { selector: "code" })).toBeVisible();
+	});
+
+	it("shows every repository for an inspected multi-repo workspace", async () => {
+		getMock.mockImplementation(async (path: string) => {
+			if (path === "/api/v1/projects/{id}") {
+				return {
+					data: {
+						status: "ok",
+						project: {
+							id: "ws-1",
+							kind: "workspace",
+							name: "Product suite",
+							path: "/repo/product-suite",
+							repo: "",
+							defaultBranch: "main",
+							agent: "claude-code",
+							workspaceRepos: [
+								{ name: "web", relativePath: "apps/web", repo: "github.com/acme/web" },
+								{ name: "api", relativePath: "apps/api", repo: "github.com/acme/api" },
+							],
+						},
+					},
+				};
+			}
+			return { data: undefined };
+		});
+
+		renderWithQuery(<SessionInspector session={session([])} />);
+
+		const repositories = within(await screen.findByRole("list", { name: "Repositories" }));
+		expect(repositories.getByText("github.com/acme/web")).toBeInTheDocument();
+		expect(repositories.getByText("github.com/acme/api")).toBeInTheDocument();
 	});
 
 	it("shows dependency blocking and clears it when the live session update is promoted", () => {

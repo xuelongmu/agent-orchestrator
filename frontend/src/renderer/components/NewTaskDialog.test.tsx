@@ -28,7 +28,7 @@ function renderDialog() {
 	const onCreated = vi.fn();
 	const onOpenChange = vi.fn();
 	render(
-		<QueryClientProvider client={new QueryClient()}>
+		<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
 			<NewTaskDialog open projectId="proj-1" onCreated={onCreated} onOpenChange={onOpenChange} />
 		</QueryClientProvider>,
 	);
@@ -93,16 +93,48 @@ describe("NewTaskDialog", () => {
 	it("shows the execution context before the task is launched", async () => {
 		renderDialog();
 
-		const context = within(await screen.findByTestId("task-execution-context"));
+		await screen.findByText("CareerOps");
+		const context = within(screen.getByRole("group", { name: "Task execution context" }));
 		expect(context.getByText("CareerOps")).toBeInTheDocument();
 		expect(context.getByText("github.com/acme/careerops")).toBeInTheDocument();
 		expect(context.getByText("main")).toBeInTheDocument();
 		expect(context.getByText("Claude Code")).toBeInTheDocument();
 		expect(context.getByText("Codex")).toBeInTheDocument();
-		expect(context.getByText("CareerOps").closest("[title]")).toHaveAttribute(
-			"title",
-			"Project path: /repos/careerops",
-		);
+		expect(context.getByText("Path")).toBeInTheDocument();
+		expect(context.getByText("/repos/careerops", { selector: "code" })).toBeVisible();
+	});
+
+	it("shows every repository for a first-class workspace project", async () => {
+		const originalImplementation = getMock.getMockImplementation();
+		getMock.mockImplementation((path: string) => {
+			if (path === "/api/v1/projects/{id}") {
+				return Promise.resolve({
+					data: {
+						status: "ok",
+						project: {
+							id: "proj-1",
+							name: "Product suite",
+							repo: "",
+							path: "/repos/product-suite",
+							defaultBranch: "main",
+							agent: "claude-code",
+							workspaceRepos: [
+								{ name: "web", relativePath: "apps/web", repo: "github.com/acme/web" },
+								{ name: "api", relativePath: "apps/api", repo: "github.com/acme/api" },
+							],
+						},
+					},
+					error: undefined,
+				});
+			}
+			return originalImplementation?.(path);
+		});
+
+		renderDialog();
+
+		const repositories = within(await screen.findByRole("list", { name: "Repositories" }));
+		expect(repositories.getByText("github.com/acme/web")).toBeInTheDocument();
+		expect(repositories.getByText("github.com/acme/api")).toBeInTheDocument();
 	});
 
 	it("aligns the Agent, Workspace, and Branch fields with matching labels and compact controls", async () => {
@@ -145,7 +177,7 @@ describe("NewTaskDialog", () => {
 		expect(onOpenChange).toHaveBeenCalledWith(false);
 	}, 20_000);
 
-	it("does not override the project workspace default while project config is loading", async () => {
+	it("shows pending project context and prevents launch while it is loading", async () => {
 		const originalImplementation = getMock.getMockImplementation();
 		getMock.mockImplementation((path: string) => {
 			if (path === "/api/v1/projects/{id}") {
@@ -155,16 +187,27 @@ describe("NewTaskDialog", () => {
 		});
 
 		renderDialog();
-		const user = userEvent.setup();
-		await waitForAgentCatalog();
-		await user.click(screen.getByRole("combobox", { name: "Agent" }));
-		await user.click(await screen.findByRole("option", { name: "Claude Code" }));
-		await user.type(screen.getByLabelText("Title"), "Research");
-		await user.type(screen.getByLabelText("Brief"), "Use the configured scratch default.");
-		await user.click(screen.getByRole("button", { name: "Start task" }));
 
-		await waitFor(() => expect(postMock).toHaveBeenCalledTimes(1));
-		expect(spawnBody().workspaceKind).toBeUndefined();
+		expect(await screen.findByText("Loading project context…")).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Start task" })).toBeDisabled();
+		expect(postMock).not.toHaveBeenCalled();
+	});
+
+	it("shows a project context error and prevents launch when project detail is unavailable", async () => {
+		const originalImplementation = getMock.getMockImplementation();
+		getMock.mockImplementation((path: string) => {
+			if (path === "/api/v1/projects/{id}") {
+				return Promise.resolve({ data: undefined, error: { message: "project lookup failed" } });
+			}
+			return originalImplementation?.(path);
+		});
+
+		renderDialog();
+
+		expect(await screen.findByText("Project context unavailable.")).toBeInTheDocument();
+		expect(screen.getByText("project lookup failed")).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Start task" })).toBeDisabled();
+		expect(postMock).not.toHaveBeenCalled();
 	});
 
 	it("spawns a branchless scratch task", async () => {

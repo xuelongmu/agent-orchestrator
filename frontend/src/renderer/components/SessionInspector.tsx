@@ -336,17 +336,18 @@ function ExecutionContext({ project, session }: { project?: Project; session: Wo
 	const configuredOrchestrator = project?.config?.orchestrator?.agent || project?.agent;
 	const activeRole = session.kind === "orchestrator" ? "Orchestrator" : "Worker";
 	const configuredActive = session.kind === "orchestrator" ? configuredOrchestrator : configuredWorker;
+	const repositories = project ? projectRepositories(project) : [];
 
 	return (
 		<Section title="Execution context">
-			<div className="rounded-md border border-border bg-surface p-3" data-testid="session-execution-context">
-				<div
-					className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs"
-					title={project?.path ? `Project path: ${project.path}` : undefined}
-				>
-					<span className="font-semibold text-foreground">{project?.name ?? session.workspaceName}</span>
-					{project?.repo ? <span className="min-w-0 break-all text-muted-foreground">{project.repo}</span> : null}
-				</div>
+			<div
+				aria-label="Session execution context"
+				className="rounded-md border border-border bg-surface p-3"
+				data-testid="session-execution-context"
+				role="group"
+			>
+				<div className="font-semibold text-foreground">{project?.name ?? session.workspaceName}</div>
+				<RepositoryList repositories={repositories} />
 				<dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-caption">
 					{project?.defaultBranch ? <ContextFact label="Base branch" value={project.defaultBranch} mono /> : null}
 					<ContextFact label={activeRole} value={session.provider} />
@@ -357,9 +358,43 @@ function ExecutionContext({ project, session }: { project?: Project; session: Wo
 						<ContextFact label="Orchestrator" value={configuredOrchestrator} />
 					) : null}
 				</dl>
+				{project?.path ? <ProjectPath path={project.path} /> : null}
 			</div>
 		</Section>
 	);
+}
+
+function RepositoryList({ repositories }: { repositories: string[] }) {
+	if (repositories.length === 0) return null;
+	return (
+		<div className="mt-1 flex min-w-0 items-start gap-1.5 text-caption">
+			<span className="shrink-0 text-muted-foreground">
+				{repositories.length === 1 ? "Repository" : "Repositories"}
+			</span>
+			<ul aria-label="Repositories" className="min-w-0 space-y-0.5 text-foreground">
+				{repositories.map((repository) => (
+					<li className="break-all" key={repository}>
+						{repository}
+					</li>
+				))}
+			</ul>
+		</div>
+	);
+}
+
+function ProjectPath({ path }: { path: string }) {
+	return (
+		<div className="mt-2 flex min-w-0 items-start gap-1.5 border-t border-border pt-2 text-caption">
+			<span className="shrink-0 text-muted-foreground">Path</span>
+			<code className="break-all font-mono text-2xs text-muted-foreground">{path}</code>
+		</div>
+	);
+}
+
+function projectRepositories(project: Project): string[] {
+	return [
+		...new Set([project.repo, ...(project.workspaceRepos ?? []).map((repository) => repository.repo)].filter(Boolean)),
+	];
 }
 
 function ContextFact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
