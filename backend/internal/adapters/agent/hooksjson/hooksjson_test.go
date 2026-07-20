@@ -139,6 +139,17 @@ func TestInstallPreservesMalformedAndNonCommandEntries(t *testing.T) {
 		map[string]any{"type": "command", "command": float64(123)},
 		map[string]any{"matcher": "", "hooks": "not-an-array", "custom": "keep"},
 		map[string]any{"matcher": "", "hooks": nil, "custom": "keep-null"},
+		map[string]any{"matcher": float64(42), "hooks": []any{}, "custom": "keep-matcher"},
+		map[string]any{
+			"matcher": "other",
+			"custom":  "keep-hook-list",
+			"hooks": []any{
+				nil,
+				"opaque-hook",
+				float64(7),
+				map[string]any{"type": float64(42), "command": false, "custom": "keep-hook"},
+			},
+		},
 	}
 	writeJSON(t, hooksPath, map[string]any{
 		"hooks": map[string]any{"SessionStart": original},
@@ -156,6 +167,31 @@ func TestInstallPreservesMalformedAndNonCommandEntries(t *testing.T) {
 		t.Fatalf("malformed/non-command entries changed:\ngot  %#v\nwant %#v", groups[:len(original)], original)
 	}
 	assertCommandCount(t, groups, testCommand, 1)
+}
+
+func TestInstallRejectsMalformedEventWithoutChangingFile(t *testing.T) {
+	workspace, hooksPath, manager := newTestManager(t)
+	writeJSON(t, hooksPath, map[string]any{
+		"custom": "keep",
+		"hooks": map[string]any{
+			"SessionStart": map[string]any{"type": "command", "command": "not-an-array"},
+		},
+	})
+	before, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.Install(context.Background(), workspace); err == nil {
+		t.Fatal("Install() error = nil, want malformed event error")
+	}
+	after, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("malformed event changed file\nbefore:\n%s\nafter:\n%s", before, after)
+	}
 }
 
 func TestInstallNormalizesExistingLegacyAOCommandWithoutDuplicate(t *testing.T) {

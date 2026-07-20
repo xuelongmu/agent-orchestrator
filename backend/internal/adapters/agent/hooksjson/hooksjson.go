@@ -353,8 +353,15 @@ func (h *HookEntry) UnmarshalJSON(data []byte) error {
 	h.Timeout = 0
 	h.raw = append(h.raw[:0], data...)
 
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil
+	}
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("decode hook entry: %w", err)
+	}
+	if fields == nil {
 		return nil
 	}
 	_ = json.Unmarshal(fields["type"], &h.Type)
@@ -382,8 +389,15 @@ func (g *MatcherGroup) UnmarshalJSON(data []byte) error {
 	g.raw = append(g.raw[:0], data...)
 	g.valid = false
 
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil
+	}
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("decode matcher group: %w", err)
+	}
+	if fields == nil {
 		return nil
 	}
 	hooksRaw, ok := fields["hooks"]
@@ -395,16 +409,22 @@ func (g *MatcherGroup) UnmarshalJSON(data []byte) error {
 	}
 	var hooks []HookEntry
 	if err := json.Unmarshal(hooksRaw, &hooks); err != nil {
-		return nil
+		return fmt.Errorf("decode matcher group hooks: %w", err)
 	}
 
 	var matcher *string
-	if matcherRaw, ok := fields["matcher"]; ok && string(matcherRaw) != "null" {
-		var value string
-		if err := json.Unmarshal(matcherRaw, &value); err != nil {
-			return nil
+	if matcherRaw, ok := fields["matcher"]; ok {
+		matcherRaw = bytes.TrimSpace(matcherRaw)
+		if string(matcherRaw) != "null" {
+			if len(matcherRaw) == 0 || matcherRaw[0] != '"' {
+				return nil
+			}
+			var value string
+			if err := json.Unmarshal(matcherRaw, &value); err != nil {
+				return fmt.Errorf("decode matcher group matcher: %w", err)
+			}
+			matcher = &value
 		}
-		matcher = &value
 	}
 	g.Matcher = matcher
 	g.Hooks = hooks
