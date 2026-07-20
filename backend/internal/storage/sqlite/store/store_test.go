@@ -1507,6 +1507,35 @@ func TestSessionWorktreesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSessionWorktreeMetadataBackfillNeverCombinesPartialPairs(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ws-partial")
+	rec, err := s.CreateSession(ctx, sampleRecord("ws-partial"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []domain.SessionWorktreeRecord{
+		{SessionID: rec.ID, RepoName: "repo-only", RepoPath: ptrTo("/repos/original"), State: "active"},
+		{SessionID: rec.ID, RepoName: "relative-only", RelativePath: ptrTo("child"), State: "active"},
+	}
+	for _, row := range rows {
+		if err := s.UpsertSessionWorktree(ctx, row); err != nil {
+			t.Fatalf("seed %s: %v", row.RepoName, err)
+		}
+		complete := row
+		complete.RepoPath = ptrTo("/repos/replacement")
+		complete.RelativePath = ptrTo("replacement")
+		if err := s.UpsertSessionWorktree(ctx, complete); err != nil {
+			t.Fatalf("update %s: %v", row.RepoName, err)
+		}
+		got, ok, err := s.GetSessionWorktree(ctx, rec.ID, row.RepoName)
+		if err != nil || !ok || !reflect.DeepEqual(got.RepoPath, row.RepoPath) || !reflect.DeepEqual(got.RelativePath, row.RelativePath) {
+			t.Fatalf("%s metadata = %v/%v ok=%v err=%v, want original partial %v/%v", row.RepoName, got.RepoPath, got.RelativePath, ok, err, row.RepoPath, row.RelativePath)
+		}
+	}
+}
+
 // TestUpsertSessionWorktreeEmptyStateDefaultsToActive exercises the guard in
 // UpsertSessionWorktree: when State is left at its zero value "", the store
 // must default it to "active" so the SQLite CHECK constraint is satisfied.

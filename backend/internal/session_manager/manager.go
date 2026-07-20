@@ -2402,7 +2402,7 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 			continue
 		}
 		var ws ports.WorkspaceInfo
-		restoredWorkspaceProject := project.Kind.WithDefault() == domain.ProjectKindWorkspace
+		restoredWorkspaceProject := project.Kind.WithDefault() == domain.ProjectKindWorkspace || sessionWorktreeRowsHavePersistedMetadata(rows) || len(rows) > 1
 		var projectRows []ports.WorkspaceRepoInfo
 		if restoredWorkspaceProject {
 			var rowErr error
@@ -2520,7 +2520,16 @@ func (m *Manager) markSessionWorktreesActive(ctx context.Context, rows []domain.
 
 func (m *Manager) restoreSessionWorkspace(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord) (ports.WorkspaceInfo, error) {
 	workspaceKind := rec.Metadata.WorkspaceKind.WithDefault()
-	if workspaceKind != domain.WorkspaceKindWorktree || project.Kind.WithDefault() != domain.ProjectKindWorkspace {
+	var markerRows []domain.SessionWorktreeRecord
+	if workspaceKind == domain.WorkspaceKindWorktree {
+		var err error
+		markerRows, err = m.store.ListSessionWorktrees(ctx, rec.ID)
+		if err != nil {
+			return ports.WorkspaceInfo{}, err
+		}
+	}
+	restoreWorkspaceProject := project.Kind.WithDefault() == domain.ProjectKindWorkspace || sessionWorktreeRowsHavePersistedMetadata(markerRows) || len(markerRows) > 1
+	if workspaceKind != domain.WorkspaceKindWorktree || !restoreWorkspaceProject {
 		ws, err := m.workspace.Restore(ctx, ports.WorkspaceConfig{
 			ProjectID:     rec.ProjectID,
 			SessionID:     rec.ID,
@@ -2536,7 +2545,7 @@ func (m *Manager) restoreSessionWorkspace(ctx context.Context, project domain.Pr
 		}
 		return ws, err
 	}
-	rows, err := m.workspaceProjectRestoreRows(ctx, project, rec)
+	rows, err := m.workspaceProjectRestoreRowsFromMarkers(ctx, project, rec, markerRows)
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
@@ -2552,16 +2561,8 @@ func (m *Manager) restoreSessionWorkspace(ctx context.Context, project domain.Pr
 	return workspaceInfoFromRepoInfo(root), nil
 }
 
-func (m *Manager) workspaceProjectRestoreRows(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord) ([]ports.WorkspaceRepoInfo, error) {
-	rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
-	if err != nil {
-		return nil, err
-	}
-	return m.workspaceProjectRestoreRowsFromMarkers(ctx, project, rec, rows)
-}
-
 func (m *Manager) workspaceProjectRestoreRowsFromMarkers(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord, rows []domain.SessionWorktreeRecord) ([]ports.WorkspaceRepoInfo, error) {
-	if len(rows) > 1 {
+	if len(rows) > 1 || len(rows) == 1 && (rows[0].RepoPath != nil || rows[0].RelativePath != nil) {
 		return m.sessionWorktreeRowsToRepoInfos(ctx, project, rec, rows)
 	}
 	childRepos, err := m.store.ListWorkspaceRepos(ctx, project.ID)
@@ -2599,6 +2600,15 @@ func (m *Manager) workspaceProjectRestoreRowsFromMarkers(ctx context.Context, pr
 	return out, nil
 }
 
+func sessionWorktreeRowsHavePersistedMetadata(rows []domain.SessionWorktreeRecord) bool {
+	for _, row := range rows {
+		if row.RepoPath != nil || row.RelativePath != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) workspaceProjectRows(ctx context.Context, rec domain.SessionRecord) ([]ports.WorkspaceRepoInfo, bool, error) {
 	rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
 	if err != nil {
@@ -2610,9 +2620,6 @@ func (m *Manager) workspaceProjectRows(ctx context.Context, rec domain.SessionRe
 	project, err := m.loadProject(ctx, rec.ProjectID)
 	if err != nil {
 		return nil, false, err
-	}
-	if project.Kind.WithDefault() != domain.ProjectKindWorkspace {
-		return nil, false, nil
 	}
 	infos, err := m.sessionWorktreeRowsToRepoInfos(ctx, project, rec, rows)
 	if err != nil {
@@ -2639,6 +2646,9 @@ func (m *Manager) sessionWorktreeRowsToRepoInfos(ctx context.Context, project do
 	repoPaths := map[string]string{}
 	relPaths := map[string]string{}
 	if legacyRows {
+		if project.Kind.WithDefault() != domain.ProjectKindWorkspace {
+			return nil, fmt.Errorf("legacy session worktree inventory no longer matches a workspace project")
+		}
 		childRepos, err := m.store.ListWorkspaceRepos(ctx, project.ID)
 		if err != nil {
 			return nil, err
@@ -2765,6 +2775,9 @@ func optionalWorktreeRepoMetadata(repoPath, relativePath string) (*string, *stri
 func validatePersistedWorktreeMetadata(row domain.SessionWorktreeRecord) error {
 	if *row.RepoPath == "" {
 		return fmt.Errorf("session worktree row %q has empty persisted repo path", row.RepoName)
+	}
+	if !filepath.IsAbs(*row.RepoPath) || filepath.Clean(*row.RepoPath) != *row.RepoPath {
+		return fmt.Errorf("session worktree row %q has malformed persisted repo path %q", row.RepoName, *row.RepoPath)
 	}
 	if row.RepoName == domain.RootWorkspaceRepoName {
 		if *row.RelativePath != "" {

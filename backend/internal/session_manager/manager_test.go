@@ -1753,8 +1753,8 @@ func TestRecoveredDependencyResetUsesPersistedMetadataAfterRegistryDrift(t *test
 	st.workspaceRepo["mer"] = []domain.WorkspaceRepoRecord{{Name: "current", RelativePath: "current"}}
 	st.setSession(base)
 	st.worktrees[base.ID] = []domain.SessionWorktreeRecord{
-		{SessionID: base.ID, RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo("/repo/historical"), RelativePath: ptrTo(""), WorktreePath: "/ws/child", State: "active"},
-		{SessionID: base.ID, RepoName: "historical", RepoPath: ptrTo("/repo/historical/historical"), RelativePath: ptrTo("historical"), WorktreePath: "/ws/child/historical", State: "active"},
+		{SessionID: base.ID, RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo(testRepoPath("historical")), RelativePath: ptrTo(""), WorktreePath: "/ws/child", State: "active"},
+		{SessionID: base.ID, RepoName: "historical", RepoPath: ptrTo(testRepoPath("historical", "historical")), RelativePath: ptrTo("historical"), WorktreePath: "/ws/child/historical", State: "active"},
 	}
 
 	reset, err := m.resetRecoveredDependencyLaunch(base, false)
@@ -3559,8 +3559,8 @@ func TestKill_WorkspaceProjectUsesPersistedMetadataAfterRegistryDrift(t *testing
 		Activity: domain.Activity{State: domain.ActivityActive},
 	}
 	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
-		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo("/repo/mer-then"), RelativePath: ptrTo(""), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1"},
-		{SessionID: "mer-1", RepoName: "old-api", RepoPath: ptrTo("/repo/mer-then/services/old-api"), RelativePath: ptrTo("services/old-api"), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/services/old-api"},
+		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo(testRepoPath("mer-then")), RelativePath: ptrTo(""), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1"},
+		{SessionID: "mer-1", RepoName: "old-api", RepoPath: ptrTo(testRepoPath("mer-then", "services", "old-api")), RelativePath: ptrTo("services/old-api"), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/services/old-api"},
 	}
 
 	freed, err := m.Kill(ctx, "mer-1")
@@ -3579,8 +3579,8 @@ func TestKill_WorkspaceProjectMixedPersistedAndLegacyMetadata(t *testing.T) {
 	st.workspaceRepo["mer"] = []domain.WorkspaceRepoRecord{{Name: "current", RelativePath: "current"}}
 	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1"}, Activity: domain.Activity{State: domain.ActivityActive}}
 	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
-		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo("/repo/mer-old"), RelativePath: ptrTo(""), WorktreePath: "/ws/mer-1"},
-		{SessionID: "mer-1", RepoName: "historical", RepoPath: ptrTo("/repo/mer-old/historical"), RelativePath: ptrTo("historical"), WorktreePath: "/ws/mer-1/historical"},
+		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo(testRepoPath("mer-old")), RelativePath: ptrTo(""), WorktreePath: "/ws/mer-1"},
+		{SessionID: "mer-1", RepoName: "historical", RepoPath: ptrTo(testRepoPath("mer-old", "historical")), RelativePath: ptrTo("historical"), WorktreePath: "/ws/mer-1/historical"},
 		{SessionID: "mer-1", RepoName: "current", WorktreePath: "/ws/mer-1/current"},
 	}
 
@@ -3600,8 +3600,8 @@ func TestKill_WorkspaceProjectMalformedPersistedMetadataFailsClosed(t *testing.T
 	st.workspaceRepo["mer"] = []domain.WorkspaceRepoRecord{{Name: "api", RelativePath: "api"}}
 	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1"}, Activity: domain.Activity{State: domain.ActivityActive}}
 	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
-		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo("/repo/mer"), RelativePath: ptrTo(""), WorktreePath: "/ws/mer-1"},
-		{SessionID: "mer-1", RepoName: "api", RepoPath: ptrTo("/repo/mer/api"), WorktreePath: "/ws/mer-1/api"},
+		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo(testRepoPath("mer")), RelativePath: ptrTo(""), WorktreePath: "/ws/mer-1"},
+		{SessionID: "mer-1", RepoName: "api", RepoPath: ptrTo(testRepoPath("mer", "api")), WorktreePath: "/ws/mer-1/api"},
 	}
 
 	freed, err := m.Kill(ctx, "mer-1")
@@ -3619,8 +3619,8 @@ func TestKill_WorkspaceProjectUnsafePersistedRelativePathFailsClosed(t *testing.
 	st.workspaceRepo["mer"] = []domain.WorkspaceRepoRecord{{Name: "api", RelativePath: "api"}}
 	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1"}, Activity: domain.Activity{State: domain.ActivityActive}}
 	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
-		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo("/repo/mer"), RelativePath: ptrTo(""), WorktreePath: "/ws/mer-1"},
-		{SessionID: "mer-1", RepoName: "api", RepoPath: ptrTo("/repo/mer/api"), RelativePath: ptrTo("../api"), WorktreePath: "/ws/mer-1/api"},
+		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo(testRepoPath("mer")), RelativePath: ptrTo(""), WorktreePath: "/ws/mer-1"},
+		{SessionID: "mer-1", RepoName: "api", RepoPath: ptrTo(testRepoPath("mer", "api")), RelativePath: ptrTo("../api"), WorktreePath: "/ws/mer-1/api"},
 	}
 
 	freed, err := m.Kill(ctx, "mer-1")
@@ -3629,6 +3629,20 @@ func TestKill_WorkspaceProjectUnsafePersistedRelativePathFailsClosed(t *testing.
 	}
 	if len(ws.calls) != 0 {
 		t.Fatalf("destroy calls = %v, want none", ws.calls)
+	}
+}
+
+func TestValidatePersistedWorktreeMetadataRejectsNonAbsoluteOrUncleanRepoPath(t *testing.T) {
+	unclean := testRepoPath("repo") + string(filepath.Separator) + "."
+	for _, repoPath := range []string{filepath.Join("relative", "repo"), unclean} {
+		t.Run(repoPath, func(t *testing.T) {
+			row := domain.SessionWorktreeRecord{
+				RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo(repoPath), RelativePath: ptrTo(""),
+			}
+			if err := validatePersistedWorktreeMetadata(row); err == nil || !strings.Contains(err.Error(), "malformed persisted repo path") {
+				t.Fatalf("validate error = %v, want malformed repo path", err)
+			}
+		})
 	}
 }
 
@@ -4368,6 +4382,31 @@ func TestRestore_WorkspaceProjectRestoresChildrenAndRecordsInventory(t *testing.
 	}
 }
 
+func TestRestore_RootOnlyPersistedMetadataSurvivesProjectKindDrift(t *testing.T) {
+	m, st, rt, ws := newManager()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: testRepoPath("readded-single"), Kind: domain.ProjectKindSingleRepo, Config: testRoleAgents()}
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode, IsTerminated: true,
+		Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1", Prompt: "resume"},
+		Activity: domain.Activity{State: domain.ActivityExited},
+	}
+	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{{
+		SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName,
+		RepoPath: ptrTo(testRepoPath("historical")), RelativePath: ptrTo(""),
+		Branch: "ao/mer-1", WorktreePath: "/ws/mer-1", State: "removed",
+	}}
+
+	if _, err := m.Restore(ctx, "mer-1"); err != nil {
+		t.Fatalf("Restore err = %v", err)
+	}
+	if got := ws.calls; len(got) == 0 || got[0] != "Restore:__root__" {
+		t.Fatalf("restore calls = %v, want persisted root", got)
+	}
+	if rt.created != 1 || len(st.worktrees["mer-1"]) != 1 || st.worktrees["mer-1"][0].State != "active" {
+		t.Fatalf("runtime created=%d rows=%+v", rt.created, st.worktrees["mer-1"])
+	}
+}
+
 func TestRestore_AppliesProjectAgentConfig(t *testing.T) {
 	st := newFakeStore()
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{AgentConfig: domain.AgentConfig{Model: "restore-model"}}}
@@ -4546,6 +4585,26 @@ func TestCleanup_WorkspaceProjectUsesInventoryWhenSessionPathWasReset(t *testing
 	want := []string{"Destroy:api", "Destroy:__root__"}
 	if got := ws.calls; strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("destroy order = %v, want %v", got, want)
+	}
+}
+
+func TestCleanup_WorkspaceProjectPreservesDirtyPersistedChildAfterProjectReaddedAsSingleRepo(t *testing.T) {
+	m, st, _, ws := newManager()
+	ws.destroyErr = fmt.Errorf("dirty historical child: %w", ports.ErrWorkspaceDirty)
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: testRepoPath("readded-single"), Kind: domain.ProjectKindSingleRepo, Config: testRoleAgents()}
+	seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1"})
+	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
+		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo(testRepoPath("historical")), RelativePath: ptrTo(""), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1"},
+		{SessionID: "mer-1", RepoName: "historical", RepoPath: ptrTo(testRepoPath("historical", "child")), RelativePath: ptrTo("child"), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/child"},
+	}
+
+	res, err := m.Cleanup(ctx, "mer")
+	if err != nil || len(res.Cleaned) != 0 || len(res.Skipped) != 1 || res.Skipped[0].SessionID != "mer-1" || res.Skipped[0].Reason != "workspace has uncommitted changes" {
+		t.Fatalf("cleanup = %+v err=%v", res, err)
+	}
+	want := []string{"Destroy:child"}
+	if got := ws.calls; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("destroy calls = %v, want %v", got, want)
 	}
 }
 
@@ -6496,7 +6555,7 @@ func TestRetireForReplacementWorkspaceProjectCapturesAndReleasesEveryRepo(t *tes
 	st.sharedLog = &sharedLog
 	ws.sharedLog = &sharedLog
 	ws.stashRef = "refs/ao/preserved/mer-orch"
-	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/repos/mer", Kind: domain.ProjectKindWorkspace, Config: testRoleAgents()}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: testRepoPath("readded-single"), Kind: domain.ProjectKindSingleRepo, Config: testRoleAgents()}
 	st.workspaceRepo["mer"] = []domain.WorkspaceRepoRecord{{
 		ProjectID:    "mer",
 		Name:         "current",
@@ -6513,7 +6572,7 @@ func TestRetireForReplacementWorkspaceProjectCapturesAndReleasesEveryRepo(t *tes
 		{
 			SessionID:    "mer-orch",
 			RepoName:     domain.RootWorkspaceRepoName,
-			RepoPath:     ptrTo("/repos/mer-historical"),
+			RepoPath:     ptrTo(testRepoPath("mer-historical")),
 			RelativePath: ptrTo(""),
 			Branch:       "ao/mer-orchestrator",
 			WorktreePath: "/ws/mer-orch",
@@ -6523,7 +6582,7 @@ func TestRetireForReplacementWorkspaceProjectCapturesAndReleasesEveryRepo(t *tes
 		{
 			SessionID:    "mer-orch",
 			RepoName:     "api",
-			RepoPath:     ptrTo("/repos/mer-historical/api"),
+			RepoPath:     ptrTo(testRepoPath("mer-historical", "api")),
 			RelativePath: ptrTo("api"),
 			Branch:       "ao/mer-orchestrator",
 			WorktreePath: "/ws/mer-orch/api",
@@ -6990,8 +7049,8 @@ func TestSaveAndTeardownAll_WorkspaceProjectUsesPersistedMetadataAfterRegistryDr
 	ws.stashRef = "refs/ao/preserved/mer-1"
 	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1", RuntimeHandleID: "h1"}, Activity: domain.Activity{State: domain.ActivityActive}}
 	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
-		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo("/repo/historical"), RelativePath: ptrTo(""), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1", State: "active"},
-		{SessionID: "mer-1", RepoName: "historical", RepoPath: ptrTo("/repo/historical/historical"), RelativePath: ptrTo("historical"), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/historical", State: "active"},
+		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo(testRepoPath("historical")), RelativePath: ptrTo(""), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1", State: "active"},
+		{SessionID: "mer-1", RepoName: "historical", RepoPath: ptrTo(testRepoPath("historical", "historical")), RelativePath: ptrTo("historical"), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/historical", State: "active"},
 	}
 
 	if err := m.SaveAndTeardownAll(ctx); err != nil {
@@ -7343,12 +7402,12 @@ func TestRestoreAll_WorkspaceProjectRestoresAndAppliesEachRepo(t *testing.T) {
 
 func TestRestoreAll_WorkspaceProjectUsesPersistedMetadataAfterRegistryDrift(t *testing.T) {
 	m, st, rt, ws := newLifecycleManager()
-	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: "/repo/mer-now", Kind: domain.ProjectKindWorkspace, Config: testRoleAgents()}
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: testRepoPath("readded-single"), Kind: domain.ProjectKindSingleRepo, Config: testRoleAgents()}
 	st.workspaceRepo["mer"] = []domain.WorkspaceRepoRecord{{Name: "current", RelativePath: "current"}}
 	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode, IsTerminated: true, Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1", Prompt: "resume"}, Activity: domain.Activity{State: domain.ActivityExited}}
 	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{
-		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo("/repo/mer-old"), RelativePath: ptrTo(""), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1", State: "removed"},
-		{SessionID: "mer-1", RepoName: "historical", RepoPath: ptrTo("/repo/mer-old/historical"), RelativePath: ptrTo("historical"), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/historical", PreservedRef: "refs/ao/preserved/historical", State: "removed"},
+		{SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo(testRepoPath("mer-old")), RelativePath: ptrTo(""), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1", State: "removed"},
+		{SessionID: "mer-1", RepoName: "historical", RepoPath: ptrTo(testRepoPath("mer-old", "historical")), RelativePath: ptrTo("historical"), Branch: "ao/mer-1", WorktreePath: "/ws/mer-1/historical", PreservedRef: "refs/ao/preserved/historical", State: "removed"},
 	}
 
 	if err := m.RestoreAll(ctx); err != nil {
@@ -7414,6 +7473,31 @@ func TestRestoreAll_WorkspaceProjectRootOnlyMarkerRestoresRegisteredChildren(t *
 	}
 	if states[domain.RootWorkspaceRepoName] != "active" || states["api"] != "active" {
 		t.Fatalf("workspace project row states = %v, want active root and child", states)
+	}
+}
+
+func TestRestoreAll_RootOnlyPersistedMetadataSurvivesProjectKindDrift(t *testing.T) {
+	m, st, rt, ws := newLifecycleManager()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Path: testRepoPath("readded-single"), Kind: domain.ProjectKindSingleRepo, Config: testRoleAgents()}
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode, IsTerminated: true,
+		Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", Branch: "ao/mer-1", Prompt: "resume"},
+		Activity: domain.Activity{State: domain.ActivityExited},
+	}
+	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{{
+		SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName,
+		RepoPath: ptrTo(testRepoPath("historical")), RelativePath: ptrTo(""),
+		Branch: "ao/mer-1", WorktreePath: "/ws/mer-1", State: "removed",
+	}}
+
+	if err := m.RestoreAll(ctx); err != nil {
+		t.Fatalf("RestoreAll err = %v", err)
+	}
+	if got := ws.calls; len(got) == 0 || got[0] != "Restore:__root__" {
+		t.Fatalf("restore calls = %v, want persisted root", got)
+	}
+	if rt.created != 1 || len(st.worktrees["mer-1"]) != 1 || st.worktrees["mer-1"][0].State != "active" {
+		t.Fatalf("runtime created=%d rows=%+v", rt.created, st.worktrees["mer-1"])
 	}
 }
 
@@ -8361,3 +8445,7 @@ func (m *flipOnNudgeMessenger) Send(_ context.Context, _ domain.SessionID, msg s
 }
 
 func ptrTo[T any](value T) *T { return &value }
+
+func testRepoPath(parts ...string) string {
+	return filepath.Join(append([]string{os.TempDir(), "ao-session-manager-test-repos"}, parts...)...)
+}

@@ -155,8 +155,12 @@ const upsertSessionWorktree = `-- name: UpsertSessionWorktree :exec
 INSERT INTO session_worktrees (session_id, repo_name, repo_path, relative_path, branch, base_sha, worktree_path, preserved_ref, state)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (session_id, repo_name) DO UPDATE SET
-    repo_path = COALESCE(session_worktrees.repo_path, excluded.repo_path),
-    relative_path = COALESCE(session_worktrees.relative_path, excluded.relative_path),
+    repo_path = CASE
+        WHEN session_worktrees.repo_path IS NULL AND session_worktrees.relative_path IS NULL
+        THEN excluded.repo_path ELSE session_worktrees.repo_path END,
+    relative_path = CASE
+        WHEN session_worktrees.repo_path IS NULL AND session_worktrees.relative_path IS NULL
+        THEN excluded.relative_path ELSE session_worktrees.relative_path END,
     branch = excluded.branch,
     base_sha = excluded.base_sha,
     worktree_path = excluded.worktree_path,
