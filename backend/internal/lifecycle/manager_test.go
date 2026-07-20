@@ -1150,6 +1150,31 @@ func TestSCMObservation_AnchoredBotReviewNudgesAgent(t *testing.T) {
 	}
 }
 
+func TestSCMObservation_AnchoredBotReviewSuppressesReadyNotification(t *testing.T) {
+	st := newFakeStore()
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{}
+	m := New(st, msg, WithNotificationSink(sink))
+	st.sessions["mer-1"] = working("mer-1")
+	o := botReviewObservation("frontend/src/App.tsx", 42, false)
+	o.CI = ports.SCMCIObservation{Summary: string(domain.CIPassing), HeadSHA: "c1"}
+	o.Review.Decision = string(domain.ReviewNone)
+	o.Review.HeadSHA = "c1"
+	o.Mergeability = ports.SCMMergeabilityObservation{State: string(domain.MergeMergeable)}
+	if !scmObservationIsReadyToMerge(o) {
+		t.Fatal("test requires provider merge readiness to remain otherwise eligible")
+	}
+	if err := m.ApplySCMObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("anchored bot review nudges = %d, want 1: %v", len(msg.msgs), msg.msgs)
+	}
+	if len(sink.intents) != 0 {
+		t.Fatalf("anchored bot review simultaneously emitted ready notification: %+v", sink.intents)
+	}
+}
+
 func TestSCMObservation_UnanchoredBotReviewIsSuppressed(t *testing.T) {
 	for _, tc := range []struct {
 		name string

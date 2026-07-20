@@ -1189,7 +1189,12 @@ func (m *Manager) notificationIntentForSCM(rec domain.SessionRecord, o ports.SCM
 		base.Type = domain.NotificationPRClosedUnmerged
 		return &base
 	}
-	if rec.IsTerminated || rec.Activity.State.NeedsInput() || !scmObservationIsReadyToMerge(o) {
+	// Merge readiness deliberately has a narrower bot-review policy than agent
+	// feedback routing. Do not change that provider policy here, but also do not
+	// tell the user a PR is ready in the same observation that routes actionable
+	// anchored feedback to its worker.
+	if rec.IsTerminated || rec.Activity.State.NeedsInput() || !scmObservationIsReadyToMerge(o) ||
+		hasUnresolvedComments(scmToPRObservation(o).Comments) {
 		return nil
 	}
 	base.Type = domain.NotificationReadyToMerge
