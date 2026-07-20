@@ -513,6 +513,10 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 		}
 		nudges = append(nudges, pendingNudge{key: "review:" + o.URL, sig: sig, msg: msg, maxAttempts: reviewMaxNudge})
 	}
+	// Only the merge-conflict lane needs the parent-stack store read. If that
+	// read fails, defer its error until after the independent CI/review nudges
+	// have been sent; the conflict lane will retry on the next observation.
+	var blockedCheckErr error
 	if o.Mergeability == domain.MergeConflicting && strings.TrimSpace(o.URL) != "" && strings.TrimSpace(o.HeadSHA) != "" {
 		// Only the bottom of a stack is eligible for the rebase nudge. A PR
 		// stacked on an open parent is expected to report conflicts against its
@@ -521,9 +525,8 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 		// post-retarget recompute window) never reaches here.
 		blocked, err := m.prBlockedByOpenParent(ctx, id, o.URL)
 		if err != nil {
-			return err
-		}
-		if !blocked {
+			blockedCheckErr = err
+		} else if !blocked {
 			sig := mergeConflictSignature(o)
 			key := mergeConflictNudgeKey(o.URL, sig)
 			if err := m.resetMergeConflictNudges(ctx, o.URL, key); err != nil {
@@ -552,6 +555,9 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 			// observer withholds its semantic acknowledgement and retries.
 			reactionErrs = append(reactionErrs, err)
 		}
+	}
+	if blockedCheckErr != nil {
+		reactionErrs = append(reactionErrs, blockedCheckErr)
 	}
 	return errors.Join(reactionErrs...)
 }

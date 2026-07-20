@@ -39,6 +39,7 @@ type fakeStore struct {
 	afterSessionRead func(domain.SessionID, int)
 	sessionReads     int
 
+	listPRsErr        error
 	signatureWriteErr error
 	signatureWrites   int
 }
@@ -60,6 +61,9 @@ func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.S
 }
 
 func (f *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]domain.PullRequest, error) {
+	if f.listPRsErr != nil {
+		return nil, f.listPRsErr
+	}
 	return f.prs[id], nil
 }
 
@@ -1100,6 +1104,48 @@ func TestPRObservation_CIFailingAndReviewBothNudge(t *testing.T) {
 	}
 	if len(msg.msgs) != 2 {
 		t.Fatalf("re-observation should not re-nudge, got %d: %v", len(msg.msgs), msg.msgs)
+	}
+}
+
+func TestPRObservation_MergeConflictReadErrorStillSendsCIAndReview(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	st.listPRsErr = errors.New("transient store read failure")
+	o := ports.PRObservation{
+		Fetched:      true,
+		URL:          "pr1",
+		HeadSHA:      "c1",
+		TargetBranch: "main",
+		CI:           domain.CIFailing,
+		Checks:       []ports.PRCheckObservation{{Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed, LogTail: "boom"}},
+		Review:       domain.ReviewChangesRequest,
+		Comments:     []ports.PRCommentObservation{{ID: "1", Author: "alice", Body: "fix this"}},
+		Mergeability: domain.MergeConflicting,
+	}
+	if err := m.ApplyPRObservation(ctx, "mer-1", o); err == nil {
+		t.Fatal("want the deferred parent-stack read error surfaced")
+	}
+	if len(msg.msgs) != 2 {
+		t.Fatalf("want CI and review nudges sent, got %d: %v", len(msg.msgs), msg.msgs)
+	}
+	if !strings.Contains(msg.msgs[0], "boom") || !strings.Contains(msg.msgs[1], "fix this") {
+		t.Fatalf("independent nudges missing or reordered: %v", msg.msgs)
+	}
+	for _, sent := range msg.msgs {
+		if strings.Contains(sent, "merge conflicts") {
+			t.Fatalf("merge-conflict nudge must be skipped on read error, got %q", sent)
+		}
+	}
+
+	st.listPRsErr = nil
+	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 3 {
+		t.Fatalf("want merge-conflict nudge after recovery with CI/review deduped, got %d: %v", len(msg.msgs), msg.msgs)
+	}
+	if !strings.Contains(msg.msgs[2], "merge conflicts") {
+		t.Fatalf("third nudge should be the recovered merge-conflict nudge, got %q", msg.msgs[2])
 	}
 }
 
