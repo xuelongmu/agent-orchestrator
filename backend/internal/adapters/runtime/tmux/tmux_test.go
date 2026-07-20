@@ -530,7 +530,32 @@ func TestDestroyRejectsPanePIDReuseBeforeAnchorCompletes(t *testing.T) {
 	}
 }
 
-func TestDestroyFailsClosedWhenSurvivorVerificationFails(t *testing.T) {
+func TestReapAfterSurvivorCheckReapsForEveryMissingServerSpelling(t *testing.T) {
+	for name, output := range map[string]string{
+		"no server running":       "no server running on /tmp/tmux-1000/default",
+		"socket missing":          "error connecting to /tmp/tmux-1000/default (No such file or directory)",
+		"socket without listener": "error connecting to /tmp/tmux-1000/default (Connection refused)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, fr := newTestRuntime(0)
+			fr.outputs = [][]byte{[]byte(output)}
+			fr.err = &exec.ExitError{}
+			reaper := &recordingReaper{}
+			r.sessionReaper = reaper
+			pane := paneRef{paneID: "%1", windowID: "@1", pid: 4242}
+			identity := processIdentity{pid: 4242, sessionID: 4242, started: "anchored"}
+
+			r.reapAfterSurvivorCheck(context.Background(), []sessionAnchor{{
+				pane: pane, sessionID: 4242, members: identitySet{identity: {}},
+			}})
+			if len(reaper.calls) != 1 {
+				t.Fatalf("reaper calls = %#v, want one after definitive missing-server output", reaper.calls)
+			}
+		})
+	}
+}
+
+func TestDestroyFailsClosedOnAmbiguousSurvivorVerificationError(t *testing.T) {
 	r, _ := newTestRuntime(0)
 	panes := []byte("%1 @1 4242 0\n")
 	call := 0
@@ -542,7 +567,7 @@ func TestDestroyFailsClosedWhenSurvivorVerificationFails(t *testing.T) {
 		if args[0] == "kill-session" {
 			return nil, nil
 		}
-		return []byte("permission denied"), &exec.ExitError{}
+		return []byte("error connecting to /tmp/tmux-1000/default (Permission denied)"), &exec.ExitError{}
 	})
 	reaper := &recordingReaper{}
 	r.sessionReaper = reaper

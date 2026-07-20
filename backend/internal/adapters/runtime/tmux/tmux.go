@@ -298,7 +298,7 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.timeout)
 	defer cancel()
 	out, err := r.run(probeCtx, listAllWindowIDsArgs()...)
-	if err != nil && !noServerRunningOutput(string(out)) {
+	if err != nil && !serverMissingOutput(string(out)) {
 		return
 	}
 	surviving := make(map[string]struct{})
@@ -547,14 +547,24 @@ func handleID(handle ports.RuntimeHandle) (string, error) {
 // than a transient probe failure.
 func sessionMissingOutput(out string) bool {
 	s := strings.ToLower(out)
-	return strings.Contains(s, "can't find session") ||
-		strings.Contains(s, "no server running") ||
-		strings.Contains(s, "error connecting") ||
+	return serverMissingOutput(s) ||
+		strings.Contains(s, "can't find session") ||
 		strings.Contains(s, "session not found")
 }
 
-func noServerRunningOutput(out string) bool {
-	return strings.Contains(strings.ToLower(out), "no server running")
+// serverMissingOutput is the authoritative set of tmux spellings that prove
+// there is no server to own a surviving window. Other command failures are
+// ambiguous and must keep descendant reaping disabled.
+func serverMissingOutput(out string) bool {
+	s := strings.ToLower(out)
+	if strings.Contains(s, "no server running") {
+		return true
+	}
+	if !strings.Contains(s, "error connecting") {
+		return false
+	}
+	return strings.Contains(s, "no such file or directory") ||
+		strings.Contains(s, "connection refused")
 }
 
 // killSessionMissingOutput reports whether a non-zero `tmux kill-session`
