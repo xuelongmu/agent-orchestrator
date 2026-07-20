@@ -64,10 +64,14 @@ func activityMeta(payload []byte) (toolName, toolUseID, errorType string) {
 	var p struct {
 		ToolName        string `json:"tool_name"`
 		ToolUseID       string `json:"tool_use_id"`
+		ToolCallID      string `json:"tool_call_id"`
 		Error           string `json:"error"`
 		LegacyErrorType string `json:"error_type"`
 	}
 	_ = json.Unmarshal(payload, &p)
+	if p.ToolUseID == "" {
+		p.ToolUseID = p.ToolCallID
+	}
 	errorType = strings.TrimSpace(p.Error)
 	if errorType == "" {
 		errorType = strings.TrimSpace(p.LegacyErrorType)

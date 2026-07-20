@@ -496,6 +496,10 @@ type toolFlight struct {
 	// NOT be mistaken for the approval). Either way, empty means nothing
 	// tool-shaped may clear the block and it lifts only at a turn boundary.
 	blockedCandidate string
+	// turnEnded retains the ids whose observation-only post callbacks may
+	// still arrive after Stop. Those delayed callbacks drain tracking but must
+	// not overwrite the completed turn's idle state.
+	turnEnded bool
 }
 
 // maxInflightTools caps a session's in-flight map so lost posts cannot grow
@@ -540,10 +544,19 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 	}
 
 	// Tracking side effects happen regardless of what the state decision is.
+	delayedPostAfterStop := false
 	switch s.Event {
 	case "pre-tool-use":
 		if s.ToolUseID != "" {
 			f := ensure()
+			if f.turnEnded {
+				// This pre belongs to a new turn. Any posts still outstanding
+				// from the completed turn are stale and no longer need tracking:
+				// the new pre itself already establishes active state.
+				f.inflight = map[string]string{}
+				f.blockedCandidate = ""
+				f.turnEnded = false
+			}
 			if len(f.inflight) >= maxInflightTools {
 				f.inflight = map[string]string{}
 			}
@@ -551,11 +564,28 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 		}
 	case "post-tool-use", "post-tool-use-failure":
 		if fl != nil {
+			_, tracked := fl.inflight[s.ToolUseID]
+			delayedPostAfterStop = fl.turnEnded && tracked
 			delete(fl.inflight, s.ToolUseID)
+		}
+	case "stop":
+		if fl != nil {
+			if len(fl.inflight) == 0 {
+				delete(m.flights, id)
+			} else {
+				fl.blockedCandidate = ""
+				fl.turnEnded = true
+			}
 		}
 	}
 
 	switch {
+	case delayedPostAfterStop:
+		if len(fl.inflight) == 0 {
+			delete(m.flights, id)
+		}
+		return suppressed
+
 	case s.State == domain.ActivityBlocked:
 		// Entering (or re-asserting) blocked: snapshot the dialog's identity.
 		// permission-request carries the blocking tool_name; the Notification
@@ -595,7 +625,9 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 		// may change the state.
 		switch {
 		case isTurnBoundaryEvent(s.Event):
-			delete(m.flights, id)
+			if s.Event != "stop" {
+				delete(m.flights, id)
+			}
 			return s
 		case (s.Event == "post-tool-use" || s.Event == "post-tool-use-failure") &&
 			fl != nil && fl.blockedCandidate != "" && s.ToolUseID == fl.blockedCandidate:
@@ -618,7 +650,7 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 		return suppressed
 
 	default:
-		if isTurnBoundaryEvent(s.Event) {
+		if isTurnBoundaryEvent(s.Event) && s.Event != "stop" {
 			delete(m.flights, id)
 		}
 		return s

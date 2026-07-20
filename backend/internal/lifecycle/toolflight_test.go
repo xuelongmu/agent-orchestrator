@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/activitydispatch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -33,6 +34,36 @@ func mustApply(t *testing.T, m *Manager, id domain.SessionID, s ports.ActivitySi
 
 func stateOf(st *fakeStore, id domain.SessionID) domain.ActivityState {
 	return st.sessions[id].Activity.State
+}
+
+func applyKimiHook(t *testing.T, m *Manager, id domain.SessionID, event, toolName, toolUseID string) {
+	t.Helper()
+	state, ok := activitydispatch.Derive("kimi", event, nil)
+	if !ok {
+		t.Fatalf("derive kimi/%s: no activity signal", event)
+	}
+	mustApply(t, m, id, sig(state, event, toolName, toolUseID))
+}
+
+func TestKimiPermissionLifecycleDispatch(t *testing.T) {
+	m, st, _ := newManager()
+	seedSignaled(st, "mer-1", domain.ActivityIdle)
+
+	steps := []struct {
+		event string
+		want  domain.ActivityState
+	}{
+		{"pre-tool-use", domain.ActivityActive},
+		{"permission-request", domain.ActivityWaitingInput},
+		{"permission-result", domain.ActivityActive},
+		{"post-tool-use", domain.ActivityActive},
+	}
+	for _, step := range steps {
+		applyKimiHook(t, m, "mer-1", step.event, "Shell", "call_42")
+		if got := stateOf(st, "mer-1"); got != step.want {
+			t.Fatalf("state after %s = %q, want %q", step.event, got, step.want)
+		}
+	}
 }
 
 // blockOnDialog drives a session into blocked through the real signal path:
@@ -68,6 +99,22 @@ func TestToolPrecedence_ApprovedToolFailurePostAlsoClears(t *testing.T) {
 	mustApply(t, m, "mer-1", sig(domain.ActivityActive, "post-tool-use-failure", "Bash", "toolu_1"))
 	if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
 		t.Fatalf("state after approved tool's failure post = %q, want active", got)
+	}
+}
+
+func TestToolPrecedence_DelayedPostAfterStopStaysIdle(t *testing.T) {
+	for _, event := range []string{"post-tool-use", "post-tool-use-failure"} {
+		t.Run(event, func(t *testing.T) {
+			m, st, _ := newManager()
+			seedSignaled(st, "mer-1", domain.ActivityActive)
+			mustApply(t, m, "mer-1", sig(domain.ActivityActive, "pre-tool-use", "Shell", "call_42"))
+			mustApply(t, m, "mer-1", sig(domain.ActivityIdle, "stop", "", ""))
+			mustApply(t, m, "mer-1", sig(domain.ActivityActive, event, "Shell", "call_42"))
+
+			if got := stateOf(st, "mer-1"); got != domain.ActivityIdle {
+				t.Fatalf("state after delayed %s = %q, want idle", event, got)
+			}
+		})
 	}
 }
 

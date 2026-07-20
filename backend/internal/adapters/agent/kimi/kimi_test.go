@@ -274,6 +274,8 @@ timeout = 7
 		`command = "ao hooks kimi post-tool-use-failure"`,
 		`event = "PermissionRequest"`,
 		`command = "ao hooks kimi permission-request"`,
+		`event = "PermissionResult"`,
+		`command = "ao hooks kimi permission-result"`,
 		`event = "Stop"`,
 		`command = "ao hooks kimi stop"`,
 		kimiHooksSentinelEnd,

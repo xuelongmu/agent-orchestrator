@@ -57,7 +57,7 @@ func TestGrokDerivesClaudeCompatibleActivity(t *testing.T) {
 }
 
 func TestKimiDerivesToolUseActivity(t *testing.T) {
-	for _, event := range []string{"pre-tool-use", "post-tool-use", "post-tool-use-failure"} {
+	for _, event := range []string{"pre-tool-use", "post-tool-use", "post-tool-use-failure", "permission-result"} {
 		t.Run(event, func(t *testing.T) {
 			got, ok := Derive("kimi", event, []byte(`{"tool_name":"Shell"}`))
 			if !ok {

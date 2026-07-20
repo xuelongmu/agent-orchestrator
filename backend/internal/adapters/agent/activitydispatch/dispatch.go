@@ -15,6 +15,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/codex"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/devin"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/droid"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/kimi"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/opencode"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
@@ -39,7 +40,7 @@ var Derivers = map[string]DeriveFunc{
 	"cursor":      activitystate.StandardDeriveActivityState,
 	"qwen":        activitystate.StandardDeriveActivityState,
 	"copilot":     activitystate.StandardDeriveActivityState,
-	"kimi":        activitystate.StandardDeriveActivityState,
+	"kimi":        kimi.DeriveActivityState,
 	"cline":       activitystate.StandardDeriveActivityState,
 	"kiro":        activitystate.StandardDeriveActivityState,
 	"kilocode":    activitystate.StandardDeriveActivityState,

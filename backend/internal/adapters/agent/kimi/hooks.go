@@ -199,6 +199,7 @@ func kimiHooksConfigBlock() string {
 		kimiHookEntry("PostToolUse", "", "ao hooks kimi post-tool-use") +
 		kimiHookEntry("PostToolUseFailure", "", "ao hooks kimi post-tool-use-failure") +
 		kimiHookEntry("PermissionRequest", "", "ao hooks kimi permission-request") +
+		kimiHookEntry("PermissionResult", "", "ao hooks kimi permission-result") +
 		kimiHookEntry("Stop", "", "ao hooks kimi stop") +
 		kimiHooksSentinelEnd + "\n"
 }
