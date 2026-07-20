@@ -683,11 +683,19 @@ func (s *Store) MarkReservedDependencyLaunchSucceeded(ctx context.Context, id do
 	return rows > 0, nil
 }
 
-// ResetReservedDependencyLaunch clears launch-owned state while retaining the prepared child for retry.
-func (s *Store) ResetReservedDependencyLaunch(ctx context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error) {
+// ResetReservedDependencyLaunch clears launch-owned state while retaining the
+// prepared child for retry. Clean teardown consumes its worktree inventory in
+// the same token-fenced transaction; dirty teardown keeps it for later cleanup.
+func (s *Store) ResetReservedDependencyLaunch(ctx context.Context, id domain.SessionID, token string, preserveWorktrees bool, updatedAt time.Time) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	rows, err := s.qw.ResetReservedDependencyLaunch(ctx, gen.ResetReservedDependencyLaunchParams{
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin reset reserved dependency launch for %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := s.qw.WithTx(tx)
+	rows, err := q.ResetReservedDependencyLaunch(ctx, gen.ResetReservedDependencyLaunchParams{
 		ActivityLastAt:           updatedAt,
 		UpdatedAt:                updatedAt,
 		ID:                       id,
@@ -696,7 +704,18 @@ func (s *Store) ResetReservedDependencyLaunch(ctx context.Context, id domain.Ses
 	if err != nil {
 		return false, fmt.Errorf("reset reserved dependency launch for %s: %w", id, err)
 	}
-	return rows > 0, nil
+	if rows == 0 {
+		return false, nil
+	}
+	if !preserveWorktrees {
+		if err := q.DeleteSessionWorktrees(ctx, id); err != nil {
+			return false, fmt.Errorf("consume reset dependency worktrees for %s: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit reset reserved dependency launch for %s: %w", id, err)
+	}
+	return true, nil
 }
 
 // ListDependencyHandoffs returns ordered prerequisite completion context for a

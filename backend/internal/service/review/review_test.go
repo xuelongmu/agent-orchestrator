@@ -74,7 +74,7 @@ func (f *fakeStore) MarkReservedDependencyLaunchSucceeded(_ context.Context, id 
 	f.sessions[id] = rec
 	return true, nil
 }
-func (f *fakeStore) ResetReservedDependencyLaunch(_ context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error) {
+func (f *fakeStore) ResetReservedDependencyLaunch(_ context.Context, id domain.SessionID, token string, _ bool, updatedAt time.Time) (bool, error) {
 	rec, ok := f.sessions[id]
 	if !ok || !rec.DependencyPromotedAt.IsZero() || rec.DependencyPromotionToken != token {
 		return false, nil

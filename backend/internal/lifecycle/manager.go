@@ -25,7 +25,7 @@ type sessionStore interface {
 	MarkReservedDependencySpawned(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, updatedAt time.Time) (bool, error)
 	PrepareReservedDependencyWorkspace(ctx context.Context, id domain.SessionID, token string, metadata domain.SessionMetadata, worktrees []domain.SessionWorktreeRecord, updatedAt time.Time) (bool, error)
 	MarkReservedDependencyLaunchSucceeded(ctx context.Context, id domain.SessionID, token string, succeededAt time.Time) (bool, error)
-	ResetReservedDependencyLaunch(ctx context.Context, id domain.SessionID, token string, updatedAt time.Time) (bool, error)
+	ResetReservedDependencyLaunch(ctx context.Context, id domain.SessionID, token string, preserveWorktrees bool, updatedAt time.Time) (bool, error)
 	// ListPRsBySession returns every PR row tracked for the session. The
 	// reducer reads it to apply the multi-PR completion rule (terminate only
 	// when no open PR remains and at least one merged) and to suppress
@@ -736,10 +736,10 @@ func (m *Manager) MarkDependencyLaunchSucceeded(ctx context.Context, id domain.S
 
 // ResetDependencyLaunch clears only resources previously committed under the
 // same promotion token after an owned post-start delivery failure.
-func (m *Manager) ResetDependencyLaunch(ctx context.Context, id domain.SessionID, token string) (bool, error) {
+func (m *Manager) ResetDependencyLaunch(ctx context.Context, id domain.SessionID, token string, preserveWorktrees bool) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.store.ResetReservedDependencyLaunch(ctx, id, token, m.clock())
+	return m.store.ResetReservedDependencyLaunch(ctx, id, token, preserveWorktrees, m.clock())
 }
 
 // MarkTerminated marks a session terminated without tearing down external resources.
