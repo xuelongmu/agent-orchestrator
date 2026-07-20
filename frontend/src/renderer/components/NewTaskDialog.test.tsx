@@ -104,8 +104,13 @@ describe("NewTaskDialog", () => {
 		expect(context.getByText("/repos/careerops", { selector: "code" })).toBeVisible();
 	});
 
-	it("shows every repository for a first-class workspace project", async () => {
+	it("keeps a many-repository workspace within a scrollable viewport-bounded dialog", async () => {
 		const originalImplementation = getMock.getMockImplementation();
+		const workspaceRepos = Array.from({ length: 12 }, (_, index) => ({
+			name: `service-${index + 1}`,
+			relativePath: `services/service-${index + 1}`,
+			repo: `github.com/acme/service-${index + 1}`,
+		}));
 		getMock.mockImplementation((path: string) => {
 			if (path === "/api/v1/projects/{id}") {
 				return Promise.resolve({
@@ -118,10 +123,7 @@ describe("NewTaskDialog", () => {
 							path: "/repos/product-suite",
 							defaultBranch: "main",
 							agent: "claude-code",
-							workspaceRepos: [
-								{ name: "web", relativePath: "apps/web", repo: "github.com/acme/web" },
-								{ name: "api", relativePath: "apps/api", repo: "github.com/acme/api" },
-							],
+							workspaceRepos,
 						},
 					},
 					error: undefined,
@@ -133,8 +135,10 @@ describe("NewTaskDialog", () => {
 		renderDialog();
 
 		const repositories = within(await screen.findByRole("list", { name: "Repositories" }));
-		expect(repositories.getByText("github.com/acme/web")).toBeInTheDocument();
-		expect(repositories.getByText("github.com/acme/api")).toBeInTheDocument();
+		expect(repositories.getAllByRole("listitem")).toHaveLength(12);
+		const dialog = screen.getByRole("dialog", { name: "New task" });
+		expect(dialog).toHaveClass("flex", "max-h-[min(720px,calc(100svh-24px))]", "overflow-hidden");
+		expect(dialog.querySelector("form")).toHaveClass("min-h-0", "flex-1", "overflow-y-auto");
 	});
 
 	it("aligns the Agent, Workspace, and Branch fields with matching labels and compact controls", async () => {

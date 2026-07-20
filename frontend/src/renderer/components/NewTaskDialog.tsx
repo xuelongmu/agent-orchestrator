@@ -131,8 +131,8 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 		<Dialog.Root open={open} onOpenChange={onOpenChange}>
 			<Dialog.Portal>
 				<Dialog.Overlay className="fixed inset-0 z-overlay bg-scrim data-[state=open]:animate-overlay-in" />
-				<Dialog.Content className="fixed left-1/2 top-1/2 z-overlay w-dialog-xl -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-popover p-0 text-popover-foreground shadow-xl data-[state=open]:animate-modal-in">
-					<div className="flex items-start justify-between gap-4 border-b border-border px-5 py-4">
+				<Dialog.Content className="fixed left-1/2 top-1/2 z-overlay flex max-h-[min(720px,calc(100svh-24px))] w-dialog-xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-lg border border-border bg-popover p-0 text-popover-foreground shadow-xl data-[state=open]:animate-modal-in">
+					<div className="flex shrink-0 items-start justify-between gap-4 border-b border-border px-5 py-4">
 						<div className="min-w-0">
 							<Dialog.Title className="text-subtitle font-semibold text-foreground">New task</Dialog.Title>
 							<Dialog.Description className="mt-1 text-xs text-muted-foreground">
@@ -150,7 +150,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 						</Dialog.Close>
 					</div>
 
-					<form onSubmit={submit} className="space-y-4 px-5 py-4">
+					<form onSubmit={submit} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
 						<div
 							aria-busy={projectQuery.isPending}
 							aria-label="Task execution context"
