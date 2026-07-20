@@ -37,7 +37,7 @@ var (
 type Manager interface {
 	Trigger(ctx context.Context, workerID domain.SessionID) (reviewcore.TriggerResult, error)
 	Cancel(ctx context.Context, workerID domain.SessionID) (reviewcore.CancelResult, error)
-	Submit(ctx context.Context, workerID domain.SessionID, runID string, verdict domain.ReviewVerdict, body, githubReviewID string) (domain.ReviewRun, error)
+	SubmitOne(ctx context.Context, workerID domain.SessionID, review SubmittedReview) (domain.ReviewRun, error)
 	SubmitMany(ctx context.Context, workerID domain.SessionID, reviews []SubmittedReview) ([]domain.ReviewRun, error)
 	List(ctx context.Context, workerID domain.SessionID) (reviewcore.SessionReviews, error)
 }
@@ -202,12 +202,18 @@ type SubmittedFinding struct {
 
 // Submit records a reviewer's result for a specific worker review pass.
 func (s *Service) Submit(ctx context.Context, workerID domain.SessionID, runID string, verdict domain.ReviewVerdict, body, githubReviewID string) (domain.ReviewRun, error) {
-	runs, err := s.SubmitMany(ctx, workerID, []SubmittedReview{{
+	return s.SubmitOne(ctx, workerID, SubmittedReview{
 		RunID:          runID,
 		Verdict:        verdict,
 		Body:           body,
 		GithubReviewID: githubReviewID,
-	}})
+	})
+}
+
+// SubmitOne records one structured result while preserving the singular API's
+// error contract when the run was already superseded.
+func (s *Service) SubmitOne(ctx context.Context, workerID domain.SessionID, review SubmittedReview) (domain.ReviewRun, error) {
+	runs, err := s.SubmitMany(ctx, workerID, []SubmittedReview{review})
 	if err != nil {
 		return domain.ReviewRun{}, err
 	}

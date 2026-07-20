@@ -19,12 +19,13 @@ import (
 )
 
 type fakeReviewService struct {
-	triggerErr error
-	cancelErr  error
-	trigger    reviewcore.TriggerResult
-	cancel     reviewcore.CancelResult
-	list       reviewcore.SessionReviews
-	submitted  []reviewsvc.SubmittedReview
+	triggerErr   error
+	cancelErr    error
+	trigger      reviewcore.TriggerResult
+	cancel       reviewcore.CancelResult
+	list         reviewcore.SessionReviews
+	submitted    []reviewsvc.SubmittedReview
+	submitOneErr error
 }
 
 func (f *fakeReviewService) Trigger(context.Context, domain.SessionID) (reviewcore.TriggerResult, error) {
@@ -37,8 +38,12 @@ func (f *fakeReviewService) Trigger(context.Context, domain.SessionID) (reviewco
 	return reviewcore.TriggerResult{Run: domain.ReviewRun{ID: "run-1"}, Created: true}, nil
 }
 
-func (f *fakeReviewService) Submit(context.Context, domain.SessionID, string, domain.ReviewVerdict, string, string) (domain.ReviewRun, error) {
-	return domain.ReviewRun{}, nil
+func (f *fakeReviewService) SubmitOne(_ context.Context, _ domain.SessionID, review reviewsvc.SubmittedReview) (domain.ReviewRun, error) {
+	f.submitted = []reviewsvc.SubmittedReview{review}
+	if f.submitOneErr != nil {
+		return domain.ReviewRun{}, f.submitOneErr
+	}
+	return domain.ReviewRun{ID: review.RunID, Verdict: review.Verdict, Body: review.Body, GithubReviewID: review.GithubReviewID}, nil
 }
 
 func (f *fakeReviewService) Cancel(context.Context, domain.SessionID) (reviewcore.CancelResult, error) {
@@ -179,5 +184,17 @@ func TestReviewsSubmitAcceptsBatchedReviews(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("body missing %s: %s", want, body)
 		}
+	}
+}
+
+func TestReviewsSubmitSingularSupersededReturns422(t *testing.T) {
+	svc := &fakeReviewService{submitOneErr: fmt.Errorf("%w: review run %q is not running", reviewsvc.ErrInvalid, "run-1")}
+	srv := newReviewTestServer(t, svc)
+
+	body, status, headers := doRequest(t, srv, "POST", "/api/v1/sessions/mer-1/reviews/submit", `{"runId":"run-1","verdict":"changes_requested","body":"stale feedback","findings":[{"classTag":"stale-finding"}]}`)
+	assertJSON(t, headers)
+	assertErrorCode(t, body, status, http.StatusUnprocessableEntity, "REVIEW_INVALID")
+	if len(svc.submitted) != 1 || svc.submitted[0].RunID != "run-1" || len(svc.submitted[0].Findings) != 1 {
+		t.Fatalf("singular submission was not routed intact: %+v", svc.submitted)
 	}
 }
