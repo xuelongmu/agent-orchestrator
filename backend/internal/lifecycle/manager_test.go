@@ -859,6 +859,33 @@ func TestMarkTerminated(t *testing.T) {
 	}
 }
 
+func TestMarkTerminatedIfExited(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		rec        domain.SessionRecord
+		wantMarked bool
+	}{
+		{name: "exited", rec: domain.SessionRecord{ID: "mer-1", Activity: domain.Activity{State: domain.ActivityExited}}, wantMarked: true},
+		{name: "active", rec: working("mer-1"), wantMarked: false},
+		{name: "already terminal", rec: domain.SessionRecord{ID: "mer-1", Activity: domain.Activity{State: domain.ActivityExited}, IsTerminated: true}, wantMarked: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m, st, _ := newManager()
+			st.sessions[tt.rec.ID] = tt.rec
+			marked, err := m.MarkTerminatedIfExited(ctx, tt.rec.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if marked != tt.wantMarked {
+				t.Fatalf("marked = %v, want %v", marked, tt.wantMarked)
+			}
+			if got := st.sessions[tt.rec.ID].IsTerminated; got != tt.wantMarked {
+				t.Fatalf("isTerminated = %v, want %v", got, tt.wantMarked)
+			}
+		})
+	}
+}
+
 func TestMarkSpawnedStoresRuntimeMetadata(t *testing.T) {
 	m, st, _ := newManager()
 	st.sessions["mer-1"] = working("mer-1")

@@ -386,6 +386,25 @@ func (l *fakeLCM) MarkTerminated(_ context.Context, id domain.SessionID) error {
 	l.store.sessions[id] = rec
 	return nil
 }
+func (l *fakeLCM) MarkTerminatedIfExited(_ context.Context, id domain.SessionID) (bool, error) {
+	if l.beforeTerminated != nil {
+		l.beforeTerminated(id)
+	}
+	rec := l.store.sessions[id]
+	if rec.IsTerminated {
+		return true, nil
+	}
+	if rec.Activity.State != domain.ActivityExited {
+		return false, nil
+	}
+	if l.terminated == nil {
+		l.terminated = map[domain.SessionID]int{}
+	}
+	l.terminated[id]++
+	rec.IsTerminated = true
+	l.store.sessions[id] = rec
+	return true, nil
+}
 
 type fakeRuntime struct {
 	createErr          error
@@ -3453,6 +3472,50 @@ func TestRestore_ReopensTerminal(t *testing.T) {
 	}
 	if rt.created != 1 {
 		t.Fatal("restore should relaunch")
+	}
+}
+
+func TestRestore_RepairsExitedSessionMissingTerminalFact(t *testing.T) {
+	m, st, rt, ws := newManager()
+	rec := mkLive("mer-1")
+	rec.Metadata.Branch = "b"
+	rec.Metadata.AgentSessionID = "agent-x"
+	rec.Activity = domain.Activity{State: domain.ActivityExited}
+	st.sessions[rec.ID] = rec
+	rt.aliveByHandle = map[string]bool{rec.Metadata.RuntimeHandleID: true}
+
+	restored, err := m.Restore(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.IsTerminated || restored.Activity.State != domain.ActivityIdle {
+		t.Fatalf("restored record = %+v, want live and idle", restored)
+	}
+	if got := m.lcm.(*fakeLCM).terminated[rec.ID]; got != 1 {
+		t.Fatalf("terminal repairs = %d, want 1", got)
+	}
+	if rt.destroyed != 1 || ws.destroyed != 0 || rt.created != 1 {
+		t.Fatalf("teardown/relaunch calls: runtime destroy=%d workspace destroy=%d runtime create=%d, want 1/0/1", rt.destroyed, ws.destroyed, rt.created)
+	}
+}
+
+func TestRestore_RefusesExitedSessionThatRecoveredBeforeTerminalClaim(t *testing.T) {
+	m, st, rt, _ := newManager()
+	rec := mkLive("mer-1")
+	rec.Metadata.Branch = "b"
+	rec.Activity = domain.Activity{State: domain.ActivityExited}
+	st.sessions[rec.ID] = rec
+	m.lcm.(*fakeLCM).beforeTerminated = func(id domain.SessionID) {
+		recovered := st.sessions[id]
+		recovered.Activity = domain.Activity{State: domain.ActivityActive}
+		st.sessions[id] = recovered
+	}
+
+	if _, err := m.Restore(ctx, rec.ID); !errors.Is(err, ErrNotRestorable) {
+		t.Fatalf("restore error = %v, want ErrNotRestorable", err)
+	}
+	if st.sessions[rec.ID].IsTerminated || rt.destroyed != 0 || rt.created != 0 {
+		t.Fatalf("recovered live session was changed: record=%+v destroy=%d create=%d", st.sessions[rec.ID], rt.destroyed, rt.created)
 	}
 }
 

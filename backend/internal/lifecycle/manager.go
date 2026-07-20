@@ -926,6 +926,33 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 	return m.reconcileDependencies()
 }
 
+// MarkTerminatedIfExited repairs the terminal fact only while the latest
+// authoritative activity is still exited. Restore uses this conditional
+// transition for legacy/inconsistent rows so a concurrent recovery signal
+// cannot turn a genuinely live session into a restorable one.
+func (m *Manager) MarkTerminatedIfExited(ctx context.Context, id domain.SessionID) (bool, error) {
+	eligible := false
+	transitioned := false
+	err := m.mutate(ctx, id, func(cur domain.SessionRecord, _ time.Time) (domain.SessionRecord, bool) {
+		if cur.IsTerminated {
+			eligible = true
+			return cur, false
+		}
+		if cur.Activity.State != domain.ActivityExited {
+			return cur, false
+		}
+		eligible = true
+		transitioned = true
+		cur.IsTerminated = true
+		delete(m.flights, id)
+		return cur, true
+	})
+	if err != nil || !transitioned {
+		return eligible, err
+	}
+	return eligible, m.reconcileDependencies()
+}
+
 // markTerminatedUnlessRateLimited atomically applies an automated terminal
 // transition only when the session is not parked on a provider usage limit.
 // Explicit user-owned teardown continues to use MarkTerminated.

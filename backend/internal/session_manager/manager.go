@@ -117,6 +117,7 @@ type lifecycleRecorder interface {
 	MarkDependencyLaunchSucceeded(ctx context.Context, id domain.SessionID, token string) (bool, error)
 	ResetDependencyLaunch(ctx context.Context, id domain.SessionID, token string, preserveWorktrees bool) (bool, error)
 	MarkTerminated(ctx context.Context, id domain.SessionID) error
+	MarkTerminatedIfExited(ctx context.Context, id domain.SessionID) (bool, error)
 }
 
 type dependencyReconciler interface {
@@ -1708,7 +1709,31 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotFound)
 	}
 	if !rec.IsTerminated {
-		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
+		if rec.Activity.State != domain.ActivityExited {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
+		}
+		marked, markErr := m.lcm.MarkTerminatedIfExited(ctx, id)
+		if markErr != nil {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: repair terminal state: %w", id, markErr)
+		}
+		if !marked {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
+		}
+		rec, ok, err = m.store.GetSession(ctx, id)
+		if err != nil {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: reload terminal state: %w", id, err)
+		}
+		if !ok {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotFound)
+		}
+	}
+	// A terminal activity signal can precede runtime-container teardown (tmux
+	// deliberately keeps a shell alive after the agent exits). Ensure that old
+	// deterministic handle is gone before Create reuses the session id.
+	if handle := runtimeHandle(rec.Metadata); handle.ID != "" {
+		if err := m.runtime.Destroy(ctx, handle); err != nil {
+			return domain.SessionRecord{}, fmt.Errorf("restore %s: old runtime: %w", id, err)
+		}
 	}
 	meta := rec.Metadata
 	if meta.WorkspaceKind.WithDefault() == domain.WorkspaceKindScratch {
