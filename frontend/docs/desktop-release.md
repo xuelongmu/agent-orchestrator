@@ -57,8 +57,10 @@ forked. Before the first stable release from a fork:
    targeted at the exact trigger SHA for all platform publishers to reuse. It
    also refuses an existing `refs/tags/vX.Y.Z`, because GitHub would otherwise
    ignore the requested target and reuse that tag. Platform assets remain draft
-   until all jobs and feed uploads succeed. Before retrying a failed version,
-   deliberately delete both its draft/release and its `vX.Y.Z` tag; otherwise,
+   until all jobs and feed uploads succeed. When rerunning failed jobs within
+   the same workflow run, keep the seeded draft and `vX.Y.Z` tag so Forge
+   publishers reuse them. Before starting an entirely new workflow run for the
+   same version, delete both its draft/release and its `vX.Y.Z` tag; otherwise,
    choose and stamp a new version.
 5. Confirm the resulting `vX.Y.Z` release is neither draft nor prerelease and
    contains `latest.yml`, `latest-mac.yml`, and `latest-linux.yml`. Inspect each
