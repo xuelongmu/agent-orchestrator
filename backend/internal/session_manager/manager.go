@@ -240,19 +240,28 @@ type Manager struct {
 	lifetimeCtx context.Context
 	// sharedDirMu serializes the durable lease check with dir spawn/restore so
 	// concurrent requests cannot both observe the project directory as free.
-	// dependencyLaunchMu serializes dependency external launch/recovery cleanup
-	// with Kill. It is always acquired before sharedDirMu.
-	dependencyLaunchMu sync.Mutex
-	sharedDirMu        sync.Mutex
-	cleanupRetryMu     sync.Mutex
-	cleanupRetries     map[domain.SessionID]string
-	cleanupRetryDelay  time.Duration
+	// workspaceMutationMu serializes dependency external launch/recovery cleanup
+	// and PR-claim checkout with Kill. It is always acquired before sharedDirMu.
+	workspaceMutationMu sync.Mutex
+	sharedDirMu         sync.Mutex
+	cleanupRetryMu      sync.Mutex
+	cleanupRetries      map[domain.SessionID]string
+	cleanupRetryDelay   time.Duration
 }
 
 // SetDependencyScheduler closes the daemon wiring cycle after both the session
 // manager (promotion launcher) and dependency scheduler have been built.
 func (m *Manager) SetDependencyScheduler(scheduler dependencyReconciler) {
 	m.dependencyScheduler = scheduler
+}
+
+// LockWorkspaceMutation enters the manager-wide external workspace mutation
+// gate. Session-service PR claims share this with dependency promotion and
+// recovery so checkout cannot observe a half-created promoted workspace.
+// Callers must invoke the returned unlock function exactly once.
+func (m *Manager) LockWorkspaceMutation() func() {
+	m.workspaceMutationMu.Lock()
+	return m.workspaceMutationMu.Unlock
 }
 
 // StartDependencyReconcileLoop starts the periodic retry path when the wired
@@ -785,8 +794,8 @@ func (m *Manager) rollbackLaunchSeed(ctx context.Context, id domain.SessionID, p
 // atomically claimed it. Parent handoffs are appended to the task prompt and
 // persisted before launch so restore and inspection see the same context.
 func (m *Manager) LaunchPromoted(ctx context.Context, id domain.SessionID, token string, parents []domain.DependencyHandoff) (domain.SessionRecord, error) {
-	m.dependencyLaunchMu.Lock()
-	defer m.dependencyLaunchMu.Unlock()
+	unlockWorkspaceMutation := m.LockWorkspaceMutation()
+	defer unlockWorkspaceMutation()
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("promote %s: %w", id, err)
@@ -1283,8 +1292,8 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, markTerminated 
 		// A waiting dependency child can gain its workspace/runtime while Kill
 		// is running. Serialize with the entire promoted launch, then re-read
 		// the authoritative cleanup inventory before deriving handles or paths.
-		m.dependencyLaunchMu.Lock()
-		defer m.dependencyLaunchMu.Unlock()
+		unlockWorkspaceMutation := m.LockWorkspaceMutation()
+		defer unlockWorkspaceMutation()
 		rec, ok, err = m.store.GetSession(ctx, id)
 		if err != nil {
 			return false, fmt.Errorf("kill %s: reload dependency cleanup inventory: %w", id, err)
@@ -2134,8 +2143,8 @@ func (m *Manager) completeRecoveredDependencyPromotions(ctx context.Context) err
 // attempts. A live runtime is adoptable only after the final launch-success
 // marker; otherwise it is destroyed before the workspace is reset for retry.
 func (m *Manager) resetRecoveredDependencyLaunch(observed domain.SessionRecord, alive bool) (bool, error) {
-	m.dependencyLaunchMu.Lock()
-	defer m.dependencyLaunchMu.Unlock()
+	unlockWorkspaceMutation := m.LockWorkspaceMutation()
+	defer unlockWorkspaceMutation()
 	cleanupCtx, cancel := m.promotionLifetimeContext()
 	defer cancel()
 	if err := cleanupCtx.Err(); err != nil {

@@ -61,6 +61,14 @@ type dependencyReconciler interface {
 	Reconcile(context.Context) error
 }
 
+// workspaceMutationLocker is implemented by Session Manager. PR checkout in
+// this service shares its gate with dependency promotion, recovery, and Kill.
+type workspaceMutationLocker interface {
+	LockWorkspaceMutation() func()
+}
+
+var _ workspaceMutationLocker = (*sessionmanager.Manager)(nil)
+
 // RollbackOutcome reports what happened in a rollback: either the seed row was
 // deleted, or the partially-spawned session was killed (runtime+workspace torn
 // down, row marked terminated).
@@ -101,10 +109,15 @@ type Service struct {
 	clock               func() time.Time
 	telemetry           ports.EventSink
 	dependencyScheduler dependencyReconciler
+	workspaceMutations  workspaceMutationLocker
 	orchestratorLocksMu sync.Mutex
 	orchestratorLocks   map[domain.ProjectID]*sync.Mutex
 	prClaimLocksMu      sync.Mutex
 	prClaimLocks        map[string]*sync.Mutex
+	// workspaceMutationMu preserves claim-vs-claim serialization for tests or
+	// reduced embeddings whose commander does not expose Session Manager's
+	// promotion gate. Production always uses workspaceMutations above.
+	workspaceMutationMu sync.Mutex
 	// signalCapable reports whether a harness has a hook pipeline that can
 	// deliver activity signals at all. Only capable harnesses are eligible for
 	// the no_signal downgrade: a hook-less harness staying silent forever is
@@ -139,6 +152,9 @@ type Deps struct {
 // NewWithDeps wires a session service with optional PR-claim dependencies.
 func NewWithDeps(d Deps) *Service {
 	s := &Service{manager: d.Manager, store: d.Store, prClaimer: d.PRClaimer, scm: d.SCM, tracker: d.Tracker, clock: d.Clock, signalCapable: d.SignalCapable, telemetry: d.Telemetry, dependencyScheduler: d.DependencyScheduler}
+	if locker, ok := d.Manager.(workspaceMutationLocker); ok {
+		s.workspaceMutations = locker
+	}
 	if s.prClaimer == nil {
 		if w, ok := d.Store.(ports.PRClaimer); ok {
 			s.prClaimer = w
@@ -148,6 +164,14 @@ func NewWithDeps(d Deps) *Service {
 		s.clock = time.Now
 	}
 	return s
+}
+
+func (s *Service) lockWorkspaceMutation() func() {
+	if s.workspaceMutations != nil {
+		return s.workspaceMutations.LockWorkspaceMutation()
+	}
+	s.workspaceMutationMu.Lock()
+	return s.workspaceMutationMu.Unlock
 }
 
 // Spawn creates a session and returns the API-facing read model.

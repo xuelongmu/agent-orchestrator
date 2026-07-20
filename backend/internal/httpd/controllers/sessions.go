@@ -744,6 +744,8 @@ func writeSessionPRError(w http.ResponseWriter, r *http.Request, err error) {
 		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "SESSION_NO_WORKSPACE", "Session has no workspace", nil)
 	case errors.Is(err, sessionsvc.ErrSessionWorkspaceNotGit):
 		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "SESSION_WORKSPACE_NOT_GIT", "Scratch and directory sessions cannot claim pull requests", nil)
+	case errors.Is(err, sessionsvc.ErrSessionDependencyPending):
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "SESSION_DEPENDENCY_PENDING", "Session workspace is still waiting for or completing dependency promotion", nil)
 	case errors.Is(err, sessionsvc.ErrProjectMismatch):
 		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "PR_PROJECT_MISMATCH", "PR does not belong to the session project", nil)
 	case errors.Is(err, sessionsvc.ErrSCMUnavailable):

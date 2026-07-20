@@ -36,6 +36,9 @@ var (
 	// ErrSessionWorkspaceNotGit reports that SCM branch operations are
 	// inapplicable to scratch and shared-directory sessions.
 	ErrSessionWorkspaceNotGit = errors.New("session: workspace is not git-backed")
+	// ErrSessionDependencyPending reports that dependency-gated workspace
+	// creation has not reached its durable promotion commit point.
+	ErrSessionDependencyPending = errors.New("session: dependency promotion is pending")
 	// ErrClaimTaskPromptTooLong rejects withheld claim work that cannot cross
 	// the same bounded prompt boundary used for a normal spawn.
 	ErrClaimTaskPromptTooLong = errors.New("session: claim task prompt is too long")
@@ -90,20 +93,8 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	if err != nil {
 		return ClaimPRResult{}, fmt.Errorf("get %s: %w", id, err)
 	}
-	if !ok {
-		return ClaimPRResult{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
-	}
-	if rec.IsTerminated {
-		return ClaimPRResult{}, sessionmanagerAPIError("SESSION_TERMINATED", "Session is terminated")
-	}
-	if rec.Kind == domain.KindOrchestrator {
-		return ClaimPRResult{}, ErrSessionNotClaimable
-	}
-	if strings.TrimSpace(rec.Metadata.WorkspacePath) == "" {
-		return ClaimPRResult{}, ErrSessionNoWorkspace
-	}
-	if rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
-		return ClaimPRResult{}, ErrSessionWorkspaceNotGit
+	if err := validatePRClaimSession(rec, ok); err != nil {
+		return ClaimPRResult{}, err
 	}
 	project, ok, err := s.store.GetProject(ctx, string(rec.ProjectID))
 	if err != nil {
@@ -151,14 +142,47 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	if err != nil {
 		return ClaimPRResult{}, err
 	}
-	workspaceBranch := fmt.Sprintf("ao/claim/%s/pr-%d/root", id, number)
-	branchChanged, err := s.scm.CheckoutPullRequest(ctx, refSpec, obs.PR, rec.Metadata.WorkspacePath, workspaceBranch)
-	if err != nil {
-		return ClaimPRResult{}, fmt.Errorf("checkout PR #%d: %w", number, err)
-	}
-	now := s.clock().UTC()
-	pr, checks, reviews, threads, comments := claimRowsFromSCM(id, obs, now)
-	outcome, err := s.prClaimer.ClaimPR(ctx, pr, checks, reviews, threads, comments, reviewMode, opts.AllowTakeover, workspaceBranch, opts.TaskPrompt)
+	var (
+		branchChanged bool
+		outcome       ports.ClaimOutcome
+	)
+	err = func() error {
+		unlockWorkspaceMutation := s.lockWorkspaceMutation()
+		defer unlockWorkspaceMutation()
+
+		// Provider enrichment is intentionally outside the workspace gate. Once
+		// inside it, reload the authoritative record: dependency promotion may
+		// have persisted a future path/branch while creating the workspace, and
+		// Kill may have terminated the session after the initial request checks.
+		latest, exists, readErr := s.store.GetSession(ctx, id)
+		if readErr != nil {
+			return fmt.Errorf("reload %s for PR claim: %w", id, readErr)
+		}
+		if err := validatePRClaimSession(latest, exists); err != nil {
+			return err
+		}
+		rec = latest
+
+		workspaceBranch := fmt.Sprintf("ao/claim/%s/pr-%d/root", id, number)
+		branchChanged, err = s.scm.CheckoutPullRequest(ctx, refSpec, obs.PR, rec.Metadata.WorkspacePath, workspaceBranch)
+		if err != nil {
+			return fmt.Errorf("checkout PR #%d: %w", number, err)
+		}
+		now := s.clock().UTC()
+		pr, checks, reviews, threads, comments := claimRowsFromSCM(id, obs, now)
+		outcome, err = s.prClaimer.ClaimPR(ctx, pr, checks, reviews, threads, comments, reviewMode, opts.AllowTakeover, workspaceBranch, opts.TaskPrompt)
+		if err != nil {
+			return err
+		}
+		// SQLite is canonical, but keep its best-effort workspace projection in
+		// the same mutation critical section as checkout and branch persistence.
+		if outcome.ContractDeliveryPending {
+			if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, outcome.DesignContract); err != nil {
+				slog.Debug("claim PR: design contract projection skipped", "prURL", prURL, "error", err)
+			}
+		}
+		return nil
+	}()
 	if err != nil {
 		return ClaimPRResult{}, err
 	}
@@ -171,11 +195,8 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 			unlockDelivery := designcontract.LockDelivery(prURL)
 			delivery, pending, deliveryErr := deliveryStore.GetPendingPRDesignContractDelivery(ctx, id, prURL)
 			if deliveryErr == nil && pending {
-				// Projection is best effort: unsafe checkout state never rolls back
-				// ownership or bypasses canonical pane delivery.
-				if err := designcontract.MaterializePR(ctx, rec.Metadata.WorkspacePath, prURL, delivery.Contract); err != nil {
-					slog.Debug("claim PR: design contract projection skipped", "prURL", prURL, "error", err)
-				}
+				// Pane delivery deliberately runs after releasing the workspace gate;
+				// it can be slow and does not mutate checkout or branch metadata.
 				message := domain.SanitizeControlChars(designcontract.ClaimReadyMessage(prURL, delivery.Contract, delivery.TaskPrompt))
 				deliveryErr = s.manager.SendAutomated(ctx, id, message)
 				if deliveryErr == nil {
@@ -200,6 +221,30 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 		res.TakenOverFrom = []domain.SessionID{outcome.PreviousOwner}
 	}
 	return res, nil
+}
+
+func validatePRClaimSession(rec domain.SessionRecord, exists bool) error {
+	if !exists {
+		return apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	if rec.IsTerminated {
+		return sessionmanagerAPIError("SESSION_TERMINATED", "Session is terminated")
+	}
+	if rec.Kind == domain.KindOrchestrator {
+		return ErrSessionNotClaimable
+	}
+	if rec.Metadata.WorkspaceKind.WithDefault() != domain.WorkspaceKindWorktree {
+		return ErrSessionWorkspaceNotGit
+	}
+	if rec.DependencyPending() || rec.DependencyPromotionToken != "" || (!rec.DependencyPreparedAt.IsZero() && rec.DependencyPromotedAt.IsZero()) {
+		return ErrSessionDependencyPending
+	}
+	// A worktree path without a branch (or vice versa) is incomplete durable
+	// inventory. Never let checkout guess against that half-created state.
+	if strings.TrimSpace(rec.Metadata.WorkspacePath) == "" || strings.TrimSpace(rec.Metadata.Branch) == "" {
+		return ErrSessionNoWorkspace
+	}
+	return nil
 }
 
 func (s *Service) prClaimLock(prURL string) *sync.Mutex {

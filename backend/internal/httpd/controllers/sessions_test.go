@@ -1183,6 +1183,7 @@ func TestSessionsAPI_ClaimPRErrors(t *testing.T) {
 		{"head mismatch", `{"pr":"142"}`, ports.PRCheckoutError{Kind: ports.PRCheckoutHeadMismatch}, http.StatusConflict, "PR_CLAIM_HEAD_MISMATCH"},
 		{"local commits", `{"pr":"142"}`, ports.PRCheckoutError{Kind: ports.PRCheckoutBranchDiverged}, http.StatusConflict, "PR_CLAIM_LOCAL_COMMITS"},
 		{"not claimable", `{"pr":"142"}`, sessionsvc.ErrSessionNotClaimable, http.StatusUnprocessableEntity, "SESSION_NOT_CLAIMABLE"},
+		{"dependency pending", `{"pr":"142"}`, sessionsvc.ErrSessionDependencyPending, http.StatusConflict, "SESSION_DEPENDENCY_PENDING"},
 		{"mismatch", `{"pr":"142"}`, sessionsvc.ErrProjectMismatch, http.StatusUnprocessableEntity, "PR_PROJECT_MISMATCH"},
 		{"scm", `{"pr":"142"}`, sessionsvc.ErrSCMUnavailable, http.StatusServiceUnavailable, "SCM_UNAVAILABLE"},
 	}
