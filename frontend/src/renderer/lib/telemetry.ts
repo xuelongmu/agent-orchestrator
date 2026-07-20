@@ -9,6 +9,7 @@ const RELEASE_TAG = "2026-01-30";
 const REDACTED_LOCAL_URL = "[redacted-local-url]";
 const REDACTED_LOCAL_PATH = "[redacted-local-path]";
 const DAILY_ACTIVE_STORAGE_KEY = "ao.telemetry.lastActiveDate";
+const CAPTURE_BUDGET_STORAGE_KEY = "ao.telemetry.captureBudget.v1";
 const EMBEDDED_LOCAL_URL_PATTERN =
 	/(?:\bfile:\/\/\/\S+|\bapp:\/\/renderer\/\S+|\bhttps?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\S*)/gi;
 
@@ -17,8 +18,18 @@ let errorHandlersBound = false;
 let telemetryContext: TelemetryProperties = {};
 let fallbackDailyActiveDate = "";
 
+// Burst state is intentionally process-local. Daily counts use localStorage so
+// a renderer reload cannot hand a crash/re-render loop a fresh daily budget.
+const EVENTS_PER_NAME_PER_MINUTE = 5;
+const EVENTS_PER_NAME_PER_DAY = 200;
+const MINUTE_MS = 60_000;
+const minuteWindows = new Map<string, { start: number; count: number }>();
+const fallbackDayWindows = new Map<string, { day: string; count: number }>();
+
 type TelemetryProperties = Record<string, unknown>;
 type DailyActiveStorage = Pick<Storage, "getItem" | "setItem">;
+type CaptureBudgetStorage = Pick<Storage, "getItem" | "setItem">;
+type PostHogPersistenceStorage = Pick<Storage, "getItem" | "removeItem">;
 type DailyActiveEventTarget = {
 	addEventListener: (type: string, listener: EventListener, options?: AddEventListenerOptions) => void;
 	removeEventListener: (type: string, listener: EventListener, options?: EventListenerOptions) => void;
@@ -40,6 +51,88 @@ export function buildTelemetryContext(appVersion: string, platform: string): Tel
 		platform,
 		build_mode: import.meta.env.DEV ? "dev" : "packaged",
 	};
+}
+
+function browserLocalStorage(): Storage | undefined {
+	try {
+		return window.localStorage;
+	} catch {
+		return undefined;
+	}
+}
+
+function reserveMinute(name: string, now: number): boolean {
+	const window = minuteWindows.get(name);
+	if (!window || now - window.start >= MINUTE_MS) {
+		minuteWindows.set(name, { start: now, count: 1 });
+		return true;
+	}
+	if (window.count >= EVENTS_PER_NAME_PER_MINUTE) return false;
+	window.count += 1;
+	return true;
+}
+
+function reserveFallbackDay(name: string, day: string): boolean {
+	const window = fallbackDayWindows.get(name);
+	if (!window || window.day !== day) {
+		fallbackDayWindows.set(name, { day, count: 1 });
+		return true;
+	}
+	if (window.count >= EVENTS_PER_NAME_PER_DAY) return false;
+	window.count += 1;
+	return true;
+}
+
+// reserveCapture enforces a process-local burst bound and, when localStorage is
+// available, a reload-safe per-UTC-day budget for each renderer event name.
+export function reserveCapture(
+	name: string,
+	now = Date.now(),
+	storage: CaptureBudgetStorage | undefined = browserLocalStorage(),
+): boolean {
+	if (!reserveMinute(name, now)) return false;
+	const day = new Date(now).toISOString().slice(0, 10);
+	if (!storage) return reserveFallbackDay(name, day);
+	try {
+		const raw = storage.getItem(CAPTURE_BUDGET_STORAGE_KEY);
+		const parsed = raw ? (JSON.parse(raw) as { day?: unknown; counts?: unknown }) : {};
+		const counts =
+			parsed.day === day && parsed.counts && typeof parsed.counts === "object"
+				? { ...(parsed.counts as Record<string, unknown>) }
+				: {};
+		const storedCount = counts[name];
+		const count = typeof storedCount === "number" && Number.isFinite(storedCount)
+			? Math.max(0, Math.floor(storedCount))
+			: 0;
+		if (count >= EVENTS_PER_NAME_PER_DAY) return false;
+		counts[name] = count + 1;
+		storage.setItem(CAPTURE_BUDGET_STORAGE_KEY, JSON.stringify({ day, counts }));
+		return true;
+	} catch {
+		return reserveFallbackDay(name, day);
+	}
+}
+
+// migrateIdentifiedPostHogPersistence removes legacy identify() state before
+// PostHog initializes. Anonymous persistence is retained, while malformed
+// legacy state is removed conservatively so an upgrade cannot resume an
+// identified person profile.
+export function migrateIdentifiedPostHogPersistence(
+	storage: PostHogPersistenceStorage | undefined,
+	projectKey: string,
+): boolean {
+	if (!storage || !projectKey) return false;
+	const key = `ph_${projectKey}_posthog`;
+	const raw = storage.getItem(key);
+	if (!raw) return false;
+	try {
+		const state = JSON.parse(raw) as Record<string, unknown>;
+		if (state.$user_state !== "identified" && typeof state.$user_id !== "string") return false;
+	} catch {
+		// Unknown legacy persistence must not be allowed to restore identity.
+	}
+	storage.removeItem(key);
+	return true;
 }
 
 function withTelemetryContext(properties: TelemetryProperties): TelemetryProperties {
@@ -334,6 +427,8 @@ export async function initTelemetry(): Promise<boolean> {
 		const bootstrap = await aoBridge.telemetry.getBootstrap();
 		if (!bootstrap) return false;
 		telemetryContext = buildTelemetryContext(bootstrap.appVersion, bootstrap.platform);
+		const storage = browserLocalStorage();
+		migrateIdentifiedPostHogPersistence(storage, POSTHOG_KEY);
 		posthog.init(POSTHOG_KEY, {
 			api_host: POSTHOG_HOST,
 			defaults: RELEASE_TAG,
@@ -341,6 +436,8 @@ export async function initTelemetry(): Promise<boolean> {
 			capture_pageview: false,
 			capture_exceptions: false,
 			persistence: "localStorage",
+			person_profiles: "never",
+			bootstrap: { distinctID: bootstrap.distinctId, isIdentifiedID: false },
 			before_send: (event) => (event ? sanitizePostHogCaptureResult(event) : event),
 			session_recording: {
 				maskCapturedNetworkRequestFn: (request) => {
@@ -351,21 +448,11 @@ export async function initTelemetry(): Promise<boolean> {
 				},
 			},
 		});
-		posthog.identify(bootstrap.distinctId, {
-			...telemetryContext,
-			surface: "renderer",
-		});
 		posthog.register({
 			...telemetryContext,
 			surface: "renderer",
 		});
 		bindErrorHandlers();
-		let storage: DailyActiveStorage | undefined;
-		try {
-			storage = window.localStorage;
-		} catch {
-			storage = undefined;
-		}
 		startDailyActiveHeartbeat({
 			storage,
 			window,
@@ -379,7 +466,9 @@ export async function initTelemetry(): Promise<boolean> {
 				})();
 			},
 		});
-		posthog.capture("ao.renderer.loaded", withTelemetryContext(await sanitizeRendererProperties("ao.renderer.loaded")));
+		if (reserveCapture("ao.renderer.loaded", Date.now(), storage)) {
+			posthog.capture("ao.renderer.loaded", withTelemetryContext(await sanitizeRendererProperties("ao.renderer.loaded")));
+		}
 		return true;
 	})().catch(() => false);
 	return initPromise;
@@ -387,12 +476,14 @@ export async function initTelemetry(): Promise<boolean> {
 
 export async function captureRendererEvent(event: string, properties?: Record<string, unknown>): Promise<void> {
 	if (!(await initTelemetry())) return;
+	if (!reserveCapture(event)) return;
 	const safeProperties = withTelemetryContext(await sanitizeRendererProperties(event, properties));
 	posthog.capture(event, safeProperties);
 }
 
 export async function captureRendererException(error: unknown, properties?: Record<string, unknown>): Promise<void> {
 	if (!(await initTelemetry())) return;
+	if (!reserveCapture(`exception:${exceptionName(error)}`)) return;
 	const safeProperties = withTelemetryContext(await sanitizeRendererExceptionProperties(error, properties));
 	posthog.captureException(normalizeException(error), safeProperties);
 }
