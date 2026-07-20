@@ -3,7 +3,12 @@ import { describe, expect, it, vi } from "vitest";
 import { evaluateDaemonIdentity, type DaemonLaunchSpec } from "./daemon-launch";
 import { pathIdentityKey, pathInside, samePath, type PathIdentityOptions } from "./path-identity";
 
-function fakeRealpath(platform: NodeJS.Platform, existingPaths: string[], caseInsensitive = false) {
+function fakeRealpath(
+	platform: NodeJS.Platform,
+	existingPaths: string[],
+	caseInsensitive = false,
+	missingCode: "ENOENT" | "ENOTDIR" = "ENOENT",
+) {
 	const paths = platform === "win32" ? path.win32 : path.posix;
 	const entries = new Map(
 		existingPaths.map((entry) => {
@@ -15,7 +20,7 @@ function fakeRealpath(platform: NodeJS.Platform, existingPaths: string[], caseIn
 		const lookup = caseInsensitive ? value.toLowerCase() : value;
 		const canonical = entries.get(lookup);
 		if (canonical) return canonical;
-		throw Object.assign(new Error(`ENOENT: ${value}`), { code: "ENOENT" });
+		throw Object.assign(new Error(`${missingCode}: ${value}`), { code: missingCode });
 	});
 }
 
@@ -51,21 +56,45 @@ describe("path identity", () => {
 		expect(pathInside(sibling, checkout, identity)).toBe(false);
 	});
 
-	it("canonicalizes the nearest existing ancestor of a missing child", () => {
-		const checkout = "/Users/example/Documents/projects/agent-orchestrator/backend";
-		const realpath = fakeRealpath("darwin", [checkout], true);
+	it.each(["ENOENT", "ENOTDIR"] as const)(
+		"canonicalizes the nearest existing ancestor when realpath returns %s",
+		(missingCode) => {
+			const checkout = "/Users/example/Documents/projects/agent-orchestrator/backend";
+			const realpath = fakeRealpath("darwin", [checkout], true, missingCode);
+			const identity: PathIdentityOptions = { platform: "darwin", realpath };
+
+			expect(
+				samePath(
+					`${checkout}/generated/bin/ao`,
+					"/Users/example/documents/projects/agent-orchestrator/backend/generated/bin/ao",
+					identity,
+				),
+			).toBe(true);
+			expect(pathIdentityKey(`${checkout}/generated/bin/ao`, identity)).toBe(`${checkout}/generated/bin/ao`);
+			expect(realpath).toHaveBeenCalledWith(`${checkout}/generated/bin/ao`);
+			expect(realpath).toHaveBeenCalledWith(checkout);
+		},
+	);
+
+	it.each([
+		["EACCES", Object.assign(new Error("permission denied"), { code: "EACCES" })],
+		["EIO", Object.assign(new Error("I/O failure"), { code: "EIO" })],
+		["an unknown error", new Error("unknown failure")],
+	])("does not walk ancestors after %s", (_label, error) => {
+		const reported = "/Users/example/documents/projects/agent-orchestrator/backend/generated/ao";
+		const expected = "/Users/example/Documents/projects/agent-orchestrator/backend/generated/ao";
+		const realpath = vi.fn((_value: string) => {
+			throw error;
+		});
 		const identity: PathIdentityOptions = { platform: "darwin", realpath };
 
-		expect(
-			samePath(
-				`${checkout}/generated/bin/ao`,
-				"/Users/example/documents/projects/agent-orchestrator/backend/generated/bin/ao",
-				identity,
-			),
-		).toBe(true);
-		expect(pathIdentityKey(`${checkout}/generated/bin/ao`, identity)).toBe(`${checkout}/generated/bin/ao`);
-		expect(realpath).toHaveBeenCalledWith(`${checkout}/generated/bin/ao`);
-		expect(realpath).toHaveBeenCalledWith(checkout);
+		expect(pathIdentityKey(reported, identity)).toBe(reported);
+		expect(realpath).toHaveBeenCalledTimes(1);
+		expect(realpath).toHaveBeenCalledWith(reported);
+
+		realpath.mockClear();
+		expect(samePath(reported, expected, identity)).toBe(false);
+		expect(realpath.mock.calls).toEqual([[reported], [expected]]);
 	});
 
 	it("keeps Windows comparisons case-insensitive", () => {

@@ -10,6 +10,12 @@ function pathOperations(platform: NodeJS.Platform) {
 	return platform === "win32" ? path.win32 : path.posix;
 }
 
+function isMissingPathError(error: unknown): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	const code = (error as NodeJS.ErrnoException).code;
+	return code === "ENOENT" || code === "ENOTDIR";
+}
+
 function canonicalPath(value: string, options: PathIdentityOptions): string {
 	const platform = options.platform ?? process.platform;
 	const paths = pathOperations(platform);
@@ -21,7 +27,8 @@ function canonicalPath(value: string, options: PathIdentityOptions): string {
 	for (;;) {
 		try {
 			return paths.join(realpath(current), ...missingSuffix);
-		} catch {
+		} catch (error) {
+			if (!isMissingPathError(error)) return resolved;
 			const parent = paths.dirname(current);
 			if (parent === current) return resolved;
 			missingSuffix.unshift(paths.basename(current));
