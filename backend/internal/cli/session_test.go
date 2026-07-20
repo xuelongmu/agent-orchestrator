@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -221,6 +220,9 @@ func TestSessionGet_SuccessWithProjectScope(t *testing.T) {
 	if !strings.Contains(out, "diagnostic: runtime_probe_failed") || !strings.Contains(out, "  | probe timed out") || !strings.Contains(out, "  | retrying") {
 		t.Fatalf("session diagnostic missing from get output:\n%s", out)
 	}
+	if strings.Contains(out, "waiting on:") || strings.Contains(out, "depends on:") {
+		t.Fatalf("session without prerequisites rendered a dependency row:\n%s", out)
+	}
 	want := []string{"GET /api/v1/sessions/demo-1"}
 	if got := log.all(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("requests = %#v, want %#v", got, want)
@@ -260,25 +262,42 @@ func TestSessionGet_DependencyStateFixtures(t *testing.T) {
 	srv, _ := sessionCommandServer(t)
 	writeRunFileFor(t, cfg, srv)
 
-	out, errOut, err := executeCLI(t, Deps{
-		ProcessAlive: func(int) bool { return true },
-	}, "session", "get", "demo-waiting")
-	if err != nil {
-		t.Fatalf("session get failed: %v\nstderr=%s", err, errOut)
-	}
-	if !strings.Contains(out, "dependencies: demo-parent, demo-api (pending)") {
-		t.Fatalf("pending prerequisites missing from get output:\n%s", out)
-	}
-
 	for _, tc := range []struct {
-		name    string
-		id      string
-		pending bool
+		name           string
+		id             string
+		pending        bool
+		humanRow       string
+		forbiddenLabel string
 	}{
-		{name: "waiting", id: "demo-waiting", pending: true},
-		{name: "promoted", id: "demo-promoted", pending: false},
+		{
+			name:           "waiting",
+			id:             "demo-waiting",
+			pending:        true,
+			humanRow:       "waiting on: demo-parent, demo-api",
+			forbiddenLabel: "depends on:",
+		},
+		{
+			name:           "promoted",
+			id:             "demo-promoted",
+			pending:        false,
+			humanRow:       "depends on: demo-parent, demo-api",
+			forbiddenLabel: "waiting on:",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			humanOut, errOut, err := executeCLI(t, Deps{
+				ProcessAlive: func(int) bool { return true },
+			}, "session", "get", tc.id)
+			if err != nil {
+				t.Fatalf("session get failed: %v\nstderr=%s", err, errOut)
+			}
+			if !strings.Contains(humanOut, tc.humanRow) {
+				t.Fatalf("dependency row %q missing from get output:\n%s", tc.humanRow, humanOut)
+			}
+			if strings.Contains(humanOut, tc.forbiddenLabel) {
+				t.Fatalf("dependency label %q unexpectedly present in get output:\n%s", tc.forbiddenLabel, humanOut)
+			}
+
 			out, errOut, err := executeCLI(t, Deps{
 				ProcessAlive: func(int) bool { return true },
 			}, "session", "get", tc.id, "--json")
@@ -295,8 +314,19 @@ func TestSessionGet_DependencyStateFixtures(t *testing.T) {
 			if got.Session.DependencyPending != tc.pending {
 				t.Fatalf("dependencyPending = %t, want %t\noutput=%s", got.Session.DependencyPending, tc.pending, out)
 			}
-			if !strings.Contains(out, fmt.Sprintf(`"dependencyPending": %t`, tc.pending)) {
-				t.Fatalf("dependencyPending missing from JSON output:\n%s", out)
+			var raw struct {
+				Session struct {
+					DependencyPending *bool `json:"dependencyPending"`
+				} `json:"session"`
+			}
+			if err := json.Unmarshal([]byte(out), &raw); err != nil {
+				t.Fatalf("session get --json output is not decodable for key-presence check: %v\noutput=%s", err, out)
+			}
+			if raw.Session.DependencyPending == nil {
+				t.Fatalf("dependencyPending key missing from JSON output:\n%s", out)
+			}
+			if *raw.Session.DependencyPending != tc.pending {
+				t.Fatalf("dependencyPending JSON value = %t, want %t\noutput=%s", *raw.Session.DependencyPending, tc.pending, out)
 			}
 		})
 	}

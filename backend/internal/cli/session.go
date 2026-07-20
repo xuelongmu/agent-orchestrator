@@ -754,9 +754,15 @@ func writeSessionDetails(cmd *cobra.Command, sess sessionDTO) error {
 		{"activity", sess.Activity.State},
 		{"harness", sess.Harness},
 		{"issue", sess.IssueID},
-		{"dependencies", sessionDependencies(sess)},
-		{"terminated", fmt.Sprintf("%t", sess.IsTerminated)},
 	}
+	if len(sess.DependsOn) > 0 {
+		label := "depends on"
+		if sess.DependencyPending {
+			label = "waiting on"
+		}
+		fields = append(fields, [2]string{label, strings.Join(sess.DependsOn, ", ")})
+	}
+	fields = append(fields, [2]string{"terminated", fmt.Sprintf("%t", sess.IsTerminated)})
 	for _, field := range fields {
 		if field[1] == "" {
 			continue
@@ -781,17 +787,6 @@ func writeSessionDetails(cmd *cobra.Command, sess sessionDTO) error {
 		}
 	}
 	return nil
-}
-
-func sessionDependencies(sess sessionDTO) string {
-	if len(sess.DependsOn) == 0 {
-		return ""
-	}
-	dependencies := strings.Join(sess.DependsOn, ", ")
-	if sess.DependencyPending {
-		return dependencies + " (pending)"
-	}
-	return dependencies
 }
 
 func writeDiagnostic(out io.Writer, diagnostic *sessionDiagnostic, indent string) error {
