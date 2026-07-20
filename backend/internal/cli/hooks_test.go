@@ -154,11 +154,11 @@ func TestHooks_StopFailureReportsStructuredErrorType(t *testing.T) {
 }
 
 func TestActivityMeta_StopFailureErrorFieldPrecedenceAndLegacyFallback(t *testing.T) {
-	_, _, got := activityMeta([]byte(`{"error":"rate_limit","error_type":"legacy_error"}`))
+	_, _, got, _ := activityMeta([]byte(`{"error":"rate_limit","error_type":"legacy_error"}`))
 	if got != "rate_limit" {
 		t.Fatalf("documented error field = %q, want rate_limit", got)
 	}
-	_, _, got = activityMeta([]byte(`{"error_type":"legacy_error"}`))
+	_, _, got, _ = activityMeta([]byte(`{"error_type":"legacy_error"}`))
 	if got != "legacy_error" {
 		t.Fatalf("legacy error_type fallback = %q, want legacy_error", got)
 	}
@@ -281,7 +281,7 @@ func TestHooks_KimiToolCallIDCarriesCorrelationFields(t *testing.T) {
 	writeRunFileFor(t, cfg, srv)
 
 	_, _, err := executeCLI(t, Deps{
-		In:           strings.NewReader(`{"tool_name":"Shell","tool_call_id":"call_42","tool_output":"ok"}`),
+		In:           strings.NewReader(`{"agent_id":"background-1","tool_name":"Shell","tool_call_id":"call_42","tool_output":"ok"}`),
 		ProcessAlive: func(int) bool { return true },
 	}, "hooks", "kimi", "post-tool-use")
 	if err != nil {
@@ -291,7 +291,7 @@ func TestHooks_KimiToolCallIDCarriesCorrelationFields(t *testing.T) {
 	if err := json.Unmarshal([]byte(capture.body), &req); err != nil {
 		t.Fatalf("decode body: %v\nbody=%s", err, capture.body)
 	}
-	want := setActivityAPIRequest{State: "active", Event: "post-tool-use", ToolName: "Shell", ToolUseID: "call_42"}
+	want := setActivityAPIRequest{State: "active", Event: "post-tool-use", ToolName: "Shell", ToolUseID: "call_42", AgentID: "background-1"}
 	if req != want {
 		t.Errorf("body = %+v, want %+v", req, want)
 	}

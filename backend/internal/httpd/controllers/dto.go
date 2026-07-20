@@ -496,18 +496,20 @@ type GetDesignContractResponse struct {
 }
 
 // SetActivityRequest is the body of POST /api/v1/sessions/{sessionId}/activity.
-// Event/ToolName/ToolUseID are optional correlation facts: which AO hook
-// sub-command produced the state and, for tool-use hooks, which tool call it
-// concerns. Lifecycle uses them to clear a stale blocked state only when the
+// Event/ToolName/ToolUseID/AgentID are optional correlation facts: which AO
+// hook sub-command produced the state and, for tool-use hooks, which agent and
+// tool call it concerns. Lifecycle uses them to correlate concurrent
+// permission callbacks and to clear a stale blocked state only when the
 // specific approved tool finishes. Absent on old CLIs and on adapters whose
-// payloads carry no tool identity — the signal then keeps its plain
-// state-only semantics.
+// payloads carry no tool identity — the signal then keeps its plain state-only
+// semantics.
 // AgentSessionID may arrive without State on metadata-only SessionStart hooks.
 type SetActivityRequest struct {
 	State          string `json:"state,omitempty" enum:"active,idle,waiting_input,blocked,rate_limited,exited" description:"Agent activity state reported by an agent hook. Optional for metadata-only hooks."`
 	Event          string `json:"event,omitempty" description:"AO hook sub-command that produced this state (e.g. post-tool-use)."`
 	ToolName       string `json:"toolName,omitempty" description:"Native tool name, for tool-use hook events."`
 	ToolUseID      string `json:"toolUseId,omitempty" description:"Native tool-use id, for tool-use hook events."`
+	AgentID        string `json:"agentId,omitempty" description:"Native agent scope id, for agent-scoped tool and permission hooks."`
 	ErrorType      string `json:"errorType,omitempty" description:"Native structured hook error category, when supplied by the harness."`
 	AgentSessionID string `json:"agentSessionId,omitempty" description:"Native agent session identifier used to resume its transcript."`
 }

@@ -474,32 +474,45 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	return recoveryErr
 }
 
-// toolFlight tracks one session's in-flight tool executions and the pending
-// permission dialog's identity, so a sticky `blocked` is cleared by the post
-// of the exact approved tool — and by nothing else tool-shaped. Answering a
-// permission dialog fires no hook of its own, so the approved tool's
-// post-tool-use is the earliest observable "the decision was resolved"
-// signal; but tool hooks also fire for parallel subagents on the same
-// session, whose traffic must never clear a dialog that is still on screen.
+// toolIdentity distinguishes tool calls that reuse an id in different Kimi
+// main/background agents. AgentID is empty for adapters without agent-scoped
+// payloads, preserving their existing ToolUseID-only correlation.
+type toolIdentity struct {
+	agentID   string
+	toolUseID string
+}
+
+func activityToolIdentity(s ports.ActivitySignal) toolIdentity {
+	return toolIdentity{agentID: s.AgentID, toolUseID: s.ToolUseID}
+}
+
+func (i toolIdentity) validPermission() bool {
+	return i.agentID != "" && i.toolUseID != ""
+}
+
+// toolFlight tracks one session's in-flight tool executions and permission
+// identities. Sticky `blocked` is cleared only by the exact approved tool's
+// post, while Kimi waiting-input requests are cleared independently by their
+// matching agent-scoped permission results. Tool hooks can fire for parallel
+// subagents on the same session, whose traffic must never cross-clear.
 // In-memory only: a daemon restart loses it and the session degrades to
 // clearing at the next turn boundary — fail-safe staleness, never a spurious
 // clear.
 type toolFlight struct {
-	// inflight maps toolUseID -> toolName for pre-tool-use signals whose post
-	// has not arrived yet.
-	inflight map[string]string
-	// blockedCandidate is the tool-use id of the UNIQUE in-flight tool bearing
+	// inflight maps agent-scoped tool identities to tool names for pre-tool-use
+	// signals whose post has not arrived yet.
+	inflight map[toolIdentity]string
+	// blockedCandidate is the identity of the UNIQUE in-flight tool bearing
 	// the dialog's tool_name when it appeared — the tool whose post proves the
-	// dialog was answered. Empty when no in-flight tool matched, or when the
-	// match was ambiguous (two same-name tools in flight: the permission
-	// payload carries no tool_use_id to disambiguate, so a sibling's post must
-	// NOT be mistaken for the approval). Either way, empty means nothing
-	// tool-shaped may clear the block and it lifts only at a turn boundary.
-	blockedCandidate string
-	// pendingPermission is the tool-use id from the latest waiting-input
-	// permission request, but only when that id matched an in-flight pre-tool
-	// signal. A permission result must match it exactly to clear the wait.
-	pendingPermission string
+	// dialog was answered. hasBlockedCandidate is false when no in-flight tool
+	// matched or the match was ambiguous.
+	blockedCandidate    toolIdentity
+	hasBlockedCandidate bool
+	// pendingPermissions contains every live Kimi approval in the current
+	// turn. resolvedPermissions remembers result-before-request delivery so a
+	// matching late request cannot recreate a completed wait.
+	pendingPermissions  map[toolIdentity]struct{}
+	resolvedPermissions map[toolIdentity]struct{}
 }
 
 // maxInflightTools caps a session's in-flight map so lost posts cannot grow
@@ -545,11 +558,16 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 	fl := m.flights[id]
 	ensure := func() *toolFlight {
 		if fl == nil {
-			fl = &toolFlight{inflight: map[string]string{}}
+			fl = &toolFlight{
+				inflight:            map[toolIdentity]string{},
+				pendingPermissions:  map[toolIdentity]struct{}{},
+				resolvedPermissions: map[toolIdentity]struct{}{},
+			}
 			m.flights[id] = fl
 		}
 		return fl
 	}
+	identity := activityToolIdentity(s)
 
 	// Tracking side effects happen regardless of what the state decision is.
 	switch s.Event {
@@ -557,36 +575,63 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 		if s.ToolUseID != "" {
 			f := ensure()
 			if len(f.inflight) >= maxInflightTools {
-				f.inflight = map[string]string{}
-				f.pendingPermission = ""
+				f.inflight = map[toolIdentity]string{}
+				f.pendingPermissions = map[toolIdentity]struct{}{}
+				f.resolvedPermissions = map[toolIdentity]struct{}{}
+				f.blockedCandidate = toolIdentity{}
+				f.hasBlockedCandidate = false
 			}
-			f.inflight[s.ToolUseID] = s.ToolName
+			delete(f.resolvedPermissions, identity)
+			f.inflight[identity] = s.ToolName
 		}
 	case "post-tool-use", "post-tool-use-failure":
 		if fl != nil {
-			delete(fl.inflight, s.ToolUseID)
-		}
-	case "permission-request":
-		if s.State == domain.ActivityWaitingInput && fl != nil {
-			// A newer request supersedes any prior approval correlation. Only a
-			// request that names a currently in-flight tool can be cleared by a
-			// later permission-result.
-			fl.pendingPermission = ""
-			if s.ToolUseID != "" {
-				if _, ok := fl.inflight[s.ToolUseID]; ok {
-					fl.pendingPermission = s.ToolUseID
-				}
-			}
+			delete(fl.inflight, identity)
+			delete(fl.resolvedPermissions, identity)
 		}
 	}
 
 	switch {
-	case s.Event == "permission-result":
-		if cur != domain.ActivityWaitingInput || fl == nil || s.ToolUseID == "" || s.ToolUseID != fl.pendingPermission {
+	case s.Event == "permission-request" && s.State == domain.ActivityWaitingInput:
+		// Observation-only Kimi permission callbacks can arrive after Stop.
+		// PreToolUse already made a legitimate current-turn request non-idle.
+		if cur == domain.ActivityIdle || fl == nil || !identity.validPermission() {
 			return suppressed
 		}
-		fl.pendingPermission = ""
+		if _, ok := fl.inflight[identity]; !ok {
+			return suppressed
+		}
+		if _, resolved := fl.resolvedPermissions[identity]; resolved {
+			// The matching result won the fire-and-forget race. Keep the
+			// completed identity until its post drains it so duplicate requests
+			// cannot recreate the wait.
+			return suppressed
+		}
+		fl.pendingPermissions[identity] = struct{}{}
 		return s
+
+	case s.Event == "permission-result":
+		if fl == nil || !identity.validPermission() {
+			return suppressed
+		}
+		if _, ok := fl.inflight[identity]; !ok {
+			return suppressed
+		}
+		if _, resolved := fl.resolvedPermissions[identity]; resolved {
+			return suppressed
+		}
+		if _, pending := fl.pendingPermissions[identity]; pending {
+			delete(fl.pendingPermissions, identity)
+			fl.resolvedPermissions[identity] = struct{}{}
+			if len(fl.pendingPermissions) > 0 {
+				s.State = domain.ActivityWaitingInput
+			}
+			return s
+		}
+		// Result-before-request: remember the completed identity within this
+		// turn and suppress its matching late request.
+		fl.resolvedPermissions[identity] = struct{}{}
+		return suppressed
 
 	case cur == domain.ActivityIdle && isDeferredToolCompletionEvent(s.Event):
 		if fl != nil && len(fl.inflight) == 0 {
@@ -612,18 +657,21 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 		if s.ToolName != "" {
 			// Recompute from scratch: this is a fresh dialog, so any candidate
 			// carried from a prior one must not leak in.
-			f.blockedCandidate = ""
-			for useID, name := range f.inflight {
+			f.blockedCandidate = toolIdentity{}
+			f.hasBlockedCandidate = false
+			for candidate, name := range f.inflight {
 				if name != s.ToolName {
 					continue
 				}
-				if f.blockedCandidate != "" {
+				if f.hasBlockedCandidate {
 					// A second same-name tool: ambiguous, fail closed by
 					// leaving no candidate (only a turn boundary clears).
-					f.blockedCandidate = ""
+					f.blockedCandidate = toolIdentity{}
+					f.hasBlockedCandidate = false
 					break
 				}
-				f.blockedCandidate = useID
+				f.blockedCandidate = candidate
+				f.hasBlockedCandidate = true
 			}
 		}
 		return s
@@ -636,11 +684,12 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 			delete(m.flights, id)
 			return s
 		case (s.Event == "post-tool-use" || s.Event == "post-tool-use-failure") &&
-			fl != nil && fl.blockedCandidate != "" && s.ToolUseID == fl.blockedCandidate:
+			fl != nil && fl.hasBlockedCandidate && identity == fl.blockedCandidate:
 			// The single unambiguous blocking tool finished: the dialog was
 			// answered. Clear the candidate so a later dialog in the same turn
 			// starts from a clean slate.
-			fl.blockedCandidate = ""
+			fl.blockedCandidate = toolIdentity{}
+			fl.hasBlockedCandidate = false
 			return s
 		default:
 			// Subagent/sibling tool traffic (including a same-name sibling when

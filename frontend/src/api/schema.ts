@@ -1243,6 +1243,8 @@ export interface components {
             session: components["schemas"]["ControllersSessionView"];
         };
         SetActivityRequest: {
+            /** @description Native agent scope id, for agent-scoped tool and permission hooks. */
+            agentId?: string;
             /** @description Native agent session identifier used to resume its transcript. */
             agentSessionId?: string;
             /** @description Native structured hook error category, when supplied by the harness. */

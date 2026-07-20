@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -37,12 +38,18 @@ func stateOf(st *fakeStore, id domain.SessionID) domain.ActivityState {
 }
 
 func applyKimiHook(t *testing.T, m *Manager, id domain.SessionID, event, toolName, toolUseID string) {
+	applyKimiAgentHook(t, m, id, event, "main", toolName, toolUseID)
+}
+
+func applyKimiAgentHook(t *testing.T, m *Manager, id domain.SessionID, event, agentID, toolName, toolUseID string) {
 	t.Helper()
 	state, ok := activitydispatch.Derive("kimi", event, nil)
 	if !ok {
 		t.Fatalf("derive kimi/%s: no activity signal", event)
 	}
-	mustApply(t, m, id, sig(state, event, toolName, toolUseID))
+	s := sig(state, event, toolName, toolUseID)
+	s.AgentID = agentID
+	mustApply(t, m, id, s)
 }
 
 func TestKimiPermissionLifecycleDispatch(t *testing.T) {
@@ -79,32 +86,38 @@ func TestKimiDelayedPermissionResultAfterStopStaysIdle(t *testing.T) {
 	}
 }
 
-func TestKimiPermissionResultRequiresMatchingToolID(t *testing.T) {
+func TestKimiPermissionResultRequiresMatchingIdentity(t *testing.T) {
 	tests := []struct {
 		name             string
+		permissionAgent  string
 		permissionToolID string
+		resultAgent      string
 		resultToolID     string
+		want             domain.ActivityState
 	}{
-		{"missing permission id", "", "call_42"},
-		{"missing result id", "call_42", ""},
-		{"unmatched result id", "call_42", "call_99"},
+		{"missing permission agent", "", "call_42", "main", "call_42", domain.ActivityActive},
+		{"missing permission id", "main", "", "main", "call_42", domain.ActivityActive},
+		{"missing result agent", "main", "call_42", "", "call_42", domain.ActivityWaitingInput},
+		{"missing result id", "main", "call_42", "main", "", domain.ActivityWaitingInput},
+		{"unmatched result agent", "main", "call_42", "background", "call_42", domain.ActivityWaitingInput},
+		{"unmatched result id", "main", "call_42", "main", "call_99", domain.ActivityWaitingInput},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m, st, _ := newManager()
 			seedSignaled(st, "mer-1", domain.ActivityIdle)
 			applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_42")
-			applyKimiHook(t, m, "mer-1", "permission-request", "Shell", tt.permissionToolID)
-			applyKimiHook(t, m, "mer-1", "permission-result", "Shell", tt.resultToolID)
+			applyKimiAgentHook(t, m, "mer-1", "permission-request", tt.permissionAgent, "Shell", tt.permissionToolID)
+			applyKimiAgentHook(t, m, "mer-1", "permission-result", tt.resultAgent, "Shell", tt.resultToolID)
 
-			if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
-				t.Fatalf("state after uncorrelated permission-result = %q, want waiting_input", got)
+			if got := stateOf(st, "mer-1"); got != tt.want {
+				t.Fatalf("state after uncorrelated permission pair = %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestKimiPermissionResultCannotCrossClearSameTurn(t *testing.T) {
+func TestKimiConcurrentPermissionsResolveIndependently(t *testing.T) {
 	m, st, _ := newManager()
 	seedSignaled(st, "mer-1", domain.ActivityIdle)
 	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_a")
@@ -112,13 +125,89 @@ func TestKimiPermissionResultCannotCrossClearSameTurn(t *testing.T) {
 	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_b")
 	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_b")
 
-	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_a")
-	if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
-		t.Fatalf("state after stale result A = %q, want waiting_input for B", got)
-	}
 	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_b")
+	if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
+		t.Fatalf("state after result B = %q, want waiting_input for A", got)
+	}
+	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_a")
 	if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
-		t.Fatalf("state after matching result B = %q, want active", got)
+		t.Fatalf("state after final result A = %q, want active", got)
+	}
+}
+
+func TestKimiConcurrentPermissionsAreAgentScoped(t *testing.T) {
+	tests := []struct {
+		name    string
+		mainID  string
+		childID string
+	}{
+		{"same tool id", "call_42", "call_42"},
+		{"different tool ids", "call_main", "call_child"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, st, _ := newManager()
+			seedSignaled(st, "mer-1", domain.ActivityIdle)
+			applyKimiAgentHook(t, m, "mer-1", "pre-tool-use", "main", "Shell", tt.mainID)
+			applyKimiAgentHook(t, m, "mer-1", "permission-request", "main", "Shell", tt.mainID)
+			applyKimiAgentHook(t, m, "mer-1", "pre-tool-use", "background", "Shell", tt.childID)
+			applyKimiAgentHook(t, m, "mer-1", "permission-request", "background", "Shell", tt.childID)
+
+			applyKimiAgentHook(t, m, "mer-1", "permission-result", "background", "Shell", tt.childID)
+			if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
+				t.Fatalf("state after background result = %q, want waiting_input for main", got)
+			}
+			applyKimiAgentHook(t, m, "mer-1", "permission-result", "main", "Shell", tt.mainID)
+			if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
+				t.Fatalf("state after main result = %q, want active", got)
+			}
+		})
+	}
+}
+
+func TestKimiEarlyPermissionResultSuppressesLateRequest(t *testing.T) {
+	m, st, _ := newManager()
+	seedSignaled(st, "mer-1", domain.ActivityIdle)
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_42")
+	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_42")
+	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_42")
+
+	if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
+		t.Fatalf("state after completed result/request pair = %q, want active", got)
+	}
+}
+
+func TestKimiDelayedPermissionRequestAfterStopStaysIdle(t *testing.T) {
+	m, st, _ := newManager()
+	seedSignaled(st, "mer-1", domain.ActivityIdle)
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_42")
+	applyKimiHook(t, m, "mer-1", "stop", "", "")
+	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_42")
+
+	if got := stateOf(st, "mer-1"); got != domain.ActivityIdle {
+		t.Fatalf("state after delayed permission-request = %q, want idle", got)
+	}
+}
+
+func TestKimiPermissionCorrelationCapAndTurnCleanup(t *testing.T) {
+	m, st, _ := newManager()
+	seedSignaled(st, "mer-1", domain.ActivityIdle)
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "pending")
+	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "pending")
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "resolved")
+	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "resolved")
+	for i := 2; i < maxInflightTools; i++ {
+		applyKimiHook(t, m, "mer-1", "pre-tool-use", "Read", fmt.Sprintf("call_%d", i))
+	}
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Read", "overflow")
+
+	fl := m.flights["mer-1"]
+	if fl == nil || len(fl.inflight) != 1 || len(fl.pendingPermissions) != 0 || len(fl.resolvedPermissions) != 0 {
+		t.Fatalf("flight after cap reset = %#v, want one inflight and empty permission sets", fl)
+	}
+	applyKimiHook(t, m, "mer-1", "stop", "", "")
+	if _, ok := m.flights["mer-1"]; ok {
+		t.Fatal("turn boundary did not release permission correlation")
 	}
 }
 
@@ -132,6 +221,10 @@ func TestKimiPermissionResultCannotCrossTurnBoundary(t *testing.T) {
 	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_b")
 	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_b")
 
+	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_a")
+	if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
+		t.Fatalf("state after prior-turn request A = %q, want waiting_input for B", got)
+	}
 	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_a")
 	if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
 		t.Fatalf("state after prior-turn result A = %q, want waiting_input for B", got)

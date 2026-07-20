@@ -3410,6 +3410,10 @@ components:
       type: object
     SetActivityRequest:
       properties:
+        agentId:
+          description: Native agent scope id, for agent-scoped tool and permission
+            hooks.
+          type: string
         agentSessionId:
           description: Native agent session identifier used to resume its transcript.
           type: string
