@@ -192,7 +192,7 @@ func (r processSessionReaper) observeAndTerm(
 	defer closeObservations(snapshot)
 	current := groupObservations(snapshot)
 	for sid, prior := range trusted {
-		if _, ok := r.liveWitness(ctx, current[sid], prior); !ok {
+		if !r.liveWitness(ctx, current[sid], prior) {
 			closeProcessSet(prior)
 			delete(trusted, sid)
 			continue
@@ -207,7 +207,7 @@ func (r processSessionReaper) observeAndTerm(
 				// The witness chosen at the start of this observation may have
 				// exited after TERM. Try every other exact retained member before
 				// abandoning continuity for the whole process session.
-				if _, ok := r.liveWitness(ctx, current[sid], prior); !ok {
+				if !r.liveWitness(ctx, current[sid], prior) {
 					closeProcessSet(prior)
 					delete(trusted, sid)
 					break
@@ -258,13 +258,13 @@ func (r processSessionReaper) signal(ctx context.Context, handle processHandle, 
 	return handle.Signal(probeCtx, signal)
 }
 
-func (r processSessionReaper) liveWitness(ctx context.Context, current []*processObservation, trusted processSet) (processIdentity, bool) {
+func (r processSessionReaper) liveWitness(ctx context.Context, current []*processObservation, trusted processSet) bool {
 	for _, observation := range current {
 		if handle, ok := trusted[observation.identity]; ok && r.alive(ctx, handle) == nil {
-			return observation.identity, true
+			return true
 		}
 	}
-	return processIdentity{}, false
+	return false
 }
 
 func groupObservations(processes []processObservation) map[int][]*processObservation {
