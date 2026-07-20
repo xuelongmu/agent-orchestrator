@@ -697,18 +697,20 @@ func TestValidateWorkspaceBranchUsesRepoIndependentInvocation(t *testing.T) {
 	}
 }
 
-func TestValidateWorkspaceBranchRejectsLeadingDashWithoutGit(t *testing.T) {
+func TestValidateWorkspaceBranchRejectsBranchOnlyConstraintsWithoutGit(t *testing.T) {
 	ws, err := New(Options{ManagedRoot: t.TempDir(), RepoResolver: StaticRepoResolver{}})
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
 	ws.run = func(context.Context, string, ...string) ([]byte, error) {
-		t.Fatal("leading-dash branch reached Git")
+		t.Fatal("branch-only rejection reached Git")
 		return nil, nil
 	}
-	err = ws.ValidateWorkspaceBranch(context.Background(), "-invalid")
-	if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
-		t.Fatalf("err = %v, want ports.ErrWorkspaceBranchInvalid", err)
+	for _, branch := range []string{"-invalid", "HEAD"} {
+		err = ws.ValidateWorkspaceBranch(context.Background(), branch)
+		if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+			t.Fatalf("branch %q: err = %v, want ports.ErrWorkspaceBranchInvalid", branch, err)
+		}
 	}
 }
 

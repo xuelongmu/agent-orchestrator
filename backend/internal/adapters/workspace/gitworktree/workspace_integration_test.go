@@ -69,9 +69,11 @@ func TestValidateWorkspaceBranchRealGitRejectsInvalidRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	err = ws.ValidateWorkspaceBranch(context.Background(), "bad..ref")
-	if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
-		t.Fatalf("err = %v, want ports.ErrWorkspaceBranchInvalid", err)
+	for _, branch := range []string{"bad..ref", "HEAD"} {
+		err = ws.ValidateWorkspaceBranch(context.Background(), branch)
+		if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+			t.Fatalf("branch %q: err = %v, want ports.ErrWorkspaceBranchInvalid", branch, err)
+		}
 	}
 }
 
