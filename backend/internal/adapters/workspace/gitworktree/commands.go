@@ -3,10 +3,9 @@ package gitworktree
 import "strings"
 
 func checkRefFormatBranchArgs(branch string) []string {
-	// check-ref-format is repository-independent. Omitting -C lets callers
-	// distinguish a deterministic invalid ref from a transient/inaccessible
-	// repository environment.
-	return []string{"check-ref-format", "--branch", branch}
+	// check-ref-format is repository-independent. Pin Git to the filesystem root
+	// so it never consults the daemon's cwd or any target repository.
+	return []string{"-C", "/", "check-ref-format", "--branch", branch}
 }
 
 func revParseVerifyArgs(repo, ref string) []string {

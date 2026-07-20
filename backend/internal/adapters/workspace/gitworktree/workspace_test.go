@@ -26,7 +26,7 @@ func TestCommandArgs(t *testing.T) {
 		got  []string
 		want []string
 	}{
-		{"check ref", checkRefFormatBranchArgs(branch), []string{"check-ref-format", "--branch", branch}},
+		{"check ref", checkRefFormatBranchArgs(branch), []string{"-C", "/", "check-ref-format", "--branch", branch}},
 		{"rev parse", revParseVerifyArgs(repo, "origin/main"), []string{"-C", repo, "rev-parse", "--verify", "--quiet", "origin/main"}},
 		{"add existing", worktreeAddBranchArgs(repo, path, branch), []string{"-C", repo, "worktree", "add", path, branch}},
 		{"add new", worktreeAddNewBranchArgs(repo, branch, path, "origin/main"), []string{"-C", repo, "worktree", "add", "-b", branch, path, "origin/main"}},
@@ -625,7 +625,7 @@ func TestCreateRejectsInvalidBranchName(t *testing.T) {
 	ws.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		joined := strings.Join(args, " ")
 		if strings.Contains(joined, "check-ref-format") {
-			return nil, exitCodeError(128)
+			return nil, exitCodeError(1)
 		}
 		t.Fatalf("no git beyond check-ref-format should run for an invalid branch: %v", args)
 		return nil, nil
@@ -647,10 +647,10 @@ func TestPlanningRejectsInvalidBranchName(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	ws.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
-		if !reflect.DeepEqual(args, []string{"check-ref-format", "--branch", "bad..ref"}) {
+		if !reflect.DeepEqual(args, []string{"-C", "/", "check-ref-format", "--branch", "bad..ref"}) {
 			t.Fatalf("unexpected git invocation: %v", args)
 		}
-		return nil, exitCodeError(128)
+		return nil, exitCodeError(1)
 	}
 
 	tests := []struct {
@@ -687,7 +687,7 @@ func TestValidateWorkspaceBranchUsesRepoIndependentInvocation(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	ws.run = func(_ context.Context, binary string, args ...string) ([]byte, error) {
-		if binary != "git" || !reflect.DeepEqual(args, []string{"check-ref-format", "--branch", "feat/valid"}) {
+		if binary != "git" || !reflect.DeepEqual(args, []string{"-C", "/", "check-ref-format", "--branch", "feat/valid"}) {
 			t.Fatalf("command = %q %v, want repo-independent check-ref-format", binary, args)
 		}
 		return nil, nil
@@ -706,6 +706,7 @@ func TestValidateWorkspaceBranchPreservesOperationalFailures(t *testing.T) {
 		errors.New("command runner unavailable"),
 		&exec.Error{Name: "git", Err: exec.ErrNotFound},
 		&os.PathError{Op: "fork/exec", Path: "git", Err: os.ErrPermission},
+		exitCodeError(128),
 	} {
 		ws.run = func(context.Context, string, ...string) ([]byte, error) { return nil, operationalErr }
 		err = ws.ValidateWorkspaceBranch(context.Background(), "feat/valid")

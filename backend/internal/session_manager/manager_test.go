@@ -1148,6 +1148,28 @@ func TestSpawn_WithDependenciesRejectsInvalidBranchBeforeDurableAdmission(t *tes
 	}
 }
 
+func TestSpawn_WithDependenciesRejectsInvalidDefaultOrchestratorBranchBeforeAdmission(t *testing.T) {
+	m, st, rt, ws := newManager()
+	scheduler := &fakeDependencyScheduler{store: st}
+	m.SetDependencyScheduler(scheduler)
+	project := st.projects["mer"]
+	project.Config.SessionPrefix = "bad..ref"
+	st.projects["mer"] = project
+	ws.validateBranchErr = fmt.Errorf("%w: %q", ports.ErrWorkspaceBranchInvalid, "ao/bad..ref-orchestrator")
+
+	_, err := m.Spawn(ctx, ports.SpawnConfig{
+		ProjectID: "mer", Kind: domain.KindOrchestrator, Harness: domain.HarnessClaudeCode,
+		DependsOn: []domain.SessionID{"mer-parent"},
+	})
+	if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) || !strings.Contains(err.Error(), "ao/bad..ref-orchestrator") {
+		t.Fatalf("err = %v, want invalid default orchestrator branch", err)
+	}
+	assertNoBranchPreflightSideEffects(t, st, rt, ws, scheduler)
+	if !reflect.DeepEqual(ws.validatedBranches, []string{"ao/bad..ref-orchestrator"}) {
+		t.Fatalf("validated branches = %#v", ws.validatedBranches)
+	}
+}
+
 func TestSpawn_WithDependenciesRetriesOperationalBranchValidationBeforeAdmission(t *testing.T) {
 	m, st, rt, ws := newManager()
 	scheduler := &fakeDependencyScheduler{store: st}

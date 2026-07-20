@@ -888,11 +888,11 @@ func (w *Workspace) validateBranch(ctx context.Context, branch string) error {
 			return fmt.Errorf("gitworktree: validate branch %q: %w", branch, ctxErr)
 		}
 		var exitErr interface{ ExitCode() int }
-		if errors.As(err, &exitErr) {
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			return fmt.Errorf("%w: %q (%w)", ErrBranchInvalid, branch, err)
 		}
-		// A failure to launch Git is operational, not proof that check-ref-format
-		// rejected the branch. Preserve its cause without the invalid sentinel.
+		// Launch failures, signals, and Git-internal exits are operational, not
+		// proof that check-ref-format rejected the branch. Preserve their cause.
 		return fmt.Errorf("gitworktree: validate branch %q: %w", branch, err)
 	}
 	return nil
