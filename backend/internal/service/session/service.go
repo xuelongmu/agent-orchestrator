@@ -64,7 +64,7 @@ type dependencyReconciler interface {
 // workspaceMutationLocker is implemented by Session Manager. PR checkout in
 // this service shares its gate with dependency promotion, recovery, and Kill.
 type workspaceMutationLocker interface {
-	LockWorkspaceMutation() func()
+	LockWorkspaceMutation(domain.SessionID) func()
 }
 
 var _ workspaceMutationLocker = (*sessionmanager.Manager)(nil)
@@ -168,9 +168,9 @@ func NewWithDeps(d Deps) *Service {
 	return s
 }
 
-func (s *Service) lockWorkspaceMutation() func() {
+func (s *Service) lockWorkspaceMutation(id domain.SessionID) func() {
 	if s.workspaceMutations != nil {
-		return s.workspaceMutations.LockWorkspaceMutation()
+		return s.workspaceMutations.LockWorkspaceMutation(id)
 	}
 	s.workspaceMutationMu.Lock()
 	return s.workspaceMutationMu.Unlock

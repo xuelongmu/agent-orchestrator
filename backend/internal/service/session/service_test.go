@@ -775,7 +775,7 @@ type fakeCommander struct {
 	sendRelease             <-chan struct{}
 }
 
-func (f *fakeCommander) LockWorkspaceMutation() func() {
+func (f *fakeCommander) LockWorkspaceMutation(domain.SessionID) func() {
 	f.workspaceMutationMu.Lock()
 	return f.workspaceMutationMu.Unlock
 }
@@ -1600,7 +1600,7 @@ func TestClaimPRWaitsForDependencyWorkspaceMutation(t *testing.T) {
 	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws", Branch: "ao/mer-1/root"}}
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
 	manager := sessionmanager.New(sessionmanager.Deps{})
-	unlockPromotion := manager.LockWorkspaceMutation()
+	unlockPromotion := manager.LockWorkspaceMutation("mer-1")
 	reviewFetched := make(chan int)
 	checkoutEntered := make(chan int, 1)
 	svc := NewWithDeps(Deps{
@@ -1801,7 +1801,7 @@ func TestClaimPRSerializesSameSessionCheckoutThroughPaneDelivery(t *testing.T) {
 	}
 	<-sendEntered
 	if !workspaceUnlockedOnSend {
-		t.Fatal("first pane delivery held the shared workspace mutation gate")
+		t.Fatal("first pane delivery held the session workspace mutation gate")
 	}
 
 	go func() {
@@ -1876,7 +1876,7 @@ func TestClaimPRRevalidatesSessionInsideWorkspaceMutation(t *testing.T) {
 			st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker, Metadata: domain.SessionMetadata{WorkspacePath: "/ws", Branch: "ao/mer-1/root"}}
 			st.projects["mer"] = domain.ProjectRecord{ID: "mer", RepoOriginURL: "https://github.com/acme/repo"}
 			manager := sessionmanager.New(sessionmanager.Deps{})
-			unlockMutation := manager.LockWorkspaceMutation()
+			unlockMutation := manager.LockWorkspaceMutation("mer-1")
 			reviewFetched := make(chan int)
 			checkoutCalled, claimCalled := false, false
 			svc := NewWithDeps(Deps{

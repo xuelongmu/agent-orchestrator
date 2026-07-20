@@ -145,7 +145,7 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	// Claims for different PRs may enrich concurrently, but one session cannot
 	// change checkout again until the preceding claim-ready delivery attempt has
 	// finished. This lock nests after the per-PR ownership lock and before the
-	// shared workspace mutation gate.
+	// session workspace mutation gate.
 	unlockSessionClaim := s.lockSessionClaim(id)
 	sessionClaimLocked := true
 	defer func() {
@@ -156,7 +156,7 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 	// A failed or incompletely acknowledged claim-ready delivery is durable and
 	// retried by lifecycle. Do not let a different PR replace checkout before
 	// that retry delivers the earlier PR's contract and withheld task. Inspect
-	// the durable barrier outside the shared workspace gate and without taking
+	// the durable barrier outside the session workspace gate and without taking
 	// the per-PR delivery lock, which lifecycle holds across pane I/O. A stale
 	// pending read only causes a safe, retryable rejection.
 	if err := s.rejectClaimWhileOtherDeliveryPending(ctx, id, prURL); err != nil {
@@ -167,7 +167,7 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 		outcome       ports.ClaimOutcome
 	)
 	err = func() error {
-		unlockWorkspaceMutation := s.lockWorkspaceMutation()
+		unlockWorkspaceMutation := s.lockWorkspaceMutation(id)
 		defer unlockWorkspaceMutation()
 
 		// Provider enrichment is intentionally outside the workspace gate. Once
@@ -250,7 +250,7 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 			}
 		}
 	}
-	// The claim-ready pane attempt is outside the shared workspace gate but
+	// The claim-ready pane attempt is outside the session workspace gate but
 	// inside this session's claim lock, so another PR cannot replace checkout
 	// before the agent receives (or definitively fails to receive) this barrier.
 	unlockSessionClaim()
