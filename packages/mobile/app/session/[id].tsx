@@ -110,6 +110,9 @@ const TERMINAL_ENHANCE_JS = `
         if (!Z.zoomed) { Z.tx = 0; Z.ty = 0; } else clampT(b);
       }
       applyTransform(b);
+      // Let resize/layout (and the resize handler's pinBottom) settle before
+      // framing an idle cursor that did not emit a cursor-move event.
+      if (Z.zoomed) setTimeout(followCursor, 0);
     } catch (_) {}
   }
   // Zoom to scale s keeping the content under screen point (ax, ay) fixed.
