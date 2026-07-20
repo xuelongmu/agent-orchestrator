@@ -357,12 +357,190 @@ func TestDoctorChecksAOBinaryIdentity(t *testing.T) {
 				ProcessAlive: func(int) bool { return false },
 			}
 			c := &commandContext{deps: deps.withDefaults()}
-			check := c.checkAOBinary()
+			check := c.checkAOBinary(context.Background())
 			if check.Level != tc.wantLevel || !strings.Contains(check.Message, tc.wantIn) {
 				t.Fatalf("ao-binary check = %+v, want level %s with %q", check, tc.wantLevel, tc.wantIn)
 			}
 		})
 	}
+}
+
+// TestDoctorFailsLegacyWindowsAOShadow is the install/update regression for a
+// stale fnm/npm shim resolving before the desktop app's bundled Go CLI. Keep
+// the platform explicit so Linux CI exercises the Windows decision too.
+func TestDoctorFailsLegacyWindowsAOShadow(t *testing.T) {
+	root := t.TempDir()
+	canonical := filepath.Join(root, "desktop", "resources", "daemon", "ao.exe")
+	shadow := writeWindowsAOShimFixture(t, filepath.Join(root, "fnm_multishells", "123"), "0.9.3")
+	deps := Deps{
+		Executable: func() (string, error) { return canonical, nil },
+		LookPath: func(name string) (string, error) {
+			if name != "ao" {
+				t.Fatalf("LookPath(%q), want ao", name)
+			}
+			return shadow, nil
+		},
+		CommandOutput: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			t.Fatalf("doctor executed untrusted PATH content: %s %v", name, args)
+			return nil, nil
+		},
+	}
+	c := &commandContext{deps: deps.withDefaults()}
+
+	preflight := c.checkAOBinaryForPlatform(context.Background(), "windows")
+	if preflight.Level != doctorFail {
+		t.Fatalf("ao-binary preflight = %+v, want FAIL", preflight)
+	}
+	checks := c.runDoctorForPlatform(context.Background(), "windows")
+	if len(checks) != 1 {
+		t.Fatalf("doctor checks = %+v, want immediate refusal before state/tool probes", checks)
+	}
+	check := checks[0]
+	if check.Level != doctorFail {
+		t.Fatalf("ao-binary check = %+v, want FAIL", check)
+	}
+	for _, want := range []string{"0.9.3", shadow, canonical, "canonical migrated entry point", "~/.agent-orchestrator", "~/.ao"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("ao-binary message %q missing %q", check.Message, want)
+		}
+	}
+}
+
+func TestDoctorWindowsAODifferentExeStaysWarningWithoutExecution(t *testing.T) {
+	root := t.TempDir()
+	canonical := filepath.Join(root, "desktop", "ao.exe")
+	other := filepath.Join(root, "other", "ao.exe")
+	for _, path := range []string{canonical, other} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture"), 0o755); err != nil { //nolint:gosec // executable-shaped test fixture
+			t.Fatal(err)
+		}
+	}
+	c := &commandContext{deps: Deps{
+		Executable: func() (string, error) { return canonical, nil },
+		LookPath:   func(string) (string, error) { return other, nil },
+		CommandOutput: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			t.Fatalf("doctor executed a different ao.exe: %s %v", name, args)
+			return nil, nil
+		},
+	}.withDefaults()}
+
+	check := c.checkAOBinaryForPlatform(context.Background(), "windows")
+	if check.Level != doctorWarn || !strings.Contains(check.Message, "different installation") {
+		t.Fatalf("ao-binary check = %+v, want WARN for different exe", check)
+	}
+}
+
+func TestDoctorWindowsMigratedShimStaysWarning(t *testing.T) {
+	root := t.TempDir()
+	shadow := writeWindowsAOShimFixture(t, filepath.Join(root, "fnm", "123"), "0.10.0")
+	c := &commandContext{deps: Deps{
+		Executable: func() (string, error) { return filepath.Join(root, "canonical", "ao.exe"), nil },
+		LookPath:   func(string) (string, error) { return shadow, nil },
+		CommandOutput: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			t.Fatalf("doctor executed migrated shim: %s %v", name, args)
+			return nil, nil
+		},
+	}.withDefaults()}
+
+	check := c.checkAOBinaryForPlatform(context.Background(), "windows")
+	if check.Level != doctorWarn || !strings.Contains(check.Message, "package version 0.10.0") {
+		t.Fatalf("ao-binary check = %+v, want WARN for different migrated install", check)
+	}
+}
+
+func TestDoctorWindowsAOMalformedOrUntrustedShimStaysWarning(t *testing.T) {
+	root := t.TempDir()
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"shell metacharacter", `@"%~dp0node.exe" "%~dp0node_modules\@aoagents\ao-cli\dist\index.js" %* & calc.exe`},
+		{"powershell launcher", `powershell -File "%~dp0ao.ps1" %*`},
+		{"arbitrary relative entry", `@"%~dp0node.exe" "..\..\untrusted.js" %*`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(root, strings.ReplaceAll(tc.name, " ", "-"))
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			shim := filepath.Join(dir, "ao.cmd")
+			if err := os.WriteFile(shim, []byte(tc.content+"\r\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			c := &commandContext{deps: Deps{
+				Executable: func() (string, error) { return filepath.Join(root, "canonical", "ao.exe"), nil },
+				LookPath:   func(string) (string, error) { return shim, nil },
+				CommandOutput: func(_ context.Context, name string, args ...string) ([]byte, error) {
+					t.Fatalf("doctor executed malformed shim: %s %v", name, args)
+					return nil, nil
+				},
+			}.withDefaults()}
+
+			check := c.checkAOBinaryForPlatform(context.Background(), "windows")
+			if check.Level != doctorWarn || !strings.Contains(check.Message, "could not safely inspect") {
+				t.Fatalf("ao-binary check = %+v, want safe WARN", check)
+			}
+		})
+	}
+
+	t.Run("untrusted package metadata", func(t *testing.T) {
+		shimDir := filepath.Join(root, "untrusted-package", "fnm", "123")
+		shim := writeWindowsAOShimFixture(t, shimDir, "0.9.3")
+		packagePath := filepath.Join(filepath.Dir(filepath.Dir(shimDir)), "agent-orchestrator", "packages", "cli", "package.json")
+		pkg := `{"name":"not-ao","version":"0.9.3","bin":{"ao":"dist/index.js"}}`
+		if err := os.WriteFile(packagePath, []byte(pkg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		c := &commandContext{deps: Deps{
+			Executable: func() (string, error) { return filepath.Join(root, "canonical", "ao.exe"), nil },
+			LookPath:   func(string) (string, error) { return shim, nil },
+			CommandOutput: func(_ context.Context, name string, args ...string) ([]byte, error) {
+				t.Fatalf("doctor executed untrusted package: %s %v", name, args)
+				return nil, nil
+			},
+		}.withDefaults()}
+
+		check := c.checkAOBinaryForPlatform(context.Background(), "windows")
+		if check.Level != doctorWarn || !strings.Contains(check.Message, `untrusted package name "not-ao"`) {
+			t.Fatalf("ao-binary check = %+v, want untrusted-package WARN", check)
+		}
+	})
+}
+
+func writeWindowsAOShimFixture(t *testing.T, shimDir, version string) string {
+	t.Helper()
+	// Match the observed fnm dogfood layout: the ephemeral shim directory owns
+	// node.exe while ao.cmd points at the absolute entry in the legacy checkout.
+	packageDir := filepath.Join(filepath.Dir(filepath.Dir(shimDir)), "agent-orchestrator", "packages", "cli")
+	entry := filepath.Join(packageDir, "dist", "index.js")
+	for _, dir := range []string{shimDir, filepath.Dir(entry), packageDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(shimDir, "node.exe"), []byte("fixture"), 0o755); err != nil { //nolint:gosec // executable-shaped test fixture
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entry, []byte("// fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkg := fmt.Sprintf(`{"name":"@aoagents/ao-cli","version":%q,"bin":{"ao":"dist/index.js"}}`, version)
+	if err := os.WriteFile(filepath.Join(packageDir, "package.json"), []byte(pkg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shim := filepath.Join(shimDir, "ao.cmd")
+	// This is the production fnm shape: native node beside the shim, an absolute
+	// package JS entry, and forwarded user arguments. Doctor reads but never runs it.
+	entryForShim := strings.ReplaceAll(entry, string(filepath.Separator), `\`)
+	content := `@"%~dp0node.exe" "` + entryForShim + `" %*` + "\r\n"
+	if err := os.WriteFile(shim, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return shim
 }
 
 // TestDoctorIncludesAOBinaryCheck asserts runDoctor actually surfaces the
