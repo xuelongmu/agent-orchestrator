@@ -686,6 +686,57 @@ func TestProcessSessionReaperRevalidatesBeforeEverySignal(t *testing.T) {
 	}
 }
 
+func TestProcessSessionReaperRejectsStartOrSessionReuseBeforeTerm(t *testing.T) {
+	original := identity(5000, 4242, "original")
+	for name, replacement := range map[string]processIdentity{
+		"start identity": identity(5000, 4242, "reused-start"),
+		"session id":     identity(5000, 9999, "reused-session"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			table := &fakeProcessTable{
+				current: map[int]processIdentity{5000: replacement},
+				snapshots: []processSnapshotStep{{
+					processes: []processIdentity{original},
+				}},
+			}
+			signaler := &recordingSignaler{}
+			reaper := newTestProcessReaper(table, signaler)
+			reaper.Reap(context.Background(), []sessionAnchor{anchor(4242, original)}, time.Second)
+			if len(signaler.calls) != 0 {
+				t.Fatalf("signals = %#v, want none after pre-TERM identity change", signaler.calls)
+			}
+		})
+	}
+}
+
+func TestProcessSessionReaperRejectsStartOrSessionReuseBeforeKill(t *testing.T) {
+	original := identity(5000, 4242, "original")
+	for name, replacement := range map[string]processIdentity{
+		"start identity": identity(5000, 4242, "reused-start"),
+		"session id":     identity(5000, 9999, "reused-session"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			table := &fakeProcessTable{
+				current: map[int]processIdentity{5000: original},
+				snapshots: []processSnapshotStep{
+					{processes: []processIdentity{original}},
+					{processes: []processIdentity{original}},
+					{processes: []processIdentity{original}},
+					{processes: []processIdentity{original}},
+					{processes: []processIdentity{original}, current: map[int]processIdentity{5000: replacement}},
+				},
+			}
+			signaler := &recordingSignaler{}
+			reaper := newTestProcessReaper(table, signaler)
+			reaper.Reap(context.Background(), []sessionAnchor{anchor(4242, original)}, 4*time.Second)
+			want := []signalCall{{pid: 5000, signal: syscall.SIGTERM}}
+			if !reflect.DeepEqual(signaler.calls, want) {
+				t.Fatalf("signals = %#v, want TERM only after pre-KILL identity change %#v", signaler.calls, want)
+			}
+		})
+	}
+}
+
 func TestProcessSessionReaperResnapshotsAndReapsLateChild(t *testing.T) {
 	original := identity(5000, 4242, "original")
 	late := identity(5001, 4242, "late")
