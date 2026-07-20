@@ -35,7 +35,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { type DaemonLaunchSpec, resolveDaemonLaunch } from "./shared/daemon-launch";
+import { evaluateDaemonIdentity, type DaemonLaunchSpec, resolveDaemonLaunch } from "./shared/daemon-launch";
 import { createListenPortScanner, defaultRunFilePath, parseRunFile, type RunFileInfo } from "./shared/daemon-discovery";
 import type { DaemonStatus } from "./shared/daemon-status";
 import { attachAppShortcuts } from "./main/app-shortcuts";
@@ -540,28 +540,11 @@ async function readDaemonProbe(port: number, endpoint: "healthz" | "readyz"): Pr
 }
 
 function daemonIdentityError(launch: DaemonLaunchSpec, probe: DaemonProbe): string | null {
-	if (launch.source === "dev") {
-		const cwdMatches = probe.workingDirectory ? samePath(probe.workingDirectory, launch.cwd) : false;
-		const executableMatches = probe.executablePath ? pathInside(probe.executablePath, launch.cwd) : false;
-		if (!probe.workingDirectory && !probe.executablePath) {
-			return "An older AO daemon is already running, but it does not report its checkout identity. Stop it and restart this app.";
-		}
-		if (!cwdMatches && !executableMatches) {
-			const actual = probe.workingDirectory ?? probe.executablePath ?? "an unknown location";
-			return `Another AO daemon is already running from ${actual}; expected this checkout at ${launch.cwd}. Stop the other daemon before using this checkout.`;
-		}
-		return null;
-	}
-
-	if (launch.source === "bundled") {
-		if (!probe.executablePath) {
-			return "An older AO daemon is already running, but it does not report its binary path. Stop it and restart this app.";
-		}
-		if (!samePath(probe.executablePath, launch.command)) {
-			return `Another AO daemon is already running from ${probe.executablePath}; expected ${launch.command}. Stop the other daemon before using this app.`;
-		}
-	}
-	return null;
+	return evaluateDaemonIdentity(launch, probe, {
+		enforceDevCheckout: devDaemonConfig.isIsolated,
+		samePath,
+		pathInside,
+	});
 }
 
 /**
