@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/gitexclude"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -641,7 +642,7 @@ func TestIgnoreCopilotPathSerializesConcurrentCommonExcludeUpdates(t *testing.T)
 
 	// Hold the same cross-process lock used by ignoreCopilotPath so both
 	// goroutines queue before either can perform its read-modify-write.
-	unlock, err := lockCopilotExclude(filepath.Join(commonGitDir, "info", "exclude.ao.lock"), nil)
+	unlock, err := gitexclude.Acquire(filepath.Join(commonGitDir, "info", "exclude.ao.lock"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
