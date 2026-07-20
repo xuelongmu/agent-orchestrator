@@ -654,6 +654,8 @@ func (missingAgents) Agent(domain.AgentHarness) (ports.Agent, bool) { return nil
 type fakeWorkspace struct {
 	mu                sync.RWMutex
 	createErr         error
+	validateBranchErr error
+	validatedBranches []string
 	destroyErr        error
 	destroyed         int
 	lastCfg           ports.WorkspaceConfig
@@ -681,6 +683,11 @@ type fakeWorkspace struct {
 	createRelease        <-chan struct{}
 	projectCreateStarted chan domain.SessionID
 	projectCreateRelease <-chan struct{}
+}
+
+func (w *fakeWorkspace) ValidateWorkspaceBranch(_ context.Context, branch string) error {
+	w.validatedBranches = append(w.validatedBranches, branch)
+	return w.validateBranchErr
 }
 
 func (w *fakeWorkspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
@@ -1077,6 +1084,60 @@ func TestSpawn_WithDependenciesPersistsLaunchAndWaitsForPromotion(t *testing.T) 
 	}
 	if !reflect.DeepEqual(got, []domain.SessionID{"mer-parent"}) {
 		t.Fatalf("dependencies not forwarded to seed record: %#v", got)
+	}
+}
+
+func TestSpawn_WithDependenciesRejectsInvalidBranchBeforeDurableAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		projectKind domain.ProjectKind
+	}{
+		{name: "single repository", projectKind: ""},
+		{name: "workspace project", projectKind: domain.ProjectKindWorkspace},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, rt, ws := newManager()
+			project := st.projects["mer"]
+			project.Kind = tc.projectKind
+			st.projects["mer"] = project
+			ws.validateBranchErr = fmt.Errorf("%w: %q", ports.ErrWorkspaceBranchInvalid, "bad..ref")
+
+			_, err := m.Spawn(ctx, ports.SpawnConfig{
+				ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+				Branch: "bad..ref", DependsOn: []domain.SessionID{"mer-parent"},
+			})
+			if !errors.Is(err, ports.ErrWorkspaceBranchInvalid) || !strings.Contains(err.Error(), "bad..ref") {
+				t.Fatalf("err = %v, want clear invalid-branch error", err)
+			}
+			if len(st.sessions) != 0 {
+				t.Fatalf("invalid branch durably admitted sessions: %#v", st.sessions)
+			}
+			if rt.created != 0 || len(ws.calls) != 0 {
+				t.Fatalf("invalid branch reached side effects: runtime=%d workspace calls=%v", rt.created, ws.calls)
+			}
+			if !reflect.DeepEqual(ws.validatedBranches, []string{"bad..ref"}) {
+				t.Fatalf("validated branches = %#v", ws.validatedBranches)
+			}
+		})
+	}
+}
+
+func TestSpawn_WithDependenciesDefersTransientBranchValidationFailure(t *testing.T) {
+	m, st, rt, ws := newManager()
+	ws.validateBranchErr = errors.New("git executable is temporarily unavailable")
+
+	child, err := m.Spawn(ctx, ports.SpawnConfig{
+		ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		Branch: "feat/valid", DependsOn: []domain.SessionID{"mer-parent"},
+	})
+	if err != nil {
+		t.Fatalf("transient preflight error escaped retryable admission: %v", err)
+	}
+	if child.ID == "" || !child.DependencyPending() || len(st.sessions) != 1 {
+		t.Fatalf("dependent child was not durably admitted for retry: child=%#v sessions=%#v", child, st.sessions)
+	}
+	if rt.created != 0 {
+		t.Fatalf("runtime created while dependency is pending: %d", rt.created)
 	}
 }
 

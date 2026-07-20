@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -24,7 +25,7 @@ func TestCommandArgs(t *testing.T) {
 		got  []string
 		want []string
 	}{
-		{"check ref", checkRefFormatBranchArgs(repo, branch), []string{"-C", repo, "check-ref-format", "--branch", branch}},
+		{"check ref", checkRefFormatBranchArgs(branch), []string{"check-ref-format", "--branch", branch}},
 		{"rev parse", revParseVerifyArgs(repo, "origin/main"), []string{"-C", repo, "rev-parse", "--verify", "--quiet", "origin/main"}},
 		{"add existing", worktreeAddBranchArgs(repo, path, branch), []string{"-C", repo, "worktree", "add", path, branch}},
 		{"add new", worktreeAddNewBranchArgs(repo, branch, path, "origin/main"), []string{"-C", repo, "worktree", "add", "-b", branch, path, "origin/main"}},
@@ -634,6 +635,65 @@ func TestCreateRejectsInvalidBranchName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bad branch!!") {
 		t.Fatalf("err = %v, want message to include the rejected branch name", err)
+	}
+}
+
+func TestPlanningRejectsInvalidBranchName(t *testing.T) {
+	root := t.TempDir()
+	repo := t.TempDir()
+	ws, err := New(Options{ManagedRoot: root, RepoResolver: StaticRepoResolver{"proj": repo}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ws.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if !reflect.DeepEqual(args, []string{"check-ref-format", "--branch", "bad..ref"}) {
+			t.Fatalf("unexpected git invocation: %v", args)
+		}
+		return nil, errors.New("exit status 1")
+	}
+
+	tests := []struct {
+		name string
+		plan func() error
+	}{
+		{
+			name: "single repository",
+			plan: func() error {
+				_, err := ws.PlanWorkspace(context.Background(), ports.WorkspaceConfig{ProjectID: "proj", SessionID: "sess", Branch: "bad..ref"})
+				return err
+			},
+		},
+		{
+			name: "workspace project",
+			plan: func() error {
+				_, err := ws.PlanWorkspaceProject(context.Background(), ports.WorkspaceProjectConfig{ProjectID: "proj", SessionID: "sess", Branch: "bad..ref", RootRepoPath: repo})
+				return err
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.plan(); !errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+				t.Fatalf("err = %v, want ports.ErrWorkspaceBranchInvalid", err)
+			}
+		})
+	}
+}
+
+func TestValidateWorkspaceBranchKeepsGitStartFailureTransient(t *testing.T) {
+	ws, err := New(Options{ManagedRoot: t.TempDir(), RepoResolver: StaticRepoResolver{"proj": t.TempDir()}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	startErr := &exec.Error{Name: "git", Err: exec.ErrNotFound}
+	ws.run = func(context.Context, string, ...string) ([]byte, error) { return nil, startErr }
+
+	err = ws.ValidateWorkspaceBranch(context.Background(), "feat/valid")
+	if err == nil || !errors.Is(err, startErr) {
+		t.Fatalf("err = %v, want wrapped Git start failure", err)
+	}
+	if errors.Is(err, ports.ErrWorkspaceBranchInvalid) {
+		t.Fatalf("Git start failure was misclassified as an invalid branch: %v", err)
 	}
 }
 

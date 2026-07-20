@@ -23,6 +23,7 @@ var _ ports.Workspace = (*Router)(nil)
 var _ ports.WorkspaceProject = (*Router)(nil)
 var _ ports.WorkspacePlanner = (*Router)(nil)
 var _ ports.WorkspaceProjectPlanner = (*Router)(nil)
+var _ ports.WorkspaceBranchValidator = (*Router)(nil)
 
 // New constructs a workspace-kind router from all supported adapters.
 func New(worktree, scratch, dir ports.Workspace) (*Router, error) {
@@ -65,6 +66,16 @@ func (r *Router) PlanWorkspace(ctx context.Context, cfg ports.WorkspaceConfig) (
 		return ports.WorkspaceInfo{}, errors.New("workspace router: adapter does not support deterministic planning")
 	}
 	return planner.PlanWorkspace(ctx, cfg)
+}
+
+// ValidateWorkspaceBranch delegates Git-ref syntax validation to the worktree
+// adapter. Branches are meaningful only for that workspace kind.
+func (r *Router) ValidateWorkspaceBranch(ctx context.Context, branch string) error {
+	validator, ok := r.worktree.(ports.WorkspaceBranchValidator)
+	if !ok {
+		return errors.New("workspace router: worktree adapter does not support branch validation")
+	}
+	return validator.ValidateWorkspaceBranch(ctx, branch)
 }
 
 // Restore delegates workspace restoration to the persisted kind.

@@ -9,9 +9,10 @@ import (
 )
 
 type recordingWorkspace struct {
-	name      string
-	called    int
-	destroyed int
+	name              string
+	called            int
+	destroyed         int
+	validatedBranches []string
 }
 
 func (w *recordingWorkspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
@@ -30,6 +31,10 @@ func (*recordingWorkspace) StashUncommitted(context.Context, ports.WorkspaceInfo
 	return "", nil
 }
 func (*recordingWorkspace) ApplyPreserved(context.Context, ports.WorkspaceInfo, string) error {
+	return nil
+}
+func (w *recordingWorkspace) ValidateWorkspaceBranch(_ context.Context, branch string) error {
+	w.validatedBranches = append(w.validatedBranches, branch)
 	return nil
 }
 
@@ -68,5 +73,19 @@ func TestCreateRoutesByKindAndDefaultsToWorktree(t *testing.T) {
 	}
 	if scratch.destroyed != 1 || worktree.destroyed != 0 || dir.destroyed != 0 {
 		t.Fatalf("destroy calls: worktree=%d scratch=%d dir=%d", worktree.destroyed, scratch.destroyed, dir.destroyed)
+	}
+}
+
+func TestValidateWorkspaceBranchRoutesToWorktree(t *testing.T) {
+	worktree := &recordingWorkspace{name: "worktree"}
+	router, err := New(worktree, &recordingWorkspace{name: "scratch"}, &recordingWorkspace{name: "dir"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := router.ValidateWorkspaceBranch(context.Background(), "feat/166"); err != nil {
+		t.Fatal(err)
+	}
+	if len(worktree.validatedBranches) != 1 || worktree.validatedBranches[0] != "feat/166" {
+		t.Fatalf("validated branches = %#v", worktree.validatedBranches)
 	}
 }

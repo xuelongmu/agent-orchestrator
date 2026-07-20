@@ -2,8 +2,11 @@ package gitworktree
 
 import "strings"
 
-func checkRefFormatBranchArgs(repo, branch string) []string {
-	return []string{"-C", repo, "check-ref-format", "--branch", branch}
+func checkRefFormatBranchArgs(branch string) []string {
+	// check-ref-format is repository-independent. Omitting -C lets callers
+	// distinguish a deterministic invalid ref from a transient/inaccessible
+	// repository environment.
+	return []string{"check-ref-format", "--branch", branch}
 }
 
 func revParseVerifyArgs(repo, ref string) []string {
