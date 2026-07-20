@@ -167,6 +167,41 @@ func TestManager_AddListGetRemove(t *testing.T) {
 	wantCode(t, err, "PROJECT_NOT_FOUND")
 }
 
+func TestManager_AddNormalizesDerivedProjectID(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name     string
+		basename string
+		wantID   domain.ProjectID
+	}{
+		{name: "valid dotted name", basename: "llama.cpp", wantID: "llama.cpp"},
+		{name: "valid separators", basename: "my_repo-v2.0", wantID: "my_repo-v2.0"},
+		{name: "invalid character", basename: "my@repo", wantID: "my-repo"},
+		{name: "trailing emoji", basename: "repo🔥", wantID: "repo"},
+		{name: "double dots", basename: "foo..bar", wantID: "foo-bar"},
+		{name: "leading punctuation", basename: ".hidden", wantID: "hidden"},
+		{name: "all invalid", basename: "@🔥", wantID: "project"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), tc.basename)
+			if out, err := exec.Command("git", "init", "-b", "main", dir).CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v (%s)", err, out)
+			}
+			commitEmpty(t, dir)
+
+			proj, err := newManager(t).Add(ctx, project.AddInput{Path: dir})
+			if err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			if proj.ID != tc.wantID {
+				t.Fatalf("project id = %q, want %q", proj.ID, tc.wantID)
+			}
+		})
+	}
+}
+
 func TestManager_AddEmitsProjectAndFirstProjectTelemetry(t *testing.T) {
 	ctx := context.Background()
 	store, err := sqlite.Open(t.TempDir())

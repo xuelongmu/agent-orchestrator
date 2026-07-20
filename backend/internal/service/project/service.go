@@ -738,11 +738,20 @@ func isGitRepo(path string) bool {
 func defaultProjectID(path string) domain.ProjectID {
 	id := strings.ToLower(filepath.Base(path))
 	id = strings.TrimSpace(id)
-	id = strings.ReplaceAll(id, " ", "-")
+	id = invalidDerivedProjectIDRunPattern.ReplaceAllString(id, "-")
+	id = doubleDotRunPattern.ReplaceAllString(id, "-")
+	id = strings.Trim(id, ".-_")
+	if id == "" {
+		id = "project"
+	}
 	return domain.ProjectID(id)
 }
 
-var projectIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var (
+	projectIDPattern                  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	invalidDerivedProjectIDRunPattern = regexp.MustCompile(`[^a-z0-9._-]+`)
+	doubleDotRunPattern               = regexp.MustCompile(`\.{2,}`)
+)
 
 func validateProjectID(id domain.ProjectID) error {
 	raw := string(id)
