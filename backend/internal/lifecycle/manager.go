@@ -185,7 +185,7 @@ func (m *Manager) SetDependencyScheduler(scheduler dependencyReconciler) {
 	m.dependencyScheduler = scheduler
 }
 
-func (m *Manager) reconcileDependencies(ctx context.Context) error {
+func (m *Manager) reconcileDependencies() error {
 	m.mu.Lock()
 	scheduler := m.dependencyScheduler
 	m.mu.Unlock()
@@ -302,7 +302,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 	if err := m.cleanupCompletedSession(ctx, id); err != nil {
 		return err
 	}
-	return m.reconcileDependencies(ctx)
+	return m.reconcileDependencies()
 }
 
 // ApplyActivitySignal records an authoritative agent activity signal and any
@@ -341,7 +341,7 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 			if err := m.cleanupCompletedSession(ctx, id); err != nil {
 				return err
 			}
-			return m.reconcileDependencies(ctx)
+			return m.reconcileDependencies()
 		}
 		return nil
 	}
@@ -467,7 +467,7 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 		if err := m.cleanupCompletedSession(ctx, id); err != nil {
 			return err
 		}
-		if err := m.reconcileDependencies(ctx); err != nil {
+		if err := m.reconcileDependencies(); err != nil {
 			return err
 		}
 	}
@@ -760,7 +760,7 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 	if err != nil {
 		return err
 	}
-	return m.reconcileDependencies(ctx)
+	return m.reconcileDependencies()
 }
 
 // markTerminatedUnlessRateLimited atomically applies an automated terminal
@@ -783,7 +783,7 @@ func (m *Manager) markTerminatedUnlessRateLimited(ctx context.Context, id domain
 	if err != nil {
 		return err
 	}
-	return m.reconcileDependencies(ctx)
+	return m.reconcileDependencies()
 }
 
 // reserveMergedCleanup atomically linearizes automated cleanup against a

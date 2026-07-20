@@ -684,7 +684,7 @@ func (m *Manager) launchCreatedSession(ctx context.Context, cfg ports.SpawnConfi
 	// under the daemon lease lifetime rather than the request lifetime: request
 	// cancellation must not turn a live runtime into an unfenced reservation,
 	// while lease loss must prevent this old daemon from writing anything else.
-	commitCtx, cancel := m.promotionLifetimeContext(10 * time.Second)
+	commitCtx, cancel := m.promotionLifetimeContext()
 	defer cancel()
 	if err := commitCtx.Err(); err != nil {
 		return domain.SessionRecord{}, dependencyLaunchCleanupError{err: fmt.Errorf("spawn %s: dependency launch ownership lost before success commit: %w", id, err)}
@@ -715,12 +715,12 @@ func (m *Manager) launchCreatedSession(ctx context.Context, cfg ports.SpawnConfi
 	return final, nil
 }
 
-func (m *Manager) promotionLifetimeContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(m.lifetimeCtx, timeout)
+func (m *Manager) promotionLifetimeContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(m.lifetimeCtx, 10*time.Second)
 }
 
-func (m *Manager) resetPromotedLaunch(ctx context.Context, id domain.SessionID, token string) error {
-	cleanupCtx, cancel := m.promotionLifetimeContext(10 * time.Second)
+func (m *Manager) resetPromotedLaunch(id domain.SessionID, token string) error {
+	cleanupCtx, cancel := m.promotionLifetimeContext()
 	defer cancel()
 	if err := cleanupCtx.Err(); err != nil {
 		return err
@@ -738,7 +738,7 @@ func (m *Manager) resetPromotedLaunch(ctx context.Context, id domain.SessionID, 
 func (m *Manager) rollbackLaunchAttempt(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo, promotionToken string, launchPersisted bool) error {
 	cleanupErr := m.rollbackLaunchWorkspace(ctx, rec, ws, workspaceProject, promotionToken)
 	if cleanupErr == nil && launchPersisted {
-		cleanupErr = m.resetPromotedLaunch(ctx, rec.ID, promotionToken)
+		cleanupErr = m.resetPromotedLaunch(rec.ID, promotionToken)
 	}
 	if cleanupErr == nil {
 		m.rollbackLaunchSeed(ctx, rec.ID, promotionToken)
@@ -749,7 +749,7 @@ func (m *Manager) rollbackLaunchAttempt(ctx context.Context, rec domain.SessionR
 func (m *Manager) rollbackStartedLaunchAttempt(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo, promotionToken string, launchPersisted bool) error {
 	cleanupErr := m.rollbackLaunchWorkspace(ctx, rec, ws, workspaceProject, promotionToken)
 	if cleanupErr == nil && launchPersisted {
-		cleanupErr = m.resetPromotedLaunch(ctx, rec.ID, promotionToken)
+		cleanupErr = m.resetPromotedLaunch(rec.ID, promotionToken)
 	}
 	return cleanupErr
 }
@@ -758,7 +758,7 @@ func (m *Manager) destroyLaunchRuntime(ctx context.Context, handle ports.Runtime
 	if promotionToken == "" {
 		return m.runtime.Destroy(ctx, handle)
 	}
-	cleanupCtx, cancel := m.promotionLifetimeContext(10 * time.Second)
+	cleanupCtx, cancel := m.promotionLifetimeContext()
 	defer cancel()
 	if err := cleanupCtx.Err(); err != nil {
 		return err
@@ -866,7 +866,7 @@ func appendDependencyHandoffs(prompt string, parents []domain.DependencyHandoff)
 		lines = append(lines, string(payload)+"\n")
 	}
 	included := len(lines)
-	marker := ""
+	var marker string
 	for {
 		marker = ""
 		if included < len(ordered) {
@@ -1073,7 +1073,7 @@ func (m *Manager) rollbackLaunchWorkspace(ctx context.Context, rec domain.Sessio
 	if promotionToken == "" {
 		return m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject)
 	}
-	cleanupCtx, cancel := m.promotionLifetimeContext(10 * time.Second)
+	cleanupCtx, cancel := m.promotionLifetimeContext()
 	defer cancel()
 	if err := cleanupCtx.Err(); err != nil {
 		return dependencyLaunchCleanupError{err: fmt.Errorf("spawn rollback: daemon ownership lost: %w", err)}
@@ -2106,7 +2106,7 @@ func (m *Manager) completeRecoveredDependencyPromotions(ctx context.Context) err
 			continue
 		}
 		if rec.IsTerminated || rec.DependencyLaunchSucceededAt.IsZero() || !alive {
-			retryable, cleanupErr := m.resetRecoveredDependencyLaunch(ctx, rec, alive)
+			retryable, cleanupErr := m.resetRecoveredDependencyLaunch(rec, alive)
 			if cleanupErr != nil {
 				recoveryErrs = append(recoveryErrs, cleanupErr)
 				continue
@@ -2128,10 +2128,10 @@ func (m *Manager) completeRecoveredDependencyPromotions(ctx context.Context) err
 // resetRecoveredDependencyLaunch handles interrupted or dead runtime-bound
 // attempts. A live runtime is adoptable only after the final launch-success
 // marker; otherwise it is destroyed before the workspace is reset for retry.
-func (m *Manager) resetRecoveredDependencyLaunch(ctx context.Context, observed domain.SessionRecord, alive bool) (bool, error) {
+func (m *Manager) resetRecoveredDependencyLaunch(observed domain.SessionRecord, alive bool) (bool, error) {
 	m.dependencyLaunchMu.Lock()
 	defer m.dependencyLaunchMu.Unlock()
-	cleanupCtx, cancel := m.promotionLifetimeContext(10 * time.Second)
+	cleanupCtx, cancel := m.promotionLifetimeContext()
 	defer cancel()
 	if err := cleanupCtx.Err(); err != nil {
 		return false, err
@@ -2155,18 +2155,28 @@ func (m *Manager) resetRecoveredDependencyLaunch(ctx context.Context, observed d
 			return false, fmt.Errorf("reconcile %s: destroy interrupted dependency runtime: %w", latest.ID, err)
 		}
 	}
+	workspacePreserved := false
 	if rows, workspaceProject, rowErr := m.workspaceProjectRows(cleanupCtx, latest); rowErr != nil {
 		return false, fmt.Errorf("reconcile %s: load dependency workspace rows: %w", latest.ID, rowErr)
 	} else if workspaceProject {
 		if _, destroyErr := m.destroyWorkspaceProjectRows(cleanupCtx, rows); destroyErr != nil {
-			return false, fmt.Errorf("reconcile %s: clean dead dependency workspace project: %w", latest.ID, destroyErr)
+			if !latest.IsTerminated || !errors.Is(destroyErr, ports.ErrWorkspaceDirty) {
+				return false, fmt.Errorf("reconcile %s: clean dead dependency workspace project: %w", latest.ID, destroyErr)
+			}
+			workspacePreserved = true
 		}
 	} else if latest.Metadata.WorkspacePath != "" {
 		if err := m.workspace.Destroy(cleanupCtx, workspaceInfo(latest)); err != nil {
-			return false, fmt.Errorf("reconcile %s: clean dead dependency workspace: %w", latest.ID, err)
+			if !latest.IsTerminated || !errors.Is(err, ports.ErrWorkspaceDirty) {
+				return false, fmt.Errorf("reconcile %s: clean dead dependency workspace: %w", latest.ID, err)
+			}
+			workspacePreserved = true
 		}
 	}
-	if latest.Metadata.WorkspacePath != "" {
+	// Kill deliberately preserves dirty worktrees. Once terminal, that refusal
+	// must not retain the promotion fence forever; reset only the durable launch
+	// state and leave the user's work untouched.
+	if latest.Metadata.WorkspacePath != "" && !workspacePreserved {
 		if err := m.cleanupAgentWorkspace(cleanupCtx, latest, latest.Metadata.WorkspacePath); err != nil {
 			return false, fmt.Errorf("reconcile %s: clean dead dependency agent workspace: %w", latest.ID, err)
 		}

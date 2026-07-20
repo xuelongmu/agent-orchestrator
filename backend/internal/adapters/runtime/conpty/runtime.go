@@ -511,5 +511,5 @@ type processKiller interface {
 
 // osProcessFinder is the production implementation; tests may replace it.
 // The real defaultOSProcessFinder is in pidalive_unix.go / pidalive_windows.go
-// (same files that provide pidAlive).
+// (the platform-specific process helper files).
 var osProcessFinder = defaultOSProcessFinder

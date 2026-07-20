@@ -1469,6 +1469,54 @@ func TestTerminatedReservedDependencyLaunchIsCleanedAndNeverCompleted(t *testing
 	}
 }
 
+func TestKillDirtyWorktreeMidPromotionRecoveryConverges(t *testing.T) {
+	m, st, rt, ws := newManager()
+	now := time.Now().UTC()
+	rec := domain.SessionRecord{
+		ID: "mer-dirty", ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		DependencyIDs:        domain.EncodeSessionDependencyIDs([]domain.SessionID{"parent"}),
+		DependencyPreparedAt: now, DependencyBasePrompt: "base", DependencyPromotionToken: "owner",
+		Metadata: domain.SessionMetadata{
+			WorkspaceKind: domain.WorkspaceKindWorktree, WorkspacePath: "/ws/dirty",
+			RuntimeHandleID: "runtime-dirty", Prompt: "rendered",
+		},
+		Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
+	}
+	st.sessions[rec.ID] = rec
+	rt.aliveByHandle = map[string]bool{"runtime-dirty": true}
+	ws.destroyErr = fmt.Errorf("gitworktree: refusing to remove: %w", ports.ErrWorkspaceDirty)
+	scheduler := &fakeDependencyScheduler{store: st}
+	m.SetDependencyScheduler(scheduler)
+
+	freed, err := m.Kill(ctx, rec.ID)
+	if err != nil || freed {
+		t.Fatalf("Kill dirty promoted child = freed:%v err:%v, want false, nil", freed, err)
+	}
+	if got := st.sessions[rec.ID]; !got.IsTerminated || got.DependencyPromotionToken != "owner" {
+		t.Fatalf("Kill did not preserve terminal reservation for recovery: %#v", got)
+	}
+
+	// Kill destroyed this runtime before preserving the dirty worktree. Recovery
+	// must not retry that preserved teardown and wedge the reservation forever.
+	rt.aliveByHandle["runtime-dirty"] = false
+	if err := m.RecoverPromotedDependencyLaunches(ctx); err != nil {
+		t.Fatalf("first recovery: %v", err)
+	}
+	if err := m.RecoverPromotedDependencyLaunches(ctx); err != nil {
+		t.Fatalf("idempotent recovery: %v", err)
+	}
+	got := st.sessions[rec.ID]
+	if !got.IsTerminated || got.DependencyPromotionToken != "" || got.Metadata.RuntimeHandleID != "" || got.Metadata.WorkspacePath != "" {
+		t.Fatalf("terminal dirty reservation did not converge: %#v", got)
+	}
+	if !reflect.DeepEqual(scheduler.released, []string{"mer-dirty:owner"}) {
+		t.Fatalf("released reservations = %v", scheduler.released)
+	}
+	if ws.destroyed != 2 {
+		t.Fatalf("dirty worktree teardown attempts = %d, want Kill plus one convergent recovery attempt", ws.destroyed)
+	}
+}
+
 func TestRecoveredDependencyFailureDoesNotWedgeOtherRecoveredRows(t *testing.T) {
 	m, st, rt, _ := newManager()
 	now := time.Now().UTC()
@@ -1524,7 +1572,7 @@ func TestRecoveredDirectoryCleanupSerializesWithKillAndReplacementHooks(t *testi
 	<-destroyStarted // Kill now owns sharedDirMu.
 	recoveryDone := make(chan error, 1)
 	go func() {
-		_, err := m.resetRecoveredDependencyLaunch(context.Background(), old, true)
+		_, err := m.resetRecoveredDependencyLaunch(old, true)
 		recoveryDone <- err
 	}()
 	spawnDone := make(chan error, 1)

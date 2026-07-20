@@ -131,15 +131,6 @@ func readRawFile(path string) ([]Entry, error) {
 	return out, nil
 }
 
-// readRaw also reads the pre-AO_DATA_DIR registry while upgrading an existing
-// install. Entries in the configured registry win on duplicate session IDs.
-// The caller removes the legacy file only after the merged list is safely
-// written to the configured location.
-func readRaw() (entries []Entry, legacyPath string, migrateLegacy bool, err error) {
-	dataDir, _ := os.LookupEnv("AO_DATA_DIR")
-	return readRawFor(dataDir)
-}
-
 func readRawFor(dataDir string) (entries []Entry, legacyPath string, migrateLegacy bool, err error) {
 	path, err := registryFileFor(dataDir)
 	if err != nil {
@@ -232,25 +223,6 @@ func writeRawFor(dataDir string, entries []Entry) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
-}
-
-func writeMigrated(entries []Entry, legacyPath string, migrateLegacy bool) error {
-	dataDir, _ := os.LookupEnv("AO_DATA_DIR")
-	return writeMigratedFor(dataDir, entries, legacyPath, migrateLegacy)
-}
-
-func writeMigratedFor(dataDir string, entries []Entry, legacyPath string, migrateLegacy bool) error {
-	if err := writeRawFor(dataDir, entries); err != nil {
-		return err
-	}
-	if !migrateLegacy {
-		return nil
-	}
-	// The configured registry is now authoritative. Cleanup is deliberately
-	// best-effort: callers must retain the readable entries even if Windows has
-	// the old file locked or its ACL prevents removal.
-	_ = removeLegacyFile(legacyPath)
-	return nil
 }
 
 // Register adds or replaces the entry for entry.SessionID. registeredAt must
