@@ -59,20 +59,39 @@ export type XtermTerminalProps = {
 // Prefer the WebGL renderer, fall back to 2D canvas. Both rasterize box-drawing
 // glyphs themselves onto a fixed cell grid; the DOM renderer does not, so TUI
 // borders would drift. Loaded after open().
-function loadRenderer(term: Terminal): void {
+function loadRenderer(term: Terminal, requestFit: () => void): void {
+	let canvasLoaded = false;
+	const loadCanvas = () => {
+		if (canvasLoaded) return;
+		canvasLoaded = true;
+		try {
+			term.loadAddon(new CanvasAddon());
+		} catch (error) {
+			console.warn("xterm: WebGL and canvas renderers unavailable; box-drawing may drift", error);
+		} finally {
+			requestFit();
+		}
+	};
+
 	try {
 		const webgl = new WebglAddon();
-		webgl.onContextLoss(() => webgl.dispose());
+		let webglDisposed = false;
+		webgl.onContextLoss(() => {
+			if (webglDisposed) return;
+			webglDisposed = true;
+			try {
+				webgl.dispose();
+			} finally {
+				loadCanvas();
+			}
+		});
 		term.loadAddon(webgl);
 		return;
 	} catch {
-		// WebGL context unavailable — fall through to the canvas renderer.
+		// WebGL context unavailable — use the same guarded canvas fallback as
+		// runtime context loss.
 	}
-	try {
-		term.loadAddon(new CanvasAddon());
-	} catch (error) {
-		console.warn("xterm: WebGL and canvas renderers unavailable; box-drawing may drift", error);
-	}
+	loadCanvas();
 }
 
 // xterm palette tracks the app theme (see lib/terminal-themes.ts + tokens.css).
@@ -296,8 +315,18 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		term.loadAddon(new WebLinksAddon(activateLink));
 		term.loadAddon(new SearchAddon());
 
+		const fitTerminal = () => {
+			try {
+				fit.fit();
+			} catch {
+				// Container momentarily has no size (hidden/unmounting) — a later
+				// trigger retries.
+			}
+		};
+		fitRef.current = fitTerminal;
+
 		term.open(host);
-		loadRenderer(term);
+		loadRenderer(term, () => fitRef.current?.());
 		term.options.macOptionClickForcesSelection = true;
 		forceSelectionMode(term);
 
@@ -400,16 +429,6 @@ export function XtermTerminal(props: XtermTerminalProps) {
 			}
 			window.setTimeout(() => copySelection({ dedupe: true }), 0);
 		});
-
-		const fitTerminal = () => {
-			try {
-				fit.fit();
-			} catch {
-				// Container momentarily has no size (hidden/unmounting) — a later
-				// trigger retries.
-			}
-		};
-		fitRef.current = fitTerminal;
 
 		const raf = requestAnimationFrame(fitTerminal);
 		// 50/250ms catch the common settle; 600/1200ms are a session-bounded
