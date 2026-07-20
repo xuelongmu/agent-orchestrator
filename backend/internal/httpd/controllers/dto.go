@@ -506,6 +506,7 @@ type GetDesignContractResponse struct {
 // AgentSessionID may arrive without State on metadata-only SessionStart hooks.
 type SetActivityRequest struct {
 	State          string `json:"state,omitempty" enum:"active,idle,waiting_input,blocked,rate_limited,exited" description:"Agent activity state reported by an agent hook. Optional for metadata-only hooks."`
+	Harness        string `json:"harness,omitempty" description:"Agent harness token for harness-specific hook ordering semantics."`
 	Event          string `json:"event,omitempty" description:"AO hook sub-command that produced this state (e.g. post-tool-use)."`
 	ToolName       string `json:"toolName,omitempty" description:"Native tool name, for tool-use hook events."`
 	ToolUseID      string `json:"toolUseId,omitempty" description:"Native tool-use id, for tool-use hook events."`

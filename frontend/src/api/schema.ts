@@ -1251,6 +1251,8 @@ export interface components {
             errorType?: string;
             /** @description AO hook sub-command that produced this state (e.g. post-tool-use). */
             event?: string;
+            /** @description Agent harness token for harness-specific hook ordering semantics. */
+            harness?: string;
             /**
              * @description Agent activity state reported by an agent hook. Optional for metadata-only hooks.
              * @enum {string}

@@ -48,7 +48,10 @@ func applyKimiAgentHook(t *testing.T, m *Manager, id domain.SessionID, event, ag
 		t.Fatalf("derive kimi/%s: no activity signal", event)
 	}
 	s := sig(state, event, toolName, toolUseID)
-	s.AgentID = agentID
+	s.Harness = "kimi"
+	if event == "permission-request" || event == "permission-result" {
+		s.AgentID = agentID
+	}
 	mustApply(t, m, id, s)
 }
 
@@ -189,6 +192,76 @@ func TestKimiDelayedPermissionRequestAfterStopStaysIdle(t *testing.T) {
 	}
 }
 
+func TestKimiPostResolvesPermissionBeforeResult(t *testing.T) {
+	m, st, _ := newManager()
+	seedSignaled(st, "mer-1", domain.ActivityIdle)
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_42")
+	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_42")
+	applyKimiHook(t, m, "mer-1", "post-tool-use", "Shell", "call_42")
+	if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
+		t.Fatalf("state after matching post = %q, want active", got)
+	}
+	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_42")
+	if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
+		t.Fatalf("state after idempotent result = %q, want active", got)
+	}
+}
+
+func TestKimiConcurrentPermissionsResolveThroughPostsAndResults(t *testing.T) {
+	tests := []struct {
+		name    string
+		mainID  string
+		childID string
+	}{
+		{"different tool ids", "call_main", "call_child"},
+		{"same tool id", "call_shared", "call_shared"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, st, _ := newManager()
+			seedSignaled(st, "mer-1", domain.ActivityIdle)
+			applyKimiAgentHook(t, m, "mer-1", "pre-tool-use", "main", "Shell", tt.mainID)
+			applyKimiAgentHook(t, m, "mer-1", "permission-request", "main", "Shell", tt.mainID)
+			applyKimiAgentHook(t, m, "mer-1", "pre-tool-use", "background", "Shell", tt.childID)
+			applyKimiAgentHook(t, m, "mer-1", "permission-request", "background", "Shell", tt.childID)
+
+			applyKimiAgentHook(t, m, "mer-1", "post-tool-use", "background", "Shell", tt.childID)
+			if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
+				t.Fatalf("state after first post = %q, want waiting_input", got)
+			}
+			applyKimiAgentHook(t, m, "mer-1", "permission-result", "background", "Shell", tt.childID)
+			if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
+				t.Fatalf("state after background result = %q, want waiting_input", got)
+			}
+			applyKimiAgentHook(t, m, "mer-1", "post-tool-use", "main", "Shell", tt.mainID)
+			if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
+				t.Fatalf("state after final post = %q, want active", got)
+			}
+			applyKimiAgentHook(t, m, "mer-1", "permission-result", "main", "Shell", tt.mainID)
+			if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
+				t.Fatalf("state after main result = %q, want active", got)
+			}
+		})
+	}
+}
+
+func TestStandardIDLessPermissionRequestsRemainWaitingInput(t *testing.T) {
+	for _, harness := range []string{"codex", "qwen"} {
+		t.Run(harness, func(t *testing.T) {
+			m, st, _ := newManager()
+			seedSignaled(st, "mer-1", domain.ActivityActive)
+			state, ok := activitydispatch.Derive(harness, "permission-request", nil)
+			if !ok {
+				t.Fatalf("derive %s permission-request: no activity signal", harness)
+			}
+			mustApply(t, m, "mer-1", sig(state, "permission-request", "", ""))
+			if got := stateOf(st, "mer-1"); got != domain.ActivityWaitingInput {
+				t.Fatalf("state = %q, want waiting_input", got)
+			}
+		})
+	}
+}
+
 func TestKimiPermissionCorrelationCapAndTurnCleanup(t *testing.T) {
 	m, st, _ := newManager()
 	seedSignaled(st, "mer-1", domain.ActivityIdle)
@@ -202,7 +275,7 @@ func TestKimiPermissionCorrelationCapAndTurnCleanup(t *testing.T) {
 	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Read", "overflow")
 
 	fl := m.flights["mer-1"]
-	if fl == nil || len(fl.inflight) != 1 || len(fl.pendingPermissions) != 0 || len(fl.resolvedPermissions) != 0 {
+	if fl == nil || len(fl.inflight) != 1 || fl.trackedTools != 1 || len(fl.pendingPermissions) != 0 || len(fl.resolvedPermissions) != 0 {
 		t.Fatalf("flight after cap reset = %#v, want one inflight and empty permission sets", fl)
 	}
 	applyKimiHook(t, m, "mer-1", "stop", "", "")

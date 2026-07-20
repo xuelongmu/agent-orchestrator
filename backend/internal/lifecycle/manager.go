@@ -474,20 +474,26 @@ func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, 
 	return recoveryErr
 }
 
-// toolIdentity distinguishes tool calls that reuse an id in different Kimi
-// main/background agents. AgentID is empty for adapters without agent-scoped
-// payloads, preserving their existing ToolUseID-only correlation.
-type toolIdentity struct {
+// permissionIdentity distinguishes approvals that reuse a tool-call id in
+// different Kimi main/background agents. Native pre/post payloads omit the
+// agent id, so tool execution progress remains keyed by tool-call id alone.
+type permissionIdentity struct {
 	agentID   string
 	toolUseID string
 }
 
-func activityToolIdentity(s ports.ActivitySignal) toolIdentity {
-	return toolIdentity{agentID: s.AgentID, toolUseID: s.ToolUseID}
+func activityPermissionIdentity(s ports.ActivitySignal) permissionIdentity {
+	return permissionIdentity{agentID: s.AgentID, toolUseID: s.ToolUseID}
 }
 
-func (i toolIdentity) validPermission() bool {
+func (i permissionIdentity) valid() bool {
 	return i.agentID != "" && i.toolUseID != ""
+}
+
+type toolProgress struct {
+	name      string
+	started   int
+	completed int
 }
 
 // toolFlight tracks one session's in-flight tool executions and permission
@@ -499,25 +505,59 @@ func (i toolIdentity) validPermission() bool {
 // clearing at the next turn boundary — fail-safe staleness, never a spurious
 // clear.
 type toolFlight struct {
-	// inflight maps agent-scoped tool identities to tool names for pre-tool-use
-	// signals whose post has not arrived yet.
-	inflight map[toolIdentity]string
-	// blockedCandidate is the identity of the UNIQUE in-flight tool bearing
+	// inflight retains bounded current-turn start/completion counts by native
+	// tool-call id. Counts preserve safe post evidence when ids are reused by
+	// concurrent main/background agents.
+	inflight     map[string]toolProgress
+	trackedTools int
+	// blockedCandidate is the id of the UNIQUE in-flight tool bearing
 	// the dialog's tool_name when it appeared — the tool whose post proves the
 	// dialog was answered. hasBlockedCandidate is false when no in-flight tool
 	// matched or the match was ambiguous.
-	blockedCandidate    toolIdentity
+	blockedCandidate    string
 	hasBlockedCandidate bool
 	// pendingPermissions contains every live Kimi approval in the current
 	// turn. resolvedPermissions remembers result-before-request delivery so a
 	// matching late request cannot recreate a completed wait.
-	pendingPermissions  map[toolIdentity]struct{}
-	resolvedPermissions map[toolIdentity]struct{}
+	pendingPermissions  map[permissionIdentity]struct{}
+	resolvedPermissions map[permissionIdentity]struct{}
 }
 
-// maxInflightTools caps a session's in-flight map so lost posts cannot grow
-// it without bound; hitting the cap resets the map, degrading that session to
-// turn-boundary clearing (fail-safe).
+func (f *toolFlight) knownPermissionCount(toolUseID string) int {
+	count := 0
+	for identity := range f.pendingPermissions {
+		if identity.toolUseID == toolUseID {
+			count++
+		}
+	}
+	for identity := range f.resolvedPermissions {
+		if identity.toolUseID == toolUseID {
+			count++
+		}
+	}
+	return count
+}
+
+func (f *toolFlight) resolveCompletedPermissions(toolUseID string) bool {
+	progress, ok := f.inflight[toolUseID]
+	if !ok || progress.completed < progress.started {
+		return false
+	}
+	resolved := false
+	for identity := range f.pendingPermissions {
+		if identity.toolUseID != toolUseID {
+			continue
+		}
+		delete(f.pendingPermissions, identity)
+		f.resolvedPermissions[identity] = struct{}{}
+		resolved = true
+	}
+	return resolved
+}
+
+// maxInflightTools caps current-turn tracked starts so reused ids and lost
+// posts cannot grow correlation state without bound. Hitting the cap resets
+// all tool and permission correlation, degrading to turn-boundary clearing.
 const maxInflightTools = 128
 
 // isToolUseEvent reports whether the AO hook event is one of the tool-use
@@ -559,46 +599,58 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 	ensure := func() *toolFlight {
 		if fl == nil {
 			fl = &toolFlight{
-				inflight:            map[toolIdentity]string{},
-				pendingPermissions:  map[toolIdentity]struct{}{},
-				resolvedPermissions: map[toolIdentity]struct{}{},
+				inflight:            map[string]toolProgress{},
+				pendingPermissions:  map[permissionIdentity]struct{}{},
+				resolvedPermissions: map[permissionIdentity]struct{}{},
 			}
 			m.flights[id] = fl
 		}
 		return fl
 	}
-	identity := activityToolIdentity(s)
+	identity := activityPermissionIdentity(s)
+	kimiPostResolved := false
 
 	// Tracking side effects happen regardless of what the state decision is.
 	switch s.Event {
 	case "pre-tool-use":
 		if s.ToolUseID != "" {
 			f := ensure()
-			if len(f.inflight) >= maxInflightTools {
-				f.inflight = map[toolIdentity]string{}
-				f.pendingPermissions = map[toolIdentity]struct{}{}
-				f.resolvedPermissions = map[toolIdentity]struct{}{}
-				f.blockedCandidate = toolIdentity{}
+			if f.trackedTools >= maxInflightTools {
+				f.inflight = map[string]toolProgress{}
+				f.trackedTools = 0
+				f.pendingPermissions = map[permissionIdentity]struct{}{}
+				f.resolvedPermissions = map[permissionIdentity]struct{}{}
+				f.blockedCandidate = ""
 				f.hasBlockedCandidate = false
 			}
-			delete(f.resolvedPermissions, identity)
-			f.inflight[identity] = s.ToolName
+			progress := f.inflight[s.ToolUseID]
+			progress.name = s.ToolName
+			progress.started++
+			f.inflight[s.ToolUseID] = progress
+			f.trackedTools++
 		}
 	case "post-tool-use", "post-tool-use-failure":
-		if fl != nil {
-			delete(fl.inflight, identity)
-			delete(fl.resolvedPermissions, identity)
+		if fl != nil && s.ToolUseID != "" {
+			progress, ok := fl.inflight[s.ToolUseID]
+			if ok && progress.completed < progress.started {
+				progress.completed++
+				fl.inflight[s.ToolUseID] = progress
+			}
+			if s.Harness == "kimi" {
+				kimiPostResolved = fl.resolveCompletedPermissions(s.ToolUseID)
+			}
 		}
 	}
 
 	switch {
-	case s.Event == "permission-request" && s.State == domain.ActivityWaitingInput:
+	case s.Harness == "kimi" && s.Event == "permission-request" && s.State == domain.ActivityWaitingInput:
 		// Observation-only Kimi permission callbacks can arrive after Stop.
 		// PreToolUse already made a legitimate current-turn request non-idle.
-		if cur == domain.ActivityIdle || fl == nil || !identity.validPermission() {
+		if cur == domain.ActivityIdle || fl == nil || !identity.valid() {
 			return suppressed
 		}
-		if _, ok := fl.inflight[identity]; !ok {
+		progress, ok := fl.inflight[identity.toolUseID]
+		if !ok {
 			return suppressed
 		}
 		if _, resolved := fl.resolvedPermissions[identity]; resolved {
@@ -607,14 +659,22 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 			// cannot recreate the wait.
 			return suppressed
 		}
+		if fl.knownPermissionCount(identity.toolUseID) >= progress.started {
+			return suppressed
+		}
+		if progress.completed >= progress.started {
+			fl.resolvedPermissions[identity] = struct{}{}
+			return suppressed
+		}
 		fl.pendingPermissions[identity] = struct{}{}
 		return s
 
-	case s.Event == "permission-result":
-		if fl == nil || !identity.validPermission() {
+	case s.Harness == "kimi" && s.Event == "permission-result":
+		if fl == nil || !identity.valid() {
 			return suppressed
 		}
-		if _, ok := fl.inflight[identity]; !ok {
+		progress, ok := fl.inflight[identity.toolUseID]
+		if !ok {
 			return suppressed
 		}
 		if _, resolved := fl.resolvedPermissions[identity]; resolved {
@@ -630,8 +690,17 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 		}
 		// Result-before-request: remember the completed identity within this
 		// turn and suppress its matching late request.
+		if fl.knownPermissionCount(identity.toolUseID) >= progress.started {
+			return suppressed
+		}
 		fl.resolvedPermissions[identity] = struct{}{}
 		return suppressed
+
+	case s.Harness == "kimi" && (s.Event == "post-tool-use" || s.Event == "post-tool-use-failure") && kimiPostResolved:
+		if len(fl.pendingPermissions) > 0 {
+			s.State = domain.ActivityWaitingInput
+		}
+		return s
 
 	case cur == domain.ActivityIdle && isDeferredToolCompletionEvent(s.Event):
 		if fl != nil && len(fl.inflight) == 0 {
@@ -657,16 +726,17 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 		if s.ToolName != "" {
 			// Recompute from scratch: this is a fresh dialog, so any candidate
 			// carried from a prior one must not leak in.
-			f.blockedCandidate = toolIdentity{}
+			f.blockedCandidate = ""
 			f.hasBlockedCandidate = false
-			for candidate, name := range f.inflight {
-				if name != s.ToolName {
+			for candidate, progress := range f.inflight {
+				outstanding := progress.started - progress.completed
+				if progress.name != s.ToolName || outstanding == 0 {
 					continue
 				}
-				if f.hasBlockedCandidate {
+				if f.hasBlockedCandidate || outstanding > 1 {
 					// A second same-name tool: ambiguous, fail closed by
 					// leaving no candidate (only a turn boundary clears).
-					f.blockedCandidate = toolIdentity{}
+					f.blockedCandidate = ""
 					f.hasBlockedCandidate = false
 					break
 				}
@@ -684,11 +754,11 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 			delete(m.flights, id)
 			return s
 		case (s.Event == "post-tool-use" || s.Event == "post-tool-use-failure") &&
-			fl != nil && fl.hasBlockedCandidate && identity == fl.blockedCandidate:
+			fl != nil && fl.hasBlockedCandidate && s.ToolUseID == fl.blockedCandidate:
 			// The single unambiguous blocking tool finished: the dialog was
 			// answered. Clear the candidate so a later dialog in the same turn
 			// starts from a clean slate.
-			fl.blockedCandidate = toolIdentity{}
+			fl.blockedCandidate = ""
 			fl.hasBlockedCandidate = false
 			return s
 		default:

@@ -42,6 +42,7 @@ const (
 // the body leniently and simply ignores them.
 type setActivityAPIRequest struct {
 	State          string `json:"state,omitempty"`
+	Harness        string `json:"harness,omitempty"`
 	Event          string `json:"event,omitempty"`
 	ToolName       string `json:"toolName,omitempty"`
 	ToolUseID      string `json:"toolUseId,omitempty"`
@@ -66,13 +67,21 @@ func activityMeta(payload []byte) (toolName, toolUseID, errorType, agentID strin
 		ToolName        string `json:"tool_name"`
 		ToolUseID       string `json:"tool_use_id"`
 		ToolCallID      string `json:"tool_call_id"`
+		ToolCallIDCamel string `json:"toolCallId"`
 		AgentID         string `json:"agent_id"`
+		AgentIDCamel    string `json:"agentId"`
 		Error           string `json:"error"`
 		LegacyErrorType string `json:"error_type"`
 	}
 	_ = json.Unmarshal(payload, &p)
 	if p.ToolUseID == "" {
 		p.ToolUseID = p.ToolCallID
+	}
+	if p.ToolUseID == "" {
+		p.ToolUseID = p.ToolCallIDCamel
+	}
+	if p.AgentID == "" {
+		p.AgentID = p.AgentIDCamel
 	}
 	errorType = strings.TrimSpace(p.Error)
 	if errorType == "" {
@@ -187,6 +196,12 @@ func (c *commandContext) runHook(ctx context.Context, agent, event string) error
 		AgentID:        agentID,
 		ErrorType:      errorType,
 		AgentSessionID: agentSessionID,
+	}
+	if agent == "kimi" {
+		switch event {
+		case "pre-tool-use", "post-tool-use", "post-tool-use-failure", "permission-request", "permission-result":
+			req.Harness = agent
+		}
 	}
 	if hasActivity {
 		req.State = string(state)

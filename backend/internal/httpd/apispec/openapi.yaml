@@ -3424,6 +3424,9 @@ components:
         event:
           description: AO hook sub-command that produced this state (e.g. post-tool-use).
           type: string
+        harness:
+          description: Agent harness token for harness-specific hook ordering semantics.
+          type: string
         state:
           description: Agent activity state reported by an agent hook. Optional for
             metadata-only hooks.

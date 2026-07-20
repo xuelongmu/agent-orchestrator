@@ -275,25 +275,38 @@ func TestHooks_PostToolUseCarriesCorrelationFields(t *testing.T) {
 }
 
 func TestHooks_KimiToolCallIDCarriesCorrelationFields(t *testing.T) {
-	t.Setenv("AO_SESSION_ID", "ao-7")
-	cfg := setConfigEnv(t)
-	srv, capture := activityServer(t, http.StatusOK, `{"ok":true}`)
-	writeRunFileFor(t, cfg, srv)
+	tests := []struct {
+		event   string
+		payload string
+		want    setActivityAPIRequest
+	}{
+		{"pre-tool-use", `{"tool_name":"Shell","toolCallId":"call_42"}`, setActivityAPIRequest{State: "active", Harness: "kimi", Event: "pre-tool-use", ToolName: "Shell", ToolUseID: "call_42"}},
+		{"post-tool-use", `{"tool_name":"Shell","toolCallId":"call_42","tool_output":"ok"}`, setActivityAPIRequest{State: "active", Harness: "kimi", Event: "post-tool-use", ToolName: "Shell", ToolUseID: "call_42"}},
+		{"permission-request", `{"agentId":"background-1","tool_name":"Shell","toolCallId":"call_42"}`, setActivityAPIRequest{State: "waiting_input", Harness: "kimi", Event: "permission-request", ToolName: "Shell", ToolUseID: "call_42", AgentID: "background-1"}},
+		{"permission-result", `{"agentId":"background-1","tool_name":"Shell","toolCallId":"call_42"}`, setActivityAPIRequest{State: "active", Harness: "kimi", Event: "permission-result", ToolName: "Shell", ToolUseID: "call_42", AgentID: "background-1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.event, func(t *testing.T) {
+			t.Setenv("AO_SESSION_ID", "ao-7")
+			cfg := setConfigEnv(t)
+			srv, capture := activityServer(t, http.StatusOK, `{"ok":true}`)
+			writeRunFileFor(t, cfg, srv)
 
-	_, _, err := executeCLI(t, Deps{
-		In:           strings.NewReader(`{"agent_id":"background-1","tool_name":"Shell","tool_call_id":"call_42","tool_output":"ok"}`),
-		ProcessAlive: func(int) bool { return true },
-	}, "hooks", "kimi", "post-tool-use")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	var req setActivityAPIRequest
-	if err := json.Unmarshal([]byte(capture.body), &req); err != nil {
-		t.Fatalf("decode body: %v\nbody=%s", err, capture.body)
-	}
-	want := setActivityAPIRequest{State: "active", Event: "post-tool-use", ToolName: "Shell", ToolUseID: "call_42", AgentID: "background-1"}
-	if req != want {
-		t.Errorf("body = %+v, want %+v", req, want)
+			_, _, err := executeCLI(t, Deps{
+				In:           strings.NewReader(tt.payload),
+				ProcessAlive: func(int) bool { return true },
+			}, "hooks", "kimi", tt.event)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var req setActivityAPIRequest
+			if err := json.Unmarshal([]byte(capture.body), &req); err != nil {
+				t.Fatalf("decode body: %v\nbody=%s", err, capture.body)
+			}
+			if req != tt.want {
+				t.Errorf("body = %+v, want %+v", req, tt.want)
+			}
+		})
 	}
 }
 
