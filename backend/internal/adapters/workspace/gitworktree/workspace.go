@@ -887,14 +887,13 @@ func (w *Workspace) validateBranch(ctx context.Context, branch string) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("gitworktree: validate branch %q: %w", branch, ctxErr)
 		}
-		var startErr *exec.Error
-		var pathErr *os.PathError
-		if errors.As(err, &startErr) || errors.As(err, &pathErr) {
-			// Failure to start Git is environmental, not proof that the ref itself
-			// is invalid. Dependency admission must keep this case retryable.
-			return fmt.Errorf("gitworktree: validate branch %q: %w", branch, err)
+		var exitErr interface{ ExitCode() int }
+		if errors.As(err, &exitErr) {
+			return fmt.Errorf("%w: %q (%w)", ErrBranchInvalid, branch, err)
 		}
-		return fmt.Errorf("%w: %q (%w)", ErrBranchInvalid, branch, err)
+		// A failure to launch Git is operational, not proof that check-ref-format
+		// rejected the branch. Preserve its cause without the invalid sentinel.
+		return fmt.Errorf("gitworktree: validate branch %q: %w", branch, err)
 	}
 	return nil
 }

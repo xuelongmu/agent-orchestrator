@@ -1273,6 +1273,16 @@ func TestToAPIErrorMapsWorkspaceBranchSentinels(t *testing.T) {
 	}
 }
 
+func TestToAPIErrorDoesNotClassifyOperationalBranchValidationAsInvalid(t *testing.T) {
+	operationalErr := errors.New("git executable unavailable")
+	err := fmt.Errorf("spawn: validate branch: %w", operationalErr)
+	mapped := toAPIError(err)
+	var apiErr *apierr.Error
+	if !errors.Is(mapped, operationalErr) || errors.As(mapped, &apiErr) {
+		t.Fatalf("mapped = %v, want unchanged operational error", mapped)
+	}
+}
+
 // TestToAPIError_NotResumable asserts that ErrNotResumable (promptless worker
 // with no adapter resume handle) maps to a Conflict with code SESSION_NOT_RESUMABLE.
 func TestToAPIError_NotResumable(t *testing.T) {

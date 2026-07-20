@@ -247,8 +247,8 @@ func TestSpawnInvalidDependentBranchSurfacesDaemonDiagnostic(t *testing.T) {
 	_, _, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }},
 		"spawn", "--project", "demo", "--agent", "codex", "--name", "child",
 		"--branch", "bad..ref", "--depends-on", "demo-1")
-	if err == nil || !strings.Contains(err.Error(), "invalid branch name") || !strings.Contains(err.Error(), "INVALID_BRANCH") {
-		t.Fatalf("err = %v, want clear INVALID_BRANCH diagnostic", err)
+	if err == nil || !strings.Contains(err.Error(), "bad..ref") || !strings.Contains(err.Error(), "INVALID_BRANCH") {
+		t.Fatalf("err = %v, want branch and INVALID_BRANCH diagnostic", err)
 	}
 }
 

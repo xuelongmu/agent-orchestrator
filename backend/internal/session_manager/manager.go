@@ -388,15 +388,12 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn: %w: branch is only valid for worktree sessions", ErrWorkspaceKindInvalid)
 	}
 	if len(cfg.DependsOn) > 0 && cfg.WorkspaceKind == domain.WorkspaceKindWorktree && cfg.Branch != "" {
-		if validator, ok := m.workspace.(ports.WorkspaceBranchValidator); ok {
-			if validateErr := validator.ValidateWorkspaceBranch(ctx, cfg.Branch); errors.Is(validateErr, ports.ErrWorkspaceBranchInvalid) {
-				return domain.SessionRecord{}, fmt.Errorf("spawn: validate branch: %w", validateErr)
-			} else if validateErr != nil {
-				// Only deterministic Git-ref errors veto durable admission. Missing
-				// executables and similar environmental failures are left for the
-				// dependency scheduler's retryable promotion path.
-				m.logger.Warn("spawn: dependency branch preflight deferred after environmental failure", "branch", cfg.Branch, "error", validateErr)
-			}
+		validator, ok := m.workspace.(ports.WorkspaceBranchValidator)
+		if !ok {
+			return domain.SessionRecord{}, errors.New("spawn: dependency workspace adapter does not support branch validation")
+		}
+		if validateErr := validator.ValidateWorkspaceBranch(ctx, cfg.Branch); validateErr != nil {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: validate branch: %w", validateErr)
 		}
 	}
 	// A per-project role override picks the harness when the spawn names none,

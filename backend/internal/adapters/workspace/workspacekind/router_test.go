@@ -2,6 +2,7 @@ package workspacekind
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -13,6 +14,7 @@ type recordingWorkspace struct {
 	called            int
 	destroyed         int
 	validatedBranches []string
+	validateErr       error
 }
 
 func (w *recordingWorkspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
@@ -35,7 +37,7 @@ func (*recordingWorkspace) ApplyPreserved(context.Context, ports.WorkspaceInfo, 
 }
 func (w *recordingWorkspace) ValidateWorkspaceBranch(_ context.Context, branch string) error {
 	w.validatedBranches = append(w.validatedBranches, branch)
-	return nil
+	return w.validateErr
 }
 
 func TestCreateRoutesByKindAndDefaultsToWorktree(t *testing.T) {
@@ -87,5 +89,10 @@ func TestValidateWorkspaceBranchRoutesToWorktree(t *testing.T) {
 	}
 	if len(worktree.validatedBranches) != 1 || worktree.validatedBranches[0] != "feat/166" {
 		t.Fatalf("validated branches = %#v", worktree.validatedBranches)
+	}
+	wantErr := errors.New("git unavailable")
+	worktree.validateErr = wantErr
+	if err := router.ValidateWorkspaceBranch(context.Background(), "feat/retry"); !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want forwarded %v", err, wantErr)
 	}
 }

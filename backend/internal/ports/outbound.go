@@ -206,9 +206,8 @@ type WorkspacePlanner interface {
 // WorkspaceBranchValidator validates the caller-supplied branch syntax without
 // materialising a workspace or consulting repository state. Session admission
 // uses this optional capability to reject deterministic Git-ref errors before
-// a dependency-gated seed becomes durable, while deferring environmental
-// failures (for example, a temporarily unavailable Git executable) to the
-// retryable promotion path.
+// a dependency-gated seed becomes durable. Operational validation failures
+// preserve their original cause so callers can retry admission later.
 type WorkspaceBranchValidator interface {
 	ValidateWorkspaceBranch(ctx context.Context, branch string) error
 }
