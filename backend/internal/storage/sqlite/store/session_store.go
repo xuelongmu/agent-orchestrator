@@ -305,7 +305,9 @@ func lifecycleMergedCleanupEqual(a, b domain.SessionMetadata) bool {
 }
 
 // RenameSession updates only the user-facing display name for an existing
-// session. It returns ok=false when the session id does not exist.
+// session. It returns ok=false when the session id does not exist. The
+// sessions_cdc_update trigger fans out a session_updated CDC event when the
+// display name actually changes.
 func (s *Store) RenameSession(ctx context.Context, id domain.SessionID, displayName string, updatedAt time.Time) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
