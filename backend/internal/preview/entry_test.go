@@ -232,6 +232,7 @@ func TestStoredWorkspaceEntryPreservesLegacyAndRelativeTargets(t *testing.T) {
 		want string
 	}{
 		{raw: "http://127.0.0.1:3001/api/v1/sessions/ao-1/preview/files/docs/report.html", want: "docs/report.html"},
+		{raw: "http://127.0.0.1:3001/api/v1/sessions/ao-1/preview/files/docs/my%2520report.html", want: "docs/my report.html"},
 		{raw: "docs/report.html", want: "docs/report.html"},
 		{raw: " docs/report.html ", want: " docs/report.html "},
 	} {
@@ -242,6 +243,9 @@ func TestStoredWorkspaceEntryPreservesLegacyAndRelativeTargets(t *testing.T) {
 	}
 	if got, ok := StoredWorkspaceEntry("https://example.com/api/v1/sessions/ao-1/preview/files/docs/report.html", "ao-1"); ok {
 		t.Fatalf("external lookalike URL = %q, true; want false", got)
+	}
+	if got, ok := StoredWorkspaceEntry("http://127.0.0.1:3001/api/v1/sessions/ao-1/preview/files/%252e%252e%252fsecret.html", "ao-1"); ok {
+		t.Fatalf("double-escaped traversal = %q, true; want false", got)
 	}
 }
 

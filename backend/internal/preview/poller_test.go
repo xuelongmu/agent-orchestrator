@@ -191,11 +191,11 @@ func TestPollerDoesNotOverrideExplicitPreviewTarget(t *testing.T) {
 	}
 }
 
-func TestPollerMigratesLegacyWorkspacePreviewURL(t *testing.T) {
+func TestPollerMigratesDoubleEscapedLegacyWorkspacePreviewURL(t *testing.T) {
 	workspace := t.TempDir()
 	writeFile(t, filepath.Join(workspace, "index.html"), "<main>hello</main>")
-	writeFile(t, filepath.Join(workspace, "docs", "report.html"), "<main>chosen report</main>")
-	legacy := "http://127.0.0.1:3001/api/v1/sessions/ao-1/preview/files/docs/report.html"
+	writeFile(t, filepath.Join(workspace, "docs", "my report.html"), "<main>chosen report</main>")
+	legacy := "http://127.0.0.1:3001/api/v1/sessions/ao-1/preview/files/docs/my%2520report.html"
 	svc := &fakePreviewSessions{sessions: []domain.SessionRecord{workerSession("ao-1", workspace, legacy)}}
 	poller := NewPoller(svc, svc, "http://127.0.0.1:3001", PollerConfig{Logger: discardLogger()})
 
@@ -205,7 +205,7 @@ func TestPollerMigratesLegacyWorkspacePreviewURL(t *testing.T) {
 
 	assertSets(t, svc.sets, previewSet{
 		id:  "ao-1",
-		url: mustFileURL(t, "http://127.0.0.1:3001", "ao-1", "docs/report.html"),
+		url: mustFileURL(t, "http://127.0.0.1:3001", "ao-1", "docs/my report.html"),
 	})
 }
 

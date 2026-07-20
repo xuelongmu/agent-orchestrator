@@ -35,6 +35,13 @@ func StoredWorkspaceEntry(raw string, id domain.SessionID) (string, bool) {
 			if err != nil {
 				return "", false
 			}
+			// Released FileURL versions escaped each path segment before assigning
+			// it to url.URL.Path, whose String method escaped the percent signs a
+			// second time. Decode that historical extra layer before validation.
+			entry, err = url.PathUnescape(entry)
+			if err != nil {
+				return "", false
+			}
 			return CleanWorkspacePath(entry)
 		}
 	}
