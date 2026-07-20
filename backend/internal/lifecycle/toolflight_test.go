@@ -66,6 +66,19 @@ func TestKimiPermissionLifecycleDispatch(t *testing.T) {
 	}
 }
 
+func TestKimiDelayedPermissionResultAfterStopStaysIdle(t *testing.T) {
+	m, st, _ := newManager()
+	seedSignaled(st, "mer-1", domain.ActivityIdle)
+	applyKimiHook(t, m, "mer-1", "pre-tool-use", "Shell", "call_42")
+	applyKimiHook(t, m, "mer-1", "permission-request", "Shell", "call_42")
+	applyKimiHook(t, m, "mer-1", "stop", "", "")
+	applyKimiHook(t, m, "mer-1", "permission-result", "Shell", "call_42")
+
+	if got := stateOf(st, "mer-1"); got != domain.ActivityIdle {
+		t.Fatalf("state after delayed permission-result = %q, want idle", got)
+	}
+}
+
 // blockOnDialog drives a session into blocked through the real signal path:
 // the blocking tool's pre-tool-use, then permission-request naming that tool.
 func blockOnDialog(t *testing.T, m *Manager, st *fakeStore, id domain.SessionID, toolName, toolUseID string) {
@@ -104,17 +117,23 @@ func TestToolPrecedence_ApprovedToolFailurePostAlsoClears(t *testing.T) {
 
 func TestToolPrecedence_DelayedPostAfterStopStaysIdle(t *testing.T) {
 	for _, event := range []string{"post-tool-use", "post-tool-use-failure"} {
-		t.Run(event, func(t *testing.T) {
-			m, st, _ := newManager()
-			seedSignaled(st, "mer-1", domain.ActivityActive)
-			mustApply(t, m, "mer-1", sig(domain.ActivityActive, "pre-tool-use", "Shell", "call_42"))
-			mustApply(t, m, "mer-1", sig(domain.ActivityIdle, "stop", "", ""))
-			mustApply(t, m, "mer-1", sig(domain.ActivityActive, event, "Shell", "call_42"))
-
-			if got := stateOf(st, "mer-1"); got != domain.ActivityIdle {
-				t.Fatalf("state after delayed %s = %q, want idle", event, got)
+		for _, toolUseID := range []string{"call_42", ""} {
+			name := "tracked"
+			if toolUseID == "" {
+				name = "missing-tool-id"
 			}
-		})
+			t.Run(event+"/"+name, func(t *testing.T) {
+				m, st, _ := newManager()
+				seedSignaled(st, "mer-1", domain.ActivityActive)
+				mustApply(t, m, "mer-1", sig(domain.ActivityActive, "pre-tool-use", "Shell", toolUseID))
+				mustApply(t, m, "mer-1", sig(domain.ActivityIdle, "stop", "", ""))
+				mustApply(t, m, "mer-1", sig(domain.ActivityActive, event, "Shell", toolUseID))
+
+				if got := stateOf(st, "mer-1"); got != domain.ActivityIdle {
+					t.Fatalf("state after delayed %s = %q, want idle", event, got)
+				}
+			})
+		}
 	}
 }
 
