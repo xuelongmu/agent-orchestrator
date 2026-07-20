@@ -112,7 +112,7 @@ func (p *Plugin) preLaunch(ctx context.Context, cfg ports.LaunchConfig, onLockCo
 	if err != nil {
 		hasGitMarker, markerErr := workspaceHasGitMarker(cfg.WorkspacePath)
 		if markerErr != nil {
-			return fmt.Errorf("classify workspace after Git resolution failed: %v: %w", err, markerErr)
+			return fmt.Errorf("classify workspace after Git resolution failed: %w; inspect repository marker: %w", err, markerErr)
 		}
 		if !hasGitMarker {
 			return nil
