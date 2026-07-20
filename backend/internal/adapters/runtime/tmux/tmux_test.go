@@ -51,8 +51,8 @@ func (f *fakeRunner) Run(_ context.Context, env []string, name string, args ...s
 // recordingReaper replaces the production process-mutation boundary in unit
 // tests. Destroy tests must never signal processes on the host running them.
 type recordingReaper struct {
-	anchoredPIDs []int
-	calls        []reaperCall
+	anchoredPanes []paneRef
+	calls         []reaperCall
 }
 
 type reaperCall struct {
@@ -61,13 +61,14 @@ type reaperCall struct {
 	grace       time.Duration
 }
 
-func (r *recordingReaper) Anchor(_ context.Context, panePIDs []int) []sessionAnchor {
-	r.anchoredPIDs = append([]int(nil), panePIDs...)
-	anchors := make([]sessionAnchor, 0, len(panePIDs))
-	for _, pid := range panePIDs {
-		identity := processIdentity{pid: pid, sessionID: pid, started: "anchored"}
+func (r *recordingReaper) Anchor(_ context.Context, panes []paneRef) []sessionAnchor {
+	r.anchoredPanes = append([]paneRef(nil), panes...)
+	anchors := make([]sessionAnchor, 0, len(panes))
+	for _, pane := range panes {
+		identity := processIdentity{pid: pane.pid, sessionID: pane.pid, started: "anchored"}
 		anchors = append(anchors, sessionAnchor{
-			sessionID: pid,
+			pane:      pane,
+			sessionID: pane.pid,
 			members:   map[processIdentity]struct{}{identity: {}},
 		})
 	}
@@ -135,8 +136,11 @@ func TestCommandBuilders(t *testing.T) {
 	if got, want := hasSessionArgs("sess-1"), []string{"has-session", "-t", "=sess-1"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("hasSessionArgs = %#v, want %#v", got, want)
 	}
-	if got, want := listPaneOwnersArgs("sess-1"), []string{"list-panes", "-s", "-t", "=sess-1", "-F", "#{pane_pid}\t#{window_linked}"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("listPaneOwnersArgs = %#v, want %#v", got, want)
+	if got, want := listPaneRefsArgs("sess-1"), []string{"list-panes", "-s", "-t", "=sess-1", "-F", "#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_dead}"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("listPaneRefsArgs = %#v, want %#v", got, want)
+	}
+	if got, want := listAllWindowIDsArgs(), []string{"list-panes", "-a", "-F", "#{window_id}"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("listAllWindowIDsArgs = %#v, want %#v", got, want)
 	}
 	if got, want := sendKeysLiteralArgs("sess-1", "hello"), []string{"send-keys", "-t", "sess-1", "-l", "hello"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("sendKeysLiteralArgs = %#v, want %#v", got, want)
@@ -443,7 +447,7 @@ func TestDestroyArgs(t *testing.T) {
 	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
-	if got, want := fr.calls[0].args, listPaneOwnersArgs("sess-1"); !reflect.DeepEqual(got, want) {
+	if got, want := fr.calls[0].args, listPaneRefsArgs("sess-1"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("list pane args = %#v, want %#v", got, want)
 	}
 	// killSessionArgs uses exact-match target =<id>.
@@ -454,7 +458,8 @@ func TestDestroyArgs(t *testing.T) {
 
 func TestDestroyReapsAllDiscoveredPaneSessions(t *testing.T) {
 	r, fr := newTestRuntime(0)
-	fr.outputs = [][]byte{[]byte("4242 0\n4243 0\n1 0\n0 0\n4242 0\nnoise\n"), nil}
+	panes := []byte("%1 @1 4242 0\n%2 @2 4243 0\n%3 @3 1 0\n%4 @4 0 0\n%1 @1 4242 0\nnoise\n")
+	fr.outputs = [][]byte{panes, panes, nil, nil}
 	reaper := &recordingReaper{}
 	r.sessionReaper = reaper
 
@@ -464,8 +469,8 @@ func TestDestroyReapsAllDiscoveredPaneSessions(t *testing.T) {
 	if len(reaper.calls) != 1 {
 		t.Fatalf("reaper calls = %d, want 1", len(reaper.calls))
 	}
-	if got, want := reaper.anchoredPIDs, []int{4242, 4243}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("anchored pane pids = %#v, want %#v", got, want)
+	if got, want := reaper.anchoredPanes, []paneRef{{paneID: "%1", windowID: "@1", pid: 4242}, {paneID: "%2", windowID: "@2", pid: 4243}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("anchored panes = %#v, want %#v", got, want)
 	}
 	if got, want := anchorSessionIDs(reaper.calls[0].anchors), []int{4242, 4243}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("reaped session ids = %#v, want %#v", got, want)
@@ -475,17 +480,77 @@ func TestDestroyReapsAllDiscoveredPaneSessions(t *testing.T) {
 	}
 }
 
-func TestDestroyExcludesPanesFromLinkedWindows(t *testing.T) {
+func TestDestroyExcludesWindowLinkedAfterDiscovery(t *testing.T) {
 	r, fr := newTestRuntime(0)
-	fr.outputs = [][]byte{[]byte("4242 0\n5000 1\n5001 1\n4243 0\n"), nil}
+	panes := []byte("%1 @1 4242 0\n%2 @2 4243 0\n")
+	fr.outputs = [][]byte{panes, panes, nil, []byte("@2\n")}
 	reaper := &recordingReaper{}
 	r.sessionReaper = reaper
 
 	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
-	if got, want := reaper.anchoredPIDs, []int{4242, 4243}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("anchored pane pids = %#v, want only unlinked panes %#v", got, want)
+	if got, want := anchorSessionIDs(reaper.calls[0].anchors), []int{4242}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("reaped session ids = %#v, want only destroyed window %#v", got, want)
+	}
+}
+
+func TestDestroyReapsDuplicateWindowLinksWithinSameSession(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	panes := []byte("%1 @1 4242 0\n%1 @1 4242 0\n")
+	fr.outputs = [][]byte{panes, panes, nil, nil}
+	reaper := &recordingReaper{}
+	r.sessionReaper = reaper
+
+	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if got, want := anchorSessionIDs(reaper.calls[0].anchors), []int{4242}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("reaped session ids = %#v, want duplicate link owned by destroyed session %#v", got, want)
+	}
+}
+
+func TestDestroyRejectsPanePIDReuseBeforeAnchorCompletes(t *testing.T) {
+	r, fr := newTestRuntime(0)
+	fr.outputs = [][]byte{
+		[]byte("%1 @1 4242 0\n"),
+		// The pane owner exited while Anchor ran. Even if 4242 has already been
+		// reused elsewhere, tmux's dead state invalidates the numeric PID.
+		[]byte("%1 @1 4242 1\n"),
+		nil,
+	}
+	reaper := &recordingReaper{}
+	r.sessionReaper = reaper
+
+	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if len(reaper.calls) != 0 {
+		t.Fatalf("reaper calls = %#v, want none for stale pane PID anchor", reaper.calls)
+	}
+}
+
+func TestDestroyFailsClosedWhenSurvivorVerificationFails(t *testing.T) {
+	r, _ := newTestRuntime(0)
+	panes := []byte("%1 @1 4242 0\n")
+	call := 0
+	r.runner = runnerFunc(func(_ context.Context, _ []string, _ string, args ...string) ([]byte, error) {
+		call++
+		if call <= 2 {
+			return panes, nil
+		}
+		if args[0] == "kill-session" {
+			return nil, nil
+		}
+		return []byte("permission denied"), &exec.ExitError{}
+	})
+	reaper := &recordingReaper{}
+	r.sessionReaper = reaper
+	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if len(reaper.calls) != 0 {
+		t.Fatalf("reaper calls = %#v, want fail-closed survivor check", reaper.calls)
 	}
 }
 
@@ -495,7 +560,7 @@ func TestDestroyDoesNotReapWhenKillSessionFails(t *testing.T) {
 		exitErrOn: "kill-session",
 		errOutput: []byte("permission denied"),
 		outputs: map[string][]byte{
-			"list-panes": []byte("4242 0\n"),
+			"list-panes": []byte("%1 @1 4242 0\n"),
 		},
 	}
 	r.runner = fr
@@ -568,9 +633,12 @@ type signalCall struct {
 	signal os.Signal
 }
 
-func (s *recordingSignaler) Signal(pid int, signal os.Signal) error {
-	s.calls = append(s.calls, signalCall{pid: pid, signal: signal})
-	return s.errs[pid]
+func (s *recordingSignaler) Signal(ctx context.Context, expected processIdentity, signal os.Signal) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.calls = append(s.calls, signalCall{pid: expected.pid, signal: signal})
+	return s.errs[expected.pid]
 }
 
 type processSnapshotStep struct {
@@ -583,9 +651,19 @@ type fakeProcessTable struct {
 	current       map[int]processIdentity
 	snapshots     []processSnapshotStep
 	identityCalls []int
+	identityDelay time.Duration
+	snapshotDelay time.Duration
+	snapshotCalls int
 }
 
 func (f *fakeProcessTable) Identity(ctx context.Context, pid int) (processIdentity, error) {
+	if f.identityDelay > 0 {
+		select {
+		case <-time.After(f.identityDelay):
+		case <-ctx.Done():
+			return processIdentity{}, ctx.Err()
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return processIdentity{}, err
 	}
@@ -598,6 +676,14 @@ func (f *fakeProcessTable) Identity(ctx context.Context, pid int) (processIdenti
 }
 
 func (f *fakeProcessTable) Snapshot(ctx context.Context, _ map[int]struct{}) ([]processIdentity, error) {
+	f.snapshotCalls++
+	if f.snapshotDelay > 0 {
+		select {
+		case <-time.After(f.snapshotDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -647,7 +733,13 @@ func TestProcessSessionReaperAnchorsOwnedSessionBeforeTeardown(t *testing.T) {
 	}
 	reaper := newTestProcessReaper(table, &recordingSignaler{})
 
-	anchors := reaper.Anchor(context.Background(), []int{0, 1, 4242, 4242, 6000})
+	anchors := reaper.Anchor(context.Background(), []paneRef{
+		{paneID: "%bad0", windowID: "@0", pid: 0},
+		{paneID: "%bad1", windowID: "@1", pid: 1},
+		{paneID: "%1", windowID: "@2", pid: 4242},
+		{paneID: "%1", windowID: "@2", pid: 4242},
+		{paneID: "%2", windowID: "@3", pid: 6000},
+	})
 	if got, want := anchorSessionIDs(anchors), []int{4242}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("anchor session ids = %#v, want %#v", got, want)
 	}
@@ -668,7 +760,6 @@ func TestProcessSessionReaperRevalidatesBeforeEverySignal(t *testing.T) {
 			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
-			{processes: []processIdentity{process}},
 			// Snapshot saw the old identity, but the immediate pre-KILL check
 			// sees a reused PID in another session.
 			{processes: []processIdentity{process}, current: map[int]processIdentity{5000: reused}},
@@ -681,7 +772,7 @@ func TestProcessSessionReaperRevalidatesBeforeEverySignal(t *testing.T) {
 	if got, want := signaler.calls, []signalCall{{pid: 5000, signal: syscall.SIGTERM}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("signals = %#v, want no KILL after immediate identity mismatch %#v", got, want)
 	}
-	if got := len(table.identityCalls); got < 6 {
+	if got := len(table.identityCalls); got < 5 {
 		t.Fatalf("identity checks = %d, want checks across snapshots and before each signal", got)
 	}
 }
@@ -719,7 +810,6 @@ func TestProcessSessionReaperRejectsStartOrSessionReuseBeforeKill(t *testing.T) 
 			table := &fakeProcessTable{
 				current: map[int]processIdentity{5000: original},
 				snapshots: []processSnapshotStep{
-					{processes: []processIdentity{original}},
 					{processes: []processIdentity{original}},
 					{processes: []processIdentity{original}},
 					{processes: []processIdentity{original}},
@@ -777,6 +867,58 @@ func TestProcessSessionReaperResnapshotsAndReapsLateChild(t *testing.T) {
 	}
 	if !reflect.DeepEqual(signaler.calls, want) {
 		t.Fatalf("signals = %#v, want late child TERM and final KILL %#v", signaler.calls, want)
+	}
+}
+
+func TestProcessSessionReaperEscalatesChildFirstSeenInFinalSlice(t *testing.T) {
+	original := identity(5000, 4242, "original")
+	late := identity(5001, 4242, "final-slice")
+	table := &fakeProcessTable{
+		current: map[int]processIdentity{5000: original},
+		snapshots: []processSnapshotStep{
+			{processes: []processIdentity{original}},
+			{processes: []processIdentity{original}},
+			{processes: []processIdentity{original}},
+			{processes: []processIdentity{original, late}, current: map[int]processIdentity{5000: original, 5001: late}},
+		},
+	}
+	signaler := &recordingSignaler{}
+	reaper := newTestProcessReaper(table, signaler)
+	reaper.Reap(context.Background(), []sessionAnchor{anchor(4242, original)}, 4*time.Second)
+	want := []signalCall{
+		{pid: 5000, signal: syscall.SIGTERM},
+		{pid: 5001, signal: syscall.SIGTERM},
+		{pid: 5000, signal: syscall.SIGKILL},
+		{pid: 5001, signal: syscall.SIGKILL},
+	}
+	if !reflect.DeepEqual(signaler.calls, want) {
+		t.Fatalf("signals = %#v, want final-slice child grace and escalation %#v", signaler.calls, want)
+	}
+}
+
+func TestProcessSessionReaperBudgetsEverySlowProbe(t *testing.T) {
+	process := identity(5000, 4242, "original")
+	table := &fakeProcessTable{
+		current:       map[int]processIdentity{5000: process},
+		identityDelay: 2 * time.Millisecond,
+		snapshotDelay: 2 * time.Millisecond,
+		snapshots: []processSnapshotStep{
+			{processes: []processIdentity{process}},
+			{processes: []processIdentity{process}},
+			{processes: []processIdentity{process}},
+			{processes: []processIdentity{process}},
+		},
+	}
+	signaler := &recordingSignaler{}
+	reaper := newTestProcessReaper(table, signaler)
+	reaper.timeout = 5 * time.Millisecond
+	reaper.Reap(context.Background(), []sessionAnchor{anchor(4242, process)}, 0)
+	if table.snapshotCalls != reapGraceSlices {
+		t.Fatalf("snapshot calls = %d, want %d independently budgeted probes", table.snapshotCalls, reapGraceSlices)
+	}
+	want := []signalCall{{pid: 5000, signal: syscall.SIGTERM}, {pid: 5000, signal: syscall.SIGKILL}}
+	if !reflect.DeepEqual(signaler.calls, want) {
+		t.Fatalf("signals = %#v, want cleanup to outlive aggregate probe timeout %#v", signaler.calls, want)
 	}
 }
 

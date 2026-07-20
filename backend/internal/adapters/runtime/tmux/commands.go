@@ -66,15 +66,20 @@ func exactSessionTarget(id string) string {
 	return "=" + id
 }
 
-// listPaneOwnersArgs builds args for list-panes across the exact session. The
-// linked flag lets Destroy exclude panes whose window is also present in
-// another tmux session: kill-session leaves those windows running, so AO must
-// not reap their processes.
-func listPaneOwnersArgs(id string) []string {
+// listPaneRefsArgs captures stable tmux object IDs around process anchoring.
+// pane_dead is included so a stale pane_pid is never treated as a live owner.
+func listPaneRefsArgs(id string) []string {
 	return []string{
 		"list-panes", "-s", "-t", exactSessionTarget(id),
-		"-F", "#{pane_pid}\t#{window_linked}",
+		"-F", "#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_dead}",
 	}
+}
+
+// listAllWindowIDsArgs is used after kill-session. A window linked anywhere
+// else survives the teardown and remains owned by tmux, so its process anchor
+// must be excluded from best-effort reaping.
+func listAllWindowIDsArgs() []string {
+	return []string{"list-panes", "-a", "-F", "#{window_id}"}
 }
 
 // sendKeysLiteralArgs builds args for `tmux send-keys -t <id> -l <chunk>`.

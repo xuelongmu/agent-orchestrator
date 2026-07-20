@@ -201,8 +201,13 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 	}
 	var anchors []sessionAnchor
 	if discoveryCtx, cancel, ok := r.paneDiscoveryContext(ctx); ok {
-		panePIDs := r.ownedPanePIDs(discoveryCtx, id)
-		anchors = r.sessionReaper.Anchor(discoveryCtx, panePIDs)
+		panes := r.livePaneRefs(discoveryCtx, listPaneRefsArgs(id))
+		anchors = r.sessionReaper.Anchor(discoveryCtx, panes)
+		// pane_pid can exit and be reused while Anchor probes the process table.
+		// Keep only anchors still attached to the same live tmux pane and PID.
+		if len(anchors) > 0 {
+			anchors = revalidatedPaneAnchors(anchors, r.livePaneRefs(discoveryCtx, listPaneRefsArgs(id)))
+		}
 		cancel()
 	}
 	out, err := r.run(ctx, killSessionArgs(id)...)
@@ -211,7 +216,7 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 		if errors.As(err, &exitErr) && killSessionMissingOutput(string(out)) {
 			// A definitive missing-session result means teardown won the race;
 			// anchored descendants can still outlive tmux and are safe to reap.
-			r.sessionReaper.Reap(ctx, anchors, r.reapGrace)
+			r.reapAfterSurvivorCheck(ctx, anchors)
 			return nil
 		}
 		// Do not reap after an unexpected failure. The tmux session may still
@@ -219,7 +224,7 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 		// that Destroy failed to tear down.
 		return fmt.Errorf("tmux runtime: destroy session %s: %w", id, err)
 	}
-	r.sessionReaper.Reap(ctx, anchors, r.reapGrace)
+	r.reapAfterSurvivorCheck(ctx, anchors)
 	return nil
 }
 
@@ -247,26 +252,70 @@ func (r *Runtime) paneDiscoveryContext(ctx context.Context) (context.Context, co
 	return discoveryCtx, cancel, true
 }
 
-// ownedPanePIDs captures pane leaders from unlinked windows only. A linked
-// window survives kill-session through its other session and must never have
-// its still-active processes reaped by this Destroy.
-func (r *Runtime) ownedPanePIDs(ctx context.Context, id string) []int {
-	out, err := r.run(ctx, listPaneOwnersArgs(id)...)
+// livePaneRefs parses only live panes with safe PIDs. Stable pane/window IDs are
+// carried across anchoring so tmux ownership can be revalidated without using
+// the racy window_linked format flag.
+func (r *Runtime) livePaneRefs(ctx context.Context, args []string) []paneRef {
+	out, err := r.run(ctx, args...)
 	if err != nil {
 		return nil
 	}
-	var pids []int
+	var panes []paneRef
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) != 2 || fields[1] != "0" {
+		if len(fields) != 4 || fields[3] != "0" {
 			continue
 		}
-		pid, parseErr := strconv.Atoi(fields[0])
+		pid, parseErr := strconv.Atoi(fields[2])
 		if parseErr == nil {
-			pids = append(pids, pid)
+			panes = append(panes, paneRef{paneID: fields[0], windowID: fields[1], pid: pid})
 		}
 	}
-	return safeUniquePIDs(pids)
+	return safeUniquePanes(panes)
+}
+
+func revalidatedPaneAnchors(anchors []sessionAnchor, panes []paneRef) []sessionAnchor {
+	live := make(map[paneRef]struct{}, len(panes))
+	for _, pane := range panes {
+		live[pane] = struct{}{}
+	}
+	verified := make([]sessionAnchor, 0, len(anchors))
+	for _, anchor := range anchors {
+		if _, ok := live[anchor.pane]; ok {
+			verified = append(verified, anchor)
+		}
+	}
+	return verified
+}
+
+// reapAfterSurvivorCheck fails closed unless tmux can prove which windows
+// remain after teardown. Duplicate links inside the destroyed session vanish
+// together; a link added in another session survives and excludes its anchor.
+func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionAnchor) {
+	if len(anchors) == 0 {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.timeout)
+	defer cancel()
+	out, err := r.run(probeCtx, listAllWindowIDsArgs()...)
+	if err != nil && !noServerRunningOutput(string(out)) {
+		return
+	}
+	surviving := make(map[string]struct{})
+	if err == nil {
+		for _, windowID := range strings.Fields(string(out)) {
+			surviving[windowID] = struct{}{}
+		}
+	}
+	verified := make([]sessionAnchor, 0, len(anchors))
+	for _, anchor := range anchors {
+		if _, survives := surviving[anchor.pane.windowID]; !survives {
+			verified = append(verified, anchor)
+		}
+	}
+	if len(verified) > 0 {
+		r.sessionReaper.Reap(ctx, verified, r.reapGrace)
+	}
 }
 
 // IsAlive reports whether the handle's session still exists via `tmux
@@ -502,6 +551,10 @@ func sessionMissingOutput(out string) bool {
 		strings.Contains(s, "no server running") ||
 		strings.Contains(s, "error connecting") ||
 		strings.Contains(s, "session not found")
+}
+
+func noServerRunningOutput(out string) bool {
+	return strings.Contains(strings.ToLower(out), "no server running")
 }
 
 // killSessionMissingOutput reports whether a non-zero `tmux kill-session`
