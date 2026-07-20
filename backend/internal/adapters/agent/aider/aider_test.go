@@ -3,7 +3,11 @@ package aider
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
@@ -170,6 +174,11 @@ func TestGetLaunchCommandMapsPermissionModes(t *testing.T) {
 					t.Fatalf("cmd = %#v missing expected flag %q", cmd, want)
 				}
 			}
+			for _, want := range []string{"--no-check-update", "--no-stream", "--no-pretty", "--no-gitignore"} {
+				if !containsArg(cmd, want) {
+					t.Fatalf("cmd = %#v missing stable launch flag %q", cmd, want)
+				}
+			}
 			for _, absent := range tt.wantAbsent {
 				for _, arg := range cmd {
 					if arg == absent {
@@ -179,6 +188,78 @@ func TestGetLaunchCommandMapsPermissionModes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPreLaunchLocallyIgnoresAllAiderArtifacts(t *testing.T) {
+	workspace := t.TempDir()
+	runGit(t, workspace, "init", "--quiet")
+
+	excludePath := strings.TrimSpace(runGit(t, workspace, "rev-parse", "--git-path", "info/exclude"))
+	if !filepath.IsAbs(excludePath) {
+		excludePath = filepath.Join(workspace, excludePath)
+	}
+	if err := os.WriteFile(excludePath, []byte("user-local-artifact\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Plugin{resolvedBinary: "aider"}
+	cfg := ports.LaunchConfig{WorkspacePath: workspace}
+	if err := p.PreLaunch(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.PreLaunch(context.Background(), cfg); err != nil {
+		t.Fatalf("second PreLaunch: %v", err)
+	}
+
+	data, err := os.ReadFile(excludePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); !strings.Contains(got, "user-local-artifact\n") {
+		t.Fatalf("local exclude lost existing content: %q", got)
+	} else if count := strings.Count(got, aiderArtifactIgnorePattern); count != 1 {
+		t.Fatalf("local exclude pattern count = %d, want 1: %q", count, got)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".gitignore")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tracked .gitignore was created or inaccessible: %v", err)
+	}
+
+	artifacts := []string{
+		".aider.input.history",
+		".aider.chat.history.md",
+		filepath.Join(".aider.tags.cache.v4", "cache.db"),
+	}
+	for _, artifact := range artifacts {
+		path := filepath.Join(workspace, artifact)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("private session state"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if status := runGit(t, workspace, "status", "--porcelain", "--untracked-files=all"); status != "" {
+		t.Fatalf("Aider artifacts dirtied worktree: %q", status)
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func runGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmdArgs := append([]string{"-C", dir}, args...)
+	out, err := exec.Command("git", cmdArgs...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func TestGetLaunchCommandSystemPromptFileUsesReadOnlyContext(t *testing.T) {
@@ -273,6 +354,9 @@ func TestContextCancellation(t *testing.T) {
 	}
 	if _, err := (&Plugin{}).GetPromptDeliveryStrategy(ctx, ports.LaunchConfig{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("GetPromptDeliveryStrategy err = %v, want context.Canceled", err)
+	}
+	if err := (&Plugin{}).PreLaunch(ctx, ports.LaunchConfig{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("PreLaunch err = %v, want context.Canceled", err)
 	}
 	if err := (&Plugin{}).GetAgentHooks(ctx, ports.WorkspaceHookConfig{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("GetAgentHooks err = %v, want context.Canceled", err)

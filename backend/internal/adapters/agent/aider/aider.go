@@ -10,11 +10,13 @@ package aider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
@@ -24,6 +26,8 @@ import (
 )
 
 const adapterID = "aider"
+
+const aiderArtifactIgnorePattern = ".aider*"
 
 // Plugin is the Aider agent adapter. It is safe for concurrent use; the binary
 // path is resolved once and cached under binaryMu.
@@ -83,6 +87,74 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	// aider has no inline system-prompt mechanism. A cfg.SystemPrompt with no
 	// file is intentionally dropped here rather than written to disk.
 	return cmd, nil
+}
+
+// PreLaunch keeps Aider's repo-local history and tag-cache artifacts out of
+// git status without changing the user's tracked .gitignore. Aider's default
+// gitignore check offers to add this same pattern interactively; AO records it
+// in Git's local info/exclude instead, then --no-gitignore suppresses the prompt.
+func (p *Plugin) PreLaunch(ctx context.Context, cfg ports.LaunchConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.WorkspacePath) == "" {
+		return nil
+	}
+
+	excludePath, err := gitExcludePath(ctx, cfg.WorkspacePath)
+	if err != nil {
+		return err
+	}
+	return appendLocalExclude(excludePath, aiderArtifactIgnorePattern)
+}
+
+func gitExcludePath(ctx context.Context, workspacePath string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", workspacePath, "rev-parse", "--git-path", "info/exclude")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve Aider artifact exclude path: %w", err)
+	}
+
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return "", errors.New("resolve Aider artifact exclude path: git returned an empty path")
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(workspacePath, path)
+	}
+	return filepath.Clean(path), nil
+}
+
+func appendLocalExclude(path, pattern string) error {
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read Aider artifact exclude %q: %w", path, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == pattern {
+			return nil
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create Aider artifact exclude directory: %w", err)
+	}
+	prefix := ""
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		prefix = "\n"
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open Aider artifact exclude %q: %w", path, err)
+	}
+	if _, err := f.WriteString(prefix + pattern + "\n"); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write Aider artifact exclude %q: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close Aider artifact exclude %q: %w", path, err)
+	}
+	return nil
 }
 
 // GetPromptDeliveryStrategy reports that AO should inject prompted Aider tasks
