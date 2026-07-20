@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -57,6 +58,34 @@ type claimedFakeStore struct {
 type lifecycleStoreAdapter struct {
 	*fakeStore
 	prs map[domain.SessionID][]domain.PullRequest
+}
+
+type restoreRepairDependencyWake struct {
+	store    *fakeStore
+	prs      map[domain.SessionID][]domain.PullRequest
+	parentID domain.SessionID
+	childID  domain.SessionID
+	wakes    int
+}
+
+func (s *restoreRepairDependencyWake) Wake() {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	s.wakes++
+	parent := s.store.sessions[s.parentID]
+	child := s.store.sessions[s.childID]
+	dependencyIDs, err := domain.DecodeSessionDependencyIDs(child.DependencyIDs)
+	if err != nil || !slices.Contains(dependencyIDs, s.parentID) || !parent.IsTerminated {
+		return
+	}
+	merged := false
+	for _, pr := range s.prs[s.parentID] {
+		merged = merged || pr.Merged
+	}
+	if merged {
+		child.DependencyPromotionToken = "reserved-after-parent-completion"
+		s.store.sessions[s.childID] = child
+	}
 }
 
 func (s *lifecycleStoreAdapter) UpdateSessionLifecycle(_ context.Context, before, after domain.SessionRecord) error {
@@ -425,7 +454,7 @@ func (l *fakeLCM) MarkTerminated(_ context.Context, id domain.SessionID) error {
 	l.store.sessions[id] = rec
 	return nil
 }
-func (l *fakeLCM) MarkTerminatedIfExited(_ context.Context, id domain.SessionID) (bool, error) {
+func (l *fakeLCM) MarkTerminatedIfExitedForRestore(_ context.Context, id domain.SessionID) (bool, error) {
 	if l.beforeTerminated != nil {
 		l.beforeTerminated(id)
 	}
@@ -444,6 +473,7 @@ func (l *fakeLCM) MarkTerminatedIfExited(_ context.Context, id domain.SessionID)
 	l.store.sessions[id] = rec
 	return true, nil
 }
+func (*fakeLCM) ReconcileDependenciesAfterRestoreFailure() {}
 
 type fakeRuntime struct {
 	createErr          error
@@ -3553,6 +3583,99 @@ func TestRestore_RepairsExitedSessionMissingTerminalFact(t *testing.T) {
 	}
 	if rt.destroyed != 1 || ws.destroyed != 0 || rt.created != 1 {
 		t.Fatalf("teardown/relaunch calls: runtime destroy=%d workspace destroy=%d runtime create=%d, want 1/0/1", rt.destroyed, ws.destroyed, rt.created)
+	}
+}
+
+func TestRestore_SkipsSharedDirectoryCleanupFenceRuntime(t *testing.T) {
+	m, st, rt, ws := newManager()
+	rec := domain.SessionRecord{
+		ID:           "dir-1",
+		ProjectID:    "mer",
+		Harness:      domain.HarnessClaudeCode,
+		IsTerminated: true,
+		Activity:     domain.Activity{State: domain.ActivityExited},
+		Metadata: domain.SessionMetadata{
+			WorkspaceKind:   domain.WorkspaceKindDir,
+			WorkspacePath:   "/shared",
+			RuntimeHandleID: sharedDirCleanupPendingHandle,
+			AgentSessionID:  "agent-x",
+		},
+	}
+	st.setSession(rec)
+	ws.path = "/shared"
+
+	restored, err := m.Restore(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(rt.destroyedIDs, sharedDirCleanupPendingHandle) {
+		t.Fatalf("Restore passed internal shared-directory cleanup fence to runtime.Destroy: %v", rt.destroyedIDs)
+	}
+	if rt.destroyed != 0 || rt.created != 1 || restored.Metadata.RuntimeHandleID != "h1" {
+		t.Fatalf("restore teardown/create/handle = %d/%d/%q, want 0/1/h1", rt.destroyed, rt.created, restored.Metadata.RuntimeHandleID)
+	}
+}
+
+func TestRestoreRepairDefersDependencyWakeUntilOutcome(t *testing.T) {
+	for _, restoreFails := range []bool{false, true} {
+		name := "success_keeps_child_waiting"
+		if restoreFails {
+			name = "failure_wakes_child"
+		}
+		t.Run(name, func(t *testing.T) {
+			m, st, rt, _ := newManager()
+			parent := mkLive("parent")
+			parent.Harness = domain.HarnessClaudeCode
+			parent.Metadata.Branch = "b"
+			parent.Metadata.AgentSessionID = "agent-x"
+			parent.Activity = domain.Activity{State: domain.ActivityExited}
+			parent.UpdatedAt = time.Now().UTC()
+			child := domain.SessionRecord{
+				ID:                   "child",
+				ProjectID:            parent.ProjectID,
+				Kind:                 domain.KindWorker,
+				Harness:              domain.HarnessClaudeCode,
+				Activity:             domain.Activity{State: domain.ActivityIdle},
+				DependencyIDs:        domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID}),
+				DependencyPreparedAt: time.Now().UTC(),
+				DependencyBasePrompt: "wait for parent",
+				Metadata:             domain.SessionMetadata{Prompt: "wait for parent"},
+			}
+			st.setSession(parent)
+			st.setSession(child)
+			prs := map[domain.SessionID][]domain.PullRequest{
+				parent.ID: {{URL: "pr1", Merged: true}},
+			}
+			lifecycleStore := &lifecycleStoreAdapter{fakeStore: st, prs: prs}
+			lcm := lifecycle.New(lifecycleStore, nil)
+			wake := &restoreRepairDependencyWake{store: st, prs: prs, parentID: parent.ID, childID: child.ID}
+			lcm.SetDependencyScheduler(wake)
+			m.lcm = lcm
+			if restoreFails {
+				rt.createErr = errors.New("runtime unavailable")
+			}
+
+			restored, err := m.Restore(ctx, parent.ID)
+			if restoreFails {
+				if err == nil || !strings.Contains(err.Error(), "runtime unavailable") {
+					t.Fatalf("restore error = %v, want runtime failure", err)
+				}
+				if wake.wakes != 1 || st.sessions[child.ID].DependencyPromotionToken == "" {
+					t.Fatalf("failed restore dependency wake/token = %d/%q, want 1/reserved", wake.wakes, st.sessions[child.ID].DependencyPromotionToken)
+				}
+				if !st.sessions[parent.ID].IsTerminated {
+					t.Fatalf("failed restore left parent live: %+v", st.sessions[parent.ID])
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+			if restored.IsTerminated || wake.wakes != 0 || st.sessions[child.ID].DependencyPromotionToken != "" {
+				t.Fatalf("successful restore parent/wake/child token = %v/%d/%q, want live/0/empty", restored.IsTerminated, wake.wakes, st.sessions[child.ID].DependencyPromotionToken)
+			}
+		})
 	}
 }
 

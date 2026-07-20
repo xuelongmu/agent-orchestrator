@@ -931,13 +931,13 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 	return m.reconcileDependencies()
 }
 
-// MarkTerminatedIfExited repairs the terminal fact only while the latest
-// authoritative activity is still exited. Restore uses this conditional
-// transition for legacy/inconsistent rows so a concurrent recovery signal
-// cannot turn a genuinely live session into a restorable one.
-func (m *Manager) MarkTerminatedIfExited(ctx context.Context, id domain.SessionID) (bool, error) {
+// MarkTerminatedIfExitedForRestore repairs the terminal fact only while the
+// latest authoritative activity is still exited. It deliberately defers the
+// dependency wake: a successful restore immediately makes the parent live
+// again, while Restore calls ReconcileDependenciesAfterRestoreFailure when the
+// repaired terminal fact becomes the final outcome.
+func (m *Manager) MarkTerminatedIfExitedForRestore(ctx context.Context, id domain.SessionID) (bool, error) {
 	eligible := false
-	transitioned := false
 	err := m.mutate(ctx, id, func(cur domain.SessionRecord, _ time.Time) (domain.SessionRecord, bool) {
 		if cur.IsTerminated {
 			eligible = true
@@ -947,15 +947,18 @@ func (m *Manager) MarkTerminatedIfExited(ctx context.Context, id domain.SessionI
 			return cur, false
 		}
 		eligible = true
-		transitioned = true
 		cur.IsTerminated = true
 		delete(m.flights, id)
 		return cur, true
 	})
-	if err != nil || !transitioned {
-		return eligible, err
-	}
-	return eligible, m.reconcileDependencies()
+	return eligible, err
+}
+
+// ReconcileDependenciesAfterRestoreFailure publishes a provisional restore
+// repair as the final terminal outcome. The scheduler re-reads authoritative
+// parent state before reserving any child.
+func (m *Manager) ReconcileDependenciesAfterRestoreFailure() {
+	_ = m.reconcileDependencies()
 }
 
 // markTerminatedUnlessRateLimited atomically applies an automated terminal

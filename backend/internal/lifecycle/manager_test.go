@@ -859,7 +859,7 @@ func TestMarkTerminated(t *testing.T) {
 	}
 }
 
-func TestMarkTerminatedIfExited(t *testing.T) {
+func TestMarkTerminatedIfExitedForRestore(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
 		rec        domain.SessionRecord
@@ -872,7 +872,7 @@ func TestMarkTerminatedIfExited(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			m, st, _ := newManager()
 			st.sessions[tt.rec.ID] = tt.rec
-			marked, err := m.MarkTerminatedIfExited(ctx, tt.rec.ID)
+			marked, err := m.MarkTerminatedIfExitedForRestore(ctx, tt.rec.ID)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -117,7 +117,8 @@ type lifecycleRecorder interface {
 	MarkDependencyLaunchSucceeded(ctx context.Context, id domain.SessionID, token string) (bool, error)
 	ResetDependencyLaunch(ctx context.Context, id domain.SessionID, token string, preserveWorktrees bool) (bool, error)
 	MarkTerminated(ctx context.Context, id domain.SessionID) error
-	MarkTerminatedIfExited(ctx context.Context, id domain.SessionID) (bool, error)
+	MarkTerminatedIfExitedForRestore(ctx context.Context, id domain.SessionID) (bool, error)
+	ReconcileDependenciesAfterRestoreFailure()
 }
 
 type dependencyReconciler interface {
@@ -1723,6 +1724,16 @@ func (m *Manager) retireWorkspaceProjectForReplacement(ctx context.Context, rec 
 func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error) {
 	unlockWorkspaceMutation := m.LockWorkspaceMutation(id)
 	defer unlockWorkspaceMutation()
+	// Repairing a stale exited row creates a provisional terminal fact. Publish
+	// that completion to dependent children only if relaunch ultimately fails;
+	// MarkSpawned replaces it with the restored live generation on success.
+	repairedTerminal := false
+	restored := false
+	defer func() {
+		if repairedTerminal && !restored {
+			m.lcm.ReconcileDependenciesAfterRestoreFailure()
+		}
+	}()
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, err)
@@ -1734,13 +1745,14 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 		if rec.Activity.State != domain.ActivityExited {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
 		}
-		marked, markErr := m.lcm.MarkTerminatedIfExited(ctx, id)
+		marked, markErr := m.lcm.MarkTerminatedIfExitedForRestore(ctx, id)
 		if markErr != nil {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: repair terminal state: %w", id, markErr)
 		}
 		if !marked {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
 		}
+		repairedTerminal = true
 		rec, ok, err = m.store.GetSession(ctx, id)
 		if err != nil {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: reload terminal state: %w", id, err)
@@ -1752,7 +1764,7 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	// A terminal activity signal can precede runtime-container teardown (tmux
 	// deliberately keeps a shell alive after the agent exits). Ensure that old
 	// deterministic handle is gone before Create reuses the session id.
-	if handle := runtimeHandle(rec.Metadata); handle.ID != "" {
+	if handle := runtimeHandle(rec.Metadata); handle.ID != "" && handle.ID != sharedDirCleanupPendingHandle {
 		if err := m.runtime.Destroy(ctx, handle); err != nil {
 			return domain.SessionRecord{}, fmt.Errorf("restore %s: old runtime: %w", id, err)
 		}
@@ -1803,7 +1815,11 @@ func (m *Manager) Restore(ctx context.Context, id domain.SessionID) (domain.Sess
 	if err != nil {
 		return domain.SessionRecord{}, fmt.Errorf("restore %s: workspace: %w", id, err)
 	}
-	return m.relaunchRestoredSession(ctx, rec, project, ws)
+	restoredSession, err := m.relaunchRestoredSession(ctx, rec, project, ws)
+	if err == nil {
+		restored = true
+	}
+	return restoredSession, err
 }
 
 func (m *Manager) relaunchRestoredSession(ctx context.Context, rec domain.SessionRecord, project domain.ProjectRecord, ws ports.WorkspaceInfo) (domain.SessionRecord, error) {
