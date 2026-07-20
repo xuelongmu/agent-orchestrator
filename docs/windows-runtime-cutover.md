@@ -19,9 +19,11 @@ the **canonical migrated command entry point**. For source dogfood, use an
 explicit `ao.exe` built from the current checkout instead. Do not use a bare
 `ao` until its resolution has been verified.
 
-The npm `@aoagents/ao` 0.10.0 package is a frozen bootstrap and is not the
-recommended install. Versions before 0.10.0 are the legacy TypeScript runtime;
-they use a different command surface and state root.
+The npm `@aoagents/ao` package can be a migrated bootstrap that launches its
+matching platform Go binary. The older `@aoagents/ao-cli` package, and older
+`@aoagents/ao` wrappers that depend on it, are the legacy TypeScript runtime
+regardless of their version string. They use a different command surface and
+state root.
 
 ## Read-only inventory
 
@@ -85,10 +87,13 @@ an fnm/npm `.cmd` shim, it accepts only a narrow no-shell shape and reads the
 sibling `node.exe` and package entry as regular files, then reads the associated
 `package.json` name/bin mapping and version. It never runs the shadowing shim,
 Node, PowerShell, or `cmd.exe`.
-Malformed/untrusted shims and different executables remain warnings; a trusted
-AO package version below 0.10.0 is a failure. The failure reports both the
-shadowing path and the canonical running binary. Doctor does not edit PATH or
-shims and does not stop, clean, migrate, or archive anything. (After this
+Malformed/untrusted shims, recognized migrated npm bootstraps, and different
+executables remain warnings; a trusted `@aoagents/ao-cli` package or an
+`@aoagents/ao` wrapper that depends on it is a failure. Direct UNC and Windows
+device namespace entries are rejected before their targets are inspected;
+local drive paths can still traverse mapped drives or reparse points. The
+failure reports both the shadowing path and the canonical running binary.
+Doctor does not edit PATH or shims and does not stop, clean, migrate, or archive anything. (After this
 preflight passes, doctor's pre-existing data-directory writability check
 creates and removes one temporary probe file under the configured Go data
 directory.)
@@ -137,7 +142,7 @@ worktree, or state root without explicit per-instance approval.
    to be stopped and takes its exclusive database-writer lease. Session/run
    history is not imported; retain or archive the legacy root if it is needed.
 
-4. With separate approval, remove the pre-0.10 npm package from the relevant
+4. With separate approval, remove the legacy npm package from the relevant
    fnm Node installation or place the intended migrated command ahead of it in
    the persistent user PATH. Do not edit ephemeral `fnm_multishells` wrappers
    individually; fnm recreates them in new shells.

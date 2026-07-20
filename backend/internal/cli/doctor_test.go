@@ -433,21 +433,82 @@ func TestDoctorWindowsAODifferentExeStaysWarningWithoutExecution(t *testing.T) {
 	}
 }
 
-func TestDoctorWindowsMigratedShimStaysWarning(t *testing.T) {
+func TestDoctorWindowsMigratedBootstrapStaysWarning(t *testing.T) {
 	root := t.TempDir()
-	shadow := writeWindowsAOShimFixture(t, filepath.Join(root, "fnm", "123"), "0.10.0")
+	shadow := writeWindowsAOShimFixture(t, filepath.Join(root, "fnm", "123"), "0.10.3")
+	writeWindowsAOPackageMetadata(t, shadow, `{"name":"@aoagents/ao","version":"0.10.3","bin":{"ao":"dist/index.js"},"optionalDependencies":{"@aoagents/ao-win32-x64":"0.10.3"}}`)
 	c := &commandContext{deps: Deps{
 		Executable: func() (string, error) { return filepath.Join(root, "canonical", "ao.exe"), nil },
 		LookPath:   func(string) (string, error) { return shadow, nil },
 		CommandOutput: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			t.Fatalf("doctor executed migrated shim: %s %v", name, args)
+			t.Fatalf("doctor executed migrated bootstrap: %s %v", name, args)
 			return nil, nil
 		},
 	}.withDefaults()}
 
 	check := c.checkAOBinaryForPlatform(context.Background(), "windows")
-	if check.Level != doctorWarn || !strings.Contains(check.Message, "package version 0.10.0") {
-		t.Fatalf("ao-binary check = %+v, want WARN for different migrated install", check)
+	if check.Level != doctorWarn || !strings.Contains(check.Message, "migrated npm bootstrap") || !strings.Contains(check.Message, "0.10.3") {
+		t.Fatalf("ao-binary check = %+v, want WARN for different migrated bootstrap", check)
+	}
+}
+
+func TestDoctorFailsLegacyWrapperDespiteLaterVersion(t *testing.T) {
+	root := t.TempDir()
+	shadow := writeWindowsAOShimFixture(t, filepath.Join(root, "fnm", "legacy-wrapper"), "0.10.1-nightly-249c")
+	writeWindowsAOPackageMetadata(t, shadow, `{"name":"@aoagents/ao","version":"0.10.1-nightly-249c","bin":{"ao":"dist/index.js"},"dependencies":{"@aoagents/ao-cli":"0.10.1-nightly-249c"}}`)
+	c := &commandContext{deps: Deps{
+		Executable: func() (string, error) { return filepath.Join(root, "canonical", "ao.exe"), nil },
+		LookPath:   func(string) (string, error) { return shadow, nil },
+		CommandOutput: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			t.Fatalf("doctor executed legacy wrapper: %s %v", name, args)
+			return nil, nil
+		},
+	}.withDefaults()}
+
+	check := c.checkAOBinaryForPlatform(context.Background(), "windows")
+	if check.Level != doctorFail || !strings.Contains(check.Message, "0.10.1-nightly-249c") {
+		t.Fatalf("ao-binary check = %+v, want FAIL for later-version legacy wrapper", check)
+	}
+}
+
+func TestInspectWindowsAOShimRejectsUNCAndDeviceEntriesBeforeIO(t *testing.T) {
+	root := t.TempDir()
+	originalStat, originalOpen := statAOPath, openAOPath
+	t.Cleanup(func() {
+		statAOPath = originalStat
+		openAOPath = originalOpen
+	})
+
+	cases := []string{
+		`\\server\share\ao\dist\index.js`,
+		`//server/share/ao/dist/index.js`,
+		`\\?\C:\ao\dist\index.js`,
+		`\\.\C:\ao\dist\index.js`,
+		`\??\C:\ao\dist\index.js`,
+	}
+	for i, entry := range cases {
+		shim := filepath.Join(root, fmt.Sprintf("unsafe-%d.cmd", i))
+		content := `@"%~dp0node.exe" "` + entry + `" %*` + "\r\n"
+		if err := os.WriteFile(shim, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		var touched []string
+		statAOPath = func(path string) (os.FileInfo, error) {
+			touched = append(touched, "stat:"+path)
+			return originalStat(path)
+		}
+		openAOPath = func(path string) (*os.File, error) {
+			touched = append(touched, "open:"+path)
+			return originalOpen(path)
+		}
+
+		if _, _, err := inspectWindowsAOShim(shim); err == nil || !strings.Contains(err.Error(), "not inspected") {
+			t.Fatalf("inspectWindowsAOShim(%q) error = %v, want namespace refusal", entry, err)
+		}
+		if len(touched) != 1 || touched[0] != "open:"+shim {
+			t.Fatalf("inspectWindowsAOShim(%q) filesystem touches = %v, want only local shim read", entry, touched)
+		}
 	}
 }
 
@@ -541,6 +602,15 @@ func writeWindowsAOShimFixture(t *testing.T, shimDir, version string) string {
 		t.Fatal(err)
 	}
 	return shim
+}
+
+func writeWindowsAOPackageMetadata(t *testing.T, shim, metadata string) {
+	t.Helper()
+	shimDir := filepath.Dir(shim)
+	packagePath := filepath.Join(filepath.Dir(filepath.Dir(shimDir)), "agent-orchestrator", "packages", "cli", "package.json")
+	if err := os.WriteFile(packagePath, []byte(metadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestDoctorIncludesAOBinaryCheck asserts runDoctor actually surfaces the

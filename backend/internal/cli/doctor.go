@@ -49,7 +49,6 @@ const (
 	doctorSectionAgents         = "Agent harnesses"
 	doctorSectionGitHub         = "GitHub"
 	minGitVersion               = "2.25.0"
-	minMigratedAOVersion        = "0.10.0"
 	maxAOShimFileBytes          = 16 << 10
 	maxAOPackageFileBytes       = 1 << 20
 	githubDoctorUserAgent       = "ao-agent-orchestrator/doctor"
@@ -244,9 +243,9 @@ func checkDataDirWritable(dataDir string) doctorCheck {
 // `ao` earlier on PATH that is not this binary (e.g. a legacy CLI without the
 // hooks command) fails every callback and silently kills activity tracking.
 // The daemon pins PATH inside sessions it spawns. On Windows, however, a
-// pre-migration (<0.10.0) fnm/npm shim in a new interactive shell still routes
-// every manual command to the incompatible TypeScript runtime and its separate
-// ~/.agent-orchestrator state root, so doctor treats a proven legacy shadow as
+// legacy fnm/npm shim in a new interactive shell can still route every manual
+// command to the incompatible TypeScript runtime and its separate
+// ~/.agent-orchestrator state root, so doctor treats a proven legacy package as
 // a failure. It only reports the skew; it never edits PATH, shims, or state.
 func (c *commandContext) checkAOBinary(ctx context.Context) doctorCheck {
 	return c.checkAOBinaryForPlatform(ctx, runtime.GOOS)
@@ -272,15 +271,14 @@ func (c *commandContext) checkAOBinaryForPlatform(_ context.Context, platform st
 	if platform == "windows" {
 		ext := strings.ToLower(filepath.Ext(onPath))
 		if ext == ".cmd" || ext == ".bat" {
-			version, inspectErr := inspectWindowsAOShim(onPath)
+			version, legacy, inspectErr := inspectWindowsAOShim(onPath)
 			if inspectErr != nil {
 				return doctorCheck{
 					Level: doctorWarn, Section: doctorSectionTools, Name: name,
 					Message: fmt.Sprintf("ao in PATH is a different installation, not this binary (%s; could not safely inspect shim: %v); canonical migrated entry point is %s", onPath, inspectErr, self),
 				}
 			}
-			cmp, cmpErr := compareDottedVersion(version, minMigratedAOVersion)
-			if cmpErr == nil && cmp < 0 {
+			if legacy {
 				return doctorCheck{
 					Level: doctorFail, Section: doctorSectionTools, Name: name,
 					Message: fmt.Sprintf("incompatible legacy ao %s at %s shadows the canonical migrated entry point %s; legacy state is under ~/.agent-orchestrator while migrated daemon/session state is under ~/.ao; no PATH, shim, process, session, or state changes were made", version, onPath, self),
@@ -288,7 +286,7 @@ func (c *commandContext) checkAOBinaryForPlatform(_ context.Context, platform st
 			}
 			return doctorCheck{
 				Level: doctorWarn, Section: doctorSectionTools, Name: name,
-				Message: fmt.Sprintf("ao in PATH is a different installation, not this binary (%s, package version %s); canonical migrated entry point is %s", onPath, version, self),
+				Message: fmt.Sprintf("ao in PATH is a migrated npm bootstrap, not this binary (%s, package version %s); canonical migrated entry point is %s", onPath, version, self),
 			}
 		}
 		return doctorCheck{
@@ -303,38 +301,43 @@ func (c *commandContext) checkAOBinaryForPlatform(_ context.Context, platform st
 }
 
 type aoPackageMetadata struct {
-	Name    string          `json:"name"`
-	Version string          `json:"version"`
-	Bin     json.RawMessage `json:"bin"`
+	Name                 string            `json:"name"`
+	Version              string            `json:"version"`
+	Bin                  json.RawMessage   `json:"bin"`
+	Dependencies         map[string]string `json:"dependencies"`
+	OptionalDependencies map[string]string `json:"optionalDependencies"`
 }
 
 var windowsNodeAOShimRE = regexp.MustCompile(`(?im)^[\t ]*@?"%(?:~dp0|dp0%)[/\\]?node\.exe"[\t ]+"([^"\r\n]+)"[\t ]+%\*[\t ]*\r?$`)
-var aoPackageVersionRE = regexp.MustCompile(`^v?(\d+\.\d+\.\d+)(?:[-+][0-9A-Za-z.-]+)?$`)
+var windowsLocalAbsolutePathRE = regexp.MustCompile(`^[A-Za-z]:[/\\]+[^/\\]`)
+var aoPackageVersionRE = regexp.MustCompile(`^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$`)
+var statAOPath = os.Stat
+var openAOPath = os.Open
 
 // inspectWindowsAOShim classifies only the narrow no-shell fnm/npm shim shape
 // AO has shipped: a sibling node.exe, one quoted JS package entry, and a final
 // %* argument forwarder. It never invokes the shim, node, or the package. The
 // package name, bin mapping, entry file, and version all have to agree before
 // doctor trusts the metadata.
-func inspectWindowsAOShim(shimPath string) (string, error) {
+func inspectWindowsAOShim(shimPath string) (string, bool, error) {
 	shim, err := readBoundedFile(shimPath, maxAOShimFileBytes)
 	if err != nil {
-		return "", fmt.Errorf("read command shim: %w", err)
+		return "", false, fmt.Errorf("read command shim: %w", err)
 	}
 	matches := windowsNodeAOShimRE.FindAllStringSubmatch(string(shim), -1)
 	if len(matches) != 1 {
-		return "", errors.New("unsupported or ambiguous command shim shape")
+		return "", false, errors.New("unsupported or ambiguous command shim shape")
 	}
 	shimDir := filepath.Dir(shimPath)
-	if err := requireRegularFile(filepath.Join(shimDir, "node.exe")); err != nil {
-		return "", fmt.Errorf("resolve native node beside shim: %w", err)
-	}
 	entry, err := resolveWindowsShimEntry(shimDir, matches[0][1])
 	if err != nil {
-		return "", err
+		return "", false, err
+	}
+	if err := requireRegularFile(filepath.Join(shimDir, "node.exe")); err != nil {
+		return "", false, fmt.Errorf("resolve native node beside shim: %w", err)
 	}
 	if err := requireRegularFile(entry); err != nil {
-		return "", fmt.Errorf("resolve package entry: %w", err)
+		return "", false, fmt.Errorf("resolve package entry: %w", err)
 	}
 	return aoPackageVersionForEntry(entry)
 }
@@ -361,49 +364,59 @@ func resolveWindowsShimEntry(shimDir, raw string) (string, error) {
 	if strings.ContainsAny(raw, "%\r\n") {
 		return "", errors.New("unexpanded variable in package entry")
 	}
+	normalized := strings.ReplaceAll(raw, `/`, `\`)
+	if strings.HasPrefix(normalized, `\\`) || strings.HasPrefix(normalized, `\??\`) {
+		return "", errors.New("UNC and device package entries are not inspected")
+	}
 	native := filepath.FromSlash(strings.ReplaceAll(raw, `\`, "/"))
-	if !filepath.IsAbs(native) {
+	if !windowsLocalAbsolutePathRE.MatchString(raw) && !filepath.IsAbs(native) {
 		return "", errors.New("package entry is not absolute or shim-relative")
 	}
 	return filepath.Clean(native), nil
 }
 
-func aoPackageVersionForEntry(entry string) (string, error) {
+func aoPackageVersionForEntry(entry string) (string, bool, error) {
 	dir := filepath.Dir(entry)
 	for range 8 {
 		packagePath := filepath.Join(dir, "package.json")
-		if _, err := os.Stat(packagePath); err == nil {
+		if _, err := statAOPath(packagePath); err == nil {
 			data, readErr := readBoundedFile(packagePath, maxAOPackageFileBytes)
 			if readErr != nil {
-				return "", fmt.Errorf("read package metadata: %w", readErr)
+				return "", false, fmt.Errorf("read package metadata: %w", readErr)
 			}
 			var metadata aoPackageMetadata
 			if err := json.Unmarshal(data, &metadata); err != nil {
-				return "", fmt.Errorf("parse package metadata: %w", err)
+				return "", false, fmt.Errorf("parse package metadata: %w", err)
 			}
 			if metadata.Name != "@aoagents/ao-cli" && metadata.Name != "@aoagents/ao" {
-				return "", fmt.Errorf("untrusted package name %q", metadata.Name)
+				return "", false, fmt.Errorf("untrusted package name %q", metadata.Name)
 			}
 			bin, err := aoBinPath(metadata.Bin)
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
 			binParts := strings.FieldsFunc(bin, func(r rune) bool { return r == '/' || r == '\\' })
 			for _, part := range binParts {
 				if part == "" || part == "." || part == ".." {
-					return "", errors.New("unsafe ao bin path in package metadata")
+					return "", false, errors.New("unsafe ao bin path in package metadata")
 				}
 			}
 			if len(binParts) == 0 || !sameBinary(filepath.Join(append([]string{dir}, binParts...)...), entry) {
-				return "", errors.New("package ao bin does not match shim entry")
+				return "", false, errors.New("package ao bin does not match shim entry")
 			}
-			match := aoPackageVersionRE.FindStringSubmatch(strings.TrimSpace(metadata.Version))
-			if len(match) != 2 {
-				return "", errors.New("package version is not a trusted semantic version")
+			version := strings.TrimSpace(metadata.Version)
+			if !aoPackageVersionRE.MatchString(version) {
+				return "", false, errors.New("package version is not a trusted semantic version")
 			}
-			return match[1], nil
+			if metadata.Name == "@aoagents/ao-cli" || strings.TrimSpace(metadata.Dependencies["@aoagents/ao-cli"]) != "" {
+				return version, true, nil
+			}
+			if strings.TrimSpace(metadata.OptionalDependencies["@aoagents/ao-win32-x64"]) != version {
+				return "", false, errors.New("@aoagents/ao package is neither a recognized legacy wrapper nor a migrated Windows bootstrap")
+			}
+			return version, false, nil
 		} else if !errors.Is(err, fs.ErrNotExist) {
-			return "", fmt.Errorf("inspect package metadata: %w", err)
+			return "", false, fmt.Errorf("inspect package metadata: %w", err)
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -411,7 +424,7 @@ func aoPackageVersionForEntry(entry string) (string, error) {
 		}
 		dir = parent
 	}
-	return "", errors.New("AO package metadata not found for shim entry")
+	return "", false, errors.New("AO package metadata not found for shim entry")
 }
 
 func aoBinPath(raw json.RawMessage) (string, error) {
@@ -429,7 +442,7 @@ func aoBinPath(raw json.RawMessage) (string, error) {
 }
 
 func requireRegularFile(path string) error {
-	info, err := os.Stat(path)
+	info, err := statAOPath(path)
 	if err != nil {
 		return err
 	}
@@ -440,7 +453,7 @@ func requireRegularFile(path string) error {
 }
 
 func readBoundedFile(path string, limit int64) ([]byte, error) {
-	f, err := os.Open(path) //nolint:gosec // doctor intentionally inspects the resolved PATH shim/package
+	f, err := openAOPath(path) //nolint:gosec // doctor intentionally inspects the resolved PATH shim/package
 	if err != nil {
 		return nil, err
 	}
