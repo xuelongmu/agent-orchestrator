@@ -295,6 +295,8 @@ type SessionWorktree struct {
 	WorktreePath string
 	PreservedRef string
 	State        string
+	RepoPath     sql.NullString
+	RelativePath sql.NullString
 }
 
 type TelemetryEvent struct {

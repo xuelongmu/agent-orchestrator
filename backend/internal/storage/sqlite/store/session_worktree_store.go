@@ -27,6 +27,8 @@ func (s *Store) UpsertSessionWorktree(ctx context.Context, row domain.SessionWor
 	return s.qw.UpsertSessionWorktree(ctx, gen.UpsertSessionWorktreeParams{
 		SessionID:    row.SessionID,
 		RepoName:     row.RepoName,
+		RepoPath:     nullableString(row.RepoPath),
+		RelativePath: nullableString(row.RelativePath),
 		Branch:       row.Branch,
 		BaseSha:      row.BaseSHA,
 		WorktreePath: row.WorktreePath,
@@ -71,6 +73,8 @@ func sessionWorktreeFromGen(row gen.SessionWorktree) domain.SessionWorktreeRecor
 	return domain.SessionWorktreeRecord{
 		SessionID:    row.SessionID,
 		RepoName:     row.RepoName,
+		RepoPath:     stringPointer(row.RepoPath),
+		RelativePath: stringPointer(row.RelativePath),
 		Branch:       row.Branch,
 		BaseSHA:      row.BaseSha,
 		WorktreePath: row.WorktreePath,
@@ -79,4 +83,18 @@ func sessionWorktreeFromGen(row gen.SessionWorktree) domain.SessionWorktreeRecor
 		// it is unused multi-repo scaffolding (see UpsertSessionWorktree above).
 		State: row.State,
 	}
+}
+
+func nullableString(value *string) sql.NullString {
+	if value == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: *value, Valid: true}
+}
+
+func stringPointer(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	return &value.String
 }
