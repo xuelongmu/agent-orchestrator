@@ -136,6 +136,7 @@ worktree, or state root without explicit per-instance approval.
    supported project/config data. A real import requires the migrated daemon
    to be stopped and takes its exclusive database-writer lease. Session/run
    history is not imported; retain or archive the legacy root if it is needed.
+
 4. With separate approval, remove the pre-0.10 npm package from the relevant
    fnm Node installation or place the intended migrated command ahead of it in
    the persistent user PATH. Do not edit ephemeral `fnm_multishells` wrappers
