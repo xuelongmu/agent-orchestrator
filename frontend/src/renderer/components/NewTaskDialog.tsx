@@ -11,7 +11,7 @@ import type { components } from "../../api/schema";
 import { apiClient, apiErrorMessage } from "../lib/api-client";
 import { captureRendererEvent } from "../lib/telemetry";
 import type { AgentProvider, WorkspaceKind } from "../types/workspace";
-import { agentsQueryKey, agentsQueryOptions, refreshAgents } from "../hooks/useAgentsQuery";
+import { agentsQueryKey, agentsQueryOptions, refreshAgents, type AgentCatalog } from "../hooks/useAgentsQuery";
 
 type Project = components["schemas"]["Project"];
 
@@ -61,6 +61,8 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 	const defaultWorkerAgent = projectQuery.data?.config?.worker?.agent ?? "";
 	const effectiveWorkspaceKind = workspaceKind || projectQuery.data?.config?.workspaceKind || "worktree";
 	const agentCatalog = agentsQuery.data;
+	const effectiveAgent = agent || defaultWorkerAgent || projectQuery.data?.agent || "";
+	const configuredOrchestratorAgent = projectQuery.data?.config?.orchestrator?.agent || projectQuery.data?.agent || "";
 
 	useEffect(() => {
 		if (!open) {
@@ -83,7 +85,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 
 	const submit = async (event: FormEvent<HTMLFormElement>) => {
 		event.preventDefault();
-		if (!projectId || isSubmitting) return;
+		if (!projectId || !projectQuery.data || isSubmitting) return;
 
 		const cleanTitle = title.trim();
 		const cleanPrompt = prompt.trim();
@@ -129,8 +131,8 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 		<Dialog.Root open={open} onOpenChange={onOpenChange}>
 			<Dialog.Portal>
 				<Dialog.Overlay className="fixed inset-0 z-overlay bg-scrim data-[state=open]:animate-overlay-in" />
-				<Dialog.Content className="fixed left-1/2 top-1/2 z-overlay w-dialog-xl -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-popover p-0 text-popover-foreground shadow-xl data-[state=open]:animate-modal-in">
-					<div className="flex items-start justify-between gap-4 border-b border-border px-5 py-4">
+				<Dialog.Content className="fixed left-1/2 top-1/2 z-overlay flex max-h-[min(720px,calc(100svh-24px))] w-dialog-xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-lg border border-border bg-popover p-0 text-popover-foreground shadow-xl data-[state=open]:animate-modal-in">
+					<div className="flex shrink-0 items-start justify-between gap-4 border-b border-border px-5 py-4">
 						<div className="min-w-0">
 							<Dialog.Title className="text-subtitle font-semibold text-foreground">New task</Dialog.Title>
 							<Dialog.Description className="mt-1 text-xs text-muted-foreground">
@@ -148,7 +150,35 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 						</Dialog.Close>
 					</div>
 
-					<form onSubmit={submit} className="space-y-4 px-5 py-4">
+					<form onSubmit={submit} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+						<div
+							aria-busy={projectQuery.isPending}
+							aria-label="Task execution context"
+							className="rounded-md border border-border bg-surface px-3 py-2.5 text-xs"
+							data-testid="task-execution-context"
+							role="group"
+						>
+							{projectQuery.data ? (
+								<TaskExecutionContext
+									agentCatalog={agentCatalog}
+									orchestratorAgent={configuredOrchestratorAgent}
+									project={projectQuery.data}
+									workerAgent={effectiveAgent}
+								/>
+							) : projectQuery.isPending ? (
+								<p className="text-muted-foreground" role="status">
+									Loading project context…
+								</p>
+							) : (
+								<div role="alert">
+									<p className="font-medium text-destructive">Project context unavailable.</p>
+									<p className="mt-0.5 text-caption text-muted-foreground">
+										{projectQuery.error instanceof Error ? projectQuery.error.message : "Project lookup failed."}
+									</p>
+								</div>
+							)}
+						</div>
+
 						<div className="space-y-1.5">
 							<label className="text-xs font-medium text-muted-foreground" htmlFor={titleId}>
 								Title
@@ -252,7 +282,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 									Cancel
 								</Button>
 							</Dialog.Close>
-							<Button type="submit" disabled={isSubmitting || !projectId}>
+							<Button type="submit" disabled={isSubmitting || !projectId || !projectQuery.data}>
 								{isSubmitting ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : null}
 								{isSubmitting ? "Starting..." : "Start task"}
 							</Button>
@@ -262,4 +292,85 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 			</Dialog.Portal>
 		</Dialog.Root>
 	);
+}
+
+function TaskExecutionContext({
+	agentCatalog,
+	orchestratorAgent,
+	project,
+	workerAgent,
+}: {
+	agentCatalog?: AgentCatalog;
+	orchestratorAgent: string;
+	project: Project;
+	workerAgent: string;
+}) {
+	const repositories = projectRepositories(project);
+	return (
+		<>
+			<div className="font-semibold text-foreground">{project.name}</div>
+			<RepositoryList repositories={repositories} />
+			<dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-caption">
+				<ContextFact label="Base branch" value={project.defaultBranch} mono />
+				{workerAgent ? <ContextFact label="Worker" value={agentDisplayName(workerAgent, agentCatalog)} /> : null}
+				{orchestratorAgent ? (
+					<ContextFact label="Orchestrator" value={agentDisplayName(orchestratorAgent, agentCatalog)} />
+				) : null}
+			</dl>
+			<ProjectPath path={project.path} />
+		</>
+	);
+}
+
+function RepositoryList({ repositories }: { repositories: string[] }) {
+	if (repositories.length === 0) return null;
+	return (
+		<div className="mt-1 flex min-w-0 items-start gap-1.5 text-caption">
+			<span className="shrink-0 text-muted-foreground">
+				{repositories.length === 1 ? "Repository" : "Repositories"}
+			</span>
+			<ul aria-label="Repositories" className="min-w-0 space-y-0.5 text-foreground">
+				{repositories.map((repository) => (
+					<li className="break-all" key={repository}>
+						{repository}
+					</li>
+				))}
+			</ul>
+		</div>
+	);
+}
+
+function ProjectPath({ path }: { path: string }) {
+	return (
+		<div className="mt-2 flex min-w-0 items-start gap-1.5 border-t border-border pt-2 text-caption">
+			<span className="shrink-0 text-muted-foreground">Path</span>
+			<code className="break-all font-mono text-2xs text-muted-foreground">{path}</code>
+		</div>
+	);
+}
+
+function projectRepositories(project: Project): string[] {
+	return [
+		...new Set([project.repo, ...(project.workspaceRepos ?? []).map((repository) => repository.repo)].filter(Boolean)),
+	];
+}
+
+function ContextFact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+	return (
+		<div className="flex min-w-0 items-baseline gap-1.5">
+			<dt className="shrink-0 text-muted-foreground">{label}</dt>
+			<dd className={mono ? "truncate font-mono text-foreground" : "truncate font-medium text-foreground"}>{value}</dd>
+		</div>
+	);
+}
+
+function agentDisplayName(agentId: string, catalog?: AgentCatalog): string {
+	const knownAgent = [...(catalog?.supported ?? []), ...(catalog?.installed ?? [])].find(
+		(agent) => agent.id === agentId,
+	);
+	if (knownAgent) return knownAgent.label;
+	return agentId
+		.split("-")
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(" ");
 }

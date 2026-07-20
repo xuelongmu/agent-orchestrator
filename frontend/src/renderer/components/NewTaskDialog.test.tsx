@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NewTaskDialog } from "./NewTaskDialog";
@@ -28,7 +28,7 @@ function renderDialog() {
 	const onCreated = vi.fn();
 	const onOpenChange = vi.fn();
 	render(
-		<QueryClientProvider client={new QueryClient()}>
+		<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
 			<NewTaskDialog open projectId="proj-1" onCreated={onCreated} onOpenChange={onOpenChange} />
 		</QueryClientProvider>,
 	);
@@ -67,7 +67,20 @@ beforeEach(() => {
 			};
 		}
 		return {
-			data: { status: "ok", project: { id: "proj-1", config: { worker: { agent: "claude-code" } } } },
+			data: {
+				status: "ok",
+				project: {
+					id: "proj-1",
+					name: "CareerOps",
+					repo: "github.com/acme/careerops",
+					path: "/repos/careerops",
+					defaultBranch: "main",
+					config: {
+						worker: { agent: "claude-code" },
+						orchestrator: { agent: "codex" },
+					},
+				},
+			},
 			error: undefined,
 		};
 	});
@@ -77,6 +90,57 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("NewTaskDialog", () => {
+	it("shows the execution context before the task is launched", async () => {
+		renderDialog();
+
+		await screen.findByText("CareerOps");
+		const context = within(screen.getByRole("group", { name: "Task execution context" }));
+		expect(context.getByText("CareerOps")).toBeInTheDocument();
+		expect(context.getByText("github.com/acme/careerops")).toBeInTheDocument();
+		expect(context.getByText("main")).toBeInTheDocument();
+		expect(context.getByText("Claude Code")).toBeInTheDocument();
+		expect(context.getByText("Codex")).toBeInTheDocument();
+		expect(context.getByText("Path")).toBeInTheDocument();
+		expect(context.getByText("/repos/careerops", { selector: "code" })).toBeVisible();
+	});
+
+	it("keeps a many-repository workspace within a scrollable viewport-bounded dialog", async () => {
+		const originalImplementation = getMock.getMockImplementation();
+		const workspaceRepos = Array.from({ length: 12 }, (_, index) => ({
+			name: `service-${index + 1}`,
+			relativePath: `services/service-${index + 1}`,
+			repo: `github.com/acme/service-${index + 1}`,
+		}));
+		getMock.mockImplementation((path: string) => {
+			if (path === "/api/v1/projects/{id}") {
+				return Promise.resolve({
+					data: {
+						status: "ok",
+						project: {
+							id: "proj-1",
+							name: "Product suite",
+							repo: "",
+							path: "/repos/product-suite",
+							defaultBranch: "main",
+							agent: "claude-code",
+							workspaceRepos,
+						},
+					},
+					error: undefined,
+				});
+			}
+			return originalImplementation?.(path);
+		});
+
+		renderDialog();
+
+		const repositories = within(await screen.findByRole("list", { name: "Repositories" }));
+		expect(repositories.getAllByRole("listitem")).toHaveLength(12);
+		const dialog = screen.getByRole("dialog", { name: "New task" });
+		expect(dialog).toHaveClass("flex", "max-h-[min(720px,calc(100svh-24px))]", "overflow-hidden");
+		expect(dialog.querySelector("form")).toHaveClass("min-h-0", "flex-1", "overflow-y-auto");
+	});
+
 	it("aligns the Agent, Workspace, and Branch fields with matching labels and compact controls", async () => {
 		renderDialog();
 		await waitForAgentCatalog();
@@ -117,7 +181,7 @@ describe("NewTaskDialog", () => {
 		expect(onOpenChange).toHaveBeenCalledWith(false);
 	}, 20_000);
 
-	it("does not override the project workspace default while project config is loading", async () => {
+	it("shows pending project context and prevents launch while it is loading", async () => {
 		const originalImplementation = getMock.getMockImplementation();
 		getMock.mockImplementation((path: string) => {
 			if (path === "/api/v1/projects/{id}") {
@@ -127,16 +191,27 @@ describe("NewTaskDialog", () => {
 		});
 
 		renderDialog();
-		const user = userEvent.setup();
-		await waitForAgentCatalog();
-		await user.click(screen.getByRole("combobox", { name: "Agent" }));
-		await user.click(await screen.findByRole("option", { name: "Claude Code" }));
-		await user.type(screen.getByLabelText("Title"), "Research");
-		await user.type(screen.getByLabelText("Brief"), "Use the configured scratch default.");
-		await user.click(screen.getByRole("button", { name: "Start task" }));
 
-		await waitFor(() => expect(postMock).toHaveBeenCalledTimes(1));
-		expect(spawnBody().workspaceKind).toBeUndefined();
+		expect(await screen.findByText("Loading project context…")).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Start task" })).toBeDisabled();
+		expect(postMock).not.toHaveBeenCalled();
+	});
+
+	it("shows a project context error and prevents launch when project detail is unavailable", async () => {
+		const originalImplementation = getMock.getMockImplementation();
+		getMock.mockImplementation((path: string) => {
+			if (path === "/api/v1/projects/{id}") {
+				return Promise.resolve({ data: undefined, error: { message: "project lookup failed" } });
+			}
+			return originalImplementation?.(path);
+		});
+
+		renderDialog();
+
+		expect(await screen.findByText("Project context unavailable.")).toBeInTheDocument();
+		expect(screen.getByText("project lookup failed")).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Start task" })).toBeDisabled();
+		expect(postMock).not.toHaveBeenCalled();
 	});
 
 	it("spawns a branchless scratch task", async () => {
