@@ -35,14 +35,16 @@ function setupBridge() {
 				isLoading: false,
 			};
 		},
-		ensure: vi.fn(async (sessionId: string): Promise<BrowserNavState> => ({
-			viewId: `42:${sessionId}`,
-			url: "",
-			title: "",
-			canGoBack: false,
-			canGoForward: false,
-			isLoading: false,
-		})),
+		ensure: vi.fn(
+			async (sessionId: string): Promise<BrowserNavState> => ({
+				viewId: `42:${sessionId}`,
+				url: "",
+				title: "",
+				canGoBack: false,
+				canGoForward: false,
+				isLoading: false,
+			}),
+		),
 		setBounds: vi.fn(),
 		capture: vi.fn(async () => "data:image/jpeg;base64,snapshot"),
 		requestMirror: vi.fn(async () => false),
@@ -155,6 +157,47 @@ describe("useBrowserView", () => {
 			expect(bridge.setBounds).toHaveBeenCalledWith({
 				viewId: "42:sess-1",
 				rect: { x: 100, y: 34, width: 150, height: 240 },
+				visible: true,
+			}),
+		);
+	});
+
+	it("re-measures current slot bounds on demand", async () => {
+		const bridge = setupBridge();
+		const slot = createSlot();
+		const { result } = renderHook(() => useBrowserView({ sessionId: "sess-1", active: true, poppedOut: false }));
+		await waitFor(() => expect(bridge.ensure).toHaveBeenCalledWith("sess-1"));
+		act(() =>
+			bridge.emit({
+				viewId: "42:sess-1",
+				url: "http://localhost:3000/",
+				title: "",
+				canGoBack: false,
+				canGoForward: false,
+				isLoading: false,
+			}),
+		);
+		act(() => result.current.slotRef(slot));
+		await waitFor(() => expect(bridge.setBounds).toHaveBeenCalled());
+
+		bridge.setBounds.mockClear();
+		slot.getBoundingClientRect = vi.fn(() => ({
+			x: 12,
+			y: 34,
+			width: 180,
+			height: 240,
+			top: 34,
+			right: 192,
+			bottom: 274,
+			left: 12,
+			toJSON: () => ({}),
+		}));
+		act(() => result.current.remeasure());
+
+		await waitFor(() =>
+			expect(bridge.setBounds).toHaveBeenCalledWith({
+				viewId: "42:sess-1",
+				rect: { x: 12, y: 34, width: 180, height: 240 },
 				visible: true,
 			}),
 		);
