@@ -10,10 +10,7 @@ export type DevDaemonConfig = {
 	apiTarget: string;
 };
 
-export type DevServerProxyConfig = Record<
-	"/api" | "/mux",
-	{ target: string; changeOrigin: false; ws?: true }
->;
+export type DevServerProxyConfig = Record<"/api" | "/mux", { target: string; changeOrigin: false; ws?: true }>;
 
 function joinPath(...segments: string[]): string {
 	return segments.map((segment) => segment.replace(/[/\\]+$/, "")).join("/");
@@ -24,16 +21,9 @@ function joinPath(...segments: string[]): string {
  * target without reading process state. Development shares the canonical
  * ~/.ao daemon by default; ISOLATE_DEV=true opts into ~/.ao/dev and port 3002.
  */
-export function resolveDevDaemonConfig(
-	env: Record<string, string | undefined>,
-	homeDir: string,
-): DevDaemonConfig {
+export function resolveDevDaemonConfig(env: Record<string, string | undefined>, homeDir: string): DevDaemonConfig {
 	const isIsolated = env.ISOLATE_DEV === "true";
-	const port = env.AO_PORT
-		? expectedDaemonPort(env)
-		: isIsolated
-			? ISOLATED_DEV_DAEMON_PORT
-			: DEFAULT_DAEMON_PORT;
+	const port = env.AO_PORT ? expectedDaemonPort(env) : isIsolated ? ISOLATED_DEV_DAEMON_PORT : DEFAULT_DAEMON_PORT;
 	const stateDir = homeDir ? joinPath(homeDir, ".ao", ...(isIsolated ? ["dev"] : [])) : null;
 
 	return {
