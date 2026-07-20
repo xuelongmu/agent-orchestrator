@@ -98,6 +98,7 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	appendSessionHookFlags(&cmd)
 	appendTerminalCompatibilityFlags(&cmd)
 	appendWorkspaceTrustFlag(&cmd, cfg.WorkspacePath)
+	appendModelFlag(&cmd, cfg.Config.Model)
 
 	if cfg.SystemPrompt != "" {
 		cmd = append(cmd, "-c", "developer_instructions="+codexTOMLConfigString(cfg.SystemPrompt))
@@ -139,6 +140,7 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	appendSessionHookFlags(&cmd)
 	appendTerminalCompatibilityFlags(&cmd)
 	appendWorkspaceTrustFlag(&cmd, cfg.Session.WorkspacePath)
+	appendModelFlag(&cmd, cfg.Config.Model)
 	if cfg.SystemPrompt != "" {
 		cmd = append(cmd, "-c", "developer_instructions="+codexTOMLConfigString(cfg.SystemPrompt))
 	} else if cfg.SystemPromptFile != "" {
@@ -355,6 +357,12 @@ func appendHookTrustBypassFlag(cmd *[]string) {
 func appendTerminalCompatibilityFlags(cmd *[]string) {
 	if runtime.GOOS == "windows" {
 		*cmd = append(*cmd, "--no-alt-screen")
+	}
+}
+
+func appendModelFlag(cmd *[]string, configuredModel string) {
+	if model := strings.TrimSpace(configuredModel); model != "" {
+		*cmd = append(*cmd, "--model", model)
 	}
 }
 
