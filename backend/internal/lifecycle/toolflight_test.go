@@ -332,6 +332,26 @@ func TestToolPrecedence_ApprovedToolPostClearsBlocked(t *testing.T) {
 	}
 }
 
+func TestToolPrecedence_ReusedCandidateIDWaitsForFinalPost(t *testing.T) {
+	// Kimi pre/post payloads omit agent_id, so concurrent main/background
+	// executions can reuse one native tool-call id. A sibling post is not proof
+	// that the original approval dialog closed while another generation remains.
+	m, st, _ := newManager()
+	seedSignaled(st, "mer-1", domain.ActivityActive)
+	blockOnDialog(t, m, st, "mer-1", "Bash", "call_shared")
+
+	mustApply(t, m, "mer-1", sig(domain.ActivityActive, "pre-tool-use", "Bash", "call_shared"))
+	mustApply(t, m, "mer-1", sig(domain.ActivityActive, "post-tool-use", "Bash", "call_shared"))
+	if got := stateOf(st, "mer-1"); got != domain.ActivityBlocked {
+		t.Fatalf("state after first sibling post = %q, want blocked", got)
+	}
+
+	mustApply(t, m, "mer-1", sig(domain.ActivityActive, "post-tool-use", "Bash", "call_shared"))
+	if got := stateOf(st, "mer-1"); got != domain.ActivityActive {
+		t.Fatalf("state after final matching post = %q, want active", got)
+	}
+}
+
 func TestToolPrecedence_ApprovedToolFailurePostAlsoClears(t *testing.T) {
 	// An approved tool that runs and FAILS still resolved the dialog.
 	m, st, _ := newManager()

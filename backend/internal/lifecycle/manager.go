@@ -538,6 +538,11 @@ func (f *toolFlight) knownPermissionCount(toolUseID string) int {
 	return count
 }
 
+func (f *toolFlight) toolFullyCompleted(toolUseID string) bool {
+	progress, ok := f.inflight[toolUseID]
+	return ok && progress.started > 0 && progress.completed == progress.started
+}
+
 func (f *toolFlight) resolveCompletedPermissions(toolUseID string) bool {
 	progress, ok := f.inflight[toolUseID]
 	if !ok || progress.completed < progress.started {
@@ -754,10 +759,11 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 			delete(m.flights, id)
 			return s
 		case (s.Event == "post-tool-use" || s.Event == "post-tool-use-failure") &&
-			fl != nil && fl.hasBlockedCandidate && s.ToolUseID == fl.blockedCandidate:
-			// The single unambiguous blocking tool finished: the dialog was
-			// answered. Clear the candidate so a later dialog in the same turn
-			// starts from a clean slate.
+			fl != nil && fl.hasBlockedCandidate && s.ToolUseID == fl.blockedCandidate &&
+			fl.toolFullyCompleted(s.ToolUseID):
+			// Every generation sharing the unambiguous blocking tool id finished:
+			// the dialog was answered. Clear the candidate so a later dialog in
+			// the same turn starts from a clean slate.
 			fl.blockedCandidate = ""
 			fl.hasBlockedCandidate = false
 			return s
