@@ -75,8 +75,9 @@ const TERMINAL_ENHANCE_JS = `
   // While zoomed we auto-pan to keep the cursor framed, so the prompt/output
   // stays in view without chasing it by hand.
   function term() { return window.terminal; }
-  // overview is the chosen view; zoomed tracks whether it currently differs
-  // from the fit scale so a phone-sized grid keeps normal scroll gesture routing.
+  // overview is the chosen view; zoomed tracks whether the non-overview render
+  // overflows either viewport dimension so a phone-sized grid keeps normal
+  // scroll gesture routing. The scale baseline itself remains fit-to-width.
   var Z = { s: 1, min: 1, tx: 0, ty: 0, overview: false, zoomed: false, lastPan: 0 };
   function box() {
     var root = document.querySelector('.xterm');
@@ -97,6 +98,9 @@ const TERMINAL_ENHANCE_JS = `
     b.root.style.transformOrigin = 'top left';
     b.root.style.transform = 'translate(' + Z.tx + 'px,' + Z.ty + 'px) scale(' + Z.s + ')';
   }
+  function overflows(b) {
+    return b.natW * Z.s > b.contW + 0.5 || b.natH * Z.s > b.contH + 0.5;
+  }
   // Fit-to-width baseline, re-run on grid/container changes. Tracks the fit
   // scale while at overview; preserves (re-clamps) the user's zoom otherwise.
   function applyScale() {
@@ -106,7 +110,7 @@ const TERMINAL_ENHANCE_JS = `
       if (Z.overview) { Z.s = Z.min; Z.zoomed = false; Z.tx = 0; Z.ty = 0; }
       else {
         if (Z.s < Z.min) Z.s = Z.min;
-        Z.zoomed = Z.s > Z.min + 0.001;
+        Z.zoomed = overflows(b);
         if (!Z.zoomed) { Z.tx = 0; Z.ty = 0; } else clampT(b);
       }
       applyTransform(b);
@@ -121,8 +125,8 @@ const TERMINAL_ENHANCE_JS = `
     if (s < Z.min) s = Z.min; if (s > 1) s = 1;
     var px = (ax - Z.tx) / Z.s, py = (ay - Z.ty) / Z.s;
     Z.s = s; Z.tx = ax - px * s; Z.ty = ay - py * s;
-    Z.zoomed = s > Z.min + 0.001;
-    if (Z.min < 0.999) Z.overview = !Z.zoomed;
+    if (Z.min < 0.999) Z.overview = s <= Z.min + 0.001;
+    Z.zoomed = !Z.overview && overflows(b);
     if (!Z.zoomed) { Z.s = Z.min; Z.tx = 0; Z.ty = 0; }
     clampT(b); applyTransform(b);
   }
@@ -380,8 +384,8 @@ const TERMINAL_ENHANCE_JS = `
       var now = Date.now();
       if (now - lastTap < DBLTAP && Math.abs(sX - ltX) < 40 && Math.abs(sY - ltY) < 40) {
         lastTap = 0;
-        if (Z.zoomed) setZoom(Z.min, 0, 0);
-        else { setZoom(1, sX, sY); Z.lastPan = Date.now(); }
+        if (Z.zoomed) { Z.overview = true; setZoom(Z.min, 0, 0); }
+        else { Z.overview = false; setZoom(1, sX, sY); Z.lastPan = Date.now(); }
       } else { lastTap = now; ltX = sX; ltY = sY; }
     }
     mode = 'idle';
