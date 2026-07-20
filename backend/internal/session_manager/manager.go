@@ -494,8 +494,13 @@ func (m *Manager) launchCreatedSession(ctx context.Context, cfg ports.SpawnConfi
 			return domain.SessionRecord{}, fmt.Errorf("spawn %s: %w", id, err)
 		}
 	}
-	if err := m.validateRuntimePrerequisites(); err != nil {
-		return domain.SessionRecord{}, fmt.Errorf("spawn: %w", err)
+	// Ordinary Spawn validates before committing its seed row. Promoted
+	// sessions defer this check until launch because their admission intentionally
+	// persists while dependencies are pending.
+	if promotionToken != "" {
+		if err := m.validateRuntimePrerequisites(); err != nil {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: %w", err)
+		}
 	}
 	var predictedHandle ports.RuntimeHandle
 	if promotionToken != "" {
