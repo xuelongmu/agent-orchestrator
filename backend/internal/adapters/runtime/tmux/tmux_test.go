@@ -489,7 +489,7 @@ func TestDestroyExcludesPanesFromLinkedWindows(t *testing.T) {
 	}
 }
 
-func TestDestroyStillReapsWhenKillSessionFails(t *testing.T) {
+func TestDestroyDoesNotReapWhenKillSessionFails(t *testing.T) {
 	r, _ := newTestRuntime(0)
 	fr := &fakeRunnerSelectiveErr{
 		exitErrOn: "kill-session",
@@ -505,8 +505,8 @@ func TestDestroyStillReapsWhenKillSessionFails(t *testing.T) {
 	if err := r.Destroy(context.Background(), ports.RuntimeHandle{ID: "sess-1"}); err == nil {
 		t.Fatal("Destroy: got nil, want kill-session error")
 	}
-	if got, want := anchorSessionIDs(reaper.calls[0].anchors), []int{4242}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("reaped session ids = %#v, want %#v", got, want)
+	if len(reaper.calls) != 0 {
+		t.Fatalf("reaper calls = %#v, want none after unexpected kill-session failure", reaper.calls)
 	}
 }
 

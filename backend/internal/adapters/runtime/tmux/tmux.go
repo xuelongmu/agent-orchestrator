@@ -206,14 +206,20 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 		cancel()
 	}
 	out, err := r.run(ctx, killSessionArgs(id)...)
-	r.sessionReaper.Reap(ctx, anchors, r.reapGrace)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && killSessionMissingOutput(string(out)) {
+			// A definitive missing-session result means teardown won the race;
+			// anchored descendants can still outlive tmux and are safe to reap.
+			r.sessionReaper.Reap(ctx, anchors, r.reapGrace)
 			return nil
 		}
+		// Do not reap after an unexpected failure. The tmux session may still
+		// be alive, so signaling its anchored processes would destroy a session
+		// that Destroy failed to tear down.
 		return fmt.Errorf("tmux runtime: destroy session %s: %w", id, err)
 	}
+	r.sessionReaper.Reap(ctx, anchors, r.reapGrace)
 	return nil
 }
 
