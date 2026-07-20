@@ -1,9 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NotificationCenter } from "./NotificationCenter";
 import type { NotificationDTO } from "../lib/notifications";
+
+const { navigateMock } = vi.hoisted(() => ({ navigateMock: vi.fn() }));
 
 const notifications: NotificationDTO[] = [
 	{
@@ -22,16 +24,28 @@ const notifications: NotificationDTO[] = [
 		id: "ntf_2",
 		sessionId: "sess-2",
 		projectId: "proj-1",
-		prUrl: "",
+		prUrl: "https://github.com/example/repo/pull/2",
 		type: "ready_to_merge",
-		title: "Ready to merge",
+		title: "Project PR ready to merge",
 		body: "",
 		status: "unread",
 		createdAt: "2026-06-16T11:00:00Z",
-		target: { kind: "session", sessionId: "sess-2" },
+		target: { kind: "pr", sessionId: "sess-2", prUrl: "https://github.com/example/repo/pull/2" },
 	},
 	{
 		id: "ntf_3",
+		sessionId: "sess-3",
+		projectId: "",
+		prUrl: "https://github.com/example/repo/pull/3",
+		type: "pr_merged",
+		title: "Unscoped PR merged",
+		body: "",
+		status: "unread",
+		createdAt: "2026-06-16T11:30:00Z",
+		target: { kind: "pr", sessionId: "sess-3", prUrl: "https://github.com/example/repo/pull/3" },
+	},
+	{
+		id: "ntf_4",
 		sessionId: "",
 		projectId: "",
 		prUrl: "",
@@ -42,9 +56,21 @@ const notifications: NotificationDTO[] = [
 		createdAt: "2026-06-16T12:00:00Z",
 		target: { kind: "control_plane", sessionId: "" },
 	},
+	{
+		id: "ntf_5",
+		sessionId: "",
+		projectId: "proj-1",
+		prUrl: "https://github.com/example/repo/pull/5",
+		type: "pr_closed_unmerged",
+		title: "PR without a session",
+		body: "",
+		status: "unread",
+		createdAt: "2026-06-16T13:00:00Z",
+		target: { kind: "pr", sessionId: "", prUrl: "https://github.com/example/repo/pull/5" },
+	},
 ];
 
-vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
+vi.mock("@tanstack/react-router", () => ({ useNavigate: () => navigateMock }));
 
 vi.mock("../hooks/useNotificationsQuery", () => ({
 	useMarkAllNotificationsReadMutation: () => ({ isPending: false, mutateAsync: vi.fn() }),
@@ -66,13 +92,26 @@ function renderNotificationCenter() {
 	);
 }
 
+async function openNotification(title: string) {
+	const user = userEvent.setup();
+	await user.click(screen.getByRole("button", { name: "5 unread notifications" }));
+	const item = (await screen.findByText(title)).closest(".grid");
+	expect(item).not.toBeNull();
+	await user.click(within(item as HTMLElement).getByTitle("Open target"));
+}
+
 describe("NotificationCenter", () => {
+	beforeEach(() => {
+		vi.restoreAllMocks();
+		navigateMock.mockReset();
+	});
+
 	it("renders a filled bell with a text-only yellow unread count", () => {
 		renderNotificationCenter();
 
-		const trigger = screen.getByRole("button", { name: "3 unread notifications" });
+		const trigger = screen.getByRole("button", { name: "5 unread notifications" });
 		const bell = trigger.querySelector("svg");
-		const count = screen.getByText("3");
+		const count = screen.getByText("5");
 
 		expect(bell).toHaveClass("fill-current");
 		expect(count).toHaveClass("text-caption");
@@ -82,15 +121,61 @@ describe("NotificationCenter", () => {
 		expect(count).not.toHaveClass("text-background");
 	});
 
+	it("opens a PR and navigates to its project-scoped session", async () => {
+		const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+		renderNotificationCenter();
+
+		await openNotification("Project PR ready to merge");
+
+		expect(openSpy).toHaveBeenCalledWith("https://github.com/example/repo/pull/2", "_blank", "noopener,noreferrer");
+		expect(navigateMock).toHaveBeenCalledWith({
+			to: "/projects/$projectId/sessions/$sessionId",
+			params: { projectId: "proj-1", sessionId: "sess-2" },
+		});
+	});
+
+	it("opens a PR and navigates to its unscoped session", async () => {
+		const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+		renderNotificationCenter();
+
+		await openNotification("Unscoped PR merged");
+
+		expect(openSpy).toHaveBeenCalledWith("https://github.com/example/repo/pull/3", "_blank", "noopener,noreferrer");
+		expect(navigateMock).toHaveBeenCalledWith({ to: "/sessions/$sessionId", params: { sessionId: "sess-3" } });
+	});
+
+	it("keeps session notification navigation unchanged", async () => {
+		const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+		renderNotificationCenter();
+
+		await openNotification("Needs input");
+
+		expect(openSpy).not.toHaveBeenCalled();
+		expect(navigateMock).toHaveBeenCalledWith({
+			to: "/projects/$projectId/sessions/$sessionId",
+			params: { projectId: "proj-1", sessionId: "sess-1" },
+		});
+	});
+
+	it("opens a PR without navigating when its session ID is missing", async () => {
+		const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+		renderNotificationCenter();
+
+		await openNotification("PR without a session");
+
+		expect(openSpy).toHaveBeenCalledWith("https://github.com/example/repo/pull/5", "_blank", "noopener,noreferrer");
+		expect(navigateMock).not.toHaveBeenCalled();
+	});
+
 	it("does not offer an open action for control-plane notifications", async () => {
 		const user = userEvent.setup();
 		renderNotificationCenter();
-		await user.click(screen.getByRole("button", { name: "3 unread notifications" }));
+		await user.click(screen.getByRole("button", { name: "5 unread notifications" }));
 
 		const title = await screen.findByText("GitHub authentication needs attention");
 		const item = title.closest(".grid");
 		expect(item).not.toBeNull();
 		expect(within(item as HTMLElement).queryByTitle("Open target")).not.toBeInTheDocument();
-		expect(screen.getAllByTitle("Open target")).toHaveLength(2);
+		expect(screen.getAllByTitle("Open target")).toHaveLength(4);
 	});
 });
