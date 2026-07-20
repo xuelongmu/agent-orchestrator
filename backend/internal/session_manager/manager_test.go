@@ -683,6 +683,7 @@ type fakeWorkspace struct {
 	validateBranchErr error
 	validatedBranches []string
 	destroyErr        error
+	destroyResult     func(attempt int) error
 	destroyed         int
 	lastCfg           ports.WorkspaceConfig
 	projectErr        error
@@ -815,10 +816,15 @@ func (w *fakeWorkspace) Destroy(_ context.Context, info ports.WorkspaceInfo) err
 			*w.sharedLog = append(*w.sharedLog, entry)
 		}
 	}
+	w.mu.Lock()
 	w.destroyed++
-	w.mu.RLock()
+	attempt := w.destroyed
+	result := w.destroyResult
 	err := w.destroyErr
-	w.mu.RUnlock()
+	w.mu.Unlock()
+	if result != nil {
+		return result(attempt)
+	}
 	return err
 }
 func (w *fakeWorkspace) setDestroyErr(err error) {
@@ -3139,7 +3145,20 @@ func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) 
 	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: time.Now()}
 	rec.Metadata.WorkspaceKind = domain.WorkspaceKindScratch
 	st.setSession(rec)
-	ws.setDestroyErr(errors.New("workspace busy"))
+	retryStarted := make(chan struct{})
+	releaseRetry := make(chan struct{})
+	ws.destroyResult = func(attempt int) error {
+		switch attempt {
+		case 1:
+			return errors.New("workspace busy")
+		case 2:
+			close(retryStarted)
+			<-releaseRetry
+			return nil
+		default:
+			return fmt.Errorf("unexpected workspace cleanup attempt %d", attempt)
+		}
+	}
 	m.cleanupRetryDelay = time.Millisecond
 
 	if err := m.CleanupCompletedSession(ctx, rec.ID); err == nil || !strings.Contains(err.Error(), "workspace busy") {
@@ -3149,7 +3168,12 @@ func TestCleanupCompletedSession_RemovesScratchAndRetriesFailures(t *testing.T) 
 		t.Fatal("failed cleanup did not retain a retry owner")
 	}
 
-	ws.setDestroyErr(nil)
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup retry did not start")
+	}
+	close(releaseRetry)
 	deadline := time.Now().Add(time.Second)
 	for retryPending(m, rec.ID) && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
