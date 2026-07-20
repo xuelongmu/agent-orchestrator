@@ -141,8 +141,8 @@ const config: ForgeConfig = {
 			name: "@electron-forge/publisher-github",
 			// Release target is build-time overridable so a fork run publishes to the
 			// fork without a source edit. AO_RELEASE_REPO is "owner/repo"; it defaults
-			// to the production target. The dev/test loop sets
-			// AO_RELEASE_REPO=harshitsinghbhandari/agent-orchestrator (spec §1.1, §8).
+			// to the production target. Release workflows set it from
+			// github.repository so each fork publishes to itself (spec §1.1, §8).
 			// Note: aoagents/agent-orchestrator was the temporary rewrite home and is
 			// intentionally NOT the default; releases land on AgentWrapper.
 			config: {

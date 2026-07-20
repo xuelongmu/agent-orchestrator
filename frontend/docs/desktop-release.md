@@ -31,6 +31,29 @@ on `main`; the PR-based flow below supersedes it.
 - A release approver available (see "Who can approve" below); the build jobs
   wait on the `release` environment until someone approves.
 
+## Fork release setup
+
+GitHub does not copy environments or Actions secrets when a repository is
+forked. Before the first stable release from a fork:
+
+1. In the fork's Settings > Environments, create `release`, enable required
+   reviewers, and choose the operators allowed to approve publishing.
+2. Add these six **repository Actions secrets** (not environment secrets, since
+   the ungated preflight must read them before approval): `CSC_LINK`,
+   `CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`,
+   `APPLE_API_ISSUER`, and `APPLE_SIGNING_IDENTITY`. The workflow fails before
+   any publishing job starts if even one is absent, without printing values.
+3. Choose an unused stable `X.Y.Z`, stamp it in `frontend/package.json` and
+   `frontend/package-lock.json` through a PR, and run Desktop release from the
+   merged `main` commit (either dispatch it or push `desktop-vX.Y.Z`). Approve
+   the `release` deployment when prompted. The workflow derives its destination
+   from `github.repository`, so the fork publishes only to itself.
+4. Confirm the resulting `vX.Y.Z` release is neither draft nor prerelease and
+   contains `latest.yml`, `latest-mac.yml`, and `latest-linux.yml`. Inspect each
+   feed's `files[].url` entries and confirm every referenced installer is an
+   asset on that release, then dispatch Release latest guard and require it to
+   pass.
+
 ## Cutting a stable release
 
 Throughout, `X.Y.Z` is the new version (e.g. `0.10.2`) and `upstream` is the
@@ -163,19 +186,20 @@ gh api repos/AgentWrapper/agent-orchestrator/environments/release \
 
 ## Fork test releases (dev loop)
 
-Test releases go to the fork, never to AgentWrapper: push a `desktop-v*` tag
-to the fork or run the workflow via `workflow_dispatch` from the fork's
-Actions tab. `AO_RELEASE_REPO` is derived from `github.repository`, so a fork
-run publishes to the fork with no source edit. See the header comment in
-`frontend-release.yml`.
+Test releases go to the fork, never to the upstream repository: push a
+`desktop-v*` tag to the fork or run the workflow via `workflow_dispatch` from
+the fork's Actions tab. `AO_RELEASE_REPO` is derived from `github.repository`,
+so a fork run publishes to the fork with no source edit. See the header comment
+in `frontend-release.yml`.
 
 ## Signing infrastructure (reference)
 
-macOS signing + notarization is driven by repo Actions secrets consumed by
+macOS signing + notarization is driven by repository Actions secrets consumed by
 `.github/actions/macos-signing-setup`: `CSC_LINK` (base64 `.p12`),
 `CSC_KEY_PASSWORD`, `APPLE_SIGNING_IDENTITY`, and the notarytool API key trio
 `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`. These are
-configured; releases since v0.10.1 ship signed and notarized, and the in-app
-auto-updater (`update-electron-app` in `src/main.ts`, active only when
-`app.isPackaged`) updates installed apps from the Releases feed. Windows
-code-signing is still a follow-up (issue #401).
+not inherited by forks; configure all six as described above. The stable
+release preflight requires the complete set before protected publishing jobs
+can start. The in-app auto-updater (`update-electron-app` in `src/main.ts`,
+active only when `app.isPackaged`) updates installed apps from the Releases
+feed. Windows code-signing is still a follow-up (issue #401).

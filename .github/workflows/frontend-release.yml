@@ -12,21 +12,19 @@ name: Desktop release
 # the daemon (issues #235/#256). The per-OS matrix keeps host == target, and the
 # Linux daemon is built on the Linux runner (AgentWrapper/agent-orchestrator#2191).
 #
-# ⚠️ Until macOS code signing + notarization secrets are configured (see
-# frontend/docs/desktop-release.md), published builds are UNSIGNED and will
-# NOT auto-update on macOS. The workflow still produces installable artifacts.
+# Stable releases require all macOS signing + notarization secrets. The
+# ungated preflight below verifies their presence before any platform can
+# publish, so a migrated fork fails closed instead of creating a partial
+# release. See frontend/docs/desktop-release.md.
 #
 # ── Cutting a FORK test release (dev loop) ────────────────────────────────────
-# Test releases go to harshitsinghbhandari/agent-orchestrator (the fork), never
-# to AgentWrapper. To cut one, on the FORK:
+# Test releases go to the fork where this workflow runs, never to the upstream
+# repository. To cut one, on the fork:
 #   - push a `desktop-v*` tag (e.g. `git push fork desktop-v0.0.0-test1`), or
 #   - run this workflow via `workflow_dispatch` from the fork's Actions tab.
-# AO_RELEASE_REPO MUST be set to the fork for a test run. It is derived
-# automatically below from `github.repository`, so a fork run publishes to the
-# fork and a run on AgentWrapper publishes to AgentWrapper, with no edit. The
-# matching test `ao` binary is built with
-# `-ldflags -X ...cli.releaseRepo=harshitsinghbhandari/agent-orchestrator` so it
-# fetches from the same fork (spec §6.3).
+# AO_RELEASE_REPO is derived automatically below from `github.repository`, so
+# each run publishes to its own repository with no source edit. The matching
+# test `ao` binary is built to fetch from the same repository (spec §6.3).
 
 on:
   push:
@@ -35,7 +33,46 @@ on:
   workflow_dispatch:
 
 jobs:
+  # This job deliberately has no `release` environment. Repository secrets are
+  # checked before required-reviewer approval and before any OS matrix leg can
+  # create or upload release assets. Only secret names are printed on failure.
+  release-preflight:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Verify signing and notarization secrets
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for secret_name in \
+            CSC_LINK \
+            CSC_KEY_PASSWORD \
+            APPLE_API_KEY_BASE64 \
+            APPLE_API_KEY_ID \
+            APPLE_API_ISSUER \
+            APPLE_SIGNING_IDENTITY; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              missing+=("$secret_name")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            printf '::error::Missing required repository Actions secret: %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+          echo "All required signing and notarization secrets are configured."
+
   release:
+    needs: release-preflight
     strategy:
       fail-fast: false
       matrix:
@@ -172,6 +209,7 @@ jobs:
   # Runner is macos-15-intel: macos-13 is deprecated/has no capacity (multi-hour
   # queues), so this leg uses the supported Intel x64 image.
   release-intel:
+    needs: release-preflight
     runs-on: macos-15-intel
     environment: release # same approval gate as the matrix release job
     permissions:
