@@ -11,7 +11,12 @@ import type { components } from "../../api/schema";
 import { apiClient, apiErrorMessage } from "../lib/api-client";
 import { captureRendererEvent } from "../lib/telemetry";
 import type { AgentProvider, WorkspaceKind } from "../types/workspace";
-import { agentsQueryKey, agentsQueryOptions, refreshAgents } from "../hooks/useAgentsQuery";
+import {
+	agentsQueryKey,
+	agentsQueryOptions,
+	refreshAgents,
+	type AgentCatalog,
+} from "../hooks/useAgentsQuery";
 
 type Project = components["schemas"]["Project"];
 
@@ -61,6 +66,9 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 	const defaultWorkerAgent = projectQuery.data?.config?.worker?.agent ?? "";
 	const effectiveWorkspaceKind = workspaceKind || projectQuery.data?.config?.workspaceKind || "worktree";
 	const agentCatalog = agentsQuery.data;
+	const effectiveAgent = agent || defaultWorkerAgent || projectQuery.data?.agent || "";
+	const configuredOrchestratorAgent =
+		projectQuery.data?.config?.orchestrator?.agent || projectQuery.data?.agent || "";
 
 	useEffect(() => {
 		if (!open) {
@@ -149,6 +157,33 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 					</div>
 
 					<form onSubmit={submit} className="space-y-4 px-5 py-4">
+						{projectQuery.data ? (
+							<div
+								className="rounded-md border border-border bg-surface px-3 py-2.5 text-xs"
+								data-testid="task-execution-context"
+							>
+								<div
+									className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5"
+									title={`Project path: ${projectQuery.data.path}`}
+								>
+									<span className="font-semibold text-foreground">{projectQuery.data.name}</span>
+									<span className="min-w-0 break-all text-muted-foreground">{projectQuery.data.repo}</span>
+								</div>
+								<dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-caption">
+									<ContextFact label="Base branch" value={projectQuery.data.defaultBranch} mono />
+									{effectiveAgent ? (
+										<ContextFact label="Worker" value={agentDisplayName(effectiveAgent, agentCatalog)} />
+									) : null}
+									{configuredOrchestratorAgent ? (
+										<ContextFact
+											label="Orchestrator"
+											value={agentDisplayName(configuredOrchestratorAgent, agentCatalog)}
+										/>
+									) : null}
+								</dl>
+							</div>
+						) : null}
+
 						<div className="space-y-1.5">
 							<label className="text-xs font-medium text-muted-foreground" htmlFor={titleId}>
 								Title
@@ -262,4 +297,26 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 			</Dialog.Portal>
 		</Dialog.Root>
 	);
+}
+
+function ContextFact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+	return (
+		<div className="flex min-w-0 items-baseline gap-1.5">
+			<dt className="shrink-0 text-muted-foreground">{label}</dt>
+			<dd className={mono ? "truncate font-mono text-foreground" : "truncate font-medium text-foreground"}>
+				{value}
+			</dd>
+		</div>
+	);
+}
+
+function agentDisplayName(agentId: string, catalog?: AgentCatalog): string {
+	const knownAgent = [...(catalog?.supported ?? []), ...(catalog?.installed ?? [])].find(
+		(agent) => agent.id === agentId,
+	);
+	if (knownAgent) return knownAgent.label;
+	return agentId
+		.split("-")
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(" ");
 }

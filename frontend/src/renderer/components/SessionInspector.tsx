@@ -20,6 +20,7 @@ import { PRSummaryMeta, PRSummaryParts } from "./PRSummaryDisplay";
 import { StatusPill } from "./StatusPill";
 
 type ProjectConfig = components["schemas"]["ProjectConfig"];
+type Project = components["schemas"]["Project"];
 type PRReviewState = components["schemas"]["PRReviewState"];
 type ReviewsResponse = components["schemas"]["ListReviewsResponse"];
 type ReviewFinding = components["schemas"]["ReviewFinding"];
@@ -255,6 +256,16 @@ function Section({
 
 function SummaryView({ session }: { session: WorkspaceSession }) {
 	const query = useSessionScmSummary(session.id);
+	const projectQuery = useQuery({
+		queryKey: ["project", session.workspaceId],
+		queryFn: async () => {
+			const { data, error } = await apiClient.GET("/api/v1/projects/{id}", {
+				params: { path: { id: session.workspaceId } },
+			});
+			if (error) throw new Error(apiErrorMessage(error, "Unable to load project context"));
+			return data?.status === "ok" ? (data.project as Project) : undefined;
+		},
+	});
 	const prSummaries = sessionPRDisplaySummaries(session, query.data);
 	const prSectionTitle = prSummaries.length > 1 ? `Pull requests (${prSummaries.length})` : "Pull request";
 	const workspaceKind = session.workspaceKind ?? "worktree";
@@ -262,6 +273,8 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 
 	return (
 		<div role="tabpanel">
+			<ExecutionContext project={projectQuery.data} session={session} />
+
 			{session.dependencyPending ? (
 				<Section title="Dependencies">
 					<div
@@ -304,7 +317,6 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 
 			<Section className="border-t border-border pt-5" title="Overview">
 				<dl className="flex flex-col gap-1">
-					<Row k="Agent" v={session.provider} mono />
 					{issueId && <Row k="Issue" v={issueId} mono />}
 					{session.dependsOn && session.dependsOn.length > 0 ? (
 						<Row k="Declared prerequisites" v={session.dependsOn.join(", ")} mono />
@@ -315,6 +327,53 @@ function SummaryView({ session }: { session: WorkspaceSession }) {
 					<Row k="Session" v={session.id} mono />
 				</dl>
 			</Section>
+		</div>
+	);
+}
+
+function ExecutionContext({ project, session }: { project?: Project; session: WorkspaceSession }) {
+	const configuredWorker = project?.config?.worker?.agent || project?.agent;
+	const configuredOrchestrator = project?.config?.orchestrator?.agent || project?.agent;
+	const activeRole = session.kind === "orchestrator" ? "Orchestrator" : "Worker";
+	const configuredActive = session.kind === "orchestrator" ? configuredOrchestrator : configuredWorker;
+
+	return (
+		<Section title="Execution context">
+			<div
+				className="rounded-md border border-border bg-surface p-3"
+				data-testid="session-execution-context"
+			>
+				<div
+					className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs"
+					title={project?.path ? `Project path: ${project.path}` : undefined}
+				>
+					<span className="font-semibold text-foreground">{project?.name ?? session.workspaceName}</span>
+					{project?.repo ? (
+						<span className="min-w-0 break-all text-muted-foreground">{project.repo}</span>
+					) : null}
+				</div>
+				<dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-caption">
+					{project?.defaultBranch ? (
+						<ContextFact label="Base branch" value={project.defaultBranch} mono />
+					) : null}
+					<ContextFact label={activeRole} value={session.provider} />
+					{configuredActive && configuredActive !== session.provider ? (
+						<ContextFact label={`${activeRole} default`} value={configuredActive} />
+					) : null}
+					{session.kind !== "orchestrator" && configuredOrchestrator ? (
+						<ContextFact label="Orchestrator" value={configuredOrchestrator} />
+					) : null}
+				</dl>
+			</div>
+		</Section>
+	);
+}
+
+function ContextFact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+	return (
+		<div className="flex min-w-0 items-baseline gap-1.5">
+			<dt className="shrink-0 text-muted-foreground">{label}</dt>
+			<dd className={cn("truncate font-medium text-foreground", mono && "font-mono text-2xs")}>{value}</dd>
 		</div>
 	);
 }

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NewTaskDialog } from "./NewTaskDialog";
@@ -67,7 +67,20 @@ beforeEach(() => {
 			};
 		}
 		return {
-			data: { status: "ok", project: { id: "proj-1", config: { worker: { agent: "claude-code" } } } },
+			data: {
+				status: "ok",
+				project: {
+					id: "proj-1",
+					name: "CareerOps",
+					repo: "github.com/acme/careerops",
+					path: "/repos/careerops",
+					defaultBranch: "main",
+					config: {
+						worker: { agent: "claude-code" },
+						orchestrator: { agent: "codex" },
+					},
+				},
+			},
 			error: undefined,
 		};
 	});
@@ -77,6 +90,21 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("NewTaskDialog", () => {
+	it("shows the execution context before the task is launched", async () => {
+		renderDialog();
+
+		const context = within(await screen.findByTestId("task-execution-context"));
+		expect(context.getByText("CareerOps")).toBeInTheDocument();
+		expect(context.getByText("github.com/acme/careerops")).toBeInTheDocument();
+		expect(context.getByText("main")).toBeInTheDocument();
+		expect(context.getByText("Claude Code")).toBeInTheDocument();
+		expect(context.getByText("Codex")).toBeInTheDocument();
+		expect(context.getByText("CareerOps").closest("[title]")).toHaveAttribute(
+			"title",
+			"Project path: /repos/careerops",
+		);
+	});
+
 	it("aligns the Agent, Workspace, and Branch fields with matching labels and compact controls", async () => {
 		renderDialog();
 		await waitForAgentCatalog();

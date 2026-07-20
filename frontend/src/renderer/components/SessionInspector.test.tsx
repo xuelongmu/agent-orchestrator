@@ -77,9 +77,13 @@ function mockCommonGets(_unusedRuns: unknown[] = [], reviewerHandleId = "", revi
 						kind: "git",
 						name: "my-app",
 						path: "/repo",
-						repo: "my-app",
+						repo: "github.com/acme/my-app",
 						defaultBranch: "main",
-						config: { reviewers: [{ harness: "codex" }] },
+						config: {
+							worker: { agent: "claude-code" },
+							orchestrator: { agent: "codex" },
+							reviewers: [{ harness: "codex" }],
+						},
 					},
 				},
 			};
@@ -131,6 +135,20 @@ afterEach(() => {
 });
 
 describe("SessionInspector tabs", () => {
+	it("shows project, repository, base branch, and configured agents for the inspected worker", async () => {
+		mockCommonGets();
+		renderWithQuery(<SessionInspector session={session([])} />);
+
+		await screen.findByText("github.com/acme/my-app");
+		const context = within(screen.getByTestId("session-execution-context"));
+		expect(context.getByText("my-app")).toBeInTheDocument();
+		expect(context.getByText("github.com/acme/my-app")).toBeInTheDocument();
+		expect(context.getByText("main")).toBeInTheDocument();
+		expect(context.getByText("claude-code")).toBeInTheDocument();
+		expect(context.getByText("codex")).toBeInTheDocument();
+		expect(context.getByText("my-app").closest("[title]")).toHaveAttribute("title", "Project path: /repo");
+	});
+
 	it("shows dependency blocking and clears it when the live session update is promoted", () => {
 		const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
 		const pending = session([], { dependsOn: ["parent-a", "parent-b"], dependencyPending: true });
