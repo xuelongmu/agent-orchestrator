@@ -50,8 +50,12 @@ type WorkspaceRepoRecord struct {
 // SessionWorktreeRecord tracks one repo worktree in a session. Workspace
 // projects create one root row plus one child row per WorkspaceRepoRecord.
 type SessionWorktreeRecord struct {
-	SessionID    SessionID
-	RepoName     string
+	SessionID SessionID
+	RepoName  string
+	// RepoPath and RelativePath are pointers so nil remains distinguishable
+	// from a persisted empty root relative path on legacy rows.
+	RepoPath     *string
+	RelativePath *string
 	Branch       string
 	BaseSHA      string
 	WorktreePath string

@@ -655,7 +655,7 @@ func (s *Store) PrepareReservedDependencyWorkspace(ctx context.Context, id domai
 		if state == "" {
 			state = "active"
 		}
-		if err := q.UpsertSessionWorktree(ctx, gen.UpsertSessionWorktreeParams{SessionID: id, RepoName: row.RepoName, Branch: row.Branch, BaseSha: row.BaseSHA, WorktreePath: row.WorktreePath, PreservedRef: row.PreservedRef, State: state}); err != nil {
+		if err := q.UpsertSessionWorktree(ctx, gen.UpsertSessionWorktreeParams{SessionID: id, RepoName: row.RepoName, RepoPath: nullableString(row.RepoPath), RelativePath: nullableString(row.RelativePath), Branch: row.Branch, BaseSha: row.BaseSHA, WorktreePath: row.WorktreePath, PreservedRef: row.PreservedRef, State: state}); err != nil {
 			return false, fmt.Errorf("prepare dependency workspace %s repo %s: %w", id, row.RepoName, err)
 		}
 	}

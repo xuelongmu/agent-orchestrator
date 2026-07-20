@@ -16,9 +16,11 @@ WHERE project_id = ?
 ORDER BY name;
 
 -- name: UpsertSessionWorktree :exec
-INSERT INTO session_worktrees (session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO session_worktrees (session_id, repo_name, repo_path, relative_path, branch, base_sha, worktree_path, preserved_ref, state)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (session_id, repo_name) DO UPDATE SET
+    repo_path = COALESCE(session_worktrees.repo_path, excluded.repo_path),
+    relative_path = COALESCE(session_worktrees.relative_path, excluded.relative_path),
     branch = excluded.branch,
     base_sha = excluded.base_sha,
     worktree_path = excluded.worktree_path,
@@ -26,12 +28,12 @@ ON CONFLICT (session_id, repo_name) DO UPDATE SET
     state = excluded.state;
 
 -- name: GetSessionWorktree :one
-SELECT session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state
+SELECT session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state, repo_path, relative_path
 FROM session_worktrees
 WHERE session_id = ? AND repo_name = ?;
 
 -- name: ListSessionWorktrees :many
-SELECT session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state
+SELECT session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state, repo_path, relative_path
 FROM session_worktrees
 WHERE session_id = ?
 ORDER BY CASE WHEN repo_name = '__root__' THEN 0 ELSE 1 END, repo_name;

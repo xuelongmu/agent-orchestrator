@@ -461,6 +461,7 @@ func TestDependencyWorkspaceInventoryFollowsPromotionFence(t *testing.T) {
 	metadata.RuntimeHandleID = "runtime"
 	root := domain.SessionWorktreeRecord{
 		SessionID: child.ID, RepoName: domain.RootWorkspaceRepoName,
+		RepoPath: ptrTo("/repos/project"), RelativePath: ptrTo(""),
 		Branch: metadata.Branch, WorktreePath: metadata.WorkspacePath, State: "active",
 	}
 
@@ -472,6 +473,9 @@ func TestDependencyWorkspaceInventoryFollowsPromotionFence(t *testing.T) {
 	}
 	if prepared, err := s.PrepareReservedDependencyWorkspace(ctx, child.ID, "owner", metadata, []domain.SessionWorktreeRecord{root}, time.Now().UTC()); err != nil || !prepared {
 		t.Fatalf("owned prepare = %v, %v", prepared, err)
+	}
+	if rows, err := s.ListSessionWorktrees(ctx, child.ID); err != nil || len(rows) != 1 || !reflect.DeepEqual(rows[0], root) {
+		t.Fatalf("owned prepare inventory = %+v err=%v, want %+v", rows, err, root)
 	}
 	if reset, err := s.ResetReservedDependencyLaunch(ctx, child.ID, "stale", false, time.Now().UTC()); err != nil || reset {
 		t.Fatalf("stale reset = %v, %v", reset, err)
@@ -1464,8 +1468,8 @@ func TestSessionWorktreesRoundTrip(t *testing.T) {
 		t.Fatalf("create session: %v", err)
 	}
 	rows := []domain.SessionWorktreeRecord{
-		{SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, Branch: "ao/ws-1", BaseSHA: "root-base", WorktreePath: "/managed/ws/ws-1", State: "active"},
-		{SessionID: rec.ID, RepoName: "api", Branch: "ao/ws-1", BaseSHA: "api-base", WorktreePath: "/managed/ws/ws-1/api", PreservedRef: "refs/ao/preserved/ws-1", State: "removed"},
+		{SessionID: rec.ID, RepoName: domain.RootWorkspaceRepoName, RepoPath: ptrTo("/repos/ws"), RelativePath: ptrTo(""), Branch: "ao/ws-1", BaseSHA: "root-base", WorktreePath: "/managed/ws/ws-1", State: "active"},
+		{SessionID: rec.ID, RepoName: "api", RepoPath: ptrTo("/repos/ws/api"), RelativePath: ptrTo("services/api"), Branch: "ao/ws-1", BaseSHA: "api-base", WorktreePath: "/managed/ws/ws-1/api", PreservedRef: "refs/ao/preserved/ws-1", State: "removed"},
 	}
 	for _, row := range rows {
 		if err := s.UpsertSessionWorktree(ctx, row); err != nil {
@@ -1485,11 +1489,13 @@ func TestSessionWorktreesRoundTrip(t *testing.T) {
 	}
 	rows[1].State = "active"
 	rows[1].PreservedRef = ""
+	rows[1].RepoPath = ptrTo("/repos/re-registered/api")
+	rows[1].RelativePath = ptrTo("api-now")
 	if err := s.UpsertSessionWorktree(ctx, rows[1]); err != nil {
 		t.Fatalf("update api worktree: %v", err)
 	}
 	one, ok, err = s.GetSessionWorktree(ctx, rec.ID, "api")
-	if err != nil || !ok || one.State != "active" || one.PreservedRef != "" {
+	if err != nil || !ok || one.State != "active" || one.PreservedRef != "" || one.RepoPath == nil || *one.RepoPath != "/repos/ws/api" || one.RelativePath == nil || *one.RelativePath != "services/api" {
 		t.Fatalf("updated api = %#v ok=%v err=%v", one, ok, err)
 	}
 	if err := s.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
@@ -1537,4 +1543,9 @@ func TestUpsertSessionWorktreeEmptyStateDefaultsToActive(t *testing.T) {
 	if got.State != "active" {
 		t.Fatalf("State = %q, want %q", got.State, "active")
 	}
+	if got.RepoPath != nil || got.RelativePath != nil {
+		t.Fatalf("legacy metadata = %v/%v, want nil", got.RepoPath, got.RelativePath)
+	}
 }
+
+func ptrTo[T any](value T) *T { return &value }
