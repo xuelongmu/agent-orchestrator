@@ -19,7 +19,7 @@ After the app is installed, make sure these tools are available before you start
 | GitHub CLI `gh` | For GitHub projects    | Reads issues, PRs, reviews, and CI status as your user.                              |
 | tmux            | Default on macOS/Linux | Keeps long-running agent sessions attachable and recoverable.                        |
 | An agent CLI    | Yes                    | The worker that writes code, such as Claude Code, Codex, Cursor, Aider, or OpenCode. |
-| Node.js 20+     | Legacy/source installs | Needed only if you use the frozen npm CLI package or build AO from source.           |
+| Node.js 20+     | npm/source installs    | Needed only if you use the npm bootstrap or build AO from source.                    |
 
 If you plan to use GitLab or Linear, install and authenticate their CLIs or credentials as described on the related plugin pages. A GitHub-only setup only needs `gh`.
 
@@ -106,14 +106,14 @@ opencode --help
 <summary>
 	<span className="ao-legacy-cli-summary-copy">
 		<span className="ao-legacy-cli-summary-title">Using the legacy CLI?</span>
-		<span className="ao-legacy-cli-summary-note">npm still works but is no longer recommended. Verify the frozen <code>@aoagents/ao</code> package, then run <code>ao start</code> to move onto the desktop build.</span>
+		<span className="ao-legacy-cli-summary-note">npm still works but is no longer recommended. Verify the <code>@aoagents/ao</code> bootstrap, or move to the desktop build.</span>
 	</span>
 	<span className="ao-legacy-cli-summary-icon" aria-hidden="true" />
 </summary>
 
 <div className="ao-legacy-cli-details__content">
 
-npm still works but is no longer recommended. `0.10.0` is the final version published to npm, and `@aoagents/ao` is frozen and will not receive further updates. These commands remain for existing CLI users; new setups should use the desktop download at the top of this page.
+npm still works but is no longer recommended. `@aoagents/ao` is a bootstrap that launches the matching platform Go binary; the historical `@aoagents/ao-cli` package is the legacy TypeScript runtime. These commands remain for existing users; new setups should use the desktop download at the top of this page.
 
 <div className="ao-compact-tabs ao-legacy-install-tabs">
 

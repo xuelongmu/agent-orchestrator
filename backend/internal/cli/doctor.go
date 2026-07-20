@@ -395,7 +395,15 @@ func aoPackageVersionForEntry(entry string) (string, bool, error) {
 			if err != nil {
 				return "", false, err
 			}
+			binNative := filepath.FromSlash(strings.ReplaceAll(bin, `\`, "/"))
+			normalizedBin := strings.ReplaceAll(bin, `/`, `\`)
+			if filepath.IsAbs(binNative) || windowsLocalAbsolutePathRE.MatchString(bin) || strings.HasPrefix(normalizedBin, `\\`) || strings.HasPrefix(normalizedBin, `\??\`) {
+				return "", false, errors.New("package ao bin path is not relative")
+			}
 			binParts := strings.FieldsFunc(bin, func(r rune) bool { return r == '/' || r == '\\' })
+			if len(binParts) > 0 && binParts[0] == "." {
+				binParts = binParts[1:]
+			}
 			for _, part := range binParts {
 				if part == "" || part == "." || part == ".." {
 					return "", false, errors.New("unsafe ao bin path in package metadata")

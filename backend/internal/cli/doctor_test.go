@@ -435,8 +435,8 @@ func TestDoctorWindowsAODifferentExeStaysWarningWithoutExecution(t *testing.T) {
 
 func TestDoctorWindowsMigratedBootstrapStaysWarning(t *testing.T) {
 	root := t.TempDir()
-	shadow := writeWindowsAOShimFixture(t, filepath.Join(root, "fnm", "123"), "0.10.3")
-	writeWindowsAOPackageMetadata(t, shadow, `{"name":"@aoagents/ao","version":"0.10.3","bin":{"ao":"dist/index.js"},"optionalDependencies":{"@aoagents/ao-win32-x64":"0.10.3"}}`)
+	shadow := writeWindowsAOShimFixtureWithEntry(t, filepath.Join(root, "fnm", "123"), "0.10.3", "bin/ao.js")
+	writeWindowsAOPackageMetadata(t, shadow, `{"name":"@aoagents/ao","version":"0.10.3","bin":{"ao":"./bin/ao.js"},"optionalDependencies":{"@aoagents/ao-win32-x64":"0.10.3"}}`)
 	c := &commandContext{deps: Deps{
 		Executable: func() (string, error) { return filepath.Join(root, "canonical", "ao.exe"), nil },
 		LookPath:   func(string) (string, error) { return shadow, nil },
@@ -454,8 +454,8 @@ func TestDoctorWindowsMigratedBootstrapStaysWarning(t *testing.T) {
 
 func TestDoctorFailsLegacyWrapperDespiteLaterVersion(t *testing.T) {
 	root := t.TempDir()
-	shadow := writeWindowsAOShimFixture(t, filepath.Join(root, "fnm", "legacy-wrapper"), "0.10.1-nightly-249c")
-	writeWindowsAOPackageMetadata(t, shadow, `{"name":"@aoagents/ao","version":"0.10.1-nightly-249c","bin":{"ao":"dist/index.js"},"dependencies":{"@aoagents/ao-cli":"0.10.1-nightly-249c"}}`)
+	shadow := writeWindowsAOShimFixtureWithEntry(t, filepath.Join(root, "fnm", "legacy-wrapper"), "0.10.1-nightly-249c", "bin/ao.js")
+	writeWindowsAOPackageMetadata(t, shadow, `{"name":"@aoagents/ao","version":"0.10.1-nightly-249c","bin":{"ao":"bin/ao.js"},"dependencies":{"@aoagents/ao-cli":"0.10.1-nightly-249c"}}`)
 	c := &commandContext{deps: Deps{
 		Executable: func() (string, error) { return filepath.Join(root, "canonical", "ao.exe"), nil },
 		LookPath:   func(string) (string, error) { return shadow, nil },
@@ -574,10 +574,16 @@ func TestDoctorWindowsAOMalformedOrUntrustedShimStaysWarning(t *testing.T) {
 
 func writeWindowsAOShimFixture(t *testing.T, shimDir, version string) string {
 	t.Helper()
+	return writeWindowsAOShimFixtureWithEntry(t, shimDir, version, "dist/index.js")
+}
+
+func writeWindowsAOShimFixtureWithEntry(t *testing.T, shimDir, version, entryRelative string) string {
+	t.Helper()
 	// Match the observed fnm dogfood layout: the ephemeral shim directory owns
 	// node.exe while ao.cmd points at the absolute entry in the legacy checkout.
 	packageDir := filepath.Join(filepath.Dir(filepath.Dir(shimDir)), "agent-orchestrator", "packages", "cli")
-	entry := filepath.Join(packageDir, "dist", "index.js")
+	entryParts := strings.FieldsFunc(entryRelative, func(r rune) bool { return r == '/' || r == '\\' })
+	entry := filepath.Join(append([]string{packageDir}, entryParts...)...)
 	for _, dir := range []string{shimDir, filepath.Dir(entry), packageDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -589,7 +595,7 @@ func writeWindowsAOShimFixture(t *testing.T, shimDir, version string) string {
 	if err := os.WriteFile(entry, []byte("// fixture\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	pkg := fmt.Sprintf(`{"name":"@aoagents/ao-cli","version":%q,"bin":{"ao":"dist/index.js"}}`, version)
+	pkg := fmt.Sprintf(`{"name":"@aoagents/ao-cli","version":%q,"bin":{"ao":%q}}`, version, entryRelative)
 	if err := os.WriteFile(filepath.Join(packageDir, "package.json"), []byte(pkg), 0o644); err != nil {
 		t.Fatal(err)
 	}

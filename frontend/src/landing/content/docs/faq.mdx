@@ -71,14 +71,14 @@ import { Accordions, Accordion } from "fumadocs-ui/components/accordion";
 </Accordion>
 
 <Accordion title="Can I still install AO via npm?">
-	Yes, npm still works, but it is no longer recommended. `0.10.0` is the final version published to npm, and the
-	`@aoagents/ao` package is frozen and will not receive further updates. Prefer the [desktop
-	download](/docs/installation). Existing CLI users can run `ao start` to fetch and open the desktop build.
+	Yes, npm still works, but it is no longer recommended. `@aoagents/ao` is a bootstrap that launches the matching
+	platform Go binary; the historical `@aoagents/ao-cli` package is the legacy TypeScript runtime. Prefer the [desktop
+	download](/docs/installation) for new installs.
 </Accordion>
 
   <Accordion title="How do I completely uninstall?">
     Uninstall the Agent Orchestrator desktop app using your operating system's normal app-removal flow. If you installed
-    the frozen npm launcher, also run `npm uninstall -g @aoagents/ao`. Remove `~/.ao` if you want to wipe all state stored
+    the npm bootstrap, also run `npm uninstall -g @aoagents/ao`. Remove `~/.ao` if you want to wipe all state stored
     in the default location. If you set `AO_DATA_DIR`, remove that directory separately; if you set `AO_RUN_FILE`, remove
     both that file and the sibling `app-state.json` marker.
   </Accordion>
