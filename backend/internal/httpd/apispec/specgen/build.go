@@ -130,18 +130,19 @@ var schemaNames = map[string]string{
 	// httpd/envelope
 	"EnvelopeAPIError": "APIError",
 	// domain
-	"DomainProjectID":           "ProjectID",
-	"DomainSessionID":           "SessionID",
-	"DomainIssueID":             "IssueID",
-	"DomainSession":             "Session",
-	"DomainLifecycleDiagnostic": "LifecycleDiagnostic",
-	"DomainProjectConfig":       "ProjectConfig",
-	"DomainReviewPolicyConfig":  "ReviewPolicyConfig",
-	"DomainTrackerIntakeConfig": "TrackerIntakeConfig",
-	"DomainAgentConfig":         "AgentConfig",
-	"DomainRoleOverride":        "RoleOverride",
-	"DomainVerificationCommand": "VerificationCommand",
-	"DomainAgentHandoff":        "AgentHandoff",
+	"DomainProjectID":                 "ProjectID",
+	"DomainSessionID":                 "SessionID",
+	"DomainIssueID":                   "IssueID",
+	"DomainSession":                   "Session",
+	"DomainLifecycleDiagnostic":       "LifecycleDiagnostic",
+	"DomainProjectConfig":             "ProjectConfig",
+	"DomainReviewPolicyConfig":        "ReviewPolicyConfig",
+	"DomainTrackerIntakeConfig":       "TrackerIntakeConfig",
+	"DomainOrchestrationPolicyConfig": "OrchestrationPolicy",
+	"DomainAgentConfig":               "AgentConfig",
+	"DomainRoleOverride":              "RoleOverride",
+	"DomainVerificationCommand":       "VerificationCommand",
+	"DomainAgentHandoff":              "AgentHandoff",
 	// httpd/controllers (wire envelopes)
 	"ControllersListProjectsResponse":               "ListProjectsResponse",
 	"ControllersProjectResponse":                    "ProjectResponse",
@@ -240,6 +241,8 @@ var schemaNames = map[string]string{
 	"ProjectInitializeRepositoryResult": "InitializeRepositoryResult",
 	"ProjectRemoveResult":               "RemoveProjectResult",
 	"ProjectSetConfigInput":             "SetProjectConfigInput",
+	"ProjectSetOrchestrationInput":      "SetProjectOrchestrationInput",
+	"ProjectOrchestrationResult":        "ProjectOrchestration",
 	"ProjectWorkspaceRepo":              "WorkspaceRepo",
 	"SessionWorkspaceFileStatus":        "WorkspaceFileStatus",
 }
@@ -575,7 +578,7 @@ func eventOperations() []operation {
 	}
 }
 
-// projectOperations declares the 4 canonical /projects operations. The set must
+// projectOperations declares the canonical /projects operations. The set must
 // stay 1:1 with the routes ProjectsController.Register mounts —
 // TestRouteSpecParity fails the build otherwise.
 func projectOperations() []operation {
@@ -630,6 +633,40 @@ func projectOperations() []operation {
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
 			},
+		},
+		{
+			method: http.MethodGet, path: "/api/v1/projects/{id}/orchestration", id: "getProjectOrchestration", tag: "projects",
+			summary:    "Get a project's effective Mission or Charter policy",
+			pathParams: []any{controllers.ProjectIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, projectsvc.OrchestrationResult{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPut, path: "/api/v1/projects/{id}/orchestration", id: "setProjectOrchestration", tag: "projects",
+			summary:    "Replace only a project's live orchestration policy",
+			pathParams: []any{controllers.ProjectIDParam{}},
+			reqBody:    projectsvc.SetOrchestrationInput{},
+			resps: []respUnit{
+				{http.StatusOK, projectsvc.OrchestrationResult{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/projects/{id}/orchestration/pause", id: "pauseProjectOrchestration", tag: "projects",
+			summary:    "Pause charter check-ins without stopping project sessions",
+			pathParams: []any{controllers.ProjectIDParam{}},
+			resps:      []respUnit{{http.StatusOK, projectsvc.OrchestrationResult{}}, {http.StatusNotFound, envelope.APIError{}}, {http.StatusInternalServerError, envelope.APIError{}}},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/projects/{id}/orchestration/resume", id: "resumeProjectOrchestration", tag: "projects",
+			summary:    "Resume charter check-ins",
+			pathParams: []any{controllers.ProjectIDParam{}},
+			resps:      []respUnit{{http.StatusOK, projectsvc.OrchestrationResult{}}, {http.StatusNotFound, envelope.APIError{}}, {http.StatusInternalServerError, envelope.APIError{}}},
 		},
 		{
 			method: http.MethodDelete, path: "/api/v1/projects/{id}", id: "removeProject", tag: "projects",

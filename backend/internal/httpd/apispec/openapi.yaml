@@ -723,6 +723,149 @@ paths:
       summary: Replace a project's per-project config
       tags:
       - projects
+  /api/v1/projects/{id}/orchestration:
+    get:
+      operationId: getProjectOrchestration
+      parameters:
+      - description: Project identifier (registry key).
+        in: path
+        name: id
+        required: true
+        schema:
+          description: Project identifier (registry key).
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectOrchestration'
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Get a project's effective Mission or Charter policy
+      tags:
+      - projects
+    put:
+      operationId: setProjectOrchestration
+      parameters:
+      - description: Project identifier (registry key).
+        in: path
+        name: id
+        required: true
+        schema:
+          description: Project identifier (registry key).
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetProjectOrchestrationInput'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectOrchestration'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Replace only a project's live orchestration policy
+      tags:
+      - projects
+  /api/v1/projects/{id}/orchestration/pause:
+    post:
+      operationId: pauseProjectOrchestration
+      parameters:
+      - description: Project identifier (registry key).
+        in: path
+        name: id
+        required: true
+        schema:
+          description: Project identifier (registry key).
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectOrchestration'
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Pause charter check-ins without stopping project sessions
+      tags:
+      - projects
+  /api/v1/projects/{id}/orchestration/resume:
+    post:
+      operationId: resumeProjectOrchestration
+      parameters:
+      - description: Project identifier (registry key).
+        in: path
+        name: id
+        required: true
+        schema:
+          description: Project identifier (registry key).
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectOrchestration'
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+      summary: Resume charter check-ins
+      tags:
+      - projects
   /api/v1/projects/initialize:
     post:
       operationId: initializeProjectRepository
@@ -2750,6 +2893,20 @@ components:
       - kind
       - sessionId
       type: object
+    OrchestrationPolicy:
+      properties:
+        checkInIntervalMinutes:
+          maximum: 1440
+          minimum: 1
+          type: integer
+        mode:
+          enum:
+          - mission
+          - charter
+          type: string
+        paused:
+          type: boolean
+      type: object
     OrchestratorResponse:
       properties:
         id:
@@ -2848,6 +3005,8 @@ components:
           additionalProperties:
             type: string
           type: object
+        orchestration:
+          $ref: '#/components/schemas/OrchestrationPolicy'
         orchestrator:
           $ref: '#/components/schemas/RoleOverride'
         orchestratorRules:
@@ -2896,6 +3055,16 @@ components:
       oneOf:
       - $ref: '#/components/schemas/Project'
       - $ref: '#/components/schemas/DegradedProject'
+      type: object
+    ProjectOrchestration:
+      properties:
+        policy:
+          $ref: '#/components/schemas/OrchestrationPolicy'
+        projectId:
+          type: string
+      required:
+      - projectId
+      - policy
       type: object
     ProjectResponse:
       properties:
@@ -3466,6 +3635,13 @@ components:
           $ref: '#/components/schemas/ProjectConfig'
       required:
       - config
+      type: object
+    SetProjectOrchestrationInput:
+      properties:
+        policy:
+          $ref: '#/components/schemas/OrchestrationPolicy'
+      required:
+      - policy
       type: object
     SetSessionPreviewRequest:
       properties:

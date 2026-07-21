@@ -53,6 +53,7 @@ type commander interface {
 	RetireForReplacement(ctx context.Context, id domain.SessionID) error
 	Send(ctx context.Context, id domain.SessionID, message string) error
 	SendAutomated(ctx context.Context, id domain.SessionID, message string) error
+	SendAutomatedIfIdle(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) error
 	Cleanup(ctx context.Context, project domain.ProjectID) (sessionmanager.CleanupResult, error)
 	RollbackSpawn(ctx context.Context, id domain.SessionID) (deleted, killed bool, err error)
 }
@@ -468,6 +469,12 @@ func (s *Service) RollbackSpawn(ctx context.Context, id domain.SessionID) (Rollb
 // Send delegates agent messaging to the internal manager.
 func (s *Service) Send(ctx context.Context, id domain.SessionID, message string) error {
 	return toAPIError(s.manager.Send(ctx, id, message))
+}
+
+// SendAutomatedIfIdle preserves the exact idle episode through Session
+// Manager's final guarded pre-write read.
+func (s *Service) SendAutomatedIfIdle(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) error {
+	return toAPIError(s.manager.SendAutomatedIfIdle(ctx, id, message, idleSince))
 }
 
 // Rename updates the user-facing session display name.

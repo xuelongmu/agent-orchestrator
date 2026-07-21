@@ -42,6 +42,7 @@ type lifecycleStack struct {
 	reaperDone  <-chan struct{}
 	scmDone     <-chan struct{}
 	trackerDone <-chan struct{}
+	charterDone <-chan struct{}
 }
 
 // startLifecycle constructs the Lifecycle Manager over the store and starts the
@@ -63,6 +64,9 @@ func (l *lifecycleStack) Stop() {
 	}
 	if l.trackerDone != nil {
 		<-l.trackerDone
+	}
+	if l.charterDone != nil {
+		<-l.charterDone
 	}
 }
 

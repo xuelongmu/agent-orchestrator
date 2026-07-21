@@ -182,6 +182,18 @@ func (f *fakeProjectManager) SetConfig(_ context.Context, id domain.ProjectID, i
 	return projectsvc.Project{ID: id, Config: &cfg}, nil
 }
 
+func (f *fakeProjectManager) GetOrchestration(_ context.Context, id domain.ProjectID) (projectsvc.OrchestrationResult, error) {
+	return projectsvc.OrchestrationResult{ProjectID: id, Policy: domain.OrchestrationPolicyConfig{Mode: domain.OrchestrationModeMission, CheckInIntervalMinutes: 30}}, nil
+}
+
+func (f *fakeProjectManager) SetOrchestration(_ context.Context, id domain.ProjectID, in projectsvc.SetOrchestrationInput) (projectsvc.OrchestrationResult, error) {
+	return projectsvc.OrchestrationResult{ProjectID: id, Policy: in.Policy.WithDefaults()}, nil
+}
+
+func (f *fakeProjectManager) SetOrchestrationPaused(_ context.Context, id domain.ProjectID, paused bool) (projectsvc.OrchestrationResult, error) {
+	return projectsvc.OrchestrationResult{ProjectID: id, Policy: domain.OrchestrationPolicyConfig{Mode: domain.OrchestrationModeCharter, Paused: paused, CheckInIntervalMinutes: 30}}, nil
+}
+
 func (f *fakeProjectManager) Remove(context.Context, domain.ProjectID) (projectsvc.RemoveResult, error) {
 	return projectsvc.RemoveResult{}, nil
 }

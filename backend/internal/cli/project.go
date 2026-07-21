@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -99,24 +101,32 @@ type reviewPolicyConfig struct {
 	OutOfScopeDeflection bool `json:"outOfScopeDeflection,omitempty"`
 }
 
+// orchestrationPolicyConfig mirrors domain.OrchestrationPolicyConfig.
+type orchestrationPolicyConfig struct {
+	Mode                   string `json:"mode,omitempty"`
+	Paused                 bool   `json:"paused,omitempty"`
+	CheckInIntervalMinutes int    `json:"checkInIntervalMinutes,omitempty"`
+}
+
 // projectConfig mirrors the daemon's typed domain.ProjectConfig for the CLI
 // client. The CLI sets common fields via flags and the whole object via
 // --config-json.
 type projectConfig struct {
-	WorkspaceKind     string              `json:"workspaceKind,omitempty"`
-	DefaultBranch     string              `json:"defaultBranch,omitempty"`
-	SessionPrefix     string              `json:"sessionPrefix,omitempty"`
-	Env               map[string]string   `json:"env,omitempty"`
-	Symlinks          []string            `json:"symlinks,omitempty"`
-	PostCreate        []string            `json:"postCreate,omitempty"`
-	AgentRules        string              `json:"agentRules,omitempty"`
-	AgentRulesFile    string              `json:"agentRulesFile,omitempty"`
-	OrchestratorRules string              `json:"orchestratorRules,omitempty"`
-	AgentConfig       agentConfig         `json:"agentConfig,omitempty"`
-	Worker            roleOverride        `json:"worker,omitempty"`
-	Orchestrator      roleOverride        `json:"orchestrator,omitempty"`
-	ReviewPolicy      reviewPolicyConfig  `json:"reviewPolicy,omitempty"`
-	TrackerIntake     trackerIntakeConfig `json:"trackerIntake,omitempty"`
+	WorkspaceKind     string                    `json:"workspaceKind,omitempty"`
+	DefaultBranch     string                    `json:"defaultBranch,omitempty"`
+	SessionPrefix     string                    `json:"sessionPrefix,omitempty"`
+	Env               map[string]string         `json:"env,omitempty"`
+	Symlinks          []string                  `json:"symlinks,omitempty"`
+	PostCreate        []string                  `json:"postCreate,omitempty"`
+	AgentRules        string                    `json:"agentRules,omitempty"`
+	AgentRulesFile    string                    `json:"agentRulesFile,omitempty"`
+	OrchestratorRules string                    `json:"orchestratorRules,omitempty"`
+	AgentConfig       agentConfig               `json:"agentConfig,omitempty"`
+	Worker            roleOverride              `json:"worker,omitempty"`
+	Orchestrator      roleOverride              `json:"orchestrator,omitempty"`
+	ReviewPolicy      reviewPolicyConfig        `json:"reviewPolicy,omitempty"`
+	TrackerIntake     trackerIntakeConfig       `json:"trackerIntake,omitempty"`
+	Orchestration     orchestrationPolicyConfig `json:"orchestration,omitempty"`
 }
 
 // setConfigRequest mirrors the daemon's SetConfigInput body for
@@ -167,6 +177,15 @@ type projectRemoveResult struct {
 	RemovedStorageDir *bool  `json:"removedStorageDir,omitempty"`
 }
 
+type projectOrchestrationResult struct {
+	ProjectID string                    `json:"projectId"`
+	Policy    orchestrationPolicyConfig `json:"policy"`
+}
+
+type setProjectOrchestrationRequest struct {
+	Policy orchestrationPolicyConfig `json:"policy"`
+}
+
 func newProjectCommand(ctx *commandContext) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "project",
@@ -176,8 +195,143 @@ func newProjectCommand(ctx *commandContext) *cobra.Command {
 	cmd.AddCommand(newProjectGetCommand(ctx))
 	cmd.AddCommand(newProjectAddCommand(ctx))
 	cmd.AddCommand(newProjectSetConfigCommand(ctx))
+	cmd.AddCommand(newProjectOrchestrationCommand(ctx))
 	cmd.AddCommand(newProjectRemoveCommand(ctx))
 	return cmd
+}
+
+func newProjectOrchestrationCommand(ctx *commandContext) *cobra.Command {
+	cmd := &cobra.Command{Use: "orchestration", Short: "Manage a project's Mission or Charter policy"}
+	cmd.AddCommand(newProjectOrchestrationGetCommand(ctx))
+	cmd.AddCommand(newProjectOrchestrationSetCommand(ctx))
+	cmd.AddCommand(newProjectOrchestrationPauseCommand(ctx, true))
+	cmd.AddCommand(newProjectOrchestrationPauseCommand(ctx, false))
+	return cmd
+}
+
+func newProjectOrchestrationGetCommand(ctx *commandContext) *cobra.Command {
+	var current, jsonOutput bool
+	cmd := &cobra.Command{
+		Use:   "get [project-id]",
+		Short: "Show a project's effective orchestration policy",
+		Args:  maximumOneArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := resolveOrchestrationProject(cmd.Context(), ctx, args, current)
+			if err != nil {
+				return err
+			}
+			var res projectOrchestrationResult
+			if err := ctx.getJSON(cmd.Context(), "projects/"+url.PathEscape(id)+"/orchestration", &res); err != nil {
+				return err
+			}
+			return writeOrchestrationResult(cmd, res, jsonOutput)
+		},
+	}
+	cmd.Flags().BoolVar(&current, "current", false, "Use the current AO project context")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output policy as JSON")
+	return cmd
+}
+
+func newProjectOrchestrationSetCommand(ctx *commandContext) *cobra.Command {
+	var current, jsonOutput bool
+	var mode, interval string
+	cmd := &cobra.Command{
+		Use:   "set [project-id]",
+		Short: "Set a project to bounded Mission or standing Charter mode",
+		Args:  maximumOneArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := resolveOrchestrationProject(cmd.Context(), ctx, args, current)
+			if err != nil {
+				return err
+			}
+			mode = strings.ToLower(strings.TrimSpace(mode))
+			if mode != "mission" && mode != "charter" {
+				return usageError{errors.New("--mode must be mission or charter")}
+			}
+			minutes, err := parseCharterInterval(interval)
+			if err != nil {
+				return err
+			}
+			req := setProjectOrchestrationRequest{Policy: orchestrationPolicyConfig{Mode: mode, CheckInIntervalMinutes: minutes}}
+			var res projectOrchestrationResult
+			if err := ctx.putJSON(cmd.Context(), "projects/"+url.PathEscape(id)+"/orchestration", req, &res); err != nil {
+				return err
+			}
+			return writeOrchestrationResult(cmd, res, jsonOutput)
+		},
+	}
+	cmd.Flags().BoolVar(&current, "current", false, "Use the current AO project context")
+	cmd.Flags().StringVar(&mode, "mode", "", "Orchestration mode: mission or charter (required)")
+	cmd.Flags().StringVar(&interval, "interval", "30m", "Charter idle check-in interval (1m to 24h)")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output policy as JSON")
+	_ = cmd.MarkFlagRequired("mode")
+	return cmd
+}
+
+func newProjectOrchestrationPauseCommand(ctx *commandContext, paused bool) *cobra.Command {
+	var current, jsonOutput bool
+	verb := "resume"
+	short := "Resume charter check-ins for a project"
+	if paused {
+		verb, short = "pause", "Pause charter check-ins for a project"
+	}
+	cmd := &cobra.Command{
+		Use: verb + " [project-id]", Short: short, Args: maximumOneArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := resolveOrchestrationProject(cmd.Context(), ctx, args, current)
+			if err != nil {
+				return err
+			}
+			var res projectOrchestrationResult
+			if err := ctx.postJSON(cmd.Context(), "projects/"+url.PathEscape(id)+"/orchestration/"+verb, struct{}{}, &res); err != nil {
+				return err
+			}
+			return writeOrchestrationResult(cmd, res, jsonOutput)
+		},
+	}
+	cmd.Flags().BoolVar(&current, "current", false, "Use the current AO project context")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output policy as JSON")
+	return cmd
+}
+
+func maximumOneArg(cmd *cobra.Command, args []string) error {
+	if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
+		return usageError{err}
+	}
+	return nil
+}
+
+func resolveOrchestrationProject(ctx context.Context, command *commandContext, args []string, current bool) (string, error) {
+	if current && len(args) > 0 {
+		return "", usageError{errors.New("project id and --current are mutually exclusive")}
+	}
+	if !current {
+		if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+			return "", usageError{errors.New("provide a project id or --current")}
+		}
+		return strings.TrimSpace(args[0]), nil
+	}
+	project, err := command.resolveSpawnProject(ctx, "")
+	if err != nil {
+		return "", err
+	}
+	return project.ID, nil
+}
+
+func parseCharterInterval(raw string) (int, error) {
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil || d%time.Minute != 0 || d < time.Minute || d > 24*time.Hour {
+		return 0, usageError{errors.New("--interval must be a whole-minute duration from 1m to 24h")}
+	}
+	return int(d / time.Minute), nil
+}
+
+func writeOrchestrationResult(cmd *cobra.Command, res projectOrchestrationResult, jsonOutput bool) error {
+	if jsonOutput {
+		return writeJSON(cmd.OutOrStdout(), res)
+	}
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "%s: %s (paused=%t, interval=%dm)\n", res.ProjectID, res.Policy.Mode, res.Policy.Paused, res.Policy.CheckInIntervalMinutes)
+	return err
 }
 
 func newProjectListCommand(ctx *commandContext) *cobra.Command {
