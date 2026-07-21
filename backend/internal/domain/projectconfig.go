@@ -72,12 +72,17 @@ type ProjectConfig struct {
 type OrchestrationMode string
 
 const (
+	// OrchestrationModeMission keeps coordination bounded with no scheduled wake.
 	OrchestrationModeMission OrchestrationMode = "mission"
+	// OrchestrationModeCharter enables periodic idle-only reconciliation.
 	OrchestrationModeCharter OrchestrationMode = "charter"
 
+	// DefaultCharterCheckInMinutes is the effective interval when none is stored.
 	DefaultCharterCheckInMinutes = 30
-	MinCharterCheckInMinutes     = 1
-	MaxCharterCheckInMinutes     = 24 * 60
+	// MinCharterCheckInMinutes bounds user-configured charter intervals.
+	MinCharterCheckInMinutes = 1
+	// MaxCharterCheckInMinutes bounds charter intervals at one day.
+	MaxCharterCheckInMinutes = 24 * 60
 )
 
 // OrchestrationPolicyConfig is user-owned, per-project policy. Paused only
