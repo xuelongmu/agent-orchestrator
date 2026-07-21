@@ -38,7 +38,7 @@ func TestObserverMissionCharterTransitionsAndActivityGate(t *testing.T) {
 	store := &fakeStore{
 		projects: []domain.ProjectRecord{{ID: "demo"}},
 		sessions: map[domain.ProjectID][]domain.SessionRecord{
-			"demo": {{ID: "orch", ProjectID: "demo", Kind: domain.KindOrchestrator, Activity: domain.Activity{State: domain.ActivityIdle}}},
+			"demo": {{ID: "orch", ProjectID: "demo", Kind: domain.KindOrchestrator, FirstSignalAt: now, Activity: domain.Activity{State: domain.ActivityIdle}}},
 		},
 	}
 	messenger := &fakeMessenger{}
@@ -108,8 +108,8 @@ func TestObserverSkipsAmbiguousOrchestratorsAndThrottlesFailures(t *testing.T) {
 	}
 	now = now.Add(time.Minute)
 	store.sessions["demo"] = []domain.SessionRecord{
-		{ID: "one", Kind: domain.KindOrchestrator, Activity: domain.Activity{State: domain.ActivityIdle}},
-		{ID: "two", Kind: domain.KindOrchestrator, Activity: domain.Activity{State: domain.ActivityIdle}},
+		{ID: "one", Kind: domain.KindOrchestrator, FirstSignalAt: now, Activity: domain.Activity{State: domain.ActivityIdle}},
+		{ID: "two", Kind: domain.KindOrchestrator, FirstSignalAt: now, Activity: domain.Activity{State: domain.ActivityIdle}},
 	}
 	if err := observer.Poll(ctx); err != nil {
 		t.Fatal(err)
@@ -131,5 +131,38 @@ func TestObserverSkipsAmbiguousOrchestratorsAndThrottlesFailures(t *testing.T) {
 	}
 	if len(messenger.ids) != 1 {
 		t.Fatalf("failure retried too soon: %d", len(messenger.ids))
+	}
+}
+
+func TestObserverRequiresRealActivitySignalBeforeCharterDelivery(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	policy := domain.OrchestrationPolicyConfig{Mode: domain.OrchestrationModeCharter, CheckInIntervalMinutes: 1}
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{{ID: "demo", Config: domain.ProjectConfig{Orchestration: policy}}},
+		sessions: map[domain.ProjectID][]domain.SessionRecord{
+			"demo": {{ID: "orch", Kind: domain.KindOrchestrator, Activity: domain.Activity{State: domain.ActivityIdle}}},
+		},
+	}
+	messenger := &fakeMessenger{}
+	observer := New(store, messenger, Config{Clock: func() time.Time { return now }, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	ctx := context.Background()
+
+	if err := observer.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	if err := observer.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(messenger.ids) != 0 {
+		t.Fatalf("no-signal deliveries = %v", messenger.ids)
+	}
+
+	store.sessions["demo"][0].FirstSignalAt = now
+	if err := observer.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(messenger.ids) != 1 || messenger.ids[0] != "orch" {
+		t.Fatalf("signaled idle deliveries = %v", messenger.ids)
 	}
 }

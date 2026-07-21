@@ -123,7 +123,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 			continue
 		}
 		orchestrator := orchestrators[0]
-		if orchestrator.Activity.State != domain.ActivityIdle {
+		if orchestrator.FirstSignalAt.IsZero() || orchestrator.Activity.State != domain.ActivityIdle {
 			continue
 		}
 		// Claim the interval before the guarded send. Success, refusal, and
