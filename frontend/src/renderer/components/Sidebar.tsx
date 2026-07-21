@@ -93,6 +93,7 @@ const SIDEBAR_COLLAPSE_THRESHOLD = SIDEBAR_MIN_WIDTH;
 type SidebarProps = {
 	daemonStatus: { state: string; message?: string };
 	underTopbar?: boolean;
+	isLoadingProjects: boolean;
 	workspaceError?: string;
 	workspaces: WorkspaceSummary[];
 	onCreateProject: (input: CreateProjectInput) => Promise<void>;
@@ -134,6 +135,7 @@ function SessionDot({ session }: { session: WorkspaceSession }) {
 export function Sidebar({
 	daemonStatus,
 	underTopbar = true,
+	isLoadingProjects,
 	workspaceError,
 	workspaces,
 	onCreateProject,
@@ -293,6 +295,14 @@ export function Sidebar({
 							<div className="sidebar-expanded-chrome px-2 py-3 group-data-[collapsible=icon]:hidden">
 								<p className="text-xs text-foreground">Could not load projects.</p>
 								<p className="mt-1 text-caption text-passive">{workspaceError}</p>
+							</div>
+						) : isLoadingProjects ? (
+							<div
+								aria-live="polite"
+								className="sidebar-expanded-chrome px-2 py-3 group-data-[collapsible=icon]:hidden"
+							>
+								<p className="text-xs text-foreground">Loading projects…</p>
+								<p className="mt-1 text-caption text-passive">Restoring your existing projects and sessions.</p>
 							</div>
 						) : workspaces.length === 0 ? (
 							<div className="sidebar-expanded-chrome px-2 py-3 group-data-[collapsible=icon]:hidden">
