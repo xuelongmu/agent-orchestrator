@@ -1,5 +1,5 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
-import { Suspense, type ComponentType, type PropsWithChildren } from "react";
+import { StrictMode, Suspense, type ComponentType, type PropsWithChildren, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useUiStore } from "../stores/ui-store";
 import type { WorkspaceSummary } from "../types/workspace";
@@ -116,17 +116,24 @@ const workspaces = [
 	},
 ] as unknown as WorkspaceSummary[];
 
-async function renderShell() {
+function shellUi(): ReactNode {
 	const ShellRoute = Route.options.component as ComponentType;
+	return (
+		<Suspense fallback={null}>
+			<ShellRoute />
+		</Suspense>
+	);
+}
+
+async function renderShell({ strictMode = false }: { strictMode?: boolean } = {}) {
+	const ui = shellUi();
+	let result: ReturnType<typeof render>;
 	await act(async () => {
-		render(
-			<Suspense fallback={null}>
-				<ShellRoute />
-			</Suspense>,
-		);
+		result = render(strictMode ? <StrictMode>{ui}</StrictMode> : ui);
 	});
-	await waitFor(() => expect(shellMocks.onNewSessionShortcut).toHaveBeenCalledTimes(1));
-	await waitFor(() => expect(shellMocks.onKeyboardShortcutsHelp).toHaveBeenCalledTimes(1));
+	await waitFor(() => expect(shellMocks.onNewSessionShortcut).toHaveBeenCalled());
+	await waitFor(() => expect(shellMocks.onKeyboardShortcutsHelp).toHaveBeenCalled());
+	return result!;
 }
 
 function emitShortcut() {
@@ -139,6 +146,9 @@ beforeEach(() => {
 	shellMocks.navigate.mockReset();
 	shellMocks.onNewSessionShortcut.mockClear();
 	shellMocks.onKeyboardShortcutsHelp.mockClear();
+	shellMocks.queryClient.fetchQuery.mockReset();
+	shellMocks.queryClient.invalidateQueries.mockReset().mockResolvedValue(undefined);
+	shellMocks.queryClient.setQueryData.mockReset();
 	shellMocks.state.newSessionListener = undefined;
 	shellMocks.state.keyboardShortcutsListener = undefined;
 	shellMocks.state.daemonStatus = { state: "stopped" };
@@ -155,6 +165,36 @@ describe("shell project loading state", () => {
 		expect(screen.getByRole("progressbar", { name: "Loading projects" })).toBeVisible();
 		expect(screen.getByText("Loading your projects…")).toBeVisible();
 		expect(screen.queryByTestId("shell-outlet")).not.toBeInTheDocument();
+	});
+
+	it("restores loading when the daemon moves from stopped to starting", async () => {
+		const view = await renderShell();
+		await waitFor(() => expect(screen.getByTestId("shell-outlet")).toBeVisible());
+
+		shellMocks.state.daemonStatus = { state: "starting" };
+		view.rerender(shellUi());
+
+		expect(await screen.findByRole("progressbar", { name: "Loading projects" })).toBeVisible();
+		expect(screen.queryByTestId("shell-outlet")).not.toBeInTheDocument();
+	});
+
+	it("finishes the ready workspace load across a StrictMode effect replay", async () => {
+		let resolveWorkspaceLoad: () => void = () => undefined;
+		const workspaceLoad = new Promise<void>((resolve) => {
+			resolveWorkspaceLoad = resolve;
+		});
+		shellMocks.state.daemonStatus = { state: "ready", port: 3037 };
+		shellMocks.queryClient.invalidateQueries.mockImplementation(({ queryKey }: { queryKey: readonly string[] }) =>
+			queryKey[0] === "workspaces" ? workspaceLoad : Promise.resolve(),
+		);
+
+		await renderShell({ strictMode: true });
+		expect(screen.getByRole("progressbar", { name: "Loading projects" })).toBeVisible();
+
+		await act(async () => resolveWorkspaceLoad());
+
+		await waitFor(() => expect(screen.getByTestId("shell-outlet")).toBeVisible());
+		expect(screen.queryByRole("progressbar", { name: "Loading projects" })).not.toBeInTheDocument();
 	});
 });
 

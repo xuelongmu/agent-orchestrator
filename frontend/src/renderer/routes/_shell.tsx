@@ -261,7 +261,7 @@ function ShellLayout() {
 	useEffect(() => {
 		if (daemonStatus.state !== "ready" || !daemonStatus.port) {
 			workspaceLoadPortRef.current = undefined;
-			if (daemonStatus.state !== "starting") setIsLoadingProjects(false);
+			setIsLoadingProjects(daemonStatus.state === "starting");
 			return;
 		}
 		if (agentCatalogPortRef.current === daemonStatus.port && workspaceLoadPortRef.current === daemonStatus.port) {
@@ -274,15 +274,15 @@ function ShellLayout() {
 
 		workspaceLoadPortRef.current = daemonStatus.port;
 		setIsLoadingProjects(true);
-		let active = true;
+		const loadPort = daemonStatus.port;
 		void Promise.resolve(queryClient.invalidateQueries({ queryKey: workspaceQueryKey }))
 			.catch(() => undefined)
 			.finally(() => {
-				if (active && workspaceLoadPortRef.current === daemonStatus.port) setIsLoadingProjects(false);
+				// Let this request finish across React StrictMode's effect replay.
+				// A real daemon transition clears the port ref, so stale requests
+				// still cannot dismiss a newer loading phase.
+				if (workspaceLoadPortRef.current === loadPort) setIsLoadingProjects(false);
 			});
-		return () => {
-			active = false;
-		};
 	}, [daemonStatus.port, daemonStatus.state, queryClient]);
 
 	// Follow OS appearance only until the user picks a theme explicitly.
@@ -346,11 +346,7 @@ function ShellLayout() {
 				<WindowTitlebar />
 				<ShellTopbar />
 				{isLoadingProjects ? (
-					<div
-						aria-label="Loading projects"
-						className="relative z-20 h-0 shrink-0"
-						role="progressbar"
-					>
+					<div aria-label="Loading projects" className="relative z-20 h-0 shrink-0" role="progressbar">
 						<div className="absolute inset-x-0 top-0 h-0.5 overflow-hidden bg-accent-weak">
 							<div className="h-full w-2/5 animate-project-loading bg-accent motion-reduce:w-full motion-reduce:animate-pulse" />
 						</div>
