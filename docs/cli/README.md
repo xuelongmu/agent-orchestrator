@@ -36,32 +36,32 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 
 ### Product commands
 
-| Command                             | Daemon route                                   |
-| ----------------------------------- | ---------------------------------------------- |
-| `ao project add`                    | `POST /api/v1/projects`                        |
-| `ao project ls`                     | `GET /api/v1/projects`                         |
-| `ao project get <id>`               | `GET /api/v1/projects/{id}`                    |
-| `ao project set-config <id>`        | `PUT /api/v1/projects/{id}/config`             |
-| `ao project orchestration get [id]` | `GET /api/v1/projects/{id}/orchestration`      |
-| `ao project orchestration set [id]` | `PUT /api/v1/projects/{id}/orchestration`      |
-| `ao project orchestration pause [id]` | `POST /api/v1/projects/{id}/orchestration/pause` |
+| Command                                | Daemon route                                      |
+| -------------------------------------- | ------------------------------------------------- |
+| `ao project add`                       | `POST /api/v1/projects`                           |
+| `ao project ls`                        | `GET /api/v1/projects`                            |
+| `ao project get <id>`                  | `GET /api/v1/projects/{id}`                       |
+| `ao project set-config <id>`           | `PUT /api/v1/projects/{id}/config`                |
+| `ao project orchestration get [id]`    | `GET /api/v1/projects/{id}/orchestration`         |
+| `ao project orchestration set [id]`    | `PUT /api/v1/projects/{id}/orchestration`         |
+| `ao project orchestration pause [id]`  | `POST /api/v1/projects/{id}/orchestration/pause`  |
 | `ao project orchestration resume [id]` | `POST /api/v1/projects/{id}/orchestration/resume` |
-| `ao project rm <id>`                | `DELETE /api/v1/projects/{id}`                 |
-| `ao agent ls`                       | `GET /api/v1/agents`                           |
-| `ao agent ls --refresh`             | `POST /api/v1/agents/refresh`                  |
-| `ao spawn`                          | `POST /api/v1/sessions`                        |
-| `ao session ls`                     | `GET /api/v1/sessions`                         |
-| `ao session get <id>`               | `GET /api/v1/sessions/{id}`                    |
-| `ao session kill <id>`              | `POST /api/v1/sessions/{id}/kill`              |
-| `ao session restore <id>`           | `POST /api/v1/sessions/{id}/restore`           |
-| `ao session rename <id> <name>`     | `PATCH /api/v1/sessions/{id}`                  |
-| `ao session cleanup`                | `POST /api/v1/sessions/cleanup`                |
-| `ao session claim-pr <id> <pr-ref>` | `POST /api/v1/sessions/{id}/pr/claim`          |
-| `ao orchestrator ls`                | `GET /api/v1/orchestrators`                    |
-| `ao send`                           | `POST /api/v1/sessions/{id}/send`              |
-| `ao preview [url]`                  | `POST /api/v1/sessions/{id}/preview`           |
-| `ao verify <profile>`               | `POST /api/v1/sessions/{id}/verify`            |
-| `ao hooks <agent> <event>`          | `POST /api/v1/sessions/{id}/activity` (hidden) |
+| `ao project rm <id>`                   | `DELETE /api/v1/projects/{id}`                    |
+| `ao agent ls`                          | `GET /api/v1/agents`                              |
+| `ao agent ls --refresh`                | `POST /api/v1/agents/refresh`                     |
+| `ao spawn`                             | `POST /api/v1/sessions`                           |
+| `ao session ls`                        | `GET /api/v1/sessions`                            |
+| `ao session get <id>`                  | `GET /api/v1/sessions/{id}`                       |
+| `ao session kill <id>`                 | `POST /api/v1/sessions/{id}/kill`                 |
+| `ao session restore <id>`              | `POST /api/v1/sessions/{id}/restore`              |
+| `ao session rename <id> <name>`        | `PATCH /api/v1/sessions/{id}`                     |
+| `ao session cleanup`                   | `POST /api/v1/sessions/cleanup`                   |
+| `ao session claim-pr <id> <pr-ref>`    | `POST /api/v1/sessions/{id}/pr/claim`             |
+| `ao orchestrator ls`                   | `GET /api/v1/orchestrators`                       |
+| `ao send`                              | `POST /api/v1/sessions/{id}/send`                 |
+| `ao preview [url]`                     | `POST /api/v1/sessions/{id}/preview`              |
+| `ao verify <profile>`                  | `POST /api/v1/sessions/{id}/verify`               |
+| `ao hooks <agent> <event>`             | `POST /api/v1/sessions/{id}/activity` (hidden)    |
 
 `ao agent ls` prints the daemon-supported agent catalog with local install/auth
 readiness. Use `--refresh` to rerun the bounded local probes and `--json` to
