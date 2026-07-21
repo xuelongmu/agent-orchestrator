@@ -42,6 +42,10 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 | `ao project ls`                     | `GET /api/v1/projects`                         |
 | `ao project get <id>`               | `GET /api/v1/projects/{id}`                    |
 | `ao project set-config <id>`        | `PUT /api/v1/projects/{id}/config`             |
+| `ao project orchestration get [id]` | `GET /api/v1/projects/{id}/orchestration`      |
+| `ao project orchestration set [id]` | `PUT /api/v1/projects/{id}/orchestration`      |
+| `ao project orchestration pause [id]` | `POST /api/v1/projects/{id}/orchestration/pause` |
+| `ao project orchestration resume [id]` | `POST /api/v1/projects/{id}/orchestration/resume` |
 | `ao project rm <id>`                | `DELETE /api/v1/projects/{id}`                 |
 | `ao agent ls`                       | `GET /api/v1/agents`                           |
 | `ao agent ls --refresh`             | `POST /api/v1/agents/refresh`                  |
@@ -75,6 +79,13 @@ catalog and fails early when the selected agent is unsupported, not installed,
 or unauthorized. It warns-but-continues when auth remains unknown because daemon
 spawn remains the authoritative runtime validation point. Use
 `--skip-agent-check` to bypass only this CLI-side preflight.
+
+`ao project orchestration` selects a project by explicit positional id or by
+`--current` (using the same AO project/session context as spawn). Mission is the
+default bounded mode and never schedules check-ins. Charter mode periodically
+checks in only when exactly one live orchestrator is idle. Mode, whole-minute
+interval (`1m` to `24h`), pause, and resume changes are persisted per project
+and consumed live; they do not replace unrelated project config.
 
 `ao spawn --workspace worktree|scratch|dir` selects the session filesystem
 shape. `worktree` remains the default and is the only kind that accepts

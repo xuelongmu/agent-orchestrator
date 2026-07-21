@@ -36,6 +36,7 @@ var (
 	ErrNotRestorable    = errors.New("session: not restorable (not terminal)")
 	ErrTerminated       = errors.New("session: terminated")
 	ErrIncompleteHandle = errors.New("session: incomplete teardown handle")
+	ErrNotIdle          = errors.New("session: idle episode changed")
 	// ErrProjectNotResolvable means the spawn's project has no usable repo
 	// (unregistered, archived, or missing a path). The API maps it to a 400.
 	ErrProjectNotResolvable = errors.New("session: project repo not resolvable")
@@ -2857,17 +2858,23 @@ func (m *Manager) applyWorkspaceProjectPreserved(ctx context.Context, rows []por
 // the session is active or the budget is exhausted. Confirmation never fails
 // the send: it only decides whether to nudge again.
 func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string) error {
-	return m.send(ctx, id, message, false)
+	return m.send(ctx, id, message, false, nil)
 }
 
 // SendAutomated delivers AO-originated work while allowing waiting_input, but
 // never recovers across a blocked/rate-limited state or an unsubmitted draft.
 // Unlike Send, it cannot be interpreted as an explicit user retry.
 func (m *Manager) SendAutomated(ctx context.Context, id domain.SessionID, message string) error {
-	return m.send(ctx, id, message, true)
+	return m.send(ctx, id, message, true, nil)
 }
 
-func (m *Manager) send(ctx context.Context, id domain.SessionID, message string, automated bool) error {
+// SendAutomatedIfIdle delivers only when the guard's final pre-write read is
+// still the exact idle episode that authorized the caller's decision.
+func (m *Manager) SendAutomatedIfIdle(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) error {
+	return m.send(ctx, id, message, true, &idleSince)
+}
+
+func (m *Manager) send(ctx context.Context, id domain.SessionID, message string, automated bool, idleSince *time.Time) error {
 	message, err := m.prepareOutboundMessage(ctx, id, message)
 	if err != nil {
 		return err
@@ -2897,7 +2904,9 @@ func (m *Manager) send(ctx context.Context, id domain.SessionID, message string,
 		}
 	}
 	var outcome sessionguard.Outcome
-	if automated {
+	if idleSince != nil {
+		outcome, err = m.messenger.NudgeIdleEpisode(ctx, id, message, *idleSince)
+	} else if automated {
 		outcome, err = m.messenger.DeliverAutomated(ctx, id, message)
 	} else {
 		outcome, err = m.messenger.Deliver(ctx, id, message)
@@ -2914,6 +2923,8 @@ func (m *Manager) send(ctx context.Context, id domain.SessionID, message string,
 		return fmt.Errorf("send %s: %w", id, ErrAwaitingDecision)
 	case sessionguard.SuppressedRateLimited:
 		return fmt.Errorf("send %s: automated delivery suppressed while rate limited", id)
+	case sessionguard.SuppressedStaleEpisode:
+		return fmt.Errorf("send %s: %w", id, ErrNotIdle)
 	}
 	// confirmActive only helps — and is only SAFE — when the harness reports
 	// both a prompt-submit signal (so the loop can observe active) and a

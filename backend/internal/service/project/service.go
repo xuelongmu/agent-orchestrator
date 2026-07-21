@@ -38,6 +38,10 @@ type Manager interface {
 	// read-model.
 	SetConfig(ctx context.Context, id domain.ProjectID, in SetConfigInput) (Project, error)
 
+	GetOrchestration(ctx context.Context, id domain.ProjectID) (OrchestrationResult, error)
+	SetOrchestration(ctx context.Context, id domain.ProjectID, in SetOrchestrationInput) (OrchestrationResult, error)
+	SetOrchestrationPaused(ctx context.Context, id domain.ProjectID, paused bool) (OrchestrationResult, error)
+
 	// Remove unregisters a project, stopping its sessions and reclaiming
 	// managed workspaces.
 	Remove(ctx context.Context, id domain.ProjectID) (RemoveResult, error)
@@ -531,6 +535,62 @@ func (m *Service) SetConfig(ctx context.Context, id domain.ProjectID, in SetConf
 		return Project{}, apierr.Internal("PROJECT_CONFIG_UPDATE_FAILED", "Failed to update project config")
 	}
 	return m.projectFromRow(row), nil
+}
+
+// GetOrchestration returns the effective live policy for one active project.
+func (m *Service) GetOrchestration(ctx context.Context, id domain.ProjectID) (OrchestrationResult, error) {
+	row, err := m.activeProject(ctx, id)
+	if err != nil {
+		return OrchestrationResult{}, err
+	}
+	return OrchestrationResult{ProjectID: id, Policy: row.Config.Orchestration.WithDefaults()}, nil
+}
+
+// SetOrchestration updates only the orchestration subresource. It deliberately
+// avoids SetConfig's whole-object replacement semantics.
+func (m *Service) SetOrchestration(ctx context.Context, id domain.ProjectID, in SetOrchestrationInput) (OrchestrationResult, error) {
+	if err := in.Policy.Validate(); err != nil {
+		return OrchestrationResult{}, apierr.Invalid("INVALID_ORCHESTRATION_POLICY", err.Error(), nil)
+	}
+	row, err := m.activeProject(ctx, id)
+	if err != nil {
+		return OrchestrationResult{}, err
+	}
+	row.Config.Orchestration = in.Policy
+	if err := m.store.UpsertProject(ctx, row); err != nil {
+		return OrchestrationResult{}, apierr.Internal("ORCHESTRATION_POLICY_UPDATE_FAILED", "Failed to update project orchestration policy")
+	}
+	return OrchestrationResult{ProjectID: id, Policy: in.Policy.WithDefaults()}, nil
+}
+
+// SetOrchestrationPaused toggles charter delivery without changing mode,
+// interval, workers, or ordinary lifecycle reactions.
+func (m *Service) SetOrchestrationPaused(ctx context.Context, id domain.ProjectID, paused bool) (OrchestrationResult, error) {
+	row, err := m.activeProject(ctx, id)
+	if err != nil {
+		return OrchestrationResult{}, err
+	}
+	policy := row.Config.Orchestration.WithDefaults()
+	policy.Paused = paused
+	row.Config.Orchestration = policy
+	if err := m.store.UpsertProject(ctx, row); err != nil {
+		return OrchestrationResult{}, apierr.Internal("ORCHESTRATION_POLICY_UPDATE_FAILED", "Failed to update project orchestration policy")
+	}
+	return OrchestrationResult{ProjectID: id, Policy: policy}, nil
+}
+
+func (m *Service) activeProject(ctx context.Context, id domain.ProjectID) (domain.ProjectRecord, error) {
+	if err := validateProjectID(id); err != nil {
+		return domain.ProjectRecord{}, err
+	}
+	row, ok, err := m.store.GetProject(ctx, string(id))
+	if err != nil {
+		return domain.ProjectRecord{}, apierr.Internal("PROJECT_LOAD_FAILED", "Failed to load project")
+	}
+	if !ok || !row.ArchivedAt.IsZero() {
+		return domain.ProjectRecord{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
+	}
+	return row, nil
 }
 
 // resolveGitOriginURL returns the project's `origin` remote URL via

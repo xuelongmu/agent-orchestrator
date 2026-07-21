@@ -45,6 +45,11 @@ func TestProjectConfigValidate(t *testing.T) {
 		{"tracker intake repo with whitespace", ProjectConfig{TrackerIntake: TrackerIntakeConfig{Enabled: true, Repo: " acme/demo", Assignee: "alice"}}, true},
 		{"tracker intake assignee with whitespace", ProjectConfig{TrackerIntake: TrackerIntakeConfig{Enabled: true, Assignee: " alice"}}, true},
 		{"tracker intake negative concurrency", ProjectConfig{TrackerIntake: TrackerIntakeConfig{Enabled: true, Assignee: "alice", MaxConcurrent: -1}}, true},
+		{"mission orchestration", ProjectConfig{Orchestration: OrchestrationPolicyConfig{Mode: OrchestrationModeMission}}, false},
+		{"charter orchestration", ProjectConfig{Orchestration: OrchestrationPolicyConfig{Mode: OrchestrationModeCharter, CheckInIntervalMinutes: 15}}, false},
+		{"unknown orchestration mode", ProjectConfig{Orchestration: OrchestrationPolicyConfig{Mode: "forever"}}, true},
+		{"charter interval below minimum", ProjectConfig{Orchestration: OrchestrationPolicyConfig{Mode: OrchestrationModeCharter, CheckInIntervalMinutes: -1}}, true},
+		{"charter interval above maximum", ProjectConfig{Orchestration: OrchestrationPolicyConfig{Mode: OrchestrationModeCharter, CheckInIntervalMinutes: MaxCharterCheckInMinutes + 1}}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -83,6 +88,9 @@ func TestProjectConfigWithDefaults(t *testing.T) {
 	}
 	if got.WorkspaceKind != WorkspaceKindWorktree {
 		t.Fatalf("WithDefaults = %#v, want workspaceKind=worktree", got)
+	}
+	if got.Orchestration.Mode != OrchestrationModeMission || got.Orchestration.CheckInIntervalMinutes != DefaultCharterCheckInMinutes {
+		t.Fatalf("WithDefaults orchestration = %#v", got.Orchestration)
 	}
 
 	// Set fields are preserved, not overwritten.

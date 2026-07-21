@@ -157,6 +157,7 @@ func Run() error {
 	// the automatic review coordinator during its immediate first poll.
 	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, reviewSvc, telemetrySink, notificationWriter, log)
 	lcStack.trackerDone = startTrackerIntake(ctx, store, sessionSvc, log)
+	lcStack.charterDone = startCharterObserver(ctx, store, sessionSvc, log)
 	agentSvc := agentsvc.New()
 	go func() {
 		if _, err := agentSvc.Refresh(ctx); err != nil {
