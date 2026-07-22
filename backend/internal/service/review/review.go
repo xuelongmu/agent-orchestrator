@@ -444,10 +444,11 @@ func (s *Service) deliverableRuns(ctx context.Context, workerID domain.SessionID
 		if err != nil {
 			return nil, nil, err
 		}
-		if len(findings) > 0 && !hasActionableFinding(findings) {
+		hasActionableFindings := hasActionableFinding(findings)
+		if len(findings) > 0 && !hasActionableFindings {
 			continue
 		}
-		if p2OnlyRoundLimit > 0 {
+		if p2OnlyRoundLimit > 0 && !hasActionableFindings {
 			reached, err := s.p2OnlyReviewStreakReached(ctx, run, p2OnlyRoundLimit)
 			if err != nil {
 				return nil, nil, err
@@ -503,7 +504,7 @@ func (s *Service) p2OnlyReviewStreakReached(ctx context.Context, current domain.
 		}
 		if currentHead != "" && head != currentHead {
 			if !headP2Only {
-				break
+				return false, nil
 			}
 			streak++
 			if streak >= limit {
@@ -513,11 +514,11 @@ func (s *Service) p2OnlyReviewStreakReached(ctx context.Context, current domain.
 		}
 		currentHead = head
 		if run.Status != domain.ReviewRunComplete && run.Status != domain.ReviewRunDelivered {
-			break
+			return false, nil
 		}
 		if run.Verdict == domain.VerdictChangesRequested {
 			if !p2OnlyChangesRequested(run) {
-				break
+				return false, nil
 			}
 			headP2Only = true
 		}

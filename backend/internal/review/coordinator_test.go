@@ -412,6 +412,7 @@ func TestBodyHasBlockingFindingsRequiresEveryFindingLineTagged(t *testing.T) {
 		{name: "p3 under heading", body: "## Suggestions\n[P3] minor cleanup", want: false},
 		{name: "indented continuation", body: "[P2] clearer name\n  This preserves the same behavior.", want: false},
 		{name: "mixed untagged", body: "[P2] clearer name\nThis can lose updates", want: true},
+		{name: "p1 heading", body: "[P2] clearer name\n## [P1] lost update", want: true},
 		{name: "p1", body: "[P1] lost update", want: true},
 		{name: "untagged", body: "This can lose updates", want: true},
 	}

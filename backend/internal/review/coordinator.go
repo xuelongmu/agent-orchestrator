@@ -232,12 +232,15 @@ func BodyHasOnlyP2P3Findings(body string) bool {
 	sawLowPriority := false
 	for _, rawLine := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
 		line := strings.TrimSpace(rawLine)
-		if line == "" || strings.HasPrefix(line, "#") || line == "---" || line == "***" {
+		if line == "" {
 			continue
 		}
 		lower := strings.ToLower(line)
 		if reviewpolicy.HasP0OrP1(lower) {
 			return false
+		}
+		if strings.HasPrefix(line, "#") || line == "---" || line == "***" {
+			continue
 		}
 		if strings.Contains(lower, "[p2]") || strings.Contains(lower, "[p3]") {
 			sawLowPriority = true
