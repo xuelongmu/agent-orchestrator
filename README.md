@@ -49,6 +49,42 @@ At a high level, Agent Orchestrator follows a simple loop:
 
 The result is a local control layer for agentic coding: agents still do the coding, while Agent Orchestrator keeps their workspaces, status, terminals, and feedback loops organized.
 
+## Mission and Charter orchestration
+
+Each project can choose how long its orchestrator should keep supervising work:
+
+- **Mission** is the default, bounded mode: "complete this issue or defined set of work." The orchestrator works through that assignment and AO never schedules follow-up check-ins.
+- **Charter** is the continuous mode: "keep working through this project's actionable backlog under its standing rules." It lets one existing orchestrator return to the issue queue after current work settles instead of ending supervision after a single assignment.
+
+Charter is an idle reconciliation loop, not a daemon that blindly claims every open issue. At each configured interval:
+
+1. AO waits until the project has exactly one live orchestrator and that orchestrator has genuinely reported idle.
+2. AO sends that orchestrator a check-in; it does not create a new orchestrator or interrupt one that is active, blocked, or waiting on a decision.
+3. The orchestrator refreshes durable project, session, issue-tracker, pull-request, CI, and review state.
+4. The orchestrator applies the project's current rules. It can take the next unowned, actionable issue, coordinate workers, follow up on CI or review feedback, and then return to idle when that work is settled.
+5. A later check-in repeats the process, allowing the project to keep chewing through real work over time.
+
+If every remaining issue is assigned, deferred, dependency-blocked, awaiting human judgment, or otherwise outside the project's rules, the orchestrator stays idle. Charter does not invent work merely to remain busy, and pausing Charter does not stop already-running sessions.
+
+The policy is stored per project and can be changed while AO is running. Select a project by id, or use `--current` from a registered project or AO session:
+
+```bash
+# Inspect the current project's policy.
+ao project orchestration get --current
+
+# Keep an idle orchestrator supervising this project every 30 minutes.
+ao project orchestration set --current --mode charter --interval 30m
+
+# Temporarily stop and later resume Charter check-ins.
+ao project orchestration pause --current
+ao project orchestration resume --current
+
+# Return to a bounded assignment.
+ao project orchestration set --current --mode mission
+```
+
+Charter intervals accept whole-minute durations from `1m` to `24h`. See the [CLI reference](docs/cli/README.md) for the complete command and project-selection behavior.
+
 ## Features
 
 The desktop app is the main control surface: projects on the left, active sessions in the center, and the selected session's terminal, pull request state, review runs, and browser preview in the inspector.
