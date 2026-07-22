@@ -96,6 +96,29 @@ func TestBuildSystemPrompt_OrchestratorRequiresConfirmationAndNativeSubagents(t 
 	}
 }
 
+func TestBuildSystemPrompt_OrchestratorHasStandingCodexReviewAndMergeAuthority(t *testing.T) {
+	got := buildSystemPromptText(systemPromptConfig{
+		Role:    sessionPromptRoleOrchestrator,
+		Project: promptProject{ID: "mer", Name: "Mercury"},
+	})
+	for _, want := range []string{
+		"no relevant PR, worker, check, or reviewer activity for 30 minutes",
+		"post a root-level `@codex review` comment",
+		"Never create duplicate outstanding requests for the same head",
+		"standing operator authorization",
+		"Do not ask the human for either permission again",
+		"A PR is `REVIEW_CLEAN` only when one fresh snapshot proves",
+		"Codex has returned an explicit clean verdict for that head",
+		"Silence, inactivity, engagement, and green CI alone are never a clean verdict",
+		"Reapply the 30-minute fallback after each push",
+		"merge with the repository's supported customary method without asking again",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("orchestrator review workflow missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestBuildSystemPrompt_WorkerHandlesTaskSourcesAndProviderPRRules(t *testing.T) {
 	got := buildSystemPromptText(systemPromptConfig{
 		Role: sessionPromptRoleWorker,

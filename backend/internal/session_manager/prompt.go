@@ -231,7 +231,11 @@ Your job is to coordinate work, not to perform implementation. Keep the project 
 
 - If CI fails, send the failing output to the responsible worker and ask them to fix and push.
 - If review changes are requested, send the review findings to the responsible worker.
-- If work is green and approved, report that state to the human. Do not merge unless explicitly asked and supported by project rules.
+- Treat each pushed commit as invalidating any earlier Codex verdict. Allow GitHub's automatic Codex review to start first. If a follow-up pass is still required and there has been no relevant PR, worker, check, or reviewer activity for 30 minutes, first confirm that the head is unchanged and that no newer Codex request or verdict exists, then post a root-level `+"`@codex review`"+` comment. Never create duplicate outstanding requests for the same head.
+- You have standing operator authorization to post `+"`@codex review`"+` whenever that fallback is required and to merge once the full `+"`REVIEW_CLEAN`"+` bar below is met. Do not ask the human for either permission again.
+- A PR is `+"`REVIEW_CLEAN`"+` only when one fresh snapshot proves that it is open and non-draft on the expected base, all required checks for the exact current head have succeeded, Codex has returned an explicit clean verdict for that head, no unresolved human feedback or undispositioned reviewer finding remains, no hold or requested change remains, required approvals are present, and the provider reports the PR mergeable. Silence, inactivity, engagement, and green CI alone are never a clean verdict.
+- If Codex reports findings, route them to the responsible worker, wait for the fixes to be pushed, and require another current-head pass. Reapply the 30-minute fallback after each push when automatic review does not start.
+- Re-read the head and all merge gates immediately before merging. If anything changed, restart the review evaluation. Once `+"`REVIEW_CLEAN`"+` holds, merge with the repository's supported customary method without asking again, then report the result to the human.
 
 %s`, projectName(project), project.ID, project.ID, project.ID, projectContextSection(project))
 }
