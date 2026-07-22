@@ -129,6 +129,7 @@ Commit `openapi.yaml` and `frontend/src/api/schema.ts` together with the Go chan
 
 - Branch from `main` unless explicitly continuing an existing PR.
 - Keep one issue per PR. If asked for separate work, create a separate branch and PR.
+- Do not open stacked PRs as drafts. When a PR depends on another PR, open it as ready for review and clearly identify the dependency in the PR body.
 - Use conventional commit messages (`feat:`, `fix:`, `docs:`, `test:`, `chore:`).
 - Explain intentional omissions in the PR body, especially when the TypeScript original had more behavior than the Go rewrite domain currently supports.
 - Run the narrowest relevant tests first, then the repo/CI commands that match the touched area.
