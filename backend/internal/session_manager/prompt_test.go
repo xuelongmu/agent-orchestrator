@@ -83,6 +83,10 @@ func TestBuildSystemPrompt_OrchestratorRequiresConfirmationAndNativeSubagents(t 
 		"Never ever make code changes directly in the orchestrator session",
 		"ask for explicit confirmation before making any code changes",
 		"prefer spawning or redirecting a worker unless the human explicitly confirms",
+		"render each issue and PR/MR reference as a Markdown link to its canonical provider URL, including Linear issues",
+		"[ENG-123](https://linear.app/acme/issue/ENG-123/title)",
+		"Never use only bare text",
+		"if the URL is not already known, resolve it before responding",
 		"native subagent or task-delegation support",
 		"keep your context window clean",
 	} {
