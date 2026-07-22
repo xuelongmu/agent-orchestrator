@@ -272,6 +272,32 @@ describe("ProjectSettingsForm", () => {
 		expect(options[4]).not.toHaveAttribute("aria-disabled", "true");
 	});
 
+	it("saves a project-scoped P2/P3 convergence limit and restarts the orchestrator", async () => {
+		mockProject({
+			id: "proj-1",
+			name: "Project One",
+			kind: "single_repo",
+			path: "/repo/project-one",
+			repo: "git@github.com:acme/project-one.git",
+			defaultBranch: "main",
+			config: {
+				worker: { agent: "codex" },
+				orchestrator: { agent: "claude-code" },
+			},
+		});
+
+		renderSettings();
+
+		const convergence = await screen.findByRole("combobox", { name: "P2/P3 convergence limit" });
+		expect(convergence).toHaveTextContent("No low-priority round limit");
+		await chooseOption(convergence, "Stop after 3 P2/P3-only rounds");
+		await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+		await waitFor(() => expect(putMock).toHaveBeenCalledTimes(1));
+		expect(putMock.mock.calls[0]?.[1]?.body.config.reviewPolicy).toEqual({ p2OnlyRoundLimit: 3 });
+		await waitFor(() => expect(postMock).toHaveBeenCalledTimes(1));
+	});
+
 	it("saves GitHub tracker intake settings, deriving the repo from the project's git origin", async () => {
 		getMock.mockResolvedValue({
 			data: {

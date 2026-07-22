@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -364,12 +365,16 @@ func (s *Service) deliverSubmitted(ctx context.Context, workerID domain.SessionI
 			runs[i] = refreshed
 		}
 	}
-	deliverable, err := s.deliverableRuns(ctx, workerID, runs)
+	deliverable, policyAccepted, err := s.deliverableRuns(ctx, workerID, runs)
+	if err != nil {
+		return nil, err
+	}
+	dispositioned, err := s.markReviewRunsDelivered(ctx, policyAccepted, false)
 	if err != nil {
 		return nil, err
 	}
 	if len(deliverable) == 0 {
-		return nil, nil
+		return dispositioned, nil
 	}
 	results, err := s.reviewResults(ctx, workerID, deliverable)
 	if err != nil {
@@ -385,11 +390,22 @@ func (s *Service) deliverSubmitted(ctx context.Context, workerID domain.SessionI
 		return nil, err
 	}
 	if outcome != lifecycle.ReviewDeliverySent {
+		return dispositioned, nil
+	}
+	delivered, err := s.markReviewRunsDelivered(ctx, deliverable, true)
+	if err != nil {
+		return nil, err
+	}
+	return append(dispositioned, delivered...), nil
+}
+
+func (s *Service) markReviewRunsDelivered(ctx context.Context, runs []domain.ReviewRun, simplificationDispatched bool) ([]domain.ReviewRun, error) {
+	if len(runs) == 0 {
 		return nil, nil
 	}
 	deliveredAt := s.clock()
-	delivered := make([]domain.ReviewRun, 0, len(deliverable))
-	for _, run := range deliverable {
+	delivered := make([]domain.ReviewRun, 0, len(runs))
+	for _, run := range runs {
 		updated, err := s.store.MarkReviewRunDelivered(ctx, run.ID, deliveredAt)
 		if err != nil {
 			return nil, err
@@ -397,7 +413,7 @@ func (s *Service) deliverSubmitted(ctx context.Context, workerID domain.SessionI
 		if updated {
 			run.Status = domain.ReviewRunDelivered
 			run.DeliveredAt = &deliveredAt
-			if run.SimplificationClass != "" {
+			if simplificationDispatched && run.SimplificationClass != "" {
 				run.SimplificationDispatchedAt = &deliveredAt
 			}
 			delivered = append(delivered, run)
@@ -406,12 +422,17 @@ func (s *Service) deliverSubmitted(ctx context.Context, workerID domain.SessionI
 	return delivered, nil
 }
 
-func (s *Service) deliverableRuns(ctx context.Context, workerID domain.SessionID, runs []domain.ReviewRun) ([]domain.ReviewRun, error) {
+func (s *Service) deliverableRuns(ctx context.Context, workerID domain.SessionID, runs []domain.ReviewRun) ([]domain.ReviewRun, []domain.ReviewRun, error) {
 	currentHeads, err := s.currentHeadsByPR(ctx, workerID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	p2OnlyRoundLimit, err := s.p2OnlyRoundLimit(ctx, workerID)
+	if err != nil {
+		return nil, nil, err
 	}
 	deliverable := make([]domain.ReviewRun, 0, len(runs))
+	policyAccepted := make([]domain.ReviewRun, 0, len(runs))
 	for _, run := range runs {
 		if run.Status != domain.ReviewRunComplete || run.Verdict != domain.VerdictChangesRequested || run.DeliveredAt != nil {
 			continue
@@ -421,14 +442,101 @@ func (s *Service) deliverableRuns(ctx context.Context, workerID domain.SessionID
 		}
 		findings, err := s.store.ListReviewFindingsByRun(ctx, run.ID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if len(findings) > 0 && !hasActionableFinding(findings) {
+		hasActionableFindings := hasActionableFinding(findings)
+		if len(findings) > 0 && !hasActionableFindings {
 			continue
+		}
+		if p2OnlyRoundLimit > 0 && !hasActionableFindings {
+			reached, err := s.p2OnlyReviewStreakReached(ctx, run, p2OnlyRoundLimit)
+			if err != nil {
+				return nil, nil, err
+			}
+			if reached {
+				policyAccepted = append(policyAccepted, run)
+				continue
+			}
 		}
 		deliverable = append(deliverable, run)
 	}
-	return deliverable, nil
+	return deliverable, policyAccepted, nil
+}
+
+func (s *Service) p2OnlyRoundLimit(ctx context.Context, workerID domain.SessionID) (int, error) {
+	session, ok, err := s.store.GetSession(ctx, workerID)
+	if err != nil || !ok {
+		return 0, err
+	}
+	project, ok, err := s.store.GetProject(ctx, string(session.ProjectID))
+	if err != nil || !ok {
+		return 0, err
+	}
+	return project.Config.ReviewPolicy.P2OnlyRoundLimit, nil
+}
+
+func (s *Service) p2OnlyReviewStreakReached(ctx context.Context, current domain.ReviewRun, limit int) (bool, error) {
+	if limit <= 0 || !p2OnlyChangesRequested(current) {
+		return false, nil
+	}
+	runs, err := s.store.ListReviewRunsByPR(ctx, current.PRURL)
+	if err != nil {
+		return false, err
+	}
+	sort.SliceStable(runs, func(i, j int) bool {
+		return runs[i].CreatedAt.After(runs[j].CreatedAt)
+	})
+
+	started := false
+	currentHead := ""
+	headP2Only := false
+	streak := 0
+	for _, run := range runs {
+		if !started {
+			if run.ID != current.ID {
+				continue
+			}
+			started = true
+		}
+		head := run.TargetSHA
+		if head == "" {
+			head = "run:" + run.ID
+		}
+		if currentHead != "" && head != currentHead {
+			if !headP2Only {
+				return false, nil
+			}
+			streak++
+			if streak >= limit {
+				return true, nil
+			}
+			headP2Only = false
+		}
+		currentHead = head
+		if run.Status != domain.ReviewRunComplete && run.Status != domain.ReviewRunDelivered {
+			return false, nil
+		}
+		if run.Verdict == domain.VerdictChangesRequested {
+			if !p2OnlyChangesRequested(run) {
+				return false, nil
+			}
+			headP2Only = true
+		}
+	}
+	if headP2Only {
+		streak++
+	}
+	return streak >= limit, nil
+}
+
+func p2OnlyChangesRequested(run domain.ReviewRun) bool {
+	if run.Status != domain.ReviewRunComplete && run.Status != domain.ReviewRunDelivered {
+		return false
+	}
+	if run.Verdict != domain.VerdictChangesRequested || !reviewcore.BodyHasOnlyP2P3Findings(run.Body) {
+		return false
+	}
+	return true
 }
 
 func hasActionableFinding(findings []domain.ReviewFinding) bool {

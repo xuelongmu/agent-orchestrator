@@ -99,6 +99,7 @@ type trackerIntakeConfig struct {
 // reviewPolicyConfig mirrors domain.ReviewPolicyConfig.
 type reviewPolicyConfig struct {
 	OutOfScopeDeflection bool `json:"outOfScopeDeflection,omitempty"`
+	P2OnlyRoundLimit     int  `json:"p2OnlyRoundLimit,omitempty"`
 }
 
 // orchestrationPolicyConfig mirrors domain.OrchestrationPolicyConfig.
@@ -440,8 +441,8 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 		Use:   "set-config <id>",
 		Short: "Set the per-project config",
 		Long: "Replace a project's per-project config (workspace kind, branch, session prefix, env, " +
-			"symlinks, post-create, rules, agent model/permissions, role overrides, tracker intake). The config " +
-			"is resolved when a session spawns.\n\n" +
+			"symlinks, post-create, rules, agent model/permissions, role overrides, tracker intake, review policy). " +
+			"Most config is resolved when a session spawns; review policy is enforced live by the daemon.\n\n" +
 			"Set fields via flags, pass the whole object with --config-json, or --clear " +
 			"to remove all config.",
 		Args: func(cmd *cobra.Command, args []string) error {

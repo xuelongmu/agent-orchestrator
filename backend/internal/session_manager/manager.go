@@ -3574,8 +3574,9 @@ func (m *Manager) buildSystemPrompt(ctx context.Context, kind domain.SessionKind
 		return "", err
 	}
 	cfg := systemPromptConfig{
-		Role:    promptRoleForKind(kind),
-		Project: promptProjectContext(projectID, project),
+		Role:         promptRoleForKind(kind),
+		Project:      promptProjectContext(projectID, project),
+		ReviewPolicy: project.Config.ReviewPolicy,
 	}
 
 	switch kind {

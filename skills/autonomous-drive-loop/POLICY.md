@@ -1,6 +1,6 @@
 # Autonomous drive-loop policy
 
-**Policy version: 1**
+**Policy version: 2**
 
 This file contains stable operator policy. Change it only in a deliberate,
 reviewed commit. Never let a recurring loop rewrite it. Procedures belong in
@@ -53,11 +53,19 @@ Merge only when all of these conditions hold in one fresh snapshot:
    when required, cancelled, failing, or unknown.
 4. Every review and issue-comment verdict channel has been inspected, and one
    current-HEAD reviewer terminal condition holds: (a) an explicit clean final
-   verdict/thumbs-up, (b) a completed review with no unresolved P1 finding, or
-   (c) the sixth completed review round with every P1 finding dispositioned.
-5. No unresolved human feedback or undispositioned reviewer finding remains.
-   Capture, resolve, or explicitly disposition non-P1 findings before merging;
-   finding contents and dispositions, not a summary count, determine this.
+   verdict/thumbs-up, (b) a completed review with no unresolved P0/P1 finding,
+   (c) the sixth completed review round with every P0/P1 finding dispositioned,
+   or (d) the project config sets `reviewPolicy.p2OnlyRoundLimit` to `N > 0`
+   and the `N` most recent completed automated review rounds, including the
+   current HEAD, are consecutive P2/P3-only rounds with no P0/P1 or untagged
+   finding.
+5. No unresolved human feedback remains, and no reviewer finding is
+   undispositioned except through condition 4(d). Under 4(d), record each
+   remaining automated P2/P3 finding as `accepted_by_project_policy` with the
+   project config and review rounds as evidence; no thread dismissal or
+   resolution is implied. Otherwise capture, resolve, or explicitly disposition
+   non-P0/P1 findings before merging.
+   Finding contents and dispositions, not a summary count, determine this.
 6. No human hold, requested change, unresolved ambiguity, out-of-scope correctness
    dependency, or owed merge-blocking output remains.
 7. The provider reports the PR mergeable and repository-required human approvals
@@ -86,6 +94,13 @@ immediately before merge; restart evaluation if it changed.
 
 - Normalize findings by violated invariant or root cause and record every
   occurrence in the finding-class ledger.
+- Read the owning project's live `reviewPolicy.p2OnlyRoundLimit` every cycle.
+  Zero or missing disables the escape hatch. A value from one through six stops
+  another automated fix dispatch when that many most-recent completed rounds
+  are consecutively P2/P3-only. Any P0/P1, untagged or ambiguous finding, human
+  feedback, or incomplete review breaks the streak. Record the policy-backed
+  disposition before evaluating merge; never reinterpret it as authority to
+  merge or to resolve provider threads.
 - Require a sibling-path sweep in every fix dispatch.
 - On the third occurrence of the same class, make the next dispatch a
   simplification round: enforce the invariant at one chokepoint and remove
@@ -98,7 +113,7 @@ immediately before merge; restart evaluation if it changed.
   limit is exhausted; those stops are not merge approval unless a reviewer
   terminal condition from the merge bar independently holds. At the sixth
   completed review round, capture, resolve, or explicitly disposition every
-  remaining non-P1 finding and require every P1 finding to be dispositioned.
+  remaining non-P0/P1 finding and require every P0/P1 finding to be dispositioned.
   Exact-head green required CI, mergeable/non-draft state, and no unresolved
   human hold or feedback remain mandatory. Include the current HEAD, finding
   classes and occurrences, attempted invariant or chokepoint, verification

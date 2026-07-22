@@ -86,6 +86,7 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 		permissions: config.agentConfig?.permissions ?? "",
 		reviewerHarness: config.reviewers?.[0]?.harness ?? "",
 		outOfScopeDeflection: config.reviewPolicy?.outOfScopeDeflection ?? false,
+		p2OnlyRoundLimit: config.reviewPolicy?.p2OnlyRoundLimit ?? 0,
 		intakeEnabled: intake.enabled ?? false,
 		intakeRepo: intake.repo ?? "",
 		intakeAssignee: intake.assignee ?? "",
@@ -95,6 +96,7 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 	const [validationError, setValidationError] = useState<string | null>(null);
 	const initialOrchestratorAgent = config.orchestrator?.agent ?? "";
 	const initialWorkspaceKind = config.workspaceKind ?? "worktree";
+	const initialP2OnlyRoundLimit = config.reviewPolicy?.p2OnlyRoundLimit ?? 0;
 	const missingRequiredAgent = form.workerAgent === "" || form.orchestratorAgent === "";
 	const agentsQuery = useQuery(agentsQueryOptions);
 	const agentCatalog = agentsQuery.data;
@@ -140,8 +142,14 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 					permissions: form.permissions || undefined,
 				}),
 				reviewers: form.reviewerHarness ? [{ harness: form.reviewerHarness }] : undefined,
-				...(form.outOfScopeDeflection || config.reviewPolicy
-					? { reviewPolicy: { ...config.reviewPolicy, outOfScopeDeflection: form.outOfScopeDeflection || undefined } }
+				...(form.outOfScopeDeflection || form.p2OnlyRoundLimit > 0 || config.reviewPolicy
+					? {
+							reviewPolicy: {
+								...config.reviewPolicy,
+								outOfScopeDeflection: form.outOfScopeDeflection || undefined,
+								p2OnlyRoundLimit: form.p2OnlyRoundLimit || undefined,
+							},
+						}
 					: {}),
 				trackerIntake: buildIntake(intakeForm),
 			};
@@ -153,6 +161,7 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 			if (
 				form.workspaceKind !== initialWorkspaceKind ||
 				form.orchestratorAgent !== initialOrchestratorAgent ||
+				form.p2OnlyRoundLimit !== initialP2OnlyRoundLimit ||
 				(activeOrchestrator && activeOrchestrator.provider !== form.orchestratorAgent)
 			) {
 				try {
@@ -362,6 +371,27 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 							value={form.reviewerHarness}
 							onChange={(v) => setForm((f) => ({ ...f, reviewerHarness: v }))}
 						/>
+					</Field>
+					<Field label="P2/P3 convergence limit" htmlFor="p2OnlyRoundLimit">
+						<Select
+							value={String(form.p2OnlyRoundLimit)}
+							onValueChange={(value) => setForm((current) => ({ ...current, p2OnlyRoundLimit: Number(value) }))}
+						>
+							<SelectTrigger id="p2OnlyRoundLimit" aria-label="P2/P3 convergence limit">
+								<SelectValue />
+							</SelectTrigger>
+							<SelectContent>
+								<SelectItem value="0">No low-priority round limit</SelectItem>
+								{[1, 2, 3, 4, 5, 6].map((rounds) => (
+									<SelectItem key={rounds} value={String(rounds)}>
+										Stop after {rounds} P2/P3-only {rounds === 1 ? "round" : "rounds"}
+									</SelectItem>
+								))}
+							</SelectContent>
+						</Select>
+						<p className="text-xs leading-row text-muted-foreground">
+							P0/P1, ambiguous feedback, human changes, CI, and merge conflicts always remain blocking.
+						</p>
 					</Field>
 					<label className="flex items-start gap-2.5 text-control text-foreground">
 						<input

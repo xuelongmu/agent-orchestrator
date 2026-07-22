@@ -3212,6 +3212,10 @@ components:
       properties:
         outOfScopeDeflection:
           type: boolean
+        p2OnlyRoundLimit:
+          maximum: 6
+          minimum: 0
+          type: integer
       type: object
     ReviewRun:
       properties:

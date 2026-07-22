@@ -18,7 +18,7 @@
 		"createdAt": "",
 		"policy": {
 			"path": "skills/autonomous-drive-loop/POLICY.md",
-			"version": 1,
+			"version": 2,
 			"gitCommit": "",
 			"contentSha256": ""
 		}

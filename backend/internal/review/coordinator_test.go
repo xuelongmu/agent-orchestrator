@@ -402,6 +402,29 @@ func TestCoordinateFailsClosedOnUntaggedChangesRequested(t *testing.T) {
 	}
 }
 
+func TestBodyHasBlockingFindingsRequiresEveryFindingLineTagged(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "p2 only", body: "[P2] clearer name", want: false},
+		{name: "p3 under heading", body: "## Suggestions\n[P3] minor cleanup", want: false},
+		{name: "indented continuation", body: "[P2] clearer name\n  This preserves the same behavior.", want: false},
+		{name: "mixed untagged", body: "[P2] clearer name\nThis can lose updates", want: true},
+		{name: "p1 heading", body: "[P2] clearer name\n## [P1] lost update", want: true},
+		{name: "p1", body: "[P1] lost update", want: true},
+		{name: "untagged", body: "This can lose updates", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := BodyHasBlockingFindings(tt.body); got != tt.want {
+				t.Fatalf("BodyHasBlockingFindings(%q) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCoordinateStopsAfterSixDistinctHeadRounds(t *testing.T) {
 	runs := make([]domain.ReviewRun, 0, MaxAutomaticReviewRounds)
 	for i := 1; i <= MaxAutomaticReviewRounds; i++ {
