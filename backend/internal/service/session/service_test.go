@@ -833,6 +833,10 @@ func (f *fakeCommander) Send(_ context.Context, id domain.SessionID, message str
 func (f *fakeCommander) SendAutomated(ctx context.Context, id domain.SessionID, message string) error {
 	return f.Send(ctx, id, message)
 }
+
+func (f *fakeCommander) SendAutomatedIfIdle(ctx context.Context, id domain.SessionID, message string, _ time.Time) error {
+	return f.SendAutomated(ctx, id, message)
+}
 func (f *fakeCommander) Cleanup(_ context.Context, project domain.ProjectID) (sessionmanager.CleanupResult, error) {
 	f.cleanupProjects = append(f.cleanupProjects, project)
 	if f.cleanupErr != nil {

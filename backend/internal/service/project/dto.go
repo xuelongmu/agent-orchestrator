@@ -34,6 +34,18 @@ type SetConfigInput struct {
 	Config domain.ProjectConfig `json:"config"`
 }
 
+// SetOrchestrationInput replaces only the project's live orchestration policy,
+// preserving every unrelated project setting.
+type SetOrchestrationInput struct {
+	Policy domain.OrchestrationPolicyConfig `json:"policy"`
+}
+
+// OrchestrationResult is the dedicated project-policy wire/read shape.
+type OrchestrationResult struct {
+	ProjectID domain.ProjectID                 `json:"projectId"`
+	Policy    domain.OrchestrationPolicyConfig `json:"policy"`
+}
+
 // RemoveResult reports what DELETE /api/v1/projects/{id} actually did.
 type RemoveResult struct {
 	ProjectID         domain.ProjectID `json:"projectId"`

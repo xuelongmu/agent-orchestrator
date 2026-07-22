@@ -31,6 +31,10 @@ func (c *ProjectsController) Register(r chi.Router) {
 	r.Post("/projects/initialize", c.initialize)
 	r.Get("/projects/{id}", c.get)
 	r.Put("/projects/{id}/config", c.setConfig)
+	r.Get("/projects/{id}/orchestration", c.getOrchestration)
+	r.Put("/projects/{id}/orchestration", c.setOrchestration)
+	r.Post("/projects/{id}/orchestration/pause", c.pauseOrchestration)
+	r.Post("/projects/{id}/orchestration/resume", c.resumeOrchestration)
 	r.Delete("/projects/{id}", c.remove)
 }
 
@@ -119,6 +123,58 @@ func (c *ProjectsController) setConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	envelope.WriteJSON(w, http.StatusOK, ProjectResponse{Project: p})
+}
+
+func (c *ProjectsController) getOrchestration(w http.ResponseWriter, r *http.Request) {
+	if c.Mgr == nil {
+		apispec.NotImplemented(w, r, "GET", "/api/v1/projects/{id}/orchestration")
+		return
+	}
+	result, err := c.Mgr.GetOrchestration(r.Context(), projectID(r))
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, result)
+}
+
+func (c *ProjectsController) setOrchestration(w http.ResponseWriter, r *http.Request) {
+	if c.Mgr == nil {
+		apispec.NotImplemented(w, r, "PUT", "/api/v1/projects/{id}/orchestration")
+		return
+	}
+	var in projectsvc.SetOrchestrationInput
+	if err := decodeJSONStrict(r, &in); err != nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Invalid JSON body", nil)
+		return
+	}
+	result, err := c.Mgr.SetOrchestration(r.Context(), projectID(r), in)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, result)
+}
+
+func (c *ProjectsController) pauseOrchestration(w http.ResponseWriter, r *http.Request) {
+	c.setOrchestrationPaused(w, r, true, "/api/v1/projects/{id}/orchestration/pause")
+}
+
+func (c *ProjectsController) resumeOrchestration(w http.ResponseWriter, r *http.Request) {
+	c.setOrchestrationPaused(w, r, false, "/api/v1/projects/{id}/orchestration/resume")
+}
+
+func (c *ProjectsController) setOrchestrationPaused(w http.ResponseWriter, r *http.Request, paused bool, specPath string) {
+	if c.Mgr == nil {
+		apispec.NotImplemented(w, r, "POST", specPath)
+		return
+	}
+	result, err := c.Mgr.SetOrchestrationPaused(r.Context(), projectID(r), paused)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, result)
 }
 
 func (c *ProjectsController) remove(w http.ResponseWriter, r *http.Request) {

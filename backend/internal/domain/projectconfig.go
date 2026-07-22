@@ -12,11 +12,9 @@ import (
 // JSON blob per project and resolved at spawn. Each field is typed and
 // validated; there is no free-form map.
 //
-// Only fields with a live consumer are modeled: DefaultBranch, Env, Symlinks,
-// PostCreate, AgentConfig, prompt rules, and the role overrides are consumed at
-// spawn; SessionPrefix feeds the display prefix. Settings whose consumers do
-// not yet exist (tracker/SCM per-project config) are intentionally absent and
-// land in focused follow-up PRs alongside the code that reads them.
+// Only fields with live consumers are modeled. Spawn resolves workspace,
+// agent, and prompt settings; observers consume tracker intake and
+// orchestration policy at runtime.
 type ProjectConfig struct {
 	// WorkspaceKind is the default filesystem shape for new sessions. Empty is
 	// the backwards-compatible git worktree default.
@@ -61,6 +59,63 @@ type ProjectConfig struct {
 	// read-only toward the tracker in v1: matching issues spawn sessions, but the
 	// tracker is not commented on or transitioned.
 	TrackerIntake TrackerIntakeConfig `json:"trackerIntake,omitempty"`
+
+	// Orchestration controls whether the project's orchestrator is a bounded
+	// mission or a standing charter. Unlike spawn-time agent settings, this
+	// policy is consumed live by the daemon's charter observer.
+	Orchestration OrchestrationPolicyConfig `json:"orchestration,omitempty"`
+}
+
+// OrchestrationMode describes the lifecycle contract for a project's
+// orchestrator. Mission is bounded and never receives scheduled check-ins;
+// charter is a standing mandate that may reconcile while idle.
+type OrchestrationMode string
+
+const (
+	// OrchestrationModeMission keeps coordination bounded with no scheduled wake.
+	OrchestrationModeMission OrchestrationMode = "mission"
+	// OrchestrationModeCharter enables periodic idle-only reconciliation.
+	OrchestrationModeCharter OrchestrationMode = "charter"
+
+	// DefaultCharterCheckInMinutes is the effective interval when none is stored.
+	DefaultCharterCheckInMinutes = 30
+	// MinCharterCheckInMinutes bounds user-configured charter intervals.
+	MinCharterCheckInMinutes = 1
+	// MaxCharterCheckInMinutes bounds charter intervals at one day.
+	MaxCharterCheckInMinutes = 24 * 60
+)
+
+// OrchestrationPolicyConfig is user-owned, per-project policy. Paused only
+// suppresses charter check-ins; it does not stop workers or ordinary SCM
+// lifecycle reactions.
+type OrchestrationPolicyConfig struct {
+	Mode                   OrchestrationMode `json:"mode,omitempty" enum:"mission,charter"`
+	Paused                 bool              `json:"paused,omitempty"`
+	CheckInIntervalMinutes int               `json:"checkInIntervalMinutes,omitempty" minimum:"1" maximum:"1440"`
+}
+
+// WithDefaults returns the effective policy without mutating the stored
+// representation. Existing projects therefore remain bounded missions.
+func (c OrchestrationPolicyConfig) WithDefaults() OrchestrationPolicyConfig {
+	if c.Mode == "" {
+		c.Mode = OrchestrationModeMission
+	}
+	if c.CheckInIntervalMinutes == 0 {
+		c.CheckInIntervalMinutes = DefaultCharterCheckInMinutes
+	}
+	return c
+}
+
+// Validate rejects policy values at the project service boundary.
+func (c OrchestrationPolicyConfig) Validate() error {
+	effective := c.WithDefaults()
+	if effective.Mode != OrchestrationModeMission && effective.Mode != OrchestrationModeCharter {
+		return fmt.Errorf("orchestration.mode: unknown mode %q", c.Mode)
+	}
+	if effective.CheckInIntervalMinutes < MinCharterCheckInMinutes || effective.CheckInIntervalMinutes > MaxCharterCheckInMinutes {
+		return fmt.Errorf("orchestration.checkInIntervalMinutes: must be between %d and %d", MinCharterCheckInMinutes, MaxCharterCheckInMinutes)
+	}
+	return nil
 }
 
 // ReviewPolicyConfig contains opt-in automation that mutates provider state.
@@ -125,6 +180,7 @@ func (c ProjectConfig) WithDefaults() ProjectConfig {
 		c.DefaultBranch = def.DefaultBranch
 	}
 	c.TrackerIntake = c.TrackerIntake.WithDefaults()
+	c.Orchestration = c.Orchestration.WithDefaults()
 	return c
 }
 
@@ -168,6 +224,9 @@ func (c ProjectConfig) Validate() error {
 		}
 	}
 	if err := c.TrackerIntake.Validate(); err != nil {
+		return err
+	}
+	if err := c.Orchestration.Validate(); err != nil {
 		return err
 	}
 	return nil

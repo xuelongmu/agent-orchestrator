@@ -25,4 +25,7 @@ Natural-language-to-command mappings for common AO tasks.
 | Claim an existing PR for a session | `ao session claim-pr <id> <pr-ref>` |
 | Submit a code review verdict | `ao review submit <session-id> --run <run-id> --verdict approved` |
 | Configure a project's default branch or model | `ao project set-config <id> --default-branch <branch> --model <model>` |
+| Make the current project a standing charter | `ao project orchestration set --current --mode charter --interval 30m` |
+| Make a project a bounded mission | `ao project orchestration set <project-id> --mode mission` |
+| Pause or resume charter check-ins | `ao project orchestration pause --current` / `resume --current` |
 | Import projects from a legacy AO install | `ao import --dry-run` (preview), then `ao import -y` |
