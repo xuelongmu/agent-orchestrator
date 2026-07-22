@@ -106,6 +106,10 @@ Complete initialization before the first health check:
 
 - Confirm the AO daemon and relevant worker/reviewer sessions are reachable.
   Prefer `ao status` and `ao session get <id>` when those sessions are involved.
+- Read the owning project through AO and validate its live
+  `reviewPolicy.p2OnlyRoundLimit`. Treat missing or zero as disabled and accept
+  only values from one through six. Do not copy the value from the recurring
+  prompt or infer it from prior behavior.
 - Confirm the state parses, its repository and PR match the requested target,
   and `schemaVersion` is exactly the supported version `2`. A version 1 state
   lacks attempt sequencing and dispatch-to-intent links; stop before every
@@ -324,10 +328,15 @@ After the retry limit, surface non-convergence instead of scheduling more retrie
   provider mutation or pretending it was handled.
 - **Non-convergence:** stop automated fix dispatches at the policy cap. The
   terminal alternatives are: (a) a simplification round repeats the same class,
-  (b) the reviewer retry budget is exhausted, or (c) the sixth completed review
-  round has all P1 findings dispositioned. In (c), capture, resolve, or explicitly
-  disposition every remaining non-P1 finding before proceeding. In every
-  alternative, require exact-head green required CI, mergeable/non-draft state,
+  (b) the reviewer retry budget is exhausted, (c) the sixth completed review
+  round has all P0/P1 findings dispositioned, or (d) the configured
+  `reviewPolicy.p2OnlyRoundLimit` is reached by consecutive completed P2/P3-only
+  rounds including the current HEAD. In (c), capture, resolve, or explicitly
+  disposition every remaining non-P0/P1 finding before proceeding. In (d),
+  record remaining automated P2/P3 findings as `accepted_by_project_policy` and
+  do not dispatch another low-priority fix round. Any P0/P1, untagged or
+  ambiguous finding, human feedback, or incomplete review breaks the streak. In
+  every alternative, require exact-head green required CI, mergeable/non-draft state,
   and no unresolved human hold or feedback. Deliver a human escalation with the
   ledger, attempted invariants/chokepoints, current HEAD, and exact decision
   needed.

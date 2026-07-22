@@ -489,6 +489,63 @@ func TestSubmitPersistsThenAppliesThenStampsDelivered(t *testing.T) {
 	}
 }
 
+func TestSubmitSuppressesConfiguredThirdConsecutiveP2OnlyRound(t *testing.T) {
+	base := time.Unix(100, 0).UTC()
+	prURL := "https://github.com/o/r/pull/1"
+	st := &fakeStore{
+		batchRuns: []domain.ReviewRun{
+			{ID: "run-1", SessionID: "mer-1", PRURL: prURL, TargetSHA: "sha1", Status: domain.ReviewRunDelivered, Verdict: domain.VerdictChangesRequested, Body: "[P2] rename this", CreatedAt: base},
+			{ID: "run-2", SessionID: "mer-1", PRURL: prURL, TargetSHA: "sha2", Status: domain.ReviewRunDelivered, Verdict: domain.VerdictChangesRequested, Body: "[P3] minor cleanup", CreatedAt: base.Add(time.Minute)},
+			{ID: "run-3", SessionID: "mer-1", PRURL: prURL, TargetSHA: "sha3", Status: domain.ReviewRunRunning, CreatedAt: base.Add(2 * time.Minute)},
+		},
+		prs:      []domain.PullRequest{{URL: prURL, HeadSHA: "sha3"}},
+		sessions: map[domain.SessionID]domain.SessionRecord{"mer-1": {ID: "mer-1", ProjectID: "mer"}},
+		project:  domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{ReviewPolicy: domain.ReviewPolicyConfig{P2OnlyRoundLimit: 3}}},
+	}
+	reducer := &fakeReducer{outcome: lifecycle.ReviewDeliverySent}
+	svc := New(nil, st, WithLifecycleReducer(reducer))
+
+	runs, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{{
+		RunID: "run-3", Verdict: domain.VerdictChangesRequested, Body: "[P2] prefer a helper",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reducer.calls != 0 || reducer.batchCalls != 0 {
+		t.Fatalf("threshold P2-only review was forwarded: reducer=%+v", reducer)
+	}
+	if len(runs) != 1 || runs[0].Status != domain.ReviewRunComplete || runs[0].DeliveredAt != nil {
+		t.Fatalf("suppressed review = %+v, want complete and not delivered", runs)
+	}
+}
+
+func TestSubmitStillForwardsBlockingReviewAfterP2OnlyRounds(t *testing.T) {
+	base := time.Unix(100, 0).UTC()
+	prURL := "https://github.com/o/r/pull/1"
+	st := &fakeStore{
+		batchRuns: []domain.ReviewRun{
+			{ID: "run-1", SessionID: "mer-1", PRURL: prURL, TargetSHA: "sha1", Status: domain.ReviewRunDelivered, Verdict: domain.VerdictChangesRequested, Body: "[P2] rename this", CreatedAt: base},
+			{ID: "run-2", SessionID: "mer-1", PRURL: prURL, TargetSHA: "sha2", Status: domain.ReviewRunDelivered, Verdict: domain.VerdictChangesRequested, Body: "[P3] minor cleanup", CreatedAt: base.Add(time.Minute)},
+			{ID: "run-3", SessionID: "mer-1", PRURL: prURL, TargetSHA: "sha3", Status: domain.ReviewRunRunning, CreatedAt: base.Add(2 * time.Minute)},
+		},
+		prs:      []domain.PullRequest{{URL: prURL, HeadSHA: "sha3"}},
+		sessions: map[domain.SessionID]domain.SessionRecord{"mer-1": {ID: "mer-1", ProjectID: "mer"}},
+		project:  domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{ReviewPolicy: domain.ReviewPolicyConfig{P2OnlyRoundLimit: 3}}},
+	}
+	reducer := &fakeReducer{outcome: lifecycle.ReviewDeliverySent}
+	svc := New(nil, st, WithLifecycleReducer(reducer))
+
+	runs, err := svc.SubmitMany(context.Background(), "mer-1", []SubmittedReview{{
+		RunID: "run-3", Verdict: domain.VerdictChangesRequested, Body: "[P1] unsafe race",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reducer.calls != 1 || len(runs) != 1 || runs[0].Status != domain.ReviewRunDelivered {
+		t.Fatalf("blocking review was not forwarded: reducer=%+v runs=%+v", reducer, runs)
+	}
+}
+
 func TestSubmitFindingRoundUsesPRHistoryAcrossReplacementSessions(t *testing.T) {
 	prURL := "https://github.com/o/r/pull/1"
 	st := &fakeStore{batchRuns: []domain.ReviewRun{

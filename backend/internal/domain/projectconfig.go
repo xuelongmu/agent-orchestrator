@@ -13,8 +13,8 @@ import (
 // validated; there is no free-form map.
 //
 // Only fields with live consumers are modeled. Spawn resolves workspace,
-// agent, and prompt settings; observers consume tracker intake and
-// orchestration policy at runtime.
+// agent, and prompt settings; observers and services consume tracker intake,
+// review, and orchestration policy at runtime.
 type ProjectConfig struct {
 	// WorkspaceKind is the default filesystem shape for new sessions. Empty is
 	// the backwards-compatible git worktree default.
@@ -123,6 +123,21 @@ func (c OrchestrationPolicyConfig) Validate() error {
 // instead of consuming another fix round.
 type ReviewPolicyConfig struct {
 	OutOfScopeDeflection bool `json:"outOfScopeDeflection,omitempty"`
+	// P2OnlyRoundLimit stops forwarding automated reviewer feedback after this
+	// many consecutive completed rounds containing only explicitly tagged P2/P3
+	// findings. Zero preserves the strict behavior with no convergence escape.
+	P2OnlyRoundLimit int `json:"p2OnlyRoundLimit,omitempty" minimum:"0" maximum:"6"`
+}
+
+const MaxP2OnlyReviewRounds = 6
+
+// Validate rejects invalid convergence limits while preserving zero as the
+// disabled/default value.
+func (c ReviewPolicyConfig) Validate() error {
+	if c.P2OnlyRoundLimit < 0 || c.P2OnlyRoundLimit > MaxP2OnlyReviewRounds {
+		return fmt.Errorf("reviewPolicy.p2OnlyRoundLimit: must be between 1 and %d, or 0 to disable", MaxP2OnlyReviewRounds)
+	}
+	return nil
 }
 
 // ReviewerConfig names one reviewer agent by harness. The harness is drawn from
@@ -222,6 +237,9 @@ func (c ProjectConfig) Validate() error {
 		if !rv.Harness.IsKnown() {
 			return fmt.Errorf("reviewers[%d].harness: unknown harness %q", i, rv.Harness)
 		}
+	}
+	if err := c.ReviewPolicy.Validate(); err != nil {
+		return err
 	}
 	if err := c.TrackerIntake.Validate(); err != nil {
 		return err

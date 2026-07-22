@@ -88,7 +88,7 @@ func TestProjectSetConfig_ReviewPolicyJSON(t *testing.T) {
 
 	_, errOut, err := executeCLI(t, Deps{
 		ProcessAlive: func(int) bool { return true },
-	}, "project", "set-config", "demo", "--config-json", `{"reviewPolicy":{"outOfScopeDeflection":true}}`)
+	}, "project", "set-config", "demo", "--config-json", `{"reviewPolicy":{"outOfScopeDeflection":true,"p2OnlyRoundLimit":3}}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
 	}
@@ -96,7 +96,7 @@ func TestProjectSetConfig_ReviewPolicyJSON(t *testing.T) {
 	if err := json.Unmarshal(capture.body, &got); err != nil {
 		t.Fatalf("decode request: %v\nbody=%s", err, capture.body)
 	}
-	if !got.Config.ReviewPolicy.OutOfScopeDeflection {
+	if !got.Config.ReviewPolicy.OutOfScopeDeflection || got.Config.ReviewPolicy.P2OnlyRoundLimit != 3 {
 		t.Fatalf("review policy request = %#v", got.Config.ReviewPolicy)
 	}
 }

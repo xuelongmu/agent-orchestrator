@@ -126,7 +126,7 @@ ao project rm agent-orchestrator -y
 
 ### ao project set-config
 
-Replace a project's per-project config (branch, session prefix, env, symlinks, post-create, agent model/permissions, role overrides, worker rules, and orchestrator rules). The config is resolved when a session spawns. Set fields via flags, pass the whole object with `--config-json`, or `--clear` to remove all config.
+Replace a project's per-project config (branch, session prefix, env, symlinks, post-create, agent model/permissions, role overrides, worker rules, orchestrator rules, and review policy). Most config is resolved when a session spawns; the daemon enforces review policy live, and newly spawned or restored agents receive it in their standing instructions. Set fields via flags, pass the whole object with `--config-json`, or `--clear` to remove all config.
 
 **Syntax:**
 ```
@@ -174,3 +174,12 @@ ao project set-config agent-orchestrator --agent-rules "Run focused tests before
 # Load worker rules from a repo-relative file
 ao project set-config agent-orchestrator --agent-rules-file docs/ao-worker-rules.md
 ```
+
+```bash
+# Stop forwarding another fix cycle after three consecutive P2/P3-only reviews
+ao project set-config agent-orchestrator --config-json '{"reviewPolicy":{"p2OnlyRoundLimit":3}}'
+```
+
+`reviewPolicy.p2OnlyRoundLimit` accepts `1` through `6`; omit it or set it to
+`0` to disable the escape hatch. It never relaxes P0/P1 findings, untagged or
+ambiguous feedback, human review, CI, mergeability, or merge authorization.

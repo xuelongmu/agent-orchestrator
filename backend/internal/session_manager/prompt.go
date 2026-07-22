@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
 type sessionPromptRole string
@@ -35,6 +37,7 @@ type systemPromptConfig struct {
 	OrchestratorSessionID string
 	ProjectRules          string
 	OrchestratorRules     string
+	ReviewPolicy          domain.ReviewPolicyConfig
 	AdditionalSections    []string
 }
 
@@ -72,11 +75,17 @@ func buildSystemPromptText(cfg systemPromptConfig) string {
 	switch cfg.Role {
 	case sessionPromptRoleOrchestrator:
 		sections = append(sections, orchestratorSystemPrompt(cfg.Project))
+		if policy := reviewConvergencePrompt(cfg.ReviewPolicy, true); policy != "" {
+			sections = append(sections, policy)
+		}
 		if rules := strings.TrimSpace(cfg.OrchestratorRules); rules != "" {
 			sections = append(sections, "## Project-Specific Orchestrator Rules\n"+rules)
 		}
 	case sessionPromptRoleWorker:
 		sections = append(sections, workerSystemPrompt(cfg.Project))
+		if policy := reviewConvergencePrompt(cfg.ReviewPolicy, false); policy != "" {
+			sections = append(sections, policy)
+		}
 		if orchestratorID := strings.TrimSpace(cfg.OrchestratorSessionID); orchestratorID != "" {
 			sections = append(sections, workerOrchestratorPrompt(orchestratorID))
 		}
@@ -94,6 +103,20 @@ func buildSystemPromptText(cfg systemPromptConfig) string {
 		}
 	}
 	return strings.Join(sections, "\n\n")
+}
+
+func reviewConvergencePrompt(policy domain.ReviewPolicyConfig, orchestrator bool) string {
+	limit := policy.P2OnlyRoundLimit
+	if limit == 0 {
+		return ""
+	}
+	roleAction := "stop making fixes solely for those low-priority findings and report the PR ready to merge"
+	if orchestrator {
+		roleAction = "stop routing those low-priority findings back to workers and report the PR ready to merge"
+	}
+	return fmt.Sprintf(`## Project Review Convergence Policy
+
+After %d consecutive completed automated review rounds whose only findings are explicitly tagged P2 or P3, %s. Treat the threshold as the project's explicit disposition of the remaining automated P2/P3 suggestions. P0/P1 findings, untagged or ambiguous feedback, human-requested changes, failed or pending required checks, merge conflicts, and human holds remain blocking. Do not merge unless the human has authorized merging.`, limit, roleAction)
 }
 
 // systemPromptGuard is appended to every agent system prompt. The role,

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -411,6 +412,10 @@ func (s *Service) deliverableRuns(ctx context.Context, workerID domain.SessionID
 	if err != nil {
 		return nil, err
 	}
+	p2OnlyRoundLimit, err := s.p2OnlyRoundLimit(ctx, workerID)
+	if err != nil {
+		return nil, err
+	}
 	deliverable := make([]domain.ReviewRun, 0, len(runs))
 	for _, run := range runs {
 		if run.Status != domain.ReviewRunComplete || run.Verdict != domain.VerdictChangesRequested || run.DeliveredAt != nil {
@@ -426,9 +431,78 @@ func (s *Service) deliverableRuns(ctx context.Context, workerID domain.SessionID
 		if len(findings) > 0 && !hasActionableFinding(findings) {
 			continue
 		}
+		if p2OnlyRoundLimit > 0 {
+			reached, err := s.p2OnlyReviewStreakReached(ctx, run, p2OnlyRoundLimit)
+			if err != nil {
+				return nil, err
+			}
+			if reached {
+				continue
+			}
+		}
 		deliverable = append(deliverable, run)
 	}
 	return deliverable, nil
+}
+
+func (s *Service) p2OnlyRoundLimit(ctx context.Context, workerID domain.SessionID) (int, error) {
+	session, ok, err := s.store.GetSession(ctx, workerID)
+	if err != nil || !ok {
+		return 0, err
+	}
+	project, ok, err := s.store.GetProject(ctx, string(session.ProjectID))
+	if err != nil || !ok {
+		return 0, err
+	}
+	return project.Config.ReviewPolicy.P2OnlyRoundLimit, nil
+}
+
+func (s *Service) p2OnlyReviewStreakReached(ctx context.Context, current domain.ReviewRun, limit int) (bool, error) {
+	if limit <= 0 || !p2OnlyChangesRequested(current) {
+		return false, nil
+	}
+	runs, err := s.store.ListReviewRunsByPR(ctx, current.PRURL)
+	if err != nil {
+		return false, err
+	}
+	sort.SliceStable(runs, func(i, j int) bool {
+		return runs[i].CreatedAt.After(runs[j].CreatedAt)
+	})
+
+	started := false
+	lastHead := ""
+	streak := 0
+	for _, run := range runs {
+		if !started {
+			if run.ID != current.ID {
+				continue
+			}
+			started = true
+		}
+		if run.TargetSHA != "" && run.TargetSHA == lastHead {
+			continue
+		}
+		lastHead = run.TargetSHA
+		if !p2OnlyChangesRequested(run) {
+			break
+		}
+		streak++
+		if streak >= limit {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func p2OnlyChangesRequested(run domain.ReviewRun) bool {
+	if run.Status != domain.ReviewRunComplete && run.Status != domain.ReviewRunDelivered {
+		return false
+	}
+	if run.Verdict != domain.VerdictChangesRequested || reviewcore.BodyHasBlockingFindings(run.Body) {
+		return false
+	}
+	body := strings.ToLower(run.Body)
+	return strings.Contains(body, "[p2]") || strings.Contains(body, "[p3]")
 }
 
 func hasActionableFinding(findings []domain.ReviewFinding) bool {

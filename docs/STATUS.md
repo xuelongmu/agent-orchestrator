@@ -49,6 +49,9 @@ surface (`npm run sqlc`, `npm run api`).
   facts; `/prs/{id}/resolve-comments` remains the review-thread action route.
 - Review routes registered: `GET /reviews`, `POST /reviews/execute`,
   `POST /reviews/{id}/send`.
+- Per-project review convergence policy can stop another automated fix dispatch
+  after a configured number of consecutive P2/P3-only rounds; P0/P1, ambiguous
+  or human feedback, CI, mergeability, and merge authority remain blocking.
 - Durable dashboard notifications for `needs_input`, `ready_to_merge`,
   `pr_merged`, and `pr_closed_unmerged`: backend enrichment/persistence,
   unread list, live notification stream, and read acknowledgement API.

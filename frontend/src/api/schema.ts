@@ -1171,6 +1171,7 @@ export interface components {
         };
         ReviewPolicyConfig: {
             outOfScopeDeflection?: boolean;
+            p2OnlyRoundLimit?: number;
         };
         ReviewRun: {
             batchId: string;

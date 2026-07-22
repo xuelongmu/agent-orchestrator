@@ -92,6 +92,45 @@ The desktop app is the main control surface: projects on the left, active sessio
   </tr>
 </table>
 
+## Review convergence policy
+
+Projects can opt into a limit for repeated low-priority automated review
+feedback. Set `reviewPolicy.p2OnlyRoundLimit` to a value from `1` through `6`.
+When that many most-recent completed review rounds are consecutively P2/P3-only,
+AO stops forwarding another low-priority fix cycle and treats those remaining
+automated suggestions as accepted by project policy.
+
+This does not relax P0/P1 findings, untagged or ambiguous feedback, human review
+requests, required CI, merge conflicts, mergeability, or merge authorization.
+The default is disabled (`0` or omitted).
+
+For an existing project, open **Project Settings → Reviewers → P2/P3 convergence
+limit**, choose a limit such as **Stop after 3 P2/P3-only rounds**, and save. The
+daemon applies the policy immediately. Because an orchestrator's standing prompt
+is assembled when its session launches, the desktop replaces the active
+orchestrator after this setting changes so the new session also receives the
+policy in its standing instructions.
+
+The setting is also available through the project config API and CLI.
+`set-config` replaces the complete project config, so do not use the minimal
+example below on a project that already has other settings without merging them
+first:
+
+```bash
+ao project set-config <project-id> --config-json '{"reviewPolicy":{"p2OnlyRoundLimit":3}}'
+```
+
+When the project already has other settings, first inspect it with
+`ao project get <project-id> --json`, merge
+`reviewPolicy.p2OnlyRoundLimit` into the existing `config` object, and submit the
+complete object. CLI/API updates are enforced live by the daemon but do not
+rewrite an already-running orchestrator's system prompt. To keep that exact
+thread instead of replacing it, notify it explicitly:
+
+```bash
+ao send --session <orchestrator-session-id> --message "Project reviewPolicy.p2OnlyRoundLimit is now 3. Re-read the live project config and apply that convergence policy."
+```
+
 ## Supported Agents
 
 AO ships adapters for 23 worker agent harnesses:
