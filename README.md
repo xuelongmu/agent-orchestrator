@@ -53,8 +53,18 @@ The result is a local control layer for agentic coding: agents still do the codi
 
 Each project can choose how long its orchestrator should keep supervising work:
 
-- **Mission** is the default, bounded mode. The orchestrator works through its current assignment and AO never schedules follow-up check-ins.
-- **Charter** is the continuous mode. At the configured interval, AO checks in only when the project has exactly one live orchestrator and that orchestrator has genuinely reported idle. It does not spawn an orchestrator, duplicate active ownership, or interrupt an agent that is busy or waiting on a decision.
+- **Mission** is the default, bounded mode: "complete this issue or defined set of work." The orchestrator works through that assignment and AO never schedules follow-up check-ins.
+- **Charter** is the continuous mode: "keep working through this project's actionable backlog under its standing rules." It lets one existing orchestrator return to the issue queue after current work settles instead of ending supervision after a single assignment.
+
+Charter is an idle reconciliation loop, not a daemon that blindly claims every open issue. At each configured interval:
+
+1. AO waits until the project has exactly one live orchestrator and that orchestrator has genuinely reported idle.
+2. AO sends that orchestrator a check-in; it does not create a new orchestrator or interrupt one that is active, blocked, or waiting on a decision.
+3. The orchestrator refreshes durable project, session, issue-tracker, pull-request, CI, and review state.
+4. The orchestrator applies the project's current rules. It can take the next unowned, actionable issue, coordinate workers, follow up on CI or review feedback, and then return to idle when that work is settled.
+5. A later check-in repeats the process, allowing the project to keep chewing through real work over time.
+
+If every remaining issue is assigned, deferred, dependency-blocked, awaiting human judgment, or otherwise outside the project's rules, the orchestrator stays idle. Charter does not invent work merely to remain busy, and pausing Charter does not stop already-running sessions.
 
 The policy is stored per project and can be changed while AO is running. Select a project by id, or use `--current` from a registered project or AO session:
 
