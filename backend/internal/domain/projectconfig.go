@@ -129,6 +129,7 @@ type ReviewPolicyConfig struct {
 	P2OnlyRoundLimit int `json:"p2OnlyRoundLimit,omitempty" minimum:"0" maximum:"6"`
 }
 
+// MaxP2OnlyReviewRounds is the largest supported automated review convergence limit.
 const MaxP2OnlyReviewRounds = 6
 
 // Validate rejects invalid convergence limits while preserving zero as the

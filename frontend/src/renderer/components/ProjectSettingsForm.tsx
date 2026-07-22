@@ -375,9 +375,7 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 					<Field label="P2/P3 convergence limit" htmlFor="p2OnlyRoundLimit">
 						<Select
 							value={String(form.p2OnlyRoundLimit)}
-							onValueChange={(value) =>
-								setForm((current) => ({ ...current, p2OnlyRoundLimit: Number(value) }))
-							}
+							onValueChange={(value) => setForm((current) => ({ ...current, p2OnlyRoundLimit: Number(value) }))}
 						>
 							<SelectTrigger id="p2OnlyRoundLimit" aria-label="P2/P3 convergence limit">
 								<SelectValue />
