@@ -214,8 +214,8 @@ func (s *Store) CancelRunningReviewRunsBySession(ctx context.Context, sessionID 
 	})
 }
 
-// MarkReviewRunDelivered records that lifecycle delivered the worker nudge for
-// a completed AO-internal review pass.
+// MarkReviewRunDelivered records that a completed AO-internal review pass was
+// either delivered to lifecycle or durably dispositioned by project policy.
 func (s *Store) MarkReviewRunDelivered(ctx context.Context, id string, deliveredAt time.Time) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

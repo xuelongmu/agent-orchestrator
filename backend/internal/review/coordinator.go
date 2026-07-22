@@ -222,11 +222,33 @@ func automaticReviewRetryDelay(attempts int) time.Duration {
 // result may predate priority tags, so untagged feedback fails closed while
 // explicitly P2/P3-only feedback is non-blocking.
 func BodyHasBlockingFindings(body string) bool {
-	body = strings.ToLower(body)
-	if reviewpolicy.HasP0OrP1(body) {
-		return true
+	return !BodyHasOnlyP2P3Findings(body)
+}
+
+// BodyHasOnlyP2P3Findings reports whether every non-structural finding line is
+// explicitly tagged P2/P3. Untagged prose fails closed; indented lines may
+// continue the preceding tagged finding.
+func BodyHasOnlyP2P3Findings(body string) bool {
+	sawLowPriority := false
+	for _, rawLine := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") || line == "---" || line == "***" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if reviewpolicy.HasP0OrP1(lower) {
+			return false
+		}
+		if strings.Contains(lower, "[p2]") || strings.Contains(lower, "[p3]") {
+			sawLowPriority = true
+			continue
+		}
+		if sawLowPriority && rawLine != "" && (rawLine[0] == ' ' || rawLine[0] == '\t') {
+			continue
+		}
+		return false
 	}
-	return !strings.Contains(body, "[p2]") && !strings.Contains(body, "[p3]")
+	return sawLowPriority
 }
 
 func firstNonEmpty(values ...string) string {
