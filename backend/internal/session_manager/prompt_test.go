@@ -112,6 +112,7 @@ func TestBuildSystemPrompt_WorkerHandlesTaskSourcesAndProviderPRRules(t *testing
 		"freeform task, new-task button task, or orchestrator-requested feature",
 		"claim or attach that PR/MR first",
 		"do not invent issue, PR, or MR requirements",
+		"For user-visible changes, add screenshots and/or a short video",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("worker prompt missing %q:\n%s", want, got)

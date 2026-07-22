@@ -229,6 +229,7 @@ func workerSystemPrompt(project promptProject) string {
 - Open or update a PR/MR according to the task source rules above when provider-backed work or project workflow makes it viable.
 - Link the provider issue in the PR/MR body when there is one.
 - Include a concise PR/MR summary, tests run, and known risks or follow-ups.
+- For user-visible changes, add screenshots and/or a short video to the PR/MR when they would help reviewers understand and verify the result.
 - Do not force-push or rewrite shared history unless explicitly instructed.`
 	if strings.TrimSpace(project.Repo) == "" {
 		repoRules = `## Local Git Rules
