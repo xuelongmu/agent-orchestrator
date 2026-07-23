@@ -1197,6 +1197,7 @@ func (m *Manager) ApplyStalledPRHeartbeat(ctx context.Context, id domain.Session
 	sig := projected.HeadSHA + "\x00" + ciFailureSignature(checks)
 	seenKey := "heartbeat:" + prURL
 	windowKey := "heartbeat-window:" + prURL
+	baseKey := "heartbeat-base:" + prURL
 	reminderKey := "heartbeat-reminder:" + prURL
 	progressKey := "heartbeat-progress:" + prURL
 	handoffKey := "heartbeat-handoff:" + prURL
@@ -1214,6 +1215,7 @@ func (m *Manager) ApplyStalledPRHeartbeat(ctx context.Context, id domain.Session
 		delete(m.react.seen, reminderKey)
 		delete(m.react.attempts, reminderKey)
 		delete(m.react.attempts, windowKey)
+		delete(m.react.attempts, baseKey)
 		delete(m.react.pending, progressKey)
 		delete(m.react.handoffs, handoffKey)
 	}
@@ -1222,20 +1224,24 @@ func (m *Manager) ApplyStalledPRHeartbeat(ctx context.Context, id domain.Session
 		return nil
 	}
 
-	markWindow := func(progressAt time.Time) error {
+	markWindow := func(progressAt time.Time, restart bool) error {
 		m.react.attempts[windowKey] = heartbeat
+		if restart {
+			m.react.attempts[baseKey] = heartbeat
+		}
 		if !progressAt.IsZero() {
 			m.react.pending[progressKey] = sig + "\x00" + progressAt.UTC().Format(time.RFC3339Nano)
 		}
 		return m.persistPRSignaturesLocked(ctx, prURL)
 	}
+	episodeHeartbeat := heartbeat - m.react.attempts[baseKey]
 
 	// Active is authoritative even when no conversational message has appeared
 	// for a long time. An outstanding tool flight additionally covers the case
 	// where a background agent is working while the main prompt remains in a
 	// sticky waiting_input state.
 	if busy {
-		err := markWindow(m.clock())
+		err := markWindow(m.clock(), true)
 		m.react.mu.Unlock()
 		return err
 	}
@@ -1243,13 +1249,13 @@ func (m *Manager) ApplyStalledPRHeartbeat(ctx context.Context, id domain.Session
 	reminded := m.react.seen[reminderKey] == sig
 	if reminded {
 		if checkpoint, ok := stalledPRProgressTime(m.react.pending[progressKey], sig); ok && rec.Activity.LastActivityAt.After(checkpoint) {
-			err := markWindow(rec.Activity.LastActivityAt)
+			err := markWindow(rec.Activity.LastActivityAt, true)
 			m.react.mu.Unlock()
 			return err
 		}
 	}
-	if !rec.IsTerminated && heartbeat < stalledPREscalationHeartbeat && reminded {
-		err := markWindow(time.Time{})
+	if !rec.IsTerminated && episodeHeartbeat < stalledPREscalationHeartbeat && reminded {
+		err := markWindow(time.Time{}, false)
 		m.react.mu.Unlock()
 		return err
 	}
@@ -1258,13 +1264,27 @@ func (m *Manager) ApplyStalledPRHeartbeat(ctx context.Context, id domain.Session
 	// entering the human lane because AO has no viable deterministic worker
 	// action. A terminated worker has no viable path even at the first heartbeat.
 	unsafe := rec.Activity.State.BlocksAutomatedDelivery()
-	if !rec.IsTerminated && (!unsafe || heartbeat < stalledPREscalationHeartbeat) && !reminded {
+	if !rec.IsTerminated && (!unsafe || episodeHeartbeat < stalledPREscalationHeartbeat) && !reminded {
 		if unsafe {
-			err := markWindow(time.Time{})
+			err := markWindow(time.Time{}, false)
 			m.react.mu.Unlock()
 			return err
 		}
 		m.react.mu.Unlock()
+		latest, latestBusy, ok, err := m.stalledPRWorkerState(ctx, id)
+		if err != nil || !ok {
+			return err
+		}
+		if latestBusy || latest.Activity.LastActivityAt.After(rec.Activity.LastActivityAt) {
+			m.react.mu.Lock()
+			if m.react.seen[seenKey] != sig {
+				m.react.mu.Unlock()
+				return nil
+			}
+			err := markWindow(m.clock(), true)
+			m.react.mu.Unlock()
+			return err
+		}
 		msg := fmt.Sprintf("[AO heartbeat] PR #%d still has unchanged failing CI after one monitoring heartbeat. Continue the fix, inspect the failed checks, and push progress when ready.\nPR: %s", o.PR.Number, domain.SanitizeControlChars(prURL))
 		fences := []ports.PRReactionFence{{PRURL: prURL, SessionID: id, HeadSHA: projected.HeadSHA}}
 		outcome, err := m.sendOnce(ctx, id, prURL, reminderKey, sig, fences, msg, 1)
@@ -1272,12 +1292,33 @@ func (m *Manager) ApplyStalledPRHeartbeat(ctx context.Context, id domain.Session
 			return err
 		}
 		m.react.mu.Lock()
-		err = markWindow(m.clock())
+		err = markWindow(m.clock(), false)
 		m.react.mu.Unlock()
 		return err
 	}
 
 	if m.react.handoffs[handoffKey].Outcome == humanHandoffNotified {
+		m.react.mu.Unlock()
+		return nil
+	}
+	m.react.mu.Unlock()
+	latest, latestBusy, ok, err := m.stalledPRWorkerState(ctx, id)
+	if err != nil || !ok {
+		return err
+	}
+	if latestBusy || latest.Activity.LastActivityAt.After(rec.Activity.LastActivityAt) {
+		m.react.mu.Lock()
+		if m.react.seen[seenKey] != sig {
+			m.react.mu.Unlock()
+			return nil
+		}
+		err := markWindow(m.clock(), true)
+		m.react.mu.Unlock()
+		return err
+	}
+	rec = latest
+	m.react.mu.Lock()
+	if m.react.seen[seenKey] != sig || m.react.handoffs[handoffKey].Outcome == humanHandoffNotified {
 		m.react.mu.Unlock()
 		return nil
 	}
@@ -1346,15 +1387,18 @@ func (m *Manager) resetStalledPRHeartbeat(ctx context.Context, prURL string) err
 	}
 	seenKey := "heartbeat:" + prURL
 	windowKey := "heartbeat-window:" + prURL
+	baseKey := "heartbeat-base:" + prURL
 	reminderKey := "heartbeat-reminder:" + prURL
 	progressKey := "heartbeat-progress:" + prURL
 	handoffKey := "heartbeat-handoff:" + prURL
 	if _, seen := m.react.seen[seenKey]; !seen {
 		if _, reminded := m.react.seen[reminderKey]; !reminded {
 			if _, windowed := m.react.attempts[windowKey]; !windowed {
-				if _, progressed := m.react.pending[progressKey]; !progressed {
-					if _, handedOff := m.react.handoffs[handoffKey]; !handedOff {
-						return nil
+				if _, based := m.react.attempts[baseKey]; !based {
+					if _, progressed := m.react.pending[progressKey]; !progressed {
+						if _, handedOff := m.react.handoffs[handoffKey]; !handedOff {
+							return nil
+						}
 					}
 				}
 			}
@@ -1364,6 +1408,7 @@ func (m *Manager) resetStalledPRHeartbeat(ctx context.Context, prURL string) err
 	delete(m.react.seen, reminderKey)
 	delete(m.react.attempts, reminderKey)
 	delete(m.react.attempts, windowKey)
+	delete(m.react.attempts, baseKey)
 	delete(m.react.pending, progressKey)
 	delete(m.react.handoffs, handoffKey)
 	return m.persistPRSignaturesLocked(ctx, prURL)
@@ -1401,32 +1446,72 @@ func (m *Manager) applyStackParentHeadChange(ctx context.Context, id domain.Sess
 		return nil
 	}
 
-	prs, err := m.store.ListPRsBySession(ctx, id)
+	parent, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
 		return err
 	}
-	children := make([]string, 0)
-	for _, pr := range prs {
-		if !pr.Merged && !pr.Closed && pr.URL != prURL && pr.TargetBranch == o.PR.SourceBranch {
-			children = append(children, pr.URL)
+	if !ok {
+		return nil
+	}
+	sessions := []domain.SessionRecord{parent}
+	if lister, ok := m.store.(stackSessionStore); ok {
+		sessions, err = lister.ListAllSessions(ctx)
+		if err != nil {
+			return err
 		}
 	}
-	if len(children) == 0 {
+	sort.Slice(sessions, func(i, j int) bool { return sessions[i].ID < sessions[j].ID })
+	childrenBySession := make(map[domain.SessionID][]domain.PullRequest)
+	for _, session := range sessions {
+		if session.ProjectID != parent.ProjectID {
+			continue
+		}
+		prs, err := m.store.ListPRsBySession(ctx, session.ID)
+		if err != nil {
+			return err
+		}
+		for _, pr := range prs {
+			if !pr.Merged && !pr.Closed && pr.URL != prURL && pr.TargetBranch == o.PR.SourceBranch && stackPRMatchesObservationRepo(pr, o) {
+				childrenBySession[session.ID] = append(childrenBySession[session.ID], pr)
+			}
+		}
+	}
+	if len(childrenBySession) == 0 {
 		m.react.mu.Lock()
 		delete(m.react.pending, pendingKey)
 		err := m.persistPRSignaturesLocked(ctx, prURL)
 		m.react.mu.Unlock()
 		return err
 	}
-	sort.Strings(children)
-	msg := fmt.Sprintf("A stacked parent PR moved from %s to %s. Update the dependent PR branch(es) and rerun their checks.\nParent: %s\nAffected child PRs:\n- %s",
-		domain.SanitizeControlChars(parts[0]), domain.SanitizeControlChars(parts[1]), domain.SanitizeControlChars(prURL), strings.Join(children, "\n- "))
-	fences := []ports.PRReactionFence{{PRURL: prURL, SessionID: id, HeadSHA: parts[1]}}
-	outcome, err := m.sendOnce(ctx, id, prURL, "stack-parent:"+prURL, parts[1], fences, msg, 0)
-	if err != nil {
-		return err
+	sessionIDs := make([]domain.SessionID, 0, len(childrenBySession))
+	for sessionID := range childrenBySession {
+		sessionIDs = append(sessionIDs, sessionID)
 	}
-	if outcome == sendOnceSuppressed {
+	sort.Slice(sessionIDs, func(i, j int) bool { return sessionIDs[i] < sessionIDs[j] })
+	pendingDelivery := false
+	for _, sessionID := range sessionIDs {
+		children := childrenBySession[sessionID]
+		sort.Slice(children, func(i, j int) bool { return children[i].URL < children[j].URL })
+		childURLs := make([]string, 0, len(children))
+		fences := []ports.PRReactionFence{{PRURL: prURL, SessionID: id, HeadSHA: parts[1]}}
+		for _, child := range children {
+			childURLs = append(childURLs, child.URL)
+			if child.URL != "" && child.HeadSHA != "" {
+				fences = append(fences, ports.PRReactionFence{PRURL: child.URL, SessionID: sessionID, HeadSHA: child.HeadSHA})
+			}
+		}
+		msg := fmt.Sprintf("A stacked parent PR moved from %s to %s. Update the dependent PR branch(es) and rerun their checks.\nParent: %s\nAffected child PRs:\n- %s",
+			domain.SanitizeControlChars(parts[0]), domain.SanitizeControlChars(parts[1]), domain.SanitizeControlChars(prURL), strings.Join(childURLs, "\n- "))
+		key := "stack-parent:" + prURL + ":" + string(sessionID)
+		outcome, err := m.sendOnce(ctx, sessionID, prURL, key, parts[1], fences, msg, 0)
+		if err != nil {
+			return err
+		}
+		if outcome == sendOnceSuppressed {
+			pendingDelivery = true
+		}
+	}
+	if pendingDelivery {
 		return errStackParentDispatchPending
 	}
 	m.react.mu.Lock()
@@ -1434,6 +1519,16 @@ func (m *Manager) applyStackParentHeadChange(ctx context.Context, id domain.Sess
 	err = m.persistPRSignaturesLocked(ctx, prURL)
 	m.react.mu.Unlock()
 	return err
+}
+
+func stackPRMatchesObservationRepo(pr domain.PullRequest, o ports.SCMObservation) bool {
+	if pr.Provider != "" && o.Provider != "" && !strings.EqualFold(pr.Provider, o.Provider) {
+		return false
+	}
+	if pr.Host != "" && o.Host != "" && !strings.EqualFold(pr.Host, o.Host) {
+		return false
+	}
+	return pr.Repo == "" || o.Repo == "" || strings.EqualFold(pr.Repo, o.Repo)
 }
 
 func (m *Manager) notificationIntentForCurrentSCM(ctx context.Context, id domain.SessionID, o ports.SCMObservation) (*ports.NotificationIntent, error) {
