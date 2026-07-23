@@ -313,6 +313,51 @@ func closedSCMObservation(prURL string, num int, headSHA string) ports.SCMObserv
 // the observation -> reducer -> store -> messenger pipeline the daemon runs in
 // production stays connected end-to-end after PR #114.
 func TestSCMObserverEndToEnd(t *testing.T) {
+	t.Run("unchanged failed PR resumes a worker after it becomes idle", func(t *testing.T) {
+		ctx := context.Background()
+		f := newSCMFixture(t, "feat/x")
+		const (
+			prURL   = "https://github.com/octocat/hello/pull/244"
+			headSHA = "5143fef"
+		)
+		f.provider.detected["feat/x"] = ports.SCMPRObservation{
+			URL: prURL, Number: 244, SourceBranch: "feat/x", HeadRepo: scmTestRepo.Repo, TargetBranch: "main", HeadSHA: headSHA,
+		}
+		f.provider.observations[244] = failingSCMObservation(prURL, 244, headSHA, "backend CI failed")
+
+		blocked := f.session
+		blocked.Activity = domain.Activity{State: domain.ActivityBlocked, LastActivityAt: f.now}
+		blocked.FirstSignalAt = f.now
+		if err := f.store.UpdateSession(ctx, blocked); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.observer.Poll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if f.spy.count() != 0 {
+			t.Fatalf("blocked worker received automated PR work: %+v", f.spy.snapshot())
+		}
+
+		idle := blocked
+		idle.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: f.now.Add(time.Minute)}
+		idle.UpdatedAt = f.now.Add(time.Minute)
+		if err := f.store.UpdateSession(ctx, idle); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.observer.Poll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.spy.snapshot(); len(got) != 1 || !strings.Contains(got[0].body, "backend CI failed") {
+			t.Fatalf("unchanged failed PR did not resume idle worker: %+v", got)
+		}
+		if err := f.observer.Poll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if f.spy.count() != 1 {
+			t.Fatalf("periodic reconciliation duplicated the CI instruction: %+v", f.spy.snapshot())
+		}
+	})
+
 	t.Run("CI failing observation persists rows, nudges once, and is idempotent on re-poll", func(t *testing.T) {
 		ctx := context.Background()
 		f := newSCMFixture(t, "feat/x")
