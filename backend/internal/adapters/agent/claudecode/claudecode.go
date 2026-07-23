@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -221,9 +222,9 @@ func (p *Plugin) PreLaunch(ctx context.Context, cfg ports.LaunchConfig) error {
 // cfg.Session.Metadata["agentSessionId"]; for sessions created before hooks
 // captured it, it falls back to the deterministic UUID AO pins via
 // --session-id at launch. ok is false only when neither is available, so the
-// caller fresh-spawns. The command re-applies the permission mode (resume
-// otherwise reverts to the configured default) but not the prompt/system
-// prompt, which the session already carries.
+// caller fresh-spawns. The command re-applies the permission mode and standing
+// system prompt (resume rebuilds both from flags), but not the completed user
+// prompt from the transcript.
 func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig) (cmd []string, ok bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -258,6 +259,38 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	}
 	cmd = append(cmd, "--resume", sessionID)
 	return cmd, true, nil
+}
+
+// StreamJSONCommand rebuilds the normal restore command and adds Claude's
+// structured print-mode transport. Print mode has no interactive approval
+// surface, so only explicit bypassPermissions sessions are eligible; prompting
+// modes return an error and the daemon preserves the interactive fallback.
+func StreamJSONCommand(ctx context.Context, cfg ports.RestoreConfig) ([]string, error) {
+	permissions := cfg.Permissions
+	if permissions == "" {
+		permissions = cfg.Config.Permissions
+	}
+	if ports.NormalizePermissionMode(permissions) != ports.PermissionModeBypassPermissions {
+		return nil, errors.New("claude-code: structured print mode requires bypassPermissions")
+	}
+	cmd, ok, err := New().GetRestoreCommand(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("claude-code: no resumable session")
+	}
+	return streamJSONCommand(cmd), nil
+}
+
+func streamJSONCommand(restoreCommand []string) []string {
+	return append(restoreCommand,
+		"-p",
+		"--input-format", "stream-json",
+		"--output-format", "stream-json",
+		"--verbose",
+		"--replay-user-messages",
+	)
 }
 
 // SessionInfo surfaces the normalized session metadata that the Claude Code

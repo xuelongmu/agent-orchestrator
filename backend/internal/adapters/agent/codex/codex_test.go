@@ -144,6 +144,70 @@ func TestIsInputPending(t *testing.T) {
 	}
 }
 
+func TestIsMessageInputPending(t *testing.T) {
+	p := New()
+	message := strings.Repeat("large pasted instructions with enough unique context 12345 ", 8)
+	wrapped := strings.Join([]string{message[:140], message[140:310], message[310:]}, "\n")
+	tests := []struct {
+		name   string
+		output string
+		msg    string
+		want   bool
+	}{
+		{name: "literal paste in editor", output: "Working (esc to interrupt)\nDone\n› " + wrapped, msg: message, want: true},
+		{name: "ansi redraw inside literal paste", output: "› " + message[:300] + "\x1b[2K\r" + message[300:], msg: message, want: true},
+		{name: "submitted literal paste", output: "› " + wrapped + "\nWorking (esc to interrupt)", msg: message, want: false},
+		{name: "queued literal paste", output: "Working (esc to interrupt)\n› " + wrapped + "\nPress up to edit queued messages", msg: message, want: false},
+		{name: "completed turn has a new editor", output: "› " + wrapped + "\n• Done\n› ", msg: message, want: false},
+		{name: "different large input", output: "› " + strings.Repeat("other terminal input ", 30), msg: message, want: false},
+		{name: "short input is ambiguous", output: "› please run tests", msg: "please run tests", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := p.IsMessageInputPending(tt.output, tt.msg); got != tt.want {
+				t.Fatalf("IsMessageInputPending(output, message) = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAppServerCommandCarriesSessionHooks(t *testing.T) {
+	cmd := appServerCommand(context.Background(), "codex", ports.RestoreConfig{
+		Config:       ports.AgentConfig{Model: "gpt-test"},
+		Permissions:  ports.PermissionModeAcceptEdits,
+		SystemPrompt: "standing instructions",
+		Session:      ports.SessionRef{WorkspacePath: t.TempDir()},
+	})
+	if cmd[0] != "codex" || cmd[len(cmd)-1] != "app-server" {
+		t.Fatalf("appServerCommand = %#v, want codex ... app-server", cmd)
+	}
+	if !contains(cmd, "--dangerously-bypass-hook-trust") {
+		t.Fatalf("appServerCommand = %#v, missing hook trust bypass", cmd)
+	}
+	for _, hook := range codexManagedHooks {
+		want := "hooks." + hook.Event + "="
+		found := false
+		for _, arg := range cmd {
+			if strings.HasPrefix(arg, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("appServerCommand = %#v, missing %s config", cmd, hook.Event)
+		}
+	}
+	if !containsSubsequence(cmd, []string{"--ask-for-approval", "on-request"}) {
+		t.Fatalf("appServerCommand = %#v, missing approval config", cmd)
+	}
+	if !containsSubsequence(cmd, []string{"--model", "gpt-test"}) {
+		t.Fatalf("appServerCommand = %#v, missing model config", cmd)
+	}
+	if !contains(cmd, "developer_instructions='standing instructions'") {
+		t.Fatalf("appServerCommand = %#v, missing standing instructions", cmd)
+	}
+}
+
 func TestResolveCodexBinaryFindsNVMInstallWhenPathIsSparse(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("NVM install discovery is Unix-specific")

@@ -26,8 +26,8 @@ type SessionReader interface {
 }
 
 // Outcome reports what a guarded write did. Anything other than Sent means the
-// message did NOT reach the pane; callers that record delivery must not stamp
-// a suppressed write as delivered.
+// message did not reach its accepting transport; callers that record delivery
+// must not stamp a suppressed write as delivered.
 type Outcome int
 
 const (
@@ -118,6 +118,14 @@ func (g *Guard) Send(ctx context.Context, id domain.SessionID, msg string) error
 // transition suppresses it alongside blocked decisions. waiting_input does not
 // suppress: that idle prompt is exactly where an Enter re-submit belongs.
 func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
+	outcome, _, err := g.DeliverWithDelivery(ctx, id, msg)
+	return outcome, err
+}
+
+// DeliverWithDelivery is Deliver plus the transport that accepted the
+// message. Structured acceptance lets the session manager skip confirmation
+// logic that is meaningful only after a terminal paste.
+func (g *Guard) DeliverWithDelivery(ctx context.Context, id domain.SessionID, msg string) (Outcome, ports.MessageDelivery, error) {
 	return g.send(ctx, id, msg, func(rec domain.SessionRecord) Outcome {
 		switch rec.Activity.State {
 		case domain.ActivityBlocked:
@@ -139,6 +147,13 @@ func (g *Guard) Deliver(ctx context.Context, id domain.SessionID, msg string) (O
 // than explicit-user Deliver and less restrictive than Nudge, which also
 // suppresses waiting_input.
 func (g *Guard) DeliverAutomated(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
+	outcome, _, err := g.DeliverAutomatedWithDelivery(ctx, id, msg)
+	return outcome, err
+}
+
+// DeliverAutomatedWithDelivery is DeliverAutomated plus the accepting
+// transport.
+func (g *Guard) DeliverAutomatedWithDelivery(ctx context.Context, id domain.SessionID, msg string) (Outcome, ports.MessageDelivery, error) {
 	return g.send(ctx, id, msg, automatedDeliveryRefusal, nil)
 }
 
@@ -158,12 +173,20 @@ func automatedDeliveryRefusal(rec domain.SessionRecord) Outcome {
 // latched as pending in the editor. An automated paste+Enter in those states
 // could answer a dialog or stack text behind a draft that has not submitted.
 func (g *Guard) Nudge(ctx context.Context, id domain.SessionID, msg string) (Outcome, error) {
-	return g.send(ctx, id, msg, nudgeRefusal, nil)
+	outcome, _, err := g.send(ctx, id, msg, nudgeRefusal, nil)
+	return outcome, err
 }
 
 // NudgeIdleEpisode writes an idle-review reminder only when the guard's final
 // pre-write read still belongs to the exact idle episode that authorized it.
 func (g *Guard) NudgeIdleEpisode(ctx context.Context, id domain.SessionID, msg string, idleSince time.Time) (Outcome, error) {
+	outcome, _, err := g.NudgeIdleEpisodeWithDelivery(ctx, id, msg, idleSince)
+	return outcome, err
+}
+
+// NudgeIdleEpisodeWithDelivery is NudgeIdleEpisode plus the accepting
+// transport.
+func (g *Guard) NudgeIdleEpisodeWithDelivery(ctx context.Context, id domain.SessionID, msg string, idleSince time.Time) (Outcome, ports.MessageDelivery, error) {
 	return g.send(ctx, id, msg, nudgeRefusal, func(rec domain.SessionRecord) bool {
 		return rec.Activity.State == domain.ActivityIdle && rec.Activity.LastActivityAt.Equal(idleSince)
 	})
@@ -185,14 +208,14 @@ func nudgeRefusal(rec domain.SessionRecord) Outcome {
 // appear mid-paste — but the just-in-time read is the strongest guarantee
 // available without scraping the terminal. Fail closed: a store error
 // suppresses the write rather than pressing Enter on an unknown state.
-func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refuse func(domain.SessionRecord) Outcome, require func(domain.SessionRecord) bool) (Outcome, error) {
+func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refuse func(domain.SessionRecord) Outcome, require func(domain.SessionRecord) bool) (Outcome, ports.MessageDelivery, error) {
 	rec, ok, err := g.store.GetSession(ctx, id)
 	if err != nil {
-		return SuppressedUnknown, fmt.Errorf("guard %s: read session: %w", id, err)
+		return SuppressedUnknown, ports.MessageDeliveryTerminal, fmt.Errorf("guard %s: read session: %w", id, err)
 	}
 	if !ok {
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "not_found")
-		return SuppressedNotFound, nil
+		return SuppressedNotFound, ports.MessageDeliveryTerminal, nil
 	}
 	// ActivityExited is refused alongside IsTerminated as defense-in-depth:
 	// every exited writer today also sets IsTerminated, but a pane whose agent
@@ -201,7 +224,7 @@ func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refus
 	// discipline alone.
 	if rec.IsTerminated || rec.Activity.State == domain.ActivityExited {
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "terminated")
-		return SuppressedTerminated, nil
+		return SuppressedTerminated, ports.MessageDeliveryTerminal, nil
 	}
 	if outcome := refuse(rec); outcome != Sent {
 		reason := "awaiting_user"
@@ -211,14 +234,23 @@ func (g *Guard) send(ctx context.Context, id domain.SessionID, msg string, refus
 			reason = "pending_submit"
 		}
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", reason, "state", string(rec.Activity.State))
-		return outcome, nil
+		return outcome, ports.MessageDeliveryTerminal, nil
 	}
 	if require != nil && !require(rec) {
 		g.logger.Info("sessionguard: write suppressed", "sessionID", id, "reason", "stale_episode", "state", string(rec.Activity.State))
-		return SuppressedStaleEpisode, nil
+		return SuppressedStaleEpisode, ports.MessageDeliveryTerminal, nil
+	}
+	delivery := ports.MessageDeliveryTerminal
+	if messenger, ok := g.messenger.(ports.DeliveryAwareAgentMessenger); ok {
+		var sendErr error
+		delivery, sendErr = messenger.SendWithDelivery(ctx, id, msg)
+		if sendErr != nil {
+			return Sent, delivery, fmt.Errorf("guard %s: send: %w", id, sendErr)
+		}
+		return Sent, delivery, nil
 	}
 	if err := g.messenger.Send(ctx, id, msg); err != nil {
-		return Sent, fmt.Errorf("guard %s: send: %w", id, err)
+		return Sent, delivery, fmt.Errorf("guard %s: send: %w", id, err)
 	}
-	return Sent, nil
+	return Sent, delivery, nil
 }

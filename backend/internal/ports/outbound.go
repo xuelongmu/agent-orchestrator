@@ -132,6 +132,29 @@ type AgentMessenger interface {
 	Send(ctx context.Context, id domain.SessionID, message string) error
 }
 
+// MessageDelivery identifies the transport that accepted an agent message.
+// Terminal is the conservative default for messengers that do not expose a
+// structured delivery result.
+type MessageDelivery int
+
+const (
+	// MessageDeliveryTerminal means the interactive terminal accepted the
+	// message and terminal-only confirmation may still be required.
+	MessageDeliveryTerminal MessageDelivery = iota
+	// MessageDeliveryStructured means the provider protocol acknowledged the
+	// turn and terminal confirmation must be skipped.
+	MessageDeliveryStructured
+)
+
+// DeliveryAwareAgentMessenger optionally reports whether a message crossed a
+// provider-owned structured protocol instead of the interactive terminal.
+// Callers use this to avoid terminal-only confirmation nudges after the
+// provider has already acknowledged the turn.
+type DeliveryAwareAgentMessenger interface {
+	AgentMessenger
+	SendWithDelivery(ctx context.Context, id domain.SessionID, message string) (MessageDelivery, error)
+}
+
 // ---- runtime / agent / workspace plugin ports ----
 
 // Runtime is the full runtime adapter contract: session creation/teardown plus

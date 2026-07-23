@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
@@ -60,6 +61,109 @@ func (p *Plugin) IsInputPending(terminalOutput string) bool {
 		strings.LastIndex(terminalOutput, "esc to interrupt"),
 	)
 	return pastedAt > turnEvidenceAt
+}
+
+const (
+	// Literal-paste detection is deliberately limited to large messages. Short
+	// snippets are too likely to also occur in normal transcript/output text.
+	minLiteralPasteRunes   = 256
+	literalPasteProbeRunes = 160
+)
+
+// IsMessageInputPending recognizes a large paste that Codex left expanded in
+// the editor instead of replacing with its usual "[Pasted Content ...]"
+// placeholder. Codex can insert soft wraps and terminal escape sequences while
+// rendering the input bar, so compare a long alphanumeric suffix after removing
+// those presentation details. Newer active/queued-turn UI wins over the match:
+// in that case the text crossed the submit boundary and another Enter would be
+// unsafe.
+func (p *Plugin) IsMessageInputPending(terminalOutput, message string) bool {
+	comparableMessage := comparableTerminalText(message)
+	messageRunes := []rune(comparableMessage)
+	if len(messageRunes) < minLiteralPasteRunes {
+		return false
+	}
+	probe := string(messageRunes[len(messageRunes)-literalPasteProbeRunes:])
+	editor, ok := liveCodexEditor(terminalOutput)
+	if !ok {
+		return false
+	}
+	comparableEditor := comparableTerminalText(editor)
+	messageAt := strings.LastIndex(comparableEditor, probe)
+	if messageAt < 0 {
+		return false
+	}
+	turnEvidenceAt := max(
+		strings.LastIndex(comparableEditor, comparableTerminalText("Press up to edit queued messages")),
+		strings.LastIndex(comparableEditor, comparableTerminalText("esc to interrupt")),
+	)
+	return messageAt > turnEvidenceAt
+}
+
+func liveCodexEditor(terminalOutput string) (string, bool) {
+	output := stripTerminalEscapes(terminalOutput)
+	editorAt := strings.LastIndex(output, "›")
+	if editorAt < 0 {
+		return "", false
+	}
+	return output[editorAt+len("›"):], true
+}
+
+func comparableTerminalText(text string) string {
+	text = stripTerminalEscapes(text)
+	var b strings.Builder
+	for _, r := range text {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
+}
+
+// stripTerminalEscapes removes CSI and OSC sequences before building the
+// comparison string. ConPTY's output ring intentionally preserves ANSI, and a
+// redraw sequence can otherwise split a literal message probe.
+func stripTerminalEscapes(text string) string {
+	var b strings.Builder
+	for i := 0; i < len(text); {
+		if text[i] != '\x1b' {
+			b.WriteByte(text[i])
+			i++
+			continue
+		}
+		i++
+		if i >= len(text) {
+			break
+		}
+		switch text[i] {
+		case '[': // CSI: consume through the final byte.
+			i++
+			for i < len(text) {
+				c := text[i]
+				i++
+				if c >= 0x40 && c <= 0x7e {
+					break
+				}
+			}
+		case ']': // OSC: consume through BEL or ST (ESC backslash).
+			i++
+			for i < len(text) {
+				if text[i] == '\a' {
+					i++
+					break
+				}
+				if text[i] == '\x1b' && i+1 < len(text) && text[i+1] == '\\' {
+					i += 2
+					break
+				}
+				i++
+			}
+		default:
+			// Two-byte escape sequence; discard its final byte.
+			i++
+		}
+	}
+	return b.String()
 }
 
 var _ adapters.Adapter = (*Plugin)(nil)
@@ -257,6 +361,36 @@ func ResolveCodexBinary(ctx context.Context) (string, error) {
 	}
 
 	return "", fmt.Errorf("codex: %w", ports.ErrAgentBinaryNotFound)
+}
+
+// AppServerCommand builds the command used by AO's structured message
+// transport. The sidecar carries the same restore-time hooks, workspace trust,
+// permissions, model, and standing instructions as the interactive TUI.
+func AppServerCommand(ctx context.Context, cfg ports.RestoreConfig) ([]string, error) {
+	binary, err := ResolveCodexBinary(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return appServerCommand(ctx, binary, cfg), nil
+}
+
+func appServerCommand(ctx context.Context, binary string, cfg ports.RestoreConfig) []string {
+	cmd := make([]string, 1, 24)
+	cmd[0] = binary
+	appendNoUpdateCheckFlag(&cmd)
+	appendHideRateLimitNudgeFlag(&cmd)
+	appendHookTrustBypassFlag(&cmd)
+	appendApprovalFlags(&cmd, cfg.Permissions)
+	appendSessionHookFlags(&cmd)
+	appendWorkspaceTrustFlag(ctx, &cmd, cfg.Session.WorkspacePath)
+	appendModelFlag(&cmd, cfg.Config.Model)
+	if cfg.SystemPrompt != "" {
+		cmd = append(cmd, "-c", "developer_instructions="+codexTOMLConfigString(cfg.SystemPrompt))
+	} else if cfg.SystemPromptFile != "" {
+		cmd = append(cmd, "-c", "model_instructions_file="+cfg.SystemPromptFile)
+	}
+	cmd = append(cmd, "app-server")
+	return cmd
 }
 
 func nvmNodeBinCandidates(home, binary string) []string {
