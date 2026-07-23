@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -93,21 +94,61 @@ func appendSessionHookFlags(cmd *[]string) {
 // inline table deep-merges with the user's persisted projects map. Both the
 // literal and symlink-resolved paths are trusted because Codex looks trust up
 // by the canonicalized cwd first and the literal path second (on macOS the two
-// commonly differ, e.g. /tmp vs /private/tmp).
-func appendWorkspaceTrustFlag(cmd *[]string, workspacePath string) {
+// commonly differ, e.g. /tmp vs /private/tmp). Linked worktrees also trust the
+// primary worktree: Codex sources project-local `.codex` config from there,
+// not from the linked worktree where the session runs.
+func appendWorkspaceTrustFlag(ctx context.Context, cmd *[]string, workspacePath string) {
 	path := strings.TrimSpace(workspacePath)
 	if path == "" {
 		return
 	}
-	keys := []string{path}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil && resolved != path {
-		keys = append(keys, resolved)
+	keys := make([]string, 0, 4)
+	addKey := func(candidate string) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return
+		}
+		for _, existing := range keys {
+			if filepath.Clean(existing) == filepath.Clean(candidate) {
+				return
+			}
+		}
+		keys = append(keys, candidate)
+		if resolved, err := filepath.EvalSymlinks(candidate); err == nil && resolved != candidate {
+			addResolved := true
+			for _, existing := range keys {
+				if filepath.Clean(existing) == filepath.Clean(resolved) {
+					addResolved = false
+					break
+				}
+			}
+			if addResolved {
+				keys = append(keys, resolved)
+			}
+		}
+	}
+	addKey(path)
+	if primary, ok := resolvePrimaryGitWorktree(ctx, path); ok {
+		addKey(primary)
 	}
 	entries := make([]string, 0, len(keys))
 	for _, key := range keys {
 		entries = append(entries, codexTOMLConfigString(key)+`={trust_level="trusted"}`)
 	}
 	*cmd = append(*cmd, "-c", "projects={"+strings.Join(entries, ",")+"}")
+}
+
+func resolvePrimaryGitWorktree(ctx context.Context, workspacePath string) (string, bool) {
+	output, err := exec.CommandContext(ctx, "git", "-C", workspacePath, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if path, ok := strings.CutPrefix(strings.TrimSpace(line), "worktree "); ok && path != "" {
+			return filepath.Clean(path), true
+		}
+	}
+	return "", false
 }
 
 func codexTOMLConfigString(s string) string {

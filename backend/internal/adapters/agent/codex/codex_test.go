@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -283,7 +284,7 @@ func TestAppendWorkspaceTrustFlagCoversLiteralAndResolvedPaths(t *testing.T) {
 	}
 
 	var cmd []string
-	appendWorkspaceTrustFlag(&cmd, link)
+	appendWorkspaceTrustFlag(context.Background(), &cmd, link)
 	want := []string{
 		"-c",
 		`projects={'` + link + `'={trust_level="trusted"},'` + target + `'={trust_level="trusted"}}`,
@@ -293,16 +294,49 @@ func TestAppendWorkspaceTrustFlagCoversLiteralAndResolvedPaths(t *testing.T) {
 	}
 
 	cmd = nil
-	appendWorkspaceTrustFlag(&cmd, target)
+	appendWorkspaceTrustFlag(context.Background(), &cmd, target)
 	want = []string{"-c", `projects={'` + target + `'={trust_level="trusted"}}`}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("canonical-path trust flag\nwant: %#v\n got: %#v", want, cmd)
 	}
 
 	cmd = nil
-	appendWorkspaceTrustFlag(&cmd, "   ")
+	appendWorkspaceTrustFlag(context.Background(), &cmd, "   ")
 	if cmd != nil {
 		t.Fatalf("blank workspace produced %#v, want no flag", cmd)
+	}
+}
+
+func TestAppendWorkspaceTrustFlagCoversPrimaryGitWorktree(t *testing.T) {
+	primary := canonicalTempDir(t)
+	linked := filepath.Join(canonicalTempDir(t), "linked")
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+
+	runGit("init", "--quiet", primary)
+	runGit("-C", primary, "config", "user.name", "AO Test")
+	runGit("-C", primary, "config", "user.email", "ao-test@example.invalid")
+	if err := os.WriteFile(filepath.Join(primary, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("-C", primary, "add", "README.md")
+	runGit("-C", primary, "commit", "--quiet", "-m", "test")
+	runGit("-C", primary, "worktree", "add", "--quiet", "-b", "linked", linked)
+
+	var cmd []string
+	appendWorkspaceTrustFlag(context.Background(), &cmd, linked)
+	want := []string{
+		"-c",
+		`projects={` + codexTOMLConfigString(linked) + `={trust_level="trusted"},` +
+			codexTOMLConfigString(primary) + `={trust_level="trusted"}}`,
+	}
+	if !reflect.DeepEqual(cmd, want) {
+		t.Fatalf("linked-worktree trust flag\nwant: %#v\n got: %#v", want, cmd)
 	}
 }
 

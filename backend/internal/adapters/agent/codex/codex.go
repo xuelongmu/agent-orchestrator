@@ -97,7 +97,7 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	appendApprovalFlags(&cmd, cfg.Permissions)
 	appendSessionHookFlags(&cmd)
 	appendTerminalCompatibilityFlags(&cmd)
-	appendWorkspaceTrustFlag(&cmd, cfg.WorkspacePath)
+	appendWorkspaceTrustFlag(ctx, &cmd, cfg.WorkspacePath)
 	appendModelFlag(&cmd, cfg.Config.Model)
 
 	if cfg.SystemPrompt != "" {
@@ -139,7 +139,7 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	appendApprovalFlags(&cmd, cfg.Permissions)
 	appendSessionHookFlags(&cmd)
 	appendTerminalCompatibilityFlags(&cmd)
-	appendWorkspaceTrustFlag(&cmd, cfg.Session.WorkspacePath)
+	appendWorkspaceTrustFlag(ctx, &cmd, cfg.Session.WorkspacePath)
 	appendModelFlag(&cmd, cfg.Config.Model)
 	if cfg.SystemPrompt != "" {
 		cmd = append(cmd, "-c", "developer_instructions="+codexTOMLConfigString(cfg.SystemPrompt))
@@ -330,7 +330,7 @@ func DoctorLaunchProbes() [][]string {
 	appendNoUpdateCheckFlag(&overrideProbe)
 	appendHideRateLimitNudgeFlag(&overrideProbe)
 	appendSessionHookFlags(&overrideProbe)
-	appendWorkspaceTrustFlag(&overrideProbe, os.TempDir())
+	appendWorkspaceTrustFlag(context.Background(), &overrideProbe, os.TempDir())
 	return [][]string{flagProbe, overrideProbe}
 }
 
