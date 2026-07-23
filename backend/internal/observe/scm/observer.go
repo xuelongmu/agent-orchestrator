@@ -603,6 +603,35 @@ func (o *Observer) poll(ctx context.Context) (pollErr error) {
 	reviewModes := map[string]ports.ReviewWriteMode{}
 	localOnlyObservations := map[string]bool{}
 	reviewStale := map[string]bool{}
+	// Provider guards deliberately avoid full PR fetches when both metadata and
+	// checks are unchanged. Level-triggered recovery cannot depend on such a
+	// fetch: rebuild only locally actionable/due observations from durable PR
+	// and check facts, then let the same reducer and reaction dedup handle them.
+	for key, subj := range selection.subjectsByPR {
+		if _, fetched := observations[key]; fetched {
+			continue
+		}
+		local := subj.known
+		actionableState := subj.session.Activity.State == domain.ActivityIdle || subj.session.Activity.State == domain.ActivityWaitingInput
+		since := firstTime(local.CIObservedAt, local.ObservedAt)
+		heartbeatDue := local.CI == domain.CIFailing && !since.IsZero() && !now.Before(since.Add(o.stalledPRHeartbeat))
+		if !actionableState && !heartbeatDue {
+			continue
+		}
+		checks, err := o.store.ListChecks(ctx, local.URL)
+		if err != nil {
+			o.logger.Error("scm observer: list local checks for stalled PR reconciliation failed", "pr", local.URL, "err", err)
+			markRepoRefreshFailed(subj.repo)
+			continue
+		}
+		localObs := observationFromLocal(subj.repo, local, checks)
+		localObs.ObservedAt = now
+		if !stalledPRWork(subj.session.Activity.State, localObs) && o.stalledPRHeartbeatNumber(local, localObs, now) == 0 {
+			continue
+		}
+		observations[key] = localObs
+		localOnlyObservations[key] = true
+	}
 	if err := o.refreshReviews(ctx, subjects, observations, selection.subjectsByPR, reviewModes, localOnlyObservations, reviewStale, now); err != nil {
 		return err
 	}
@@ -632,6 +661,7 @@ func (o *Observer) poll(ctx context.Context) (pollErr error) {
 		if !prepared.Changed.Metadata && !prepared.Changed.CI && !prepared.Changed.Review {
 			if o.lifecycle != nil {
 				decision := o.maybeRerunFlakyCI(ctx, subj, prepared)
+				rerunPending := decision == ciRerunRequested || decision == ciRerunStillPending
 				if decision == ciRerunRequested || decision == ciRerunDispatchFailure {
 					lifecycleObservation := prepared
 					lifecycleObservation.CI.RerunRequested = decision == ciRerunRequested
@@ -653,23 +683,25 @@ func (o *Observer) poll(ctx context.Context) (pollErr error) {
 						continue
 					}
 				}
-				if heartbeat := o.stalledPRHeartbeatNumber(local, prepared, now); heartbeat > 0 {
-					if err := o.lifecycle.ApplyStalledPRHeartbeat(ctx, subj.session.ID, prepared, heartbeat); err != nil {
-						o.logger.Error("scm observer: stalled PR escalation failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
-						markRepoRefreshFailed(subj.repo)
-						continue
+				if !rerunPending {
+					if heartbeat := o.stalledPRHeartbeatNumber(local, prepared, now); heartbeat > 0 {
+						if err := o.lifecycle.ApplyStalledPRHeartbeat(ctx, subj.session.ID, prepared, heartbeat); err != nil {
+							o.logger.Error("scm observer: stalled PR escalation failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
+							markRepoRefreshFailed(subj.repo)
+							continue
+						}
 					}
-				}
-				// Actionable PR state is level-triggered for an idle worker or one
-				// sitting at an empty prompt. This recovers failures observed while
-				// delivery was unsafe (or acknowledged by an older daemon) without
-				// waiting for a new GitHub transition. Lifecycle's durable reaction
-				// signatures keep the 30-second reconciliation idempotent.
-				if stalledPRWork(subj.session.Activity.State, prepared) {
-					if err := o.lifecycle.ApplySCMObservation(ctx, subj.session.ID, prepared); err != nil {
-						o.logger.Error("scm observer: stalled PR reconciliation failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
-						markRepoRefreshFailed(subj.repo)
-						continue
+					// Actionable PR state is level-triggered for an idle worker or one
+					// sitting at an empty prompt. This recovers failures observed while
+					// delivery was unsafe (or acknowledged by an older daemon) without
+					// waiting for a new GitHub transition. Lifecycle's durable reaction
+					// signatures keep the 30-second reconciliation idempotent.
+					if stalledPRWork(subj.session.Activity.State, prepared) {
+						if err := o.lifecycle.ApplySCMObservation(ctx, subj.session.ID, prepared); err != nil {
+							o.logger.Error("scm observer: stalled PR reconciliation failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
+							markRepoRefreshFailed(subj.repo)
+							continue
+						}
 					}
 				}
 			}
