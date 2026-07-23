@@ -158,6 +158,15 @@ type inputPendingDetector interface {
 	IsInputPending(terminalOutput string) bool
 }
 
+// messageInputPendingDetector augments the adapter's durable/restart-safe
+// editor marker detection with the message that was just delivered. Some
+// Codex versions render medium-sized pastes literally instead of collapsing
+// them behind "[Pasted Content ...]". The message is intentionally available
+// only during the initial confirmation; AO persists a digest, not prompt text.
+type messageInputPendingDetector interface {
+	IsMessageInputPending(terminalOutput, message string) bool
+}
+
 // sharedDirHookScope lets adapters whose hooks are global explicitly reject
 // shared-directory sessions. Those hooks cannot be removed for one directory
 // owner without affecting unrelated sessions using the same global config.
@@ -417,6 +426,66 @@ func New(d Deps) *Manager {
 	// is built after the logger default).
 	m.messenger = sessionguard.New(d.Store, d.Messenger, m.logger)
 	return m
+}
+
+// MessageRestoreConfig recomputes the same provider configuration used by a
+// full session restore. Structured message sidecars use it so resuming a native
+// provider session does not drop AO's standing instructions, model, or
+// permission mode.
+func (m *Manager) MessageRestoreConfig(ctx context.Context, id domain.SessionID) (ports.RestoreConfig, error) {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return ports.RestoreConfig{}, err
+	}
+	if !ok {
+		return ports.RestoreConfig{}, ErrNotFound
+	}
+	project, err := m.loadProject(ctx, rec.ProjectID)
+	if err != nil {
+		return ports.RestoreConfig{}, err
+	}
+	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID)
+	if err != nil {
+		return ports.RestoreConfig{}, err
+	}
+	agentConfig := effectiveAgentConfig(rec.Kind, project.Config)
+	return ports.RestoreConfig{
+		Config:       agentConfig,
+		Kind:         rec.Kind,
+		Permissions:  agentConfig.Permissions,
+		SystemPrompt: systemPrompt,
+		Session: ports.SessionRef{
+			ID:            string(rec.ID),
+			WorkspacePath: rec.Metadata.WorkspacePath,
+			Metadata: map[string]string{
+				ports.MetadataKeyAgentSessionID: rec.Metadata.AgentSessionID,
+			},
+		},
+	}, nil
+}
+
+// MessageRuntimeEnv rebuilds the exact runtime environment for a provider
+// sidecar, including project variables, AO identity, capability tokens, and
+// the daemon-pinned hook PATH.
+func (m *Manager) MessageRuntimeEnv(ctx context.Context, id domain.SessionID) (map[string]string, error) {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrNotFound
+	}
+	project, err := m.loadProject(ctx, rec.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	env := m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
+	if m.agents != nil {
+		if agent, ok := m.agents.Agent(rec.Harness); ok {
+			m.augmentAgentRuntimeEnv(agent, env)
+		}
+	}
+	return env, nil
 }
 
 // Spawn creates the session row (which assigns the "{project}-{n}" id), then the
@@ -2208,7 +2277,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			}
 			continue
 		}
-		if _, _, recoverErr := m.recoverPendingSubmit(ctx, rec); recoverErr != nil {
+		if _, _, recoverErr := m.recoverPendingSubmit(ctx, rec, ""); recoverErr != nil {
 			m.logger.Error("reconcile: pending submit recovery failed", "sessionID", rec.ID, "error", recoverErr)
 		}
 	}
@@ -2846,17 +2915,16 @@ func (m *Manager) applyWorkspaceProjectPreserved(ctx context.Context, rows []por
 }
 
 // Send delivers a message to a running session's agent through the guarded
-// pane-write primitive, then best-effort confirms the agent actually accepted
-// it. The guard refuses delivery into a session that is gone, terminated, or
+// delivery primitive, then best-effort confirms a terminal paste was accepted.
+// The guard refuses delivery into a session that is gone, terminated, or
 // paused on a permission decision (pasting there could answer the dialog);
 // those refusals surface as typed sentinels so the API reports why instead of
-// silently dropping the message. AO has no delivery ack: the messenger returns
-// nil the moment the runtime paste + Enter commands exit 0, and for a large
-// multiline prompt a single Enter may not submit (claude-code leaves it as an
-// unsubmitted draft). confirmActive observes the durable Activity.State
-// (flipped to active by the user-prompt-submit hook) and re-sends Enter until
-// the session is active or the budget is exhausted. Confirmation never fails
-// the send: it only decides whether to nudge again.
+// silently dropping the message. Structured providers acknowledge the turn
+// directly and skip terminal confirmation. The terminal fallback returns when
+// paste + Enter exits 0, but a large multiline prompt may remain as an
+// unsubmitted draft. confirmActive observes the durable Activity.State and
+// re-sends Enter until the session is active or the budget is exhausted.
+// Confirmation never fails the send: it only decides whether to nudge again.
 func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string) error {
 	return m.send(ctx, id, message, false, nil)
 }
@@ -2892,7 +2960,7 @@ func (m *Manager) send(ctx context.Context, id domain.SessionID, message string,
 			return &InputPendingError{SessionID: id, RecoveryAttempted: latched.Metadata.PendingSubmitRecoveryAttempted}
 		}
 		fingerprint := pendingSubmitFingerprint(message)
-		stillPending, recoveryAttempted, recoverErr := m.recoverPendingSubmit(ctx, latched)
+		stillPending, recoveryAttempted, recoverErr := m.recoverPendingSubmit(ctx, latched, message)
 		if recoverErr != nil {
 			return fmt.Errorf("send %s: recover pending submit: %w", id, recoverErr)
 		}
@@ -2903,13 +2971,16 @@ func (m *Manager) send(ctx context.Context, id domain.SessionID, message string,
 			return nil
 		}
 	}
-	var outcome sessionguard.Outcome
+	var (
+		outcome  sessionguard.Outcome
+		delivery ports.MessageDelivery
+	)
 	if idleSince != nil {
-		outcome, err = m.messenger.NudgeIdleEpisode(ctx, id, message, *idleSince)
+		outcome, delivery, err = m.messenger.NudgeIdleEpisodeWithDelivery(ctx, id, message, *idleSince)
 	} else if automated {
-		outcome, err = m.messenger.DeliverAutomated(ctx, id, message)
+		outcome, delivery, err = m.messenger.DeliverAutomatedWithDelivery(ctx, id, message)
 	} else {
-		outcome, err = m.messenger.Deliver(ctx, id, message)
+		outcome, delivery, err = m.messenger.DeliverWithDelivery(ctx, id, message)
 	}
 	if err != nil {
 		return fmt.Errorf("send %s: %w", id, err)
@@ -2925,6 +2996,9 @@ func (m *Manager) send(ctx context.Context, id domain.SessionID, message string,
 		return fmt.Errorf("send %s: automated delivery suppressed while rate limited", id)
 	case sessionguard.SuppressedStaleEpisode:
 		return fmt.Errorf("send %s: %w", id, ErrNotIdle)
+	}
+	if delivery == ports.MessageDeliveryStructured {
+		return nil
 	}
 	// confirmActive only helps — and is only SAFE — when the harness reports
 	// both a prompt-submit signal (so the loop can observe active) and a
@@ -2948,7 +3022,7 @@ func (m *Manager) send(ctx context.Context, id domain.SessionID, message string,
 		agent, agentOK := m.agents.Agent(rec.Harness)
 		if agentOK {
 			if detector, supportsPendingDetection := agent.(inputPendingDetector); supportsPendingDetection {
-				if err := m.confirmInputSubmitted(ctx, m.messenger, detector, rec, pendingSubmitFingerprint(message)); err != nil {
+				if err := m.confirmInputSubmitted(ctx, m.messenger, detector, rec, message); err != nil {
 					return err
 				}
 			}
@@ -2965,11 +3039,13 @@ func (m *Manager) send(ctx context.Context, id domain.SessionID, message string,
 // pending paste is observed, it sends Enter only through the same just-in-time
 // session guard used by confirmActive. If the paste is still pending after the
 // bounded poll budget, the typed error tells callers not to resend the text.
-func (m *Manager) confirmInputSubmitted(ctx context.Context, guard *sessionguard.Guard, detector inputPendingDetector, rec domain.SessionRecord, fingerprint string) error {
+func (m *Manager) confirmInputSubmitted(ctx context.Context, guard *sessionguard.Guard, detector inputPendingDetector, rec domain.SessionRecord, message string) error {
 	handle := runtimeHandle(rec.Metadata)
 	if handle.ID == "" || m.runtime == nil {
 		return nil
 	}
+	fingerprint := pendingSubmitFingerprint(message)
+	messageDetector, detectsLiteralMessage := detector.(messageInputPendingDetector)
 
 	pending := false
 	recoveryAttempted := false
@@ -2989,7 +3065,11 @@ func (m *Manager) confirmInputSubmitted(ctx context.Context, guard *sessionguard
 			m.logger.Debug("send: pending-input confirmation unavailable", "sessionID", rec.ID, "error", err)
 			return nil
 		}
-		if !detector.IsInputPending(output) {
+		inputPending := detector.IsInputPending(output)
+		if !inputPending && detectsLiteralMessage {
+			inputPending = messageDetector.IsMessageInputPending(output, message)
+		}
+		if !inputPending {
 			// Empty output can be a best-effort runtime read failure. It does not
 			// prove an already-observed draft was submitted.
 			if pending && output == "" {
@@ -3045,9 +3125,11 @@ func (m *Manager) confirmInputSubmitted(ctx context.Context, guard *sessionguard
 }
 
 // recoverPendingSubmit inspects and, when still safe and not previously
-// claimed, submits one durably latched editor draft with Enter only. It returns
-// stillPending when callers must not deliver any full prompt text.
-func (m *Manager) recoverPendingSubmit(ctx context.Context, rec domain.SessionRecord) (stillPending, recoveryAttempted bool, err error) {
+// claimed, submits one durably latched editor draft with Enter only. A retry's
+// matching message lets adapters re-detect an expanded literal draft that has
+// no collapsed-paste marker. It returns stillPending when callers must not
+// deliver any full prompt text.
+func (m *Manager) recoverPendingSubmit(ctx context.Context, rec domain.SessionRecord, message string) (stillPending, recoveryAttempted bool, err error) {
 	fingerprint := rec.Metadata.PendingSubmitFingerprint
 	if fingerprint == "" {
 		return false, false, nil
@@ -3067,6 +3149,10 @@ func (m *Manager) recoverPendingSubmit(ctx context.Context, rec domain.SessionRe
 	if !ok {
 		return true, rec.Metadata.PendingSubmitRecoveryAttempted, nil
 	}
+	messageDetector, detectsLiteralMessage := detector.(messageInputPendingDetector)
+	canDetectLiteralMessage := detectsLiteralMessage &&
+		message != "" &&
+		pendingSubmitFingerprint(message) == fingerprint
 
 	recoveryAttempted = rec.Metadata.PendingSubmitRecoveryAttempted
 	handle := runtimeHandle(rec.Metadata)
@@ -3083,7 +3169,11 @@ func (m *Manager) recoverPendingSubmit(ctx context.Context, rec domain.SessionRe
 		if outputErr != nil {
 			return true, recoveryAttempted, fmt.Errorf("read pending-input terminal output: %w", outputErr)
 		}
-		if !detector.IsInputPending(output) {
+		inputPending := detector.IsInputPending(output)
+		if !inputPending && canDetectLiteralMessage {
+			inputPending = messageDetector.IsMessageInputPending(output, message)
+		}
+		if !inputPending {
 			if output == "" {
 				continue
 			}

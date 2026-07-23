@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -410,6 +411,47 @@ func TestGetRestoreCommandReappendsSystemPrompt(t *testing.T) {
 	want := []string{"claude", "--permission-mode", "bypassPermissions", "--append-system-prompt", "You are an orchestrator.", "--resume", "claude-native-1"}
 	if !reflect.DeepEqual(cmd, want) {
 		t.Fatalf("restore cmd\nwant: %#v\n got: %#v", want, cmd)
+	}
+}
+
+func TestStreamJSONCommandPreservesRestoreFlags(t *testing.T) {
+	restore := []string{
+		"claude",
+		"--permission-mode", "bypassPermissions",
+		"--append-system-prompt", "You are an orchestrator.",
+		"--resume", "claude-native-1",
+	}
+	got := streamJSONCommand(append([]string(nil), restore...))
+	want := append(restore,
+		"-p",
+		"--input-format", "stream-json",
+		"--output-format", "stream-json",
+		"--verbose",
+		"--replay-user-messages",
+	)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stream JSON command\nwant: %#v\n got: %#v", want, got)
+	}
+}
+
+func TestStreamJSONCommandRejectsPromptingPermissionModes(t *testing.T) {
+	for _, permissions := range []ports.PermissionMode{
+		ports.PermissionModeDefault,
+		ports.PermissionModeAcceptEdits,
+		ports.PermissionModeAuto,
+	} {
+		t.Run(string(permissions), func(t *testing.T) {
+			_, err := StreamJSONCommand(context.Background(), ports.RestoreConfig{
+				Permissions: permissions,
+				Session: ports.SessionRef{
+					ID:       "sess-r",
+					Metadata: map[string]string{ports.MetadataKeyAgentSessionID: "claude-native-1"},
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), "requires bypassPermissions") {
+				t.Fatalf("StreamJSONCommand error = %v, want bypassPermissions requirement", err)
+			}
+		})
 	}
 }
 

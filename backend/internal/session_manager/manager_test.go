@@ -1028,6 +1028,15 @@ func (m *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) 
 	return m.err
 }
 
+type structuredMessenger struct {
+	fakeMessenger
+}
+
+func (m *structuredMessenger) SendWithDelivery(_ context.Context, _ domain.SessionID, msg string) (ports.MessageDelivery, error) {
+	m.msgs = append(m.msgs, msg)
+	return ports.MessageDeliveryStructured, m.err
+}
+
 func TestSend_WrapsCopilotOrchestratorMessageWithDelegationDirective(t *testing.T) {
 	st := newFakeStore()
 	st.sessions["mer-1"] = domain.SessionRecord{
@@ -5475,6 +5484,83 @@ func TestRestore_OrchestratorRederivesSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestMessageRestoreConfigRederivesProviderSettings(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{
+		ID: "mer",
+		Config: domain.ProjectConfig{
+			AgentConfig: domain.AgentConfig{Model: "base-model"},
+			Orchestrator: domain.RoleOverride{
+				AgentConfig: domain.AgentConfig{
+					Model:       "orchestrator-model",
+					Permissions: domain.PermissionModeAuto,
+				},
+			},
+			OrchestratorRules: "Delegate implementation work.",
+		},
+	}
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator, Harness: domain.HarnessCodex,
+		Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", AgentSessionID: "native-1"},
+	}
+	m := New(Deps{Store: st, DataDir: t.TempDir()})
+
+	cfg, err := m.MessageRestoreConfig(context.Background(), "mer-1")
+	if err != nil {
+		t.Fatalf("MessageRestoreConfig: %v", err)
+	}
+	if cfg.Config.Model != "orchestrator-model" || cfg.Permissions != domain.PermissionModeAuto {
+		t.Fatalf("agent config = %#v permissions=%q", cfg.Config, cfg.Permissions)
+	}
+	if cfg.Session.Metadata[ports.MetadataKeyAgentSessionID] != "native-1" ||
+		cfg.Session.WorkspacePath != "/ws/mer-1" {
+		t.Fatalf("session ref = %#v", cfg.Session)
+	}
+	if !strings.Contains(cfg.SystemPrompt, "Delegate implementation work.") {
+		t.Fatalf("system prompt missing current orchestrator rules:\n%s", cfg.SystemPrompt)
+	}
+}
+
+func TestMessageRuntimeEnvMatchesSessionRuntimeEnvironment(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{
+		ID: "mer",
+		Config: domain.ProjectConfig{Env: map[string]string{
+			"PROJECT_ENV": "kept",
+			"PATH":        "project-bin",
+		}},
+	}
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID: "mer-1", ProjectID: "mer", IssueID: "issue-9", Kind: domain.KindWorker,
+	}
+	executableName := "ao"
+	if runtime.GOOS == "windows" {
+		executableName += ".exe"
+	}
+	executablePath := filepath.Join(t.TempDir(), executableName)
+	dataDir := t.TempDir()
+	m := New(Deps{
+		Store:      st,
+		DataDir:    dataDir,
+		Executable: func() (string, error) { return executablePath, nil },
+	})
+
+	env, err := m.MessageRuntimeEnv(context.Background(), "mer-1")
+	if err != nil {
+		t.Fatalf("MessageRuntimeEnv: %v", err)
+	}
+	if env[EnvSessionID] != "mer-1" || env[EnvProjectID] != "mer" || env[EnvIssueID] != "issue-9" {
+		t.Fatalf("AO identity env = %#v", env)
+	}
+	if env[EnvDataDir] != dataDir || env["PROJECT_ENV"] != "kept" {
+		t.Fatalf("runtime env = %#v", env)
+	}
+	wantPath := filepath.Dir(executablePath) + string(os.PathListSeparator) + "project-bin"
+	if env["PATH"] != wantPath {
+		t.Fatalf("PATH = %q, want %q", env["PATH"], wantPath)
+	}
+}
+
 func TestRestore_FallsBackToInlineWhenPromptFileUnavailable(t *testing.T) {
 	st := newFakeStore()
 	st.sessions["mer-1"] = domain.SessionRecord{
@@ -7990,6 +8076,12 @@ func (pendingInputAgent) IsInputPending(output string) bool {
 	return pastedAt > strings.LastIndex(output, "esc to interrupt")
 }
 
+type literalPendingInputAgent struct{ pendingInputAgent }
+
+func (literalPendingInputAgent) IsMessageInputPending(output, message string) bool {
+	return strings.Contains(output, "LITERAL-DRAFT:"+message)
+}
+
 // newSendTestManager builds a Manager wired for Send confirmation tests with
 // fast (millisecond) confirmation timings so no test waits real seconds. The
 // returned messenger records every Send; the store is mutable so a test can
@@ -8036,6 +8128,24 @@ func TestSend_SkipsConfirmForHooklessHarness(t *testing.T) {
 	}
 }
 
+func TestSend_SkipsTerminalConfirmationAfterStructuredAcknowledgement(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = domain.SessionRecord{
+		ID:       "s1",
+		Harness:  domain.HarnessClaudeCode,
+		Activity: domain.Activity{State: domain.ActivityIdle},
+	}
+	msg := &structuredMessenger{}
+	m := newSendTestManager(t, signalingAgent{}, msg, st)
+
+	if err := m.Send(context.Background(), "s1", "hello provider"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !reflect.DeepEqual(msg.msgs, []string{"hello provider"}) {
+		t.Fatalf("messages = %#v, want structured message only with no terminal nudges", msg.msgs)
+	}
+}
+
 func TestSend_CodexPendingInputRecoversWithEnterOnly(t *testing.T) {
 	st := newFakeStore()
 	st.sessions["s1"] = domain.SessionRecord{
@@ -8057,6 +8167,35 @@ func TestSend_CodexPendingInputRecoversWithEnterOnly(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 	if !reflect.DeepEqual(msg.msgs, []string{"large multiline review context", ""}) {
+		t.Fatalf("messages = %#v, want full text once followed by Enter-only recovery", msg.msgs)
+	}
+	if rt.outputCalls != 2 {
+		t.Fatalf("GetOutput calls = %d, want 2", rt.outputCalls)
+	}
+}
+
+func TestSend_CodexLiteralPendingInputRecoversWithEnterOnly(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["s1"] = domain.SessionRecord{
+		ID: "s1", Harness: domain.HarnessCodex,
+		Metadata: domain.SessionMetadata{RuntimeHandleID: "h1"},
+	}
+	message := strings.Repeat("literal pasted review context ", 50)
+	rt := &fakeRuntime{outputs: []string{
+		"â€º LITERAL-DRAFT:" + message,
+		"Working (esc to interrupt)",
+	}}
+	msg := &fakeMessenger{}
+	m := New(Deps{
+		Runtime: rt, Agents: singleAgent{literalPendingInputAgent{}}, Store: st,
+		Messenger: msg, Logger: slog.Default(),
+	})
+	m.sendConfirm = sendConfirmConfig{pollInterval: time.Millisecond, maxAttempts: 3}
+
+	if err := m.Send(context.Background(), "s1", message); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !reflect.DeepEqual(msg.msgs, []string{message, ""}) {
 		t.Fatalf("messages = %#v, want full text once followed by Enter-only recovery", msg.msgs)
 	}
 	if rt.outputCalls != 2 {
@@ -8120,6 +8259,37 @@ func TestSend_CodexDiscardedPendingErrorDoesNotResendPrompt(t *testing.T) {
 	got := st.sessions["s1"].Metadata
 	if got.PendingSubmitFingerprint == "" || !got.PendingSubmitRecoveryAttempted {
 		t.Fatalf("pending-submit latch = %+v, want durable attempted latch", got)
+	}
+}
+
+func TestSend_CodexLiteralPendingRetryKeepsLatch(t *testing.T) {
+	st := newFakeStore()
+	message := strings.Repeat("literal pasted review context ", 50)
+	st.sessions["s1"] = domain.SessionRecord{
+		ID: "s1", Harness: domain.HarnessCodex,
+		Metadata: domain.SessionMetadata{RuntimeHandleID: "h1"},
+	}
+	literalDraft := "› LITERAL-DRAFT:" + message
+	rt := &fakeRuntime{outputs: []string{literalDraft, literalDraft, literalDraft, literalDraft}}
+	msg := &fakeMessenger{}
+	m := New(Deps{
+		Runtime: rt, Agents: singleAgent{literalPendingInputAgent{}}, Store: st,
+		Messenger: msg, Logger: slog.Default(),
+	})
+	m.sendConfirm = sendConfirmConfig{pollInterval: time.Millisecond, maxAttempts: 2}
+
+	if err := m.Send(context.Background(), "s1", message); !errors.Is(err, ErrInputPending) {
+		t.Fatalf("first Send error = %v, want ErrInputPending", err)
+	}
+	if err := m.Send(context.Background(), "s1", message); !errors.Is(err, ErrInputPending) {
+		t.Fatalf("retry error = %v, want ErrInputPending", err)
+	}
+	if !reflect.DeepEqual(msg.msgs, []string{message, ""}) {
+		t.Fatalf("messages = %#v, want full text and Enter each delivered exactly once", msg.msgs)
+	}
+	got := st.sessions["s1"].Metadata
+	if got.PendingSubmitFingerprint != pendingSubmitFingerprint(message) || !got.PendingSubmitRecoveryAttempted {
+		t.Fatalf("pending-submit latch = %+v, want literal draft retained", got)
 	}
 }
 
