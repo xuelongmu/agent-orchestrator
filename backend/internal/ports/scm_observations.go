@@ -87,6 +87,10 @@ type SCMObservation struct {
 type SCMChanged struct {
 	// Metadata is true when PR metadata or mergeability facts changed.
 	Metadata bool
+	// Head is true only when an already-tracked PR moved to a different exact
+	// head. PreviousHeadSHA identifies the prior head for stack routing.
+	Head            bool
+	PreviousHeadSHA string
 	// CI is true when check/CI facts or failure logs changed.
 	CI bool
 	// Review is true when review decision, threads, or comments changed.

@@ -316,6 +316,19 @@ flowchart TD
 
 ### Feedback Routing Flow
 
+PR supervision has two cadences. The 30-second observer poll routes new CI,
+review, conflict, and stacked-parent head changes to the owning worker. A
+10-minute heartbeat checks each open failing PR against its durable CI-observed
+timestamp. Authoritative `active` hook state or an outstanding tool flight wins
+over conversational silence, so a long-running worker is not interrupted. The
+first eligible unchanged heartbeat reminds a workable worker directly; only a
+third unchanged heartbeat (30 minutes at the default cadence) with no
+authoritative progress emits one restart-safe operator escalation. This leaves
+room for a normal long-running code-review pass without sacrificing the early
+worker-only reminder. Heartbeat windows, reminders, and escalation outcomes
+are durable. New head or CI progress rearms the episode. Stacked-parent head
+delivery is also persisted until the worker can safely receive it.
+
 ```mermaid
 sequenceDiagram
     participant SCM as SCM Observer

@@ -25,6 +25,7 @@ const reviewMaxNudge = 3
 const mergeConflictMaxNudge = 1
 const idleReviewMaxNudges = 3
 const reactionReservationLease = 30 * time.Second
+const stalledPREscalationHeartbeat = 3
 
 const reviewRoundCapNotificationFailed = "review-round-cap-notification-failed"
 const suppressedNudgeNotificationFailed = "suppressed-nudge-notification-failed"
@@ -34,9 +35,11 @@ const idleReviewUndeliverable = "idle-review-undeliverable"
 const idleReviewNudgeFailed = "idle-review-nudge-failed"
 const idleReviewNudgeExhausted = "idle-review-nudge-exhausted"
 const prReactionDeliveryUncertain = "pr-reaction-delivery-uncertain"
+const stalledPRHeartbeatNotificationFailed = "stalled-pr-heartbeat-notification-failed"
 
 var errMergedCleanupRateLimited = errors.New("merged cleanup parked by agent usage limit")
 var errPRReactionHandoffPending = errors.New("uncertain PR reaction operator handoff is pending")
+var errStackParentDispatchPending = errors.New("stack parent head-change delivery is pending")
 
 type humanHandoffOutcomeKind string
 
@@ -95,7 +98,7 @@ func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionI
 	if err != nil || !ok {
 		return ReviewDeliveryNoop, err
 	}
-	if rec.IsTerminated || rec.Activity.State.PausesAutomation() {
+	if rec.IsTerminated || rec.Activity.State.BlocksAutomatedDelivery() {
 		return ReviewDeliveryNoop, nil
 	}
 	if m.guard == nil {
@@ -304,6 +307,7 @@ type reactionState struct {
 	seen     map[string]string
 	attempts map[string]int
 	handoffs map[string]humanHandoffOutcome
+	pending  map[string]string
 	// loaded tracks PR URLs whose persisted dedup payload has been merged into
 	// seen/attempts during this process. Lazy: we only pay the DB read on the
 	// first reaction touching each PR after startup.
@@ -311,7 +315,7 @@ type reactionState struct {
 }
 
 func newReactionState() reactionState {
-	return reactionState{seen: map[string]string{}, attempts: map[string]int{}, handoffs: map[string]humanHandoffOutcome{}, loaded: map[string]bool{}}
+	return reactionState{seen: map[string]string{}, attempts: map[string]int{}, handoffs: map[string]humanHandoffOutcome{}, pending: map[string]string{}, loaded: map[string]bool{}}
 }
 
 // reactionPayload is the JSON document persisted in pr.last_nudge_signature.
@@ -321,6 +325,7 @@ type reactionPayload struct {
 	Seen     map[string]string              `json:"seen,omitempty"`
 	Attempts map[string]int                 `json:"attempts,omitempty"`
 	Handoffs map[string]humanHandoffOutcome `json:"handoffs,omitempty"`
+	Pending  map[string]string              `json:"pending,omitempty"`
 }
 
 func reviewRoundCapHandoffKey(prURL string) string {
@@ -465,7 +470,7 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 	if err != nil || !ok {
 		return err
 	}
-	if rec.IsTerminated || rec.Activity.State.PausesAutomation() {
+	if rec.IsTerminated || rec.Activity.State.BlocksAutomatedDelivery() {
 		return nil
 	}
 	// A single PR can trip several actionable conditions at once (failing CI,
@@ -1055,7 +1060,7 @@ func (m *Manager) ApplyReviewResult(ctx context.Context, workerID domain.Session
 	if err != nil || !ok {
 		return ReviewDeliveryNoop, err
 	}
-	if rec.IsTerminated || rec.Activity.State.PausesAutomation() {
+	if rec.IsTerminated || rec.Activity.State.BlocksAutomatedDelivery() {
 		return ReviewDeliveryNoop, nil
 	}
 	if m.guard == nil {
@@ -1152,6 +1157,16 @@ func (m *Manager) ApplySCMObservation(ctx context.Context, id domain.SessionID, 
 	if !o.Fetched {
 		return nil
 	}
+	if o.Changed.CI {
+		if err := m.resetStalledPRHeartbeat(ctx, firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)); err != nil {
+			return err
+		}
+	}
+	if o.Changed.Metadata {
+		if err := m.applyStackParentHeadChange(ctx, id, o); err != nil {
+			return err
+		}
+	}
 	if err := m.ApplyPRObservation(ctx, id, scmToPRObservation(o)); err != nil {
 		return err
 	}
@@ -1161,6 +1176,359 @@ func (m *Manager) ApplySCMObservation(ctx context.Context, id domain.SessionID, 
 	}
 	m.emitNotification(ctx, intent)
 	return nil
+}
+
+// ApplyStalledPRHeartbeat reconciles one unchanged failing-head episode at a
+// coarse heartbeat boundary. A positively active worker is left alone. The
+// first eligible heartbeat reminds a workable worker directly; only a later
+// unchanged heartbeat may hand off to a human. Episode, reminder, progress,
+// and notification state are durable so daemon restarts preserve the policy.
+func (m *Manager) ApplyStalledPRHeartbeat(ctx context.Context, id domain.SessionID, o ports.SCMObservation, heartbeat int) error {
+	prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
+	projected := scmToPRObservation(o)
+	checks := failedPRChecks(projected.Checks)
+	if heartbeat < 1 || prURL == "" || projected.HeadSHA == "" || projected.CI != domain.CIFailing || len(checks) == 0 {
+		return nil
+	}
+	rec, busy, ok, err := m.stalledPRWorkerState(ctx, id)
+	if err != nil || !ok {
+		return err
+	}
+	sig := projected.HeadSHA + "\x00" + ciFailureSignature(checks)
+	seenKey := "heartbeat:" + prURL
+	windowKey := "heartbeat-window:" + prURL
+	baseKey := "heartbeat-base:" + prURL
+	reminderKey := "heartbeat-reminder:" + prURL
+	progressKey := "heartbeat-progress:" + prURL
+	handoffKey := "heartbeat-handoff:" + prURL
+
+	m.react.mu.Lock()
+	if !m.react.loaded[prURL] {
+		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+			m.react.mu.Unlock()
+			return err
+		}
+		m.react.loaded[prURL] = true
+	}
+	if m.react.seen[seenKey] != sig {
+		m.react.seen[seenKey] = sig
+		delete(m.react.seen, reminderKey)
+		delete(m.react.attempts, reminderKey)
+		delete(m.react.attempts, windowKey)
+		delete(m.react.attempts, baseKey)
+		delete(m.react.pending, progressKey)
+		delete(m.react.handoffs, handoffKey)
+	}
+	if m.react.attempts[windowKey] >= heartbeat || m.react.handoffs[handoffKey].Outcome == humanHandoffNotified {
+		m.react.mu.Unlock()
+		return nil
+	}
+
+	markWindow := func(progressAt time.Time, restart bool) error {
+		m.react.attempts[windowKey] = heartbeat
+		if restart {
+			m.react.attempts[baseKey] = heartbeat
+		}
+		if !progressAt.IsZero() {
+			m.react.pending[progressKey] = sig + "\x00" + progressAt.UTC().Format(time.RFC3339Nano)
+		}
+		return m.persistPRSignaturesLocked(ctx, prURL)
+	}
+	episodeHeartbeat := heartbeat - m.react.attempts[baseKey]
+
+	// Active is authoritative even when no conversational message has appeared
+	// for a long time. An outstanding tool flight additionally covers the case
+	// where a background agent is working while the main prompt remains in a
+	// sticky waiting_input state.
+	if busy {
+		err := markWindow(m.clock(), true)
+		m.react.mu.Unlock()
+		return err
+	}
+
+	reminded := m.react.seen[reminderKey] == sig
+	if reminded {
+		if checkpoint, ok := stalledPRProgressTime(m.react.pending[progressKey], sig); ok && rec.Activity.LastActivityAt.After(checkpoint) {
+			err := markWindow(rec.Activity.LastActivityAt, true)
+			m.react.mu.Unlock()
+			return err
+		}
+	}
+	if !rec.IsTerminated && episodeHeartbeat < stalledPREscalationHeartbeat && reminded {
+		err := markWindow(time.Time{}, false)
+		m.react.mu.Unlock()
+		return err
+	}
+
+	// Unsafe delivery states wait through the same review-sized window before
+	// entering the human lane because AO has no viable deterministic worker
+	// action. A terminated worker has no viable path even at the first heartbeat.
+	unsafe := rec.Activity.State.BlocksAutomatedDelivery()
+	if !rec.IsTerminated && (!unsafe || episodeHeartbeat < stalledPREscalationHeartbeat) && !reminded {
+		if unsafe {
+			err := markWindow(time.Time{}, false)
+			m.react.mu.Unlock()
+			return err
+		}
+		m.react.mu.Unlock()
+		latest, latestBusy, ok, err := m.stalledPRWorkerState(ctx, id)
+		if err != nil || !ok {
+			return err
+		}
+		if latestBusy || latest.Activity.LastActivityAt.After(rec.Activity.LastActivityAt) {
+			m.react.mu.Lock()
+			if m.react.seen[seenKey] != sig {
+				m.react.mu.Unlock()
+				return nil
+			}
+			err := markWindow(m.clock(), true)
+			m.react.mu.Unlock()
+			return err
+		}
+		msg := fmt.Sprintf("[AO heartbeat] PR #%d still has unchanged failing CI after one monitoring heartbeat. Continue the fix, inspect the failed checks, and push progress when ready.\nPR: %s", o.PR.Number, domain.SanitizeControlChars(prURL))
+		fences := []ports.PRReactionFence{{PRURL: prURL, SessionID: id, HeadSHA: projected.HeadSHA}}
+		outcome, err := m.sendOnce(ctx, id, prURL, reminderKey, sig, fences, msg, 1)
+		if err != nil || outcome == sendOnceSuppressed {
+			return err
+		}
+		m.react.mu.Lock()
+		err = markWindow(m.clock(), false)
+		m.react.mu.Unlock()
+		return err
+	}
+
+	if m.react.handoffs[handoffKey].Outcome == humanHandoffNotified {
+		m.react.mu.Unlock()
+		return nil
+	}
+	m.react.mu.Unlock()
+	latest, latestBusy, ok, err := m.stalledPRWorkerState(ctx, id)
+	if err != nil || !ok {
+		return err
+	}
+	if latestBusy || latest.Activity.LastActivityAt.After(rec.Activity.LastActivityAt) {
+		m.react.mu.Lock()
+		if m.react.seen[seenKey] != sig {
+			m.react.mu.Unlock()
+			return nil
+		}
+		err := markWindow(m.clock(), true)
+		m.react.mu.Unlock()
+		return err
+	}
+	rec = latest
+	m.react.mu.Lock()
+	if m.react.seen[seenKey] != sig || m.react.handoffs[handoffKey].Outcome == humanHandoffNotified {
+		m.react.mu.Unlock()
+		return nil
+	}
+	intent := ports.NotificationIntent{
+		Type:               domain.NotificationNeedsInput,
+		SessionID:          rec.ID,
+		ProjectID:          rec.ProjectID,
+		PRURL:              prURL,
+		CreatedAt:          m.clock(),
+		TitleOverride:      fmt.Sprintf("PR #%d is still red after %d heartbeats", o.PR.Number, heartbeat),
+		BodyOverride:       "The pull request still has unchanged failing CI after AO's worker-reminder window, and no authoritative worker progress was observed. Inspect the worker and pull request.",
+		SessionDisplayName: rec.DisplayName,
+		PRNumber:           o.PR.Number,
+		PRTitle:            o.PR.Title,
+		PRSourceBranch:     o.PR.SourceBranch,
+		PRTargetBranch:     o.PR.TargetBranch,
+		Provider:           o.Provider,
+		Repo:               o.Repo,
+	}
+	err = m.deliverHumanHandoffLocked(ctx, prURL, handoffKey, stalledPRHeartbeatNotificationFailed, intent, nil)
+	m.react.mu.Unlock()
+	return err
+}
+
+func (m *Manager) stalledPRWorkerState(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return rec, false, ok, err
+	}
+	if !rec.IsTerminated && rec.Activity.State == domain.ActivityActive {
+		return rec, true, true, nil
+	}
+	flight := m.flights[id]
+	if flight != nil && !rec.IsTerminated {
+		for _, progress := range flight.inflight {
+			if progress.started > progress.completed {
+				return rec, true, true, nil
+			}
+		}
+	}
+	return rec, false, true, nil
+}
+
+func stalledPRProgressTime(raw, sig string) (time.Time, bool) {
+	prefix := sig + "\x00"
+	if !strings.HasPrefix(raw, prefix) {
+		return time.Time{}, false
+	}
+	stamp, err := time.Parse(time.RFC3339Nano, strings.TrimPrefix(raw, prefix))
+	return stamp, err == nil
+}
+
+func (m *Manager) resetStalledPRHeartbeat(ctx context.Context, prURL string) error {
+	if prURL == "" {
+		return nil
+	}
+	m.react.mu.Lock()
+	defer m.react.mu.Unlock()
+	if !m.react.loaded[prURL] {
+		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+			return err
+		}
+		m.react.loaded[prURL] = true
+	}
+	seenKey := "heartbeat:" + prURL
+	windowKey := "heartbeat-window:" + prURL
+	baseKey := "heartbeat-base:" + prURL
+	reminderKey := "heartbeat-reminder:" + prURL
+	progressKey := "heartbeat-progress:" + prURL
+	handoffKey := "heartbeat-handoff:" + prURL
+	if _, seen := m.react.seen[seenKey]; !seen {
+		if _, reminded := m.react.seen[reminderKey]; !reminded {
+			if _, windowed := m.react.attempts[windowKey]; !windowed {
+				if _, based := m.react.attempts[baseKey]; !based {
+					if _, progressed := m.react.pending[progressKey]; !progressed {
+						if _, handedOff := m.react.handoffs[handoffKey]; !handedOff {
+							return nil
+						}
+					}
+				}
+			}
+		}
+	}
+	delete(m.react.seen, seenKey)
+	delete(m.react.seen, reminderKey)
+	delete(m.react.attempts, reminderKey)
+	delete(m.react.attempts, windowKey)
+	delete(m.react.attempts, baseKey)
+	delete(m.react.pending, progressKey)
+	delete(m.react.handoffs, handoffKey)
+	return m.persistPRSignaturesLocked(ctx, prURL)
+}
+
+func (m *Manager) applyStackParentHeadChange(ctx context.Context, id domain.SessionID, o ports.SCMObservation) error {
+	prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
+	pendingKey := "stack-parent-pending:" + prURL
+	if prURL == "" || o.PR.HeadSHA == "" {
+		return nil
+	}
+
+	m.react.mu.Lock()
+	if !m.react.loaded[prURL] {
+		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+			m.react.mu.Unlock()
+			return err
+		}
+		m.react.loaded[prURL] = true
+	}
+	if o.Changed.Head {
+		m.react.pending[pendingKey] = o.Changed.PreviousHeadSHA + "\x00" + o.PR.HeadSHA
+		if err := m.persistPRSignaturesLocked(ctx, prURL); err != nil {
+			m.react.mu.Unlock()
+			return err
+		}
+	}
+	pending := m.react.pending[pendingKey]
+	m.react.mu.Unlock()
+	if pending == "" {
+		return nil
+	}
+	parts := strings.SplitN(pending, "\x00", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return nil
+	}
+
+	parent, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	sessions := []domain.SessionRecord{parent}
+	if lister, ok := m.store.(stackSessionStore); ok {
+		sessions, err = lister.ListAllSessions(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	sort.Slice(sessions, func(i, j int) bool { return sessions[i].ID < sessions[j].ID })
+	childrenBySession := make(map[domain.SessionID][]domain.PullRequest)
+	for _, session := range sessions {
+		if session.ProjectID != parent.ProjectID {
+			continue
+		}
+		prs, err := m.store.ListPRsBySession(ctx, session.ID)
+		if err != nil {
+			return err
+		}
+		for _, pr := range prs {
+			if !pr.Merged && !pr.Closed && pr.URL != prURL && pr.TargetBranch == o.PR.SourceBranch && stackPRMatchesObservationRepo(pr, o) {
+				childrenBySession[session.ID] = append(childrenBySession[session.ID], pr)
+			}
+		}
+	}
+	if len(childrenBySession) == 0 {
+		m.react.mu.Lock()
+		delete(m.react.pending, pendingKey)
+		err := m.persistPRSignaturesLocked(ctx, prURL)
+		m.react.mu.Unlock()
+		return err
+	}
+	sessionIDs := make([]domain.SessionID, 0, len(childrenBySession))
+	for sessionID := range childrenBySession {
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+	sort.Slice(sessionIDs, func(i, j int) bool { return sessionIDs[i] < sessionIDs[j] })
+	pendingDelivery := false
+	for _, sessionID := range sessionIDs {
+		children := childrenBySession[sessionID]
+		sort.Slice(children, func(i, j int) bool { return children[i].URL < children[j].URL })
+		childURLs := make([]string, 0, len(children))
+		fences := []ports.PRReactionFence{{PRURL: prURL, SessionID: id, HeadSHA: parts[1]}}
+		for _, child := range children {
+			childURLs = append(childURLs, child.URL)
+			if child.URL != "" && child.HeadSHA != "" {
+				fences = append(fences, ports.PRReactionFence{PRURL: child.URL, SessionID: sessionID, HeadSHA: child.HeadSHA})
+			}
+		}
+		msg := fmt.Sprintf("A stacked parent PR moved from %s to %s. Update the dependent PR branch(es) and rerun their checks.\nParent: %s\nAffected child PRs:\n- %s",
+			domain.SanitizeControlChars(parts[0]), domain.SanitizeControlChars(parts[1]), domain.SanitizeControlChars(prURL), strings.Join(childURLs, "\n- "))
+		key := "stack-parent:" + prURL + ":" + string(sessionID)
+		outcome, err := m.sendOnce(ctx, sessionID, prURL, key, parts[1], fences, msg, 0)
+		if err != nil {
+			return err
+		}
+		if outcome == sendOnceSuppressed {
+			pendingDelivery = true
+		}
+	}
+	if pendingDelivery {
+		return errStackParentDispatchPending
+	}
+	m.react.mu.Lock()
+	delete(m.react.pending, pendingKey)
+	err = m.persistPRSignaturesLocked(ctx, prURL)
+	m.react.mu.Unlock()
+	return err
+}
+
+func stackPRMatchesObservationRepo(pr domain.PullRequest, o ports.SCMObservation) bool {
+	if pr.Provider != "" && o.Provider != "" && !strings.EqualFold(pr.Provider, o.Provider) {
+		return false
+	}
+	if pr.Host != "" && o.Host != "" && !strings.EqualFold(pr.Host, o.Host) {
+		return false
+	}
+	return pr.Repo == "" || o.Repo == "" || strings.EqualFold(pr.Repo, o.Repo)
 }
 
 func (m *Manager) notificationIntentForCurrentSCM(ctx context.Context, id domain.SessionID, o ports.SCMObservation) (*ports.NotificationIntent, error) {
@@ -1708,16 +2076,16 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 		reservationToken = ""
 		return nil
 	}
-	// The guard re-reads the session immediately before pasting: the caller's
-	// NeedsInput() entry check ran before this function's dedup/persist I/O, so
-	// a permission hook could have stored blocked (or the session could have
-	// terminated) in the meantime. A suppressed write returns SUPPRESSED (not
-	// accounted), so a review caller won't stamp it delivered and it re-fires
-	// once the session is workable again. A store failure inside the guard also
-	// suppresses (fail closed, nothing was written); a messenger failure means
-	// the write was attempted and stays accounted, matching the pre-guard
-	// behavior.
-	outcome, err := m.guard.Nudge(ctx, id, msg)
+	// The guard re-reads the session immediately before pasting. Actionable PR
+	// work is an AO-originated instruction, so it may wake a worker waiting at an
+	// empty prompt; blocked decisions, rate limits, pending editor input, and
+	// terminated sessions still fail closed. A suppressed write returns
+	// SUPPRESSED (not accounted), so a review caller won't stamp it delivered and
+	// it re-fires once the session is workable again. A store failure inside the
+	// guard also suppresses (fail closed, nothing was written); a messenger
+	// failure means the write was attempted and stays accounted, matching the
+	// pre-guard behavior.
+	outcome, err := m.guard.DeliverAutomated(ctx, id, msg)
 	if err != nil {
 		if outcome != sessionguard.Sent {
 			rollbackErr := rollbackReservation()
@@ -2035,6 +2403,11 @@ func (m *Manager) loadPRSignaturesLocked(ctx context.Context, prURL string) erro
 			m.react.handoffs[k] = v
 		}
 	}
+	for k, v := range p.Pending {
+		if _, ok := m.react.pending[k]; !ok {
+			m.react.pending[k] = v
+		}
+	}
 	return nil
 }
 
@@ -2043,7 +2416,7 @@ func (m *Manager) loadPRSignaturesLocked(ctx context.Context, prURL string) erro
 // hold m.react.mu. A failed persist surfaces upward so the in-memory mutation
 // (which the messenger already acted on) is not silently divergent from disk.
 func (m *Manager) persistPRSignaturesLocked(ctx context.Context, prURL string) error {
-	payload := reactionPayload{Seen: map[string]string{}, Attempts: map[string]int{}, Handoffs: map[string]humanHandoffOutcome{}}
+	payload := reactionPayload{Seen: map[string]string{}, Attempts: map[string]int{}, Handoffs: map[string]humanHandoffOutcome{}, Pending: map[string]string{}}
 	for k, v := range m.react.seen {
 		if reactionKeyTargetsPR(k, prURL) {
 			payload.Seen[k] = v
@@ -2057,6 +2430,11 @@ func (m *Manager) persistPRSignaturesLocked(ctx context.Context, prURL string) e
 	for k, v := range m.react.handoffs {
 		if reactionKeyTargetsPR(k, prURL) {
 			payload.Handoffs[k] = v
+		}
+	}
+	for k, v := range m.react.pending {
+		if reactionKeyTargetsPR(k, prURL) {
+			payload.Pending[k] = v
 		}
 	}
 	raw, err := json.Marshal(payload)

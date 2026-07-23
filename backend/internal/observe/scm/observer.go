@@ -34,6 +34,10 @@ const (
 	// the defer/notify decision; this observer-side floor only avoids spending
 	// provider calls on freshly idle workers inside the normal review cadence.
 	DefaultIdleReviewDecisionThreshold = 60 * time.Second
+	// DefaultStalledPRHeartbeat is the coarse checkpoint interval for an
+	// unchanged failing PR. Lifecycle decides whether to wait, remind the
+	// worker, or escalate at each numbered checkpoint.
+	DefaultStalledPRHeartbeat = 10 * time.Minute
 	// DefaultCacheMax bounds each in-memory ETag/review cache map.
 	DefaultCacheMax = 512
 	// BatchSize is the maximum number of PRs in one provider batch fetch.
@@ -77,6 +81,7 @@ type Store interface {
 // Lifecycle is the provider-neutral lifecycle notification sink.
 type Lifecycle interface {
 	ApplySCMObservation(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
+	ApplyStalledPRHeartbeat(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation, heartbeat int) error
 	ApplySCMReviewFetchFailure(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
 	ApplyIdleReviewSnapshot(ctx context.Context, sessionID domain.SessionID, obs ports.SCMObservation) error
 	RetryMergedCleanup(ctx context.Context, sessionID domain.SessionID) error
@@ -104,6 +109,9 @@ type Config struct {
 	Tick time.Duration
 	// ReviewInterval is the slower review-thread refresh interval.
 	ReviewInterval time.Duration
+	// StalledPRHeartbeat is the unchanged-red checkpoint interval. Zero uses
+	// DefaultStalledPRHeartbeat.
+	StalledPRHeartbeat time.Duration
 	// Clock supplies timestamps for observations and tests. Nil uses time.Now.
 	Clock func() time.Time
 	// Logger receives operational diagnostics for provider/store/lifecycle failures.
@@ -172,6 +180,8 @@ type Observer struct {
 	tick time.Duration
 	// reviewInterval is the minimum duration between review-thread fetches per PR.
 	reviewInterval time.Duration
+	// stalledPRHeartbeat is the unchanged-red checkpoint interval.
+	stalledPRHeartbeat time.Duration
 	// clock supplies observation timestamps.
 	clock func() time.Time
 	// logger receives non-fatal operational failures.
@@ -199,12 +209,15 @@ type Observer struct {
 // New constructs an Observer with default cadence/cache settings for zero
 // values in cfg.
 func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Observer {
-	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, reviewCoordinator: cfg.ReviewCoordinator, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, telemetry: cfg.Telemetry, notifications: cfg.Notifications, Cache: newCache(cfg.CacheMax)}
+	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, reviewCoordinator: cfg.ReviewCoordinator, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, stalledPRHeartbeat: cfg.StalledPRHeartbeat, clock: cfg.Clock, logger: cfg.Logger, telemetry: cfg.Telemetry, notifications: cfg.Notifications, Cache: newCache(cfg.CacheMax)}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
 	if o.reviewInterval <= 0 {
 		o.reviewInterval = DefaultReviewInterval
+	}
+	if o.stalledPRHeartbeat <= 0 {
+		o.stalledPRHeartbeat = DefaultStalledPRHeartbeat
 	}
 	if o.clock == nil {
 		o.clock = time.Now
@@ -590,6 +603,35 @@ func (o *Observer) poll(ctx context.Context) (pollErr error) {
 	reviewModes := map[string]ports.ReviewWriteMode{}
 	localOnlyObservations := map[string]bool{}
 	reviewStale := map[string]bool{}
+	// Provider guards deliberately avoid full PR fetches when both metadata and
+	// checks are unchanged. Level-triggered recovery cannot depend on such a
+	// fetch: rebuild only locally actionable/due observations from durable PR
+	// and check facts, then let the same reducer and reaction dedup handle them.
+	for key, subj := range selection.subjectsByPR {
+		if _, fetched := observations[key]; fetched {
+			continue
+		}
+		local := subj.known
+		actionableState := subj.session.Activity.State == domain.ActivityIdle || subj.session.Activity.State == domain.ActivityWaitingInput
+		since := firstTime(local.CIObservedAt, local.ObservedAt)
+		heartbeatDue := local.CI == domain.CIFailing && !since.IsZero() && !now.Before(since.Add(o.stalledPRHeartbeat))
+		if !actionableState && !heartbeatDue {
+			continue
+		}
+		checks, err := o.store.ListChecks(ctx, local.URL)
+		if err != nil {
+			o.logger.Error("scm observer: list local checks for stalled PR reconciliation failed", "pr", local.URL, "err", err)
+			markRepoRefreshFailed(subj.repo)
+			continue
+		}
+		localObs := observationFromLocal(subj.repo, local, checks)
+		localObs.ObservedAt = now
+		if !stalledPRWork(subj.session.Activity.State, localObs) && o.stalledPRHeartbeatNumber(local, localObs, now) == 0 {
+			continue
+		}
+		observations[key] = localObs
+		localOnlyObservations[key] = true
+	}
 	if err := o.refreshReviews(ctx, subjects, observations, selection.subjectsByPR, reviewModes, localOnlyObservations, reviewStale, now); err != nil {
 		return err
 	}
@@ -619,6 +661,7 @@ func (o *Observer) poll(ctx context.Context) (pollErr error) {
 		if !prepared.Changed.Metadata && !prepared.Changed.CI && !prepared.Changed.Review {
 			if o.lifecycle != nil {
 				decision := o.maybeRerunFlakyCI(ctx, subj, prepared)
+				rerunPending := decision == ciRerunRequested || decision == ciRerunStillPending
 				if decision == ciRerunRequested || decision == ciRerunDispatchFailure {
 					lifecycleObservation := prepared
 					lifecycleObservation.CI.RerunRequested = decision == ciRerunRequested
@@ -638,6 +681,27 @@ func (o *Observer) poll(ctx context.Context) (pollErr error) {
 						o.logger.Error("scm observer: idle review decision failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
 						markRepoRefreshFailed(subj.repo)
 						continue
+					}
+				}
+				if !rerunPending {
+					if heartbeat := o.stalledPRHeartbeatNumber(local, prepared, now); heartbeat > 0 {
+						if err := o.lifecycle.ApplyStalledPRHeartbeat(ctx, subj.session.ID, prepared, heartbeat); err != nil {
+							o.logger.Error("scm observer: stalled PR escalation failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
+							markRepoRefreshFailed(subj.repo)
+							continue
+						}
+					}
+					// Actionable PR state is level-triggered for an idle worker or one
+					// sitting at an empty prompt. This recovers failures observed while
+					// delivery was unsafe (or acknowledged by an older daemon) without
+					// waiting for a new GitHub transition. Lifecycle's durable reaction
+					// signatures keep the 30-second reconciliation idempotent.
+					if stalledPRWork(subj.session.Activity.State, prepared) {
+						if err := o.lifecycle.ApplySCMObservation(ctx, subj.session.ID, prepared); err != nil {
+							o.logger.Error("scm observer: stalled PR reconciliation failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
+							markRepoRefreshFailed(subj.repo)
+							continue
+						}
 					}
 				}
 			}
@@ -714,6 +778,58 @@ func (o *Observer) poll(ctx context.Context) (pollErr error) {
 		}
 	}
 	return nil
+}
+
+func actionablePRWork(obs ports.SCMObservation) bool {
+	if !obs.Fetched || obs.PR.Merged || obs.PR.Closed || strings.TrimSpace(obs.PR.HeadSHA) == "" {
+		return false
+	}
+	if obs.CI.Summary == string(domain.CIFailing) && len(obs.CI.FailedChecks) > 0 {
+		return true
+	}
+	if obs.Review.Decision == string(domain.ReviewChangesRequest) {
+		return true
+	}
+	for _, thread := range obs.Review.Threads {
+		if thread.Resolved {
+			continue
+		}
+		for _, comment := range thread.Comments {
+			if !comment.IsBot || (strings.TrimSpace(thread.Path) != "" && thread.Line > 0) {
+				return true
+			}
+		}
+	}
+	return obs.Mergeability.State == string(domain.MergeConflicting) &&
+		strings.TrimSpace(firstNonEmpty(obs.PR.URL, obs.PR.HTMLURL)) != ""
+}
+
+func stalledPRWork(state domain.ActivityState, obs ports.SCMObservation) bool {
+	if state == domain.ActivityWaitingInput {
+		return actionablePRWork(obs)
+	}
+	// Idle review backlogs have their own bounded reminder/handoff reducer.
+	// Reconcile CI failures and merge conflicts here so a delivery suppressed
+	// during an earlier blocked episode is not lost when the worker becomes idle.
+	if state != domain.ActivityIdle || !obs.Fetched || obs.PR.Merged || obs.PR.Closed || strings.TrimSpace(obs.PR.HeadSHA) == "" {
+		return false
+	}
+	return (obs.CI.Summary == string(domain.CIFailing) && len(obs.CI.FailedChecks) > 0) ||
+		(obs.Mergeability.State == string(domain.MergeConflicting) && strings.TrimSpace(firstNonEmpty(obs.PR.URL, obs.PR.HTMLURL)) != "")
+}
+
+func (o *Observer) stalledPRHeartbeatNumber(local domain.PullRequest, obs ports.SCMObservation, now time.Time) int {
+	if !obs.Fetched || obs.PR.Merged || obs.PR.Closed || obs.CI.Summary != string(domain.CIFailing) || len(obs.CI.FailedChecks) == 0 {
+		return 0
+	}
+	since := local.CIObservedAt
+	if since.IsZero() {
+		since = local.ObservedAt
+	}
+	if since.IsZero() || now.Before(since.Add(o.stalledPRHeartbeat)) {
+		return 0
+	}
+	return int(now.Sub(since) / o.stalledPRHeartbeat)
 }
 
 // applyUnavailableSCMFallbacks keeps the fail-closed human handoff alive when
@@ -1493,9 +1609,11 @@ func (o *Observer) prepareForPersistence(obs ports.SCMObservation, local domain.
 		reviewHash = reviewSemanticHash(obs.Review)
 	}
 	obs.Changed = ports.SCMChanged{
-		Metadata: metadataHash != local.MetadataHash,
-		CI:       ciHash != local.CIHash,
-		Review:   reviewHash != local.ReviewHash,
+		Metadata:        metadataHash != local.MetadataHash,
+		Head:            local.URL != "" && local.HeadSHA != "" && obs.PR.HeadSHA != "" && local.HeadSHA != obs.PR.HeadSHA,
+		PreviousHeadSHA: local.HeadSHA,
+		CI:              ciHash != local.CIHash,
+		Review:          reviewHash != local.ReviewHash,
 	}
 	obs.PR.State = firstNonEmpty(obs.PR.State, normalizePRState(obs.PR.Draft, obs.PR.Merged, obs.PR.Closed))
 	obs.ObservedAt = firstTime(obs.ObservedAt, now)

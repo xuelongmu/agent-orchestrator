@@ -38,6 +38,14 @@ type sessionStore interface {
 	GetPRDesignContract(ctx context.Context, prURL string) (string, bool, error)
 }
 
+// stackSessionStore is the production store's cross-session read boundary used
+// only when a parent PR movement may affect child PRs owned by more-specific
+// sessions. Small test/embedding stores may omit it and retain same-session
+// behavior.
+type stackSessionStore interface {
+	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+}
+
 type designContractDeliveryStore interface {
 	GetPendingPRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL string) (designcontract.PendingDelivery, bool, error)
 	CompletePRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error)

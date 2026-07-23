@@ -316,6 +316,8 @@ func (p *fakeProvider) RerunFailedCheck(_ context.Context, _ ports.SCMRepo, _ po
 
 type fakeLifecycle struct {
 	observed            []ports.SCMObservation
+	heartbeats          []ports.SCMObservation
+	heartbeatNumbers    []int
 	idleReviewSnapshots []ports.SCMObservation
 	reviewFetchFailures []ports.SCMObservation
 	retried             []domain.SessionID
@@ -337,6 +339,15 @@ func (l *fakeLifecycle) ApplySCMObservation(_ context.Context, _ domain.SessionI
 		return l.err
 	}
 	l.observed = append(l.observed, obs)
+	return nil
+}
+
+func (l *fakeLifecycle) ApplyStalledPRHeartbeat(_ context.Context, _ domain.SessionID, obs ports.SCMObservation, heartbeat int) error {
+	if l.err != nil {
+		return l.err
+	}
+	l.heartbeats = append(l.heartbeats, obs)
+	l.heartbeatNumbers = append(l.heartbeatNumbers, heartbeat)
 	return nil
 }
 
@@ -1845,6 +1856,35 @@ func TestPoll_CIRerunUnchangedPreFeatureFailureEntersPendingOnce(t *testing.T) {
 	}
 }
 
+func TestPoll_CIRerunPendingSuppressesDueHeartbeatAndStalledWork(t *testing.T) {
+	store, provider, lifecycle, observer := ciRerunPollFixture(
+		[]string{"backend/internal/lifecycle/reactions.go"},
+		"101", "FAIL frontend/src/renderer/components/CenterPane.test.tsx > renders",
+	)
+	now := time.Unix(1_000, 0).UTC()
+	observed := provider.observations[prKey(testRepo, 1)]
+	local := store.prs["p-1"][0]
+	local.MetadataHash = metadataSemanticHash(observed)
+	local.CI = domain.CIFailing
+	local.CIHash = ciSemanticHash(observed.CI)
+	local.CIObservedAt = now.Add(-30 * time.Minute)
+	local.ReviewHash = reviewSemanticHash(observed.Review)
+	store.prs["p-1"] = []domain.PullRequest{local}
+	store.sessions[0].Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}
+	key := "https://github.com/o/r/pull/1\x00sha1\x00frontend test"
+	store.ciRerunAttempts[key] = ports.SCMCIRerunAttempt{
+		PRURL: "https://github.com/o/r/pull/1", HeadSHA: "sha1", CheckName: "frontend test",
+		ProviderID: "101", Status: ports.SCMCIRerunRequested, RequestedAt: now.Add(-time.Minute),
+	}
+
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(lifecycle.observed) != 0 || len(lifecycle.heartbeats) != 0 {
+		t.Fatalf("pending rerun leaked stale work: lifecycle=%#v heartbeats=%#v", lifecycle.observed, lifecycle.heartbeats)
+	}
+}
+
 func TestPoll_CIRerunProviderFailureResumesNormalDispatch(t *testing.T) {
 	store, provider, lifecycle, observer := ciRerunPollFixture(
 		[]string{"backend/internal/lifecycle/reactions.go"},
@@ -2204,6 +2244,102 @@ func TestPoll_UnchangedHashesDoNotWriteOrNotify(t *testing.T) {
 	}
 	if len(coordinator.observed) != 1 || coordinator.observed[0].PR.HeadSHA != obsValue.PR.HeadSHA {
 		t.Fatalf("unchanged durable snapshot was not coordinated: %#v", coordinator.observed)
+	}
+}
+
+func TestPoll_UnchangedFailingPRFiresTenMinuteHeartbeat(t *testing.T) {
+	now := time.Unix(3600, 0).UTC()
+	store := testStoreWithSession()
+	obsValue := testObs(1)
+	failed := ports.SCMCheckObservation{Name: "backend", Status: string(domain.PRCheckFailed), Conclusion: "failure", LogTail: "boom"}
+	obsValue.CI = ports.SCMCIObservation{
+		Summary: string(domain.CIFailing), HeadSHA: obsValue.PR.HeadSHA,
+		FailedFingerprint: "backend-failed", Checks: []ports.SCMCheckObservation{failed}, FailedChecks: []ports.SCMCheckObservation{failed}, FailureLogTail: "boom",
+	}
+	local, checks, _, _, _ := domainFromObservation("p-1", obsValue, domain.PullRequest{}, persistenceOptions{}, now.Add(-10*time.Minute))
+	local.MetadataHash = metadataSemanticHash(obsValue)
+	local.CIHash = ciSemanticHash(obsValue.CI)
+	local.ReviewHash = reviewSemanticHash(obsValue.Review)
+	local.CIObservedAt = now.Add(-10 * time.Minute)
+	store.prs["p-1"] = []domain.PullRequest{local}
+	store.checks[local.URL] = checks
+	provider := &fakeProvider{
+		repoGuards:  map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "repo", NotModified: true}},
+		checkGuards: map[string]ports.SCMGuardResult{commitKey(testRepo, local.HeadSHA): {ETag: "checks", NotModified: true}},
+	}
+	lc := &fakeLifecycle{}
+	observer := New(provider, store, lc, Config{
+		Clock: func() time.Time { return now }, Tick: time.Hour,
+		StalledPRHeartbeat: 10 * time.Minute, Logger: quietSlog(), CacheMax: 128,
+	})
+	observer.Cache.RepoPRListETag[prKey(testRepo, 0)] = "repo"
+	observer.Cache.CommitChecksETag[commitKey(testRepo, local.HeadSHA)] = "checks"
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.fetchBatches) != 0 {
+		t.Fatalf("unchanged guards triggered provider PR fetches: %#v", provider.fetchBatches)
+	}
+	if len(lc.heartbeats) != 1 || lc.heartbeats[0].PR.HeadSHA != obsValue.PR.HeadSHA {
+		t.Fatalf("ten-minute heartbeat escalations = %#v, want exact failing head", lc.heartbeats)
+	}
+	if len(lc.heartbeatNumbers) != 1 || lc.heartbeatNumbers[0] != 1 {
+		t.Fatalf("heartbeat numbers = %v, want [1]", lc.heartbeatNumbers)
+	}
+}
+
+func TestPoll_UnchangedGuardsReconcileLocalFailureToIdleWorker(t *testing.T) {
+	now := time.Unix(3600, 0).UTC()
+	store := testStoreWithSession()
+	store.sessions[0].Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}
+	obsValue := testObs(1)
+	failed := ports.SCMCheckObservation{Name: "backend", Status: string(domain.PRCheckFailed), Conclusion: "failure", LogTail: "boom"}
+	obsValue.CI = ports.SCMCIObservation{
+		Summary: string(domain.CIFailing), HeadSHA: obsValue.PR.HeadSHA,
+		FailedFingerprint: "backend-failed", Checks: []ports.SCMCheckObservation{failed}, FailedChecks: []ports.SCMCheckObservation{failed}, FailureLogTail: "boom",
+	}
+	local, checks, _, _, _ := domainFromObservation("p-1", obsValue, domain.PullRequest{}, persistenceOptions{}, now)
+	local.MetadataHash = metadataSemanticHash(obsValue)
+	local.CIHash = ciSemanticHash(obsValue.CI)
+	local.ReviewHash = reviewSemanticHash(obsValue.Review)
+	store.prs["p-1"] = []domain.PullRequest{local}
+	store.checks[local.URL] = checks
+	provider := &fakeProvider{
+		repoGuards:  map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "repo", NotModified: true}},
+		checkGuards: map[string]ports.SCMGuardResult{commitKey(testRepo, local.HeadSHA): {ETag: "checks", NotModified: true}},
+	}
+	lifecycle := &fakeLifecycle{}
+	observer := newTestObserver(store, provider, lifecycle, now)
+	observer.Cache.RepoPRListETag[prKey(testRepo, 0)] = "repo"
+	observer.Cache.CommitChecksETag[commitKey(testRepo, local.HeadSHA)] = "checks"
+
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.fetchBatches) != 0 {
+		t.Fatalf("unchanged guards triggered provider PR fetches: %#v", provider.fetchBatches)
+	}
+	if len(lifecycle.observed) != 1 || lifecycle.observed[0].PR.HeadSHA != local.HeadSHA {
+		t.Fatalf("local failed PR was not reconciled to idle worker: %#v", lifecycle.observed)
+	}
+}
+
+func TestPrepareForPersistenceMarksTrackedHeadMovement(t *testing.T) {
+	local := knownPR(1)
+	observed := testObs(1)
+	observed.PR.HeadSHA = "sha-new"
+	prepared := newTestObserver(testStoreWithSession(), &fakeProvider{}, nil, time.Unix(2, 0).UTC()).prepareForPersistence(
+		observed, local, persistenceOptions{}, time.Unix(2, 0).UTC(),
+	)
+	if !prepared.Changed.Metadata || !prepared.Changed.Head || prepared.Changed.PreviousHeadSHA != local.HeadSHA {
+		t.Fatalf("head movement facts = %+v, want previous %q", prepared.Changed, local.HeadSHA)
+	}
+
+	prepared = newTestObserver(testStoreWithSession(), &fakeProvider{}, nil, time.Unix(2, 0).UTC()).prepareForPersistence(
+		observed, domain.PullRequest{}, persistenceOptions{}, time.Unix(2, 0).UTC(),
+	)
+	if prepared.Changed.Head {
+		t.Fatalf("new PR discovery was misclassified as a parent head move: %+v", prepared.Changed)
 	}
 }
 

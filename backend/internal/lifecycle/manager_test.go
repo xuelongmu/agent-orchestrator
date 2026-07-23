@@ -60,6 +60,14 @@ func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.S
 	return r, ok, nil
 }
 
+func (f *fakeStore) ListAllSessions(_ context.Context) ([]domain.SessionRecord, error) {
+	out := make([]domain.SessionRecord, 0, len(f.sessions))
+	for _, rec := range f.sessions {
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
 func (f *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]domain.PullRequest, error) {
 	if f.listPRsErr != nil {
 		return nil, f.listPRsErr
@@ -182,6 +190,7 @@ func (f *fakeStore) EnsureReviewRunSimplificationEvent(_ context.Context, id, ta
 
 type fakeMessenger struct {
 	msgs         []string
+	ids          []domain.SessionID
 	err          error
 	writeThenErr bool
 	onSend       func()
@@ -301,17 +310,19 @@ func (*telemetrySink) Close(context.Context) error { return nil }
 
 func (*telemetrySink) DurableLocalTelemetry() bool { return true }
 
-func (f *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) error {
+func (f *fakeMessenger) Send(_ context.Context, id domain.SessionID, msg string) error {
 	if f.onSend != nil {
 		f.onSend()
 	}
 	if f.err != nil {
 		if f.writeThenErr {
 			f.msgs = append(f.msgs, msg)
+			f.ids = append(f.ids, id)
 		}
 		return f.err
 	}
 	f.msgs = append(f.msgs, msg)
+	f.ids = append(f.ids, id)
 	return nil
 }
 
@@ -1506,7 +1517,7 @@ func TestSCMObservation_MergeConflictCarriesExactPRHead(t *testing.T) {
 	}
 }
 
-func TestPRObservation_MergeConflictWaitsForWorkableSession(t *testing.T) {
+func TestPRObservation_MergeConflictResumesWaitingInputSession(t *testing.T) {
 	m, st, msg := newManager()
 	rec := working("mer-1")
 	rec.Activity.State = domain.ActivityWaitingInput
@@ -1518,15 +1529,14 @@ func TestPRObservation_MergeConflictWaitsForWorkableSession(t *testing.T) {
 	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
 		t.Fatal(err)
 	}
-	if len(msg.msgs) != 0 || st.signatures["pr1"] != "" {
-		t.Fatalf("waiting-input session consumed conflict dispatch: messages=%v signature=%q", msg.msgs, st.signatures["pr1"])
+	if len(msg.msgs) != 1 || !strings.Contains(msg.msgs[0], "merge conflicts") || st.signatures["pr1"] == "" {
+		t.Fatalf("waiting-input session was not resumed for conflict work: messages=%v signature=%q", msg.msgs, st.signatures["pr1"])
 	}
-	st.sessions["mer-1"] = working("mer-1")
 	if err := m.ApplyPRObservation(ctx, "mer-1", o); err != nil {
 		t.Fatal(err)
 	}
 	if len(msg.msgs) != 1 {
-		t.Fatalf("conflict did not dispatch after session became workable: %v", msg.msgs)
+		t.Fatalf("identical conflict re-dispatched after resume: %v", msg.msgs)
 	}
 }
 
@@ -2857,11 +2867,6 @@ func TestApplyReviewResultNoopsWhenIrrelevant(t *testing.T) {
 			result: ReviewResult{RunID: "run-1", PRURL: "pr1", Verdict: domain.VerdictChangesRequested},
 			rec:    func() domain.SessionRecord { r := working("mer-1"); r.IsTerminated = true; return r }(),
 		},
-		{
-			name:   "worker waiting input",
-			result: ReviewResult{RunID: "run-1", PRURL: "pr1", Verdict: domain.VerdictChangesRequested},
-			rec:    domain.SessionRecord{ID: "mer-1", Activity: domain.Activity{State: domain.ActivityWaitingInput}},
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2875,6 +2880,359 @@ func TestApplyReviewResultNoopsWhenIrrelevant(t *testing.T) {
 				t.Fatalf("irrelevant result should no-op, outcome=%q msgs=%v signatureWrites=%d", outcome, msg.msgs, st.signatureWrites)
 			}
 		})
+	}
+}
+
+func TestApplyReviewResultResumesWaitingInputWorker(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", Activity: domain.Activity{State: domain.ActivityWaitingInput}}
+	result := ReviewResult{
+		RunID: "run-1", PRURL: "pr1", TargetSHA: "head-1",
+		Verdict: domain.VerdictChangesRequested, Body: "fix the race",
+	}
+	outcome, err := m.ApplyReviewResult(ctx, "mer-1", result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome != ReviewDeliverySent || len(msg.msgs) != 1 || !strings.Contains(msg.msgs[0], "fix the race") {
+		t.Fatalf("waiting-input worker was not resumed with review work: outcome=%q messages=%v", outcome, msg.msgs)
+	}
+}
+
+func TestStalledPRHeartbeatRemindsWorkerThenEscalatesOncePerUnchangedRedEpisode(t *testing.T) {
+	st := newFakeStore()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	rec := working("mer-1")
+	rec.Activity.State = domain.ActivityIdle
+	rec.Activity.LastActivityAt = now.Add(-time.Minute)
+	rec.ProjectID = "mer"
+	st.sessions[rec.ID] = rec
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{}
+	m := New(st, msg, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	observation := func(head, tail string) ports.SCMObservation {
+		failed := ports.SCMCheckObservation{Name: "backend", Status: string(domain.PRCheckFailed), LogTail: tail}
+		return ports.SCMObservation{
+			Fetched: true, Provider: "github", Repo: "o/r",
+			PR: ports.SCMPRObservation{URL: "https://github.com/o/r/pull/244", Number: 244, HeadSHA: head, Title: "Fix routing"},
+			CI: ports.SCMCIObservation{Summary: string(domain.CIFailing), HeadSHA: head, FailedChecks: []ports.SCMCheckObservation{failed}},
+		}
+	}
+	first := observation("head-1", "boom")
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, first, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, first, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 || len(sink.intents) != 0 {
+		t.Fatalf("first heartbeat messages=%d escalations=%d, want worker reminder only", len(msg.msgs), len(sink.intents))
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, first, 2); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 0 {
+		t.Fatalf("second unchanged heartbeat escalations = %d, want 0 during review window", len(sink.intents))
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, first, 3); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("third unchanged heartbeat escalations = %d, want 1", len(sink.intents))
+	}
+	second := observation("head-2", "different boom")
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, second, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 1 || len(msg.msgs) != 2 {
+		t.Fatalf("new episode did not restart at worker reminder: messages=%d escalations=%d", len(msg.msgs), len(sink.intents))
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, second, 2); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("new episode escalated before review window elapsed: %+v", sink.intents)
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, second, 3); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 2 {
+		t.Fatalf("new failing episode did not rearm escalation: %+v", sink.intents)
+	}
+}
+
+func TestStalledPRHeartbeatLeavesActiveWorkerAlone(t *testing.T) {
+	st := newFakeStore()
+	rec := working("mer-1")
+	st.sessions[rec.ID] = rec
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{}
+	m := New(st, msg, WithNotificationSink(sink))
+	failed := ports.SCMCheckObservation{Name: "backend", Status: string(domain.PRCheckFailed), LogTail: "boom"}
+	obs := ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "pr1", Number: 1, HeadSHA: "head-1"},
+		CI:      ports.SCMCIObservation{Summary: string(domain.CIFailing), HeadSHA: "head-1", FailedChecks: []ports.SCMCheckObservation{failed}},
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 3); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 || len(sink.intents) != 0 {
+		t.Fatalf("active worker was interrupted: messages=%v escalations=%v", msg.msgs, sink.intents)
+	}
+}
+
+func TestStalledPRHeartbeatTreatsBackgroundToolFlightAsActive(t *testing.T) {
+	st := newFakeStore()
+	rec := working("mer-1")
+	rec.Activity.State = domain.ActivityWaitingInput
+	rec.FirstSignalAt = time.Now().Add(-time.Minute)
+	st.sessions[rec.ID] = rec
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{}
+	m := New(st, msg, WithNotificationSink(sink))
+	if err := m.ApplyActivitySignal(ctx, rec.ID, ports.ActivitySignal{
+		Valid: true, State: domain.ActivityActive, Event: "pre-tool-use", ToolUseID: "background-1", ToolName: "Bash",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.sessions[rec.ID].Activity.State; got != domain.ActivityWaitingInput {
+		t.Fatalf("background tool traffic cleared sticky main prompt: %q", got)
+	}
+	failed := ports.SCMCheckObservation{Name: "backend", Status: string(domain.PRCheckFailed), LogTail: "boom"}
+	obs := ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "pr1", Number: 1, HeadSHA: "head-1"},
+		CI:      ports.SCMCIObservation{Summary: string(domain.CIFailing), HeadSHA: "head-1", FailedChecks: []ports.SCMCheckObservation{failed}},
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 3); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 || len(sink.intents) != 0 {
+		t.Fatalf("background tool flight was interrupted: messages=%v escalations=%v", msg.msgs, sink.intents)
+	}
+}
+
+func TestStalledPRHeartbeatRechecksLivenessBeforeReminder(t *testing.T) {
+	st := newFakeStore()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-time.Minute)}
+	st.sessions[rec.ID] = rec
+	st.afterSessionRead = func(id domain.SessionID, reads int) {
+		if reads != 1 {
+			return
+		}
+		latest := st.sessions[id]
+		latest.Activity = domain.Activity{State: domain.ActivityActive, LastActivityAt: now}
+		st.sessions[id] = latest
+	}
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{}
+	m := New(st, msg, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	failed := ports.SCMCheckObservation{Name: "backend", Status: string(domain.PRCheckFailed), LogTail: "boom"}
+	obs := ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "pr1", Number: 1, HeadSHA: "head-1"},
+		CI:      ports.SCMCIObservation{Summary: string(domain.CIFailing), HeadSHA: "head-1", FailedChecks: []ports.SCMCheckObservation{failed}},
+	}
+
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 || len(sink.intents) != 0 {
+		t.Fatalf("just-in-time active worker was interrupted: messages=%v escalations=%v", msg.msgs, sink.intents)
+	}
+}
+
+func TestStalledPRHeartbeatRechecksLivenessBeforeHandoff(t *testing.T) {
+	st := newFakeStore()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-time.Minute)}
+	st.sessions[rec.ID] = rec
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{}
+	m := New(st, msg, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	failed := ports.SCMCheckObservation{Name: "backend", Status: string(domain.PRCheckFailed), LogTail: "boom"}
+	obs := ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "pr1", Number: 1, HeadSHA: "head-1"},
+		CI:      ports.SCMCIObservation{Summary: string(domain.CIFailing), HeadSHA: "head-1", FailedChecks: []ports.SCMCheckObservation{failed}},
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 1); err != nil {
+		t.Fatal(err)
+	}
+	st.sessionReads = 0
+	st.afterSessionRead = func(id domain.SessionID, reads int) {
+		if reads != 1 {
+			return
+		}
+		latest := st.sessions[id]
+		latest.Activity = domain.Activity{State: domain.ActivityActive, LastActivityAt: now}
+		st.sessions[id] = latest
+	}
+
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 3); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 || len(sink.intents) != 0 {
+		t.Fatalf("just-in-time active worker reached handoff: messages=%v escalations=%v", msg.msgs, sink.intents)
+	}
+}
+
+func TestStalledPRHeartbeatRestartsEscalationWindowAfterProgress(t *testing.T) {
+	st := newFakeStore()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-time.Minute)}
+	st.sessions[rec.ID] = rec
+	msg := &fakeMessenger{}
+	sink := &fakeNotificationSink{}
+	m := New(st, msg, WithNotificationSink(sink))
+	m.clock = func() time.Time { return now }
+	failed := ports.SCMCheckObservation{Name: "backend", Status: string(domain.PRCheckFailed), LogTail: "boom"}
+	obs := ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "pr1", Number: 1, HeadSHA: "head-1"},
+		CI:      ports.SCMCIObservation{Summary: string(domain.CIFailing), HeadSHA: "head-1", FailedChecks: []ports.SCMCheckObservation{failed}},
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 1); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	rec = st.sessions[rec.ID]
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}
+	st.sessions[rec.ID] = rec
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 2); err != nil {
+		t.Fatal(err)
+	}
+	for _, heartbeat := range []int{3, 4} {
+		if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, heartbeat); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(sink.intents) != 0 {
+		t.Fatalf("progress did not restart three-heartbeat window: %+v", sink.intents)
+	}
+	if err := m.ApplyStalledPRHeartbeat(ctx, rec.ID, obs, 5); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("restarted window did not escalate at heartbeat 5: %+v", sink.intents)
+	}
+}
+
+func TestStackParentHeadChangeRoutesToWorkerAndDedups(t *testing.T) {
+	st := newFakeStore()
+	rec := working("mer-1")
+	rec.Activity.State = domain.ActivityWaitingInput
+	st.sessions[rec.ID] = rec
+	st.prs[rec.ID] = []domain.PullRequest{
+		{URL: "parent", SourceBranch: "ao/x", TargetBranch: "main", HeadSHA: "new-parent"},
+		{URL: "child", SourceBranch: "ao/x/auth", TargetBranch: "ao/x", HeadSHA: "child-head"},
+	}
+	msg := &fakeMessenger{}
+	m := New(st, msg)
+	obs := ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "parent", Number: 1, SourceBranch: "ao/x", TargetBranch: "main", HeadSHA: "new-parent"},
+		Changed: ports.SCMChanged{Metadata: true, Head: true, PreviousHeadSHA: "old-parent"},
+	}
+	if err := m.ApplySCMObservation(ctx, rec.ID, obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 || !strings.Contains(msg.msgs[0], "old-parent") || !strings.Contains(msg.msgs[0], "new-parent") || !strings.Contains(msg.msgs[0], "child") {
+		t.Fatalf("stack parent movement was not routed with affected child: %v", msg.msgs)
+	}
+	if err := m.ApplySCMObservation(ctx, rec.ID, obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("identical parent head movement re-routed: %v", msg.msgs)
+	}
+}
+
+func TestStackParentHeadChangeRoutesToChildOwningSession(t *testing.T) {
+	st := newFakeStore()
+	parent := working("mer-parent")
+	parent.ProjectID = "mer"
+	parent.Activity.State = domain.ActivityWaitingInput
+	child := working("mer-child")
+	child.ProjectID = "mer"
+	child.Activity.State = domain.ActivityWaitingInput
+	st.sessions[parent.ID] = parent
+	st.sessions[child.ID] = child
+	st.prs[parent.ID] = []domain.PullRequest{
+		{URL: "parent", SessionID: parent.ID, SourceBranch: "ao/x", TargetBranch: "main", HeadSHA: "new-parent"},
+	}
+	st.prs[child.ID] = []domain.PullRequest{
+		{URL: "child", SessionID: child.ID, SourceBranch: "ao/x/auth", TargetBranch: "ao/x", HeadSHA: "child-head"},
+	}
+	msg := &fakeMessenger{}
+	m := New(st, msg)
+	obs := ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "parent", Number: 1, SourceBranch: "ao/x", TargetBranch: "main", HeadSHA: "new-parent"},
+		Changed: ports.SCMChanged{Metadata: true, Head: true, PreviousHeadSHA: "old-parent"},
+	}
+
+	if err := m.ApplySCMObservation(ctx, parent.ID, obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 || len(msg.ids) != 1 || msg.ids[0] != child.ID || !strings.Contains(msg.msgs[0], "child") {
+		t.Fatalf("parent movement did not reach child owner: ids=%v messages=%v", msg.ids, msg.msgs)
+	}
+}
+
+func TestStackParentHeadChangeRetriesAfterBlockedWorkerAcrossRestart(t *testing.T) {
+	st := newFakeStore()
+	rec := working("mer-1")
+	rec.Activity.State = domain.ActivityBlocked
+	st.sessions[rec.ID] = rec
+	st.prs[rec.ID] = []domain.PullRequest{
+		{URL: "parent", SourceBranch: "ao/x", TargetBranch: "main", HeadSHA: "new-parent"},
+		{URL: "child", SourceBranch: "ao/x/auth", TargetBranch: "ao/x", HeadSHA: "child-head"},
+	}
+	first := &fakeMessenger{}
+	changed := ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "parent", SourceBranch: "ao/x", TargetBranch: "main", HeadSHA: "new-parent"},
+		Changed: ports.SCMChanged{Metadata: true, Head: true, PreviousHeadSHA: "old-parent"},
+	}
+	if err := New(st, first).ApplySCMObservation(ctx, rec.ID, changed); !errors.Is(err, errStackParentDispatchPending) {
+		t.Fatalf("blocked parent dispatch error = %v, want pending", err)
+	}
+	if len(first.msgs) != 0 {
+		t.Fatalf("blocked worker received parent update: %v", first.msgs)
+	}
+
+	rec.Activity.State = domain.ActivityWaitingInput
+	st.sessions[rec.ID] = rec
+	second := &fakeMessenger{}
+	retry := changed
+	retry.Changed.Head = false
+	retry.Changed.PreviousHeadSHA = ""
+	if err := New(st, second).ApplySCMObservation(ctx, rec.ID, retry); err != nil {
+		t.Fatal(err)
+	}
+	if len(second.msgs) != 1 || !strings.Contains(second.msgs[0], "new-parent") {
+		t.Fatalf("durable parent update did not resume after restart: %v", second.msgs)
 	}
 }
 
