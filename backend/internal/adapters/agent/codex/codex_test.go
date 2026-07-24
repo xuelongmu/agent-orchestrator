@@ -278,6 +278,64 @@ func TestResolveCodexBinaryPrefersNPMOverWindowsAppsExecutable(t *testing.T) {
 	}
 }
 
+func TestResolveCodexBinaryPrefersActivePathOverFallbackNPM(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows resolver only")
+	}
+	root := t.TempDir()
+	activeDir := filepath.Join(root, "active")
+	activeShim := filepath.Join(activeDir, "codex.cmd")
+	want := filepath.Join(activeDir, "node_modules", "@openai", "codex", "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe")
+	for _, path := range []string{activeShim, want} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("active codex"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	appData := filepath.Join(root, "Roaming")
+	fallback := filepath.Join(appData, "npm", "codex.cmd")
+	if err := os.MkdirAll(filepath.Dir(fallback), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fallback, []byte("stale codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("APPDATA", appData)
+	t.Setenv("PATH", activeDir)
+
+	got, err := ResolveCodexBinary(context.Background())
+	if err != nil {
+		t.Fatalf("ResolveCodexBinary: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ResolveCodexBinary = %q, want active PATH binary %q", got, want)
+	}
+}
+
+func TestClassifyAuthStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   ports.AgentAuthStatus
+	}{
+		{name: "logged in", output: "Logged in using ChatGPT", want: ports.AgentAuthStatusAuthorized},
+		{name: "not logged in", output: "Not logged in", want: ports.AgentAuthStatusUnauthorized},
+		{name: "logged out", output: "Logged out", want: ports.AgentAuthStatusUnauthorized},
+		{name: "unrelated failure", output: "Error loading configuration", want: ports.AgentAuthStatusUnknown},
+		{name: "unrecognized success", output: "Status unavailable", want: ports.AgentAuthStatusUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyAuthStatus(tt.output); got != tt.want {
+				t.Fatalf("classifyAuthStatus(%q) = %q, want %q", tt.output, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetLaunchCommandMapsApprovalModes(t *testing.T) {
 	tests := []struct {
 		name        string

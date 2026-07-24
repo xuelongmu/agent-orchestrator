@@ -277,17 +277,22 @@ func (p *Plugin) AuthStatus(ctx context.Context) (ports.AgentAuthStatus, error) 
 	if probeCtx.Err() != nil {
 		return ports.AgentAuthStatusUnknown, probeCtx.Err()
 	}
-	text := strings.ToLower(string(out))
+	status := classifyAuthStatus(string(out))
+	if status == ports.AgentAuthStatusUnknown && err != nil {
+		return status, fmt.Errorf("codex login status: %w", err)
+	}
+	return status, nil
+}
+
+func classifyAuthStatus(output string) ports.AgentAuthStatus {
+	text := strings.ToLower(output)
 	if strings.Contains(text, "not logged in") || strings.Contains(text, "logged out") {
-		return ports.AgentAuthStatusUnauthorized, nil
+		return ports.AgentAuthStatusUnauthorized
 	}
 	if strings.Contains(text, "logged in") {
-		return ports.AgentAuthStatusAuthorized, nil
+		return ports.AgentAuthStatusAuthorized
 	}
-	if err != nil {
-		return ports.AgentAuthStatusUnauthorized, nil
-	}
-	return ports.AgentAuthStatusUnknown, nil
+	return ports.AgentAuthStatusUnknown
 }
 
 // ResolveCodexBinary returns the path to the codex binary on this machine,
@@ -298,6 +303,19 @@ func ResolveCodexBinary(ctx context.Context) (string, error) {
 	}
 
 	if runtime.GOOS == "windows" {
+		for _, name := range []string{"codex.cmd", "codex", "codex.exe"} {
+			path, err := exec.LookPath(name)
+			if err == nil && path != "" {
+				if isWindowsAppsCodexExecutable(path) {
+					continue
+				}
+				return resolveNativeWindowsCodex(path), nil
+			}
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+		}
+
 		candidates := []string{}
 		if appData := os.Getenv("APPDATA"); appData != "" {
 			shim := filepath.Join(appData, "npm", "codex.cmd")
@@ -313,19 +331,6 @@ func ResolveCodexBinary(ctx context.Context) (string, error) {
 		for _, candidate := range candidates {
 			if fileExists(candidate) {
 				return resolveNativeWindowsCodex(candidate), nil
-			}
-			if err := ctx.Err(); err != nil {
-				return "", err
-			}
-		}
-
-		for _, name := range []string{"codex.cmd", "codex", "codex.exe"} {
-			path, err := exec.LookPath(name)
-			if err == nil && path != "" {
-				if isWindowsAppsCodexExecutable(path) {
-					continue
-				}
-				return resolveNativeWindowsCodex(path), nil
 			}
 			if err := ctx.Err(); err != nil {
 				return "", err
