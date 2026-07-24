@@ -25,6 +25,11 @@ matching platform Go binary. The older `@aoagents/ao-cli` package, and older
 regardless of their version string. They use a different command surface and
 state root.
 
+This is a one-way cutover guide. It does not migrate or translate legacy
+TypeScript state. The Go runtime starts from `~/.ao`; an old
+`~/.agent-orchestrator` tree remains inert unless it is deliberately archived
+or removed outside this procedure.
+
 ## Read-only inventory
 
 Run this before changing PATH, fnm, npm packages, state, or processes:
@@ -118,52 +123,57 @@ directory to their PATH. That prevents a legacy shim from taking over inside
 new migrated sessions. It does not repair interactive shells or sessions that
 were spawned by the legacy daemon.
 
+## Source dogfood install
+
+Until a migrated stable desktop release is installed, build the current Go CLI
+to the default user-local bin directory:
+
+```powershell
+pwsh -NoProfile -File .\scripts\daemon-build.ps1
+& "$HOME\.local\bin\ao.exe" version
+```
+
+The helper stamps the current version and commit into the binary, installs only
+`ao.exe`, and verifies that exact file by absolute path. It does not edit PATH,
+remove another installation, or read either AO state tree. Pass `-InstallDir`
+to use another existing PATH directory.
+
 ## Safe cutover (approval required)
 
 The runtime cutover is deliberately not automatic. Do not perform any step in
-this section while a legacy AO process or session still depends on the old
+this section while an old AO process or session still depends on the old
 install. Never stop, kill, clean, remove, or move a live AO process, session,
 worktree, or state root without explicit per-instance approval.
 
-1. Record the read-only inventory above and let legacy work finish normally.
-   Get approval for every remaining process/session before stopping it.
-2. Preserve `~/.agent-orchestrator` while the legacy runtime is retained. Do
-   not point `AO_DATA_DIR` at it: the Go database belongs under `~/.ao` and the
-   two state formats are not interchangeable.
-3. After approved shutdown of all relevant writers, preview supported project
-   import with the absolute Go binary:
-
-   ```powershell
-   & $canonical import --from "$HOME\.agent-orchestrator" --dry-run
-   ```
-
-   `ao import` reads legacy files without modifying them and imports only
-   supported project/config data. A real import requires the migrated daemon
-   to be stopped and takes its exclusive database-writer lease. Session/run
-   history is not imported; retain or archive the legacy root if it is needed.
-
-4. With separate approval, remove the legacy npm package from the relevant
+1. Record the read-only inventory above and let old work finish normally. Get
+   approval for every remaining process/session before stopping it.
+2. Install the desktop release or the explicit source build above. Verify that
+   binary by absolute path before changing command resolution.
+3. Remove the old npm package from the relevant
    fnm Node installation or place the intended migrated command ahead of it in
    the persistent user PATH. Do not edit ephemeral `fnm_multishells` wrappers
    individually; fnm recreates them in new shells.
-5. Open a new PowerShell and repeat the inventory and verification checks.
+   If npm has already removed the package but left orphaned `ao`, `ao.cmd`, or
+   `ao.ps1` files, remove only those confirmed wrappers from the underlying fnm
+   Node installation.
+4. Open a new PowerShell and repeat the inventory and verification checks.
    Existing shells keep their old PATH and command cache.
 
-Until those steps are approved and completed, the legacy runtime is temporary,
-unsupported, and retained only for already-running work. Invoke each runtime by
-absolute path to prevent cross-use.
+Do not point `AO_DATA_DIR` or `AO_RUN_FILE` into
+`~/.agent-orchestrator`. Retaining or deleting that unused tree is independent
+of the new installation and is not part of this cutover.
 
 ## Rollback
 
-Before cutover, record the original user PATH, fnm default Node version, npm AO
-version, and archive location. If the new-shell verification fails:
+Before cutover, record the original user PATH and the absolute path of the
+known-good Go or desktop binary. If the new-shell verification fails:
 
-1. restore the recorded PATH/fnm selection or reinstall the recorded npm
-   version;
-2. keep using absolute paths so legacy and migrated state cannot be confused;
-3. restore an archived legacy root to its original location only after
-   confirming no process is writing either copy; and
-4. rerun the read-only inventory before launching anything.
+1. restore the recorded PATH and invoke the known-good Go binary by absolute
+   path;
+2. install a prior migrated desktop release or rebuild a known-good Go commit;
+   and
+3. rerun the read-only inventory before launching anything.
 
-Rollback never copies `~/.agent-orchestrator` over `~/.ao`, and it never starts,
-stops, or cleans sessions as a side effect.
+Rollback never restores the TypeScript runtime, never copies
+`~/.agent-orchestrator` over `~/.ao`, and never starts, stops, or cleans
+sessions as a side effect.
