@@ -104,6 +104,17 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 		mutationFn: refreshAgents,
 		onSuccess: (next) => queryClient.setQueryData(agentsQueryKey, next),
 	});
+	const replacementMutation = useMutation({
+		mutationFn: () => spawnOrchestrator(projectId, "settings", true),
+		onSuccess: () => {
+			setReplacementError(null);
+			void queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
+		},
+		onError: (error) => {
+			setReplacementError(error instanceof Error ? error.message : "Could not replace orchestrator");
+			void queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
+		},
+	});
 
 	// The Electron app only registers git projects today, so the daemon always has a usable
 	// git origin to derive owner/repo from (trackerRepo() in observer.go) when
@@ -158,29 +169,23 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 				body: { config: next },
 			});
 			if (error) throw new Error(apiErrorMessage(error));
-			if (
+			return {
+				restartRequired:
 				form.workspaceKind !== initialWorkspaceKind ||
 				form.orchestratorAgent !== initialOrchestratorAgent ||
 				form.p2OnlyRoundLimit !== initialP2OnlyRoundLimit ||
-				(activeOrchestrator && activeOrchestrator.provider !== form.orchestratorAgent)
-			) {
-				try {
-					await spawnOrchestrator(projectId, "settings", true);
-				} catch (error) {
-					return {
-						replacementError: error instanceof Error ? error.message : "Could not replace orchestrator",
-					};
-				}
-			}
-			return { replacementError: null };
+				Boolean(activeOrchestrator && activeOrchestrator.provider !== form.orchestratorAgent),
+			};
 		},
 		onSuccess: (result) => {
 			void captureRendererEvent("ao.renderer.settings_save_succeeded", { project_id: projectId });
 			setSavedAt(Date.now());
-			setReplacementError(result.replacementError);
 			setValidationError(null);
 			void queryClient.invalidateQueries({ queryKey: ["project", projectId] });
 			onSaved();
+			if (result.restartRequired && !replacementMutation.isPending) {
+				replacementMutation.mutate();
+			}
 		},
 		onError: () => {
 			void captureRendererEvent("ao.renderer.settings_save_failed", { project_id: projectId });
@@ -430,7 +435,10 @@ function SettingsBody({ project, projectId, onSaved }: { project: Project; proje
 					</span>
 				)}
 				{savedAt && !mutation.isPending && !mutation.isError && <span className="text-xs text-success">Saved.</span>}
-				{replacementError && !mutation.isPending && !mutation.isError && (
+				{replacementMutation.isPending && !mutation.isError && (
+					<span className="text-xs text-muted-foreground">Restarting orchestrator…</span>
+				)}
+				{replacementError && !replacementMutation.isPending && !mutation.isPending && !mutation.isError && (
 					<span className="text-xs text-warning">Orchestrator restart failed: {replacementError}</span>
 				)}
 			</div>

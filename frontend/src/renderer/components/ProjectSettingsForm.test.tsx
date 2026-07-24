@@ -466,4 +466,43 @@ describe("ProjectSettingsForm", () => {
 		expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project", "proj-1"] });
 		expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: workspaceQueryKey });
 	});
+
+	it("finishes saving while a required orchestrator replacement is still running", async () => {
+		mockProject({
+			id: "proj-1",
+			name: "Project One",
+			kind: "single_repo",
+			path: "/repo/project-one",
+			repo: "",
+			defaultBranch: "main",
+			config: {
+				worker: { agent: "codex" },
+				orchestrator: { agent: "claude-code" },
+			},
+		});
+		let finishReplacement: ((value: unknown) => void) | undefined;
+		postMock.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					finishReplacement = resolve;
+				}),
+		);
+
+		renderSettings();
+
+		const orchestratorAgent = await screen.findByRole("combobox", { name: "Default orchestrator agent" });
+		await chooseOption(orchestratorAgent, "Goose");
+		await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+		expect(await screen.findByText("Saved.")).toBeInTheDocument();
+		expect(screen.getByText("Restarting orchestrator…")).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+
+		finishReplacement?.({
+			data: { orchestrator: { id: "proj-1-orch-2" } },
+			error: undefined,
+			response: { status: 201 },
+		});
+		await waitFor(() => expect(screen.queryByText("Restarting orchestrator…")).not.toBeInTheDocument());
+	});
 });

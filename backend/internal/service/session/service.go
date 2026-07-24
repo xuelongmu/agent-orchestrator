@@ -321,11 +321,13 @@ func (s *Service) emitSpawnFailed(cfg ports.SpawnConfig, err error, durationMs i
 	})
 }
 
-// SpawnOrchestrator spawns an orchestrator session for a project. When clean is
-// true it first tears down any active orchestrator(s) for that project so the new
-// one is the only live coordinator. When clean is false it is idempotent: if an
-// active orchestrator already exists it is returned as-is. A business rule that
-// belongs here, not in the HTTP controller.
+// SpawnOrchestrator starts an orchestrator session for a project. When clean is
+// true it first tears down any active orchestrator(s) for that project. If the
+// newest coordinator still matches the configured harness, workspace kind, and
+// canonical branch, it is restored so the native agent transcript survives a
+// settings restart; otherwise a new session is spawned. When clean is false it
+// is idempotent: if an active orchestrator already exists it is returned as-is.
+// A business rule that belongs here, not in the HTTP controller.
 func (s *Service) SpawnOrchestrator(ctx context.Context, projectID domain.ProjectID, clean bool) (domain.Session, error) {
 	unlock := s.lockOrchestratorProject(projectID)
 	defer unlock()
@@ -340,11 +342,38 @@ func (s *Service) SpawnOrchestrator(ctx context.Context, projectID domain.Projec
 		if err != nil {
 			return domain.Session{}, err
 		}
+		var restoreID domain.SessionID
+		if len(existing) > 0 {
+			candidate := newestSession(existing)
+			if orchestratorCanResumeAfterConfigChange(project, candidate) {
+				restoreID = candidate.ID
+			}
+		}
 		for _, orch := range existing {
 			_ = s.sendRetireNotice(ctx, orch.ID)
 			if err := s.manager.RetireForReplacement(ctx, orch.ID); err != nil {
-				return domain.Session{}, toAPIError(err)
+				stillActive, checkErr := s.orchestratorIsActive(ctx, projectID, orch.ID)
+				if checkErr != nil {
+					return domain.Session{}, errors.Join(toAPIError(err), fmt.Errorf("check replacement retirement for %s: %w", orch.ID, checkErr))
+				}
+				if stillActive {
+					return domain.Session{}, toAPIError(err)
+				}
+				// Runtime exit callbacks can durably terminate the orchestrator
+				// while teardown is reporting a late cleanup error. Once the row
+				// proves retirement, continue with the replacement; spawning will
+				// still surface any branch/workspace cleanup conflict.
 			}
+		}
+		if restoreID != "" {
+			sess, err := s.Restore(ctx, restoreID)
+			if err != nil {
+				return domain.Session{}, err
+			}
+			if err := verifyOrchestratorReplacement(project, sess); err != nil {
+				return domain.Session{}, err
+			}
+			return sess, nil
 		}
 	} else {
 		// ponytail: check-then-spawn is not atomic; fine for the single-frontend ensure-on-load case. Upgrade path: a partial unique index on (project_id) where kind=orchestrator and not terminated.
@@ -366,7 +395,34 @@ func (s *Service) SpawnOrchestrator(ctx context.Context, projectID domain.Projec
 	return sess, nil
 }
 
-const orchestratorRetireNotice = "AO is replacing this project orchestrator. Stop coordinating new work now; a fresh orchestrator will take over on the canonical branch."
+func orchestratorCanResumeAfterConfigChange(project domain.ProjectRecord, sess domain.Session) bool {
+	if expected := project.Config.Orchestrator.Harness; expected != "" && sess.Harness != expected {
+		return false
+	}
+	if sess.Metadata.WorkspaceKind.WithDefault() != project.Config.WorkspaceKind.WithDefault() {
+		return false
+	}
+	expectedBranch := "ao/" + serviceSessionPrefix(project) + "-orchestrator"
+	return sess.Metadata.Branch == "" || sess.Metadata.Branch == expectedBranch
+}
+
+func (s *Service) orchestratorIsActive(ctx context.Context, projectID domain.ProjectID, id domain.SessionID) (bool, error) {
+	if s.store == nil {
+		return true, nil
+	}
+	sessions, err := s.store.ListSessions(ctx, projectID)
+	if err != nil {
+		return false, err
+	}
+	for _, rec := range sessions {
+		if rec.ID == id {
+			return rec.Kind == domain.KindOrchestrator && !rec.IsTerminated, nil
+		}
+	}
+	return false, nil
+}
+
+const orchestratorRetireNotice = "AO is restarting or replacing this project orchestrator to apply updated settings. Stop coordinating new work now; coordination will continue on the canonical branch."
 
 func (s *Service) sendRetireNotice(ctx context.Context, id domain.SessionID) error {
 	if err := s.manager.Send(ctx, id, orchestratorRetireNotice); err != nil {

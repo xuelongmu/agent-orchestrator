@@ -763,6 +763,11 @@ type fakeCommander struct {
 	cleanupProjects         []domain.ProjectID
 	killErr                 error
 	retireErr               error
+	retireHook              func(domain.SessionID)
+	restoreErr              error
+	restoreRecord           domain.SessionRecord
+	restored                []domain.SessionID
+	retirementsAtRestore    int
 	sendErr                 error
 	cleanupErr              error
 	spawnErr                error
@@ -792,8 +797,16 @@ func (f *fakeCommander) Spawn(_ context.Context, cfg ports.SpawnConfig) (domain.
 	}
 	return domain.SessionRecord{ID: "mer-9", ProjectID: cfg.ProjectID, Kind: cfg.Kind, Harness: cfg.Harness}, nil
 }
-func (f *fakeCommander) Restore(context.Context, domain.SessionID) (domain.SessionRecord, error) {
-	return domain.SessionRecord{}, nil
+func (f *fakeCommander) Restore(_ context.Context, id domain.SessionID) (domain.SessionRecord, error) {
+	if f.restoreErr != nil {
+		return domain.SessionRecord{}, f.restoreErr
+	}
+	f.restored = append(f.restored, id)
+	f.retirementsAtRestore = len(f.retired)
+	if f.restoreRecord.ID != "" {
+		return f.restoreRecord, nil
+	}
+	return domain.SessionRecord{ID: id, Kind: domain.KindOrchestrator}, nil
 }
 func (f *fakeCommander) Kill(_ context.Context, id domain.SessionID) (bool, error) {
 	if f.killErr != nil {
@@ -803,6 +816,9 @@ func (f *fakeCommander) Kill(_ context.Context, id domain.SessionID) (bool, erro
 	return true, nil
 }
 func (f *fakeCommander) RetireForReplacement(_ context.Context, id domain.SessionID) error {
+	if f.retireHook != nil {
+		f.retireHook(id)
+	}
 	if f.retireErr != nil {
 		return f.retireErr
 	}
@@ -902,7 +918,7 @@ func TestTeardownProjectStopsOnKillError(t *testing.T) {
 	}
 }
 
-func TestSpawnOrchestratorCleanRetiresActiveOrchestratorsBeforeSpawn(t *testing.T) {
+func TestSpawnOrchestratorCleanRetiresActiveOrchestratorsBeforeRestore(t *testing.T) {
 	st := newFakeStore()
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
 	// Two active orchestrators plus an unrelated worker and a terminated
@@ -925,8 +941,11 @@ func TestSpawnOrchestratorCleanRetiresActiveOrchestratorsBeforeSpawn(t *testing.
 	if len(fc.sent) != 2 {
 		t.Fatalf("retire notices = %v, want the two active orchestrators", fc.sent)
 	}
-	if !fc.spawned || fc.killsAtSpawn != 2 {
-		t.Fatalf("spawn must run after both retirements: spawned=%v retirementsAtSpawn=%d", fc.spawned, fc.killsAtSpawn)
+	if len(fc.restored) != 1 || fc.restored[0] != "mer-2" || fc.retirementsAtRestore != 2 {
+		t.Fatalf("newest orchestrator must restore after both retirements: restored=%v retirementsAtRestore=%d", fc.restored, fc.retirementsAtRestore)
+	}
+	if fc.spawned {
+		t.Fatal("same-harness settings restart must not mint a new orchestrator")
 	}
 	if len(fc.killed) != 0 {
 		t.Fatalf("interactive Kill must not be used for replacement: killed=%v", fc.killed)
@@ -946,8 +965,108 @@ func TestSpawnOrchestratorCleanContinuesWhenRetireNoticeFails(t *testing.T) {
 	if len(fc.retired) != 1 || fc.retired[0] != "mer-1" {
 		t.Fatalf("retired = %v, want mer-1 despite retire notice failure", fc.retired)
 	}
+	if len(fc.restored) != 1 || fc.restored[0] != "mer-1" {
+		t.Fatalf("replacement should still restore when retire notice delivery fails: restored=%v", fc.restored)
+	}
+}
+
+func TestSpawnOrchestratorCleanContinuesWhenRetireErrorRacesWithTermination(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator}
+	fc := &fakeCommander{retireErr: errors.New("late runtime cleanup failure")}
+	fc.retireHook = func(id domain.SessionID) {
+		rec := st.sessions[id]
+		rec.IsTerminated = true
+		st.sessions[id] = rec
+	}
+	svc := &Service{manager: fc, store: st}
+
+	if _, err := svc.SpawnOrchestrator(context.Background(), "mer", true); err != nil {
+		t.Fatalf("SpawnOrchestrator: %v", err)
+	}
+	if len(fc.restored) != 1 || fc.restored[0] != "mer-1" {
+		t.Fatalf("replacement should restore after the old orchestrator is durably terminated: restored=%v", fc.restored)
+	}
+}
+
+func TestSpawnOrchestratorCleanStopsWhenRetireErrorLeavesOrchestratorActive(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator}
+	fc := &fakeCommander{retireErr: errors.New("runtime is still active")}
+	svc := &Service{manager: fc, store: st}
+
+	if _, err := svc.SpawnOrchestrator(context.Background(), "mer", true); err == nil {
+		t.Fatal("SpawnOrchestrator error = nil, want retirement failure")
+	}
+	if fc.spawned {
+		t.Fatal("replacement must not spawn while the old orchestrator remains active")
+	}
+	if len(fc.restored) != 0 {
+		t.Fatalf("replacement must not restore while the old orchestrator remains active: restored=%v", fc.restored)
+	}
+}
+
+func TestSpawnOrchestratorCleanSpawnsWhenHarnessChanges(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{
+		ID:     "mer",
+		Config: domain.ProjectConfig{Orchestrator: domain.RoleOverride{Harness: domain.HarnessCodex}},
+	}
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID:        "mer-1",
+		ProjectID: "mer",
+		Kind:      domain.KindOrchestrator,
+		Harness:   domain.HarnessClaudeCode,
+		Metadata:  domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, Branch: "ao/mer-orchestrator"},
+	}
+	fc := &fakeCommander{
+		spawnRecord: domain.SessionRecord{
+			ID:        "mer-9",
+			ProjectID: "mer",
+			Kind:      domain.KindOrchestrator,
+			Harness:   domain.HarnessCodex,
+			Metadata:  domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, Branch: "ao/mer-orchestrator"},
+		},
+	}
+	svc := &Service{manager: fc, store: st}
+
+	got, err := svc.SpawnOrchestrator(context.Background(), "mer", true)
+	if err != nil {
+		t.Fatalf("SpawnOrchestrator: %v", err)
+	}
+	if !fc.spawned || got.ID != "mer-9" {
+		t.Fatalf("harness change must spawn the configured replacement: spawned=%v id=%q", fc.spawned, got.ID)
+	}
+	if len(fc.restored) != 0 {
+		t.Fatalf("harness change must not restore the old native transcript: restored=%v", fc.restored)
+	}
+}
+
+func TestSpawnOrchestratorCleanSpawnsWhenWorkspaceKindChanges(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{
+		ID:     "mer",
+		Config: domain.ProjectConfig{WorkspaceKind: domain.WorkspaceKindScratch},
+	}
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID:        "mer-1",
+		ProjectID: "mer",
+		Kind:      domain.KindOrchestrator,
+		Metadata:  domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, Branch: "ao/mer-orchestrator"},
+	}
+	fc := &fakeCommander{}
+	svc := &Service{manager: fc, store: st}
+
+	if _, err := svc.SpawnOrchestrator(context.Background(), "mer", true); err != nil {
+		t.Fatalf("SpawnOrchestrator: %v", err)
+	}
 	if !fc.spawned {
-		t.Fatal("replacement should still spawn when retire notice delivery fails")
+		t.Fatal("workspace-kind change must spawn a new orchestrator")
+	}
+	if len(fc.restored) != 0 {
+		t.Fatalf("workspace-kind change must not restore the old session: restored=%v", fc.restored)
 	}
 }
 
