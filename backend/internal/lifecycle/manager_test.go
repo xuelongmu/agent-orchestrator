@@ -227,6 +227,10 @@ func (s guardedAutomatedSender) DeliverAutomated(ctx context.Context, id domain.
 	return s.guard.DeliverAutomated(ctx, id, msg)
 }
 
+func (s guardedAutomatedSender) NudgeIdleEpisode(ctx context.Context, id domain.SessionID, msg string, idleSince time.Time) (sessionguard.Outcome, error) {
+	return s.guard.NudgeIdleEpisode(ctx, id, msg, idleSince)
+}
+
 func (f *fakeAutomatedSender) SendAutomated(_ context.Context, _ domain.SessionID, msg string) error {
 	f.msgs = append(f.msgs, msg)
 	if f.beforeReturn != nil {
@@ -236,6 +240,14 @@ func (f *fakeAutomatedSender) SendAutomated(_ context.Context, _ domain.SessionI
 }
 
 func (f *fakeAutomatedSender) DeliverAutomated(_ context.Context, _ domain.SessionID, msg string) (sessionguard.Outcome, error) {
+	f.msgs = append(f.msgs, msg)
+	if f.beforeReturn != nil {
+		f.beforeReturn()
+	}
+	return sessionguard.Sent, f.err
+}
+
+func (f *fakeAutomatedSender) NudgeIdleEpisode(_ context.Context, _ domain.SessionID, msg string, _ time.Time) (sessionguard.Outcome, error) {
 	f.msgs = append(f.msgs, msg)
 	if f.beforeReturn != nil {
 		f.beforeReturn()
@@ -343,6 +355,10 @@ func (f *fakeMessenger) SendAutomated(ctx context.Context, id domain.SessionID, 
 }
 
 func (f *fakeMessenger) DeliverAutomated(ctx context.Context, id domain.SessionID, msg string) (sessionguard.Outcome, error) {
+	return sessionguard.Sent, f.Send(ctx, id, msg)
+}
+
+func (f *fakeMessenger) NudgeIdleEpisode(ctx context.Context, id domain.SessionID, msg string, _ time.Time) (sessionguard.Outcome, error) {
 	return sessionguard.Sent, f.Send(ctx, id, msg)
 }
 
@@ -4328,6 +4344,41 @@ func TestIdleReviewSnapshot_DeliveredNudgesDeferUntilBudgetExhausted(t *testing.
 	}
 	if len(sink.intents) != 1 {
 		t.Fatalf("exhaustion notifications = %d, want exactly 1: %+v", len(sink.intents), sink.intents)
+	}
+}
+
+func TestIdleReviewSnapshotRoutesReminderThroughAutomatedSenderBoundary(t *testing.T) {
+	st := newFakeStore()
+	rawMessenger := &fakeMessenger{}
+	sender := &fakeAutomatedSender{}
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	rec.FirstSignalAt = now.Add(-2 * time.Minute)
+	st.sessions[rec.ID] = rec
+	prURL := "https://github.com/o/r/pull/1"
+	obs := idleReviewSnapshot(prURL, false, ports.SCMReviewThreadObservation{
+		ID: "t1", Path: "a.go", Line: 9,
+		Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix this"}},
+	})
+	delivered := reactionPayload{Seen: map[string]string{"review:" + prURL: idleReviewDeliverySignature(obs)}}
+	raw, err := json.Marshal(delivered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.signatures[prURL] = string(raw)
+	m := New(st, rawMessenger)
+	m.SetAutomatedMessageSender(sender)
+	m.clock = func() time.Time { return now }
+
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.msgs) != 1 {
+		t.Fatalf("gated idle sender messages = %d, want 1", len(sender.msgs))
+	}
+	if len(rawMessenger.msgs) != 0 {
+		t.Fatalf("raw guard messenger received %d direct writes, want 0", len(rawMessenger.msgs))
 	}
 }
 

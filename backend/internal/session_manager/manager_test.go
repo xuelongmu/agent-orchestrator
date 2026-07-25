@@ -3317,9 +3317,12 @@ func TestKillWaitsForInFlightMessageDelivery(t *testing.T) {
 	}
 }
 
-func TestMessageDeliveryWaitsForInFlightKillAndObservesTermination(t *testing.T) {
+func TestIdleEpisodeNudgeWaitsForInFlightKillAndObservesTermination(t *testing.T) {
 	st := newFakeStore()
-	st.setSession(mkLive("mer-1"))
+	rec := mkLive("mer-1")
+	idleSince := time.Now().Add(-time.Minute)
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: idleSince}
+	st.setSession(rec)
 	rt := &fakeRuntime{}
 	ws := &fakeWorkspace{}
 	messenger := &fakeMessenger{}
@@ -3355,7 +3358,7 @@ func TestMessageDeliveryWaitsForInFlightKillAndObservesTermination(t *testing.T)
 	}
 	sendDone := make(chan deliveryResult, 1)
 	go func() {
-		outcome, err := m.DeliverAutomated(context.Background(), "mer-1", "must not be delivered")
+		outcome, err := m.NudgeIdleEpisode(context.Background(), "mer-1", "must not be delivered", idleSince)
 		sendDone <- deliveryResult{outcome: outcome, err: err}
 	}()
 	select {

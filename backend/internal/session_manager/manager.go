@@ -2892,6 +2892,21 @@ func (m *Manager) DeliverAutomated(ctx context.Context, id domain.SessionID, mes
 	return outcome, err
 }
 
+// NudgeIdleEpisode is the lifecycle idle-review delivery boundary. It keeps
+// the exact-episode guard outcome while serializing the final pane write with
+// every operation that can replace or tear down session ownership.
+func (m *Manager) NudgeIdleEpisode(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) (sessionguard.Outcome, error) {
+	unlockSessionCommand := m.LockWorkspaceMutation(id)
+	defer unlockSessionCommand()
+
+	message, err := m.prepareOutboundMessage(ctx, id, message)
+	if err != nil {
+		return sessionguard.SuppressedUnknown, err
+	}
+	outcome, _, err := m.messenger.NudgeIdleEpisodeWithDelivery(ctx, id, message, idleSince)
+	return outcome, err
+}
+
 // SendAutomatedIfIdle delivers only when the guard's final pre-write read is
 // still the exact idle episode that authorized the caller's decision.
 func (m *Manager) SendAutomatedIfIdle(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) error {

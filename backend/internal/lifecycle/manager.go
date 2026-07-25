@@ -103,6 +103,7 @@ type diagnosticRuntime interface {
 type automatedMessageSender interface {
 	SendAutomated(ctx context.Context, id domain.SessionID, message string) error
 	DeliverAutomated(ctx context.Context, id domain.SessionID, message string) (sessionguard.Outcome, error)
+	NudgeIdleEpisode(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) (sessionguard.Outcome, error)
 }
 
 type dependencyReconciler interface {

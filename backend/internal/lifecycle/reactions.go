@@ -756,7 +756,18 @@ func (m *Manager) ApplyIdleReviewSnapshot(ctx context.Context, id domain.Session
 		return err
 	}
 	msg += contract.String()
-	outcome, sendErr := m.guard.NudgeIdleEpisode(ctx, id, msg, rec.Activity.LastActivityAt)
+	m.mu.Lock()
+	sender := m.automatedSender
+	m.mu.Unlock()
+	var outcome sessionguard.Outcome
+	var sendErr error
+	if sender != nil {
+		outcome, sendErr = sender.NudgeIdleEpisode(ctx, id, msg, rec.Activity.LastActivityAt)
+	} else {
+		// Pure reducer embeddings may wire only the raw guarded messenger. The
+		// daemon always supplies the gated Session Manager boundary.
+		outcome, sendErr = m.guard.NudgeIdleEpisode(ctx, id, msg, rec.Activity.LastActivityAt)
+	}
 	if outcome == sessionguard.SuppressedStaleEpisode || outcome == sessionguard.SuppressedRateLimited {
 		return m.clearIdleReviewEpisodeIdentityLocked(ctx, prURL, rec.Activity.LastActivityAt)
 	}
