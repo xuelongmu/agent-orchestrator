@@ -20,6 +20,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/conpty/ptyregistry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 // livePID returns a PID that is guaranteed to be alive (the current process).
@@ -91,6 +92,7 @@ type inProcHost struct {
 	cancel     context.CancelFunc
 	done       chan error
 	ln         net.Listener
+	job        *process.SessionJob
 }
 
 func startInProcHost(t *testing.T, sessionID string, fakePID int, generations ...string) *inProcHost {
@@ -99,8 +101,14 @@ func startInProcHost(t *testing.T, sessionID string, fakePID int, generations ..
 	if len(generations) > 0 {
 		generation = generations[0]
 	}
+	dataDir, _ := os.LookupEnv(dataDirEnv)
+	job, err := process.CreateSessionJob(dataDir, sessionID, generation)
+	if err != nil {
+		t.Fatalf("create test session job: %v", err)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		_ = job.Close()
 		t.Fatalf("listen: %v", err)
 	}
 	pty := newFakePTY(fakePID)
@@ -126,6 +134,7 @@ func startInProcHost(t *testing.T, sessionID string, fakePID int, generations ..
 		cancel:     cancel,
 		done:       done,
 		ln:         ln,
+		job:        job,
 	}
 }
 
@@ -136,6 +145,9 @@ func (h *inProcHost) cleanup(t *testing.T) {
 	case <-h.done:
 	case <-time.After(2 * time.Second):
 		t.Log("warning: inProcHost did not stop within 2s")
+	}
+	if err := h.job.Close(); err != nil {
+		t.Errorf("close test session job: %v", err)
 	}
 }
 

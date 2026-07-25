@@ -833,6 +833,20 @@ During this one-version upgrade boundary, stop the old `pty-host` manually (for
 example in Task Manager) and then restart/restore the AO session; the daemon
 will not force-kill or automatically adopt an identity-less host.
 
+Each new Windows `pty-host` also owns a named Job Object scoped to the AO data
+directory, session, and exact runtime generation. The ConPTY child starts
+suspended, joins the job, and is resumed only after assignment. Runtime destroy
+opens only the identity-verified generation's job, terminates it, and waits for
+it to report zero live processes before session cleanup may reclaim the
+workspace.
+
+Interactive messages always go to the session's existing runtime pane; the
+daemon never starts a second provider process to resume the same native
+conversation. Message delivery shares the session's command gate with kill,
+restore, cleanup, and workspace mutation. A teardown that wins the gate blocks
+later delivery and leaves the terminal guard to observe the durable terminated
+state; a delivery that wins completes its one pane write before teardown starts.
+
 ### Attach Flow
 
 ```mermaid
