@@ -106,6 +106,14 @@ type automatedMessageSender interface {
 	NudgeIdleEpisode(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) (sessionguard.Outcome, error)
 }
 
+// sessionCommandAutomatedSender is implemented by Session Manager. It lets the
+// durable claim-ready path acquire session ownership before the per-PR design
+// delivery lock, then send without recursively entering the same session gate.
+type sessionCommandAutomatedSender interface {
+	LockSessionCommand(id domain.SessionID) func()
+	SendAutomatedWithSessionCommand(ctx context.Context, id domain.SessionID, message string) error
+}
+
 type dependencyReconciler interface {
 	Wake()
 }

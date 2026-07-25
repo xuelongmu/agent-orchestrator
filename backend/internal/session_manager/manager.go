@@ -2877,6 +2877,20 @@ func (m *Manager) SendAutomated(ctx context.Context, id domain.SessionID, messag
 	return m.send(ctx, id, message, true, nil)
 }
 
+// LockSessionCommand exposes the session gate to the lifecycle claim-delivery
+// coordinator so it can establish the global session-before-design lock order.
+func (m *Manager) LockSessionCommand(id domain.SessionID) func() {
+	return m.LockWorkspaceMutation(id)
+}
+
+// SendAutomatedWithSessionCommand performs automated delivery while the caller
+// owns LockSessionCommand(id). It exists only for lifecycle's durable
+// claim-ready transaction, which must acquire the per-PR delivery lock after
+// the session gate without recursively locking the session.
+func (m *Manager) SendAutomatedWithSessionCommand(ctx context.Context, id domain.SessionID, message string) error {
+	return m.sendWithMutationLock(ctx, id, message, true, nil)
+}
+
 // DeliverAutomated is the lifecycle reaction delivery boundary. It preserves
 // the guard's exact outcome for durable reaction accounting while sharing the
 // same per-session gate as SendAutomated, kill, restore, and cleanup.
@@ -2917,6 +2931,10 @@ func (m *Manager) send(ctx context.Context, id domain.SessionID, message string,
 	unlockSessionCommand := m.LockWorkspaceMutation(id)
 	defer unlockSessionCommand()
 
+	return m.sendWithMutationLock(ctx, id, message, automated, idleSince)
+}
+
+func (m *Manager) sendWithMutationLock(ctx context.Context, id domain.SessionID, message string, automated bool, idleSince *time.Time) error {
 	message, err := m.prepareOutboundMessage(ctx, id, message)
 	if err != nil {
 		return err

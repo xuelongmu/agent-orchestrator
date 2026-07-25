@@ -202,6 +202,24 @@ type fakeAutomatedSender struct {
 	beforeReturn func()
 }
 
+type coordinatedAutomatedSender struct {
+	*fakeAutomatedSender
+	sessionGate sync.Mutex
+	attempted   chan struct{}
+}
+
+func (s *coordinatedAutomatedSender) LockSessionCommand(domain.SessionID) func() {
+	if s.attempted != nil {
+		s.attempted <- struct{}{}
+	}
+	s.sessionGate.Lock()
+	return s.sessionGate.Unlock
+}
+
+func (s *coordinatedAutomatedSender) SendAutomatedWithSessionCommand(ctx context.Context, id domain.SessionID, message string) error {
+	return s.SendAutomated(ctx, id, message)
+}
+
 type fakeDependencyScheduler struct{ calls int }
 
 func (s *fakeDependencyScheduler) Wake() {
@@ -1666,6 +1684,71 @@ func TestPRObservationRecoversPendingClaimContractAfterRestartBeforeOtherWork(t 
 		if strings.Contains(recoveredMessenger.msgs[0], forbidden) {
 			t.Fatalf("claim-ready delivery retained control %q: %q", forbidden, recoveredMessenger.msgs[0])
 		}
+	}
+}
+
+func TestPendingClaimRecoveryAcquiresSessionBeforeDesignDeliveryLock(t *testing.T) {
+	st := newFakeStore()
+	prURL := "https://github.com/o/r/pull/7"
+	rec := working("mer-1")
+	rec.Metadata.WorkspacePath = t.TempDir()
+	st.sessions[rec.ID] = rec
+	st.designContracts[prURL] = designcontract.BuildSeed("7", "preserve ordering")
+	st.pendingContractDelivery[prURL] = rec.ID
+	st.pendingContractToken[prURL] = "generation-1"
+	st.pendingContractRevision[prURL] = 1
+	sender := &coordinatedAutomatedSender{
+		fakeAutomatedSender: &fakeAutomatedSender{},
+		attempted:           make(chan struct{}, 1),
+	}
+	m := New(st, &fakeMessenger{})
+	m.SetAutomatedMessageSender(sender)
+
+	// Model ClaimPR already owning the session gate while it is about to take
+	// the per-PR delivery lock.
+	sender.sessionGate.Lock()
+	recoveryDone := make(chan error, 1)
+	go func() {
+		_, err := m.ensurePRDesignContractDelivered(context.Background(), rec.ID, prURL)
+		recoveryDone <- err
+	}()
+	select {
+	case <-sender.attempted:
+	case <-time.After(time.Second):
+		sender.sessionGate.Unlock()
+		t.Fatal("lifecycle recovery did not attempt the session gate")
+	}
+
+	deliveryAcquired := make(chan func(), 1)
+	go func() {
+		deliveryAcquired <- designcontract.LockDelivery(prURL)
+	}()
+	var unlockDelivery func()
+	select {
+	case unlockDelivery = <-deliveryAcquired:
+	case <-time.After(time.Second):
+		sender.sessionGate.Unlock()
+		t.Fatal("lifecycle held the design-delivery lock while waiting for the session gate")
+	}
+
+	sender.sessionGate.Unlock()
+	select {
+	case err := <-recoveryDone:
+		unlockDelivery()
+		t.Fatalf("recovery crossed the held design-delivery lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlockDelivery()
+	select {
+	case err := <-recoveryDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not resume after the ordered locks were released")
+	}
+	if len(sender.msgs) != 1 || st.pendingContractDelivery[prURL] != "" {
+		t.Fatalf("ordered recovery = messages:%d pending:%q", len(sender.msgs), st.pendingContractDelivery[prURL])
 	}
 }
 
