@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/conpty/ptyregistry"
+	"github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 // RunHost is the "ao pty-host" entrypoint. argv is everything after the
@@ -57,7 +58,16 @@ func RunHost(args []string, stdout io.Writer) int {
 	}
 	port := tcpAddr.Port
 
-	pty, err := newConPTY(cwd, shellCmd, shellArgs)
+	dataDir, _ := os.LookupEnv(dataDirEnv)
+	sessionJob, err := process.CreateSessionJob(dataDir, sessionID, generation)
+	if err != nil {
+		_ = ln.Close()
+		fmt.Fprintf(os.Stderr, "pty-host [%s]: create process job: %v\n", sessionID, err)
+		return 1
+	}
+	defer func() { _ = sessionJob.Close() }()
+
+	pty, err := newConPTY(cwd, shellCmd, shellArgs, sessionJob)
 	if err != nil {
 		_ = ln.Close()
 		fmt.Fprintf(os.Stderr, "pty-host [%s]: newConPTY: %v\n", sessionID, err)
@@ -77,7 +87,6 @@ func RunHost(args []string, stdout io.Writer) int {
 	if _, err := fmt.Fprintf(stdout, "READY:%d %d\n", os.Getpid(), port); err != nil {
 		_ = pty.Close()
 		_ = ln.Close()
-		dataDir, _ := os.LookupEnv(dataDirEnv)
 		_ = ptyregistry.UnregisterGenerationAt(dataDir, sessionID, generation)
 		fmt.Fprintf(os.Stderr, "pty-host [%s]: publish READY: %v\n", sessionID, err)
 		return 1

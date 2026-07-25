@@ -166,10 +166,16 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 		branchChanged bool
 		outcome       ports.ClaimOutcome
 	)
+	// Global order: session command/workspace gate, then per-PR design delivery
+	// lock. Lifecycle claim-ready recovery uses the same order.
+	unlockWorkspaceMutation := s.lockWorkspaceMutation(id)
+	workspaceMutationLocked := true
+	defer func() {
+		if workspaceMutationLocked {
+			unlockWorkspaceMutation()
+		}
+	}()
 	err = func() error {
-		unlockWorkspaceMutation := s.lockWorkspaceMutation(id)
-		defer unlockWorkspaceMutation()
-
 		// Provider enrichment is intentionally outside the workspace gate. Once
 		// inside it, reload the authoritative record: dependency promotion may
 		// have persisted a future path/branch while creating the workspace, and
@@ -234,10 +240,15 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 			unlockDelivery := designcontract.LockDelivery(prURL)
 			delivery, pending, deliveryErr := deliveryStore.GetPendingPRDesignContractDelivery(ctx, id, prURL)
 			if deliveryErr == nil && pending {
-				// Pane delivery deliberately runs after releasing the workspace gate;
-				// it can be slow and does not mutate checkout or branch metadata.
+				// Pane delivery shares the command/workspace gate so no teardown,
+				// restore, or competing checkout can cross this delivery boundary.
 				message := domain.SanitizeControlChars(designcontract.ClaimReadyMessage(prURL, delivery.Contract, delivery.TaskPrompt))
-				deliveryErr = s.manager.SendAutomated(ctx, id, message)
+				if sender, ok := s.manager.(sessionCommandAutomatedSender); ok {
+					deliveryErr = sender.SendAutomatedWithSessionCommand(ctx, id, message)
+				} else {
+					// Test/embedding managers do not own the production gate.
+					deliveryErr = s.manager.SendAutomated(ctx, id, message)
+				}
 				if deliveryErr == nil {
 					contractReady, deliveryErr = deliveryStore.CompletePRDesignContractDelivery(ctx, id, prURL, delivery.Token, delivery.Revision)
 				}
@@ -250,9 +261,10 @@ func (s *Service) ClaimPR(ctx context.Context, id domain.SessionID, ref string, 
 			}
 		}
 	}
-	// The claim-ready pane attempt is outside the session workspace gate but
-	// inside this session's claim lock, so another PR cannot replace checkout
-	// before the agent receives (or definitively fails to receive) this barrier.
+	unlockWorkspaceMutation()
+	workspaceMutationLocked = false
+	// The claim-ready pane attempt and checkout share the session command gate
+	// and claim lock, so no teardown or different PR can cross the barrier.
 	unlockSessionClaim()
 	sessionClaimLocked = false
 	prs, err := s.listPRFacts(ctx, id)

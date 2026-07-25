@@ -834,6 +834,10 @@ func (f *fakeCommander) SendAutomated(ctx context.Context, id domain.SessionID, 
 	return f.Send(ctx, id, message)
 }
 
+func (f *fakeCommander) SendAutomatedWithSessionCommand(ctx context.Context, id domain.SessionID, message string) error {
+	return f.Send(ctx, id, message)
+}
+
 func (f *fakeCommander) SendAutomatedIfIdle(ctx context.Context, id domain.SessionID, message string, _ time.Time) error {
 	return f.SendAutomated(ctx, id, message)
 }
@@ -1804,8 +1808,8 @@ func TestClaimPRSerializesSameSessionCheckoutThroughPaneDelivery(t *testing.T) {
 		t.Fatalf("first checkout = PR %d, want 7", got)
 	}
 	<-sendEntered
-	if !workspaceUnlockedOnSend {
-		t.Fatal("first pane delivery held the session workspace mutation gate")
+	if workspaceUnlockedOnSend {
+		t.Fatal("first pane delivery released the session command/workspace gate")
 	}
 
 	go func() {
@@ -2012,8 +2016,8 @@ func TestClaimPRReplacementUsesFinalAtomicOwnerAndNudgesCanonicalContract(t *tes
 	if !res.ContractReady || st.pendingContractDelivery[prURL] != "" {
 		t.Fatalf("contract delivery barrier = ready %v pending %q", res.ContractReady, st.pendingContractDelivery[prURL])
 	}
-	if !workspaceUnlockedOnSend {
-		t.Fatal("claim-ready pane delivery ran while the workspace mutation gate was held")
+	if workspaceUnlockedOnSend {
+		t.Fatal("claim-ready pane delivery released the session command/workspace gate")
 	}
 	if persistedTask != taskPrompt || len(commander.sentMessages) != 1 || !strings.Contains(commander.sentMessages[0], "Preserve the final owner's rounds") || !strings.Contains(commander.sentMessages[0], taskPrompt) || strings.Contains(commander.sentMessages[0], "mer-A") {
 		t.Fatalf("claim-time contract nudge = %v", commander.sentMessages)

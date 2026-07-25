@@ -165,7 +165,7 @@ func TestNewConPTYRepeatedStartFailuresDoNotLeakHandles(t *testing.T) {
 	before := currentProcessHandleCount(t)
 	missingCommand := filepath.Join(t.TempDir(), "missing-agent.exe")
 	for i := 0; i < 32; i++ {
-		if _, err := newConPTY(t.TempDir(), missingCommand, nil); err == nil {
+		if _, err := newConPTY(t.TempDir(), missingCommand, nil, nil); err == nil {
 			t.Fatalf("iteration %d unexpectedly succeeded", i)
 		}
 	}

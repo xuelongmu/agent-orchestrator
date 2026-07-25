@@ -20,6 +20,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/conpty/ptyregistry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 // livePID returns a PID that is guaranteed to be alive (the current process).
@@ -48,6 +49,23 @@ func (p *fakeProcessHandle) Alive() (bool, error) {
 }
 func (p *fakeProcessHandle) Kill() error  { p.killed = true; return p.killErr }
 func (p *fakeProcessHandle) Close() error { p.closed = true; return nil }
+
+type fakeSessionProcessJob struct {
+	terminate func(context.Context) error
+	closed    int
+}
+
+func (j *fakeSessionProcessJob) TerminateAndWait(ctx context.Context) error {
+	if j.terminate == nil {
+		return nil
+	}
+	return j.terminate(ctx)
+}
+
+func (j *fakeSessionProcessJob) Close() error {
+	j.closed++
+	return nil
+}
 
 func withProcessFinder(t *testing.T, finder func(int) (processKiller, error)) {
 	t.Helper()
@@ -91,6 +109,7 @@ type inProcHost struct {
 	cancel     context.CancelFunc
 	done       chan error
 	ln         net.Listener
+	job        *process.SessionJob
 }
 
 func startInProcHost(t *testing.T, sessionID string, fakePID int, generations ...string) *inProcHost {
@@ -99,8 +118,14 @@ func startInProcHost(t *testing.T, sessionID string, fakePID int, generations ..
 	if len(generations) > 0 {
 		generation = generations[0]
 	}
+	dataDir, _ := os.LookupEnv(dataDirEnv)
+	job, err := process.CreateSessionJob(dataDir, sessionID, generation)
+	if err != nil {
+		t.Fatalf("create test session job: %v", err)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		_ = job.Close()
 		t.Fatalf("listen: %v", err)
 	}
 	pty := newFakePTY(fakePID)
@@ -126,6 +151,7 @@ func startInProcHost(t *testing.T, sessionID string, fakePID int, generations ..
 		cancel:     cancel,
 		done:       done,
 		ln:         ln,
+		job:        job,
 	}
 }
 
@@ -136,6 +162,9 @@ func (h *inProcHost) cleanup(t *testing.T) {
 	case <-h.done:
 	case <-time.After(2 * time.Second):
 		t.Log("warning: inProcHost did not stop within 2s")
+	}
+	if err := h.job.Close(); err != nil {
+		t.Errorf("close test session job: %v", err)
 	}
 }
 
@@ -805,6 +834,115 @@ func TestDestroyAlreadyExitedProcessCleansExactGeneration(t *testing.T) {
 	}
 }
 
+func TestDestroyHostDisappearsBetweenProcessOpenAndIdentityProbe(t *testing.T) {
+	isolateRegistry(t)
+	processHandle := &fakeProcessHandle{}
+	withProcessFinder(t, func(int) (processKiller, error) { return processHandle, nil })
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sess := &hostSession{addr: addr, pid: livePID(), generation: "probe-exit-generation"}
+	rt := New(Options{})
+	rt.mu.Lock()
+	rt.sessions["probe-exit"] = sess
+	rt.mu.Unlock()
+	if err := ptyregistry.Register(ptyregistry.Entry{
+		SessionID: "probe-exit", PtyHostPID: livePID(), PipePath: addr,
+		RegisteredAt: time.Now().UTC().Format(time.RFC3339Nano), Generation: sess.generation,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rt.Destroy(context.Background(), ports.RuntimeHandle{ID: "probe-exit"}); err != nil {
+		t.Fatal(err)
+	}
+	if processHandle.killed {
+		t.Fatal("definitively absent host was force-killed")
+	}
+	if !processHandle.closed {
+		t.Fatal("retained host process handle was not closed")
+	}
+	if entries, err := ptyregistry.LookupAll("probe-exit"); err != nil || len(entries) != 0 {
+		t.Fatalf("probe-exit generation remained registered: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestDestroyRetainsTimedOutJobForCleanupRetry(t *testing.T) {
+	isolateRegistry(t)
+	hosts := map[string]*inProcHost{}
+	processLookups := 0
+	withProcessFinder(t, func(int) (processKiller, error) {
+		processLookups++
+		if processLookups == 1 {
+			return &fakeProcessHandle{}, nil
+		}
+		return nil, os.ErrProcessDone
+	})
+	rt := New(Options{Spawner: fakeSpawnerFor(t, hosts, deadPID())})
+	handle, err := rt.Create(context.Background(), ports.RuntimeConfig{
+		SessionID:     "job-timeout",
+		WorkspacePath: "/tmp/w",
+		Argv:          []string{"agent"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	terminateCalls := 0
+	job := &fakeSessionProcessJob{terminate: func(context.Context) error {
+		terminateCalls++
+		if terminateCalls == 1 {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}}
+	openCalls := 0
+	rt.openJob = func(_, _, _ string) (sessionProcessJob, error) {
+		openCalls++
+		return job, nil
+	}
+
+	err = rt.Destroy(context.Background(), handle)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Destroy error=%v, want job timeout", err)
+	}
+	if job.closed != 0 {
+		t.Fatal("timed-out job handle was closed before cleanup could retry")
+	}
+	rt.mu.Lock()
+	retainedSession := rt.sessions["job-timeout"]
+	var retainedJob sessionProcessJob
+	if retainedSession != nil {
+		retainedJob = rt.teardownJobs[sessionJobKey{sessionID: "job-timeout", generation: retainedSession.generation}]
+	}
+	rt.mu.Unlock()
+	if retainedSession == nil || retainedJob != job {
+		t.Fatalf("timed-out teardown ownership was not retained: session=%+v job=%T", retainedSession, retainedJob)
+	}
+
+	if err := rt.Destroy(context.Background(), handle); err != nil {
+		t.Fatalf("retry Destroy: %v", err)
+	}
+	if openCalls != 1 {
+		t.Fatalf("job opener calls=%d, want retained handle reuse", openCalls)
+	}
+	if terminateCalls != 2 {
+		t.Fatalf("job termination calls=%d, want timeout plus retry", terminateCalls)
+	}
+	if job.closed != 1 {
+		t.Fatalf("job close calls=%d, want close after zero-process confirmation", job.closed)
+	}
+	if entries, lookupErr := ptyregistry.LookupAll("job-timeout"); lookupErr != nil || len(entries) != 0 {
+		t.Fatalf("retried generation remained registered: entries=%v err=%v", entries, lookupErr)
+	}
+}
+
 func TestDestroyDrainsEveryVerifiedGeneration(t *testing.T) {
 	isolateRegistry(t)
 	withProcessFinder(t, func(int) (processKiller, error) { return &fakeProcessHandle{}, nil })
@@ -1239,6 +1377,44 @@ func TestDestroy_KillsHostAndCleansUp(t *testing.T) {
 	// Second Destroy must be idempotent (returns nil).
 	if err := rt.Destroy(ctx, handle); err != nil {
 		t.Fatalf("second Destroy: expected nil, got %v", err)
+	}
+}
+
+func TestDestroyAdoptedPreJobGenerationUsesVerifiedLegacyTeardown(t *testing.T) {
+	isolateRegistry(t)
+	processHandle := &fakeProcessHandle{}
+	withProcessFinder(t, func(int) (processKiller, error) { return processHandle, nil })
+	hosts := map[string]*inProcHost{}
+	rt := New(Options{Spawner: fakeSpawnerFor(t, hosts, deadPID())})
+
+	handle, err := rt.Create(context.Background(), ports.RuntimeConfig{
+		SessionID:     "pre-job",
+		WorkspacePath: "/tmp/w",
+		Argv:          []string{"sh"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := hosts["pre-job"]
+	// Model a generation-aware host created by the immediately preceding
+	// release: its endpoint identity is valid, but no Job Object was created.
+	if err := host.job.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rt.Destroy(context.Background(), handle); err != nil {
+		t.Fatalf("Destroy pre-job generation: %v", err)
+	}
+	select {
+	case <-host.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pre-job host did not stop after verified teardown")
+	}
+	if processHandle.killed {
+		t.Fatal("legacy teardown force-killed after the retained process handle reported dead")
+	}
+	if entries, err := ptyregistry.LookupAll("pre-job"); err != nil || len(entries) != 0 {
+		t.Fatalf("pre-job generation remained registered: entries=%v err=%v", entries, err)
 	}
 }
 

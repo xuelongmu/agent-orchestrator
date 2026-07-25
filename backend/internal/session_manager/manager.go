@@ -257,11 +257,12 @@ type Manager struct {
 	lifetimeCtx context.Context
 	// sharedDirMu serializes the durable lease check with dir spawn/restore so
 	// concurrent requests cannot both observe the project directory as free.
-	// workspaceMutationLocks serialize dependency external launch/recovery,
-	// PR-claim checkout, restore, and teardown for the same session. Entries are
-	// reference-counted so unrelated sessions can mutate their private
-	// workspaces concurrently without growing this map forever. A session lock
-	// is always acquired before sharedDirMu (and therefore before lifecycle.mu).
+	// workspaceMutationLocks are the per-session command gates. They serialize
+	// message delivery with dependency external launch/recovery, PR-claim
+	// checkout, restore, and teardown so kill cannot race a pane write. Entries
+	// are reference-counted so unrelated sessions can
+	// proceed concurrently without growing this map forever. A session lock is
+	// always acquired before sharedDirMu (and therefore before lifecycle.mu).
 	workspaceMutationLocksMu sync.Mutex
 	workspaceMutationLocks   map[domain.SessionID]*sessionMutationLock
 	// workspaceMutationLockAttempt is a test seam invoked immediately before
@@ -284,10 +285,10 @@ func (m *Manager) SetDependencyScheduler(scheduler dependencyReconciler) {
 	m.dependencyScheduler = scheduler
 }
 
-// LockWorkspaceMutation enters one session's external workspace mutation gate.
-// Session-service PR claims share this with dependency promotion, recovery,
-// restore, and teardown so no operation observes or destroys half-transitioned
-// runtime/workspace ownership.
+// LockWorkspaceMutation enters one session's external command/mutation gate.
+// Message delivery and session-service PR claims share this with dependency
+// promotion, recovery, restore, and teardown so no operation writes through a
+// runtime while another operation is replacing or destroying its ownership.
 // Callers must invoke the returned unlock function exactly once.
 func (m *Manager) LockWorkspaceMutation(id domain.SessionID) func() {
 	m.workspaceMutationLocksMu.Lock()
@@ -432,66 +433,6 @@ func New(d Deps) *Manager {
 	// is built after the logger default).
 	m.messenger = sessionguard.New(d.Store, d.Messenger, m.logger)
 	return m
-}
-
-// MessageRestoreConfig recomputes the same provider configuration used by a
-// full session restore. Structured message sidecars use it so resuming a native
-// provider session does not drop AO's standing instructions, model, or
-// permission mode.
-func (m *Manager) MessageRestoreConfig(ctx context.Context, id domain.SessionID) (ports.RestoreConfig, error) {
-	rec, ok, err := m.store.GetSession(ctx, id)
-	if err != nil {
-		return ports.RestoreConfig{}, err
-	}
-	if !ok {
-		return ports.RestoreConfig{}, ErrNotFound
-	}
-	project, err := m.loadProject(ctx, rec.ProjectID)
-	if err != nil {
-		return ports.RestoreConfig{}, err
-	}
-	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID)
-	if err != nil {
-		return ports.RestoreConfig{}, err
-	}
-	agentConfig := effectiveAgentConfig(rec.Kind, project.Config)
-	return ports.RestoreConfig{
-		Config:       agentConfig,
-		Kind:         rec.Kind,
-		Permissions:  agentConfig.Permissions,
-		SystemPrompt: systemPrompt,
-		Session: ports.SessionRef{
-			ID:            string(rec.ID),
-			WorkspacePath: rec.Metadata.WorkspacePath,
-			Metadata: map[string]string{
-				ports.MetadataKeyAgentSessionID: rec.Metadata.AgentSessionID,
-			},
-		},
-	}, nil
-}
-
-// MessageRuntimeEnv rebuilds the exact runtime environment for a provider
-// sidecar, including project variables, AO identity, capability tokens, and
-// the daemon-pinned hook PATH.
-func (m *Manager) MessageRuntimeEnv(ctx context.Context, id domain.SessionID) (map[string]string, error) {
-	rec, ok, err := m.store.GetSession(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, ErrNotFound
-	}
-	project, err := m.loadProject(ctx, rec.ProjectID)
-	if err != nil {
-		return nil, err
-	}
-	env := m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
-	if m.agents != nil {
-		if agent, ok := m.agents.Agent(rec.Harness); ok {
-			m.augmentAgentRuntimeEnv(agent, env)
-		}
-	}
-	return env, nil
 }
 
 // Spawn creates the session row (which assigns the "{project}-{n}" id), then the
@@ -2933,9 +2874,9 @@ func (m *Manager) applyWorkspaceProjectPreserved(ctx context.Context, rows []por
 // The guard refuses delivery into a session that is gone, terminated, or
 // paused on a permission decision (pasting there could answer the dialog);
 // those refusals surface as typed sentinels so the API reports why instead of
-// silently dropping the message. Structured providers acknowledge the turn
-// directly and skip terminal confirmation. The terminal fallback returns when
-// paste + Enter exits 0, but a large multiline prompt may remain as an
+// silently dropping the message. Delivery always targets the one interactive
+// runtime process owned by the session. It returns when paste + Enter exits 0,
+// but a large multiline prompt may remain as an
 // unsubmitted draft. confirmActive observes the durable Activity.State and
 // re-sends Enter until the session is active or the budget is exhausted.
 // Confirmation never fails the send: it only decides whether to nudge again.
@@ -2950,6 +2891,50 @@ func (m *Manager) SendAutomated(ctx context.Context, id domain.SessionID, messag
 	return m.send(ctx, id, message, true, nil)
 }
 
+// LockSessionCommand exposes the session gate to the lifecycle claim-delivery
+// coordinator so it can establish the global session-before-design lock order.
+func (m *Manager) LockSessionCommand(id domain.SessionID) func() {
+	return m.LockWorkspaceMutation(id)
+}
+
+// SendAutomatedWithSessionCommand performs automated delivery while the caller
+// owns LockSessionCommand(id). It exists only for lifecycle's durable
+// claim-ready transaction, which must acquire the per-PR delivery lock after
+// the session gate without recursively locking the session.
+func (m *Manager) SendAutomatedWithSessionCommand(ctx context.Context, id domain.SessionID, message string) error {
+	return m.sendWithMutationLock(ctx, id, message, true, nil)
+}
+
+// DeliverAutomated is the lifecycle reaction delivery boundary. It preserves
+// the guard's exact outcome for durable reaction accounting while sharing the
+// same per-session gate as SendAutomated, kill, restore, and cleanup.
+func (m *Manager) DeliverAutomated(ctx context.Context, id domain.SessionID, message string) (sessionguard.Outcome, error) {
+	unlockSessionCommand := m.LockWorkspaceMutation(id)
+	defer unlockSessionCommand()
+
+	message, err := m.prepareOutboundMessage(ctx, id, message)
+	if err != nil {
+		return sessionguard.SuppressedUnknown, err
+	}
+	outcome, _, err := m.messenger.DeliverAutomatedWithDelivery(ctx, id, message)
+	return outcome, err
+}
+
+// NudgeIdleEpisode is the lifecycle idle-review delivery boundary. It keeps
+// the exact-episode guard outcome while serializing the final pane write with
+// every operation that can replace or tear down session ownership.
+func (m *Manager) NudgeIdleEpisode(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) (sessionguard.Outcome, error) {
+	unlockSessionCommand := m.LockWorkspaceMutation(id)
+	defer unlockSessionCommand()
+
+	message, err := m.prepareOutboundMessage(ctx, id, message)
+	if err != nil {
+		return sessionguard.SuppressedUnknown, err
+	}
+	outcome, _, err := m.messenger.NudgeIdleEpisodeWithDelivery(ctx, id, message, idleSince)
+	return outcome, err
+}
+
 // SendAutomatedIfIdle delivers only when the guard's final pre-write read is
 // still the exact idle episode that authorized the caller's decision.
 func (m *Manager) SendAutomatedIfIdle(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) error {
@@ -2957,6 +2942,13 @@ func (m *Manager) SendAutomatedIfIdle(ctx context.Context, id domain.SessionID, 
 }
 
 func (m *Manager) send(ctx context.Context, id domain.SessionID, message string, automated bool, idleSince *time.Time) error {
+	unlockSessionCommand := m.LockWorkspaceMutation(id)
+	defer unlockSessionCommand()
+
+	return m.sendWithMutationLock(ctx, id, message, automated, idleSince)
+}
+
+func (m *Manager) sendWithMutationLock(ctx context.Context, id domain.SessionID, message string, automated bool, idleSince *time.Time) error {
 	message, err := m.prepareOutboundMessage(ctx, id, message)
 	if err != nil {
 		return err
@@ -3462,7 +3454,13 @@ func (m *Manager) cleanupTerminalRecord(ctx context.Context, id domain.SessionID
 		inventoryBacked = true
 	}
 	if h := runtimeHandle(rec.Metadata); h.ID != "" {
-		_ = m.destroyRuntime(ctx, h) // best effort; usually already gone
+		if err := m.destroyRuntime(ctx, h); err != nil {
+			// Do not reclaim a workspace until runtime teardown has positively
+			// completed. In particular, Windows Job Object termination may need
+			// a later retry before every harness descendant is gone.
+			m.logger.Warn("cleanup: runtime teardown failed", "sessionID", rec.ID, "error", err)
+			return false, "runtime teardown failed"
+		}
 	}
 	if workspaceProject {
 		if _, err := m.destroyWorkspaceProjectRows(ctx, rows); err != nil {

@@ -202,6 +202,24 @@ type fakeAutomatedSender struct {
 	beforeReturn func()
 }
 
+type coordinatedAutomatedSender struct {
+	*fakeAutomatedSender
+	sessionGate sync.Mutex
+	attempted   chan struct{}
+}
+
+func (s *coordinatedAutomatedSender) LockSessionCommand(domain.SessionID) func() {
+	if s.attempted != nil {
+		s.attempted <- struct{}{}
+	}
+	s.sessionGate.Lock()
+	return s.sessionGate.Unlock
+}
+
+func (s *coordinatedAutomatedSender) SendAutomatedWithSessionCommand(ctx context.Context, id domain.SessionID, message string) error {
+	return s.SendAutomated(ctx, id, message)
+}
+
 type fakeDependencyScheduler struct{ calls int }
 
 func (s *fakeDependencyScheduler) Wake() {
@@ -213,7 +231,7 @@ type guardedAutomatedSender struct {
 }
 
 func (s guardedAutomatedSender) SendAutomated(ctx context.Context, id domain.SessionID, msg string) error {
-	outcome, err := s.guard.DeliverAutomated(ctx, id, msg)
+	outcome, err := s.DeliverAutomated(ctx, id, msg)
 	if err != nil {
 		return err
 	}
@@ -223,12 +241,36 @@ func (s guardedAutomatedSender) SendAutomated(ctx context.Context, id domain.Ses
 	return nil
 }
 
+func (s guardedAutomatedSender) DeliverAutomated(ctx context.Context, id domain.SessionID, msg string) (sessionguard.Outcome, error) {
+	return s.guard.DeliverAutomated(ctx, id, msg)
+}
+
+func (s guardedAutomatedSender) NudgeIdleEpisode(ctx context.Context, id domain.SessionID, msg string, idleSince time.Time) (sessionguard.Outcome, error) {
+	return s.guard.NudgeIdleEpisode(ctx, id, msg, idleSince)
+}
+
 func (f *fakeAutomatedSender) SendAutomated(_ context.Context, _ domain.SessionID, msg string) error {
 	f.msgs = append(f.msgs, msg)
 	if f.beforeReturn != nil {
 		f.beforeReturn()
 	}
 	return f.err
+}
+
+func (f *fakeAutomatedSender) DeliverAutomated(_ context.Context, _ domain.SessionID, msg string) (sessionguard.Outcome, error) {
+	f.msgs = append(f.msgs, msg)
+	if f.beforeReturn != nil {
+		f.beforeReturn()
+	}
+	return sessionguard.Sent, f.err
+}
+
+func (f *fakeAutomatedSender) NudgeIdleEpisode(_ context.Context, _ domain.SessionID, msg string, _ time.Time) (sessionguard.Outcome, error) {
+	f.msgs = append(f.msgs, msg)
+	if f.beforeReturn != nil {
+		f.beforeReturn()
+	}
+	return sessionguard.Sent, f.err
 }
 
 type retryMergedCleaner struct {
@@ -328,6 +370,14 @@ func (f *fakeMessenger) Send(_ context.Context, id domain.SessionID, msg string)
 
 func (f *fakeMessenger) SendAutomated(ctx context.Context, id domain.SessionID, msg string) error {
 	return f.Send(ctx, id, msg)
+}
+
+func (f *fakeMessenger) DeliverAutomated(ctx context.Context, id domain.SessionID, msg string) (sessionguard.Outcome, error) {
+	return sessionguard.Sent, f.Send(ctx, id, msg)
+}
+
+func (f *fakeMessenger) NudgeIdleEpisode(ctx context.Context, id domain.SessionID, msg string, _ time.Time) (sessionguard.Outcome, error) {
+	return sessionguard.Sent, f.Send(ctx, id, msg)
 }
 
 type fakeReactionReservation struct {
@@ -991,6 +1041,32 @@ func TestPRObservation_CIFailingNudgesAgentWithLogs(t *testing.T) {
 	}
 }
 
+func TestPRObservationRoutesReactionThroughAutomatedSenderBoundary(t *testing.T) {
+	m, st, raw := newManager()
+	sender := &fakeAutomatedSender{}
+	m.SetAutomatedMessageSender(sender)
+	st.sessions["mer-1"] = working("mer-1")
+
+	err := m.ApplyPRObservation(ctx, "mer-1", ports.PRObservation{
+		Fetched: true,
+		URL:     "pr1",
+		HeadSHA: "c1",
+		CI:      domain.CIFailing,
+		Checks: []ports.PRCheckObservation{{
+			Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.msgs) != 1 {
+		t.Fatalf("automated sender messages = %d, want 1", len(sender.msgs))
+	}
+	if len(raw.msgs) != 0 {
+		t.Fatalf("raw guard messenger received %d direct writes, want 0", len(raw.msgs))
+	}
+}
+
 func TestPRObservation_CancelledChecksDoNotNudge(t *testing.T) {
 	m, st, msg := newManager()
 	st.sessions["mer-1"] = working("mer-1")
@@ -1608,6 +1684,71 @@ func TestPRObservationRecoversPendingClaimContractAfterRestartBeforeOtherWork(t 
 		if strings.Contains(recoveredMessenger.msgs[0], forbidden) {
 			t.Fatalf("claim-ready delivery retained control %q: %q", forbidden, recoveredMessenger.msgs[0])
 		}
+	}
+}
+
+func TestPendingClaimRecoveryAcquiresSessionBeforeDesignDeliveryLock(t *testing.T) {
+	st := newFakeStore()
+	prURL := "https://github.com/o/r/pull/7"
+	rec := working("mer-1")
+	rec.Metadata.WorkspacePath = t.TempDir()
+	st.sessions[rec.ID] = rec
+	st.designContracts[prURL] = designcontract.BuildSeed("7", "preserve ordering")
+	st.pendingContractDelivery[prURL] = rec.ID
+	st.pendingContractToken[prURL] = "generation-1"
+	st.pendingContractRevision[prURL] = 1
+	sender := &coordinatedAutomatedSender{
+		fakeAutomatedSender: &fakeAutomatedSender{},
+		attempted:           make(chan struct{}, 1),
+	}
+	m := New(st, &fakeMessenger{})
+	m.SetAutomatedMessageSender(sender)
+
+	// Model ClaimPR already owning the session gate while it is about to take
+	// the per-PR delivery lock.
+	sender.sessionGate.Lock()
+	recoveryDone := make(chan error, 1)
+	go func() {
+		_, err := m.ensurePRDesignContractDelivered(context.Background(), rec.ID, prURL)
+		recoveryDone <- err
+	}()
+	select {
+	case <-sender.attempted:
+	case <-time.After(time.Second):
+		sender.sessionGate.Unlock()
+		t.Fatal("lifecycle recovery did not attempt the session gate")
+	}
+
+	deliveryAcquired := make(chan func(), 1)
+	go func() {
+		deliveryAcquired <- designcontract.LockDelivery(prURL)
+	}()
+	var unlockDelivery func()
+	select {
+	case unlockDelivery = <-deliveryAcquired:
+	case <-time.After(time.Second):
+		sender.sessionGate.Unlock()
+		t.Fatal("lifecycle held the design-delivery lock while waiting for the session gate")
+	}
+
+	sender.sessionGate.Unlock()
+	select {
+	case err := <-recoveryDone:
+		unlockDelivery()
+		t.Fatalf("recovery crossed the held design-delivery lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlockDelivery()
+	select {
+	case err := <-recoveryDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not resume after the ordered locks were released")
+	}
+	if len(sender.msgs) != 1 || st.pendingContractDelivery[prURL] != "" {
+		t.Fatalf("ordered recovery = messages:%d pending:%q", len(sender.msgs), st.pendingContractDelivery[prURL])
 	}
 }
 
@@ -4286,6 +4427,41 @@ func TestIdleReviewSnapshot_DeliveredNudgesDeferUntilBudgetExhausted(t *testing.
 	}
 	if len(sink.intents) != 1 {
 		t.Fatalf("exhaustion notifications = %d, want exactly 1: %+v", len(sink.intents), sink.intents)
+	}
+}
+
+func TestIdleReviewSnapshotRoutesReminderThroughAutomatedSenderBoundary(t *testing.T) {
+	st := newFakeStore()
+	rawMessenger := &fakeMessenger{}
+	sender := &fakeAutomatedSender{}
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	rec := working("mer-1")
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-2 * time.Minute)}
+	rec.FirstSignalAt = now.Add(-2 * time.Minute)
+	st.sessions[rec.ID] = rec
+	prURL := "https://github.com/o/r/pull/1"
+	obs := idleReviewSnapshot(prURL, false, ports.SCMReviewThreadObservation{
+		ID: "t1", Path: "a.go", Line: 9,
+		Comments: []ports.SCMReviewCommentObservation{{ID: "c1", Author: "alice", Body: "fix this"}},
+	})
+	delivered := reactionPayload{Seen: map[string]string{"review:" + prURL: idleReviewDeliverySignature(obs)}}
+	raw, err := json.Marshal(delivered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.signatures[prURL] = string(raw)
+	m := New(st, rawMessenger)
+	m.SetAutomatedMessageSender(sender)
+	m.clock = func() time.Time { return now }
+
+	if err := m.ApplyIdleReviewSnapshot(ctx, rec.ID, obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.msgs) != 1 {
+		t.Fatalf("gated idle sender messages = %d, want 1", len(sender.msgs))
+	}
+	if len(rawMessenger.msgs) != 0 {
+		t.Fatalf("raw guard messenger received %d direct writes, want 0", len(rawMessenger.msgs))
 	}
 }
 

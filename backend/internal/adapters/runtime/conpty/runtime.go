@@ -19,6 +19,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/conpty/ptyregistry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 // Ensure Runtime satisfies the port at compile time (Attach in attach.go).
@@ -38,6 +39,16 @@ var errHostLaunchInProgress = errors.New("conpty: host launch is still in progre
 type hostSession struct {
 	addr       string
 	pid        int
+	generation string
+}
+
+type sessionProcessJob interface {
+	TerminateAndWait(context.Context) error
+	Close() error
+}
+
+type sessionJobKey struct {
+	sessionID  string
 	generation string
 }
 
@@ -63,11 +74,13 @@ type Runtime struct {
 	register   func(ptyregistry.Entry) error
 	unregister func(string, string) error
 	lookupAll  func(string) ([]ptyregistry.Entry, error)
+	openJob    func(string, string, string) (sessionProcessJob, error)
 	dataDir    string
 	initErr    error
 
-	mu       sync.Mutex
-	sessions map[string]*hostSession // sessionID -> live session
+	mu           sync.Mutex
+	sessions     map[string]*hostSession // sessionID -> live session
+	teardownJobs map[sessionJobKey]sessionProcessJob
 }
 
 // New creates a Runtime with the given options.
@@ -120,9 +133,17 @@ func New(opts Options) *Runtime {
 		register:   register,
 		unregister: unregister,
 		lookupAll:  lookupAll,
-		dataDir:    dataDir,
-		initErr:    initErr,
-		sessions:   make(map[string]*hostSession),
+		openJob: func(dataDir, sessionID, generation string) (sessionProcessJob, error) {
+			job, err := process.OpenSessionJob(dataDir, sessionID, generation)
+			if job == nil {
+				return nil, err
+			}
+			return job, err
+		},
+		dataDir:      dataDir,
+		initErr:      initErr,
+		sessions:     make(map[string]*hostSession),
+		teardownJobs: make(map[sessionJobKey]sessionProcessJob),
 	}
 }
 
@@ -214,7 +235,7 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 		RegisteredAt: time.Now().UTC().Format(time.RFC3339Nano),
 		Generation:   generation,
 	}); err != nil {
-		cleanupErr := r.destroySession(id, sess)
+		cleanupErr := r.destroySession(ctx, id, sess)
 		r.mu.Lock()
 		if current, exists := r.sessions[id]; exists && current == nil {
 			delete(r.sessions, id)
@@ -229,7 +250,7 @@ func (r *Runtime) Create(ctx context.Context, cfg ports.RuntimeConfig) (ports.Ru
 	r.mu.Lock()
 	if current, exists := r.sessions[id]; !exists || current != nil {
 		r.mu.Unlock()
-		cleanupErr := r.destroySession(id, sess)
+		cleanupErr := r.destroySession(ctx, id, sess)
 		return ports.RuntimeHandle{}, errors.Join(fmt.Errorf("conpty: launch reservation for %q was lost before commit", id), cleanupErr)
 	}
 	r.sessions[id] = sess
@@ -250,13 +271,17 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 		if sess == nil {
 			return nil // unknown or every generation is gone
 		}
-		if err := r.destroySession(handle.ID, sess); err != nil {
+		if err := r.destroySession(ctx, handle.ID, sess); err != nil {
 			return err
 		}
 	}
 }
 
-func (r *Runtime) destroySession(id string, sess *hostSession) error {
+func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSession) error {
+	sessionJob, jobErr := r.acquireTeardownJob(id, sess.generation)
+	if jobErr != nil && !errors.Is(jobErr, process.ErrSessionJobNotFound) {
+		return fmt.Errorf("conpty: open generation process job %q/%q: %w", id, sess.generation, jobErr)
+	}
 
 	// Open the process object before probing the endpoint. On Windows the
 	// retained handle remains bound to that exact process even if it exits and
@@ -264,6 +289,9 @@ func (r *Runtime) destroySession(id string, sess *hostSession) error {
 	ownedProcess, err := findProcess(sess.pid)
 	if err != nil {
 		if isProcessNotFound(err) {
+			if err := r.terminateAndReleaseJob(ctx, id, sess.generation, sessionJob); err != nil {
+				return err
+			}
 			return r.evictGeneration(id, sess)
 		}
 		return fmt.Errorf("conpty: open host process %q: %w", id, err)
@@ -271,13 +299,16 @@ func (r *Runtime) destroySession(id string, sess *hostSession) error {
 	defer func() { _ = ownedProcess.Close() }()
 
 	// Prove the endpoint, host PID, session, and creation generation while the
-	// exact process handle is retained before any destructive action.
-	// destructive action. A stale registry PID or reused loopback port must not
-	// let session A gracefully or forcibly terminate session B.
+	// exact process handle is retained before any destructive action. A stale
+	// registry PID or reused loopback port must not let session A gracefully or
+	// forcibly terminate session B.
 	alive, err := clientIsAlive(sess.addr, id, sess.generation, sess.pid)
 	if err != nil {
 		var mismatch *hostIdentityMismatchError
 		if errors.As(err, &mismatch) {
+			if closeErr := r.releaseTeardownJob(id, sess.generation, sessionJob); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 			if cleanupErr := r.evictGeneration(id, sess); cleanupErr != nil {
 				return errors.Join(err, cleanupErr)
 			}
@@ -285,30 +316,47 @@ func (r *Runtime) destroySession(id string, sess *hostSession) error {
 		}
 		return fmt.Errorf("conpty: verify %q before destroy: %w", id, err)
 	}
-	if alive {
-		if err := clientKill(sess.addr, id, sess.generation, sess.pid); err != nil {
-			return fmt.Errorf("conpty: stop verified host %q: %w", id, err)
+	if !alive {
+		// Connection refusal is definitive absence, including the race where
+		// the retained host process exits after findProcess but before the
+		// identity probe. Confirm the generation job is empty before evicting
+		// the exact observed generation.
+		if err := r.terminateAndReleaseJob(ctx, id, sess.generation, sessionJob); err != nil {
+			return err
 		}
+		return r.evictGeneration(id, sess)
+	}
 
-		// Poll the retained process object, never the reusable numeric PID.
-		stillAlive, err := ownedProcess.Alive()
+	// Stop the verified host even when its PTY child has already exited. The
+	// host owns the job handle and registry generation, so "agent exited" is
+	// not equivalent to "the session process owner is gone".
+	if err := clientKill(sess.addr, id, sess.generation, sess.pid); err != nil {
+		return fmt.Errorf("conpty: stop verified host %q: %w", id, err)
+	}
+
+	// Poll the retained process object, never the reusable numeric PID.
+	stillAlive, err := ownedProcess.Alive()
+	if err != nil {
+		return fmt.Errorf("conpty: poll verified host %q: %w", id, err)
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for stillAlive && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+		stillAlive, err = ownedProcess.Alive()
 		if err != nil {
 			return fmt.Errorf("conpty: poll verified host %q: %w", id, err)
 		}
-		deadline := time.Now().Add(500 * time.Millisecond)
-		for stillAlive && time.Now().Before(deadline) {
-			time.Sleep(25 * time.Millisecond)
-			stillAlive, err = ownedProcess.Alive()
-			if err != nil {
-				return fmt.Errorf("conpty: poll verified host %q: %w", id, err)
-			}
+	}
+	// Never look the PID up after observing it dead. Only a process handle
+	// captured while the endpoint identity was proven may be force-killed.
+	if stillAlive {
+		if err := ownedProcess.Kill(); err != nil {
+			return fmt.Errorf("conpty: force-kill verified host %q: %w", id, err)
 		}
-		// Never look the PID up after observing it dead. Only a process handle
-		// captured while the endpoint identity was proven may be force-killed.
-		if stillAlive {
-			if err := ownedProcess.Kill(); err != nil {
-				return fmt.Errorf("conpty: force-kill verified host %q: %w", id, err)
-			}
+	}
+	if sessionJob != nil {
+		if err := r.terminateAndReleaseJob(ctx, id, sess.generation, sessionJob); err != nil {
+			return err
 		}
 	}
 
@@ -324,6 +372,65 @@ func (r *Runtime) destroySession(id string, sess *hostSession) error {
 	}
 	r.mu.Unlock()
 	return nil
+}
+
+func (r *Runtime) acquireTeardownJob(id, generation string) (sessionProcessJob, error) {
+	key := sessionJobKey{sessionID: id, generation: generation}
+	r.mu.Lock()
+	if job := r.teardownJobs[key]; job != nil {
+		r.mu.Unlock()
+		return job, nil
+	}
+	r.mu.Unlock()
+
+	job, err := r.openJob(r.dataDir, id, generation)
+	if err != nil || job == nil {
+		return job, err
+	}
+
+	r.mu.Lock()
+	if retained := r.teardownJobs[key]; retained != nil {
+		r.mu.Unlock()
+		_ = job.Close()
+		return retained, nil
+	}
+	r.teardownJobs[key] = job
+	r.mu.Unlock()
+	return job, nil
+}
+
+func (r *Runtime) terminateAndReleaseJob(ctx context.Context, id, generation string, job sessionProcessJob) error {
+	if job == nil {
+		return nil
+	}
+	jobCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	err := job.TerminateAndWait(jobCtx)
+	cancel()
+	if err != nil {
+		// Keep the daemon-owned handle in teardownJobs. A later Destroy can
+		// retry the exact generation and must observe zero active processes
+		// before cleanup is allowed to reclaim the workspace.
+		return fmt.Errorf("conpty: terminate generation process job %q/%q: %w", id, generation, err)
+	}
+	if err := r.releaseTeardownJob(id, generation, job); err != nil {
+		return fmt.Errorf("conpty: release generation process job %q/%q: %w", id, generation, err)
+	}
+	return nil
+}
+
+func (r *Runtime) releaseTeardownJob(id, generation string, job sessionProcessJob) error {
+	if job == nil {
+		return nil
+	}
+	key := sessionJobKey{sessionID: id, generation: generation}
+	r.mu.Lock()
+	if r.teardownJobs[key] != job {
+		r.mu.Unlock()
+		return nil
+	}
+	delete(r.teardownJobs, key)
+	r.mu.Unlock()
+	return job.Close()
 }
 
 // IsAlive distinguishes three outcomes so the reaper never spuriously reaps a

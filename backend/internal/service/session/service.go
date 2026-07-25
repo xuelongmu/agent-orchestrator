@@ -68,7 +68,12 @@ type workspaceMutationLocker interface {
 	LockWorkspaceMutation(domain.SessionID) func()
 }
 
+type sessionCommandAutomatedSender interface {
+	SendAutomatedWithSessionCommand(ctx context.Context, id domain.SessionID, message string) error
+}
+
 var _ workspaceMutationLocker = (*sessionmanager.Manager)(nil)
+var _ sessionCommandAutomatedSender = (*sessionmanager.Manager)(nil)
 
 // RollbackOutcome reports what happened in a rollback: either the seed row was
 // deleted, or the partially-spawned session was killed (runtime+workspace torn
