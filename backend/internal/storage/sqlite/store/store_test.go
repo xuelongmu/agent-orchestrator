@@ -389,7 +389,7 @@ func TestSessionCreationAtomicallyResolvesIncarnationBranch(t *testing.T) {
 	record := sampleRecord("ao")
 	record.Metadata = domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree}
 	record.CreateBranchPrefix = "ao/"
-	record.CreateBranchSuffix = "-a1b2c3d4e5f6/root"
+	record.CreateBranchSuffix = "/a1b2c3d4e5f6/root"
 
 	created, err := s.CreateSession(ctx, record)
 	if err != nil {
@@ -399,7 +399,7 @@ func TestSessionCreationAtomicallyResolvesIncarnationBranch(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("get session: ok=%v err=%v", ok, err)
 	}
-	want := "ao/" + string(created.ID) + "-a1b2c3d4e5f6/root"
+	want := "ao/" + string(created.ID) + "/a1b2c3d4e5f6/root"
 	if got.Metadata.Branch != want {
 		t.Fatalf("branch = %q, want %q", got.Metadata.Branch, want)
 	}

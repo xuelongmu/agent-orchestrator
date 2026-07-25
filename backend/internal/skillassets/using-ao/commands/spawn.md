@@ -12,7 +12,7 @@ ao spawn [flags]
 
 | Flag | Meaning | Default / Required |
 |---|---|---|
-| `--branch string` | Branch for the session worktree | `ao/<session-id>-<incarnation>/root` |
+| `--branch string` | Branch for the session worktree | `ao/<session-id>/<incarnation>/root` |
 | `--claim-pr string` | Immediately claim an existing PR for the spawned session | - |
 | `--depends-on strings` | Wait for prerequisite sessions before launch (repeat or comma-separate, maximum 32) | - |
 | `--harness string` | Agent harness to use (see list below) | Project `worker.agent`; required if the project has none |

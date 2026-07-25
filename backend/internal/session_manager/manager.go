@@ -3559,12 +3559,12 @@ func seedRecord(cfg ports.SpawnConfig, prompt string, project domain.ProjectReco
 		switch {
 		case project.Kind.WithDefault() == domain.ProjectKindWorkspace:
 			rec.CreateBranchPrefix = "ao/"
-			rec.CreateBranchSuffix = "-" + branchIncarnation
+			rec.CreateBranchSuffix = "/" + branchIncarnation
 		case cfg.Kind == domain.KindOrchestrator:
 			rec.Metadata.Branch = "ao/" + sessionPrefix(project) + "-orchestrator"
 		default:
 			rec.CreateBranchPrefix = "ao/"
-			rec.CreateBranchSuffix = "-" + branchIncarnation + "/root"
+			rec.CreateBranchSuffix = "/" + branchIncarnation + "/root"
 		}
 	}
 	if len(cfg.DependsOn) == 0 {

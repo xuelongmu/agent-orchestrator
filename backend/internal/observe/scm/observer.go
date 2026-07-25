@@ -1240,17 +1240,9 @@ func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRep
 			// dropped (as is an empty head repo from a deleted fork), preserving
 			// the no-misattribution guarantee.
 			eligible := candidatesForHeadRepo(byRepo[repoKey], pr.HeadRepo)
+			eligible = candidatesNotPredatedByPR(eligible, pr)
 			sr, ok := matchSession(eligible, pr.SourceBranch)
 			if !ok {
-				continue
-			}
-			if prPredatesSession(pr, sr.session) {
-				o.logger.Warn("scm observer: skipped PR from an older session incarnation",
-					"session", sr.session.ID,
-					"session_created_at", sr.session.CreatedAt,
-					"pr", firstNonEmpty(pr.URL, pr.HTMLURL),
-					"pr_created_at", pr.CreatedAtProvider,
-					"source_branch", pr.SourceBranch)
 				continue
 			}
 			known := domain.PullRequest{
@@ -1341,6 +1333,16 @@ func prPredatesSession(pr ports.SCMPRObservation, session domain.SessionRecord) 
 		return false
 	}
 	return pr.CreatedAtProvider.Before(session.CreatedAt.Add(-autoDiscoveryClockSkew))
+}
+
+func candidatesNotPredatedByPR(candidates []sessionRepo, pr ports.SCMPRObservation) []sessionRepo {
+	eligible := make([]sessionRepo, 0, len(candidates))
+	for _, sr := range candidates {
+		if !prPredatesSession(pr, sr.session) {
+			eligible = append(eligible, sr)
+		}
+	}
+	return eligible
 }
 
 func sessionBranchPrefixes(branch string) []string {

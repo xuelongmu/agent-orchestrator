@@ -3092,7 +3092,7 @@ func TestSpawn_WorkspaceProjectRecordsRootAndChildWorktrees(t *testing.T) {
 	if rec.Metadata.WorkspacePath != managedPath {
 		t.Fatalf("workspace path = %q, want root worktree path", rec.Metadata.WorkspacePath)
 	}
-	if rec.Metadata.Branch != "ao/mer-1-a1b2c3d4e5f6" {
+	if rec.Metadata.Branch != "ao/mer-1/a1b2c3d4e5f6" {
 		t.Fatalf("workspace branch = %q, want incarnation-scoped branch", rec.Metadata.Branch)
 	}
 	if got := ws.lastProjectCfg.RootRepoPath; got != projectPath {
@@ -4970,7 +4970,7 @@ func TestSpawn_DefaultsBranchFromSessionID(t *testing.T) {
 	}
 	// An empty SpawnConfig.Branch defaults to a unique per-session root branch
 	// under a namespace that can also hold sibling PR branches.
-	if got := st.sessions[s.ID].Metadata.Branch; got != "ao/mer-1-a1b2c3d4e5f6/root" {
+	if got := st.sessions[s.ID].Metadata.Branch; got != "ao/mer-1/a1b2c3d4e5f6/root" {
 		t.Fatalf("default branch = %q, want incarnation-scoped root branch", got)
 	}
 }
