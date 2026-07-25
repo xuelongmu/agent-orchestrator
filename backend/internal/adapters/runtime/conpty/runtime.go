@@ -287,10 +287,12 @@ func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSessi
 		return fmt.Errorf("conpty: verify %q before destroy: %w", id, err)
 	}
 	sessionJob, jobErr := process.OpenSessionJob(r.dataDir, id, sess.generation)
-	if jobErr != nil {
+	if jobErr != nil && !errors.Is(jobErr, process.ErrSessionJobNotFound) {
 		return fmt.Errorf("conpty: open generation process job %q/%q: %w", id, sess.generation, jobErr)
 	}
-	defer func() { _ = sessionJob.Close() }()
+	if sessionJob != nil {
+		defer func() { _ = sessionJob.Close() }()
+	}
 
 	// Stop the verified host even when its PTY child has already exited. The
 	// host owns the job handle and registry generation, so "agent exited" is
@@ -319,11 +321,13 @@ func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSessi
 			return fmt.Errorf("conpty: force-kill verified host %q: %w", id, err)
 		}
 	}
-	jobCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	jobErr = sessionJob.TerminateAndWait(jobCtx)
-	cancel()
-	if jobErr != nil {
-		return fmt.Errorf("conpty: terminate generation process job %q/%q: %w", id, sess.generation, jobErr)
+	if sessionJob != nil {
+		jobCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		jobErr = sessionJob.TerminateAndWait(jobCtx)
+		cancel()
+		if jobErr != nil {
+			return fmt.Errorf("conpty: terminate generation process job %q/%q: %w", id, sess.generation, jobErr)
+		}
 	}
 
 	// Remove the exact durable generation before exposing an absent map slot.

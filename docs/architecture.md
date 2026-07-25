@@ -840,6 +840,11 @@ opens only the identity-verified generation's job, terminates it, and waits for
 it to report zero live processes before session cleanup may reclaim the
 workspace.
 
+An identity-aware `pty-host` adopted from the immediately preceding release has
+no Job Object. AO retains the generation/PID-verified legacy host teardown for
+that one-version boundary; restarting the session moves it under Job Object
+ownership and enables the stronger whole-tree completion guarantee.
+
 Interactive messages always go to the session's existing runtime pane; the
 daemon never starts a second provider process to resume the same native
 conversation. Message delivery shares the session's command gate with kill,

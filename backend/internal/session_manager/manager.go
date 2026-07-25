@@ -2877,6 +2877,21 @@ func (m *Manager) SendAutomated(ctx context.Context, id domain.SessionID, messag
 	return m.send(ctx, id, message, true, nil)
 }
 
+// DeliverAutomated is the lifecycle reaction delivery boundary. It preserves
+// the guard's exact outcome for durable reaction accounting while sharing the
+// same per-session gate as SendAutomated, kill, restore, and cleanup.
+func (m *Manager) DeliverAutomated(ctx context.Context, id domain.SessionID, message string) (sessionguard.Outcome, error) {
+	unlockSessionCommand := m.LockWorkspaceMutation(id)
+	defer unlockSessionCommand()
+
+	message, err := m.prepareOutboundMessage(ctx, id, message)
+	if err != nil {
+		return sessionguard.SuppressedUnknown, err
+	}
+	outcome, _, err := m.messenger.DeliverAutomatedWithDelivery(ctx, id, message)
+	return outcome, err
+}
+
 // SendAutomatedIfIdle delivers only when the guard's final pre-write read is
 // still the exact idle episode that authorized the caller's decision.
 func (m *Manager) SendAutomatedIfIdle(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) error {

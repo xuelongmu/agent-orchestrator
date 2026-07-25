@@ -213,7 +213,7 @@ type guardedAutomatedSender struct {
 }
 
 func (s guardedAutomatedSender) SendAutomated(ctx context.Context, id domain.SessionID, msg string) error {
-	outcome, err := s.guard.DeliverAutomated(ctx, id, msg)
+	outcome, err := s.DeliverAutomated(ctx, id, msg)
 	if err != nil {
 		return err
 	}
@@ -223,12 +223,24 @@ func (s guardedAutomatedSender) SendAutomated(ctx context.Context, id domain.Ses
 	return nil
 }
 
+func (s guardedAutomatedSender) DeliverAutomated(ctx context.Context, id domain.SessionID, msg string) (sessionguard.Outcome, error) {
+	return s.guard.DeliverAutomated(ctx, id, msg)
+}
+
 func (f *fakeAutomatedSender) SendAutomated(_ context.Context, _ domain.SessionID, msg string) error {
 	f.msgs = append(f.msgs, msg)
 	if f.beforeReturn != nil {
 		f.beforeReturn()
 	}
 	return f.err
+}
+
+func (f *fakeAutomatedSender) DeliverAutomated(_ context.Context, _ domain.SessionID, msg string) (sessionguard.Outcome, error) {
+	f.msgs = append(f.msgs, msg)
+	if f.beforeReturn != nil {
+		f.beforeReturn()
+	}
+	return sessionguard.Sent, f.err
 }
 
 type retryMergedCleaner struct {
@@ -328,6 +340,10 @@ func (f *fakeMessenger) Send(_ context.Context, id domain.SessionID, msg string)
 
 func (f *fakeMessenger) SendAutomated(ctx context.Context, id domain.SessionID, msg string) error {
 	return f.Send(ctx, id, msg)
+}
+
+func (f *fakeMessenger) DeliverAutomated(ctx context.Context, id domain.SessionID, msg string) (sessionguard.Outcome, error) {
+	return sessionguard.Sent, f.Send(ctx, id, msg)
 }
 
 type fakeReactionReservation struct {
@@ -988,6 +1004,32 @@ func TestPRObservation_CIFailingNudgesAgentWithLogs(t *testing.T) {
 	}
 	if strings.Contains(msg.msgs[0], "lint") || strings.Contains(msg.msgs[0], "cancelled") {
 		t.Fatalf("cancelled checks must not be included in CI nudge:\n%s", msg.msgs[0])
+	}
+}
+
+func TestPRObservationRoutesReactionThroughAutomatedSenderBoundary(t *testing.T) {
+	m, st, raw := newManager()
+	sender := &fakeAutomatedSender{}
+	m.SetAutomatedMessageSender(sender)
+	st.sessions["mer-1"] = working("mer-1")
+
+	err := m.ApplyPRObservation(ctx, "mer-1", ports.PRObservation{
+		Fetched: true,
+		URL:     "pr1",
+		HeadSHA: "c1",
+		CI:      domain.CIFailing,
+		Checks: []ports.PRCheckObservation{{
+			Name: "build", CommitHash: "c1", Status: domain.PRCheckFailed,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.msgs) != 1 {
+		t.Fatalf("automated sender messages = %d, want 1", len(sender.msgs))
+	}
+	if len(raw.msgs) != 0 {
+		t.Fatalf("raw guard messenger received %d direct writes, want 0", len(raw.msgs))
 	}
 }
 

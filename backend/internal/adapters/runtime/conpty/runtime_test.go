@@ -1254,6 +1254,44 @@ func TestDestroy_KillsHostAndCleansUp(t *testing.T) {
 	}
 }
 
+func TestDestroyAdoptedPreJobGenerationUsesVerifiedLegacyTeardown(t *testing.T) {
+	isolateRegistry(t)
+	processHandle := &fakeProcessHandle{}
+	withProcessFinder(t, func(int) (processKiller, error) { return processHandle, nil })
+	hosts := map[string]*inProcHost{}
+	rt := New(Options{Spawner: fakeSpawnerFor(t, hosts, deadPID())})
+
+	handle, err := rt.Create(context.Background(), ports.RuntimeConfig{
+		SessionID:     "pre-job",
+		WorkspacePath: "/tmp/w",
+		Argv:          []string{"sh"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := hosts["pre-job"]
+	// Model a generation-aware host created by the immediately preceding
+	// release: its endpoint identity is valid, but no Job Object was created.
+	if err := host.job.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rt.Destroy(context.Background(), handle); err != nil {
+		t.Fatalf("Destroy pre-job generation: %v", err)
+	}
+	select {
+	case <-host.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pre-job host did not stop after verified teardown")
+	}
+	if processHandle.killed {
+		t.Fatal("legacy teardown force-killed after the retained process handle reported dead")
+	}
+	if entries, err := ptyregistry.LookupAll("pre-job"); err != nil || len(entries) != 0 {
+		t.Fatalf("pre-job generation remained registered: entries=%v err=%v", entries, err)
+	}
+}
+
 // TestResolveViaRegistry verifies that with an empty in-memory map but a
 // registry entry pointing at a live in-process host, IsAlive and SendMessage
 // still work (simulates a daemon restart).

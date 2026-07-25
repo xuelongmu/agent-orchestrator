@@ -2076,16 +2076,24 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 		reservationToken = ""
 		return nil
 	}
-	// The guard re-reads the session immediately before pasting. Actionable PR
-	// work is an AO-originated instruction, so it may wake a worker waiting at an
-	// empty prompt; blocked decisions, rate limits, pending editor input, and
-	// terminated sessions still fail closed. A suppressed write returns
-	// SUPPRESSED (not accounted), so a review caller won't stamp it delivered and
-	// it re-fires once the session is workable again. A store failure inside the
-	// guard also suppresses (fail closed, nothing was written); a messenger
-	// failure means the write was attempted and stays accounted, matching the
-	// pre-guard behavior.
-	outcome, err := m.guard.DeliverAutomated(ctx, id, msg)
+	// The session-manager boundary acquires the same per-session gate as kill,
+	// restore, cleanup, and workspace mutation, then performs the guard's final
+	// state read immediately before pasting. Actionable PR work may wake a worker
+	// waiting at an empty prompt; blocked decisions, rate limits, pending editor
+	// input, and terminated sessions still fail closed. A suppressed write is
+	// not accounted so it can re-fire once the session is workable again.
+	m.mu.Lock()
+	sender := m.automatedSender
+	m.mu.Unlock()
+	var outcome sessionguard.Outcome
+	if sender != nil {
+		outcome, err = sender.DeliverAutomated(ctx, id, msg)
+	} else {
+		// Pure reducer embeddings may wire only the raw guarded messenger. The
+		// daemon always wires Session Manager above, which supplies the
+		// cross-lifecycle command gate.
+		outcome, err = m.guard.DeliverAutomated(ctx, id, msg)
+	}
 	if err != nil {
 		if outcome != sessionguard.Sent {
 			rollbackErr := rollbackReservation()

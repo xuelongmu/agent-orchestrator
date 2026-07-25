@@ -21,6 +21,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
 )
 
 var ctx = context.Background()
@@ -3272,7 +3273,11 @@ func TestKillWaitsForInFlightMessageDelivery(t *testing.T) {
 
 	sendDone := make(chan error, 1)
 	go func() {
-		sendDone <- m.Send(context.Background(), "mer-1", "finish this turn")
+		outcome, err := m.DeliverAutomated(context.Background(), "mer-1", "finish this turn")
+		if err == nil && outcome != sessionguard.Sent {
+			err = fmt.Errorf("delivery outcome = %s, want sent", outcome)
+		}
+		sendDone <- err
 	}()
 	select {
 	case <-messenger.entered:
@@ -3344,13 +3349,18 @@ func TestMessageDeliveryWaitsForInFlightKillAndObservesTermination(t *testing.T)
 		t.Fatal("Kill did not enter runtime teardown")
 	}
 
-	sendDone := make(chan error, 1)
+	type deliveryResult struct {
+		outcome sessionguard.Outcome
+		err     error
+	}
+	sendDone := make(chan deliveryResult, 1)
 	go func() {
-		sendDone <- m.Send(context.Background(), "mer-1", "must not be delivered")
+		outcome, err := m.DeliverAutomated(context.Background(), "mer-1", "must not be delivered")
+		sendDone <- deliveryResult{outcome: outcome, err: err}
 	}()
 	select {
-	case err := <-sendDone:
-		t.Fatalf("message delivery escaped the in-flight Kill gate: %v", err)
+	case result := <-sendDone:
+		t.Fatalf("message delivery escaped the in-flight Kill gate: outcome=%s err=%v", result.outcome, result.err)
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -3364,9 +3374,9 @@ func TestMessageDeliveryWaitsForInFlightKillAndObservesTermination(t *testing.T)
 		t.Fatal("Kill did not finish")
 	}
 	select {
-	case err := <-sendDone:
-		if !errors.Is(err, ErrTerminated) {
-			t.Fatalf("Send error = %v, want ErrTerminated", err)
+	case result := <-sendDone:
+		if result.err != nil || result.outcome != sessionguard.SuppressedTerminated {
+			t.Fatalf("delivery result = outcome:%s err:%v, want suppressed_terminated", result.outcome, result.err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("message delivery did not resume after Kill")
