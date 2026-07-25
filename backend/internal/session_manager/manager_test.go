@@ -21,6 +21,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
 )
 
 var ctx = context.Background()
@@ -1026,6 +1027,25 @@ type fakeMessenger struct {
 func (m *fakeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) error {
 	m.msgs = append(m.msgs, msg)
 	return m.err
+}
+
+type blockingMessenger struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (m *blockingMessenger) Send(ctx context.Context, _ domain.SessionID, _ string) error {
+	select {
+	case m.entered <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-m.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type structuredMessenger struct {
@@ -3233,6 +3253,142 @@ func TestKill_OrdinaryWorktreeWaitsForClaimWorkspaceMutation(t *testing.T) {
 	}
 }
 
+func TestKillWaitsForInFlightMessageDelivery(t *testing.T) {
+	st := newFakeStore()
+	st.setSession(mkLive("mer-1"))
+	rt := &fakeRuntime{}
+	ws := &fakeWorkspace{}
+	messenger := &blockingMessenger{
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	m := New(Deps{
+		Runtime:   rt,
+		Agents:    fakeAgents{},
+		Workspace: ws,
+		Store:     st,
+		Messenger: messenger,
+		Lifecycle: &fakeLCM{store: st},
+	})
+
+	sendDone := make(chan error, 1)
+	go func() {
+		outcome, err := m.DeliverAutomated(context.Background(), "mer-1", "finish this turn")
+		if err == nil && outcome != sessionguard.Sent {
+			err = fmt.Errorf("delivery outcome = %s, want sent", outcome)
+		}
+		sendDone <- err
+	}()
+	select {
+	case <-messenger.entered:
+	case <-time.After(time.Second):
+		t.Fatal("message delivery did not start")
+	}
+
+	destroyEntered := make(chan struct{}, 1)
+	rt.beforeDestroy = func(ports.RuntimeHandle) { destroyEntered <- struct{}{} }
+	killDone := make(chan error, 1)
+	go func() {
+		_, err := m.Kill(context.Background(), "mer-1")
+		killDone <- err
+	}()
+	select {
+	case <-destroyEntered:
+		t.Fatal("Kill entered runtime teardown while message delivery owned the session gate")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(messenger.release)
+	select {
+	case err := <-sendDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("message delivery did not finish")
+	}
+	select {
+	case err := <-killDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Kill did not resume after message delivery")
+	}
+}
+
+func TestIdleEpisodeNudgeWaitsForInFlightKillAndObservesTermination(t *testing.T) {
+	st := newFakeStore()
+	rec := mkLive("mer-1")
+	idleSince := time.Now().Add(-time.Minute)
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: idleSince}
+	st.setSession(rec)
+	rt := &fakeRuntime{}
+	ws := &fakeWorkspace{}
+	messenger := &fakeMessenger{}
+	m := New(Deps{
+		Runtime:   rt,
+		Agents:    fakeAgents{},
+		Workspace: ws,
+		Store:     st,
+		Messenger: messenger,
+		Lifecycle: &fakeLCM{store: st},
+	})
+
+	destroyEntered := make(chan struct{}, 1)
+	releaseDestroy := make(chan struct{})
+	rt.beforeDestroy = func(ports.RuntimeHandle) {
+		destroyEntered <- struct{}{}
+		<-releaseDestroy
+	}
+	killDone := make(chan error, 1)
+	go func() {
+		_, err := m.Kill(context.Background(), "mer-1")
+		killDone <- err
+	}()
+	select {
+	case <-destroyEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Kill did not enter runtime teardown")
+	}
+
+	type deliveryResult struct {
+		outcome sessionguard.Outcome
+		err     error
+	}
+	sendDone := make(chan deliveryResult, 1)
+	go func() {
+		outcome, err := m.NudgeIdleEpisode(context.Background(), "mer-1", "must not be delivered", idleSince)
+		sendDone <- deliveryResult{outcome: outcome, err: err}
+	}()
+	select {
+	case result := <-sendDone:
+		t.Fatalf("message delivery escaped the in-flight Kill gate: outcome=%s err=%v", result.outcome, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseDestroy)
+	select {
+	case err := <-killDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Kill did not finish")
+	}
+	select {
+	case result := <-sendDone:
+		if result.err != nil || result.outcome != sessionguard.SuppressedTerminated {
+			t.Fatalf("delivery result = outcome:%s err:%v, want suppressed_terminated", result.outcome, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("message delivery did not resume after Kill")
+	}
+	if len(messenger.msgs) != 0 {
+		t.Fatalf("terminal writes = %d, want 0 after termination", len(messenger.msgs))
+	}
+}
+
 // TestKill_TerminatesIncompleteHandle: a session whose runtime handle or
 // workspace path is missing is still terminated — the destroy steps are
 // skipped, but the session moves to terminal state so it can be cleaned up
@@ -4557,6 +4713,38 @@ func TestCleanup_ReclaimsTerminalWorkspaces(t *testing.T) {
 	}
 }
 
+func TestCleanup_WaitsForRuntimeTeardownBeforeWorkspaceReclaim(t *testing.T) {
+	m, st, rt, ws := newManager()
+	seedTerminal(st, "mer-1", domain.SessionMetadata{
+		WorkspacePath:   "/ws/mer-1",
+		RuntimeHandleID: "h1",
+	})
+	rt.destroyErr = errors.New("process job still has active members")
+
+	res, err := m.Cleanup(ctx, "mer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Cleaned) != 0 || len(res.Skipped) != 1 || res.Skipped[0].Reason != "runtime teardown failed" {
+		t.Fatalf("first cleanup = %+v, want retryable runtime teardown skip", res)
+	}
+	if ws.destroyed != 0 {
+		t.Fatalf("workspace destroyed %d times before runtime death was confirmed", ws.destroyed)
+	}
+
+	rt.destroyErr = nil
+	res, err = m.Cleanup(ctx, "mer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Cleaned) != 1 || res.Cleaned[0] != "mer-1" || len(res.Skipped) != 0 {
+		t.Fatalf("retry cleanup = %+v, want mer-1 reclaimed", res)
+	}
+	if rt.destroyed != 2 || ws.destroyed != 1 {
+		t.Fatalf("retry teardown calls: runtime=%d workspace=%d, want 2/1", rt.destroyed, ws.destroyed)
+	}
+}
+
 // TestCleanup_ReportsSkippedWorkspaces: a refused teardown must be visible in
 // the result with a reason — a silent skip leaves users staring at
 // "Would clean N … 0 sessions cleaned" with no explanation.
@@ -5481,83 +5669,6 @@ func TestRestore_OrchestratorRederivesSystemPrompt(t *testing.T) {
 	wantPath := filepath.Join(dataDir, "prompts", "mer-1", "system.md")
 	if agent.lastRestore.SystemPromptFile != wantPath {
 		t.Fatalf("restore system prompt file = %q, want %q", agent.lastRestore.SystemPromptFile, wantPath)
-	}
-}
-
-func TestMessageRestoreConfigRederivesProviderSettings(t *testing.T) {
-	st := newFakeStore()
-	st.projects["mer"] = domain.ProjectRecord{
-		ID: "mer",
-		Config: domain.ProjectConfig{
-			AgentConfig: domain.AgentConfig{Model: "base-model"},
-			Orchestrator: domain.RoleOverride{
-				AgentConfig: domain.AgentConfig{
-					Model:       "orchestrator-model",
-					Permissions: domain.PermissionModeAuto,
-				},
-			},
-			OrchestratorRules: "Delegate implementation work.",
-		},
-	}
-	st.sessions["mer-1"] = domain.SessionRecord{
-		ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator, Harness: domain.HarnessCodex,
-		Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", AgentSessionID: "native-1"},
-	}
-	m := New(Deps{Store: st, DataDir: t.TempDir()})
-
-	cfg, err := m.MessageRestoreConfig(context.Background(), "mer-1")
-	if err != nil {
-		t.Fatalf("MessageRestoreConfig: %v", err)
-	}
-	if cfg.Config.Model != "orchestrator-model" || cfg.Permissions != domain.PermissionModeAuto {
-		t.Fatalf("agent config = %#v permissions=%q", cfg.Config, cfg.Permissions)
-	}
-	if cfg.Session.Metadata[ports.MetadataKeyAgentSessionID] != "native-1" ||
-		cfg.Session.WorkspacePath != "/ws/mer-1" {
-		t.Fatalf("session ref = %#v", cfg.Session)
-	}
-	if !strings.Contains(cfg.SystemPrompt, "Delegate implementation work.") {
-		t.Fatalf("system prompt missing current orchestrator rules:\n%s", cfg.SystemPrompt)
-	}
-}
-
-func TestMessageRuntimeEnvMatchesSessionRuntimeEnvironment(t *testing.T) {
-	st := newFakeStore()
-	st.projects["mer"] = domain.ProjectRecord{
-		ID: "mer",
-		Config: domain.ProjectConfig{Env: map[string]string{
-			"PROJECT_ENV": "kept",
-			"PATH":        "project-bin",
-		}},
-	}
-	st.sessions["mer-1"] = domain.SessionRecord{
-		ID: "mer-1", ProjectID: "mer", IssueID: "issue-9", Kind: domain.KindWorker,
-	}
-	executableName := "ao"
-	if runtime.GOOS == "windows" {
-		executableName += ".exe"
-	}
-	executablePath := filepath.Join(t.TempDir(), executableName)
-	dataDir := t.TempDir()
-	m := New(Deps{
-		Store:      st,
-		DataDir:    dataDir,
-		Executable: func() (string, error) { return executablePath, nil },
-	})
-
-	env, err := m.MessageRuntimeEnv(context.Background(), "mer-1")
-	if err != nil {
-		t.Fatalf("MessageRuntimeEnv: %v", err)
-	}
-	if env[EnvSessionID] != "mer-1" || env[EnvProjectID] != "mer" || env[EnvIssueID] != "issue-9" {
-		t.Fatalf("AO identity env = %#v", env)
-	}
-	if env[EnvDataDir] != dataDir || env["PROJECT_ENV"] != "kept" {
-		t.Fatalf("runtime env = %#v", env)
-	}
-	wantPath := filepath.Dir(executablePath) + string(os.PathListSeparator) + "project-bin"
-	if env["PATH"] != wantPath {
-		t.Fatalf("PATH = %q, want %q", env["PATH"], wantPath)
 	}
 }
 

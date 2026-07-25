@@ -133,10 +133,6 @@ func startSession(lifetimeCtx context.Context, cfg config.Config, runtime runtim
 		VerificationCapabilities: capabilityIssuer,
 		LifetimeContext:          lifetimeCtx,
 	})
-	if provider, ok := messenger.(*providerMessenger); ok {
-		provider.restoreConfig = mgr.MessageRestoreConfig
-		provider.environment = mgr.MessageRuntimeEnv
-	}
 	dependencyScheduler := dependency.New(store, mgr, nil, log)
 	dependencyScheduler.SetLifetimeContext(lifetimeCtx)
 	mgr.SetDependencyScheduler(dependencyScheduler)
@@ -227,13 +223,12 @@ func (m runtimeMessenger) Send(ctx context.Context, id domain.SessionID, message
 	return m.runtime.SendMessage(ctx, ports.RuntimeHandle{ID: handleID}, message)
 }
 
-// newSessionMessenger assembles the per-daemon agent messenger. Codex and
-// Claude sessions prefer provider-owned structured protocols; the live runtime
-// pane remains the compatibility fallback when a provider cannot acknowledge
-// the message.
-func newSessionMessenger(store *sqlite.Store, runtime runtimeMessageSender, logger *slog.Logger) ports.AgentMessenger {
-	fallback := runtimeMessenger{store: store, runtime: runtime}
-	return newProviderMessenger(fallback, logger)
+// newSessionMessenger assembles the per-daemon agent messenger. Every
+// interactive harness stays on its one live runtime process. Starting a second
+// provider process to resume the same native conversation creates a competing
+// worktree writer and escapes the runtime's lifecycle ownership.
+func newSessionMessenger(store *sqlite.Store, runtime runtimeMessageSender, _ *slog.Logger) ports.AgentMessenger {
+	return runtimeMessenger{store: store, runtime: runtime}
 }
 
 // buildAgentRegistry returns a registry populated with the agent adapters the

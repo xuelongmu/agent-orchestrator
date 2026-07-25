@@ -102,6 +102,16 @@ type diagnosticRuntime interface {
 // drafts before reporting success.
 type automatedMessageSender interface {
 	SendAutomated(ctx context.Context, id domain.SessionID, message string) error
+	DeliverAutomated(ctx context.Context, id domain.SessionID, message string) (sessionguard.Outcome, error)
+	NudgeIdleEpisode(ctx context.Context, id domain.SessionID, message string, idleSince time.Time) (sessionguard.Outcome, error)
+}
+
+// sessionCommandAutomatedSender is implemented by Session Manager. It lets the
+// durable claim-ready path acquire session ownership before the per-PR design
+// delivery lock, then send without recursively entering the same session gate.
+type sessionCommandAutomatedSender interface {
+	LockSessionCommand(id domain.SessionID) func()
+	SendAutomatedWithSessionCommand(ctx context.Context, id domain.SessionID, message string) error
 }
 
 type dependencyReconciler interface {
@@ -137,9 +147,10 @@ func WithDiagnosticRuntime(runtime diagnosticRuntime) Option {
 // It also owns agent nudges caused by PR observations, including merge-conflict, CI-failure, and review-feedback prompts.
 type Manager struct {
 	store sessionStore
-	// guard is the shared pane-write primitive every reaction nudge goes
-	// through (see sessionguard). Nil when no messenger was wired: reaction
-	// nudges become no-ops but the reducer still runs.
+	// guard is the shared pane-write primitive. Production reaction nudges reach
+	// it through automatedSender so Session Manager can first acquire the
+	// per-session lifecycle gate. Pure reducer embeddings may use it directly.
+	// Nil when no messenger was wired: reaction nudges become no-ops.
 	guard               *sessionguard.Guard
 	automatedSender     automatedMessageSender
 	notifications       notificationSink

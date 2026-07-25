@@ -22,7 +22,7 @@ func TestRunHostReadyWriteFailureReleasesSetupResources(t *testing.T) {
 	isolateRegistry(t)
 	t.Setenv(hostGenerationEnv, "ready-write-failure")
 	command := windowsCommand(t)
-	_, _ = newConPTY(t.TempDir(), filepath.Join(t.TempDir(), "missing-warmup.exe"), nil)
+	_, _ = newConPTY(t.TempDir(), filepath.Join(t.TempDir(), "missing-warmup.exe"), nil, nil)
 	before := currentProcessHandleCount(t)
 
 	if code := RunHost([]string{"ready-write-failure", t.TempDir(), command, "/D", "/Q", "/K"}, failingReadyWriter{}); code != 1 {
@@ -47,7 +47,7 @@ func TestRunHostRegistryFailureReleasesSetupResources(t *testing.T) {
 	t.Setenv("AO_RUN_FILE", filepath.Join(blockedDataDir, "running.json"))
 	t.Setenv(hostGenerationEnv, "registry-failure")
 	command := windowsCommand(t)
-	_, _ = newConPTY(t.TempDir(), filepath.Join(t.TempDir(), "missing-warmup.exe"), nil)
+	_, _ = newConPTY(t.TempDir(), filepath.Join(t.TempDir(), "missing-warmup.exe"), nil, nil)
 	before := currentProcessHandleCount(t)
 
 	if code := RunHost([]string{"registry-failure", t.TempDir(), command, "/D", "/Q", "/K"}, os.Stdout); code != 1 {
