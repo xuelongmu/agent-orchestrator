@@ -84,11 +84,12 @@ type SessionRecord struct {
 	DependencyPromotedAt time.Time `json:"-"`
 	DependencyPreparedAt time.Time `json:"-"`
 	DependencyBasePrompt string    `json:"-"`
-	// DependencyBranchPrefix/Suffix are create-time-only inputs that let the
-	// store resolve an id-derived default branch inside the same transaction
-	// that inserts the child, its launch prompt, and its dependency edges.
-	DependencyBranchPrefix string `json:"-"`
-	DependencyBranchSuffix string `json:"-"`
+	// CreateBranchPrefix/Suffix are create-time-only inputs that let the store
+	// resolve an id-derived default branch inside the same transaction that
+	// inserts the session. They are not persisted separately: the resolved
+	// branch is the durable session-incarnation identity used by SCM discovery.
+	CreateBranchPrefix string `json:"-"`
+	CreateBranchSuffix string `json:"-"`
 	// DependencyPromotionToken fences the in-flight external launch. A new
 	// daemon holding the exclusive store lease clears an abandoned token before
 	// retrying; completion accepts only the reserving token.

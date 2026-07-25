@@ -363,8 +363,8 @@ func TestDependencyChildCreationAtomicallyPersistsPreparedLaunchInputs(t *testin
 	childRecord.DependencyIDs = domain.EncodeSessionDependencyIDs([]domain.SessionID{parent.ID})
 	childRecord.DependencyPreparedAt = now
 	childRecord.DependencyBasePrompt = "immutable base"
-	childRecord.DependencyBranchPrefix = "ao/"
-	childRecord.DependencyBranchSuffix = "/root"
+	childRecord.CreateBranchPrefix = "ao/"
+	childRecord.CreateBranchSuffix = "/root"
 	childRecord.Metadata = domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree, Prompt: "immutable base"}
 	child, err := s.CreateSession(ctx, childRecord)
 	if err != nil {
@@ -379,6 +379,29 @@ func TestDependencyChildCreationAtomicallyPersistsPreparedLaunchInputs(t *testin
 	}
 	if got.Metadata.RuntimeHandleID != "" || !got.DependencyPromotedAt.IsZero() {
 		t.Fatalf("prepared child launched during create: %#v", got)
+	}
+}
+
+func TestSessionCreationAtomicallyResolvesIncarnationBranch(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "ao")
+	record := sampleRecord("ao")
+	record.Metadata = domain.SessionMetadata{WorkspaceKind: domain.WorkspaceKindWorktree}
+	record.CreateBranchPrefix = "ao/"
+	record.CreateBranchSuffix = "-a1b2c3d4e5f6/root"
+
+	created, err := s.CreateSession(ctx, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetSession(ctx, created.ID)
+	if err != nil || !ok {
+		t.Fatalf("get session: ok=%v err=%v", ok, err)
+	}
+	want := "ao/" + string(created.ID) + "-a1b2c3d4e5f6/root"
+	if got.Metadata.Branch != want {
+		t.Fatalf("branch = %q, want %q", got.Metadata.Branch, want)
 	}
 }
 

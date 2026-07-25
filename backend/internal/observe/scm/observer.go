@@ -38,6 +38,10 @@ const (
 	// unchanged failing PR. Lifecycle decides whether to wait, remind the
 	// worker, or escalate at each numbered checkpoint.
 	DefaultStalledPRHeartbeat = 10 * time.Minute
+	// autoDiscoveryClockSkew covers GitHub's second-granularity timestamps and
+	// small local/provider clock differences. Older PRs must use the explicit
+	// claim flow instead of inheriting a reused branch namespace.
+	autoDiscoveryClockSkew = 2 * time.Second
 	// DefaultCacheMax bounds each in-memory ETag/review cache map.
 	DefaultCacheMax = 512
 	// BatchSize is the maximum number of PRs in one provider batch fetch.
@@ -1240,6 +1244,15 @@ func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRep
 			if !ok {
 				continue
 			}
+			if prPredatesSession(pr, sr.session) {
+				o.logger.Warn("scm observer: skipped PR from an older session incarnation",
+					"session", sr.session.ID,
+					"session_created_at", sr.session.CreatedAt,
+					"pr", firstNonEmpty(pr.URL, pr.HTMLURL),
+					"pr_created_at", pr.CreatedAtProvider,
+					"source_branch", pr.SourceBranch)
+				continue
+			}
 			known := domain.PullRequest{
 				URL:          firstNonEmpty(pr.URL, pr.HTMLURL),
 				SessionID:    sr.session.ID,
@@ -1321,6 +1334,13 @@ func matchSession(candidates []sessionRepo, sourceBranch string) (sessionRepo, b
 		}
 	}
 	return best, bestLen >= 0
+}
+
+func prPredatesSession(pr ports.SCMPRObservation, session domain.SessionRecord) bool {
+	if pr.CreatedAtProvider.IsZero() || session.CreatedAt.IsZero() {
+		return false
+	}
+	return pr.CreatedAtProvider.Before(session.CreatedAt.Add(-autoDiscoveryClockSkew))
 }
 
 func sessionBranchPrefixes(branch string) []string {
