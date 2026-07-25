@@ -275,7 +275,7 @@ func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSessi
 	// exact process handle is retained before any destructive action. A stale
 	// registry PID or reused loopback port must not let session A gracefully or
 	// forcibly terminate session B.
-	_, err = clientIsAlive(sess.addr, id, sess.generation, sess.pid)
+	alive, err := clientIsAlive(sess.addr, id, sess.generation, sess.pid)
 	if err != nil {
 		var mismatch *hostIdentityMismatchError
 		if errors.As(err, &mismatch) {
@@ -285,6 +285,12 @@ func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSessi
 			return nil
 		}
 		return fmt.Errorf("conpty: verify %q before destroy: %w", id, err)
+	}
+	if !alive {
+		// Connection refusal is definitive absence, including the race where
+		// the retained host process exits after findProcess but before the
+		// identity probe. Evict only the exact observed generation.
+		return r.evictGeneration(id, sess)
 	}
 	sessionJob, jobErr := process.OpenSessionJob(r.dataDir, id, sess.generation)
 	if jobErr != nil && !errors.Is(jobErr, process.ErrSessionJobNotFound) {

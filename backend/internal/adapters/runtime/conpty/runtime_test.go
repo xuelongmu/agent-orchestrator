@@ -817,6 +817,45 @@ func TestDestroyAlreadyExitedProcessCleansExactGeneration(t *testing.T) {
 	}
 }
 
+func TestDestroyHostDisappearsBetweenProcessOpenAndIdentityProbe(t *testing.T) {
+	isolateRegistry(t)
+	processHandle := &fakeProcessHandle{}
+	withProcessFinder(t, func(int) (processKiller, error) { return processHandle, nil })
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sess := &hostSession{addr: addr, pid: livePID(), generation: "probe-exit-generation"}
+	rt := New(Options{})
+	rt.mu.Lock()
+	rt.sessions["probe-exit"] = sess
+	rt.mu.Unlock()
+	if err := ptyregistry.Register(ptyregistry.Entry{
+		SessionID: "probe-exit", PtyHostPID: livePID(), PipePath: addr,
+		RegisteredAt: time.Now().UTC().Format(time.RFC3339Nano), Generation: sess.generation,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rt.Destroy(context.Background(), ports.RuntimeHandle{ID: "probe-exit"}); err != nil {
+		t.Fatal(err)
+	}
+	if processHandle.killed {
+		t.Fatal("definitively absent host was force-killed")
+	}
+	if !processHandle.closed {
+		t.Fatal("retained host process handle was not closed")
+	}
+	if entries, err := ptyregistry.LookupAll("probe-exit"); err != nil || len(entries) != 0 {
+		t.Fatalf("probe-exit generation remained registered: entries=%v err=%v", entries, err)
+	}
+}
+
 func TestDestroyDrainsEveryVerifiedGeneration(t *testing.T) {
 	isolateRegistry(t)
 	withProcessFinder(t, func(int) (processKiller, error) { return &fakeProcessHandle{}, nil })
