@@ -42,6 +42,16 @@ type hostSession struct {
 	generation string
 }
 
+type sessionProcessJob interface {
+	TerminateAndWait(context.Context) error
+	Close() error
+}
+
+type sessionJobKey struct {
+	sessionID  string
+	generation string
+}
+
 // Options configures the Runtime. All fields are optional; zero values use
 // sensible defaults. The Spawner field is injectable for tests.
 type Options struct {
@@ -64,11 +74,13 @@ type Runtime struct {
 	register   func(ptyregistry.Entry) error
 	unregister func(string, string) error
 	lookupAll  func(string) ([]ptyregistry.Entry, error)
+	openJob    func(string, string, string) (sessionProcessJob, error)
 	dataDir    string
 	initErr    error
 
-	mu       sync.Mutex
-	sessions map[string]*hostSession // sessionID -> live session
+	mu           sync.Mutex
+	sessions     map[string]*hostSession // sessionID -> live session
+	teardownJobs map[sessionJobKey]sessionProcessJob
 }
 
 // New creates a Runtime with the given options.
@@ -121,9 +133,17 @@ func New(opts Options) *Runtime {
 		register:   register,
 		unregister: unregister,
 		lookupAll:  lookupAll,
-		dataDir:    dataDir,
-		initErr:    initErr,
-		sessions:   make(map[string]*hostSession),
+		openJob: func(dataDir, sessionID, generation string) (sessionProcessJob, error) {
+			job, err := process.OpenSessionJob(dataDir, sessionID, generation)
+			if job == nil {
+				return nil, err
+			}
+			return job, err
+		},
+		dataDir:      dataDir,
+		initErr:      initErr,
+		sessions:     make(map[string]*hostSession),
+		teardownJobs: make(map[sessionJobKey]sessionProcessJob),
 	}
 }
 
@@ -258,6 +278,10 @@ func (r *Runtime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error
 }
 
 func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSession) error {
+	sessionJob, jobErr := r.acquireTeardownJob(id, sess.generation)
+	if jobErr != nil && !errors.Is(jobErr, process.ErrSessionJobNotFound) {
+		return fmt.Errorf("conpty: open generation process job %q/%q: %w", id, sess.generation, jobErr)
+	}
 
 	// Open the process object before probing the endpoint. On Windows the
 	// retained handle remains bound to that exact process even if it exits and
@@ -265,6 +289,9 @@ func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSessi
 	ownedProcess, err := findProcess(sess.pid)
 	if err != nil {
 		if isProcessNotFound(err) {
+			if err := r.terminateAndReleaseJob(ctx, id, sess.generation, sessionJob); err != nil {
+				return err
+			}
 			return r.evictGeneration(id, sess)
 		}
 		return fmt.Errorf("conpty: open host process %q: %w", id, err)
@@ -279,6 +306,9 @@ func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSessi
 	if err != nil {
 		var mismatch *hostIdentityMismatchError
 		if errors.As(err, &mismatch) {
+			if closeErr := r.releaseTeardownJob(id, sess.generation, sessionJob); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 			if cleanupErr := r.evictGeneration(id, sess); cleanupErr != nil {
 				return errors.Join(err, cleanupErr)
 			}
@@ -289,15 +319,12 @@ func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSessi
 	if !alive {
 		// Connection refusal is definitive absence, including the race where
 		// the retained host process exits after findProcess but before the
-		// identity probe. Evict only the exact observed generation.
+		// identity probe. Confirm the generation job is empty before evicting
+		// the exact observed generation.
+		if err := r.terminateAndReleaseJob(ctx, id, sess.generation, sessionJob); err != nil {
+			return err
+		}
 		return r.evictGeneration(id, sess)
-	}
-	sessionJob, jobErr := process.OpenSessionJob(r.dataDir, id, sess.generation)
-	if jobErr != nil && !errors.Is(jobErr, process.ErrSessionJobNotFound) {
-		return fmt.Errorf("conpty: open generation process job %q/%q: %w", id, sess.generation, jobErr)
-	}
-	if sessionJob != nil {
-		defer func() { _ = sessionJob.Close() }()
 	}
 
 	// Stop the verified host even when its PTY child has already exited. The
@@ -328,11 +355,8 @@ func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSessi
 		}
 	}
 	if sessionJob != nil {
-		jobCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		jobErr = sessionJob.TerminateAndWait(jobCtx)
-		cancel()
-		if jobErr != nil {
-			return fmt.Errorf("conpty: terminate generation process job %q/%q: %w", id, sess.generation, jobErr)
+		if err := r.terminateAndReleaseJob(ctx, id, sess.generation, sessionJob); err != nil {
+			return err
 		}
 	}
 
@@ -348,6 +372,65 @@ func (r *Runtime) destroySession(ctx context.Context, id string, sess *hostSessi
 	}
 	r.mu.Unlock()
 	return nil
+}
+
+func (r *Runtime) acquireTeardownJob(id, generation string) (sessionProcessJob, error) {
+	key := sessionJobKey{sessionID: id, generation: generation}
+	r.mu.Lock()
+	if job := r.teardownJobs[key]; job != nil {
+		r.mu.Unlock()
+		return job, nil
+	}
+	r.mu.Unlock()
+
+	job, err := r.openJob(r.dataDir, id, generation)
+	if err != nil || job == nil {
+		return job, err
+	}
+
+	r.mu.Lock()
+	if retained := r.teardownJobs[key]; retained != nil {
+		r.mu.Unlock()
+		_ = job.Close()
+		return retained, nil
+	}
+	r.teardownJobs[key] = job
+	r.mu.Unlock()
+	return job, nil
+}
+
+func (r *Runtime) terminateAndReleaseJob(ctx context.Context, id, generation string, job sessionProcessJob) error {
+	if job == nil {
+		return nil
+	}
+	jobCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	err := job.TerminateAndWait(jobCtx)
+	cancel()
+	if err != nil {
+		// Keep the daemon-owned handle in teardownJobs. A later Destroy can
+		// retry the exact generation and must observe zero active processes
+		// before cleanup is allowed to reclaim the workspace.
+		return fmt.Errorf("conpty: terminate generation process job %q/%q: %w", id, generation, err)
+	}
+	if err := r.releaseTeardownJob(id, generation, job); err != nil {
+		return fmt.Errorf("conpty: release generation process job %q/%q: %w", id, generation, err)
+	}
+	return nil
+}
+
+func (r *Runtime) releaseTeardownJob(id, generation string, job sessionProcessJob) error {
+	if job == nil {
+		return nil
+	}
+	key := sessionJobKey{sessionID: id, generation: generation}
+	r.mu.Lock()
+	if r.teardownJobs[key] != job {
+		r.mu.Unlock()
+		return nil
+	}
+	delete(r.teardownJobs, key)
+	r.mu.Unlock()
+	return job.Close()
 }
 
 // IsAlive distinguishes three outcomes so the reaper never spuriously reaps a

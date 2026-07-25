@@ -50,6 +50,23 @@ func (p *fakeProcessHandle) Alive() (bool, error) {
 func (p *fakeProcessHandle) Kill() error  { p.killed = true; return p.killErr }
 func (p *fakeProcessHandle) Close() error { p.closed = true; return nil }
 
+type fakeSessionProcessJob struct {
+	terminate func(context.Context) error
+	closed    int
+}
+
+func (j *fakeSessionProcessJob) TerminateAndWait(ctx context.Context) error {
+	if j.terminate == nil {
+		return nil
+	}
+	return j.terminate(ctx)
+}
+
+func (j *fakeSessionProcessJob) Close() error {
+	j.closed++
+	return nil
+}
+
 func withProcessFinder(t *testing.T, finder func(int) (processKiller, error)) {
 	t.Helper()
 	original := osProcessFinder
@@ -853,6 +870,76 @@ func TestDestroyHostDisappearsBetweenProcessOpenAndIdentityProbe(t *testing.T) {
 	}
 	if entries, err := ptyregistry.LookupAll("probe-exit"); err != nil || len(entries) != 0 {
 		t.Fatalf("probe-exit generation remained registered: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestDestroyRetainsTimedOutJobForCleanupRetry(t *testing.T) {
+	isolateRegistry(t)
+	hosts := map[string]*inProcHost{}
+	processLookups := 0
+	withProcessFinder(t, func(int) (processKiller, error) {
+		processLookups++
+		if processLookups == 1 {
+			return &fakeProcessHandle{}, nil
+		}
+		return nil, os.ErrProcessDone
+	})
+	rt := New(Options{Spawner: fakeSpawnerFor(t, hosts, deadPID())})
+	handle, err := rt.Create(context.Background(), ports.RuntimeConfig{
+		SessionID:     "job-timeout",
+		WorkspacePath: "/tmp/w",
+		Argv:          []string{"agent"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	terminateCalls := 0
+	job := &fakeSessionProcessJob{terminate: func(context.Context) error {
+		terminateCalls++
+		if terminateCalls == 1 {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}}
+	openCalls := 0
+	rt.openJob = func(_, _, _ string) (sessionProcessJob, error) {
+		openCalls++
+		return job, nil
+	}
+
+	err = rt.Destroy(context.Background(), handle)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Destroy error=%v, want job timeout", err)
+	}
+	if job.closed != 0 {
+		t.Fatal("timed-out job handle was closed before cleanup could retry")
+	}
+	rt.mu.Lock()
+	retainedSession := rt.sessions["job-timeout"]
+	var retainedJob sessionProcessJob
+	if retainedSession != nil {
+		retainedJob = rt.teardownJobs[sessionJobKey{sessionID: "job-timeout", generation: retainedSession.generation}]
+	}
+	rt.mu.Unlock()
+	if retainedSession == nil || retainedJob != job {
+		t.Fatalf("timed-out teardown ownership was not retained: session=%+v job=%T", retainedSession, retainedJob)
+	}
+
+	if err := rt.Destroy(context.Background(), handle); err != nil {
+		t.Fatalf("retry Destroy: %v", err)
+	}
+	if openCalls != 1 {
+		t.Fatalf("job opener calls=%d, want retained handle reuse", openCalls)
+	}
+	if terminateCalls != 2 {
+		t.Fatalf("job termination calls=%d, want timeout plus retry", terminateCalls)
+	}
+	if job.closed != 1 {
+		t.Fatalf("job close calls=%d, want close after zero-process confirmation", job.closed)
+	}
+	if entries, lookupErr := ptyregistry.LookupAll("job-timeout"); lookupErr != nil || len(entries) != 0 {
+		t.Fatalf("retried generation remained registered: entries=%v err=%v", entries, lookupErr)
 	}
 }
 
