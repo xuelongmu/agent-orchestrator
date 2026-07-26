@@ -4,6 +4,7 @@ package sessionmanager
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -231,6 +232,10 @@ type Manager struct {
 	lcm       lifecycleRecorder
 	dataDir   string
 	clock     func() time.Time
+	// branchIncarnation returns a random, Git-ref-safe suffix that makes a
+	// worker's branch namespace unique even when a rebuilt database reuses the
+	// human-facing session id. Tests may inject a deterministic value.
+	branchIncarnation func() (string, error)
 	// lookPath is pathenv.LookPath in production; tests substitute a stub so
 	// they don't need real binaries on PATH. Returns ports.ErrAgentBinaryNotFound
 	// when the binary is missing so the sentinel propagates through toAPIError.
@@ -387,15 +392,16 @@ type Deps struct {
 // time.Now when Deps.Clock is nil.
 func New(d Deps) *Manager {
 	m := &Manager{
-		runtime:    d.Runtime,
-		agents:     d.Agents,
-		workspace:  d.Workspace,
-		store:      d.Store,
-		lcm:        d.Lifecycle,
-		dataDir:    d.DataDir,
-		clock:      d.Clock,
-		lookPath:   d.LookPath,
-		executable: d.Executable,
+		runtime:           d.Runtime,
+		agents:            d.Agents,
+		workspace:         d.Workspace,
+		store:             d.Store,
+		lcm:               d.Lifecycle,
+		dataDir:           d.DataDir,
+		clock:             d.Clock,
+		branchIncarnation: newBranchIncarnation,
+		lookPath:          d.LookPath,
+		executable:        d.Executable,
 		sendConfirm: sendConfirmConfig{
 			pollInterval:    sendConfirmPollInterval,
 			attemptDeadline: sendConfirmAttemptDeadline,
@@ -497,7 +503,14 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, fmt.Errorf("spawn: prompt: %w", err)
 	}
 
-	seed := seedRecord(cfg, prompt, project, m.clock())
+	branchIncarnation := ""
+	if needsBranchIncarnation(cfg, project) {
+		branchIncarnation, err = m.branchIncarnation()
+		if err != nil {
+			return domain.SessionRecord{}, fmt.Errorf("spawn: branch incarnation: %w", err)
+		}
+	}
+	seed := seedRecord(cfg, prompt, project, m.clock(), branchIncarnation)
 	var rec domain.SessionRecord
 	var claimedStore claimedSessionStore
 	if cfg.IntakeClaim != nil {
@@ -521,9 +534,10 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		}
 	}
 
-	branch := cfg.Branch
+	branch := rec.Metadata.Branch
 	if cfg.WorkspaceKind == domain.WorkspaceKindWorktree && branch == "" {
-		branch = defaultSpawnBranch(id, cfg.Kind, sessionPrefix(project), project.Kind.WithDefault())
+		m.rollbackSpawnSeedRow(ctx, id)
+		return domain.SessionRecord{}, fmt.Errorf("spawn %s: default branch was not resolved", id)
 	}
 	if cfg.IntakeClaim != nil {
 		started, startErr := claimedStore.MarkTrackerIntakeSpawnStarted(ctx, *cfg.IntakeClaim, id, m.clock().UTC())
@@ -3528,7 +3542,7 @@ func (m *Manager) cleanupRecords(ctx context.Context, project domain.ProjectID) 
 
 // ---- helpers ----
 
-func seedRecord(cfg ports.SpawnConfig, prompt string, project domain.ProjectRecord, now time.Time) domain.SessionRecord {
+func seedRecord(cfg ports.SpawnConfig, prompt string, project domain.ProjectRecord, now time.Time, branchIncarnation string) domain.SessionRecord {
 	rec := domain.SessionRecord{
 		ProjectID:     cfg.ProjectID,
 		IssueID:       cfg.IssueID,
@@ -3538,8 +3552,20 @@ func seedRecord(cfg ports.SpawnConfig, prompt string, project domain.ProjectReco
 		Harness:       cfg.Harness,
 		DisplayName:   cfg.DisplayName,
 		DependencyIDs: domain.EncodeSessionDependencyIDs(cfg.DependsOn),
-		Metadata:      domain.SessionMetadata{WorkspaceKind: cfg.WorkspaceKind.WithDefault()},
+		Metadata:      domain.SessionMetadata{WorkspaceKind: cfg.WorkspaceKind.WithDefault(), Branch: cfg.Branch},
 		Activity:      domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
+	}
+	if rec.Metadata.Branch == "" && cfg.WorkspaceKind == domain.WorkspaceKindWorktree {
+		switch {
+		case project.Kind.WithDefault() == domain.ProjectKindWorkspace:
+			rec.CreateBranchPrefix = "ao/"
+			rec.CreateBranchSuffix = "/" + branchIncarnation
+		case cfg.Kind == domain.KindOrchestrator:
+			rec.Metadata.Branch = "ao/" + sessionPrefix(project) + "-orchestrator"
+		default:
+			rec.CreateBranchPrefix = "ao/"
+			rec.CreateBranchSuffix = "/" + branchIncarnation + "/root"
+		}
 	}
 	if len(cfg.DependsOn) == 0 {
 		return rec
@@ -3547,18 +3573,6 @@ func seedRecord(cfg ports.SpawnConfig, prompt string, project domain.ProjectReco
 	rec.DependencyPreparedAt = now
 	rec.DependencyBasePrompt = prompt
 	rec.Metadata.Prompt = prompt
-	rec.Metadata.Branch = cfg.Branch
-	if rec.Metadata.Branch == "" && cfg.WorkspaceKind == domain.WorkspaceKindWorktree {
-		switch {
-		case project.Kind.WithDefault() == domain.ProjectKindWorkspace:
-			rec.DependencyBranchPrefix = "ao/"
-		case cfg.Kind == domain.KindOrchestrator:
-			rec.Metadata.Branch = "ao/" + sessionPrefix(project) + "-orchestrator"
-		default:
-			rec.DependencyBranchPrefix = "ao/"
-			rec.DependencyBranchSuffix = "/root"
-		}
-	}
 	return rec
 }
 
@@ -3569,22 +3583,19 @@ func effectiveWorkspaceKind(explicit, configured domain.WorkspaceKind) domain.Wo
 	return configured.WithDefault()
 }
 
-func defaultSessionBranch(id domain.SessionID, kind domain.SessionKind, prefix string) string {
-	if kind == domain.KindOrchestrator {
-		return "ao/" + prefix + "-orchestrator"
+func needsBranchIncarnation(cfg ports.SpawnConfig, project domain.ProjectRecord) bool {
+	if cfg.WorkspaceKind != domain.WorkspaceKindWorktree || cfg.Branch != "" {
+		return false
 	}
-	// A fresh, unique branch per worker session: gitworktree can't add a worktree
-	// on a branch already checked out elsewhere (e.g. main). Put the root work
-	// branch under a session namespace so sibling PR branches such as
-	// ao/<session>/<topic> remain valid Git refs.
-	return "ao/" + string(id) + "/root"
+	return project.Kind.WithDefault() == domain.ProjectKindWorkspace || cfg.Kind != domain.KindOrchestrator
 }
 
-func defaultSpawnBranch(id domain.SessionID, kind domain.SessionKind, prefix string, projectKind domain.ProjectKind) string {
-	if projectKind == domain.ProjectKindWorkspace {
-		return "ao/" + string(id)
+func newBranchIncarnation() (string, error) {
+	var token [6]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", err
 	}
-	return defaultSessionBranch(id, kind, prefix)
+	return hex.EncodeToString(token[:]), nil
 }
 
 // dependencyAdmissionBranch returns only branches that can be known before the
@@ -3597,7 +3608,7 @@ func dependencyAdmissionBranch(cfg ports.SpawnConfig, project domain.ProjectReco
 		return cfg.Branch
 	}
 	if cfg.Kind == domain.KindOrchestrator && project.Kind.WithDefault() != domain.ProjectKindWorkspace {
-		return defaultSpawnBranch("", cfg.Kind, sessionPrefix(project), project.Kind.WithDefault())
+		return "ao/" + sessionPrefix(project) + "-orchestrator"
 	}
 	return ""
 }

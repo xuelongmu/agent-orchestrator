@@ -162,8 +162,8 @@ func (f *fakeStore) ListWorkspaceRepos(_ context.Context, projectID string) ([]d
 func (f *fakeStore) CreateSession(_ context.Context, rec domain.SessionRecord) (domain.SessionRecord, error) {
 	f.num++
 	rec.ID = domain.SessionID(fmt.Sprintf("%s-%d", rec.ProjectID, f.num))
-	if !rec.DependencyPreparedAt.IsZero() && rec.Metadata.Branch == "" && rec.DependencyBranchPrefix != "" {
-		rec.Metadata.Branch = rec.DependencyBranchPrefix + string(rec.ID) + rec.DependencyBranchSuffix
+	if rec.Metadata.Branch == "" && rec.CreateBranchPrefix != "" {
+		rec.Metadata.Branch = rec.CreateBranchPrefix + string(rec.ID) + rec.CreateBranchSuffix
 	}
 	f.sessions[rec.ID] = rec
 	if f.afterCreate != nil {
@@ -3083,6 +3083,7 @@ func TestSpawn_WorkspaceProjectRecordsRootAndChildWorktrees(t *testing.T) {
 		Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
 		LookPath: func(string) (string, error) { return "/bin/true", nil },
 	})
+	m.branchIncarnation = func() (string, error) { return "a1b2c3d4e5f6", nil }
 
 	rec, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker})
 	if err != nil {
@@ -3091,8 +3092,8 @@ func TestSpawn_WorkspaceProjectRecordsRootAndChildWorktrees(t *testing.T) {
 	if rec.Metadata.WorkspacePath != managedPath {
 		t.Fatalf("workspace path = %q, want root worktree path", rec.Metadata.WorkspacePath)
 	}
-	if rec.Metadata.Branch != "ao/mer-1" {
-		t.Fatalf("workspace branch = %q, want ao/mer-1", rec.Metadata.Branch)
+	if rec.Metadata.Branch != "ao/mer-1/a1b2c3d4e5f6" {
+		t.Fatalf("workspace branch = %q, want incarnation-scoped branch", rec.Metadata.Branch)
 	}
 	if got := ws.lastProjectCfg.RootRepoPath; got != projectPath {
 		t.Fatalf("root repo path = %q, want %q", got, projectPath)
@@ -4962,14 +4963,42 @@ func TestCleanup_WorkspaceProjectDirtyRowsAreSkipped(t *testing.T) {
 
 func TestSpawn_DefaultsBranchFromSessionID(t *testing.T) {
 	m, st, _, _ := newManager()
+	m.branchIncarnation = func() (string, error) { return "a1b2c3d4e5f6", nil }
 	s, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// An empty SpawnConfig.Branch defaults to a unique per-session root branch
 	// under a namespace that can also hold sibling PR branches.
-	if got := st.sessions[s.ID].Metadata.Branch; got != "ao/mer-1/root" {
-		t.Fatalf("default branch = %q, want ao/mer-1/root", got)
+	if got := st.sessions[s.ID].Metadata.Branch; got != "ao/mer-1/a1b2c3d4e5f6/root" {
+		t.Fatalf("default branch = %q, want incarnation-scoped root branch", got)
+	}
+}
+
+func TestSpawn_ReusedSessionIDGetsDifferentBranchIncarnation(t *testing.T) {
+	first, firstStore, _, _ := newManager()
+	first.branchIncarnation = func() (string, error) { return "111111111111", nil }
+	firstSession, err := first.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A rebuilt database can assign the same human-facing id again. The remote
+	// branch namespace must still be a different ownership identity.
+	second, secondStore, _, _ := newManager()
+	second.branchIncarnation = func() (string, error) { return "222222222222", nil }
+	secondSession, err := second.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if firstSession.ID != secondSession.ID {
+		t.Fatalf("session ids = %q/%q, want deliberate reuse", firstSession.ID, secondSession.ID)
+	}
+	firstBranch := firstStore.sessions[firstSession.ID].Metadata.Branch
+	secondBranch := secondStore.sessions[secondSession.ID].Metadata.Branch
+	if firstBranch == secondBranch {
+		t.Fatalf("reused session id shared branch namespace %q", firstBranch)
 	}
 }
 

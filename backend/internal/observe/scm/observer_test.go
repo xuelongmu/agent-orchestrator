@@ -1268,6 +1268,102 @@ func TestPoll_DiscoversSiblingUnderRootSessionNamespace(t *testing.T) {
 	}
 }
 
+func TestPoll_SkipsPRCreatedBeforeReusedSession(t *testing.T) {
+	now := time.Unix(10_000, 0).UTC()
+	store := testStoreWithSession()
+	store.sessions[0].CreatedAt = now
+	store.sessions[0].Metadata.Branch = "ao/p-1/root"
+	provider := &fakeProvider{
+		repoGuards: map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
+		openPRs: map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {
+			{
+				URL:               "https://github.com/o/r/pull/1",
+				Number:            1,
+				SourceBranch:      "ao/p-1/old-work",
+				HeadRepo:          "o/r",
+				TargetBranch:      "main",
+				HeadSHA:           "sha1",
+				CreatedAtProvider: now.Add(-time.Hour),
+			},
+		}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): testObs(1)},
+	}
+	lc := &fakeLifecycle{}
+	obs := newTestObserver(store, provider, lc, now)
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.fetchBatches) != 0 || len(store.writes) != 0 || len(lc.observed) != 0 {
+		t.Fatalf("older PR was attributed to reused session: fetches=%#v writes=%d lifecycle=%d", provider.fetchBatches, len(store.writes), len(lc.observed))
+	}
+}
+
+func TestPoll_IncarnationNamespaceDoesNotMatchPriorSessionBranch(t *testing.T) {
+	store := testStoreWithSession()
+	store.sessions[0].Metadata.Branch = "ao/p-1/bbbbbbbbbbbb/root"
+	provider := &fakeProvider{
+		repoGuards: map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
+		openPRs: map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {
+			{
+				URL:          "https://github.com/o/r/pull/1",
+				Number:       1,
+				SourceBranch: "ao/p-1/aaaaaaaaaaaa/old-work",
+				HeadRepo:     "o/r",
+				TargetBranch: "main",
+				HeadSHA:      "sha1",
+			},
+		}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): testObs(1)},
+	}
+	lc := &fakeLifecycle{}
+	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.fetchBatches) != 0 || len(store.writes) != 0 || len(lc.observed) != 0 {
+		t.Fatalf("prior incarnation branch was attributed: fetches=%#v writes=%d lifecycle=%d", provider.fetchBatches, len(store.writes), len(lc.observed))
+	}
+}
+
+func TestPoll_PredatingSpecificSessionFallsBackToOlderMatchingOwner(t *testing.T) {
+	now := time.Unix(10_000, 0).UTC()
+	store := testStoreWithSession()
+	store.sessions[0].CreatedAt = now.Add(-2 * time.Hour)
+	store.sessions[0].Metadata.Branch = "ao/team/root"
+	store.sessions = append(store.sessions, domain.SessionRecord{
+		ID:        "p-2",
+		ProjectID: "p",
+		CreatedAt: now,
+		Metadata:  domain.SessionMetadata{Branch: "ao/team/topic/root"},
+	})
+	provider := &fakeProvider{
+		repoGuards: map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
+		openPRs: map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {
+			{
+				URL:               "https://github.com/o/r/pull/1",
+				Number:            1,
+				SourceBranch:      "ao/team/topic/fix",
+				HeadRepo:          "o/r",
+				TargetBranch:      "main",
+				HeadSHA:           "sha1",
+				CreatedAtProvider: now.Add(-time.Hour),
+			},
+		}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): testObs(1)},
+	}
+	lc := &fakeLifecycle{}
+	obs := newTestObserver(store, provider, lc, now)
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.writes) == 0 {
+		t.Fatal("expected PR to fall back to older matching session")
+	}
+	if got := store.writes[0].pr.SessionID; got != "p-1" {
+		t.Fatalf("session id = %q, want older matching owner p-1", got)
+	}
+}
+
 func TestPoll_DiscoversWorkspaceChildRepoPR(t *testing.T) {
 	store := testStoreWithSession()
 	store.sessions[0].Metadata.Branch = "ao/p-1/root"
