@@ -255,7 +255,9 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		const host = hostRef.current;
 		if (!host) return undefined;
 		const activateLink = (_event: MouseEvent, uri: string) => {
-			window.open(uri, "_blank", "noopener");
+			void aoBridge.app.openExternal(uri).catch((error) => {
+				console.warn("Unable to open terminal link externally", error);
+			});
 			callbacksRef.current.onLinkOpen?.(uri);
 		};
 
@@ -306,12 +308,9 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		const unicode = new Unicode11Addon();
 		term.loadAddon(unicode);
 		term.unicode.activeVersion = "11";
-		// Open plain and OSC 8 links in the OS browser. The default handlers call
-		// window.open() with no URL and then assigns location.href, but the
-		// Electron main process denies every window.open and only forwards the URL
-		// passed to it (main.ts setWindowOpenHandler), so the default handlers'
-		// empty open is dropped and clicks silently no-op. Pass the matched URL to
-		// window.open directly so the main process routes it to shell.openExternal.
+		// Open plain and OSC 8 links through the preload bridge. This hands the URL
+		// directly to Electron's validated shell.openExternal IPC path instead of
+		// relying on BrowserWindow popup handling.
 		term.loadAddon(new WebLinksAddon(activateLink));
 		term.loadAddon(new SearchAddon());
 
