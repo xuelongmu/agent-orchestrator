@@ -2844,8 +2844,12 @@ func TestDiscoverSubjects_DoesNotBackfillReplacedProject(t *testing.T) {
 		store.projects["p"] = replacement
 	}
 	obs := newTestObserver(store, &fakeProvider{}, &fakeLifecycle{}, time.Unix(0, 0).UTC())
-	if _, _, err := obs.discoverSubjects(context.Background()); err != nil {
+	subjects, sessionRepos, err := obs.discoverSubjects(context.Background())
+	if err != nil {
 		t.Fatalf("discoverSubjects: %v", err)
+	}
+	if len(subjects) != 0 || len(sessionRepos) != 0 {
+		t.Fatalf("stale project should be skipped, got %d subjects and %d session repositories", len(subjects), len(sessionRepos))
 	}
 	got := store.projects["p"]
 	if got.RepoOriginURL != "" || got.Path != replacement.Path || got.Config.Env["REPLACEMENT"] != "safe" {

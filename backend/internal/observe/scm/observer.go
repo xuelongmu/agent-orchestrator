@@ -972,10 +972,15 @@ func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, [
 			}
 			if p.RepoOriginURL == "" && p.Path != "" {
 				if url := resolveGitOriginURL(p.Path); url != "" {
-					p.RepoOriginURL = url
-					if _, err := o.store.UpdateProjectOriginURL(ctx, p.ID, p.RegisteredAt, url); err != nil {
+					updated, err := o.store.UpdateProjectOriginURL(ctx, p.ID, p.RegisteredAt, url)
+					if err != nil {
 						o.logger.Warn("scm observer: backfill origin URL persist failed", "project", p.ID, "err", err)
+						continue
 					}
+					if !updated {
+						continue
+					}
+					p.RepoOriginURL = url
 				}
 			}
 			projects[sess.ProjectID] = p
