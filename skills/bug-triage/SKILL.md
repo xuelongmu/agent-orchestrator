@@ -218,23 +218,48 @@ EOF
 
 ### 5b. Upload screenshots
 
-**⛔ NEVER use placeholder URLs.** Upload BEFORE creating the issue.
+**⛔ NEVER use placeholder, repository-file, raw-content, or temporary asset-branch
+URLs.** Upload BEFORE creating the issue using GitHub's native user-attachments
+flow. It returns the same durable `https://github.com/user-attachments/...` URL
+that GitHub inserts when a file is dropped into its web editor.
+
+Use a filename containing only letters, numbers, dots, underscores, and hyphens
+so the query string does not need extra encoding. Send the file as raw bytes, not
+multipart, JSON, or base64:
 
 ```bash
-SLUG="descriptive-slug"
-# Create asset branch
-gh api -X POST repos/AgentWrapper/agent-orchestrator/git/refs \
-  -f ref="refs/heads/issue-assets-${SLUG}" \
-  -f sha=$(git rev-parse upstream/main)
+REPO="AgentWrapper/agent-orchestrator"
+FILE="/path/to/descriptive-screenshot.png"
+MIME="image/png"
+REPO_ID=$(gh api "repos/$REPO" --jq '.id')
+TOKEN=$(gh auth token)
 
-# Upload (portable base64)
-IMG_B64=$(base64 < /path/to/screenshot.png | tr -d '\n')
-gh api -X PUT "repos/AgentWrapper/agent-orchestrator/contents/.issue-assets/${SLUG}/name.png" \
-  -f message="chore: upload screenshot" \
-  -f content="$IMG_B64" \
-  -f branch="issue-assets-${SLUG}"
-# Use: ![screenshot](https://raw.githubusercontent.com/AgentWrapper/agent-orchestrator/issue-assets-<slug>/.issue-assets/<file>)
+RESPONSE=$(
+  builtin printf 'Authorization: Bearer %s\n' "$TOKEN" |
+    curl --fail-with-body --silent --show-error -X POST \
+      "https://uploads.github.com/user-attachments/assets?name=$(basename "$FILE")&content_type=$MIME&repository_id=$REPO_ID" \
+      -H "Accept: application/vnd.github+json" \
+      --header @- \
+      -H "Content-Type: application/octet-stream" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      --data-binary @"$FILE"
+)
+unset TOKEN
+
+ASSET_URL=$(printf '%s' "$RESPONSE" |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')
+case "$ASSET_URL" in
+  https://github.com/user-attachments/*) ;;
+  *) echo "unexpected GitHub attachment URL: $ASSET_URL" >&2; exit 1 ;;
+esac
+
+# Use the returned URL in the issue or PR body:
+# ![descriptive alt text](https://github.com/user-attachments/assets/<uuid>)
 ```
+
+For video, set the real MIME type (for example `video/mp4`) and embed the
+returned URL on its own line. Never print the token or the authorization header,
+or expand the token into an external process's arguments.
 
 ### 5c. Create the issue
 
