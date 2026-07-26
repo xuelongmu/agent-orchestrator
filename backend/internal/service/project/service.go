@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -556,20 +557,10 @@ func (m *Service) PatchEnvironment(ctx context.Context, id domain.ProjectID, in 
 	if len(in.Set) == 0 && len(in.Unset) == 0 {
 		return EnvironmentResult{}, apierr.Invalid("EMPTY_ENVIRONMENT_PATCH", "Set or unset at least one environment variable", nil)
 	}
-	for key := range in.Set {
-		if err := validateEnvironmentName(key); err != nil {
-			return EnvironmentResult{}, err
-		}
-	}
-	seenUnset := make(map[string]struct{}, len(in.Unset))
-	for _, key := range in.Unset {
-		if err := validateEnvironmentName(key); err != nil {
-			return EnvironmentResult{}, err
-		}
-		if _, conflict := in.Set[key]; conflict {
-			return EnvironmentResult{}, apierr.Invalid("ENVIRONMENT_PATCH_CONFLICT", "An environment variable cannot be set and unset in the same request", map[string]any{"key": key})
-		}
-		seenUnset[key] = struct{}{}
+	caseInsensitive := runtime.GOOS == "windows"
+	setKeys, seenUnset, err := validateEnvironmentPatch(in, caseInsensitive)
+	if err != nil {
+		return EnvironmentResult{}, err
 	}
 
 	m.configMu.Lock()
@@ -578,23 +569,18 @@ func (m *Service) PatchEnvironment(ctx context.Context, id domain.ProjectID, in 
 	if err != nil {
 		return EnvironmentResult{}, err
 	}
-	env := make(map[string]string, len(row.Config.Env)+len(in.Set))
-	for key, value := range row.Config.Env {
-		env[key] = value
-	}
-	for key, value := range in.Set {
-		env[key] = value
-	}
-	for key := range seenUnset {
-		delete(env, key)
-	}
+	env := applyEnvironmentPatch(row.Config.Env, in.Set, setKeys, seenUnset, caseInsensitive)
 	if len(env) == 0 {
 		row.Config.Env = nil
 	} else {
 		row.Config.Env = env
 	}
-	if err := m.store.UpsertProject(ctx, row); err != nil {
+	updated, err := m.store.UpdateProjectConfig(ctx, row.ID, row.Config)
+	if err != nil {
 		return EnvironmentResult{}, apierr.Internal("PROJECT_ENVIRONMENT_UPDATE_FAILED", "Failed to update project environment")
+	}
+	if !updated {
+		return EnvironmentResult{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
 	}
 	keys := make([]string, 0, len(row.Config.Env))
 	for key := range row.Config.Env {
@@ -602,6 +588,60 @@ func (m *Service) PatchEnvironment(ctx context.Context, id domain.ProjectID, in 
 	}
 	sort.Strings(keys)
 	return EnvironmentResult{ProjectID: id, Keys: keys}, nil
+}
+
+func validateEnvironmentPatch(in PatchEnvironmentInput, caseInsensitive bool) (map[string]string, map[string]struct{}, error) {
+	setKeys := make(map[string]string, len(in.Set))
+	for key := range in.Set {
+		if err := validateEnvironmentName(key); err != nil {
+			return nil, nil, err
+		}
+		identity := environmentKeyIdentity(key, caseInsensitive)
+		if previous, duplicate := setKeys[identity]; duplicate {
+			return nil, nil, apierr.Invalid("DUPLICATE_ENVIRONMENT_NAME", "Environment variable names must be unique for this platform", map[string]any{"key": key, "conflicts_with": previous})
+		}
+		setKeys[identity] = key
+	}
+	seenUnset := make(map[string]struct{}, len(in.Unset))
+	for _, key := range in.Unset {
+		if err := validateEnvironmentName(key); err != nil {
+			return nil, nil, err
+		}
+		identity := environmentKeyIdentity(key, caseInsensitive)
+		if _, conflict := setKeys[identity]; conflict {
+			return nil, nil, apierr.Invalid("ENVIRONMENT_PATCH_CONFLICT", "An environment variable cannot be set and unset in the same request", map[string]any{"key": key})
+		}
+		seenUnset[identity] = struct{}{}
+	}
+	return setKeys, seenUnset, nil
+}
+
+func environmentKeyIdentity(key string, caseInsensitive bool) string {
+	if caseInsensitive {
+		return strings.ToUpper(key)
+	}
+	return key
+}
+
+func applyEnvironmentPatch(current, set map[string]string, setKeys map[string]string, unset map[string]struct{}, caseInsensitive bool) map[string]string {
+	env := make(map[string]string, len(current)+len(set))
+	for key, value := range current {
+		env[key] = value
+	}
+	for key := range env {
+		identity := environmentKeyIdentity(key, caseInsensitive)
+		if _, remove := unset[identity]; remove {
+			delete(env, key)
+			continue
+		}
+		if _, replace := setKeys[identity]; replace {
+			delete(env, key)
+		}
+	}
+	for key, value := range set {
+		env[key] = value
+	}
+	return env
 }
 
 // GetOrchestration returns the effective live policy for one active project.

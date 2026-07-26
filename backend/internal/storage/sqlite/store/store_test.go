@@ -170,6 +170,44 @@ func TestProjectConfigRoundTrips(t *testing.T) {
 	}
 }
 
+func TestProjectConfigAndOriginUpdatesDoNotOverwriteEachOther(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.UpsertProject(ctx, domain.ProjectRecord{
+		ID: "atomic", Path: "/tmp/atomic", RegisteredAt: now,
+		Config: domain.ProjectConfig{
+			AgentRules: "preserve",
+			Env:        map[string]string{"OLD": "value"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.UpdateProjectConfig(ctx, "atomic", domain.ProjectConfig{
+		AgentRules: "preserve",
+		Env:        map[string]string{"NEW": "value"},
+	})
+	if err != nil || !updated {
+		t.Fatalf("UpdateProjectConfig = %v, err=%v", updated, err)
+	}
+	updated, err = s.UpdateProjectOriginURL(ctx, "atomic", "https://github.com/o/r.git")
+	if err != nil || !updated {
+		t.Fatalf("UpdateProjectOriginURL = %v, err=%v", updated, err)
+	}
+
+	got, ok, err := s.GetProject(ctx, "atomic")
+	if err != nil || !ok {
+		t.Fatalf("GetProject: ok=%v err=%v", ok, err)
+	}
+	if got.RepoOriginURL != "https://github.com/o/r.git" {
+		t.Fatalf("origin = %q", got.RepoOriginURL)
+	}
+	if !reflect.DeepEqual(got.Config.Env, map[string]string{"NEW": "value"}) || got.Config.AgentRules != "preserve" {
+		t.Fatalf("config = %#v", got.Config)
+	}
+}
+
 func TestSessionCreateAssignsPerProjectID(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

@@ -112,14 +112,16 @@ func (s *fakeStore) GetProject(_ context.Context, id string) (domain.ProjectReco
 	return p, ok, nil
 }
 
-func (s *fakeStore) UpsertProject(_ context.Context, row domain.ProjectRecord) error {
+func (s *fakeStore) UpdateProjectOriginURL(_ context.Context, id, originURL string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.projects == nil {
-		s.projects = map[string]domain.ProjectRecord{}
+	row, ok := s.projects[id]
+	if !ok || !row.ArchivedAt.IsZero() {
+		return false, nil
 	}
-	s.projects[row.ID] = row
-	return nil
+	row.RepoOriginURL = originURL
+	s.projects[id] = row
+	return true, nil
 }
 
 func (s *fakeStore) ListWorkspaceRepos(_ context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error) {
@@ -2783,9 +2785,13 @@ func TestDiscoverSubjects_BackfillsRepoOriginURL(t *testing.T) {
 
 	store := &fakeStore{
 		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "feat"}}},
-		projects: map[string]domain.ProjectRecord{"p": {ID: "p", Path: dir}}, // empty RepoOriginURL
-		prs:      map[domain.SessionID][]domain.PullRequest{},
-		checks:   map[string][]domain.PullRequestCheck{},
+		projects: map[string]domain.ProjectRecord{"p": {
+			ID:     "p",
+			Path:   dir,
+			Config: domain.ProjectConfig{Env: map[string]string{"KEEP": "value"}},
+		}}, // empty RepoOriginURL
+		prs:    map[domain.SessionID][]domain.PullRequest{},
+		checks: map[string][]domain.PullRequestCheck{},
 	}
 	provider := &fakeProvider{}
 	obs := newTestObserver(store, provider, &fakeLifecycle{}, time.Unix(0, 0).UTC())
@@ -2795,6 +2801,9 @@ func TestDiscoverSubjects_BackfillsRepoOriginURL(t *testing.T) {
 	}
 	if got := store.projects["p"].RepoOriginURL; got != "https://github.com/o/r.git" {
 		t.Fatalf("RepoOriginURL after backfill = %q, want https://github.com/o/r.git", got)
+	}
+	if got := store.projects["p"].Config.Env["KEEP"]; got != "value" {
+		t.Fatalf("config after origin backfill = %#v, want KEEP preserved", store.projects["p"].Config)
 	}
 }
 

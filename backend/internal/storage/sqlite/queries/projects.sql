@@ -13,6 +13,16 @@ ON CONFLICT (id) DO UPDATE SET
 SELECT id, path, repo_origin_url, display_name, registered_at, archived_at, config, kind
 FROM projects WHERE id = ?;
 
+-- name: UpdateProjectConfig :execrows
+UPDATE projects
+SET config = ?
+WHERE id = ? AND archived_at IS NULL;
+
+-- name: UpdateProjectOriginURL :execrows
+UPDATE projects
+SET repo_origin_url = ?
+WHERE id = ? AND archived_at IS NULL;
+
 -- name: ListProjects :many
 SELECT id, path, repo_origin_url, display_name, registered_at, archived_at, config, kind
 FROM projects WHERE archived_at IS NULL ORDER BY id;

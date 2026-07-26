@@ -23,6 +23,41 @@ func (s *Store) UpsertProject(ctx context.Context, r domain.ProjectRecord) error
 	return upsertProject(ctx, s.qw, r, config)
 }
 
+// UpdateProjectConfig changes only an active project's config column. Keeping
+// this write narrow prevents independent metadata discovery from replaying a
+// stale full-row snapshot over a newer config.
+func (s *Store) UpdateProjectConfig(ctx context.Context, id string, cfg domain.ProjectConfig) (bool, error) {
+	config, err := marshalProjectConfig(cfg)
+	if err != nil {
+		return false, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	n, err := s.qw.UpdateProjectConfig(ctx, gen.UpdateProjectConfigParams{
+		Config: config,
+		ID:     domain.ProjectID(id),
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// UpdateProjectOriginURL changes only an active project's discovered origin.
+// It deliberately does not persist the caller's potentially stale project row.
+func (s *Store) UpdateProjectOriginURL(ctx context.Context, id, originURL string) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	n, err := s.qw.UpdateProjectOriginURL(ctx, gen.UpdateProjectOriginURLParams{
+		RepoOriginURL: originURL,
+		ID:            domain.ProjectID(id),
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // UpsertWorkspaceProject inserts or replaces a workspace project and its child
 // repository registry in one transaction. The child set is authoritative.
 func (s *Store) UpsertWorkspaceProject(ctx context.Context, r domain.ProjectRecord, repos []domain.WorkspaceRepoRecord) error {

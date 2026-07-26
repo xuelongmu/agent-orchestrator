@@ -2,6 +2,7 @@ import { rmSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { repositoryIdentity } from "./repository-identity.mjs";
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const frontendRoot = resolve(scriptsDir, "..");
@@ -19,8 +20,7 @@ function gitOutput(...args) {
 function repositoryName() {
 	if (process.env.GITHUB_REPOSITORY) return process.env.GITHUB_REPOSITORY;
 	const remote = gitOutput("config", "--get", "remote.origin.url");
-	const github = /github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?$/.exec(remote);
-	return github ? `${github[1]}/${github[2]}` : remote;
+	return repositoryIdentity(remote);
 }
 
 const commit = process.env.GITHUB_SHA || gitOutput("rev-parse", "HEAD");
