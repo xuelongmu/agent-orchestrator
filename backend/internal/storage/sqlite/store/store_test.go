@@ -195,7 +195,7 @@ func TestProjectConfigAndOriginUpdatesDoNotOverwriteEachOther(t *testing.T) {
 	if err != nil || !updated {
 		t.Fatalf("UpdateProjectConfig = %v, err=%v; written=%s loaded=%s", updated, err, now.Format(time.RFC3339Nano), loaded.RegisteredAt.Format(time.RFC3339Nano))
 	}
-	updated, err = s.UpdateProjectOriginURL(ctx, "atomic", "https://github.com/o/r.git")
+	updated, err = s.UpdateProjectOriginURL(ctx, "atomic", loaded.RegisteredAt, "https://github.com/o/r.git")
 	if err != nil || !updated {
 		t.Fatalf("UpdateProjectOriginURL = %v, err=%v", updated, err)
 	}
@@ -226,6 +226,10 @@ func TestProjectConfigAndOriginUpdatesDoNotOverwriteEachOther(t *testing.T) {
 	})
 	if err != nil || updated {
 		t.Fatalf("stale UpdateProjectConfig = %v, err=%v; want false, nil", updated, err)
+	}
+	updated, err = s.UpdateProjectOriginURL(ctx, "atomic", now, "https://github.com/stale/repo.git")
+	if err != nil || updated {
+		t.Fatalf("stale UpdateProjectOriginURL = %v, err=%v; want false, nil", updated, err)
 	}
 	got, ok, err = s.GetProject(ctx, "atomic")
 	if err != nil || !ok {

@@ -45,14 +45,15 @@ func (s *Store) UpdateProjectConfig(ctx context.Context, id string, registeredAt
 	return n > 0, nil
 }
 
-// UpdateProjectOriginURL changes only an active project's discovered origin.
-// It deliberately does not persist the caller's potentially stale project row.
-func (s *Store) UpdateProjectOriginURL(ctx context.Context, id, originURL string) (bool, error) {
+// UpdateProjectOriginURL changes only the discovered origin of the active
+// project incarnation the caller loaded.
+func (s *Store) UpdateProjectOriginURL(ctx context.Context, id string, registeredAt time.Time, originURL string) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	n, err := s.qw.UpdateProjectOriginURL(ctx, gen.UpdateProjectOriginURLParams{
-		RepoOriginURL: originURL,
-		ID:            domain.ProjectID(id),
+		RepoOriginURL:    originURL,
+		ID:               domain.ProjectID(id),
+		RegisteredAtText: registeredAt.Round(0).String(),
 	})
 	if err != nil {
 		return false, err

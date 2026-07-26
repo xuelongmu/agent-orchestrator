@@ -140,16 +140,23 @@ func (q *Queries) UpdateProjectConfig(ctx context.Context, arg UpdateProjectConf
 const updateProjectOriginURL = `-- name: UpdateProjectOriginURL :execrows
 UPDATE projects
 SET repo_origin_url = ?
-WHERE id = ? AND archived_at IS NULL
+WHERE id = ?
+  AND substr(
+      CAST(registered_at AS TEXT),
+      1,
+      instr(CAST(registered_at AS TEXT) || ' m=', ' m=') - 1
+  ) = CAST(?3 AS TEXT)
+  AND archived_at IS NULL
 `
 
 type UpdateProjectOriginURLParams struct {
-	RepoOriginURL string
-	ID            domain.ProjectID
+	RepoOriginURL    string
+	ID               domain.ProjectID
+	RegisteredAtText string
 }
 
 func (q *Queries) UpdateProjectOriginURL(ctx context.Context, arg UpdateProjectOriginURLParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, updateProjectOriginURL, arg.RepoOriginURL, arg.ID)
+	result, err := q.db.ExecContext(ctx, updateProjectOriginURL, arg.RepoOriginURL, arg.ID, arg.RegisteredAtText)
 	if err != nil {
 		return 0, err
 	}

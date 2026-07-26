@@ -30,7 +30,13 @@ WHERE id = ?
 -- name: UpdateProjectOriginURL :execrows
 UPDATE projects
 SET repo_origin_url = ?
-WHERE id = ? AND archived_at IS NULL;
+WHERE id = ?
+  AND substr(
+      CAST(registered_at AS TEXT),
+      1,
+      instr(CAST(registered_at AS TEXT) || ' m=', ' m=') - 1
+  ) = CAST(sqlc.arg(registered_at_text) AS TEXT)
+  AND archived_at IS NULL;
 
 -- name: ListProjects :many
 SELECT id, path, repo_origin_url, display_name, registered_at, archived_at, config, kind

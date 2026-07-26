@@ -17,12 +17,14 @@ export function repositoryIdentity(remote) {
 		if (!url.hostname) return "";
 		const path = trimGitSuffix(url.pathname);
 		if (!path) return "";
-		return url.hostname.toLowerCase() === "github.com" ? path : `${url.hostname}/${path}`;
+		const identity = url.hostname.toLowerCase() === "github.com" ? path : `${url.hostname}/${path}`;
+		return /\s/.test(identity) ? "" : identity;
 	} catch {
 		const scp = /^(?:[^@/:]+@)?([^/:]+):(.+)$/.exec(value);
 		if (!scp) return "";
 		const path = trimGitSuffix(scp[2]);
 		if (!path) return "";
-		return scp[1].toLowerCase() === "github.com" ? path : `${scp[1]}/${path}`;
+		const identity = scp[1].toLowerCase() === "github.com" ? path : `${scp[1]}/${path}`;
+		return /\s/.test(identity) ? "" : identity;
 	}
 }

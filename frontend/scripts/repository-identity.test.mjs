@@ -17,6 +17,11 @@ test("repositoryIdentity strips Git suffixes before trailing separators", () => 
 	expect(repositoryIdentity("git@github.com:org/repo.git/")).toBe("org/repo");
 });
 
+test("repositoryIdentity omits linker argument separators", () => {
+	expect(repositoryIdentity("git@example.com:org/my repo.git")).toBe("");
+	expect(repositoryIdentity("git@example.com:org/my\trepo.git")).toBe("");
+});
+
 test("repositoryIdentity omits unsafe or local remotes", () => {
 	expect(repositoryIdentity("C:\\repos\\private")).toBe("");
 	expect(repositoryIdentity("../private")).toBe("");

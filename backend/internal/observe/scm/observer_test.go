@@ -45,6 +45,8 @@ type fakeStore struct {
 	listRelease chan struct{}
 	listHook    func()
 	listCalls   int
+
+	beforeOriginUpdate func()
 }
 
 type fakeWrite struct {
@@ -112,11 +114,15 @@ func (s *fakeStore) GetProject(_ context.Context, id string) (domain.ProjectReco
 	return p, ok, nil
 }
 
-func (s *fakeStore) UpdateProjectOriginURL(_ context.Context, id, originURL string) (bool, error) {
+func (s *fakeStore) UpdateProjectOriginURL(_ context.Context, id string, registeredAt time.Time, originURL string) (bool, error) {
+	if s.beforeOriginUpdate != nil {
+		s.beforeOriginUpdate()
+		s.beforeOriginUpdate = nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row, ok := s.projects[id]
-	if !ok || !row.ArchivedAt.IsZero() {
+	if !ok || !row.ArchivedAt.IsZero() || !row.RegisteredAt.Equal(registeredAt) {
 		return false, nil
 	}
 	row.RepoOriginURL = originURL
@@ -2786,9 +2792,10 @@ func TestDiscoverSubjects_BackfillsRepoOriginURL(t *testing.T) {
 	store := &fakeStore{
 		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "feat"}}},
 		projects: map[string]domain.ProjectRecord{"p": {
-			ID:     "p",
-			Path:   dir,
-			Config: domain.ProjectConfig{Env: map[string]string{"KEEP": "value"}},
+			ID:           "p",
+			Path:         dir,
+			RegisteredAt: time.Unix(1, 0).UTC(),
+			Config:       domain.ProjectConfig{Env: map[string]string{"KEEP": "value"}},
 		}}, // empty RepoOriginURL
 		prs:    map[domain.SessionID][]domain.PullRequest{},
 		checks: map[string][]domain.PullRequestCheck{},
@@ -2804,6 +2811,45 @@ func TestDiscoverSubjects_BackfillsRepoOriginURL(t *testing.T) {
 	}
 	if got := store.projects["p"].Config.Env["KEEP"]; got != "value" {
 		t.Fatalf("config after origin backfill = %#v, want KEEP preserved", store.projects["p"].Config)
+	}
+}
+
+func TestDiscoverSubjects_DoesNotBackfillReplacedProject(t *testing.T) {
+	dir := t.TempDir()
+	if out, err := exec.Command("git", "init", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", dir, "remote", "add", "origin", "https://github.com/old/repo.git").CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v (%s)", err, out)
+	}
+
+	originalAt := time.Unix(1, 0).UTC()
+	replacement := domain.ProjectRecord{
+		ID:           "p",
+		Path:         t.TempDir(),
+		RegisteredAt: time.Unix(2, 0).UTC(),
+		Config:       domain.ProjectConfig{Env: map[string]string{"REPLACEMENT": "safe"}},
+	}
+	store := &fakeStore{
+		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "feat"}}},
+		projects: map[string]domain.ProjectRecord{"p": {
+			ID:           "p",
+			Path:         dir,
+			RegisteredAt: originalAt,
+		}},
+		prs:    map[domain.SessionID][]domain.PullRequest{},
+		checks: map[string][]domain.PullRequestCheck{},
+	}
+	store.beforeOriginUpdate = func() {
+		store.projects["p"] = replacement
+	}
+	obs := newTestObserver(store, &fakeProvider{}, &fakeLifecycle{}, time.Unix(0, 0).UTC())
+	if _, _, err := obs.discoverSubjects(context.Background()); err != nil {
+		t.Fatalf("discoverSubjects: %v", err)
+	}
+	got := store.projects["p"]
+	if got.RepoOriginURL != "" || got.Path != replacement.Path || got.Config.Env["REPLACEMENT"] != "safe" {
+		t.Fatalf("replacement project changed by stale origin backfill: %#v", got)
 	}
 }
 
