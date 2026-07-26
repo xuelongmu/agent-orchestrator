@@ -9,6 +9,7 @@ test("repositoryIdentity strips credentials from URL remotes", () => {
 
 test("repositoryIdentity normalizes SCP-style remotes", () => {
 	expect(repositoryIdentity("git@gitlab.com:org/repo.git")).toBe("gitlab.com/org/repo");
+	expect(repositoryIdentity("git@github.com:org/repo.git")).toBe("org/repo");
 });
 
 test("repositoryIdentity omits unsafe or local remotes", () => {

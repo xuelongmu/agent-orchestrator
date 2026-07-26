@@ -16,11 +16,13 @@ export function repositoryIdentity(remote) {
 		const url = new URL(value);
 		if (!url.hostname) return "";
 		const path = trimGitSuffix(url.pathname);
-		return path ? `${url.hostname}/${path}` : "";
+		if (!path) return "";
+		return url.hostname.toLowerCase() === "github.com" ? path : `${url.hostname}/${path}`;
 	} catch {
 		const scp = /^(?:[^@/:]+@)?([^/:]+):(.+)$/.exec(value);
 		if (!scp) return "";
 		const path = trimGitSuffix(scp[2]);
-		return path ? `${scp[1]}/${path}` : "";
+		if (!path) return "";
+		return scp[1].toLowerCase() === "github.com" ? path : `${scp[1]}/${path}`;
 	}
 }

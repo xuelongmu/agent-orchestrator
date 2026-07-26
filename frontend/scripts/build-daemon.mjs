@@ -2,6 +2,7 @@ import { rmSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { buildChannel } from "./build-channel.mjs";
 import { repositoryIdentity } from "./repository-identity.mjs";
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
@@ -28,11 +29,7 @@ const repository = repositoryName();
 const builtAt = process.env.SOURCE_DATE_EPOCH
 	? new Date(Number(process.env.SOURCE_DATE_EPOCH) * 1000).toISOString()
 	: new Date().toISOString();
-const channel = packageVersion.includes("-nightly.")
-	? "nightly"
-	: packageVersion === "0.0.0"
-		? "development"
-		: "stable";
+const channel = buildChannel(process.env.AO_BUILD_CHANNEL, packageVersion);
 const cliPackage = "github.com/aoagents/agent-orchestrator/backend/internal/cli";
 const ldflags = [
 	`-X ${cliPackage}.Version=${packageVersion}`,
