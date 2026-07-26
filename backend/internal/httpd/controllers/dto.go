@@ -42,6 +42,13 @@ type ProjectResponse struct {
 	Project projectsvc.Project `json:"project"`
 }
 
+// ProjectEnvironmentResponse confirms the durable environment key set without
+// returning values that may contain credentials.
+type ProjectEnvironmentResponse struct {
+	ProjectID domain.ProjectID `json:"projectId"`
+	Keys      []string         `json:"keys"`
+}
+
 // GetProjectResponse is the { status, project } body of GET /projects/{id},
 // where project is oneOf Project|Degraded discriminated by status.
 type GetProjectResponse struct {

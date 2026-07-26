@@ -42,11 +42,11 @@ type PatchEnvironmentInput struct {
 	Unset []string          `json:"unset,omitempty"`
 }
 
-// EnvironmentResult confirms the durable environment key set without returning
-// values that may contain credentials.
+// EnvironmentResult is the service result mapped by the HTTP and CLI
+// boundaries to their public response shapes.
 type EnvironmentResult struct {
-	ProjectID domain.ProjectID `json:"projectId"`
-	Keys      []string         `json:"keys"`
+	ProjectID domain.ProjectID
+	Keys      []string
 }
 
 // SetOrchestrationInput replaces only the project's live orchestration policy,

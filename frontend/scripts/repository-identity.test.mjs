@@ -12,6 +12,11 @@ test("repositoryIdentity normalizes SCP-style remotes", () => {
 	expect(repositoryIdentity("git@github.com:org/repo.git")).toBe("org/repo");
 });
 
+test("repositoryIdentity strips Git suffixes before trailing separators", () => {
+	expect(repositoryIdentity("https://github.com/org/repo.git/")).toBe("org/repo");
+	expect(repositoryIdentity("git@github.com:org/repo.git/")).toBe("org/repo");
+});
+
 test("repositoryIdentity omits unsafe or local remotes", () => {
 	expect(repositoryIdentity("C:\\repos\\private")).toBe("");
 	expect(repositoryIdentity("../private")).toBe("");

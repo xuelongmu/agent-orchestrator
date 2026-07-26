@@ -233,20 +233,20 @@ var schemaNames = map[string]string{
 	// legacyimport report
 	"LegacyimportReport": "ImportReport",
 	// service/project entities + DTOs
-	"ProjectProject":                    "Project",
-	"ProjectSummary":                    "ProjectSummary",
-	"ProjectDegraded":                   "DegradedProject",
-	"ProjectAddInput":                   "AddProjectInput",
-	"ProjectInitializeRepositoryInput":  "InitializeRepositoryInput",
-	"ProjectInitializeRepositoryResult": "InitializeRepositoryResult",
-	"ProjectRemoveResult":               "RemoveProjectResult",
-	"ProjectSetConfigInput":             "SetProjectConfigInput",
-	"ProjectPatchEnvironmentInput":      "PatchProjectEnvironmentInput",
-	"ProjectEnvironmentResult":          "ProjectEnvironment",
-	"ProjectSetOrchestrationInput":      "SetProjectOrchestrationInput",
-	"ProjectOrchestrationResult":        "ProjectOrchestration",
-	"ProjectWorkspaceRepo":              "WorkspaceRepo",
-	"SessionWorkspaceFileStatus":        "WorkspaceFileStatus",
+	"ProjectProject":                        "Project",
+	"ProjectSummary":                        "ProjectSummary",
+	"ProjectDegraded":                       "DegradedProject",
+	"ProjectAddInput":                       "AddProjectInput",
+	"ProjectInitializeRepositoryInput":      "InitializeRepositoryInput",
+	"ProjectInitializeRepositoryResult":     "InitializeRepositoryResult",
+	"ProjectRemoveResult":                   "RemoveProjectResult",
+	"ProjectSetConfigInput":                 "SetProjectConfigInput",
+	"ProjectPatchEnvironmentInput":          "PatchProjectEnvironmentInput",
+	"ControllersProjectEnvironmentResponse": "ProjectEnvironment",
+	"ProjectSetOrchestrationInput":          "SetProjectOrchestrationInput",
+	"ProjectOrchestrationResult":            "ProjectOrchestration",
+	"ProjectWorkspaceRepo":                  "WorkspaceRepo",
+	"SessionWorkspaceFileStatus":            "WorkspaceFileStatus",
 }
 
 // markRequestBodyRequired sets requestBody.required: true on the operation's
@@ -642,7 +642,7 @@ func projectOperations() []operation {
 			pathParams: []any{controllers.ProjectIDParam{}},
 			reqBody:    projectsvc.PatchEnvironmentInput{},
 			resps: []respUnit{
-				{http.StatusOK, projectsvc.EnvironmentResult{}},
+				{http.StatusOK, controllers.ProjectEnvironmentResponse{}},
 				{http.StatusBadRequest, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},

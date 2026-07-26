@@ -575,7 +575,7 @@ func (m *Service) PatchEnvironment(ctx context.Context, id domain.ProjectID, in 
 	} else {
 		row.Config.Env = env
 	}
-	updated, err := m.store.UpdateProjectConfig(ctx, row.ID, row.Config)
+	updated, err := m.store.UpdateProjectConfig(ctx, row.ID, row.RegisteredAt, row.Config)
 	if err != nil {
 		return EnvironmentResult{}, apierr.Internal("PROJECT_ENVIRONMENT_UPDATE_FAILED", "Failed to update project environment")
 	}

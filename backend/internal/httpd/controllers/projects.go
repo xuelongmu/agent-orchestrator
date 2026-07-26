@@ -141,7 +141,10 @@ func (c *ProjectsController) patchEnvironment(w http.ResponseWriter, r *http.Req
 		envelope.WriteError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, result)
+	envelope.WriteJSON(w, http.StatusOK, ProjectEnvironmentResponse{
+		ProjectID: result.ProjectID,
+		Keys:      result.Keys,
+	})
 }
 
 func (c *ProjectsController) getOrchestration(w http.ResponseWriter, r *http.Request) {

@@ -23,10 +23,11 @@ func (s *Store) UpsertProject(ctx context.Context, r domain.ProjectRecord) error
 	return upsertProject(ctx, s.qw, r, config)
 }
 
-// UpdateProjectConfig changes only an active project's config column. Keeping
-// this write narrow prevents independent metadata discovery from replaying a
-// stale full-row snapshot over a newer config.
-func (s *Store) UpdateProjectConfig(ctx context.Context, id string, cfg domain.ProjectConfig) (bool, error) {
+// UpdateProjectConfig changes only the config column of the active project
+// incarnation the caller loaded. Keeping this write narrow and conditional
+// prevents metadata discovery or remove/re-register races from accepting a
+// stale full-row snapshot.
+func (s *Store) UpdateProjectConfig(ctx context.Context, id string, registeredAt time.Time, cfg domain.ProjectConfig) (bool, error) {
 	config, err := marshalProjectConfig(cfg)
 	if err != nil {
 		return false, err
@@ -34,8 +35,9 @@ func (s *Store) UpdateProjectConfig(ctx context.Context, id string, cfg domain.P
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	n, err := s.qw.UpdateProjectConfig(ctx, gen.UpdateProjectConfigParams{
-		Config: config,
-		ID:     domain.ProjectID(id),
+		Config:           config,
+		ID:               domain.ProjectID(id),
+		RegisteredAtText: registeredAt.Round(0).String(),
 	})
 	if err != nil {
 		return false, err
@@ -115,7 +117,7 @@ func upsertProject(ctx context.Context, q *gen.Queries, r domain.ProjectRecord, 
 		Path:          r.Path,
 		RepoOriginURL: r.RepoOriginURL,
 		DisplayName:   r.DisplayName,
-		RegisteredAt:  r.RegisteredAt,
+		RegisteredAt:  r.RegisteredAt.Round(0),
 		ArchivedAt:    nullTime(r.ArchivedAt),
 		Config:        config,
 		Kind:          string(kind),

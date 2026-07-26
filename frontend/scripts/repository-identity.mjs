@@ -1,8 +1,8 @@
 function trimGitSuffix(pathname) {
 	return pathname
 		.replace(/^\/+/, "")
-		.replace(/\.git$/, "")
-		.replace(/\/+$/, "");
+		.replace(/\/+$/, "")
+		.replace(/\.git$/, "");
 }
 
 // repositoryIdentity returns a credential-free host/path identity suitable for

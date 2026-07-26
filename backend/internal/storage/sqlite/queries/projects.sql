@@ -5,6 +5,7 @@ ON CONFLICT (id) DO UPDATE SET
     path = excluded.path,
     repo_origin_url = excluded.repo_origin_url,
     display_name = excluded.display_name,
+    registered_at = excluded.registered_at,
     archived_at = excluded.archived_at,
     config = excluded.config,
     kind = excluded.kind;
@@ -16,7 +17,15 @@ FROM projects WHERE id = ?;
 -- name: UpdateProjectConfig :execrows
 UPDATE projects
 SET config = ?
-WHERE id = ? AND archived_at IS NULL;
+WHERE id = ?
+  -- Older driver writes may include Go's transient " m=+..." monotonic suffix.
+  -- Strip it so a timestamp read back from SQLite still identifies that row.
+  AND substr(
+      CAST(registered_at AS TEXT),
+      1,
+      instr(CAST(registered_at AS TEXT) || ' m=', ' m=') - 1
+  ) = CAST(sqlc.arg(registered_at_text) AS TEXT)
+  AND archived_at IS NULL;
 
 -- name: UpdateProjectOriginURL :execrows
 UPDATE projects
