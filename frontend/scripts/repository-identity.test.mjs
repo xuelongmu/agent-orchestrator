@@ -1,17 +1,17 @@
-import assert from "node:assert/strict";
-import test from "node:test";
+// @vitest-environment node
+import { expect, test } from "vitest";
 
 import { repositoryIdentity } from "./repository-identity.mjs";
 
 test("repositoryIdentity strips credentials from URL remotes", () => {
-	assert.equal(repositoryIdentity("https://user:token@gitlab.com/org/repo.git"), "gitlab.com/org/repo");
+	expect(repositoryIdentity("https://user:token@gitlab.com/org/repo.git")).toBe("gitlab.com/org/repo");
 });
 
 test("repositoryIdentity normalizes SCP-style remotes", () => {
-	assert.equal(repositoryIdentity("git@gitlab.com:org/repo.git"), "gitlab.com/org/repo");
+	expect(repositoryIdentity("git@gitlab.com:org/repo.git")).toBe("gitlab.com/org/repo");
 });
 
 test("repositoryIdentity omits unsafe or local remotes", () => {
-	assert.equal(repositoryIdentity("C:\\repos\\private"), "");
-	assert.equal(repositoryIdentity("../private"), "");
+	expect(repositoryIdentity("C:\\repos\\private")).toBe("");
+	expect(repositoryIdentity("../private")).toBe("");
 });
