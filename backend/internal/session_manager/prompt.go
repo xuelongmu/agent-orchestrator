@@ -257,7 +257,7 @@ func workerSystemPrompt(project promptProject) string {
 - Link the provider issue in the PR/MR body when there is one.
 - Include a concise PR/MR summary, tests run, and known risks or follow-ups.
 - For user-visible changes, add screenshots and/or a short video to the PR/MR when they would help reviewers understand and verify the result.
-- On GitHub, upload that media with GitHub's native user-attachments flow and embed the returned https://github.com/user-attachments/... URL. Resolve the numeric repository ID with gh api repos/OWNER/REPO --jq .id, authenticate with gh auth token without printing the token, and POST the raw file bytes to https://uploads.github.com/user-attachments/assets with the filename, MIME type, and repository_id query parameters. Do not commit review media to the repository, put it on a temporary asset branch, or use a branch-backed raw.githubusercontent.com URL.
+- On GitHub, upload that media with GitHub's native user-attachments flow and embed the returned https://github.com/user-attachments/... URL. Resolve the numeric repository ID with gh api repos/OWNER/REPO --jq .id, authenticate with gh auth token without printing the token or placing it in child process arguments, and POST the raw file bytes to https://uploads.github.com/user-attachments/assets with the filename, MIME type, and repository_id query parameters. Pipe the authorization header to curl through stdin, for example with --header @-. Do not commit review media to the repository, put it on a temporary asset branch, or use a branch-backed raw.githubusercontent.com URL.
 - Do not force-push or rewrite shared history unless explicitly instructed.`
 	if strings.TrimSpace(project.Repo) == "" {
 		repoRules = `## Local Git Rules

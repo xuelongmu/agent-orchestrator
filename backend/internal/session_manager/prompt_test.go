@@ -138,6 +138,8 @@ func TestBuildSystemPrompt_WorkerHandlesTaskSourcesAndProviderPRRules(t *testing
 		"For user-visible changes, add screenshots and/or a short video",
 		"GitHub's native user-attachments flow",
 		"gh api repos/OWNER/REPO --jq .id",
+		"without printing the token or placing it in child process arguments",
+		"Pipe the authorization header to curl through stdin",
 		"https://uploads.github.com/user-attachments/assets",
 		"Do not commit review media to the repository",
 	} {

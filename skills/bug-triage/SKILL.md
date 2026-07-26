@@ -234,13 +234,16 @@ MIME="image/png"
 REPO_ID=$(gh api "repos/$REPO" --jq '.id')
 TOKEN=$(gh auth token)
 
-RESPONSE=$(curl --fail-with-body --silent --show-error -X POST \
-  "https://uploads.github.com/user-attachments/assets?name=$(basename "$FILE")&content_type=$MIME&repository_id=$REPO_ID" \
-  -H "Accept: application/vnd.github+json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/octet-stream" \
-  -H "X-GitHub-Api-Version: 2022-11-28" \
-  --data-binary @"$FILE")
+RESPONSE=$(
+  builtin printf 'Authorization: Bearer %s\n' "$TOKEN" |
+    curl --fail-with-body --silent --show-error -X POST \
+      "https://uploads.github.com/user-attachments/assets?name=$(basename "$FILE")&content_type=$MIME&repository_id=$REPO_ID" \
+      -H "Accept: application/vnd.github+json" \
+      --header @- \
+      -H "Content-Type: application/octet-stream" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      --data-binary @"$FILE"
+)
 unset TOKEN
 
 ASSET_URL=$(printf '%s' "$RESPONSE" |
@@ -255,7 +258,8 @@ esac
 ```
 
 For video, set the real MIME type (for example `video/mp4`) and embed the
-returned URL on its own line. Never print the token or the authorization header.
+returned URL on its own line. Never print the token or the authorization header,
+or expand the token into an external process's arguments.
 
 ### 5c. Create the issue
 
