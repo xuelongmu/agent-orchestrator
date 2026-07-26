@@ -38,6 +38,10 @@ const (
 	// unchanged failing PR. Lifecycle decides whether to wait, remind the
 	// worker, or escalate at each numbered checkpoint.
 	DefaultStalledPRHeartbeat = 10 * time.Minute
+	// autoDiscoveryClockSkew covers GitHub's second-granularity timestamps and
+	// small local/provider clock differences. Older PRs must use the explicit
+	// claim flow instead of inheriting a reused branch namespace.
+	autoDiscoveryClockSkew = 2 * time.Second
 	// DefaultCacheMax bounds each in-memory ETag/review cache map.
 	DefaultCacheMax = 512
 	// BatchSize is the maximum number of PRs in one provider batch fetch.
@@ -1236,6 +1240,7 @@ func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRep
 			// dropped (as is an empty head repo from a deleted fork), preserving
 			// the no-misattribution guarantee.
 			eligible := candidatesForHeadRepo(byRepo[repoKey], pr.HeadRepo)
+			eligible = candidatesNotPredatedByPR(eligible, pr)
 			sr, ok := matchSession(eligible, pr.SourceBranch)
 			if !ok {
 				continue
@@ -1321,6 +1326,23 @@ func matchSession(candidates []sessionRepo, sourceBranch string) (sessionRepo, b
 		}
 	}
 	return best, bestLen >= 0
+}
+
+func prPredatesSession(pr ports.SCMPRObservation, session domain.SessionRecord) bool {
+	if pr.CreatedAtProvider.IsZero() || session.CreatedAt.IsZero() {
+		return false
+	}
+	return pr.CreatedAtProvider.Before(session.CreatedAt.Add(-autoDiscoveryClockSkew))
+}
+
+func candidatesNotPredatedByPR(candidates []sessionRepo, pr ports.SCMPRObservation) []sessionRepo {
+	eligible := make([]sessionRepo, 0, len(candidates))
+	for _, sr := range candidates {
+		if !prPredatesSession(pr, sr.session) {
+			eligible = append(eligible, sr)
+		}
+	}
+	return eligible
 }
 
 func sessionBranchPrefixes(branch string) []string {

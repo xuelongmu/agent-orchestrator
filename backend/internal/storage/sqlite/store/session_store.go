@@ -44,8 +44,8 @@ func (s *Store) CreateSession(ctx context.Context, rec domain.SessionRecord) (do
 		return domain.SessionRecord{}, fmt.Errorf("next session num for %s: %w", rec.ProjectID, err)
 	}
 	rec.ID = domain.SessionID(fmt.Sprintf("%s-%d", rec.ProjectID, num))
-	if !rec.DependencyPreparedAt.IsZero() && rec.Metadata.Branch == "" && rec.DependencyBranchPrefix != "" {
-		rec.Metadata.Branch = rec.DependencyBranchPrefix + string(rec.ID) + rec.DependencyBranchSuffix
+	if rec.Metadata.Branch == "" && rec.CreateBranchPrefix != "" {
+		rec.Metadata.Branch = rec.CreateBranchPrefix + string(rec.ID) + rec.CreateBranchSuffix
 	}
 	if err := validateDependencies(ctx, tx, rec.ID, rec.ProjectID, deps); err != nil {
 		return domain.SessionRecord{}, err
@@ -100,8 +100,8 @@ func (s *Store) CreateClaimedSession(ctx context.Context, rec domain.SessionReco
 			return fmt.Errorf("next session num for %s: %w", rec.ProjectID, err)
 		}
 		rec.ID = domain.SessionID(fmt.Sprintf("%s-%d", rec.ProjectID, num))
-		if !rec.DependencyPreparedAt.IsZero() && rec.Metadata.Branch == "" && rec.DependencyBranchPrefix != "" {
-			rec.Metadata.Branch = rec.DependencyBranchPrefix + string(rec.ID) + rec.DependencyBranchSuffix
+		if rec.Metadata.Branch == "" && rec.CreateBranchPrefix != "" {
+			rec.Metadata.Branch = rec.CreateBranchPrefix + string(rec.ID) + rec.CreateBranchSuffix
 		}
 		if err := validateDependencies(ctx, conn, rec.ID, rec.ProjectID, deps); err != nil {
 			return err
