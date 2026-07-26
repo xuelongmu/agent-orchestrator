@@ -36,6 +36,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    env:
+      AO_BUILD_CHANNEL: testing
     defaults:
       run:
         working-directory: frontend
