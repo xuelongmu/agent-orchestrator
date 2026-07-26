@@ -28,7 +28,11 @@ const repository = repositoryName();
 const builtAt = process.env.SOURCE_DATE_EPOCH
 	? new Date(Number(process.env.SOURCE_DATE_EPOCH) * 1000).toISOString()
 	: new Date().toISOString();
-const channel = packageVersion.includes("-nightly.") ? "nightly" : packageVersion === "0.0.0" ? "development" : "stable";
+const channel = packageVersion.includes("-nightly.")
+	? "nightly"
+	: packageVersion === "0.0.0"
+		? "development"
+		: "stable";
 const cliPackage = "github.com/aoagents/agent-orchestrator/backend/internal/cli";
 const ldflags = [
 	`-X ${cliPackage}.Version=${packageVersion}`,
