@@ -6,19 +6,19 @@ import (
 )
 
 func TestApplyEnvironmentPatchWindowsKeySemantics(t *testing.T) {
-	set := map[string]string{"PATH": "new"}
+	set := map[string]string{"Path": "new", "ao_session_id": "project-value"}
 	setKeys, unset, err := validateEnvironmentPatch(PatchEnvironmentInput{Set: set}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := applyEnvironmentPatch(
-		map[string]string{"Path": "old", "OTHER": "keep"},
+		map[string]string{"Path": "old", "Other": "keep"},
 		set,
 		setKeys,
 		unset,
 		true,
 	)
-	want := map[string]string{"PATH": "new", "OTHER": "keep"}
+	want := map[string]string{"PATH": "new", "AO_SESSION_ID": "project-value", "OTHER": "keep"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("environment = %#v, want %#v", got, want)
 	}
@@ -56,6 +56,12 @@ func TestValidateEnvironmentPatchUsesPlatformKeySemantics(t *testing.T) {
 		Set: map[string]string{"Path": "one", "PATH": "two"},
 	}, true); err == nil {
 		t.Fatal("Windows-style duplicate set keys were accepted")
+	}
+
+	if _, _, err := validateEnvironmentPatch(PatchEnvironmentInput{
+		Set: map[string]string{"TOKEN": "before\x00after"},
+	}, false); err == nil {
+		t.Fatal("NUL-containing environment value was accepted")
 	}
 }
 

@@ -592,9 +592,12 @@ func (m *Service) PatchEnvironment(ctx context.Context, id domain.ProjectID, in 
 
 func validateEnvironmentPatch(in PatchEnvironmentInput, caseInsensitive bool) (map[string]string, map[string]struct{}, error) {
 	setKeys := make(map[string]string, len(in.Set))
-	for key := range in.Set {
+	for key, value := range in.Set {
 		if err := validateEnvironmentName(key); err != nil {
 			return nil, nil, err
+		}
+		if strings.IndexByte(value, 0) >= 0 {
+			return nil, nil, apierr.Invalid("INVALID_ENVIRONMENT_VALUE", "Environment variable values cannot contain NUL bytes", map[string]any{"key": key})
 		}
 		identity := environmentKeyIdentity(key, caseInsensitive)
 		if previous, duplicate := setKeys[identity]; duplicate {
@@ -625,21 +628,31 @@ func environmentKeyIdentity(key string, caseInsensitive bool) string {
 
 func applyEnvironmentPatch(current, set, setKeys map[string]string, unset map[string]struct{}, caseInsensitive bool) map[string]string {
 	env := make(map[string]string, len(current)+len(set))
-	for key, value := range current {
-		env[key] = value
+	currentKeys := make([]string, 0, len(current))
+	for key := range current {
+		currentKeys = append(currentKeys, key)
 	}
-	for key := range env {
+	sort.Strings(currentKeys)
+	for _, key := range currentKeys {
 		identity := environmentKeyIdentity(key, caseInsensitive)
 		if _, remove := unset[identity]; remove {
-			delete(env, key)
 			continue
 		}
 		if _, replace := setKeys[identity]; replace {
-			delete(env, key)
+			continue
 		}
+		persistedKey := key
+		if caseInsensitive {
+			persistedKey = identity
+		}
+		env[persistedKey] = current[key]
 	}
 	for key, value := range set {
-		env[key] = value
+		persistedKey := key
+		if caseInsensitive {
+			persistedKey = environmentKeyIdentity(key, true)
+		}
+		env[persistedKey] = value
 	}
 	return env
 }

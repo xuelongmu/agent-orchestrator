@@ -541,6 +541,9 @@ func TestManager_PatchEnvironmentValidation(t *testing.T) {
 	_, err = m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{Set: map[string]string{"BAD-NAME": "x"}})
 	wantCode(t, err, "INVALID_ENVIRONMENT_NAME")
 
+	_, err = m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{Set: map[string]string{"TOKEN": "before\x00after"}})
+	wantCode(t, err, "INVALID_ENVIRONMENT_VALUE")
+
 	_, err = m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{
 		Set:   map[string]string{"SAME": "x"},
 		Unset: []string{"SAME"},
