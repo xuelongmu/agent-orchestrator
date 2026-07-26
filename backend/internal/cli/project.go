@@ -187,6 +187,16 @@ type setProjectOrchestrationRequest struct {
 	Policy orchestrationPolicyConfig `json:"policy"`
 }
 
+type patchProjectEnvironmentRequest struct {
+	Set   map[string]string `json:"set,omitempty"`
+	Unset []string          `json:"unset,omitempty"`
+}
+
+type projectEnvironmentResult struct {
+	ProjectID string   `json:"projectId"`
+	Keys      []string `json:"keys"`
+}
+
 func newProjectCommand(ctx *commandContext) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "project",
@@ -196,9 +206,91 @@ func newProjectCommand(ctx *commandContext) *cobra.Command {
 	cmd.AddCommand(newProjectGetCommand(ctx))
 	cmd.AddCommand(newProjectAddCommand(ctx))
 	cmd.AddCommand(newProjectSetConfigCommand(ctx))
+	cmd.AddCommand(newProjectEnvironmentCommand(ctx))
 	cmd.AddCommand(newProjectOrchestrationCommand(ctx))
 	cmd.AddCommand(newProjectRemoveCommand(ctx))
 	return cmd
+}
+
+func newProjectEnvironmentCommand(ctx *commandContext) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "env",
+		Short: "Update persisted environment variables without replacing project config",
+	}
+	cmd.AddCommand(newProjectEnvironmentSetCommand(ctx))
+	cmd.AddCommand(newProjectEnvironmentUnsetCommand(ctx))
+	return cmd
+}
+
+func newProjectEnvironmentSetCommand(ctx *commandContext) *cobra.Command {
+	return &cobra.Command{
+		Use:   "set <project-id> KEY=VALUE [KEY=VALUE...]",
+		Short: "Set persisted environment variables for future session launches",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.MinimumNArgs(2)(cmd, args); err != nil {
+				return usageError{err}
+			}
+			if strings.TrimSpace(args[0]) == "" {
+				return usageError{errors.New("usage: project id is required")}
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := strings.TrimSpace(args[0])
+			env, err := parseEnvPairs(args[1:])
+			if err != nil {
+				return err
+			}
+			var result projectEnvironmentResult
+			if err := ctx.patchJSON(cmd.Context(), "projects/"+url.PathEscape(id)+"/config/env", patchProjectEnvironmentRequest{Set: env}, &result); err != nil {
+				return err
+			}
+			keys := sortedEnvironmentKeys(env)
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "updated environment for project %s: set %s\n", result.ProjectID, strings.Join(keys, ", "))
+			return err
+		},
+	}
+}
+
+func newProjectEnvironmentUnsetCommand(ctx *commandContext) *cobra.Command {
+	return &cobra.Command{
+		Use:   "unset <project-id> KEY [KEY...]",
+		Short: "Remove persisted environment variables from future session launches",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.MinimumNArgs(2)(cmd, args); err != nil {
+				return usageError{err}
+			}
+			if strings.TrimSpace(args[0]) == "" {
+				return usageError{errors.New("usage: project id is required")}
+			}
+			for _, key := range args[1:] {
+				if strings.TrimSpace(key) == "" {
+					return usageError{errors.New("environment variable name must not be empty")}
+				}
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := strings.TrimSpace(args[0])
+			keys := append([]string(nil), args[1:]...)
+			sort.Strings(keys)
+			var result projectEnvironmentResult
+			if err := ctx.patchJSON(cmd.Context(), "projects/"+url.PathEscape(id)+"/config/env", patchProjectEnvironmentRequest{Unset: keys}, &result); err != nil {
+				return err
+			}
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "updated environment for project %s: unset %s\n", result.ProjectID, strings.Join(keys, ", "))
+			return err
+		},
+	}
+}
+
+func sortedEnvironmentKeys(env map[string]string) []string {
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func newProjectOrchestrationCommand(ctx *commandContext) *cobra.Command {

@@ -241,6 +241,8 @@ var schemaNames = map[string]string{
 	"ProjectInitializeRepositoryResult": "InitializeRepositoryResult",
 	"ProjectRemoveResult":               "RemoveProjectResult",
 	"ProjectSetConfigInput":             "SetProjectConfigInput",
+	"ProjectPatchEnvironmentInput":      "PatchProjectEnvironmentInput",
+	"ProjectEnvironmentResult":          "ProjectEnvironment",
 	"ProjectSetOrchestrationInput":      "SetProjectOrchestrationInput",
 	"ProjectOrchestrationResult":        "ProjectOrchestration",
 	"ProjectWorkspaceRepo":              "WorkspaceRepo",
@@ -629,6 +631,18 @@ func projectOperations() []operation {
 			reqBody:    projectsvc.SetConfigInput{},
 			resps: []respUnit{
 				{http.StatusOK, controllers.ProjectResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPatch, path: "/api/v1/projects/{id}/config/env", id: "patchProjectEnvironment", tag: "projects",
+			summary:    "Set or unset selected project environment variables",
+			pathParams: []any{controllers.ProjectIDParam{}},
+			reqBody:    projectsvc.PatchEnvironmentInput{},
+			resps: []respUnit{
+				{http.StatusOK, projectsvc.EnvironmentResult{}},
 				{http.StatusBadRequest, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},

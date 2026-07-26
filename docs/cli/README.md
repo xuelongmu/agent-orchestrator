@@ -31,7 +31,7 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 | `ao status` / `--json`        | Report daemon state from `running.json`, process liveness, `/healthz`, and `/readyz`.                                                 |
 | `ao doctor` / `--json`        | Check config/state, daemon, tools, harnesses, and AO executable identity; on Windows a proven legacy Node/npm AO shadow is a failure. |
 | `ao completion <shell>`       | Generate completions for `bash`, `zsh`, `fish`, or `powershell`.                                                                      |
-| `ao version` / `ao --version` | Print build metadata.                                                                                                                 |
+| `ao version` / `ao --version` | Print build metadata; `ao version --json` includes source provenance and named capabilities.                                          |
 | `ao daemon`                   | Hidden internal daemon entrypoint used by `ao start`.                                                                                 |
 
 ### Product commands
@@ -42,6 +42,8 @@ Every product command resolves to a daemon HTTP route. Run `ao <command>
 | `ao project ls`                        | `GET /api/v1/projects`                            |
 | `ao project get <id>`                  | `GET /api/v1/projects/{id}`                       |
 | `ao project set-config <id>`           | `PUT /api/v1/projects/{id}/config`                |
+| `ao project env set <id> KEY=VALUE`    | `PATCH /api/v1/projects/{id}/config/env`          |
+| `ao project env unset <id> KEY`        | `PATCH /api/v1/projects/{id}/config/env`          |
 | `ao project orchestration get [id]`    | `GET /api/v1/projects/{id}/orchestration`         |
 | `ao project orchestration set [id]`    | `PUT /api/v1/projects/{id}/orchestration`         |
 | `ao project orchestration pause [id]`  | `POST /api/v1/projects/{id}/orchestration/pause`  |
@@ -86,6 +88,12 @@ default bounded mode and never schedules check-ins. Charter mode periodically
 checks in only when exactly one live orchestrator is idle. Mode, whole-minute
 interval (`1m` to `24h`), pause, and resume changes are persisted per project
 and consumed live; they do not replace unrelated project config.
+
+`ao project env set` and `ao project env unset` mutate only named environment
+entries while preserving every other project setting. Changes are durable and
+apply when a session is next spawned or restored; they do not rewrite the
+environment of an already-running process. Command output names changed keys
+without echoing their values.
 
 `ao spawn --workspace worktree|scratch|dir` selects the session filesystem
 shape. `worktree` remains the default and is the only kind that accepts

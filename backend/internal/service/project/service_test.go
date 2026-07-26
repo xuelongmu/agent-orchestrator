@@ -484,6 +484,73 @@ func TestManager_SetConfig(t *testing.T) {
 	wantCode(t, err, "PROJECT_NOT_FOUND")
 }
 
+func TestManager_PatchEnvironmentPreservesProjectConfig(t *testing.T) {
+	ctx := context.Background()
+	m := newManager(t)
+	repo := gitRepo(t)
+	cfg := domain.ProjectConfig{
+		DefaultBranch:     "develop",
+		Env:               map[string]string{"KEEP": "yes", "REMOVE": "old"},
+		AgentRules:        "Preserve this.",
+		OrchestratorRules: "Preserve this too.",
+	}
+	if _, err := m.Add(ctx, project.AddInput{Path: repo, ProjectID: ptr("ao"), Config: &cfg}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	result, err := m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{
+		Set:   map[string]string{"CODEX_LANGFUSE_BWS": "true", "KEEP": "updated"},
+		Unset: []string{"REMOVE"},
+	})
+	if err != nil {
+		t.Fatalf("PatchEnvironment: %v", err)
+	}
+	if result.ProjectID != "ao" || strings.Join(result.Keys, ",") != "CODEX_LANGFUSE_BWS,KEEP" {
+		t.Fatalf("environment result = %#v", result)
+	}
+
+	got, err := m.Get(ctx, "ao")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Project == nil || got.Project.Config == nil {
+		t.Fatalf("Get config = %#v", got.Project)
+	}
+	if got.Project.Config.DefaultBranch != "develop" || got.Project.Config.AgentRules != "Preserve this." || got.Project.Config.OrchestratorRules != "Preserve this too." {
+		t.Fatalf("unrelated config changed: %#v", got.Project.Config)
+	}
+	if got.Project.Config.Env["CODEX_LANGFUSE_BWS"] != "true" || got.Project.Config.Env["KEEP"] != "updated" {
+		t.Fatalf("environment was not persisted: %#v", got.Project.Config.Env)
+	}
+	if _, ok := got.Project.Config.Env["REMOVE"]; ok {
+		t.Fatalf("removed key survived: %#v", got.Project.Config.Env)
+	}
+}
+
+func TestManager_PatchEnvironmentValidation(t *testing.T) {
+	ctx := context.Background()
+	m := newManager(t)
+	repo := gitRepo(t)
+	if _, err := m.Add(ctx, project.AddInput{Path: repo, ProjectID: ptr("ao")}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	_, err := m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{})
+	wantCode(t, err, "EMPTY_ENVIRONMENT_PATCH")
+
+	_, err = m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{Set: map[string]string{"BAD-NAME": "x"}})
+	wantCode(t, err, "INVALID_ENVIRONMENT_NAME")
+
+	_, err = m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{
+		Set:   map[string]string{"SAME": "x"},
+		Unset: []string{"SAME"},
+	})
+	wantCode(t, err, "ENVIRONMENT_PATCH_CONFLICT")
+
+	_, err = m.PatchEnvironment(ctx, "missing", project.PatchEnvironmentInput{Set: map[string]string{"OK": "x"}})
+	wantCode(t, err, "PROJECT_NOT_FOUND")
+}
+
 func TestManager_ListIncludesOnlySummarySafeProjectConfig(t *testing.T) {
 	ctx := context.Background()
 	m := newManager(t)
