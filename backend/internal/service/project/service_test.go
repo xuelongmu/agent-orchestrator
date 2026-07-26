@@ -45,7 +45,7 @@ func (s *replaceOnConfigUpdateStore) UpdateProjectConfig(
 	cfg domain.ProjectConfig,
 ) (bool, error) {
 	s.once.Do(func() {
-		archived, err := s.Store.ArchiveProject(ctx, id, registeredAt.Add(time.Millisecond))
+		archived, err := s.ArchiveProject(ctx, id, registeredAt.Add(time.Millisecond))
 		if err != nil {
 			s.replaceErr = err
 			return
@@ -54,7 +54,7 @@ func (s *replaceOnConfigUpdateStore) UpdateProjectConfig(
 			s.replaceErr = errors.New("project was not active before replacement")
 			return
 		}
-		s.replaceErr = s.Store.UpsertProject(ctx, s.replacement)
+		s.replaceErr = s.UpsertProject(ctx, s.replacement)
 	})
 	if s.replaceErr != nil {
 		return false, s.replaceErr
