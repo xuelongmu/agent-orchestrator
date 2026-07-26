@@ -623,7 +623,7 @@ func environmentKeyIdentity(key string, caseInsensitive bool) string {
 	return key
 }
 
-func applyEnvironmentPatch(current, set map[string]string, setKeys map[string]string, unset map[string]struct{}, caseInsensitive bool) map[string]string {
+func applyEnvironmentPatch(current, set, setKeys map[string]string, unset map[string]struct{}, caseInsensitive bool) map[string]string {
 	env := make(map[string]string, len(current)+len(set))
 	for key, value := range current {
 		env[key] = value
