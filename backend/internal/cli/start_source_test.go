@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -245,12 +246,17 @@ func TestStart_SourceIsolatedRemedyScopesTheStop(t *testing.T) {
 		t.Fatalf("start --source: %v", err)
 	}
 	// Plain `ao stop` resolves through config.Load, which ignores ISOLATE_DEV and
-	// would stop the canonical daemon instead, so the remedy must be scoped.
-	if !strings.Contains(errOut, "AO_RUN_FILE="+isolatedRunFile) {
-		t.Fatalf("remedy does not scope the stop to the isolated run file: %q", errOut)
+	// would stop the canonical daemon instead, so the remedy must name the
+	// isolated paths. It quotes them rather than emitting a shell command: a
+	// POSIX `VAR=x cmd` prefix is not valid in PowerShell or cmd.exe.
+	if !strings.Contains(errOut, strconv.Quote(isolatedRunFile)) {
+		t.Fatalf("remedy does not name the isolated run file: %q", errOut)
 	}
-	if !strings.Contains(errOut, "AO_DATA_DIR="+filepath.Join(home, ".ao", "dev", "data")) {
-		t.Fatalf("remedy does not scope the data dir: %q", errOut)
+	if !strings.Contains(errOut, strconv.Quote(filepath.Join(home, ".ao", "dev", "data"))) {
+		t.Fatalf("remedy does not name the isolated data dir: %q", errOut)
+	}
+	if strings.Contains(errOut, "AO_RUN_FILE="+isolatedRunFile) {
+		t.Fatalf("remedy emits a POSIX-only env prefix: %q", errOut)
 	}
 }
 

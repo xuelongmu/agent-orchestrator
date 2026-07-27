@@ -145,11 +145,18 @@ func (c *commandContext) warnRunningDaemon(w io.Writer) {
 	remedy := "Stop it with `ao stop`, or set ISOLATE_DEV=true to use a separate data dir and port."
 	if isolated {
 		// ISOLATE_DEV is already on, so recommending it would be nonsense. Plain
-		// `ao stop` is also wrong here: it resolves through config.Load, which
-		// does not read ISOLATE_DEV, so it would target the canonical daemon and
-		// report success while the isolated one kept running. Spell out the
-		// scoped invocation, which config.Load does honor.
-		remedy = fmt.Sprintf("Stop it with `AO_RUN_FILE=%s AO_DATA_DIR=%s ao stop` if it is not from this checkout.",
+		// `ao stop` is also wrong: it resolves through config.Load, which does
+		// not read ISOLATE_DEV, so it would target the canonical daemon and
+		// report success while the isolated one kept running.
+		//
+		// Name the two variables rather than emitting a command. A copy-paste
+		// line would have to pick a shell — POSIX `VAR=x cmd` prefixes are not
+		// valid in PowerShell or cmd.exe — and would need per-shell quoting for
+		// paths containing spaces. docs/local-development.md carries the actual
+		// invocations, where the shell is known.
+		remedy = fmt.Sprintf("If it is not from this checkout, stop it by running `ao stop` with "+
+			"AO_RUN_FILE=%q and AO_DATA_DIR=%q set (`ao stop` does not read ISOLATE_DEV); "+
+			"see docs/local-development.md.",
 			runFile, filepath.Join(filepath.Dir(runFile), "data"))
 	}
 	_, _ = fmt.Fprintf(w,

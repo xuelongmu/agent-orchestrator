@@ -257,11 +257,20 @@ ISOLATE_DEV=true ao start --source
 
 Note that `ao stop` does not read `ISOLATE_DEV` — it resolves through the
 canonical config, so it would stop the wrong daemon and report success. To stop
-an isolated one, scope it explicitly:
+an isolated one, point it at the isolated paths explicitly:
 
 ```bash
-AO_RUN_FILE=~/.ao/dev/running.json AO_DATA_DIR=~/.ao/dev/data ao stop
+AO_RUN_FILE="$HOME/.ao/dev/running.json" AO_DATA_DIR="$HOME/.ao/dev/data" ao stop
 ```
+
+```powershell
+$env:AO_RUN_FILE = "$HOME\.ao\dev\running.json"
+$env:AO_DATA_DIR = "$HOME\.ao\dev\data"
+ao stop
+```
+
+PowerShell and `cmd.exe` do not accept the POSIX `VAR=value command` prefix form,
+which is why the two are spelled out separately.
 
 **Tests fail on paths like `/var/…` vs `/private/var/…`** — on macOS `TMPDIR`
 lives under `/var`, a symlink to `/private/var`. Production code resolves
