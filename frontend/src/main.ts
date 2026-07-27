@@ -1090,9 +1090,7 @@ async function stopDaemon(): Promise<DaemonStatus> {
 		supervisorConnected: daemonOwnership.supervisorConnected,
 		pid: ownedPID,
 		requestShutdown: () =>
-			ownedPID !== undefined && port !== undefined
-				? requestDaemonShutdown(port, ownedPID)
-				: Promise.resolve(false),
+			ownedPID !== undefined && port !== undefined ? requestDaemonShutdown(port, ownedPID) : Promise.resolve(false),
 		confirmStopped,
 		terminateProcess,
 		clearOwnership: () => daemonOwnership.clear(),
