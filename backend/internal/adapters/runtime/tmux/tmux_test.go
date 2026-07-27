@@ -1344,11 +1344,22 @@ func TestProcessSessionReaperObservesChildCreatedDuringFinalGraceWait(t *testing
 }
 
 func TestProcessSessionReaperBudgetsEverySlowProbe(t *testing.T) {
+	// Timings must clear the host clock's granularity, which is ~15.6ms on
+	// Windows by default. With a 2ms delay against a 5ms budget the budget could
+	// expire before a probe finished, so the loop aborted early and the test read
+	// as though the probes shared one budget (snapshot calls = 2, want 6).
+	//
+	// The assertion needs two relationships to hold, both preserved here:
+	// per-probe delay < per-probe budget (each probe completes), and
+	// reapObservations * delay > budget (a shared budget would abort early).
+	const probeDelay = 20 * time.Millisecond
+	const probeBudget = 50 * time.Millisecond
+
 	process := identity(5000, 4242, "original")
 	table := &fakeProcessTable{
 		current:       map[int]processIdentity{5000: process},
-		identityDelay: 2 * time.Millisecond,
-		snapshotDelay: 2 * time.Millisecond,
+		identityDelay: probeDelay,
+		snapshotDelay: probeDelay,
 		snapshots: []processSnapshotStep{
 			{processes: []processIdentity{process}},
 			{processes: []processIdentity{process}},
@@ -1360,7 +1371,7 @@ func TestProcessSessionReaperBudgetsEverySlowProbe(t *testing.T) {
 	}
 	signaler := &recordingSignaler{}
 	reaper := newTestProcessReaper(table, signaler)
-	reaper.timeout = 5 * time.Millisecond
+	reaper.timeout = probeBudget
 	reaper.Reap(context.Background(), []sessionAnchor{anchor(table, 4242, process)}, 0)
 	if table.snapshotCalls != reapObservations {
 		t.Fatalf("snapshot calls = %d, want %d independently budgeted probes", table.snapshotCalls, reapObservations)

@@ -10,7 +10,7 @@
  *   - :root[data-theme="light"]    → light (renderer Zustand toggle)
  *   - :root.dark / .dark           → alias for landing/docs (Fumadocs)
  *
- * Imported by src/renderer/styles.css. See DESIGN_TOKENS.md.
+ * Imported by src/renderer/styles.css. See DESIGN.md.
  */
 
 :root,

@@ -7,14 +7,24 @@
 # shipped in each npm tarball via that package's `files` entry.
 #
 # CGO-free build (modernc.org/sqlite driver) so cross-compilation needs no C
-# toolchain. Prod build: no -ldflags, so cli.releaseRepo keeps its default
-# (AgentWrapper/agent-orchestrator).
+# toolchain. cli.releaseRepo is deliberately left unstamped so it keeps its
+# default (AgentWrapper/agent-orchestrator); only cli.Version is set, from the
+# @aoagents/ao package version. That stamp matters beyond `ao version`: an
+# unstamped binary reports "dev", which is how `ao start` recognizes a build
+# made from a source checkout. Leaving these unstamped made a published npm
+# binary look like a contributor's local build.
 set -euo pipefail
 
 # Repo layout: this script lives at <repo>/packages/build-binaries.sh.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BACKEND_DIR="${REPO_ROOT}/backend"
+
+# Stamp cli.Version from the bootstrap package so published binaries are not
+# mistaken for local source builds.
+CLI_PKG="github.com/aoagents/agent-orchestrator/backend/internal/cli"
+AO_VERSION="$(node -p "require('${SCRIPT_DIR}/ao/package.json').version")"
+LDFLAGS="-X ${CLI_PKG}.Version=${AO_VERSION}"
 
 # pkg_dir : npm_os : npm_arch : GOOS : GOARCH : bin_name
 TARGETS=(
@@ -31,7 +41,7 @@ for t in "${TARGETS[@]}"; do
   mkdir -p "${SCRIPT_DIR}/${pkg}/bin"
   echo "  -> ${pkg} (GOOS=${goos} GOARCH=${goarch}) -> bin/${bin}"
   (cd "${BACKEND_DIR}" && CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
-    go build -o "${out}" ./cmd/ao)
+    go build -ldflags "${LDFLAGS}" -o "${out}" ./cmd/ao)
   chmod 0755 "${out}"
 done
 

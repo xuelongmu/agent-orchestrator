@@ -29,16 +29,21 @@ state stays in memory.
 ## Design System
 
 Always read [`DESIGN.md`](DESIGN.md) before making any visual or UI decision —
-**start with the "clone agent-orchestrator verbatim" banner at the top**, which
-governs the current look.
+**start with the "the shipped renderer is the reference" section at the top**,
+which governs the current look.
 
-The renderer **clones the agent-orchestrator web app verbatim**
-(`~/Projects/agent-orchestrator/packages/web/src`) in looks and design, with a
-refined-blue accent and the terminal keeping its own palette. This **supersedes the
-older "match emdash" framing** in DESIGN.md (per explicit user decision 2026-06-10).
-Build new UI from shadcn primitives (`components/ui/*`) where a component fits. Do not
-deviate without explicit user approval. In QA/review, flag any renderer code that
-diverges from **agent-orchestrator** — do **not** re-flag emdash mismatches.
+The reference is the code in this repository. Design tokens live in
+`frontend/src/styles/tokens.css` (the declared source of truth, imported by
+`frontend/src/renderer/styles.css`); structure and behavior live in the shipped
+components under `frontend/src/renderer/components`. Change tokens there rather
+than hardcoding values. Build new UI from shadcn primitives
+(`frontend/src/renderer/components/ui/*`) where a component fits. Do not deviate
+without explicit user approval.
+
+Older revisions of DESIGN.md pointed at a private external checkout
+(`~/Projects/agent-orchestrator/packages/web/src`) and at an "emdash" framing.
+Both are retired: the clone is complete and its palette is preserved in
+`tokens.css`. Do not re-flag either in QA/review.
 
 When showing or demoing frontend changes, run `ao preview [url]` from inside the
 session so the change renders in the desktop browser panel (the inspector rail's

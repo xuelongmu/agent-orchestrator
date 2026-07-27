@@ -2,7 +2,13 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-const workflow = readFileSync(new URL("../../.github/workflows/frontend-release.yml", import.meta.url), "utf8");
+function normalizeNewlines(value) {
+	return value.replace(/\r\n?/g, "\n");
+}
+
+const workflow = normalizeNewlines(
+	readFileSync(new URL("../../.github/workflows/frontend-release.yml", import.meta.url), "utf8"),
+);
 const forgeConfig = readFileSync(new URL("../forge.config.ts", import.meta.url), "utf8");
 
 function job(name) {
@@ -15,6 +21,10 @@ function job(name) {
 }
 
 describe("stable desktop release workflow", () => {
+	it("normalizes Windows checkout newlines before parsing jobs", () => {
+		expect(normalizeNewlines("jobs:\r\n  release:\r\n")).toBe("jobs:\n  release:\n");
+	});
+
 	it("checks eligibility without secrets or an environment", () => {
 		const eligibility = job("release-eligibility");
 		expect(eligibility).toContain("contents: read");

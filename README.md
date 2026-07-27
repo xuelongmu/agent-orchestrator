@@ -253,6 +253,7 @@ ao start
 
 | Document                                                                 | Start here when you need                                                                     |
 | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| [docs/local-development.md](docs/local-development.md)                   | To build and run AO from source: prerequisites, install, dev entrypoints, troubleshooting.   |
 | [docs/architecture.md](docs/architecture.md)                             | Backend mental model, lifecycle, persistence, CDC, status derivation, and daemon boundaries. |
 | [docs/backend-code-structure.md](docs/backend-code-structure.md)         | Package ownership and where each backend concern belongs.                                    |
 | [docs/cli/README.md](docs/cli/README.md)                                 | CLI behavior and daemon route mapping.                                                       |

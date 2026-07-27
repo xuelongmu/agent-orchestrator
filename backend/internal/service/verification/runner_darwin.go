@@ -41,7 +41,7 @@ func waitVerificationProcess(cmd *exec.Cmd, owner io.Reader) (error, error) {
 	defer func() { _ = unix.Close(kq) }()
 
 	change := []unix.Kevent_t{{
-		Ident:  uint64(cmd.Process.Pid),
+		Ident:  uint64(cmd.Process.Pid), // #nosec G115 -- a started process's PID is positive.
 		Filter: unix.EVFILT_PROC,
 		Flags:  unix.EV_ADD | unix.EV_ONESHOT,
 		Fflags: unix.NOTE_EXIT,
@@ -63,6 +63,7 @@ func waitVerificationProcess(cmd *exec.Cmd, owner io.Reader) (error, error) {
 				continue
 			}
 			if eventErr == nil && events[0].Flags&unix.EV_ERROR != 0 {
+				// #nosec G115 -- EV_ERROR sets Data to a small positive errno.
 				eventErr = syscall.Errno(events[0].Data)
 			}
 			exited <- eventErr

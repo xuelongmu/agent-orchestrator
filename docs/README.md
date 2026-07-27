@@ -12,6 +12,7 @@ Start with [architecture.md](architecture.md) for the current backend model and
 
 | Doc                                                            | What it covers                                                                                                        |
 | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| [local-development.md](local-development.md)                   | Prerequisites, dependency install, running AO from source, `ao doctor`, and troubleshooting.                          |
 | [architecture.md](architecture.md)                             | Current backend model, package layout, status derivation, persistence/CDC, and load-bearing rules.                    |
 | [backend-code-structure.md](backend-code-structure.md)         | Package ownership rules for the Go backend: domain, services, ports, adapters, storage, HTTP, CLI, and daemon wiring. |
 | [cli/README.md](cli/README.md)                                 | CLI commands and daemon control surface.                                                                              |

@@ -72,6 +72,11 @@ type Deps struct {
 	LookPath           func(file string) (string, error)
 	CommandOutput      func(ctx context.Context, name string, args ...string) ([]byte, error)
 	CommandOutputInDir func(ctx context.Context, dir, name string, args ...string) ([]byte, error)
+	// RunAttached runs a command in dir with the caller's stdio and blocks until
+	// it exits. `ao start --source` needs this: a dev server's output and its
+	// Ctrl-C belong to the terminal, which neither CommandOutput (captures) nor
+	// StartProcess (detaches) provides.
+	RunAttached func(ctx context.Context, dir, name string, args ...string) error
 	// DoctorGitHubRESTBase lets tests point the doctor GitHub token probe at
 	// httptest without mutating package-global state.
 	DoctorGitHubRESTBase string
@@ -98,6 +103,7 @@ func DefaultDeps() Deps {
 		LookPath:             exec.LookPath,
 		CommandOutput:        commandOutput,
 		CommandOutputInDir:   commandOutputInDir,
+		RunAttached:          runAttached,
 		DoctorGitHubRESTBase: defaultDoctorGitHubRESTBase,
 		Now:                  time.Now,
 		Sleep:                time.Sleep,
@@ -115,6 +121,22 @@ func commandOutputInDir(ctx context.Context, dir, name string, args ...string) (
 	cmd := aoprocess.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	return cmd.CombinedOutput()
+}
+
+// runAttached runs name in dir wired to the process stdio and waits for it.
+//
+// This deliberately uses exec directly rather than aoprocess.CommandContext:
+// that wrapper sets CREATE_NO_WINDOW/HideWindow for non-interactive tools the
+// daemon spawns, which would detach the child from the caller's console on
+// Windows and stop Ctrl-C from reaching it. An attached dev server must share
+// the console it was started from.
+func runAttached(ctx context.Context, dir, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func (d Deps) withDefaults() Deps {
@@ -148,6 +170,9 @@ func (d Deps) withDefaults() Deps {
 	}
 	if d.CommandOutputInDir == nil {
 		d.CommandOutputInDir = def.CommandOutputInDir
+	}
+	if d.RunAttached == nil {
+		d.RunAttached = def.RunAttached
 	}
 	if d.OpenStore == nil {
 		d.OpenStore = def.OpenStore
