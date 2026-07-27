@@ -52,7 +52,7 @@ function joinPath(...segments: string[]): string {
 	return segments.map((segment) => segment.replace(/[/\\]+$/, "")).join("/");
 }
 
-export function bundledDaemonBinaryName(platform: NodeJS.Platform): string {
+export function daemonBinaryName(platform: NodeJS.Platform): string {
 	return platform === "win32" ? "ao.exe" : "ao";
 }
 
@@ -75,9 +75,18 @@ export function resolveDaemonLaunch(
 	}
 
 	if (!isPackaged) {
+		// Spawn the daemon binary that `predev` builds into frontend/daemon, not
+		// `go run ./cmd/ao daemon`. `go run` compiles to a temp binary and execs it
+		// as a GRANDCHILD, so Electron's handle would be the `go` wrapper rather
+		// than the process it has to observe, signal, and stop. Windows has no
+		// process group to fall back on there, which left the real daemon holding
+		// the port after Electron quit.
+		//
+		// cwd stays the backend checkout so the daemon still reports this checkout
+		// as its working directory for evaluateDaemonIdentity above.
 		return {
-			command: "go",
-			args: ["run", "./cmd/ao", "daemon"],
+			command: joinPath(appPath, "daemon", daemonBinaryName(platform)),
+			args: ["daemon"],
 			cwd: joinPath(appPath, "..", "backend"),
 			shell: false,
 			source: "dev",
@@ -85,7 +94,7 @@ export function resolveDaemonLaunch(
 	}
 
 	return {
-		command: joinPath(resourcesPath, "daemon", bundledDaemonBinaryName(platform)),
+		command: joinPath(resourcesPath, "daemon", daemonBinaryName(platform)),
 		args: ["daemon"],
 		cwd: resourcesPath,
 		shell: false,

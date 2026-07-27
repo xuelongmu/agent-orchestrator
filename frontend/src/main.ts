@@ -36,6 +36,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { evaluateDaemonIdentity, type DaemonLaunchSpec, resolveDaemonLaunch } from "./shared/daemon-launch";
+import { ownedShutdownGraceMs } from "./shared/daemon-shutdown";
 import { createListenPortScanner, defaultRunFilePath, parseRunFile, type RunFileInfo } from "./shared/daemon-discovery";
 import type { DaemonStatus } from "./shared/daemon-status";
 import { attachAppShortcuts } from "./main/app-shortcuts";
@@ -64,7 +65,7 @@ import {
 	stopAdoptedDaemon,
 	validatedDaemonOwner,
 } from "./main/daemon-restart";
-import { probeProcessLiveness, terminateProcess } from "./main/process-lifecycle";
+import { killDaemon, probeProcessLiveness, terminateProcess } from "./main/process-lifecycle";
 import { readMigrationState, updateMigration, writeAppStateMarker, type MigrationState } from "./main/app-state";
 import { isAllowedAppExternalURL, openAllowedAppExternalURL } from "./main/external-open";
 import { pathInside, samePath } from "./shared/path-identity";
@@ -107,6 +108,10 @@ app.setPath("userData", path.join(os.homedir(), ".ao", "electron"));
 let mainWindow: BrowserWindow | null = null;
 let daemonProcess: ChildProcessWithoutNullStreams | null = null;
 let daemonStoppingProcess: ChildProcessWithoutNullStreams | null = null;
+// Grace period for the running daemon's own shutdown deadline, resolved from the
+// environment it was spawned with. A GUI launch recovers AO_SHUTDOWN_TIMEOUT from
+// the login shell, so process.env alone would understate the daemon's budget.
+let daemonShutdownGraceMs = ownedShutdownGraceMs(process.env);
 let daemonStartPromise: Promise<DaemonStatus> | null = null;
 let daemonStartEpoch = 0;
 let daemonStatus: DaemonStatus = { state: "stopped" };
@@ -616,8 +621,8 @@ async function readRunFileForStop(): Promise<StopRunFileState> {
 	}
 }
 
-async function requestAdoptedDaemonShutdown(port: number, pid: number): Promise<boolean> {
-	// Verify that the control endpoint still belongs to the adopted PID before
+async function requestDaemonShutdown(port: number, pid: number): Promise<boolean> {
+	// Verify that the control endpoint still belongs to the expected PID before
 	// issuing the state-changing request; the port may have been reused.
 	const probe = await readDaemonProbe(port, "healthz");
 	if (!probe || probe.pid !== pid) return false;
@@ -858,11 +863,17 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	}
 	if (startEpoch !== daemonStartEpoch || daemonStopIntent.stopping) return daemonStatus;
 
-	if (launch.source === "bundled" && !existsSync(launch.command)) {
+	// Both bundled and dev launches exec a binary path directly (only `configured`
+	// is a shell command line), so a missing file is a reportable setup error
+	// rather than an opaque ENOENT spawn failure.
+	if (launch.source !== "configured" && !existsSync(launch.command)) {
 		daemonOwnership.clear();
 		setDaemonStatus({
 			state: "error",
-			message: `Bundled AO daemon binary was not found at ${launch.command}. Rebuild the desktop package.`,
+			message:
+				launch.source === "dev"
+					? `AO daemon binary was not found at ${launch.command}. Run "npm run build:daemon:dev" in frontend/.`
+					: `Bundled AO daemon binary was not found at ${launch.command}. Rebuild the desktop package.`,
 			code: "binary_missing",
 		});
 		return daemonStatus;
@@ -875,13 +886,19 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// on THIS process. Without this, a stale exit from an already-stopped daemon
 	// could null out a newer daemonProcess started in the meantime, orphaning it.
 	//
-	// `detached` makes the child its own process-group leader. Because shell:true
-	// runs the command through /bin/sh, a plain kill() would only signal the shell
-	// wrapper and orphan the real daemon (which keeps holding the port). Killing
-	// the whole group via killDaemon() reaches the daemon and any PTY children.
+	// `detached` makes the child its own process-group leader. The dev and bundled
+	// launches exec the daemon binary directly, so the child IS the daemon; only
+	// `configured` (shell:true) runs through /bin/sh, where a plain kill() would
+	// signal the shell wrapper and orphan the real daemon (which keeps holding the
+	// port). Killing the whole group via killDaemon() covers that wrapper case.
+	// Session hosts are not in this group — tmux servers own their own session and
+	// Windows ConPTY hosts are spawned DETACHED_PROCESS — so they survive the stop
+	// and are reconciled by the replacement daemon.
+	const spawnEnv = daemonEnv();
+	daemonShutdownGraceMs = ownedShutdownGraceMs(spawnEnv);
 	const child = spawn(launch.command, launch.args, {
 		cwd: launch.cwd,
-		env: daemonEnv(),
+		env: spawnEnv,
 		shell: launch.shell,
 		detached: true,
 		// Hide the daemon's console on a Windows GUI launch (no flashing terminal).
@@ -1008,17 +1025,27 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	return daemonStatus;
 }
 
-// Signal the daemon's whole process group so the kill reaches the real daemon
-// behind the /bin/sh wrapper (and any PTY children it forked), not just the
-// shell. Falls back to a direct kill if the group signal can't be delivered
-// (e.g. the process already exited).
-function killDaemon(child: ChildProcessWithoutNullStreams): void {
-	if (child.pid === undefined) return;
-	try {
-		process.kill(-child.pid, "SIGTERM");
-	} catch {
-		child.kill("SIGTERM");
+/**
+ * Stop the daemon this process spawned, preferring the loopback control route.
+ * Now that the child IS the daemon on every platform, a bare signal on Windows
+ * is a hard TerminateProcess that would leave running.json behind; /shutdown
+ * lets the daemon remove its own handshake file. The signal remains the fallback
+ * for a daemon that is unreachable or ignores the request.
+ */
+async function stopOwnedDaemon(child: ChildProcessWithoutNullStreams): Promise<void> {
+	const port = daemonStatus.port;
+	const pid = child.pid;
+	const accepted = port !== undefined && pid !== undefined ? await requestDaemonShutdown(port, pid) : false;
+	if (!accepted) {
+		killDaemon(child);
+		return;
 	}
+	// Wait out the daemon's own shutdown deadline before signalling. A daemon
+	// draining a long request is still on the graceful path, and killing it there
+	// is what would strand the run file.
+	setTimeout(() => {
+		if (child.exitCode === null && child.signalCode === null) killDaemon(child);
+	}, daemonShutdownGraceMs).unref();
 }
 
 async function stopDaemon(): Promise<DaemonStatus> {
@@ -1027,9 +1054,10 @@ async function stopDaemon(): Promise<DaemonStatus> {
 	daemonStartEpoch += 1;
 	daemonStartPromise = null;
 	if (daemonProcess) {
-		daemonStoppingProcess = daemonProcess;
+		const child = daemonProcess;
+		daemonStoppingProcess = child;
 		// Drop the liveness link only after initiating the explicit process stop.
-		killDaemon(daemonProcess);
+		await stopOwnedDaemon(child);
 		daemonOwnership.clear();
 		setDaemonStatus({ state: "stopped" });
 		return daemonStatus;
@@ -1062,9 +1090,7 @@ async function stopDaemon(): Promise<DaemonStatus> {
 		supervisorConnected: daemonOwnership.supervisorConnected,
 		pid: ownedPID,
 		requestShutdown: () =>
-			ownedPID !== undefined && port !== undefined
-				? requestAdoptedDaemonShutdown(port, ownedPID)
-				: Promise.resolve(false),
+			ownedPID !== undefined && port !== undefined ? requestDaemonShutdown(port, ownedPID) : Promise.resolve(false),
 		confirmStopped,
 		terminateProcess,
 		clearOwnership: () => daemonOwnership.clear(),
