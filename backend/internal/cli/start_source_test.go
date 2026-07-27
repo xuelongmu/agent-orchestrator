@@ -215,6 +215,45 @@ func TestStart_SourceIsolatedIgnoresTheCanonicalDaemon(t *testing.T) {
 	}
 }
 
+func TestStart_SourceIsolatedRemedyScopesTheStop(t *testing.T) {
+	setConfigEnv(t)
+	root := makeCheckout(t, true)
+	chdir(t, root)
+	home := t.TempDir()
+	t.Setenv("ISOLATE_DEV", "true")
+	t.Setenv("AO_RUN_FILE", "")
+	setHomeDir(t, home)
+
+	// A live daemon on the isolated run file is what an isolated launch attaches to.
+	isolatedRunFile := filepath.Join(home, ".ao", "dev", "running.json")
+	if err := os.MkdirAll(filepath.Dir(isolatedRunFile), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := runfile.Write(isolatedRunFile, runfile.Info{
+		PID: os.Getpid(), Port: 3002, StartedAt: time.Unix(100, 0).UTC(),
+	}); err != nil {
+		t.Fatalf("write run-file: %v", err)
+	}
+
+	deps := Deps{
+		LookPath:    func(string) (string, error) { return "/usr/bin/npm", nil },
+		RunAttached: func(context.Context, string, string, ...string) error { return nil },
+	}
+
+	_, errOut, err := executeCLI(t, deps, "start", "--source")
+	if err != nil {
+		t.Fatalf("start --source: %v", err)
+	}
+	// Plain `ao stop` resolves through config.Load, which ignores ISOLATE_DEV and
+	// would stop the canonical daemon instead, so the remedy must be scoped.
+	if !strings.Contains(errOut, "AO_RUN_FILE="+isolatedRunFile) {
+		t.Fatalf("remedy does not scope the stop to the isolated run file: %q", errOut)
+	}
+	if !strings.Contains(errOut, "AO_DATA_DIR="+filepath.Join(home, ".ao", "dev", "data")) {
+		t.Fatalf("remedy does not scope the data dir: %q", errOut)
+	}
+}
+
 func TestDevRunFilePath(t *testing.T) {
 	home := t.TempDir()
 	canonical := filepath.Join(home, ".ao", "running.json")

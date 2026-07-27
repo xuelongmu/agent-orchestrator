@@ -8,7 +8,7 @@ source. If you only want to _use_ AO, install the desktop app instead — see
 
 | Tool               | Version                           | Why                                               |
 | ------------------ | --------------------------------- | ------------------------------------------------- |
-| Go                 | 1.25.x (`backend/go.mod`)         | backend, daemon, code generation                  |
+| Go                 | 1.25.7+ (`backend/go.mod`)        | backend, daemon, code generation                  |
 | Node               | 20.19+ or 22.12+ (24 works)       | frontend, `npm run api:ts`                        |
 | git                | 2.25+                             | session workspaces are git worktrees              |
 | tmux (macOS/Linux) | 3.x                               | the terminal runtime the daemon execs per session |
@@ -50,6 +50,10 @@ Open a new shell, then confirm with `go version`.
 `brew install go` (no version suffix) currently gives 1.26.x. That builds the
 module fine, but pinning 1.25 matches CI, which reads the version from
 `backend/go.mod`.
+
+The patch version matters: `go.mod` declares `go 1.25.7`, so 1.25.0–1.25.6 do
+not satisfy it. With `GOTOOLCHAIN=local` those fail outright; otherwise Go tries
+to download 1.25.7, which fails on an offline or restricted machine.
 
 ### Nix
 
@@ -95,18 +99,23 @@ the next step fails with command-not-found. The macOS snippet above already adds
 it; on Linux add the equivalent to your shell profile, and on Windows add the
 directory to your user `PATH`:
 
-Append the line to the startup file your shell actually reads — zsh reads
-`~/.zprofile`, not `~/.profile` — then export it once for the shell you are in:
+Append the line to the startup file your shell actually reads, then export it
+once for the shell you are in. Most terminal emulators open an interactive
+non-login shell, which reads `~/.bashrc` under bash and `~/.zshrc` under zsh —
+`~/.profile` and `~/.zprofile` are only read by login shells, so a line placed
+there will not survive opening a new terminal. (macOS Terminal.app is the
+exception: it opens login shells, which is why the macOS snippet above uses
+`~/.zprofile`.)
 
 ```bash
 # Linux, bash
-echo 'export PATH="$(go env GOPATH)/bin:$PATH"' >> ~/.profile
+echo 'export PATH="$(go env GOPATH)/bin:$PATH"' >> ~/.bashrc
 export PATH="$(go env GOPATH)/bin:$PATH"
 ```
 
 ```bash
 # Linux, zsh
-echo 'export PATH="$(go env GOPATH)/bin:$PATH"' >> ~/.zprofile
+echo 'export PATH="$(go env GOPATH)/bin:$PATH"' >> ~/.zshrc
 export PATH="$(go env GOPATH)/bin:$PATH"
 ```
 
@@ -244,6 +253,14 @@ both can coexist:
 
 ```bash
 ISOLATE_DEV=true ao start --source
+```
+
+Note that `ao stop` does not read `ISOLATE_DEV` — it resolves through the
+canonical config, so it would stop the wrong daemon and report success. To stop
+an isolated one, scope it explicitly:
+
+```bash
+AO_RUN_FILE=~/.ao/dev/running.json AO_DATA_DIR=~/.ao/dev/data ao stop
 ```
 
 **Tests fail on paths like `/var/…` vs `/private/var/…`** — on macOS `TMPDIR`

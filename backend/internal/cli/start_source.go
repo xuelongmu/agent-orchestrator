@@ -144,9 +144,13 @@ func (c *commandContext) warnRunningDaemon(w io.Writer) {
 	}
 	remedy := "Stop it with `ao stop`, or set ISOLATE_DEV=true to use a separate data dir and port."
 	if isolated {
-		// ISOLATE_DEV is already on, so recommending it would be nonsense; the
-		// live daemon is the isolated one this launch intends to reuse.
-		remedy = "Stop it with `ao stop` if it is not from this checkout."
+		// ISOLATE_DEV is already on, so recommending it would be nonsense. Plain
+		// `ao stop` is also wrong here: it resolves through config.Load, which
+		// does not read ISOLATE_DEV, so it would target the canonical daemon and
+		// report success while the isolated one kept running. Spell out the
+		// scoped invocation, which config.Load does honor.
+		remedy = fmt.Sprintf("Stop it with `AO_RUN_FILE=%s AO_DATA_DIR=%s ao stop` if it is not from this checkout.",
+			runFile, filepath.Join(filepath.Dir(runFile), "data"))
 	}
 	_, _ = fmt.Fprintf(w,
 		"Warning: an AO daemon is already running (pid %d, port %d), and a dev launch\n"+
