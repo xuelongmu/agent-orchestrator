@@ -49,7 +49,8 @@ Frontend-specific checks:
 ```bash
 cd frontend
 npm run typecheck
-npm run build
+npx vitest run
+npm run package   # optional: packaging build (runs build:daemon first)
 ```
 
 When showing or demoing frontend changes, run `ao preview [url]` from inside the session so the change renders in the desktop browser panel (the inspector rail's Browser tab); do not just describe it.

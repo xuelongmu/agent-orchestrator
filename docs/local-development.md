@@ -6,16 +6,19 @@ source. If you only want to _use_ AO, install the desktop app instead — see
 
 ## Prerequisites
 
-| Tool        | Version                           | Why                                                                |
-| ----------- | --------------------------------- | ------------------------------------------------------------------ |
-| Go          | 1.25.x (`backend/go.mod`)         | backend, daemon, code generation                                   |
-| Node        | 20 baseline; 22/24 also work      | frontend, `npm run api:ts`                                         |
-| git         | 2.20+ (worktree support)          | session workspaces are git worktrees                               |
-| tmux        | 3.x                               | the daemon execs tmux for every session — AO cannot run without it |
-| gh          | any, authenticated                | pull request, CI, and review facts                                 |
-| C toolchain | Xcode CLI tools / build-essential | cgo and native npm modules                                         |
+| Tool               | Version                           | Why                                               |
+| ------------------ | --------------------------------- | ------------------------------------------------- |
+| Go                 | 1.25.x (`backend/go.mod`)         | backend, daemon, code generation                  |
+| Node               | 20 baseline; 22/24 also work      | frontend, `npm run api:ts`                        |
+| git                | 2.20+ (worktree support)          | session workspaces are git worktrees              |
+| tmux (macOS/Linux) | 3.x                               | the terminal runtime the daemon execs per session |
+| gh                 | any, authenticated                | pull request, CI, and review facts                |
+| C toolchain        | Xcode CLI tools / build-essential | cgo and native npm modules                        |
 
-`tmux` is easy to miss and is not optional. `ao doctor` checks for it.
+On macOS and Linux, `tmux` is easy to miss and is not optional — the daemon
+execs it for every session. **Windows does not need it**: the daemon uses the
+built-in ConPTY runtime there instead. Either way `ao doctor` reports which
+terminal runtime your platform uses and whether it is available.
 
 ### macOS
 
@@ -28,9 +31,14 @@ brew install go@1.25 node git tmux gh
 (including `ao`) resolve:
 
 ```bash
-echo 'export PATH="/opt/homebrew/opt/go@1.25/bin:$PATH"' >> ~/.zprofile
-echo 'export PATH="$(/opt/homebrew/opt/go@1.25/bin/go env GOPATH)/bin:$PATH"' >> ~/.zprofile
+echo 'export PATH="$(brew --prefix go@1.25)/bin:$PATH"' >> ~/.zprofile
+echo 'export PATH="$(go env GOPATH)/bin:$PATH"' >> ~/.zprofile
 ```
+
+Let `brew --prefix` resolve the location rather than hardcoding it: keg-only
+formulae live under `/opt/homebrew/opt` on Apple silicon but `/usr/local/opt` on
+Intel. The lines are evaluated in order at shell startup, so the second one
+resolves `go` via the first.
 
 Open a new shell, then confirm with `go version`.
 
@@ -109,8 +117,9 @@ ao doctor
 ```
 
 This is the fastest way to confirm an environment is good. It checks config, the
-data directory, SQLite, the running daemon, git, tmux, whether the `ao` on your
-`PATH` is the one you built, each agent harness it can find, and your gh token.
+data directory, SQLite, the running daemon, git, your platform's terminal runtime
+(tmux on macOS/Linux, ConPTY on Windows), whether the `ao` on your `PATH` is the
+one you built, each agent harness it can find, and your gh token.
 
 Check where state lives with `ao status`. Everything must resolve under `~/.ao`
 (overridable with `AO_DATA_DIR` / `AO_RUN_FILE`) — never
@@ -145,7 +154,15 @@ Frontend:
 cd frontend
 npm run typecheck
 npx vitest run
-npm run build
+```
+
+Packaging the desktop app is a separate, slower step. Both commands run
+`build:daemon` first, so they need the Go toolchain as well:
+
+```bash
+cd frontend
+npm run package   # build the app bundle
+npm run make      # build distributables
 ```
 
 Optional, and requiring Docker (not installed by default):
