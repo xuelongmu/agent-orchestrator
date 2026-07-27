@@ -1,9 +1,20 @@
 import { mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 /** Prefix for a daemon binary that had to be moved out of the way. */
 export function asidePrefix(outPath) {
 	return `${basename(outPath)}.aside-`;
+}
+
+/**
+ * Where busy executables are parked. Deliberately a sibling of the output
+ * directory, not inside it: forge.config.ts copies the whole `daemon` directory
+ * via extraResource, and an aside created by the packaging build's own run
+ * cannot be swept by that same run — it would ship as a stale second executable.
+ * A sibling keeps it on the same volume, so the rename cannot fail with EXDEV.
+ */
+export function asideDir(outDir) {
+	return join(dirname(outDir), `.${basename(outDir)}-aside`);
 }
 
 /**
@@ -25,15 +36,17 @@ export function prepareOutDir(outDir, outPath, fs = {}) {
 	const rename = fs.rename ?? renameSync;
 	const pid = fs.pid ?? process.pid;
 	const prefix = asidePrefix(outPath);
+	const parked = asideDir(outDir);
 
 	mkdir(outDir);
+	mkdir(parked);
 
-	// Sweep binaries set aside by earlier runs. One still in use stays put and is
+	// Sweep binaries parked by earlier runs. One still in use stays put and is
 	// collected by a later build.
-	for (const entry of readdir(outDir)) {
+	for (const entry of readdir(parked)) {
 		if (!entry.startsWith(prefix)) continue;
 		try {
-			remove(join(outDir, entry));
+			remove(join(parked, entry));
 		} catch {
 			// Still loaded; a later build will get it.
 		}
@@ -44,7 +57,7 @@ export function prepareOutDir(outDir, outPath, fs = {}) {
 		return { setAside: null };
 	} catch (error) {
 		if (!["EPERM", "EACCES", "EBUSY", "ETXTBSY"].includes(error.code)) throw error;
-		const setAside = join(outDir, `${prefix}${pid}`);
+		const setAside = join(parked, `${prefix}${pid}`);
 		rename(outPath, setAside);
 		return { setAside };
 	}

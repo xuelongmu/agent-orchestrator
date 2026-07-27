@@ -108,6 +108,10 @@ app.setPath("userData", path.join(os.homedir(), ".ao", "electron"));
 let mainWindow: BrowserWindow | null = null;
 let daemonProcess: ChildProcessWithoutNullStreams | null = null;
 let daemonStoppingProcess: ChildProcessWithoutNullStreams | null = null;
+// Grace period for the running daemon's own shutdown deadline, resolved from the
+// environment it was spawned with. A GUI launch recovers AO_SHUTDOWN_TIMEOUT from
+// the login shell, so process.env alone would understate the daemon's budget.
+let daemonShutdownGraceMs = ownedShutdownGraceMs(process.env);
 let daemonStartPromise: Promise<DaemonStatus> | null = null;
 let daemonStartEpoch = 0;
 let daemonStatus: DaemonStatus = { state: "stopped" };
@@ -890,9 +894,11 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// Session hosts are not in this group — tmux servers own their own session and
 	// Windows ConPTY hosts are spawned DETACHED_PROCESS — so they survive the stop
 	// and are reconciled by the replacement daemon.
+	const spawnEnv = daemonEnv();
+	daemonShutdownGraceMs = ownedShutdownGraceMs(spawnEnv);
 	const child = spawn(launch.command, launch.args, {
 		cwd: launch.cwd,
-		env: daemonEnv(),
+		env: spawnEnv,
 		shell: launch.shell,
 		detached: true,
 		// Hide the daemon's console on a Windows GUI launch (no flashing terminal).
@@ -1039,7 +1045,7 @@ async function stopOwnedDaemon(child: ChildProcessWithoutNullStreams): Promise<v
 	// is what would strand the run file.
 	setTimeout(() => {
 		if (child.exitCode === null && child.signalCode === null) killDaemon(child);
-	}, ownedShutdownGraceMs(process.env)).unref();
+	}, daemonShutdownGraceMs).unref();
 }
 
 async function stopDaemon(): Promise<DaemonStatus> {

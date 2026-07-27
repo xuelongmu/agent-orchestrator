@@ -23,7 +23,17 @@ const DURATION_UNIT_MS: Record<string, number> = {
 	h: 3_600_000,
 };
 
-const DURATION_PATTERN = /^([0-9]*\.?[0-9]+)(ns|us|µs|μs|ms|s|m|h)/;
+// Go's mantissa grammar is `[0-9]*(\.[0-9]*)?` with the rule that at least one
+// digit appears on some side of the point, so `30.s` and `.5s` are both valid
+// durations (`.s` is not). Rejecting `30.s` here would leave the supervisor on
+// the default while the daemon honored a longer deadline.
+const DURATION_PATTERN = /^([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(ns|us|µs|μs|ms|s|m|h)/;
+
+// Node stores a timer delay in a signed 32-bit int and silently reschedules
+// anything larger to 1ms — which would signal the daemon immediately, the exact
+// failure this grace period prevents. Clamping instead defers past any plausible
+// app lifetime, so the signal effectively never beats the daemon's own exit.
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /**
  * Parse a Go `time.ParseDuration` string into milliseconds, mirroring the
@@ -62,8 +72,13 @@ export function parseGoDurationMs(raw: string | undefined): number | null {
  * deadline rather than a fixed constant: a signal inside that window is a hard
  * TerminateProcess on Windows, which would strand running.json — exactly the
  * cleanup the graceful route exists to perform.
+ *
+ * Pass the environment the daemon was actually spawned with, not process.env:
+ * a Finder/Dock launch recovers AO_SHUTDOWN_TIMEOUT from the login shell, so the
+ * two can disagree.
  */
 export function ownedShutdownGraceMs(env: Record<string, string | undefined>): number {
 	const configured = parseGoDurationMs(env.AO_SHUTDOWN_TIMEOUT);
-	return (configured ?? DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_MS) + SHUTDOWN_KILL_HEADROOM_MS;
+	const grace = (configured ?? DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_MS) + SHUTDOWN_KILL_HEADROOM_MS;
+	return Math.min(grace, MAX_TIMER_DELAY_MS);
 }
