@@ -15,7 +15,11 @@ Operational guidance for coding agents working in this repository. Keep changes 
 New machine? [`docs/local-development.md`](docs/local-development.md) covers
 prerequisites (Go, Node, git, **tmux**, gh), dependency install, and how to run
 AO from source. Dependencies install at two levels — `npm ci` at the repo root
-and `npm ci --prefix frontend` — and `ao doctor` verifies the result.
+and `npm ci --prefix frontend`. `ao doctor` then checks the daemon-side
+prerequisites — config, state dir, SQLite, git, the terminal runtime, the `ao`
+binary, agent harnesses, and the gh token — but it does not inspect Node or
+either `node_modules`, so it passes on a checkout whose npm installs were
+skipped.
 
 From the repo root unless noted:
 

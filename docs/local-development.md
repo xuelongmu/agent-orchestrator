@@ -95,9 +95,18 @@ the next step fails with command-not-found. The macOS snippet above already adds
 it; on Linux add the equivalent to your shell profile, and on Windows add the
 directory to your user `PATH`:
 
+Append the line to the startup file your shell actually reads — zsh reads
+`~/.zprofile`, not `~/.profile` — then export it once for the shell you are in:
+
 ```bash
-# Linux (bash/zsh) — persists for new shells; run the export once to use it now
+# Linux, bash
 echo 'export PATH="$(go env GOPATH)/bin:$PATH"' >> ~/.profile
+export PATH="$(go env GOPATH)/bin:$PATH"
+```
+
+```bash
+# Linux, zsh
+echo 'export PATH="$(go env GOPATH)/bin:$PATH"' >> ~/.zprofile
 export PATH="$(go env GOPATH)/bin:$PATH"
 ```
 
@@ -161,6 +170,10 @@ This is the fastest way to confirm an environment is good. It checks config, the
 data directory, SQLite, the running daemon, git, your platform's terminal runtime
 (tmux on macOS/Linux, ConPTY on Windows), whether the `ao` on your `PATH` is the
 one you built, each agent harness it can find, and your gh token.
+
+It does **not** check Node or either `node_modules`, so a green `ao doctor` on a
+checkout that skipped the `npm ci` steps above will still fail at
+`ao start --source`. The preflight in `ao start --source` covers that separately.
 
 Check where state lives with `ao status`. Everything must resolve under `~/.ao`
 (overridable with `AO_DATA_DIR` / `AO_RUN_FILE`) — never

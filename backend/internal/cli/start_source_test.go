@@ -177,6 +177,69 @@ func TestStart_SourceWarnsWhenADaemonIsAlreadyRunning(t *testing.T) {
 	}
 }
 
+func TestStart_SourceIsolatedIgnoresTheCanonicalDaemon(t *testing.T) {
+	cfg := setConfigEnv(t)
+	root := makeCheckout(t, true)
+	chdir(t, root)
+	// ISOLATE_DEV moves the dev launch to ~/.ao/dev, so a daemon on the
+	// canonical run file is not the one it would attach to.
+	t.Setenv("ISOLATE_DEV", "true")
+	t.Setenv("AO_RUN_FILE", "")
+	t.Setenv("HOME", t.TempDir())
+	if err := runfile.Write(cfg.runFile, runfile.Info{
+		PID: os.Getpid(), Port: 3001, StartedAt: time.Unix(100, 0).UTC(),
+	}); err != nil {
+		t.Fatalf("write run-file: %v", err)
+	}
+
+	deps := Deps{
+		LookPath:    func(string) (string, error) { return "/usr/bin/npm", nil },
+		RunAttached: func(context.Context, string, string, ...string) error { return nil },
+	}
+
+	_, errOut, err := executeCLI(t, deps, "start", "--source")
+	if err != nil {
+		t.Fatalf("start --source: %v", err)
+	}
+	if strings.Contains(errOut, "already running") {
+		t.Fatalf("warned about the canonical daemon under ISOLATE_DEV: %q", errOut)
+	}
+}
+
+func TestDevRunFilePath(t *testing.T) {
+	home := t.TempDir()
+	canonical := filepath.Join(home, ".ao", "running.json")
+
+	t.Run("canonical when not isolated", func(t *testing.T) {
+		t.Setenv("ISOLATE_DEV", "")
+		t.Setenv("AO_RUN_FILE", "")
+		got, isolated := devRunFilePath(canonical)
+		if got != canonical || isolated {
+			t.Fatalf("= %q isolated=%v, want %q false", got, isolated, canonical)
+		}
+	})
+
+	t.Run("isolated moves under .ao/dev", func(t *testing.T) {
+		t.Setenv("ISOLATE_DEV", "true")
+		t.Setenv("AO_RUN_FILE", "")
+		t.Setenv("HOME", home)
+		want := filepath.Join(home, ".ao", "dev", "running.json")
+		got, isolated := devRunFilePath(canonical)
+		if got != want || !isolated {
+			t.Fatalf("= %q isolated=%v, want %q true", got, isolated, want)
+		}
+	})
+
+	t.Run("explicit AO_RUN_FILE wins over isolation", func(t *testing.T) {
+		t.Setenv("ISOLATE_DEV", "true")
+		t.Setenv("AO_RUN_FILE", filepath.Join(home, "custom.json"))
+		got, isolated := devRunFilePath(canonical)
+		if got != canonical || !isolated {
+			t.Fatalf("= %q isolated=%v, want %q true", got, isolated, canonical)
+		}
+	})
+}
+
 func TestStart_SourceOutsideCheckoutIsUsageError(t *testing.T) {
 	setConfigEnv(t)
 	chdir(t, t.TempDir())

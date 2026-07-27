@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
@@ -105,27 +106,51 @@ func (c *commandContext) runStartFromSource(ctx context.Context, out, errOut io.
 	return c.deps.RunAttached(ctx, frontend, name, args...)
 }
 
-// warnRunningDaemon prints a heads-up when a daemon is already live.
+// devRunFilePath resolves the run file the dev launch will actually consult,
+// mirroring resolveDevDaemonConfig in frontend/src/shared/dev-daemon-config.ts:
+// an explicit AO_RUN_FILE wins, otherwise ISOLATE_DEV=true moves state to
+// ~/.ao/dev. Without this, an isolated launch would be judged against the
+// canonical daemon it is specifically avoiding.
+func devRunFilePath(canonical string) (path string, isolated bool) {
+	isolated = os.Getenv("ISOLATE_DEV") == "true"
+	if !isolated || strings.TrimSpace(os.Getenv("AO_RUN_FILE")) != "" {
+		return canonical, isolated
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return canonical, isolated
+	}
+	return filepath.Join(home, ".ao", "dev", "running.json"), true
+}
+
+// warnRunningDaemon prints a heads-up when a daemon the dev launch would attach
+// to is already live.
 //
 // A dev launch does NOT enforce checkout identity by default: Electron passes
 // enforceDevCheckout: devDaemonConfig.isIsolated, which is false unless
 // ISOLATE_DEV=true. So the app attaches to whatever genuine AO daemon holds the
-// canonical port rather than spawning one from this checkout — meaning backend
-// changes here silently would not be running. Say that plainly; the failure is
-// invisible otherwise.
+// port it is going to use rather than spawning one from this checkout — meaning
+// backend changes here silently would not be running. Say that plainly; the
+// failure is invisible otherwise.
 func (c *commandContext) warnRunningDaemon(w io.Writer) {
 	cfg, err := config.Load()
 	if err != nil {
 		return
 	}
-	info, err := runfile.CheckStale(cfg.RunFilePath)
+	runFile, isolated := devRunFilePath(cfg.RunFilePath)
+	info, err := runfile.CheckStale(runFile)
 	if err != nil || info == nil {
 		return
+	}
+	remedy := "Stop it with `ao stop`, or set ISOLATE_DEV=true to use a separate data dir and port."
+	if isolated {
+		// ISOLATE_DEV is already on, so recommending it would be nonsense; the
+		// live daemon is the isolated one this launch intends to reuse.
+		remedy = "Stop it with `ao stop` if it is not from this checkout."
 	}
 	_, _ = fmt.Fprintf(w,
 		"Warning: an AO daemon is already running (pid %d, port %d), and a dev launch\n"+
 			"attaches to it instead of starting one from this checkout. If it is not this\n"+
-			"checkout's daemon, your backend changes will not be running. Stop it with\n"+
-			"`ao stop`, or set ISOLATE_DEV=true to use a separate data dir and port.\n",
-		info.PID, info.Port)
+			"checkout's daemon, your backend changes will not be running. %s\n",
+		info.PID, info.Port, remedy)
 }
