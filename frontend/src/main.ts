@@ -36,6 +36,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { evaluateDaemonIdentity, type DaemonLaunchSpec, resolveDaemonLaunch } from "./shared/daemon-launch";
+import { ownedShutdownGraceMs } from "./shared/daemon-shutdown";
 import { createListenPortScanner, defaultRunFilePath, parseRunFile, type RunFileInfo } from "./shared/daemon-discovery";
 import type { DaemonStatus } from "./shared/daemon-status";
 import { attachAppShortcuts } from "./main/app-shortcuts";
@@ -867,7 +868,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 			state: "error",
 			message:
 				launch.source === "dev"
-					? `AO daemon binary was not found at ${launch.command}. Run "npm run build:daemon" in frontend/.`
+					? `AO daemon binary was not found at ${launch.command}. Run "npm run build:daemon:dev" in frontend/.`
 					: `Bundled AO daemon binary was not found at ${launch.command}. Rebuild the desktop package.`,
 			code: "binary_missing",
 		});
@@ -1018,10 +1019,6 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	return daemonStatus;
 }
 
-// How long an owned daemon that accepted POST /shutdown gets to exit on its own
-// before the signal fallback fires.
-const OWNED_SHUTDOWN_GRACE_MS = 7_000;
-
 /**
  * Stop the daemon this process spawned, preferring the loopback control route.
  * Now that the child IS the daemon on every platform, a bare signal on Windows
@@ -1037,9 +1034,12 @@ async function stopOwnedDaemon(child: ChildProcessWithoutNullStreams): Promise<v
 		killDaemon(child);
 		return;
 	}
+	// Wait out the daemon's own shutdown deadline before signalling. A daemon
+	// draining a long request is still on the graceful path, and killing it there
+	// is what would strand the run file.
 	setTimeout(() => {
 		if (child.exitCode === null && child.signalCode === null) killDaemon(child);
-	}, OWNED_SHUTDOWN_GRACE_MS).unref();
+	}, ownedShutdownGraceMs(process.env)).unref();
 }
 
 async function stopDaemon(): Promise<DaemonStatus> {
