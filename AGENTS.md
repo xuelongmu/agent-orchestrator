@@ -12,6 +12,11 @@ Operational guidance for coding agents working in this repository. Keep changes 
 
 ## Commands
 
+New machine? [`docs/local-development.md`](docs/local-development.md) covers
+prerequisites (Go, Node, git, **tmux**, gh), dependency install, and how to run
+AO from source. Dependencies install at two levels — `npm ci` at the repo root
+and `npm ci --prefix frontend` — and `ao doctor` verifies the result.
+
 From the repo root unless noted:
 
 ```bash
@@ -30,8 +35,14 @@ go build ./...
 go test ./...
 go test -race ./...
 go vet ./...
-go run ./cmd/ao start
+go run ./cmd/ao daemon    # run the daemon from source (hidden command)
 ```
+
+`ao start` is not the daemon entrypoint. From a checkout with a binary you built
+it launches the frontend dev harness (`npm run dev`) and blocks; otherwise it
+resolves — and if necessary downloads — the published desktop app. Use
+`ao start --source` / `--release` to pick explicitly, and `ao daemon` when you
+want the daemon alone.
 
 Frontend-specific checks:
 
@@ -46,6 +57,7 @@ When showing or demoing frontend changes, run `ao preview [url]` from inside the
 ## Where to look first
 
 - `README.md` — current run/config/test quickstart.
+- `docs/local-development.md` — prerequisites, dependency install, running from source, `ao doctor`.
 - `docs/README.md` — docs index.
 - `docs/architecture.md` — backend mental model, package layout, lifecycle/session/service boundaries, and load-bearing rules.
 - `docs/STATUS.md` — what is shipped on `main` today and what is still in flight.

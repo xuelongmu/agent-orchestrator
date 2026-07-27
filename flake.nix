@@ -23,17 +23,20 @@
           buildInputs = [
             go
             pkgs.gotools
-            pkgs.nodejs_22
-            pkgs.pnpm_10
-            pkgs.just
+            # Node 20 is the baseline the frontend, release, and packaging
+            # workflows build against. Newer runtimes work locally; match CI here.
+            pkgs.nodejs_20
+            # tmux is a runtime prerequisite, not a convenience: the daemon execs
+            # it for every session, so a shell without it cannot run AO.
+            pkgs.tmux
+            pkgs.git
           ];
 
           shellHook = ''
             export GOROOT="${go}/share/go"
             export GOPATH="$PWD/.go"
             export GOBIN="$GOPATH/bin"
-            export PNPM_HOME="$PWD/.pnpm"
-            export PATH="$GOBIN:$PNPM_HOME:$PATH"
+            export PATH="$GOBIN:$PATH"
           '';
         };
       }

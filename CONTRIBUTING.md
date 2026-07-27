@@ -26,11 +26,12 @@ Non-trivial work? Comment on the issue or ping Discord first. Get a thumbs-up, t
 ## Quick start
 
 1. **Join Discord** — say hi and get guidance
-2. **Read the contract** — [AGENTS.md](AGENTS.md) (layout, commands, hard rules, PR hygiene)
-3. **Pick something focused** — [open issues](https://github.com/AgentWrapper/agent-orchestrator/issues); prefer `good-first-issue` / `help wanted`
-4. **Claim it** — comment `I'd like to work on this` and wait for assignment
-5. **Open a clear PR** — narrow change, link the issue, user-visible impact, tests
-6. **Iterate** — address review; maintainers merge
+2. **Set up your machine** — [docs/local-development.md](docs/local-development.md) (prerequisites, install, running from source)
+3. **Read the contract** — [AGENTS.md](AGENTS.md) (layout, commands, hard rules, PR hygiene)
+4. **Pick something focused** — [open issues](https://github.com/AgentWrapper/agent-orchestrator/issues); prefer `good-first-issue` / `help wanted`
+5. **Claim it** — comment `I'd like to work on this` and wait for assignment
+6. **Open a clear PR** — narrow change, link the issue, user-visible impact, tests
+7. **Iterate** — address review; maintainers merge
 
 Need the product/run overview first? Start with [README.md](README.md) and [docs/architecture.md](docs/architecture.md).
 
