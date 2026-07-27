@@ -25,6 +25,8 @@
             pkgs.gotools
             # Node 20 is the baseline the frontend, release, and packaging
             # workflows build against. Newer runtimes work locally; match CI here.
+            # The real floor is finer than the major: the locked Vite requires
+            # ^20.19.0 || >=22.12.0, which the latest 20.x satisfies.
             pkgs.nodejs_20
             # tmux is a runtime prerequisite, not a convenience: the daemon execs
             # it for every session, so a shell without it cannot run AO.

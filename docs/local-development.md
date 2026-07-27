@@ -9,7 +9,7 @@ source. If you only want to _use_ AO, install the desktop app instead — see
 | Tool               | Version                           | Why                                               |
 | ------------------ | --------------------------------- | ------------------------------------------------- |
 | Go                 | 1.25.x (`backend/go.mod`)         | backend, daemon, code generation                  |
-| Node               | 20 baseline; 22/24 also work      | frontend, `npm run api:ts`                        |
+| Node               | 20.19+ or 22.12+ (24 works)       | frontend, `npm run api:ts`                        |
 | git                | 2.25+                             | session workspaces are git worktrees              |
 | tmux (macOS/Linux) | 3.x                               | the terminal runtime the daemon execs per session |
 | gh                 | any, authenticated                | pull request, CI, and review facts                |
@@ -19,6 +19,11 @@ On macOS and Linux, `tmux` is easy to miss and is not optional — the daemon
 execs it for every session. **Windows does not need it**: the daemon uses the
 built-in ConPTY runtime there instead. Either way `ao doctor` reports which
 terminal runtime your platform uses and whether it is available.
+
+The Node floor is not the major version alone: the locked Vite requires
+`^20.19.0 || >=22.12.0`, so 20.0–20.18 and 22.0–22.11 are too old. `npm ci` only
+warns about this, so the mismatch surfaces later as a confusing failure in
+`npm run dev`.
 
 ### macOS
 
@@ -84,6 +89,26 @@ Use `go install` rather than `go build -o …/bin/ao`: it puts the binary in
 `$(go env GOPATH)/bin` and appends the right extension per platform. An explicit
 `-o` output name produces an extensionless file on Windows, which `PATH`/`PATHEXT`
 lookup will not find.
+
+`go install` does not change your `PATH`, so that directory has to be on it or
+the next step fails with command-not-found. The macOS snippet above already adds
+it; on Linux add the equivalent to your shell profile, and on Windows add the
+directory to your user `PATH`:
+
+```bash
+# Linux (bash/zsh)
+echo 'export PATH="$(go env GOPATH)/bin:$PATH"' >> ~/.profile
+```
+
+```powershell
+# Windows (PowerShell, persists for the current user)
+[Environment]::SetEnvironmentVariable(
+  "Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$(go env GOPATH)\bin", "User")
+```
+
+Check it resolves with `ao version` (a source build prints `dev`). Alternatively,
+skip `PATH` entirely and invoke the binary by full path:
+`"$(go env GOPATH)/bin/ao" start`.
 
 Then, from anywhere inside the checkout:
 
