@@ -71,9 +71,12 @@ jobs:
           AO_REQUIRE_INTEGRATION: "1"
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
+      # Quote -coverprofile: this step runs under pwsh, which otherwise splits
+      # `-coverprofile=coverage.out` after the `=` and hands `.out` to go test as
+      # a package path ("no required module provides package .out").
       - name: Test on Windows with coverage
         if: runner.os == 'Windows'
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+        run: go test -race -covermode=atomic "-coverprofile=coverage.out" ./...
 
       # One ratchet, one platform. Coverage is platform-independent here, and
       # running it per-OS would just make the floor race between matrix legs.
