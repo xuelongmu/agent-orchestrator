@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 )
 
@@ -96,7 +97,7 @@ func (c *commandContext) runStartFromSource(ctx context.Context, out, errOut io.
 		return fmt.Errorf("ao start: frontend dependencies are not installed; run `npm ci --prefix %s` first", frontend)
 	}
 
-	c.warnRunningDaemon(errOut)
+	c.warnRunningDaemon(ctx, errOut)
 
 	_, _ = fmt.Fprintf(out, "Starting Agent Orchestrator from source at %s\n", root)
 	_, _ = fmt.Fprintf(out, "Running `npm run dev` in %s — press Ctrl-C to stop.\n", frontend)
@@ -123,6 +124,20 @@ func devRunFilePath(canonical string) (path string, isolated bool) {
 	return filepath.Join(home, ".ao", "dev", "running.json"), true
 }
 
+// devDaemonPort mirrors resolveDevDaemonConfig's port choice: an explicit
+// AO_PORT (already resolved into cfg.Port) wins, otherwise isolation moves the
+// daemon to 3002.
+func devDaemonPort(configured int, isolated bool) int {
+	if isolated && strings.TrimSpace(os.Getenv("AO_PORT")) == "" {
+		return isolatedDevDaemonPort
+	}
+	return configured
+}
+
+// isolatedDevDaemonPort matches ISOLATED_DEV_DAEMON_PORT in
+// frontend/src/shared/dev-daemon-config.ts.
+const isolatedDevDaemonPort = 3002
+
 // warnRunningDaemon prints a heads-up when a daemon the dev launch would attach
 // to is already live.
 //
@@ -132,14 +147,25 @@ func devRunFilePath(canonical string) (path string, isolated bool) {
 // port it is going to use rather than spawning one from this checkout — meaning
 // backend changes here silently would not be running. Say that plainly; the
 // failure is invisible otherwise.
-func (c *commandContext) warnRunningDaemon(w io.Writer) {
+func (c *commandContext) warnRunningDaemon(ctx context.Context, w io.Writer) {
 	cfg, err := config.Load()
 	if err != nil {
 		return
 	}
 	runFile, isolated := devRunFilePath(cfg.RunFilePath)
-	info, err := runfile.CheckStale(runFile)
-	if err != nil || info == nil {
+	port := devDaemonPort(cfg.Port, isolated)
+
+	pid, live := 0, false
+	if info, err := runfile.CheckStale(runFile); err == nil && info != nil {
+		pid, port, live = info.PID, info.Port, true
+	} else if probe, err := c.readProbe(ctx, port, "healthz"); err == nil && probe.Service == daemonmeta.ServiceName {
+		// The run file is missing, stale, or unparseable, but a daemon may still
+		// hold the port. Electron attaches in exactly that case via the
+		// direct-port fallback in main.ts, so staying silent here would hide the
+		// attachment the warning exists to surface.
+		pid, live = probe.PID, true
+	}
+	if !live {
 		return
 	}
 	remedy := "Stop it with `ao stop`, or set ISOLATE_DEV=true to use a separate data dir and port."
@@ -163,5 +189,5 @@ func (c *commandContext) warnRunningDaemon(w io.Writer) {
 		"Warning: an AO daemon is already running (pid %d, port %d), and a dev launch\n"+
 			"attaches to it instead of starting one from this checkout. If it is not this\n"+
 			"checkout's daemon, your backend changes will not be running. %s\n",
-		info.PID, info.Port, remedy)
+		pid, port, remedy)
 }

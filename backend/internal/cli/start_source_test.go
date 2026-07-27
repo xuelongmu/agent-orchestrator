@@ -2,7 +2,10 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 )
 
@@ -42,6 +46,15 @@ func makeCheckout(t *testing.T, withNodeModules bool) string {
 		}
 	}
 	return root
+}
+
+// offlineHTTPClient returns a client whose requests always fail, so the
+// daemon-port probe in warnRunningDaemon cannot reach a real daemon on the
+// developer's machine. Without it these tests would depend on host state.
+func offlineHTTPClient() *http.Client {
+	return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("offline")
+	})}
 }
 
 // setHomeDir points os.UserHomeDir at dir for the duration of the test. It sets
@@ -129,7 +142,8 @@ func TestStart_SourceRunsFrontendDevHarness(t *testing.T) {
 	var gotDir string
 	var gotArgv []string
 	deps := Deps{
-		LookPath: func(string) (string, error) { return "/usr/bin/npm", nil },
+		HTTPClient: offlineHTTPClient(),
+		LookPath:   func(string) (string, error) { return "/usr/bin/npm", nil },
 		RunAttached: func(_ context.Context, dir, name string, args ...string) error {
 			gotDir = dir
 			gotArgv = append([]string{name}, args...)
@@ -169,6 +183,7 @@ func TestStart_SourceWarnsWhenADaemonIsAlreadyRunning(t *testing.T) {
 	}
 
 	deps := Deps{
+		HTTPClient:  offlineHTTPClient(),
 		LookPath:    func(string) (string, error) { return "/usr/bin/npm", nil },
 		RunAttached: func(context.Context, string, string, ...string) error { return nil },
 	}
@@ -184,6 +199,41 @@ func TestStart_SourceWarnsWhenADaemonIsAlreadyRunning(t *testing.T) {
 		if !strings.Contains(errOut, want) {
 			t.Fatalf("warning %q missing %q", errOut, want)
 		}
+	}
+}
+
+func TestStart_SourceWarnsWhenOnlyThePortAnswers(t *testing.T) {
+	// No run file at all, but a daemon holds the port. Electron attaches in
+	// exactly this case through main.ts's direct-port fallback, so the warning
+	// must not depend on the run file being readable.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(probeResult{
+			Status: "ok", Service: daemonmeta.ServiceName, PID: 4242,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	setConfigEnv(t)
+	t.Setenv("AO_PORT", strconv.Itoa(serverPort(t, srv.URL)))
+	root := makeCheckout(t, true)
+	chdir(t, root)
+
+	deps := Deps{
+		HTTPClient:  srv.Client(),
+		LookPath:    func(string) (string, error) { return "/usr/bin/npm", nil },
+		RunAttached: func(context.Context, string, string, ...string) error { return nil },
+	}
+
+	_, errOut, err := executeCLI(t, deps, "start", "--source")
+	if err != nil {
+		t.Fatalf("start --source: %v", err)
+	}
+	if !strings.Contains(errOut, "already running") || !strings.Contains(errOut, "pid 4242") {
+		t.Fatalf("no warning for a port-only daemon: %q", errOut)
 	}
 }
 
@@ -203,6 +253,7 @@ func TestStart_SourceIsolatedIgnoresTheCanonicalDaemon(t *testing.T) {
 	}
 
 	deps := Deps{
+		HTTPClient:  offlineHTTPClient(),
 		LookPath:    func(string) (string, error) { return "/usr/bin/npm", nil },
 		RunAttached: func(context.Context, string, string, ...string) error { return nil },
 	}
@@ -237,6 +288,7 @@ func TestStart_SourceIsolatedRemedyScopesTheStop(t *testing.T) {
 	}
 
 	deps := Deps{
+		HTTPClient:  offlineHTTPClient(),
 		LookPath:    func(string) (string, error) { return "/usr/bin/npm", nil },
 		RunAttached: func(context.Context, string, string, ...string) error { return nil },
 	}
@@ -299,6 +351,7 @@ func TestStart_SourceOutsideCheckoutIsUsageError(t *testing.T) {
 	chdir(t, t.TempDir())
 
 	deps := Deps{
+		HTTPClient: offlineHTTPClient(),
 		RunAttached: func(context.Context, string, string, ...string) error {
 			t.Fatal("must not run the dev harness outside a checkout")
 			return nil
@@ -323,7 +376,7 @@ func TestStart_SourceWithJSONIsUsageError(t *testing.T) {
 	setConfigEnv(t)
 	chdir(t, makeCheckout(t, true))
 
-	deps := Deps{LookPath: func(string) (string, error) { return "/usr/bin/npm", nil }}
+	deps := Deps{LookPath: func(string) (string, error) { return "/usr/bin/npm", nil }, HTTPClient: offlineHTTPClient()}
 	if _, _, err := executeCLI(t, deps, "start", "--source", "--json"); ExitCode(err) != 2 {
 		t.Fatalf("exit code = %d, want 2 (usage); err = %v", ExitCode(err), err)
 	}
@@ -334,7 +387,8 @@ func TestStart_SourceWithoutFrontendDepsExplainsInstall(t *testing.T) {
 	chdir(t, makeCheckout(t, false))
 
 	deps := Deps{
-		LookPath: func(string) (string, error) { return "/usr/bin/npm", nil },
+		HTTPClient: offlineHTTPClient(),
+		LookPath:   func(string) (string, error) { return "/usr/bin/npm", nil },
 		RunAttached: func(context.Context, string, string, ...string) error {
 			t.Fatal("must not run the dev harness before deps are installed")
 			return nil
@@ -352,7 +406,8 @@ func TestStart_SourceWithoutNPMExplainsRequirement(t *testing.T) {
 	chdir(t, makeCheckout(t, true))
 
 	deps := Deps{
-		LookPath: func(string) (string, error) { return "", errors.New("not found") },
+		HTTPClient: offlineHTTPClient(),
+		LookPath:   func(string) (string, error) { return "", errors.New("not found") },
 		RunAttached: func(context.Context, string, string, ...string) error {
 			t.Fatal("must not run the dev harness without npm")
 			return nil
