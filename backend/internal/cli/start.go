@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,7 +46,9 @@ type appState struct {
 }
 
 type startOptions struct {
-	json bool
+	json    bool
+	source  bool
+	release bool
 }
 
 // startResult is the JSON shape emitted with --json: what `ao start` resolved,
@@ -61,26 +64,60 @@ func newStartCommand(ctx *commandContext) *cobra.Command {
 	opts := startOptions{}
 	cmd := &cobra.Command{
 		Use:   "start",
-		Short: "Fetch (if needed) and open the Agent Orchestrator desktop app",
-		Long: "Fetch (if needed) and open the Agent Orchestrator desktop app.\n\n" +
-			"The desktop app now owns the daemon, state, and updates. `ao start` no\n" +
-			"longer runs a daemon: it resolves the installed app (or downloads the\n" +
-			"latest release), opens it, and exits.",
+		Short: "Open Agent Orchestrator — from this source checkout, or the published desktop app",
+		Long: "Open Agent Orchestrator.\n\n" +
+			"Run from a source checkout with a binary you built yourself, `ao start`\n" +
+			"launches that checkout via the frontend dev harness and blocks until you\n" +
+			"stop it. This is the contributor path: it runs your code.\n\n" +
+			"Otherwise the desktop app owns the daemon, state, and updates: `ao start`\n" +
+			"resolves the installed app (or downloads the latest release), opens it,\n" +
+			"and exits.\n\n" +
+			"Use --source or --release to choose explicitly.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return ctx.runStart(cmd.Context(), cmd, opts)
 		},
 	}
 	cmd.Flags().BoolVar(&opts.json, "json", false, "Output start result as JSON")
+	cmd.Flags().BoolVar(&opts.source, "source", false, "Run from the source checkout containing the working directory")
+	cmd.Flags().BoolVar(&opts.release, "release", false, "Fetch (if needed) and open the published desktop app")
 	return cmd
 }
 
-// runStart implements the spec §6.1 algorithm: resolve the installed app, fetch
-// it if absent, open it, then print the deprecation notice. It never blocks or
-// supervises the launched app.
+// runStart picks between the source and release paths, then runs the chosen
+// one. The release path implements the spec §6.1 algorithm: resolve the
+// installed app, fetch it if absent, open it, then print the deprecation
+// notice; it never blocks or supervises the launched app. The source path does
+// block — see runStartFromSource.
 func (c *commandContext) runStart(ctx context.Context, cmd *cobra.Command, opts startOptions) error {
 	out := cmd.OutOrStdout()
 	res := startResult{}
+
+	if opts.source && opts.release {
+		return usageError{errors.New("ao start: --source and --release are mutually exclusive")}
+	}
+	requested := startModeAuto
+	switch {
+	case opts.source:
+		requested = startModeSource
+	case opts.release:
+		requested = startModeRelease
+	}
+
+	// A missing working directory is not fatal: it only means we cannot detect a
+	// checkout, so auto resolution falls through to the release path.
+	cwd, _ := os.Getwd()
+	checkout := findSourceCheckout(cwd)
+
+	if resolveStartMode(requested, checkout, isDevBuild()) == startModeSource {
+		if checkout == "" {
+			return usageError{fmt.Errorf("ao start: --source must run inside an Agent Orchestrator checkout; none found at or above %q", cwd)}
+		}
+		if opts.json {
+			return usageError{errors.New("ao start: --json is not supported with --source (the dev harness streams its own output)")}
+		}
+		return c.runStartFromSource(ctx, out, cmd.ErrOrStderr(), checkout)
+	}
 
 	appPath := c.resolveApp()
 	res.Resolved = appPath != ""
