@@ -170,6 +170,76 @@ func TestProjectConfigRoundTrips(t *testing.T) {
 	}
 }
 
+func TestProjectConfigAndOriginUpdatesDoNotOverwriteEachOther(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.UpsertProject(ctx, domain.ProjectRecord{
+		ID: "atomic", Path: "/tmp/atomic", RegisteredAt: now,
+		Config: domain.ProjectConfig{
+			AgentRules: "preserve",
+			Env:        map[string]string{"OLD": "value"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, ok, err := s.GetProject(ctx, "atomic")
+	if err != nil || !ok {
+		t.Fatalf("GetProject before config update: ok=%v err=%v", ok, err)
+	}
+
+	updated, err := s.UpdateProjectConfig(ctx, "atomic", loaded.RegisteredAt, domain.ProjectConfig{
+		AgentRules: "preserve",
+		Env:        map[string]string{"NEW": "value"},
+	})
+	if err != nil || !updated {
+		t.Fatalf("UpdateProjectConfig = %v, err=%v; written=%s loaded=%s", updated, err, now.Format(time.RFC3339Nano), loaded.RegisteredAt.Format(time.RFC3339Nano))
+	}
+	updated, err = s.UpdateProjectOriginURL(ctx, "atomic", loaded.RegisteredAt, "https://github.com/o/r.git")
+	if err != nil || !updated {
+		t.Fatalf("UpdateProjectOriginURL = %v, err=%v", updated, err)
+	}
+
+	got, ok, err := s.GetProject(ctx, "atomic")
+	if err != nil || !ok {
+		t.Fatalf("GetProject: ok=%v err=%v", ok, err)
+	}
+	if got.RepoOriginURL != "https://github.com/o/r.git" {
+		t.Fatalf("origin = %q", got.RepoOriginURL)
+	}
+	if !reflect.DeepEqual(got.Config.Env, map[string]string{"NEW": "value"}) || got.Config.AgentRules != "preserve" {
+		t.Fatalf("config = %#v", got.Config)
+	}
+
+	if updated, err = s.ArchiveProject(ctx, "atomic", now.Add(time.Second)); err != nil || !updated {
+		t.Fatalf("ArchiveProject = %v, err=%v", updated, err)
+	}
+	replacementAt := now.Add(2 * time.Second)
+	replacementConfig := domain.ProjectConfig{Env: map[string]string{"REPLACEMENT": "safe"}}
+	if err := s.UpsertProject(ctx, domain.ProjectRecord{
+		ID: "atomic", Path: "/tmp/replacement", RegisteredAt: replacementAt, Config: replacementConfig,
+	}); err != nil {
+		t.Fatalf("replace project incarnation: %v", err)
+	}
+	updated, err = s.UpdateProjectConfig(ctx, "atomic", now, domain.ProjectConfig{
+		Env: map[string]string{"STALE": "unsafe"},
+	})
+	if err != nil || updated {
+		t.Fatalf("stale UpdateProjectConfig = %v, err=%v; want false, nil", updated, err)
+	}
+	updated, err = s.UpdateProjectOriginURL(ctx, "atomic", now, "https://github.com/stale/repo.git")
+	if err != nil || updated {
+		t.Fatalf("stale UpdateProjectOriginURL = %v, err=%v; want false, nil", updated, err)
+	}
+	got, ok, err = s.GetProject(ctx, "atomic")
+	if err != nil || !ok {
+		t.Fatalf("GetProject replacement: ok=%v err=%v", ok, err)
+	}
+	if !got.RegisteredAt.Equal(replacementAt) || !reflect.DeepEqual(got.Config, replacementConfig) {
+		t.Fatalf("replacement project changed: %#v", got)
+	}
+}
+
 func TestSessionCreateAssignsPerProjectID(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

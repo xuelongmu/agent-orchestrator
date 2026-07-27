@@ -182,6 +182,14 @@ func (f *fakeProjectManager) SetConfig(_ context.Context, id domain.ProjectID, i
 	return projectsvc.Project{ID: id, Config: &cfg}, nil
 }
 
+func (f *fakeProjectManager) PatchEnvironment(_ context.Context, id domain.ProjectID, in projectsvc.PatchEnvironmentInput) (projectsvc.EnvironmentResult, error) {
+	keys := make([]string, 0, len(in.Set))
+	for key := range in.Set {
+		keys = append(keys, key)
+	}
+	return projectsvc.EnvironmentResult{ProjectID: id, Keys: keys}, nil
+}
+
 func (f *fakeProjectManager) GetOrchestration(_ context.Context, id domain.ProjectID) (projectsvc.OrchestrationResult, error) {
 	return projectsvc.OrchestrationResult{ProjectID: id, Policy: domain.OrchestrationPolicyConfig{Mode: domain.OrchestrationModeMission, CheckInIntervalMinutes: 30}}, nil
 }

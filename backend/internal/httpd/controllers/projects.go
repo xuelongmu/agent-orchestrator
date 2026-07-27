@@ -31,6 +31,7 @@ func (c *ProjectsController) Register(r chi.Router) {
 	r.Post("/projects/initialize", c.initialize)
 	r.Get("/projects/{id}", c.get)
 	r.Put("/projects/{id}/config", c.setConfig)
+	r.Patch("/projects/{id}/config/env", c.patchEnvironment)
 	r.Get("/projects/{id}/orchestration", c.getOrchestration)
 	r.Put("/projects/{id}/orchestration", c.setOrchestration)
 	r.Post("/projects/{id}/orchestration/pause", c.pauseOrchestration)
@@ -123,6 +124,27 @@ func (c *ProjectsController) setConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	envelope.WriteJSON(w, http.StatusOK, ProjectResponse{Project: p})
+}
+
+func (c *ProjectsController) patchEnvironment(w http.ResponseWriter, r *http.Request) {
+	if c.Mgr == nil {
+		apispec.NotImplemented(w, r, "PATCH", "/api/v1/projects/{id}/config/env")
+		return
+	}
+	var in projectsvc.PatchEnvironmentInput
+	if err := decodeJSONStrict(r, &in); err != nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Invalid JSON body", nil)
+		return
+	}
+	result, err := c.Mgr.PatchEnvironment(r.Context(), projectID(r), in)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, ProjectEnvironmentResponse{
+		ProjectID: result.ProjectID,
+		Keys:      result.Keys,
+	})
 }
 
 func (c *ProjectsController) getOrchestration(w http.ResponseWriter, r *http.Request) {

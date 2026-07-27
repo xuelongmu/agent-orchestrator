@@ -38,7 +38,8 @@ surface (`npm run sqlc`, `npm run api`).
 - Per-session workspace kinds: dedicated git worktree (default), ephemeral
   scratch directory, or the registered project's shared directory. Non-git
   sessions are branchless and excluded from SCM/PR operations.
-- Project CRUD plus per-project config (`PUT /projects/{id}/config`).
+- Project CRUD plus per-project config (`PUT /projects/{id}/config`) and
+  merge-safe environment updates (`PATCH /projects/{id}/config/env`).
 - Project-scoped Mission/Charter orchestration policy with live CLI/API
   updates. Mission remains bounded by default; Charter periodically reconciles
   exactly one idle orchestrator without messaging busy or decision-blocked

@@ -45,6 +45,8 @@ type fakeStore struct {
 	listRelease chan struct{}
 	listHook    func()
 	listCalls   int
+
+	beforeOriginUpdate func()
 }
 
 type fakeWrite struct {
@@ -112,14 +114,20 @@ func (s *fakeStore) GetProject(_ context.Context, id string) (domain.ProjectReco
 	return p, ok, nil
 }
 
-func (s *fakeStore) UpsertProject(_ context.Context, row domain.ProjectRecord) error {
+func (s *fakeStore) UpdateProjectOriginURL(_ context.Context, id string, registeredAt time.Time, originURL string) (bool, error) {
+	if s.beforeOriginUpdate != nil {
+		s.beforeOriginUpdate()
+		s.beforeOriginUpdate = nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.projects == nil {
-		s.projects = map[string]domain.ProjectRecord{}
+	row, ok := s.projects[id]
+	if !ok || !row.ArchivedAt.IsZero() || !row.RegisteredAt.Equal(registeredAt) {
+		return false, nil
 	}
-	s.projects[row.ID] = row
-	return nil
+	row.RepoOriginURL = originURL
+	s.projects[id] = row
+	return true, nil
 }
 
 func (s *fakeStore) ListWorkspaceRepos(_ context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error) {
@@ -2783,9 +2791,14 @@ func TestDiscoverSubjects_BackfillsRepoOriginURL(t *testing.T) {
 
 	store := &fakeStore{
 		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "feat"}}},
-		projects: map[string]domain.ProjectRecord{"p": {ID: "p", Path: dir}}, // empty RepoOriginURL
-		prs:      map[domain.SessionID][]domain.PullRequest{},
-		checks:   map[string][]domain.PullRequestCheck{},
+		projects: map[string]domain.ProjectRecord{"p": {
+			ID:           "p",
+			Path:         dir,
+			RegisteredAt: time.Unix(1, 0).UTC(),
+			Config:       domain.ProjectConfig{Env: map[string]string{"KEEP": "value"}},
+		}}, // empty RepoOriginURL
+		prs:    map[domain.SessionID][]domain.PullRequest{},
+		checks: map[string][]domain.PullRequestCheck{},
 	}
 	provider := &fakeProvider{}
 	obs := newTestObserver(store, provider, &fakeLifecycle{}, time.Unix(0, 0).UTC())
@@ -2795,6 +2808,52 @@ func TestDiscoverSubjects_BackfillsRepoOriginURL(t *testing.T) {
 	}
 	if got := store.projects["p"].RepoOriginURL; got != "https://github.com/o/r.git" {
 		t.Fatalf("RepoOriginURL after backfill = %q, want https://github.com/o/r.git", got)
+	}
+	if got := store.projects["p"].Config.Env["KEEP"]; got != "value" {
+		t.Fatalf("config after origin backfill = %#v, want KEEP preserved", store.projects["p"].Config)
+	}
+}
+
+func TestDiscoverSubjects_DoesNotBackfillReplacedProject(t *testing.T) {
+	dir := t.TempDir()
+	if out, err := exec.Command("git", "init", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", dir, "remote", "add", "origin", "https://github.com/old/repo.git").CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v (%s)", err, out)
+	}
+
+	originalAt := time.Unix(1, 0).UTC()
+	replacement := domain.ProjectRecord{
+		ID:           "p",
+		Path:         t.TempDir(),
+		RegisteredAt: time.Unix(2, 0).UTC(),
+		Config:       domain.ProjectConfig{Env: map[string]string{"REPLACEMENT": "safe"}},
+	}
+	store := &fakeStore{
+		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "feat"}}},
+		projects: map[string]domain.ProjectRecord{"p": {
+			ID:           "p",
+			Path:         dir,
+			RegisteredAt: originalAt,
+		}},
+		prs:    map[domain.SessionID][]domain.PullRequest{},
+		checks: map[string][]domain.PullRequestCheck{},
+	}
+	store.beforeOriginUpdate = func() {
+		store.projects["p"] = replacement
+	}
+	obs := newTestObserver(store, &fakeProvider{}, &fakeLifecycle{}, time.Unix(0, 0).UTC())
+	subjects, sessionRepos, err := obs.discoverSubjects(context.Background())
+	if err != nil {
+		t.Fatalf("discoverSubjects: %v", err)
+	}
+	if len(subjects) != 0 || len(sessionRepos) != 0 {
+		t.Fatalf("stale project should be skipped, got %d subjects and %d session repositories", len(subjects), len(sessionRepos))
+	}
+	got := store.projects["p"]
+	if got.RepoOriginURL != "" || got.Path != replacement.Path || got.Config.Env["REPLACEMENT"] != "safe" {
+		t.Fatalf("replacement project changed by stale origin backfill: %#v", got)
 	}
 }
 

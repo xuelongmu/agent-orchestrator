@@ -101,6 +101,81 @@ func TestProjectSetConfig_ReviewPolicyJSON(t *testing.T) {
 	}
 }
 
+func TestProjectEnvironmentSet(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, capture := projectServer(t, http.StatusOK, `{"projectId":"demo","keys":["CODEX_LANGFUSE_BWS","OTHER"]}`)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{
+		ProcessAlive: func(int) bool { return true },
+	}, "project", "env", "set", "demo", "OTHER=value", "CODEX_LANGFUSE_BWS=true")
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+	}
+	if capture.method != http.MethodPatch || capture.path != "/api/v1/projects/demo/config/env" {
+		t.Fatalf("request = %s %s, want PATCH /api/v1/projects/demo/config/env", capture.method, capture.path)
+	}
+	var got patchProjectEnvironmentRequest
+	if err := json.Unmarshal(capture.body, &got); err != nil {
+		t.Fatalf("decode request: %v\nbody=%s", err, capture.body)
+	}
+	if got.Set["CODEX_LANGFUSE_BWS"] != "true" || got.Set["OTHER"] != "value" || len(got.Unset) != 0 {
+		t.Fatalf("environment patch = %#v", got)
+	}
+	if !strings.Contains(out, "set CODEX_LANGFUSE_BWS, OTHER") || strings.Contains(out, "true") || strings.Contains(out, "value") {
+		t.Fatalf("output should name keys without echoing values:\n%s", out)
+	}
+}
+
+func TestProjectEnvironmentUnset(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, capture := projectServer(t, http.StatusOK, `{"projectId":"demo","keys":[]}`)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{
+		ProcessAlive: func(int) bool { return true },
+	}, "project", "env", "unset", "demo", "SECOND", "FIRST")
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+	}
+	var got patchProjectEnvironmentRequest
+	if err := json.Unmarshal(capture.body, &got); err != nil {
+		t.Fatalf("decode request: %v\nbody=%s", err, capture.body)
+	}
+	if strings.Join(got.Unset, ",") != "FIRST,SECOND" || len(got.Set) != 0 {
+		t.Fatalf("environment patch = %#v", got)
+	}
+	if !strings.Contains(out, "unset FIRST, SECOND") {
+		t.Fatalf("output missing sorted keys:\n%s", out)
+	}
+}
+
+func TestProjectEnvironmentSetValidationAndDaemonError(t *testing.T) {
+	setConfigEnv(t)
+	_, _, err := executeCLI(t, Deps{}, "project", "env", "set", "demo")
+	if err == nil || ExitCode(err) != 2 {
+		t.Fatalf("missing KEY=VALUE error = %v, code=%d", err, ExitCode(err))
+	}
+
+	_, _, err = executeCLI(t, Deps{}, "project", "env", "set", "demo", "MISSING_EQUALS")
+	if err == nil || ExitCode(err) != 2 {
+		t.Fatalf("malformed KEY=VALUE error = %v, code=%d", err, ExitCode(err))
+	}
+
+	cfg := setConfigEnv(t)
+	srv, _ := projectServer(t, http.StatusBadRequest, `{"error":"bad_request","code":"INVALID_ENVIRONMENT_NAME","message":"invalid"}`)
+	writeRunFileFor(t, cfg, srv)
+	_, errOut, err := executeCLI(t, Deps{
+		ProcessAlive: func(int) bool { return true },
+	}, "project", "env", "set", "demo", "BAD-NAME=value")
+	if err == nil || ExitCode(err) != 1 {
+		t.Fatalf("daemon validation error = %v, code=%d", err, ExitCode(err))
+	}
+	if !strings.Contains(err.Error(), "INVALID_ENVIRONMENT_NAME") && !strings.Contains(errOut, "INVALID_ENVIRONMENT_NAME") {
+		t.Fatalf("daemon error envelope not surfaced: %v\nstderr=%s", err, errOut)
+	}
+}
+
 func TestBuildProjectConfigTrackerIntakeFlags(t *testing.T) {
 	got, err := buildProjectConfig(projectSetConfigOptions{
 		trackerIntake:   true,

@@ -34,6 +34,21 @@ type SetConfigInput struct {
 	Config domain.ProjectConfig `json:"config"`
 }
 
+// PatchEnvironmentInput changes only selected environment entries, preserving
+// every unrelated project setting. A key may be set or unset, but not both in
+// the same request.
+type PatchEnvironmentInput struct {
+	Set   map[string]string `json:"set,omitempty"`
+	Unset []string          `json:"unset,omitempty"`
+}
+
+// EnvironmentResult is the service result mapped by the HTTP and CLI
+// boundaries to their public response shapes.
+type EnvironmentResult struct {
+	ProjectID domain.ProjectID
+	Keys      []string
+}
+
 // SetOrchestrationInput replaces only the project's live orchestration policy,
 // preserving every unrelated project setting.
 type SetOrchestrationInput struct {

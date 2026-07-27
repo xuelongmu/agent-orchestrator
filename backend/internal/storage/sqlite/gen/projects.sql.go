@@ -109,6 +109,60 @@ func (q *Queries) ListProjects(ctx context.Context) ([]Project, error) {
 	return items, nil
 }
 
+const updateProjectConfig = `-- name: UpdateProjectConfig :execrows
+UPDATE projects
+SET config = ?
+WHERE id = ?
+  -- Older driver writes may include Go's transient " m=+..." monotonic suffix.
+  -- Strip it so a timestamp read back from SQLite still identifies that row.
+  AND substr(
+      CAST(registered_at AS TEXT),
+      1,
+      instr(CAST(registered_at AS TEXT) || ' m=', ' m=') - 1
+  ) = CAST(?3 AS TEXT)
+  AND archived_at IS NULL
+`
+
+type UpdateProjectConfigParams struct {
+	Config           sql.NullString
+	ID               domain.ProjectID
+	RegisteredAtText string
+}
+
+func (q *Queries) UpdateProjectConfig(ctx context.Context, arg UpdateProjectConfigParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateProjectConfig, arg.Config, arg.ID, arg.RegisteredAtText)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const updateProjectOriginURL = `-- name: UpdateProjectOriginURL :execrows
+UPDATE projects
+SET repo_origin_url = ?
+WHERE id = ?
+  AND substr(
+      CAST(registered_at AS TEXT),
+      1,
+      instr(CAST(registered_at AS TEXT) || ' m=', ' m=') - 1
+  ) = CAST(?3 AS TEXT)
+  AND archived_at IS NULL
+`
+
+type UpdateProjectOriginURLParams struct {
+	RepoOriginURL    string
+	ID               domain.ProjectID
+	RegisteredAtText string
+}
+
+func (q *Queries) UpdateProjectOriginURL(ctx context.Context, arg UpdateProjectOriginURLParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateProjectOriginURL, arg.RepoOriginURL, arg.ID, arg.RegisteredAtText)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const upsertProject = `-- name: UpsertProject :exec
 INSERT INTO projects (id, path, repo_origin_url, display_name, registered_at, archived_at, config, kind)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -116,6 +170,7 @@ ON CONFLICT (id) DO UPDATE SET
     path = excluded.path,
     repo_origin_url = excluded.repo_origin_url,
     display_name = excluded.display_name,
+    registered_at = excluded.registered_at,
     archived_at = excluded.archived_at,
     config = excluded.config,
     kind = excluded.kind

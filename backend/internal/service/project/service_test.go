@@ -6,9 +6,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
@@ -27,6 +29,37 @@ func newManager(t *testing.T) project.Manager {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return project.New(store)
+}
+
+type replaceOnConfigUpdateStore struct {
+	project.Store
+	replacement domain.ProjectRecord
+	once        sync.Once
+	replaceErr  error
+}
+
+func (s *replaceOnConfigUpdateStore) UpdateProjectConfig(
+	ctx context.Context,
+	id string,
+	registeredAt time.Time,
+	cfg domain.ProjectConfig,
+) (bool, error) {
+	s.once.Do(func() {
+		archived, err := s.ArchiveProject(ctx, id, registeredAt.Add(time.Millisecond))
+		if err != nil {
+			s.replaceErr = err
+			return
+		}
+		if !archived {
+			s.replaceErr = errors.New("project was not active before replacement")
+			return
+		}
+		s.replaceErr = s.UpsertProject(ctx, s.replacement)
+	})
+	if s.replaceErr != nil {
+		return false, s.replaceErr
+	}
+	return s.Store.UpdateProjectConfig(ctx, id, registeredAt, cfg)
 }
 
 // gitRepo creates a real git repository in a fresh temp dir and returns its
@@ -481,6 +514,118 @@ func TestManager_SetConfig(t *testing.T) {
 
 	// Setting on an unknown project is a clean not-found.
 	_, err = m.SetConfig(ctx, "ghost", project.SetConfigInput{Config: cfg})
+	wantCode(t, err, "PROJECT_NOT_FOUND")
+}
+
+func TestManager_PatchEnvironmentPreservesProjectConfig(t *testing.T) {
+	ctx := context.Background()
+	m := newManager(t)
+	repo := gitRepo(t)
+	cfg := domain.ProjectConfig{
+		DefaultBranch:     "develop",
+		Env:               map[string]string{"KEEP": "yes", "REMOVE": "old"},
+		AgentRules:        "Preserve this.",
+		OrchestratorRules: "Preserve this too.",
+	}
+	if _, err := m.Add(ctx, project.AddInput{Path: repo, ProjectID: ptr("ao"), Config: &cfg}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	result, err := m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{
+		Set:   map[string]string{"CODEX_LANGFUSE_BWS": "true", "KEEP": "updated"},
+		Unset: []string{"REMOVE"},
+	})
+	if err != nil {
+		t.Fatalf("PatchEnvironment: %v", err)
+	}
+	if result.ProjectID != "ao" || strings.Join(result.Keys, ",") != "CODEX_LANGFUSE_BWS,KEEP" {
+		t.Fatalf("environment result = %#v", result)
+	}
+
+	got, err := m.Get(ctx, "ao")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Project == nil || got.Project.Config == nil {
+		t.Fatalf("Get config = %#v", got.Project)
+	}
+	if got.Project.Config.DefaultBranch != "develop" || got.Project.Config.AgentRules != "Preserve this." || got.Project.Config.OrchestratorRules != "Preserve this too." {
+		t.Fatalf("unrelated config changed: %#v", got.Project.Config)
+	}
+	if got.Project.Config.Env["CODEX_LANGFUSE_BWS"] != "true" || got.Project.Config.Env["KEEP"] != "updated" {
+		t.Fatalf("environment was not persisted: %#v", got.Project.Config.Env)
+	}
+	if _, ok := got.Project.Config.Env["REMOVE"]; ok {
+		t.Fatalf("removed key survived: %#v", got.Project.Config.Env)
+	}
+}
+
+func TestManager_PatchEnvironmentRejectsStaleProjectIncarnation(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	registeredAt := time.Now().UTC().Truncate(time.Second)
+	if err := store.UpsertProject(ctx, domain.ProjectRecord{
+		ID:           "ao",
+		Path:         "/tmp/original",
+		RegisteredAt: registeredAt,
+		Config:       domain.ProjectConfig{Env: map[string]string{"ORIGINAL": "value"}},
+	}); err != nil {
+		t.Fatalf("seed original project: %v", err)
+	}
+	replacementConfig := domain.ProjectConfig{Env: map[string]string{"REPLACEMENT": "safe"}}
+	racingStore := &replaceOnConfigUpdateStore{
+		Store: store,
+		replacement: domain.ProjectRecord{
+			ID:           "ao",
+			Path:         "/tmp/replacement",
+			RegisteredAt: registeredAt.Add(time.Second),
+			Config:       replacementConfig,
+		},
+	}
+	manager := project.New(racingStore)
+	_, err = manager.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{
+		Set: map[string]string{"STALE": "unsafe"},
+	})
+	wantCode(t, err, "PROJECT_NOT_FOUND")
+
+	got, ok, err := store.GetProject(ctx, "ao")
+	if err != nil || !ok {
+		t.Fatalf("GetProject replacement: ok=%v err=%v", ok, err)
+	}
+	if got.Path != "/tmp/replacement" || !reflect.DeepEqual(got.Config, replacementConfig) {
+		t.Fatalf("replacement project changed: %#v", got)
+	}
+}
+
+func TestManager_PatchEnvironmentValidation(t *testing.T) {
+	ctx := context.Background()
+	m := newManager(t)
+	repo := gitRepo(t)
+	if _, err := m.Add(ctx, project.AddInput{Path: repo, ProjectID: ptr("ao")}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	_, err := m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{})
+	wantCode(t, err, "EMPTY_ENVIRONMENT_PATCH")
+
+	_, err = m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{Set: map[string]string{"BAD-NAME": "x"}})
+	wantCode(t, err, "INVALID_ENVIRONMENT_NAME")
+
+	_, err = m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{Set: map[string]string{"TOKEN": "before\x00after"}})
+	wantCode(t, err, "INVALID_ENVIRONMENT_VALUE")
+
+	_, err = m.PatchEnvironment(ctx, "ao", project.PatchEnvironmentInput{
+		Set:   map[string]string{"SAME": "x"},
+		Unset: []string{"SAME"},
+	})
+	wantCode(t, err, "ENVIRONMENT_PATCH_CONFLICT")
+
+	_, err = m.PatchEnvironment(ctx, "missing", project.PatchEnvironmentInput{Set: map[string]string{"OK": "x"}})
 	wantCode(t, err, "PROJECT_NOT_FOUND")
 }
 

@@ -233,18 +233,20 @@ var schemaNames = map[string]string{
 	// legacyimport report
 	"LegacyimportReport": "ImportReport",
 	// service/project entities + DTOs
-	"ProjectProject":                    "Project",
-	"ProjectSummary":                    "ProjectSummary",
-	"ProjectDegraded":                   "DegradedProject",
-	"ProjectAddInput":                   "AddProjectInput",
-	"ProjectInitializeRepositoryInput":  "InitializeRepositoryInput",
-	"ProjectInitializeRepositoryResult": "InitializeRepositoryResult",
-	"ProjectRemoveResult":               "RemoveProjectResult",
-	"ProjectSetConfigInput":             "SetProjectConfigInput",
-	"ProjectSetOrchestrationInput":      "SetProjectOrchestrationInput",
-	"ProjectOrchestrationResult":        "ProjectOrchestration",
-	"ProjectWorkspaceRepo":              "WorkspaceRepo",
-	"SessionWorkspaceFileStatus":        "WorkspaceFileStatus",
+	"ProjectProject":                        "Project",
+	"ProjectSummary":                        "ProjectSummary",
+	"ProjectDegraded":                       "DegradedProject",
+	"ProjectAddInput":                       "AddProjectInput",
+	"ProjectInitializeRepositoryInput":      "InitializeRepositoryInput",
+	"ProjectInitializeRepositoryResult":     "InitializeRepositoryResult",
+	"ProjectRemoveResult":                   "RemoveProjectResult",
+	"ProjectSetConfigInput":                 "SetProjectConfigInput",
+	"ProjectPatchEnvironmentInput":          "PatchProjectEnvironmentInput",
+	"ControllersProjectEnvironmentResponse": "ProjectEnvironment",
+	"ProjectSetOrchestrationInput":          "SetProjectOrchestrationInput",
+	"ProjectOrchestrationResult":            "ProjectOrchestration",
+	"ProjectWorkspaceRepo":                  "WorkspaceRepo",
+	"SessionWorkspaceFileStatus":            "WorkspaceFileStatus",
 }
 
 // markRequestBodyRequired sets requestBody.required: true on the operation's
@@ -629,6 +631,18 @@ func projectOperations() []operation {
 			reqBody:    projectsvc.SetConfigInput{},
 			resps: []respUnit{
 				{http.StatusOK, controllers.ProjectResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPatch, path: "/api/v1/projects/{id}/config/env", id: "patchProjectEnvironment", tag: "projects",
+			summary:    "Set or unset selected project environment variables",
+			pathParams: []any{controllers.ProjectIDParam{}},
+			reqBody:    projectsvc.PatchEnvironmentInput{},
+			resps: []respUnit{
+				{http.StatusOK, controllers.ProjectEnvironmentResponse{}},
 				{http.StatusBadRequest, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},

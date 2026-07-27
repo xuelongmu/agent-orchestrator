@@ -189,6 +189,8 @@ jobs:
     environment: release
     permissions:
       contents: write
+    env:
+      AO_BUILD_CHANNEL: stable
     defaults:
       run:
         working-directory: frontend
@@ -319,6 +321,8 @@ jobs:
     environment: release # same approval gate as the matrix release job
     permissions:
       contents: write
+    env:
+      AO_BUILD_CHANNEL: stable
     defaults:
       run:
         working-directory: frontend

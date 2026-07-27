@@ -41,6 +41,7 @@ jobs:
       run:
         working-directory: frontend
     env:
+      AO_BUILD_CHANNEL: testing
       # Pure-Go sqlite (modernc) needs no cgo; on Linux this also keeps the daemon
       # static and portable across glibc.
       CGO_ENABLED: 0

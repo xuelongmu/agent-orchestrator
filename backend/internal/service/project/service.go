@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +39,7 @@ type Manager interface {
 	// SetConfig replaces a project's per-project config, returning the updated
 	// read-model.
 	SetConfig(ctx context.Context, id domain.ProjectID, in SetConfigInput) (Project, error)
+	PatchEnvironment(ctx context.Context, id domain.ProjectID, in PatchEnvironmentInput) (EnvironmentResult, error)
 
 	GetOrchestration(ctx context.Context, id domain.ProjectID) (OrchestrationResult, error)
 	SetOrchestration(ctx context.Context, id domain.ProjectID, in SetOrchestrationInput) (OrchestrationResult, error)
@@ -65,6 +68,10 @@ type Service struct {
 	// covered by the store's own writeMu, so path/id conflict checks plus the
 	// subsequent mutation must be atomic from the perspective of concurrent callers.
 	addMu sync.Mutex
+	// configMu serializes read-modify-write mutations of ProjectConfig so
+	// environment and orchestration subresources cannot lose each other's
+	// updates inside the single daemon process.
+	configMu sync.Mutex
 }
 
 var _ Manager = (*Service)(nil)
@@ -523,6 +530,8 @@ func (m *Service) SetConfig(ctx context.Context, id domain.ProjectID, in SetConf
 	if err := in.Config.Validate(); err != nil {
 		return Project{}, apierr.Invalid("INVALID_PROJECT_CONFIG", err.Error(), nil)
 	}
+	m.configMu.Lock()
+	defer m.configMu.Unlock()
 	row, ok, err := m.store.GetProject(ctx, string(id))
 	if err != nil {
 		return Project{}, apierr.Internal("PROJECT_LOAD_FAILED", "Failed to load project")
@@ -535,6 +544,117 @@ func (m *Service) SetConfig(ctx context.Context, id domain.ProjectID, in SetConf
 		return Project{}, apierr.Internal("PROJECT_CONFIG_UPDATE_FAILED", "Failed to update project config")
 	}
 	return m.projectFromRow(row), nil
+}
+
+// PatchEnvironment applies a key-level environment mutation without replacing
+// the rest of ProjectConfig. Environment is resolved at spawn/restore, so the
+// durable change affects future session launches while existing processes keep
+// their launch-time environment.
+func (m *Service) PatchEnvironment(ctx context.Context, id domain.ProjectID, in PatchEnvironmentInput) (EnvironmentResult, error) {
+	if err := validateProjectID(id); err != nil {
+		return EnvironmentResult{}, err
+	}
+	if len(in.Set) == 0 && len(in.Unset) == 0 {
+		return EnvironmentResult{}, apierr.Invalid("EMPTY_ENVIRONMENT_PATCH", "Set or unset at least one environment variable", nil)
+	}
+	caseInsensitive := runtime.GOOS == "windows"
+	setKeys, seenUnset, err := validateEnvironmentPatch(in, caseInsensitive)
+	if err != nil {
+		return EnvironmentResult{}, err
+	}
+
+	m.configMu.Lock()
+	defer m.configMu.Unlock()
+	row, err := m.activeProject(ctx, id)
+	if err != nil {
+		return EnvironmentResult{}, err
+	}
+	env := applyEnvironmentPatch(row.Config.Env, in.Set, setKeys, seenUnset, caseInsensitive)
+	if len(env) == 0 {
+		row.Config.Env = nil
+	} else {
+		row.Config.Env = env
+	}
+	updated, err := m.store.UpdateProjectConfig(ctx, row.ID, row.RegisteredAt, row.Config)
+	if err != nil {
+		return EnvironmentResult{}, apierr.Internal("PROJECT_ENVIRONMENT_UPDATE_FAILED", "Failed to update project environment")
+	}
+	if !updated {
+		return EnvironmentResult{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project")
+	}
+	keys := make([]string, 0, len(row.Config.Env))
+	for key := range row.Config.Env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return EnvironmentResult{ProjectID: id, Keys: keys}, nil
+}
+
+func validateEnvironmentPatch(in PatchEnvironmentInput, caseInsensitive bool) (map[string]string, map[string]struct{}, error) {
+	setKeys := make(map[string]string, len(in.Set))
+	for key, value := range in.Set {
+		if err := validateEnvironmentName(key); err != nil {
+			return nil, nil, err
+		}
+		if strings.IndexByte(value, 0) >= 0 {
+			return nil, nil, apierr.Invalid("INVALID_ENVIRONMENT_VALUE", "Environment variable values cannot contain NUL bytes", map[string]any{"key": key})
+		}
+		identity := environmentKeyIdentity(key, caseInsensitive)
+		if previous, duplicate := setKeys[identity]; duplicate {
+			return nil, nil, apierr.Invalid("DUPLICATE_ENVIRONMENT_NAME", "Environment variable names must be unique for this platform", map[string]any{"key": key, "conflicts_with": previous})
+		}
+		setKeys[identity] = key
+	}
+	seenUnset := make(map[string]struct{}, len(in.Unset))
+	for _, key := range in.Unset {
+		if err := validateEnvironmentName(key); err != nil {
+			return nil, nil, err
+		}
+		identity := environmentKeyIdentity(key, caseInsensitive)
+		if _, conflict := setKeys[identity]; conflict {
+			return nil, nil, apierr.Invalid("ENVIRONMENT_PATCH_CONFLICT", "An environment variable cannot be set and unset in the same request", map[string]any{"key": key})
+		}
+		seenUnset[identity] = struct{}{}
+	}
+	return setKeys, seenUnset, nil
+}
+
+func environmentKeyIdentity(key string, caseInsensitive bool) string {
+	if caseInsensitive {
+		return strings.ToUpper(key)
+	}
+	return key
+}
+
+func applyEnvironmentPatch(current, set, setKeys map[string]string, unset map[string]struct{}, caseInsensitive bool) map[string]string {
+	env := make(map[string]string, len(current)+len(set))
+	currentKeys := make([]string, 0, len(current))
+	for key := range current {
+		currentKeys = append(currentKeys, key)
+	}
+	sort.Strings(currentKeys)
+	for _, key := range currentKeys {
+		identity := environmentKeyIdentity(key, caseInsensitive)
+		if _, remove := unset[identity]; remove {
+			continue
+		}
+		if _, replace := setKeys[identity]; replace {
+			continue
+		}
+		persistedKey := key
+		if caseInsensitive {
+			persistedKey = identity
+		}
+		env[persistedKey] = current[key]
+	}
+	for key, value := range set {
+		persistedKey := key
+		if caseInsensitive {
+			persistedKey = environmentKeyIdentity(key, true)
+		}
+		env[persistedKey] = value
+	}
+	return env
 }
 
 // GetOrchestration returns the effective live policy for one active project.
@@ -552,6 +672,8 @@ func (m *Service) SetOrchestration(ctx context.Context, id domain.ProjectID, in 
 	if err := in.Policy.Validate(); err != nil {
 		return OrchestrationResult{}, apierr.Invalid("INVALID_ORCHESTRATION_POLICY", err.Error(), nil)
 	}
+	m.configMu.Lock()
+	defer m.configMu.Unlock()
 	row, err := m.activeProject(ctx, id)
 	if err != nil {
 		return OrchestrationResult{}, err
@@ -566,6 +688,8 @@ func (m *Service) SetOrchestration(ctx context.Context, id domain.ProjectID, in 
 // SetOrchestrationPaused toggles charter delivery without changing mode,
 // interval, workers, or ordinary lifecycle reactions.
 func (m *Service) SetOrchestrationPaused(ctx context.Context, id domain.ProjectID, paused bool) (OrchestrationResult, error) {
+	m.configMu.Lock()
+	defer m.configMu.Unlock()
 	row, err := m.activeProject(ctx, id)
 	if err != nil {
 		return OrchestrationResult{}, err
@@ -811,6 +935,7 @@ var (
 	projectIDPattern                  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 	invalidDerivedProjectIDRunPattern = regexp.MustCompile(`[^a-z0-9._-]+`)
 	doubleDotRunPattern               = regexp.MustCompile(`\.{2,}`)
+	environmentNamePattern            = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 func validateProjectID(id domain.ProjectID) error {
@@ -820,6 +945,13 @@ func validateProjectID(id domain.ProjectID) error {
 	// check-ref-format rejects — surfacing as an opaque 500 at spawn time.
 	if raw == "" || raw == "." || strings.Contains(raw, "..") || strings.ContainsAny(raw, `/\`) || !projectIDPattern.MatchString(raw) {
 		return apierr.Invalid("INVALID_PROJECT_ID", "Project id failed storage-path validation", nil)
+	}
+	return nil
+}
+
+func validateEnvironmentName(key string) error {
+	if !environmentNamePattern.MatchString(key) {
+		return apierr.Invalid("INVALID_ENVIRONMENT_NAME", "Environment variable names must start with a letter or underscore and contain only letters, digits, or underscores", map[string]any{"key": key})
 	}
 	return nil
 }

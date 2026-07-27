@@ -71,7 +71,7 @@ type Provider interface {
 type Store interface {
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
 	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
-	UpsertProject(ctx context.Context, row domain.ProjectRecord) error
+	UpdateProjectOriginURL(ctx context.Context, id string, registeredAt time.Time, originURL string) (bool, error)
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
 	ListSessionWorktrees(ctx context.Context, sessionID domain.SessionID) ([]domain.SessionWorktreeRecord, error)
 	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
@@ -972,10 +972,15 @@ func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, [
 			}
 			if p.RepoOriginURL == "" && p.Path != "" {
 				if url := resolveGitOriginURL(p.Path); url != "" {
-					p.RepoOriginURL = url
-					if err := o.store.UpsertProject(ctx, p); err != nil {
+					updated, err := o.store.UpdateProjectOriginURL(ctx, p.ID, p.RegisteredAt, url)
+					if err != nil {
 						o.logger.Warn("scm observer: backfill origin URL persist failed", "project", p.ID, "err", err)
+						continue
 					}
+					if !updated {
+						continue
+					}
+					p.RepoOriginURL = url
 				}
 			}
 			projects[sess.ProjectID] = p

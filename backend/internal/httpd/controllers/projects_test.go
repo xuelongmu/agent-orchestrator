@@ -29,6 +29,8 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
+
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
@@ -386,6 +388,65 @@ func TestProjectsAPI_RejectsUnknownConfigKeys(t *testing.T) {
 	if status != http.StatusCreated {
 		t.Fatalf("orchestratorRules add config = %d, want 201; body=%s", status, body)
 	}
+}
+
+type environmentPatchManager struct {
+	projectsvc.Manager
+	id     domain.ProjectID
+	input  projectsvc.PatchEnvironmentInput
+	result projectsvc.EnvironmentResult
+	err    error
+}
+
+func (m *environmentPatchManager) PatchEnvironment(_ context.Context, id domain.ProjectID, input projectsvc.PatchEnvironmentInput) (projectsvc.EnvironmentResult, error) {
+	m.id, m.input = id, input
+	return m.result, m.err
+}
+
+func newProjectManagerServer(t *testing.T, manager projectsvc.Manager) *httptest.Server {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, log, nil, httpd.APIDeps{
+		Projects: manager,
+	}, httpd.ControlDeps{}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestProjectsAPI_PatchEnvironmentDispatches(t *testing.T) {
+	manager := &environmentPatchManager{
+		result: projectsvc.EnvironmentResult{ProjectID: "env", Keys: []string{"CODEX_LANGFUSE_BWS", "OLD"}},
+	}
+	srv := newProjectManagerServer(t, manager)
+	body, status, _ := doRequest(t, srv, "PATCH", "/api/v1/projects/env/config/env", `{"set":{"CODEX_LANGFUSE_BWS":"true","OLD":"updated"},"unset":["REMOVE"]}`)
+	if status != http.StatusOK {
+		t.Fatalf("PATCH environment = %d, want 200; body=%s", status, body)
+	}
+	var result projectsvc.EnvironmentResult
+	mustJSON(t, body, &result)
+	if result.ProjectID != "env" || strings.Join(result.Keys, ",") != "CODEX_LANGFUSE_BWS,OLD" {
+		t.Fatalf("environment response = %#v", result)
+	}
+	if manager.id != "env" || manager.input.Set["CODEX_LANGFUSE_BWS"] != "true" || manager.input.Set["OLD"] != "updated" {
+		t.Fatalf("manager call = id %q input %#v", manager.id, manager.input)
+	}
+	if strings.Join(manager.input.Unset, ",") != "REMOVE" {
+		t.Fatalf("manager unset = %#v", manager.input.Unset)
+	}
+}
+
+func TestProjectsAPI_PatchEnvironmentRejectsInvalidRequests(t *testing.T) {
+	manager := &environmentPatchManager{}
+	srv := newProjectManagerServer(t, manager)
+	body, status, _ := doRequest(t, srv, "PATCH", "/api/v1/projects/envbad/config/env", `{"surprise":true}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
+	if manager.id != "" {
+		t.Fatalf("manager called for invalid JSON: %q", manager.id)
+	}
+
+	manager.err = apierr.Invalid("EMPTY_ENVIRONMENT_PATCH", "Set or unset at least one environment variable", nil)
+	body, status, _ = doRequest(t, srv, "PATCH", "/api/v1/projects/envbad/config/env", `{}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "EMPTY_ENVIRONMENT_PATCH")
 }
 
 func TestProjectsRoutes_LegacyUnregistered(t *testing.T) {

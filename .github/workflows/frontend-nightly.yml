@@ -60,6 +60,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    env:
+      AO_BUILD_CHANNEL: nightly
     defaults:
       run:
         working-directory: frontend
@@ -121,6 +123,8 @@ jobs:
     runs-on: macos-15-intel
     permissions:
       contents: write
+    env:
+      AO_BUILD_CHANNEL: nightly
     defaults:
       run:
         working-directory: frontend
