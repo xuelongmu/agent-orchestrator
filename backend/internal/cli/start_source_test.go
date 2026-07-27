@@ -8,6 +8,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 )
 
 // makeCheckout builds a directory that satisfies isSourceCheckout, optionally
@@ -132,11 +135,45 @@ func TestStart_SourceRunsFrontendDevHarness(t *testing.T) {
 	if gotDir != wantDir {
 		t.Fatalf("ran in %q, want %q", gotDir, wantDir)
 	}
-	if want := []string{"npm", "run", "dev"}; !reflect.DeepEqual(gotArgv, want) {
+	// The LookPath-resolved npm is what gets run, not the bare name: on Windows
+	// the resolution determines whether a batch shim needs cmd.exe.
+	wantName, wantArgs := devHarnessArgv("/usr/bin/npm")
+	if want := append([]string{wantName}, wantArgs...); !reflect.DeepEqual(gotArgv, want) {
 		t.Fatalf("argv = %v, want %v", gotArgv, want)
 	}
 	if !strings.Contains(out, root) {
 		t.Fatalf("output does not name the checkout it started: %q", out)
+	}
+}
+
+func TestStart_SourceWarnsWhenADaemonIsAlreadyRunning(t *testing.T) {
+	cfg := setConfigEnv(t)
+	root := makeCheckout(t, true)
+	chdir(t, root)
+
+	// A live PID makes runfile.CheckStale report the daemon as running.
+	if err := runfile.Write(cfg.runFile, runfile.Info{
+		PID: os.Getpid(), Port: 3001, StartedAt: time.Unix(100, 0).UTC(),
+	}); err != nil {
+		t.Fatalf("write run-file: %v", err)
+	}
+
+	deps := Deps{
+		LookPath:    func(string) (string, error) { return "/usr/bin/npm", nil },
+		RunAttached: func(context.Context, string, string, ...string) error { return nil },
+	}
+
+	_, errOut, err := executeCLI(t, deps, "start", "--source")
+	if err != nil {
+		t.Fatalf("start --source: %v", err)
+	}
+	// A dev launch attaches to an existing daemon rather than starting this
+	// checkout's, so the warning must name the escape hatches, not claim the
+	// app will refuse to attach.
+	for _, want := range []string{"already running", "ao stop", "ISOLATE_DEV=true"} {
+		if !strings.Contains(errOut, want) {
+			t.Fatalf("warning %q missing %q", errOut, want)
+		}
 	}
 }
 

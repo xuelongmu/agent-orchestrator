@@ -30,6 +30,9 @@
             # it for every session, so a shell without it cannot run AO.
             pkgs.tmux
             pkgs.git
+            # gh is not optional: the daemon shells out to it for pull request,
+            # CI, and review facts, and ao doctor checks for a valid token.
+            pkgs.gh
           ];
 
           shellHook = ''

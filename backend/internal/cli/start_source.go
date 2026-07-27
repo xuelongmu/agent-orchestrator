@@ -87,26 +87,33 @@ func isSourceCheckout(dir string) bool {
 func (c *commandContext) runStartFromSource(ctx context.Context, out, errOut io.Writer, root string) error {
 	frontend := filepath.Join(root, "frontend")
 
-	if _, err := c.deps.LookPath("npm"); err != nil {
+	npmPath, err := c.deps.LookPath("npm")
+	if err != nil {
 		return fmt.Errorf("ao start: running from source needs npm on PATH (install Node.js), or use `ao start --release`")
 	}
 	if _, err := os.Stat(filepath.Join(frontend, "node_modules")); err != nil {
 		return fmt.Errorf("ao start: frontend dependencies are not installed; run `npm ci --prefix %s` first", frontend)
 	}
 
-	c.warnForeignDaemon(errOut, root)
+	c.warnRunningDaemon(errOut)
 
 	_, _ = fmt.Fprintf(out, "Starting Agent Orchestrator from source at %s\n", root)
 	_, _ = fmt.Fprintf(out, "Running `npm run dev` in %s — press Ctrl-C to stop.\n", frontend)
 	_, _ = fmt.Fprintf(out, "Use `ao start --release` to fetch and open the published desktop app instead.\n")
 
-	return c.deps.RunAttached(ctx, frontend, "npm", "run", "dev")
+	name, args := devHarnessArgv(npmPath)
+	return c.deps.RunAttached(ctx, frontend, name, args...)
 }
 
-// warnForeignDaemon prints a heads-up when a daemon is already live and did not
-// come from this checkout. The desktop app enforces launch identity and will
-// refuse to attach, which otherwise surfaces as a confusing in-app error.
-func (c *commandContext) warnForeignDaemon(w io.Writer, root string) {
+// warnRunningDaemon prints a heads-up when a daemon is already live.
+//
+// A dev launch does NOT enforce checkout identity by default: Electron passes
+// enforceDevCheckout: devDaemonConfig.isIsolated, which is false unless
+// ISOLATE_DEV=true. So the app attaches to whatever genuine AO daemon holds the
+// canonical port rather than spawning one from this checkout — meaning backend
+// changes here silently would not be running. Say that plainly; the failure is
+// invisible otherwise.
+func (c *commandContext) warnRunningDaemon(w io.Writer) {
 	cfg, err := config.Load()
 	if err != nil {
 		return
@@ -116,7 +123,9 @@ func (c *commandContext) warnForeignDaemon(w io.Writer, root string) {
 		return
 	}
 	_, _ = fmt.Fprintf(w,
-		"Warning: an AO daemon is already running (pid %d, port %d).\n"+
-			"If it is not from %s, quit that app first — the dev app will refuse to attach to it.\n",
-		info.PID, info.Port, root)
+		"Warning: an AO daemon is already running (pid %d, port %d), and a dev launch\n"+
+			"attaches to it instead of starting one from this checkout. If it is not this\n"+
+			"checkout's daemon, your backend changes will not be running. Stop it with\n"+
+			"`ao stop`, or set ISOLATE_DEV=true to use a separate data dir and port.\n",
+		info.PID, info.Port)
 }

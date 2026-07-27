@@ -10,7 +10,7 @@ source. If you only want to _use_ AO, install the desktop app instead — see
 | ------------------ | --------------------------------- | ------------------------------------------------- |
 | Go                 | 1.25.x (`backend/go.mod`)         | backend, daemon, code generation                  |
 | Node               | 20 baseline; 22/24 also work      | frontend, `npm run api:ts`                        |
-| git                | 2.20+ (worktree support)          | session workspaces are git worktrees              |
+| git                | 2.25+                             | session workspaces are git worktrees              |
 | tmux (macOS/Linux) | 3.x                               | the terminal runtime the daemon execs per session |
 | gh                 | any, authenticated                | pull request, CI, and review facts                |
 | C toolchain        | Xcode CLI tools / build-essential | cgo and native npm modules                        |
@@ -77,8 +77,13 @@ that drift shows up as unrelated noise in your next pull request.
 Build the CLI and put it on your `PATH`:
 
 ```bash
-cd backend && go build -o "$(go env GOPATH)/bin/ao" ./cmd/ao
+cd backend && go install ./cmd/ao
 ```
+
+Use `go install` rather than `go build -o …/bin/ao`: it puts the binary in
+`$(go env GOPATH)/bin` and appends the right extension per platform. An explicit
+`-o` output name produces an extensionless file on Windows, which `PATH`/`PATHEXT`
+lookup will not find.
 
 Then, from anywhere inside the checkout:
 
@@ -174,11 +179,23 @@ docker build -f test/cli/Dockerfile -t ao-cli-smoke . && docker run --rm --init 
 
 ## Troubleshooting
 
-**"Another AO daemon is already running from …"** — the desktop app checks that
-the daemon it attaches to came from where it expects. The usual cause is an
-installed `/Applications/Agent Orchestrator.app` (or a stray `npm run dev`)
-holding port 3001. Quit it, then start again. `ao start --source` warns when it
-detects a live daemon before launching.
+**Your backend changes do not seem to be running** — a dev launch attaches to
+whatever AO daemon already holds the canonical port rather than starting one
+from your checkout. Checkout identity is only enforced when `ISOLATE_DEV=true`,
+so an installed `/Applications/Agent Orchestrator.app` or a stray `npm run dev`
+will be used silently. `ao start --source` warns when it sees a live daemon.
+Either stop the other one:
+
+```bash
+ao stop
+```
+
+or run isolated, which uses its own data dir (`~/.ao/dev`) and port (3002) so
+both can coexist:
+
+```bash
+ISOLATE_DEV=true ao start --source
+```
 
 **Tests fail on paths like `/var/…` vs `/private/var/…`** — on macOS `TMPDIR`
 lives under `/var`, a symlink to `/private/var`. Production code resolves
