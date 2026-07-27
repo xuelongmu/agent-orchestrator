@@ -1,42 +1,64 @@
-# Design System — ReverbCode
+# Design System — Agent Orchestrator
 
-> Source of truth for the ReverbCode desktop UI (Electron + React 19 + Tailwind v4
->
-> - Radix/shadcn + xterm, in `frontend/src/renderer`). Read this before any visual
->   or UI change. Created by `/design-consultation` on 2026-06-09.
+> Source of truth for the Agent Orchestrator desktop UI (Electron + React 19 +
+> Tailwind v4 + Radix/shadcn + xterm, in `frontend/src/renderer`). Read this
+> before any visual or UI change. Created by `/design-consultation` on
+> 2026-06-09.
 
-## ⚠️ Design direction — clone agent-orchestrator verbatim (SUPERSEDES emdash · 2026-06-10)
+## Design direction — the shipped renderer is the reference
 
-By explicit user decision (2026-06-10), the renderer **clones the
-agent-orchestrator web app verbatim** in looks and design. This **supersedes the
-"match emdash" direction** documented in _Aesthetic Direction_ and the palette
-sections below — where they conflict, **agent-orchestrator wins**. Do not re-flag
-"this doesn't match emdash" in QA/review; flag divergence from **agent-orchestrator**.
+The renderer was originally built by cloning an external web app, and that clone
+is **done**. The result now lives in this repository, so the reference is the
+code here — not any external checkout:
 
-- **Reference (the user's own app):** `~/Projects/agent-orchestrator/packages/web/src`
-  — `app/globals.css`, `app/mc-board.css`, `app/mc-sidebar.css`,
-  `components/{ProjectSidebar,Dashboard,SessionCard,SessionDetailHeader,SessionInspector,StatusBadge}.tsx`.
-- **Palette (live in `frontend/src/renderer/styles.css` `:root`):** `--bg #0a0b0d`,
-  `--bg-1 #15171b`, `--fg #f4f5f7`, `--fg-muted #9ba1aa`, `--fg-passive #646a73`,
-  hairline white-alpha borders, accent `--accent #4d8dff`; status: working=orange
-  `#f59f4c`, needs-you=amber `#e8c14a`, mergeable=green `#74b98a`, fail=red `#ef6b6b`.
-  The sidebar rail is the cooler `#08090b`.
+- **Design tokens:** `frontend/src/styles/tokens.css`. It declares itself the
+  source of truth for the visual system and is imported by
+  `frontend/src/renderer/styles.css`. Change colors, spacing, radii, and
+  typography there; do not hardcode hex values in components.
+- **Structure and behavior:** the shipped components under
+  `frontend/src/renderer/components`.
+- **Build with shadcn primitives** where a component fits
+  (`frontend/src/renderer/components/ui/*`: dropdown-menu, select, card, table,
+  tooltip, …).
+
+In QA and review, flag divergence from those files. Sections further down this
+document that predate the clone are retained for history; where they conflict
+with `tokens.css`, **`tokens.css` wins**.
+
+> **Historical note.** Earlier revisions of this file directed contributors to
+> clone `~/Projects/agent-orchestrator/packages/web/src` "verbatim" and described
+> the design as "matching emdash". That path was a private checkout belonging to
+> the original author of this document and is not available to anyone else, so
+> the instruction was unfollowable. The palette it specified survives intact in
+> `tokens.css` (near-black surface ramp, hairline white-alpha borders,
+> refined-blue `#4d8dff` accent, and the working/needs-you/mergeable/fail status
+> colors), which is why that reference is now retired rather than reconstructed.
+
+### Palette
+
+Authoritative values live in `frontend/src/styles/tokens.css`; this summary is
+for orientation only. Surfaces `--color-bg-primary #0a0b0d`,
+`--color-bg-secondary #15171b`, sidebar rail `--color-bg-sidebar #08090b`; text
+`--color-text-primary #f4f5f7`, `--color-text-muted #9ba1aa`,
+`--color-text-passive #646a73`; hairline white-alpha borders; accent
+`--color-accent #4d8dff`. Status: working `#f59f4c`, needs-you `#e8c14a`,
+mergeable `#74b98a`, fail `#ef6b6b`. Dark is primary (`:root`); light is the
+supported override (`:root[data-theme="light"]`). The terminal keeps its own
+palette.
+
+### Cloned surfaces and approved divergences
+
 - **Cloned surfaces:** the four-column gradient kanban board, the `ProjectSidebar`
   (brand + project disclosure + nested session rows + Settings menu footer), the
   session topbar (Kanban back button + identity + breathing `StatusBadge` pill), and
   the shared `DashboardTopbar`/`DashboardSubhead` chrome (Coding/Reviews tabs · "N
   working" pill · subhead) reused across board/review/PR/settings.
-- **Build with shadcn primitives** where a component fits (`components/ui/*`:
-  dropdown-menu, select, card, table, tooltip, …); agent-orchestrator's own
-  hand-rolled CSS components are structure/behaviour reference only.
-- The one carried-over divergence still holds: the **accent is refined blue**, and
-  the **terminal keeps its own palette**. Everything else tracks agent-orchestrator.
 - **Approved divergence (2026-06-10):** on macOS, a titlebar cluster (sidebar toggle +
   back/forward history arrows, `TitlebarNav`) sits beside the traffic lights,
-  VS Code-style — the web reference has no window chrome, so no analogue exists.
+  VS Code-style — the web reference had no window chrome, so no analogue exists.
 - **Approved divergence (2026-06-10):** the session inspector rail is fully
-  collapsible, built on the shadcn resizable primitive (`pnpm dlx shadcn add
-resizable`, react-resizable-panels v4 `collapsible` panel + imperative API,
+  collapsible, built on the shadcn resizable primitive (react-resizable-panels v4
+  `collapsible` panel + imperative API,
   user-requested). The panel animates to 0% via a flex-grow transition while the
   content keeps a stable min-width (yyork-style, no mid-animation reflow). Toggled
   by a `PanelRight` icon button in the session topbar and ⌘⇧B; open state + split
@@ -49,6 +71,9 @@ resizable`, react-resizable-panels v4 `collapsible` panel + imperative API,
   cluster (`.is-under-titlebar-nav`, 180px).
 
 ## Product Context
+
+> "ReverbCode" below is a former name for this app; it survives in some URLs and
+> identifiers. Read it as Agent Orchestrator.
 
 - **What this is:** ReverbCode is an Electron desktop app for supervising many parallel
   AI coding-agent sessions, backed by a Go daemon (`backend/`). The `ao` CLI is the
@@ -87,10 +112,11 @@ ReverbCode is **orchestrator-led**, which is the one thing that differs from emd
 
 ## Aesthetic Direction
 
-> **Superseded (2026-06-10):** see the _Design direction — clone agent-orchestrator
-> verbatim_ banner at the top. The emdash framing below is retained for history; the
-> live look tracks agent-orchestrator (same flat near-black / hairline family, so most
-> of this still reads true).
+> **Superseded (2026-06-10):** see _Design direction — the shipped renderer is the
+> reference_ at the top; authoritative values live in
+> `frontend/src/styles/tokens.css`. The emdash framing below is retained for
+> history and still reads true in spirit — the live look is the same flat
+> near-black / hairline family.
 
 - **Direction:** match **emdash** exactly — flat, near-black, hairline-bordered,
   utilitarian. Industrial control surface, calm chrome, the terminal as the center of gravity.
