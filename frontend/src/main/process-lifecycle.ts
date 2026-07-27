@@ -69,3 +69,30 @@ export async function terminateProcess(pid: number, options: TerminateProcessOpt
 		return probeProcessLiveness(pid, signalProcess) === "dead";
 	}
 }
+
+/** The part of a spawned daemon handle that killDaemon needs. */
+export type SignalableChild = {
+	pid?: number;
+	kill: (signal?: NodeJS.Signals | number) => boolean;
+};
+
+/**
+ * Stop the daemon Electron spawned. The group signal exists for the shell:true
+ * `configured` launch, where the direct child is /bin/sh and the daemon behind it
+ * would otherwise be orphaned; dev and bundled launches exec the daemon binary
+ * directly, so the group leader already is the daemon. Falls back to a direct
+ * kill when the group signal cannot be delivered — including Windows, which has
+ * no POSIX process group.
+ *
+ * This deliberately never kills a process tree. Session hosts (tmux servers,
+ * detached ConPTY hosts) are outside the daemon's group and must survive so the
+ * replacement daemon can reconcile them.
+ */
+export function killDaemon(child: SignalableChild, signalProcess: SignalProcess = process.kill.bind(process)): void {
+	if (child.pid === undefined) return;
+	try {
+		signalProcess(-child.pid, "SIGTERM");
+	} catch {
+		child.kill("SIGTERM");
+	}
+}

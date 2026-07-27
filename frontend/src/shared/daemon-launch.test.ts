@@ -16,11 +16,21 @@ describe("resolveDaemonLaunch", () => {
 		);
 	});
 
-	it("runs the backend daemon from source in dev without an explicit command", () => {
+	it("runs the built dev daemon binary directly so Electron owns the daemon process", () => {
 		expect(resolveDaemonLaunch({}, false, "/resources", "/repo/frontend", "darwin")).toEqual({
-			command: "go",
-			args: ["run", "./cmd/ao", "daemon"],
+			command: "/repo/frontend/daemon/ao",
+			args: ["daemon"],
 			cwd: "/repo/frontend/../backend",
+			shell: false,
+			source: "dev",
+		});
+	});
+
+	it("uses the dev daemon exe on Windows", () => {
+		expect(resolveDaemonLaunch({}, false, "C:\\repo\\resources", "C:\\repo\\frontend", "win32")).toEqual({
+			command: "C:\\repo\\frontend/daemon/ao.exe",
+			args: ["daemon"],
+			cwd: "C:\\repo\\frontend/../backend",
 			shell: false,
 			source: "dev",
 		});
@@ -59,8 +69,8 @@ describe("resolveDaemonLaunch", () => {
 
 describe("development daemon attach identity", () => {
 	const launch: DaemonLaunchSpec = {
-		command: "go",
-		args: ["run", "./cmd/ao", "daemon"],
+		command: "/repo/frontend/daemon/ao",
+		args: ["daemon"],
 		cwd: "/repo/backend",
 		shell: false,
 		source: "dev",
@@ -103,5 +113,38 @@ describe("development daemon attach identity", () => {
 			pid: 4242,
 			code: "identity_mismatch",
 		});
+	});
+
+	// The built dev binary lives in frontend/daemon, outside the backend cwd, so
+	// isolated dev accepts it on the reported working directory rather than on
+	// executable containment.
+	it("accepts a daemon built into frontend/daemon and run from the backend checkout", () => {
+		const identity = evaluateDaemonIdentity(
+			launch,
+			{
+				status: "ok",
+				service: DAEMON_SERVICE_NAME,
+				pid: 4242,
+				executablePath: "/repo/frontend/daemon/ao",
+				workingDirectory: "/repo/backend",
+			},
+			{ enforceDevCheckout: true, samePath, pathInside },
+		);
+		expect(identity).toBeNull();
+	});
+
+	it("still rejects a daemon built and run from another checkout", () => {
+		const identity = evaluateDaemonIdentity(
+			launch,
+			{
+				status: "ok",
+				service: DAEMON_SERVICE_NAME,
+				pid: 4242,
+				executablePath: "/other/frontend/daemon/ao",
+				workingDirectory: "/other/backend",
+			},
+			{ enforceDevCheckout: true, samePath, pathInside },
+		);
+		expect(identity).toContain("/other/backend");
 	});
 });
