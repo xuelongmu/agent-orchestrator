@@ -237,6 +237,21 @@ docker build -f test/cli/Dockerfile -t ao-cli-smoke . && docker run --rm --init 
 
 ## Troubleshooting
 
+**Processes still around right after Ctrl-C** — shutdown is graceful, not
+immediate. The daemon drains on SIGTERM within `AO_SHUTDOWN_TIMEOUT` (default
+10s), so a check run a second later will still see it holding the port and its
+run file. Wait for that window before concluding something leaked.
+
+Two things legitimately survive and are not leaks: `ao pty-host` processes
+belonging to existing sessions, which are designed to outlive a daemon restart,
+and anything owned by a _different_ AO install. When testing shutdown, use
+isolated state so the dev app cannot restore real sessions and confuse the
+result:
+
+```bash
+ISOLATE_DEV=true ao start --source
+```
+
 **Your backend changes do not seem to be running** — a dev launch attaches to
 whatever AO daemon already holds the canonical port rather than starting one
 from your checkout. Checkout identity is only enforced when `ISOLATE_DEV=true`,
