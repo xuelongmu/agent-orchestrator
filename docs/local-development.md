@@ -64,6 +64,10 @@ A dev shell is provided. `.envrc` contains `use flake`, so with
 nix develop      # or: direnv allow
 ```
 
+The shell provides Node 22 rather than CI's 20: Node 20 reached end-of-life in
+April 2026, and nixpkgs refuses to build an end-of-life Node. 22 satisfies the
+version floor above.
+
 Nix is entirely optional — a Homebrew or distro toolchain works the same.
 
 ## Install dependencies

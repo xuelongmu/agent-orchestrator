@@ -23,11 +23,12 @@
           buildInputs = [
             go
             pkgs.gotools
-            # Node 20 is the baseline the frontend, release, and packaging
-            # workflows build against. Newer runtimes work locally; match CI here.
-            # The real floor is finer than the major: the locked Vite requires
-            # ^20.19.0 || >=22.12.0, which the latest 20.x satisfies.
-            pkgs.nodejs_20
+            # Node 22, not 20. CI pins node-version: 20 and GitHub still ships
+            # 20.x binaries, but Node 20 went end-of-life in April 2026 and the
+            # nixpkgs revision locked here (2026-05-29) postdates that, so
+            # nodejs_20 evaluates as insecure and `nix develop` refuses to build.
+            # 22 satisfies the locked Vite's ^20.19.0 || >=22.12.0 floor.
+            pkgs.nodejs_22
             # tmux is a runtime prerequisite, not a convenience: the daemon execs
             # it for every session, so a shell without it cannot run AO.
             pkgs.tmux
