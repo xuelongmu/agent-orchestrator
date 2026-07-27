@@ -22,8 +22,9 @@ jobs:
       matrix:
         # macOS is not redundant with Ubuntu: its TMPDIR lives under /var, a
         # symlink to /private/var, which is exactly the class of path-resolution
-        # bug that used to fail locally on macOS while CI stayed green.
-        os: [ubuntu-latest, macos-latest]
+        # bug that used to fail locally on macOS while CI stayed green. Windows
+        # exercises ConPTY and native path normalization.
+        os: [ubuntu-latest, macos-latest, windows-latest]
     defaults:
       run:
         working-directory: backend
@@ -32,7 +33,8 @@ jobs:
 
       # Ubuntu runners ship tmux; macOS runners do not. Install it rather than
       # letting AO_REQUIRE_INTEGRATION turn a missing prerequisite into a
-      # hard failure (or, worse, a false-green skip).
+      # hard failure (or, worse, a false-green skip). Windows has no tmux and
+      # runs the suite without requiring those platform-inapplicable tests.
       - name: Install tmux (macOS)
         if: runner.os == 'macOS'
         run: brew install tmux
@@ -45,6 +47,7 @@ jobs:
           cache: false
 
       - name: Check formatting
+        shell: bash
         run: |
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
@@ -59,12 +62,17 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # The current Go integration tests need only host-provided git and tmux,
-      # so every hosted runner is a trusted context. Do not let a missing
-      # runner prerequisite turn this blocking check into a false-green skip.
+      # The Unix integration surface needs only host-provided git and tmux.
+      # Windows exercises its supported native surface without forcing the
+      # platform-inapplicable tmux tests to fail.
       - name: Test with trusted integrations and coverage
+        if: runner.os != 'Windows'
         env:
           AO_REQUIRE_INTEGRATION: "1"
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Test on Windows with coverage
+        if: runner.os == 'Windows'
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
       # One ratchet, one platform. Coverage is platform-independent here, and
