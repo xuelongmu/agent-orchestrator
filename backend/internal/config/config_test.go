@@ -97,7 +97,13 @@ func TestLoadOverrides(t *testing.T) {
 }
 
 func TestLoadCanonicalizesRelativeDataDir(t *testing.T) {
-	root := t.TempDir()
+	// Load canonicalizes through the working directory, and os.Getwd resolves
+	// symlinks. On macOS TMPDIR sits under /var -> /private/var, so the raw
+	// t.TempDir() path would never equal what Load returns.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	oldCWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)

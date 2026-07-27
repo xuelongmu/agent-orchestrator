@@ -11,7 +11,12 @@ import (
 )
 
 func TestCreateUsesProjectPathAndDestroyPreservesIt(t *testing.T) {
-	path := t.TempDir()
+	// Create resolves the project path through EvalSymlinks; on macOS TMPDIR
+	// sits under /var -> /private/var, so resolve here too or Path never matches.
+	path, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	marker := filepath.Join(path, "shared.txt")
 	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)

@@ -331,7 +331,13 @@ func TestExplicitDefaultDataDirRecoversHostWhenEnvUnset(t *testing.T) {
 }
 
 func TestRelativeDataDirPinsHostPublicationAndRestartRecovery(t *testing.T) {
-	root := t.TempDir()
+	// The runtime resolves the relative data dir against the working directory,
+	// and os.Getwd resolves symlinks. On macOS TMPDIR sits under /var ->
+	// /private/var, so absoluteDataDir must be built from the resolved root.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	oldCWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
