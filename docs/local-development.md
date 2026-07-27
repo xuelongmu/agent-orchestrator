@@ -96,19 +96,30 @@ it; on Linux add the equivalent to your shell profile, and on Windows add the
 directory to your user `PATH`:
 
 ```bash
-# Linux (bash/zsh)
+# Linux (bash/zsh) — persists for new shells; run the export once to use it now
 echo 'export PATH="$(go env GOPATH)/bin:$PATH"' >> ~/.profile
+export PATH="$(go env GOPATH)/bin:$PATH"
 ```
 
 ```powershell
-# Windows (PowerShell, persists for the current user)
+# Windows (PowerShell). The first line persists for future processes; the second
+# updates the session you are in, which the first does not do.
 [Environment]::SetEnvironmentVariable(
   "Path", "$([Environment]::GetEnvironmentVariable('Path','User'));$(go env GOPATH)\bin", "User")
+$env:Path += ";$(go env GOPATH)\bin"
 ```
 
-Check it resolves with `ao version` (a source build prints `dev`). Alternatively,
-skip `PATH` entirely and invoke the binary by full path:
-`"$(go env GOPATH)/bin/ao" start`.
+Check it resolves with `ao version` (a source build prints `dev`).
+
+Alternatively, skip `PATH` entirely and invoke the binary by full path:
+
+```bash
+"$(go env GOPATH)/bin/ao" start       # bash/zsh
+```
+
+```powershell
+& "$(go env GOPATH)\bin\ao.exe" start  # PowerShell needs the & call operator
+```
 
 Then, from anywhere inside the checkout:
 
