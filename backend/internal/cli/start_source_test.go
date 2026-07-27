@@ -43,6 +43,15 @@ func makeCheckout(t *testing.T, withNodeModules bool) string {
 	return root
 }
 
+// setHomeDir points os.UserHomeDir at dir for the duration of the test. It sets
+// both variables because os.UserHomeDir reads USERPROFILE on Windows and HOME
+// elsewhere; setting only HOME silently resolves the real profile on Windows.
+func setHomeDir(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+}
+
 // chdir moves into dir for the duration of the test.
 func chdir(t *testing.T, dir string) {
 	t.Helper()
@@ -185,7 +194,7 @@ func TestStart_SourceIsolatedIgnoresTheCanonicalDaemon(t *testing.T) {
 	// canonical run file is not the one it would attach to.
 	t.Setenv("ISOLATE_DEV", "true")
 	t.Setenv("AO_RUN_FILE", "")
-	t.Setenv("HOME", t.TempDir())
+	setHomeDir(t, t.TempDir())
 	if err := runfile.Write(cfg.runFile, runfile.Info{
 		PID: os.Getpid(), Port: 3001, StartedAt: time.Unix(100, 0).UTC(),
 	}); err != nil {
@@ -222,7 +231,7 @@ func TestDevRunFilePath(t *testing.T) {
 	t.Run("isolated moves under .ao/dev", func(t *testing.T) {
 		t.Setenv("ISOLATE_DEV", "true")
 		t.Setenv("AO_RUN_FILE", "")
-		t.Setenv("HOME", home)
+		setHomeDir(t, home)
 		want := filepath.Join(home, ".ao", "dev", "running.json")
 		got, isolated := devRunFilePath(canonical)
 		if got != want || !isolated {
