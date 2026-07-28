@@ -126,16 +126,26 @@ function Get-FirstAOInPath {
         [string]$PathValue
     )
 
+    $pathExtValue = [Environment]::GetEnvironmentVariable('PATHEXT', 'Machine')
+    if (-not $pathExtValue) {
+        $pathExtValue = '.COM;.EXE;.BAT;.CMD'
+    }
+    $extensions = @(@('') + @(
+        $pathExtValue -split ';' | Where-Object { $_ }
+    ) + @('.PS1') | Select-Object -Unique)
+
     foreach ($entry in @($PathValue -split ';' | Where-Object { $_ })) {
-        try {
-            $directory = [Environment]::ExpandEnvironmentVariables($entry).Trim().Trim('"')
-            $candidate = Join-Path $directory 'ao.exe'
-            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                return [System.IO.Path]::GetFullPath($candidate)
+        foreach ($extension in $extensions) {
+            try {
+                $directory = [Environment]::ExpandEnvironmentVariables($entry).Trim().Trim('"')
+                $candidate = Join-Path $directory "ao$extension"
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                    return [System.IO.Path]::GetFullPath($candidate)
+                }
             }
-        }
-        catch {
-            # Ignore malformed PATH entries; Windows does the same during lookup.
+            catch {
+                # Ignore malformed PATH entries; Windows does the same during lookup.
+            }
         }
     }
     return $null
@@ -448,6 +458,16 @@ try {
     }
     finally {
         Pop-Location
+    }
+
+    try {
+        & $builtPath version *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw "version exited with code $LASTEXITCODE"
+        }
+    }
+    catch {
+        throw 'The temporary AO build cannot run on this Windows host; clear cross-compilation settings such as GOOS or GOARCH, then run this installer again'
     }
 
     $daemonExecutable = Get-RunningDaemonExecutable
