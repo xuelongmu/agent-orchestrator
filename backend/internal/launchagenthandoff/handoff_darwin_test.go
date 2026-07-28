@@ -47,6 +47,23 @@ func TestRunRestoresEnvironmentWhenElectronPipeCloses(t *testing.T) {
 	}
 }
 
+func TestRunLockOnlyDoesNotInspectOrMutateEnvironment(t *testing.T) {
+	originalRunLaunchctl := runLaunchctl
+	t.Cleanup(func() { runLaunchctl = originalRunLaunchctl })
+	runLaunchctl = func(context.Context, ...string) ([]byte, error) {
+		t.Fatal("lock-only handoff called launchctl")
+		return nil, nil
+	}
+
+	var output strings.Builder
+	if err := Run(context.Background(), strings.NewReader("{}\n"), &output); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if output.String() != "ready\n" {
+		t.Fatalf("output = %q, want ready", output.String())
+	}
+}
+
 func TestInstallTemporarilyClearsOmittedLaunchdEnvironment(t *testing.T) {
 	originalRunLaunchctl := runLaunchctl
 	t.Cleanup(func() { runLaunchctl = originalRunLaunchctl })

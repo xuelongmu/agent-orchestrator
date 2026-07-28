@@ -516,7 +516,7 @@ function launchAgentHandoffBinary(): string {
 async function startLaunchdEnvironmentHandoff(
 	helperBinary: string,
 	lockPath: string,
-	entries: Array<[string, string]>,
+	entries: Array<[string, string]> | null,
 ): Promise<() => Promise<void>> {
 	await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o750 });
 	return new Promise((resolve, reject) => {
@@ -576,7 +576,8 @@ async function startLaunchdEnvironmentHandoff(
 				new Error(`could not acquire the macOS launchd environment lock (code ${String(code)}): ${errorOutput.trim()}`),
 			);
 		});
-		holder.stdin.write(`${JSON.stringify({ environment: Object.fromEntries(entries) })}\n`);
+		const request = entries === null ? {} : { environment: Object.fromEntries(entries) };
+		holder.stdin.write(`${JSON.stringify(request)}\n`);
 	});
 }
 
@@ -1427,44 +1428,88 @@ async function stopDaemon(): Promise<DaemonStatus> {
 	daemonRestart.cancel();
 	daemonStartEpoch += 1;
 	daemonStartPromise = null;
-	if (daemonLaunchAgent && (await isLaunchAgentLoaded(daemonLaunchAgent))) {
-		const previousPID = daemonStatus.pid;
+	if (daemonLaunchAgent) {
+		let releaseLaunchAgentLock: (() => Promise<void>) | null = null;
 		try {
-			await execFileAsync("/bin/launchctl", ["bootout", daemonLaunchAgent.serviceTarget]);
+			releaseLaunchAgentLock = await startLaunchdEnvironmentHandoff(
+				launchAgentHandoffBinary(),
+				daemonLaunchAgent.environmentLockPath,
+				null,
+			);
 		} catch (error) {
 			setDaemonStatus({
 				...daemonStatus,
 				state: "error",
-				message: `Could not unload the macOS daemon LaunchAgent: ${String(error)}`,
+				message: `Could not acquire the macOS daemon LaunchAgent lock: ${String(error)}`,
 				code: "daemon_unreachable",
 			});
 			return daemonStatus;
 		}
-		const shutdownWaitMs = daemonShutdownGraceMs + 2_000;
-		const deadline = Date.now() + shutdownWaitMs;
-		let stopped = false;
-		while (Date.now() < deadline) {
-			const runFile = await readRunFileForStop();
-			if (runFile.state === "missing" || (previousPID !== undefined && probeProcessLiveness(previousPID) === "dead")) {
-				stopped = true;
-				break;
+		let launchAgentStop: "not_owned" | "stopped" | "error" = "not_owned";
+		try {
+			if (await isLaunchAgentLoaded(daemonLaunchAgent)) {
+				const previousPID = daemonStatus.pid;
+				const launchAgentPID = await launchAgentProcessID(daemonLaunchAgent);
+				const ownsDaemon = daemonLaunchAgentOwnsPID(launchAgentPID, previousPID, await processAncestorIDs(previousPID));
+				if (ownsDaemon) {
+					try {
+						await execFileAsync("/bin/launchctl", ["bootout", daemonLaunchAgent.serviceTarget]);
+					} catch (error) {
+						setDaemonStatus({
+							...daemonStatus,
+							state: "error",
+							message: `Could not unload the macOS daemon LaunchAgent: ${String(error)}`,
+							code: "daemon_unreachable",
+						});
+						launchAgentStop = "error";
+					}
+					if (launchAgentStop !== "error") {
+						const shutdownWaitMs = daemonShutdownGraceMs + 2_000;
+						const deadline = Date.now() + shutdownWaitMs;
+						let stopped = false;
+						while (Date.now() < deadline) {
+							const runFile = await readRunFileForStop();
+							if (
+								runFile.state === "missing" ||
+								(previousPID !== undefined && probeProcessLiveness(previousPID) === "dead")
+							) {
+								stopped = true;
+								break;
+							}
+							await new Promise<void>((resolve) => setTimeout(resolve, 200));
+						}
+						if (!stopped) {
+							setDaemonStatus({
+								...daemonStatus,
+								state: "error",
+								message: `The macOS daemon LaunchAgent was unloaded, but its daemon did not stop within ${Math.ceil(
+									shutdownWaitMs / 1_000,
+								)} seconds.`,
+								code: "daemon_unreachable",
+							});
+							launchAgentStop = "error";
+						} else {
+							daemonOwnership.clear();
+							setDaemonStatus({ state: "stopped" });
+							launchAgentStop = "stopped";
+						}
+					}
+				}
 			}
-			await new Promise<void>((resolve) => setTimeout(resolve, 200));
+		} finally {
+			try {
+				await releaseLaunchAgentLock();
+			} catch (error) {
+				setDaemonStatus({
+					...daemonStatus,
+					state: "error",
+					message: `Could not release the macOS daemon LaunchAgent lock: ${String(error)}`,
+					code: "daemon_unreachable",
+				});
+				launchAgentStop = "error";
+			}
 		}
-		if (!stopped) {
-			setDaemonStatus({
-				...daemonStatus,
-				state: "error",
-				message: `The macOS daemon LaunchAgent was unloaded, but its daemon did not stop within ${Math.ceil(
-					shutdownWaitMs / 1_000,
-				)} seconds.`,
-				code: "daemon_unreachable",
-			});
-			return daemonStatus;
-		}
-		daemonOwnership.clear();
-		setDaemonStatus({ state: "stopped" });
-		return daemonStatus;
+		if (launchAgentStop !== "not_owned") return daemonStatus;
 	}
 	if (daemonProcess) {
 		const child = daemonProcess;

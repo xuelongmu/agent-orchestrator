@@ -11,7 +11,7 @@ import (
 )
 
 type request struct {
-	Environment map[string]string `json:"environment"`
+	Environment *map[string]string `json:"environment,omitempty"`
 }
 
 // Run reads one JSON request, applies it, reports readiness, then restores the
@@ -28,9 +28,12 @@ func Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	if err := json.Unmarshal(line, &req); err != nil {
 		return fmt.Errorf("decode handoff request: %w", err)
 	}
-	restore, err := install(ctx, req.Environment)
-	if err != nil {
-		return err
+	restore := func() error { return nil }
+	if req.Environment != nil {
+		restore, err = install(ctx, *req.Environment)
+		if err != nil {
+			return err
+		}
 	}
 	defer func() { _ = restore() }()
 	if _, err := io.WriteString(out, "ready\n"); err != nil {
