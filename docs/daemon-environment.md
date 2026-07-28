@@ -1,12 +1,12 @@
 # Daemon environment: the GUI-launch PATH/credentials problem
 
-Status: proposed
+Status: implemented
 Scope: desktop (Electron) launch of the AO daemon on macOS (and any GUI-launched
 desktop platform)
 
 ## Summary
 
-When the desktop app is launched from Finder/Dock/Spotlight, the daemon it spawns
+When the desktop app is launched from Finder/Dock/Spotlight, the daemon it starts
 inherits a stunted environment (minimal `PATH`, no shell-exported credentials).
 The daemon then cannot find `tmux`/`git`/the agent CLIs, and the agents it
 launches cannot see API keys. The same app launched from a terminal works,
@@ -14,9 +14,26 @@ because a terminal-started process inherits the shell's fully-populated
 environment. The fix is to resolve the user's login-shell environment once at
 startup and use it as the base for the daemon's environment.
 
+## Aqua audit session and login-keychain access
+
+Environment repair alone does not grant login-keychain access. macOS scopes
+keychain interaction to an audit session, and a daemon inherited from the wrong
+launch context can receive `errSecInteractionNotAllowed` even when it has the
+right user ID and environment. AO therefore writes a mode-0600 LaunchAgent
+definition beside its selected run file and bootstraps it into `gui/<uid>` with
+`LimitLoadToSessionType=Aqua`. The job is `KeepAlive`, so quitting Electron does
+not strand or silently replace the daemon; the desktop Stop action unloads the
+job explicitly.
+
+`ao doctor` reports `keychain-session` by asking the running daemon to execute
+`security show-keychain-info` from its own process context. A failed interaction
+is a hard failure because tmux servers and worker panes inherit the daemon's
+audit session. The loopback-only diagnostic route is blocked entirely on the
+optional LAN listener.
+
 ## Problem statement
 
-The Electron supervisor spawns the Go daemon with the environment it forwards in
+The Electron supervisor starts the Go daemon with the environment it forwards in
 `daemonEnv()` (`frontend/src/main.ts`), which is essentially `...process.env`
 plus AO's telemetry defaults. The daemon, in turn, is the parent of every agent
 session (it execs `tmux`, which runs `claude`/`codex`, etc.), and the agent's
@@ -27,7 +44,7 @@ session (it execs `tmux`, which runs `claude`/`codex`, etc.), and the agent's
 So whatever environment the daemon receives propagates to the entire stack:
 
 ```
-launchd (or terminal) -> Electron main -> daemon -> tmux -> agent (claude/codex)
+Electron main -> launchd gui/<uid> LaunchAgent -> daemon -> tmux -> agent
 ```
 
 When that environment is impoverished, everything downstream breaks.

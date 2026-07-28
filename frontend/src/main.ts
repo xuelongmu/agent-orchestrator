@@ -30,7 +30,7 @@ import {
 } from "./main/update-settings";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -68,6 +68,7 @@ import {
 import { killDaemon, probeProcessLiveness, terminateProcess } from "./main/process-lifecycle";
 import { readMigrationState, updateMigration, writeAppStateMarker, type MigrationState } from "./main/app-state";
 import { isAllowedAppExternalURL, openAllowedAppExternalURL } from "./main/external-open";
+import { renderDaemonLaunchAgentPlist, resolveDaemonLaunchAgent, type DaemonLaunchAgent } from "./main/launch-agent";
 import { pathInside, samePath } from "./shared/path-identity";
 
 // Globals injected at compile time by @electron-forge/plugin-vite.
@@ -115,16 +116,16 @@ let daemonShutdownGraceMs = ownedShutdownGraceMs(process.env);
 let daemonStartPromise: Promise<DaemonStatus> | null = null;
 let daemonStartEpoch = 0;
 let daemonStatus: DaemonStatus = { state: "stopped" };
+let daemonLaunchAgent: DaemonLaunchAgent | null = null;
 let browserViewHost: BrowserViewHost | null = null;
 let appQuitting = false;
 const daemonOwnership = new DaemonOwnershipController();
 const daemonStopIntent = new DaemonStopIntentController();
 
-// The desktop app owns the daemon it spawns, so replace an unexpectedly exited
-// child with a bounded retry loop. Go's boot reconciliation adopts the durable
-// tmux/ConPTY sessions after the replacement reaches readiness. Intentional
-// stops and app quit cancel the loop below; no signal handling changes are
-// needed in either process.
+// On Windows/Linux the desktop app owns the daemon child it spawns, so replace
+// an unexpected exit with a bounded retry loop. macOS delegates that policy to
+// launchd's KeepAlive job instead. Go's boot reconciliation adopts the durable
+// tmux/ConPTY sessions after either replacement reaches readiness.
 const daemonRestart = new DaemonRestartController({
 	restart: () => (daemonProcess ? undefined : startDaemon()),
 	shouldRestart: () => daemonOwnership.appOwned && !appQuitting && !daemonStopIntent.stopping,
@@ -412,6 +413,93 @@ function runFilePath(): string | null {
 	return defaultRunFilePath(process.platform, process.env, os.homedir());
 }
 
+function macDaemonLaunchAgent(): DaemonLaunchAgent | null {
+	if (process.platform !== "darwin") return null;
+	const runFile = runFilePath();
+	const canonicalRunFile = defaultRunFilePath(process.platform, process.env, os.homedir());
+	if (!runFile || !canonicalRunFile) return null;
+	return resolveDaemonLaunchAgent(runFile, canonicalRunFile, os.userInfo().uid);
+}
+
+async function isLaunchAgentLoaded(job: DaemonLaunchAgent): Promise<boolean> {
+	try {
+		await execFileAsync("/bin/launchctl", ["print", job.serviceTarget]);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function installAndKickstartLaunchAgent(
+	job: DaemonLaunchAgent,
+	launch: DaemonLaunchSpec,
+	env: NodeJS.ProcessEnv,
+): Promise<void> {
+	const plist = renderDaemonLaunchAgentPlist(job, launch, env);
+	let existing = "";
+	try {
+		existing = await readFile(job.plistPath, "utf8");
+	} catch {
+		// First install, or an unreadable stale definition that will be replaced.
+	}
+	const definitionChanged = existing !== plist;
+	const loaded = await isLaunchAgentLoaded(job);
+
+	if (loaded && definitionChanged) {
+		await execFileAsync("/bin/launchctl", ["bootout", job.serviceTarget]);
+	}
+	await mkdir(path.dirname(job.plistPath), { recursive: true, mode: 0o750 });
+	await writeFile(job.plistPath, plist, { encoding: "utf8", mode: 0o600 });
+	await chmod(job.plistPath, 0o600);
+
+	if (!loaded || definitionChanged) {
+		try {
+			await execFileAsync("/bin/launchctl", ["bootstrap", job.domain, job.plistPath]);
+		} catch (error) {
+			// A concurrent app instance may have loaded the same job after our
+			// print probe. Accept that race only when launchd now reports it loaded.
+			if (!(await isLaunchAgentLoaded(job))) throw error;
+		}
+	}
+	await execFileAsync("/bin/launchctl", ["kickstart", "-k", job.serviceTarget]);
+}
+
+async function startDaemonViaLaunchAgent(
+	launch: DaemonLaunchSpec,
+	job: DaemonLaunchAgent,
+	startEpoch: number,
+): Promise<DaemonStatus> {
+	setDaemonStatus({ state: "starting" });
+	daemonOwnership.clear();
+	try {
+		await installAndKickstartLaunchAgent(job, launch, daemonEnv(false));
+	} catch (error) {
+		setDaemonStatus({
+			state: "error",
+			message: `Could not start the macOS daemon LaunchAgent: ${String(error)}`,
+			code: "spawn_failed",
+		});
+		return daemonStatus;
+	}
+
+	const deadline = Date.now() + PORT_DISCOVERY_TIMEOUT_MS;
+	while (Date.now() < deadline) {
+		if (startEpoch !== daemonStartEpoch || daemonStopIntent.stopping) return daemonStatus;
+		const existing = await inspectExistingDaemon(launch);
+		if (existing?.status.state === "ready") {
+			setDaemonStatus(existing.status);
+			return daemonStatus;
+		}
+		await new Promise<void>((resolve) => setTimeout(resolve, RUN_FILE_POLL_MS));
+	}
+	setDaemonStatus({
+		state: "error",
+		message: `The macOS daemon LaunchAgent started but did not become ready. See ${job.stderrPath}.`,
+		code: "not_ready",
+	});
+	return daemonStatus;
+}
+
 // How long to wait for the login shell to print its env before giving up. A
 // misconfigured rc that blocks (or a slow nvm/pyenv chain) must not hang startup;
 // the daemon then falls back to the static PATH floor.
@@ -488,11 +576,11 @@ function ensureShellEnv(): Promise<void> {
 	return shellEnvPromise;
 }
 
-function daemonEnv(): NodeJS.ProcessEnv {
+function daemonEnv(appOwned = true): NodeJS.ProcessEnv {
 	// AO_OWNER=app marks this daemon as app-spawned so the app can re-link the
 	// supervisor on attach (headless `ao start` daemons get no AO_OWNER and stay
 	// unlinked, preserving their persistence across app quit).
-	const ownerTag = { AO_OWNER: "app" };
+	const ownerTag: Record<string, string> = appOwned ? { AO_OWNER: "app" } : {};
 	// Dev shares the installed app's daemon and state by default. Explicit
 	// isolation injects sandbox defaults; user-set values still take priority.
 	const devExtras: Record<string, string> = {};
@@ -507,9 +595,17 @@ function daemonEnv(): NodeJS.ProcessEnv {
 	}
 	// Windows keeps the old behavior exactly: no shell probe, no unix PATH floor.
 	if (process.platform === "win32") {
-		return { ...process.env, ...devExtras, ...telemetryOverrides(), ...ownerTag };
+		const env = { ...process.env, ...devExtras, ...telemetryOverrides(), ...ownerTag };
+		if (!appOwned) delete env.AO_OWNER;
+		return env;
 	}
-	return buildDaemonEnv(process.env, cachedShellEnv, { ...devExtras, ...telemetryOverrides(), ...ownerTag });
+	const env = buildDaemonEnv(process.env, cachedShellEnv, {
+		...devExtras,
+		...telemetryOverrides(),
+		...ownerTag,
+	});
+	if (!appOwned) delete env.AO_OWNER;
+	return env;
 }
 
 function processAlive(pid: number): boolean {
@@ -768,23 +864,38 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		});
 		return daemonStatus;
 	}
+	daemonLaunchAgent = macDaemonLaunchAgent();
 
+	let replacingMacLaunchAgent = false;
 	const existing = await inspectExistingDaemon(launch);
 	if (startEpoch !== daemonStartEpoch) {
 		return daemonStatus;
 	}
 	if (existing) {
-		setDaemonStatus(existing.status);
-		// Re-link the supervisor only when attaching to an app-owned daemon (one we
-		// previously spawned). Headless `ao start` daemons (owner unset) stay unlinked
-		// so they remain persistent after app quit.
-		const appOwned = shouldLinkOnAttach(existing.owner);
-		daemonOwnership.setAppOwned(appOwned);
-		if (appOwned) {
-			if (existing.status.state === "ready") daemonRestart.onReady();
-			establishSupervisorLink();
+		// A persistent LaunchAgent may still be running the binary from the
+		// previous app version. Only replace an identity mismatch when launchd
+		// confirms that the job with our exact label owns this launch boundary;
+		// a foreign terminal-started daemon remains fail-closed.
+		const replaceStaleLaunchAgent =
+			existing.status.code === "identity_mismatch" &&
+			daemonLaunchAgent !== null &&
+			(await isLaunchAgentLoaded(daemonLaunchAgent));
+		if (replaceStaleLaunchAgent) {
+			replacingMacLaunchAgent = true;
+			console.log("AO: replacing stale macOS daemon LaunchAgent definition");
+		} else {
+			setDaemonStatus(existing.status);
+			// Re-link the supervisor only when attaching to an app-owned daemon (one we
+			// previously spawned). Headless `ao start` daemons (owner unset) stay unlinked
+			// so they remain persistent after app quit.
+			const appOwned = shouldLinkOnAttach(existing.owner);
+			daemonOwnership.setAppOwned(appOwned);
+			if (appOwned) {
+				if (existing.status.state === "ready") daemonRestart.onReady();
+				establishSupervisorLink();
+			}
+			return daemonStatus;
 		}
-		return daemonStatus;
 	}
 
 	// Defensive: inspectExistingDaemon only attaches when the run-file agrees with
@@ -795,11 +906,13 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// daemon answers. The expected port (AO_PORT or the default) is exactly the
 	// port the Go child would bind and collide on — probing a hardcoded 3001 would
 	// miss an AO_PORT override.
-	const directDaemon = await resolveDaemonFromPort({
-		expectedPort: resolvedDaemonPort(),
-		probe: readDaemonProbe,
-		identityError: (probe) => daemonIdentityError(launch, probe),
-	});
+	const directDaemon = replacingMacLaunchAgent
+		? null
+		: await resolveDaemonFromPort({
+				expectedPort: resolvedDaemonPort(),
+				probe: readDaemonProbe,
+				identityError: (probe) => daemonIdentityError(launch, probe),
+			});
 	if (startEpoch !== daemonStartEpoch) {
 		return daemonStatus;
 	}
@@ -877,6 +990,15 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 			code: "binary_missing",
 		});
 		return daemonStatus;
+	}
+
+	// macOS login-keychain access is scoped to the Aqua audit session. Starting
+	// the daemon as an Electron child can put the daemon, its tmux server, and
+	// every worker pane in a non-GUI audit session where securityd refuses all
+	// interaction. launchd's gui/<uid> domain is the session boundary that makes
+	// daemon-spawned workers behave like processes launched from Terminal.
+	if (daemonLaunchAgent) {
+		return startDaemonViaLaunchAgent(launch, daemonLaunchAgent, startEpoch);
 	}
 
 	setDaemonStatus({ state: "starting" });
@@ -1053,6 +1175,42 @@ async function stopDaemon(): Promise<DaemonStatus> {
 	daemonRestart.cancel();
 	daemonStartEpoch += 1;
 	daemonStartPromise = null;
+	if (daemonLaunchAgent && (await isLaunchAgentLoaded(daemonLaunchAgent))) {
+		const previousPID = daemonStatus.pid;
+		try {
+			await execFileAsync("/bin/launchctl", ["bootout", daemonLaunchAgent.serviceTarget]);
+		} catch (error) {
+			setDaemonStatus({
+				...daemonStatus,
+				state: "error",
+				message: `Could not unload the macOS daemon LaunchAgent: ${String(error)}`,
+				code: "daemon_unreachable",
+			});
+			return daemonStatus;
+		}
+		const deadline = Date.now() + 7_000;
+		let stopped = false;
+		while (Date.now() < deadline) {
+			const runFile = await readRunFileForStop();
+			if (runFile.state === "missing" || (previousPID !== undefined && probeProcessLiveness(previousPID) === "dead")) {
+				stopped = true;
+				break;
+			}
+			await new Promise<void>((resolve) => setTimeout(resolve, 200));
+		}
+		if (!stopped) {
+			setDaemonStatus({
+				...daemonStatus,
+				state: "error",
+				message: "The macOS daemon LaunchAgent was unloaded, but its daemon did not stop within 7 seconds.",
+				code: "daemon_unreachable",
+			});
+			return daemonStatus;
+		}
+		daemonOwnership.clear();
+		setDaemonStatus({ state: "stopped" });
+		return daemonStatus;
+	}
 	if (daemonProcess) {
 		const child = daemonProcess;
 		daemonStoppingProcess = child;

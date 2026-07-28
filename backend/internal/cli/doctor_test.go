@@ -242,6 +242,73 @@ func TestDoctorFailsExpiredGitHubToken(t *testing.T) {
 	}
 }
 
+func TestCheckKeychainSessionMatchesDaemonToAquaAuditSession(t *testing.T) {
+	srv := keychainDiagnosticServer(t, http.StatusOK, `{"status":"available","service":"agent-orchestrator-daemon","pid":4321,"detail":"login-keychain interaction succeeded"}`)
+	defer srv.Close()
+	c := &commandContext{deps: Deps{HTTPClient: srv.Client()}.withDefaults()}
+
+	check := c.checkKeychainSession(context.Background(), daemonStatus{
+		State: stateReady, PID: 4321, Port: serverPort(t, srv.URL),
+	}, nil)
+	if check.Level != doctorPass || !strings.Contains(check.Message, "can interact with the login keychain") {
+		t.Fatalf("keychain-session check = %+v, want PASS", check)
+	}
+}
+
+func TestCheckKeychainSessionFailsOutsideAquaAuditSession(t *testing.T) {
+	srv := keychainDiagnosticServer(t, http.StatusOK, `{"status":"unavailable","service":"agent-orchestrator-daemon","pid":4321,"detail":"security show-keychain-info failed (exit 36)"}`)
+	defer srv.Close()
+	c := &commandContext{deps: Deps{HTTPClient: srv.Client()}.withDefaults()}
+
+	check := c.checkKeychainSession(context.Background(), daemonStatus{
+		State: stateReady, PID: 4321, Port: serverPort(t, srv.URL),
+	}, nil)
+	if check.Level != doctorFail ||
+		!strings.Contains(check.Message, "cannot interact with the login keychain") ||
+		!strings.Contains(check.Message, "LaunchAgent") {
+		t.Fatalf("keychain-session check = %+v, want actionable FAIL", check)
+	}
+}
+
+func TestCheckKeychainSessionWarnsWhenDaemonStopped(t *testing.T) {
+	c := &commandContext{deps: Deps{
+		CommandOutput: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			t.Fatalf("stopped-daemon keychain check ran %s %v", name, args)
+			return nil, nil
+		},
+	}.withDefaults()}
+
+	check := c.checkKeychainSession(context.Background(), daemonStatus{State: stateStopped}, nil)
+	if check.Level != doctorWarn || !strings.Contains(check.Message, "daemon is not running") {
+		t.Fatalf("keychain-session check = %+v, want WARN", check)
+	}
+}
+
+func TestCheckKeychainSessionWarnsForOlderDaemonWithoutDiagnostic(t *testing.T) {
+	srv := keychainDiagnosticServer(t, http.StatusNotFound, `{"error":"not found"}`)
+	defer srv.Close()
+	c := &commandContext{deps: Deps{HTTPClient: srv.Client()}.withDefaults()}
+
+	check := c.checkKeychainSession(context.Background(), daemonStatus{
+		State: stateReady, PID: 4321, Port: serverPort(t, srv.URL),
+	}, nil)
+	if check.Level != doctorWarn || !strings.Contains(check.Message, "diagnostic is unavailable") {
+		t.Fatalf("keychain-session check = %+v, want compatibility WARN", check)
+	}
+}
+
+func keychainDiagnosticServer(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/internal/diagnostics/keychain-session" {
+			t.Fatalf("unexpected keychain probe: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+}
+
 func TestDoctorJSONOutputIsDecodable(t *testing.T) {
 	setConfigEnv(t)
 	clearDoctorGitHubEnv(t)

@@ -20,6 +20,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/codex"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 )
 
 type doctorLevel string
@@ -159,9 +160,9 @@ func (c *commandContext) runDoctorForPlatform(ctx context.Context, platform stri
 
 	checks = append(checks, checkStore(cfg.DataDir), checkHooksLog(cfg.DataDir, time.Now()))
 
-	st, err := c.inspectDaemon(ctx)
-	if err != nil {
-		checks = append(checks, doctorCheck{Level: doctorFail, Section: doctorSectionCore, Name: "daemon", Message: err.Error()})
+	st, daemonErr := c.inspectDaemon(ctx)
+	if daemonErr != nil {
+		checks = append(checks, doctorCheck{Level: doctorFail, Section: doctorSectionCore, Name: "daemon", Message: daemonErr.Error()})
 	} else {
 		level := doctorPass
 		switch st.State {
@@ -179,6 +180,9 @@ func (c *commandContext) runDoctorForPlatform(ctx context.Context, platform stri
 		}
 		checks = append(checks, doctorCheck{Level: level, Section: doctorSectionCore, Name: "daemon", Message: msg})
 	}
+	if platform == "darwin" {
+		checks = append(checks, c.checkKeychainSession(ctx, st, daemonErr))
+	}
 
 	checks = append(checks,
 		c.checkGit(ctx),
@@ -190,6 +194,83 @@ func (c *commandContext) runDoctorForPlatform(ctx context.Context, platform stri
 	}
 	checks = append(checks, c.checkCodexLaunchFlags(ctx), c.checkGitHubToken(ctx))
 	return checks
+}
+
+func (c *commandContext) checkKeychainSession(ctx context.Context, st daemonStatus, daemonErr error) doctorCheck {
+	const name = "keychain-session"
+	if daemonErr != nil || st.PID == 0 || st.State == stateStopped || st.State == stateStale {
+		return doctorCheck{
+			Level: doctorWarn, Section: doctorSectionCore, Name: name,
+			Message: "daemon is not running; start the desktop app, then rerun `ao doctor` to verify its macOS Aqua audit session",
+		}
+	}
+	result, err := c.readKeychainSessionProbe(ctx, st.Port)
+	if err != nil {
+		return doctorCheck{
+			Level: doctorWarn, Section: doctorSectionCore, Name: name,
+			Message: fmt.Sprintf("daemon keychain diagnostic is unavailable; restart AO through the desktop app, then rerun doctor: %v", err),
+		}
+	}
+	if result.Service != daemonmeta.ServiceName || result.PID != st.PID {
+		return doctorCheck{
+			Level: doctorFail, Section: doctorSectionCore, Name: name,
+			Message: fmt.Sprintf("keychain diagnostic owner mismatch: service=%q pid=%d", result.Service, result.PID),
+		}
+	}
+	switch result.Status {
+	case "available":
+		return doctorCheck{
+			Level: doctorPass, Section: doctorSectionCore, Name: name,
+			Message: fmt.Sprintf("daemon pid %d can interact with the login keychain (%s)", st.PID, result.Detail),
+		}
+	case "unavailable":
+		return doctorCheck{
+			Level: doctorFail, Section: doctorSectionCore, Name: name,
+			Message: fmt.Sprintf(
+				"daemon pid %d cannot interact with the login keychain (%s); stop and start AO through the desktop app so its Aqua LaunchAgent can restore access",
+				st.PID, result.Detail,
+			),
+		}
+	default:
+		return doctorCheck{
+			Level: doctorWarn, Section: doctorSectionCore, Name: name,
+			Message: fmt.Sprintf("daemon returned unsupported keychain diagnostic status %q (%s)", result.Status, result.Detail),
+		}
+	}
+}
+
+type keychainSessionProbe struct {
+	Status  string `json:"status"`
+	Service string `json:"service"`
+	PID     int    `json:"pid"`
+	Detail  string `json:"detail"`
+}
+
+func (c *commandContext) readKeychainSessionProbe(ctx context.Context, port int) (keychainSessionProbe, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(
+		reqCtx,
+		http.MethodGet,
+		fmt.Sprintf("http://%s:%d/internal/diagnostics/keychain-session", config.LoopbackHost, port),
+		http.NoBody,
+	)
+	if err != nil {
+		return keychainSessionProbe{}, err
+	}
+	resp, err := c.deps.HTTPClient.Do(req)
+	if err != nil {
+		return keychainSessionProbe{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return keychainSessionProbe{}, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	var result keychainSessionProbe
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return keychainSessionProbe{}, fmt.Errorf("decode response: %w", err)
+	}
+	return result, nil
 }
 
 // checkStore inspects the SQLite store WITHOUT opening or migrating it. The

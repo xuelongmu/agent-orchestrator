@@ -63,6 +63,7 @@ func TestLANManagerBlocksLoopbackOnlyControlRoutes(t *testing.T) {
 	blocked := []string{
 		"/shutdown",
 		"/internal/telemetry/cli-invoked",
+		"/internal/diagnostics/keychain-session",
 		"/api/v1/mobile/status",
 		"/api/v1/sessions/ao-1/verify",
 	}

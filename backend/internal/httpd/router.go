@@ -3,6 +3,7 @@
 package httpd
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
+	"github.com/aoagents/agent-orchestrator/backend/internal/keychainsession"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/telemetrymeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
@@ -25,7 +27,8 @@ import (
 // ControlDeps carries the daemon-control hooks the router exposes, such as the
 // callback that requests a graceful shutdown.
 type ControlDeps struct {
-	RequestShutdown func()
+	RequestShutdown      func()
+	ProbeKeychainSession func(context.Context) keychainsession.Result
 }
 
 // NewRouterWithControl builds the root router with the standard middleware
@@ -94,24 +97,50 @@ func mountHealth(r chi.Router) {
 // keep a browser the user happens to have open (CSRF / DNS-rebinding) or a
 // remote client from being able to kill the daemon.
 func mountControl(r chi.Router, deps ControlDeps) {
-	if deps.RequestShutdown == nil {
-		return
-	}
-	r.Post("/shutdown", func(w http.ResponseWriter, req *http.Request) {
-		if !localControlRequest(req) {
-			envelope.WriteJSON(w, http.StatusForbidden, map[string]any{
-				"status":  "forbidden",
+	if deps.ProbeKeychainSession != nil {
+		r.Get("/internal/diagnostics/keychain-session", func(w http.ResponseWriter, req *http.Request) {
+			if !localControlRequest(req) {
+				envelope.WriteJSON(w, http.StatusForbidden, map[string]any{
+					"status":  "forbidden",
+					"service": daemonmeta.ServiceName,
+				})
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(req.Context(), 3*time.Second)
+			defer cancel()
+			result := deps.ProbeKeychainSession(probeCtx)
+			status := "unsupported"
+			if result.Supported {
+				status = "unavailable"
+				if result.Available {
+					status = "available"
+				}
+			}
+			envelope.WriteJSON(w, http.StatusOK, map[string]any{
+				"status":  status,
 				"service": daemonmeta.ServiceName,
+				"pid":     os.Getpid(),
+				"detail":  result.Detail,
 			})
-			return
-		}
-		envelope.WriteJSON(w, http.StatusAccepted, map[string]any{
-			"status":  "shutting_down",
-			"service": daemonmeta.ServiceName,
-			"pid":     os.Getpid(),
 		})
-		deps.RequestShutdown()
-	})
+	}
+	if deps.RequestShutdown != nil {
+		r.Post("/shutdown", func(w http.ResponseWriter, req *http.Request) {
+			if !localControlRequest(req) {
+				envelope.WriteJSON(w, http.StatusForbidden, map[string]any{
+					"status":  "forbidden",
+					"service": daemonmeta.ServiceName,
+				})
+				return
+			}
+			envelope.WriteJSON(w, http.StatusAccepted, map[string]any{
+				"status":  "shutting_down",
+				"service": daemonmeta.ServiceName,
+				"pid":     os.Getpid(),
+			})
+			deps.RequestShutdown()
+		})
+	}
 }
 
 // mountMobile registers the Connect Mobile control routes: status, enable,
