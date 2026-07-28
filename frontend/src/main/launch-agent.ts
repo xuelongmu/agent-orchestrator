@@ -80,6 +80,11 @@ export function daemonLaunchAgentOwnsSupervisor(command: string, plist: string):
 	return command.includes("ao-daemon-supervisor") && plist.includes("<string>ao-daemon-supervisor</string>");
 }
 
+export function daemonLaunchAgentShutdownTimeout(plist: string): string | undefined {
+	const match = plist.match(/<key>AO_SHUTDOWN_TIMEOUT<\/key>\s*<string>([^<]*)<\/string>/);
+	return match?.[1];
+}
+
 export function shouldReplaceDaemonLaunchAgent(options: {
 	loaded: boolean;
 	ownsDaemon: boolean;

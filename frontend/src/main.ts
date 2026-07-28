@@ -77,6 +77,7 @@ import { isAllowedAppExternalURL, openAllowedAppExternalURL } from "./main/exter
 import {
 	daemonLaunchAgentOwnsPID,
 	daemonLaunchAgentOwnsSupervisor,
+	daemonLaunchAgentShutdownTimeout,
 	parseDaemonLaunchAgentPID,
 	renderDaemonLaunchAgentPlist,
 	resolveDaemonLaunchAgent,
@@ -507,6 +508,15 @@ async function launchAgentSupervisorIsAOOwned(job: DaemonLaunchAgent, pid: numbe
 		return daemonLaunchAgentOwnsSupervisor(String(stdout), plist);
 	} catch {
 		return false;
+	}
+}
+
+async function launchAgentShutdownWaitMs(job: DaemonLaunchAgent): Promise<number> {
+	try {
+		const installedTimeout = daemonLaunchAgentShutdownTimeout(await readFile(job.plistPath, "utf8"));
+		return Math.max(daemonShutdownGraceMs, ownedShutdownGraceMs({ AO_SHUTDOWN_TIMEOUT: installedTimeout })) + 2_000;
+	} catch {
+		return daemonShutdownGraceMs + 2_000;
 	}
 }
 
@@ -1529,7 +1539,7 @@ async function stopDaemon(): Promise<DaemonStatus> {
 						launchAgentStop = "error";
 					}
 					if (launchAgentStop !== "error") {
-						const shutdownWaitMs = daemonShutdownGraceMs + 2_000;
+						const shutdownWaitMs = await launchAgentShutdownWaitMs(daemonLaunchAgent);
 						const deadline = Date.now() + shutdownWaitMs;
 						let stopped = false;
 						while (Date.now() < deadline) {

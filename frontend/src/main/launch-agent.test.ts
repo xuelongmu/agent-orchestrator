@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	daemonLaunchAgentOwnsPID,
 	daemonLaunchAgentOwnsSupervisor,
+	daemonLaunchAgentShutdownTimeout,
 	DEFAULT_DAEMON_LAUNCH_AGENT_LABEL,
 	parseDaemonLaunchAgentPID,
 	renderDaemonLaunchAgentPlist,
@@ -35,6 +36,15 @@ describe("parseDaemonLaunchAgentPID", () => {
 			false,
 		);
 		expect(daemonLaunchAgentOwnsSupervisor("ao-daemon-supervisor", "<string>foreign</string>")).toBe(false);
+	});
+
+	it("reads the installed job's shutdown timeout", () => {
+		expect(
+			daemonLaunchAgentShutdownTimeout(
+				"<key>AO_PORT</key><string>3001</string><key>AO_SHUTDOWN_TIMEOUT</key>\n<string>45s</string>",
+			),
+		).toBe("45s");
+		expect(daemonLaunchAgentShutdownTimeout("<key>AO_PORT</key><string>3001</string>")).toBeUndefined();
 	});
 
 	it("preserves a loaded packaged definition for shared development", () => {
