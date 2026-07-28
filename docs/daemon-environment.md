@@ -27,16 +27,20 @@ stopped. The desktop Stop action unloads the job explicitly.
 
 The on-disk plist contains only non-secret launch configuration such as paths,
 locale, state location, port, and telemetry mode. Credentials and all other
-shell variables are injected only into the GUI launchd domain's memory while the
-job is loaded, so crash replacements inherit them; unloading the job restores
-or removes those values. This keeps API keys and tokens out of the mode-0600 file
-as well as off disk entirely.
+shell variables are injected into the GUI launchd domain only long enough to
+start a label-specific in-memory supervisor, then the prior domain environment
+is restored. The supervisor retains its job's private environment and restarts
+the daemon child after unsuccessful exits. This keeps concurrent isolated jobs
+from overwriting each other's credentials, and keeps API keys and tokens out of
+the mode-0600 file as well as off disk entirely.
 
 `ao doctor` reports `keychain-session` by asking the running daemon to execute
-`security show-keychain-info` from its own process context. A failed interaction
-is a hard failure because tmux servers and worker panes inherit the daemon's
-audit session. The loopback-only diagnostic route is blocked entirely on the
-optional LAN listener.
+`security show-keychain-info` from its own process context and, when one exists,
+through the active tmux server. The second check matters during upgrade because
+a persistent pre-Aqua tmux server keeps its original audit session and remains
+the parent of current and future worker panes. A failed interaction in either
+context is a hard failure. The loopback-only diagnostic route is blocked
+entirely on the optional LAN listener.
 
 ## Problem statement
 

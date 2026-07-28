@@ -221,13 +221,13 @@ func (c *commandContext) checkKeychainSession(ctx context.Context, st daemonStat
 	case "available":
 		return doctorCheck{
 			Level: doctorPass, Section: doctorSectionCore, Name: name,
-			Message: fmt.Sprintf("daemon pid %d can interact with the login keychain (%s)", st.PID, result.Detail),
+			Message: fmt.Sprintf("worker contexts for daemon pid %d can interact with the login keychain (%s)", st.PID, result.Detail),
 		}
 	case "unavailable":
 		return doctorCheck{
 			Level: doctorFail, Section: doctorSectionCore, Name: name,
 			Message: fmt.Sprintf(
-				"daemon pid %d cannot interact with the login keychain (%s); stop and start AO through the desktop app so its Aqua LaunchAgent can restore access",
+				"worker context for daemon pid %d cannot interact with the login keychain (%s); finish any pre-Aqua tmux sessions, then stop and start AO through the desktop app's Aqua LaunchAgent",
 				st.PID, result.Detail,
 			),
 		}

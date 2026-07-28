@@ -73,6 +73,7 @@ import {
 	parseDaemonLaunchAgentPID,
 	renderDaemonLaunchAgentPlist,
 	resolveDaemonLaunchAgent,
+	shouldReplaceDaemonLaunchAgent,
 	splitDaemonLaunchAgentEnvironment,
 	type DaemonLaunchAgent,
 	type DaemonLaunchAgentEnvironment,
@@ -125,8 +126,6 @@ let daemonStartPromise: Promise<DaemonStatus> | null = null;
 let daemonStartEpoch = 0;
 let daemonStatus: DaemonStatus = { state: "stopped" };
 let daemonLaunchAgent: DaemonLaunchAgent | null = null;
-let restoreLaunchAgentEnvironment: (() => Promise<void>) | null = null;
-let retainedLaunchAgentEnvironment: Array<[string, string]> = [];
 let browserViewHost: BrowserViewHost | null = null;
 let appQuitting = false;
 const daemonOwnership = new DaemonOwnershipController();
@@ -449,6 +448,17 @@ async function launchAgentProcessID(job: DaemonLaunchAgent): Promise<number | nu
 	}
 }
 
+async function processParentID(pid: number | undefined): Promise<number | null> {
+	if (pid === undefined) return null;
+	try {
+		const { stdout } = await execFileAsync("/bin/ps", ["-o", "ppid=", "-p", String(pid)]);
+		const parent = Number(String(stdout).trim());
+		return Number.isSafeInteger(parent) && parent > 0 ? parent : null;
+	} catch {
+		return null;
+	}
+}
+
 async function launchAgentDefinitionChanged(job: DaemonLaunchAgent, desired: string): Promise<boolean> {
 	try {
 		return (await readFile(job.plistPath, "utf8")) !== desired;
@@ -487,46 +497,29 @@ async function installTemporaryLaunchdEnvironment(entries: Array<[string, string
 	}
 }
 
-async function clearRetainedLaunchAgentEnvironment(): Promise<void> {
-	const restore = restoreLaunchAgentEnvironment;
-	restoreLaunchAgentEnvironment = null;
-	if (restore) {
-		await restore();
-	}
-	for (const [key, value] of retainedLaunchAgentEnvironment) {
-		try {
-			const { stdout } = await execFileAsync("/bin/launchctl", ["getenv", key]);
-			if (String(stdout).replace(/\n$/, "") === value) {
-				await execFileAsync("/bin/launchctl", ["unsetenv", key]);
-			}
-		} catch {
-			// Already absent, or inaccessible during logout.
-		}
-	}
-	retainedLaunchAgentEnvironment = [];
-}
-
 async function installAndKickstartLaunchAgent(
 	job: DaemonLaunchAgent,
 	launch: DaemonLaunchSpec,
 	environment: DaemonLaunchAgentEnvironment,
+	preserveLoadedDefinition: boolean,
 	shouldContinue: () => boolean,
 ): Promise<boolean> {
 	if (!shouldContinue()) return false;
 	const plist = renderDaemonLaunchAgentPlist(job, launch, environment.persisted);
-	const definitionChanged = await launchAgentDefinitionChanged(job, plist);
 	const loaded = await isLaunchAgentLoaded(job);
+	const definitionChanged = !preserveLoadedDefinition && (await launchAgentDefinitionChanged(job, plist));
 
 	if (loaded && definitionChanged) {
 		await execFileAsync("/bin/launchctl", ["bootout", job.serviceTarget]);
 	}
 	if (!shouldContinue()) return false;
-	await mkdir(path.dirname(job.plistPath), { recursive: true, mode: 0o750 });
-	await writeFile(job.plistPath, plist, { encoding: "utf8", mode: 0o600 });
-	await chmod(job.plistPath, 0o600);
+	if (!preserveLoadedDefinition || !loaded) {
+		await mkdir(path.dirname(job.plistPath), { recursive: true, mode: 0o750 });
+		await writeFile(job.plistPath, plist, { encoding: "utf8", mode: 0o600 });
+		await chmod(job.plistPath, 0o600);
+	}
 
 	const restoreEnvironment = await installTemporaryLaunchdEnvironment(environment.transient);
-	let keepEnvironment = false;
 	try {
 		if (!shouldContinue()) return false;
 		if (!loaded || definitionChanged) {
@@ -551,16 +544,12 @@ async function installAndKickstartLaunchAgent(
 			}
 			return false;
 		}
-		// Keep transient values in launchd's in-memory GUI domain while the job
-		// is loaded so an unsuccessful-exit restart inherits the same credentials.
-		// They never enter the plist and are restored when this supervisor unloads
-		// the job. A later supervisor can at least remove matching retained values.
-		restoreLaunchAgentEnvironment = restoreEnvironment;
-		retainedLaunchAgentEnvironment = environment.transient;
-		keepEnvironment = true;
 		return true;
 	} finally {
-		if (!keepEnvironment) await restoreEnvironment();
+		// The per-job shell supervisor has inherited a private copy and owns daemon
+		// child restarts. Restore the shared GUI launchd domain immediately so an
+		// isolated job cannot overwrite another job's credentials.
+		await restoreEnvironment();
 	}
 }
 
@@ -569,6 +558,7 @@ async function startDaemonViaLaunchAgent(
 	job: DaemonLaunchAgent,
 	startEpoch: number,
 	environment: DaemonLaunchAgentEnvironment,
+	preserveLoadedDefinition: boolean,
 ): Promise<DaemonStatus> {
 	setDaemonStatus({ state: "starting" });
 	daemonOwnership.clear();
@@ -577,6 +567,7 @@ async function startDaemonViaLaunchAgent(
 			job,
 			launch,
 			environment,
+			preserveLoadedDefinition,
 			() => startEpoch === daemonStartEpoch && !daemonStopIntent.stopping,
 		);
 		if (!started) return daemonStatus;
@@ -973,16 +964,21 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		return daemonStatus;
 	}
 	daemonLaunchAgent = macDaemonLaunchAgent();
-	const launchAgentFullEnvironment = daemonLaunchAgent ? daemonEnv(false) : null;
+	const launchAgentFullEnvironment = daemonLaunchAgent
+		? {
+				...daemonEnv(false),
+				AO_DESKTOP_BUILD_ID: app.isPackaged ? `release:${app.getVersion()}` : "development",
+			}
+		: null;
 	const launchAgentEnvironment = launchAgentFullEnvironment
 		? splitDaemonLaunchAgentEnvironment(launchAgentFullEnvironment)
 		: null;
 	if (launchAgentFullEnvironment) {
 		daemonShutdownGraceMs = ownedShutdownGraceMs(launchAgentFullEnvironment);
 	}
-	retainedLaunchAgentEnvironment = launchAgentEnvironment?.transient ?? [];
 	const launchAgentLoaded = daemonLaunchAgent ? await isLaunchAgentLoaded(daemonLaunchAgent) : false;
 	const launchAgentPID = daemonLaunchAgent ? await launchAgentProcessID(daemonLaunchAgent) : null;
+	const preserveSharedDevLaunchAgent = isDev && !devDaemonConfig.isIsolated && launchAgentLoaded;
 	const launchAgentDefinitionIsStale =
 		daemonLaunchAgent !== null &&
 		launchAgentEnvironment !== null &&
@@ -1003,10 +999,17 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		// in-place upgrade. Replace an identity mismatch or changed definition
 		// only when launchd confirms that our exact label owns this boundary; a
 		// foreign terminal-started daemon remains fail-closed.
-		const replaceStaleLaunchAgent =
-			launchAgentLoaded &&
-			daemonLaunchAgentOwnsPID(launchAgentPID, existing.status.pid) &&
-			(existing.status.code === "identity_mismatch" || launchAgentDefinitionIsStale);
+		const replaceStaleLaunchAgent = shouldReplaceDaemonLaunchAgent({
+			loaded: launchAgentLoaded,
+			ownsDaemon: daemonLaunchAgentOwnsPID(
+				launchAgentPID,
+				existing.status.pid,
+				await processParentID(existing.status.pid),
+			),
+			identityMismatch: existing.status.code === "identity_mismatch",
+			definitionChanged: launchAgentDefinitionIsStale,
+			preserveLoadedDefinition: preserveSharedDevLaunchAgent,
+		});
 		if (replaceStaleLaunchAgent) {
 			replacingMacLaunchAgent = true;
 			console.log("AO: replacing stale macOS daemon LaunchAgent definition");
@@ -1125,7 +1128,13 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// interaction. launchd's gui/<uid> domain is the session boundary that makes
 	// daemon-spawned workers behave like processes launched from Terminal.
 	if (daemonLaunchAgent && launchAgentEnvironment) {
-		return startDaemonViaLaunchAgent(launch, daemonLaunchAgent, startEpoch, launchAgentEnvironment);
+		return startDaemonViaLaunchAgent(
+			launch,
+			daemonLaunchAgent,
+			startEpoch,
+			launchAgentEnvironment,
+			preserveSharedDevLaunchAgent,
+		);
 	}
 
 	setDaemonStatus({ state: "starting" });
@@ -1306,7 +1315,6 @@ async function stopDaemon(): Promise<DaemonStatus> {
 		const previousPID = daemonStatus.pid;
 		try {
 			await execFileAsync("/bin/launchctl", ["bootout", daemonLaunchAgent.serviceTarget]);
-			await clearRetainedLaunchAgentEnvironment();
 		} catch (error) {
 			setDaemonStatus({
 				...daemonStatus,
@@ -1341,9 +1349,6 @@ async function stopDaemon(): Promise<DaemonStatus> {
 		daemonOwnership.clear();
 		setDaemonStatus({ state: "stopped" });
 		return daemonStatus;
-	}
-	if (daemonLaunchAgent) {
-		await clearRetainedLaunchAgentEnvironment();
 	}
 	if (daemonProcess) {
 		const child = daemonProcess;

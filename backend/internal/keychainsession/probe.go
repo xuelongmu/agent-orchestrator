@@ -1,5 +1,5 @@
-// Package keychainsession diagnoses whether the daemon process can interact
-// with the current user's login keychain.
+// Package keychainsession diagnoses whether the daemon and any persistent
+// worker runtime can interact with the current user's login keychain.
 package keychainsession
 
 // Result is the platform-neutral result returned to the loopback diagnostic

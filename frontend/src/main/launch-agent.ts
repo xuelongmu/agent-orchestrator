@@ -28,6 +28,7 @@ const PERSISTED_ENVIRONMENT_KEYS = new Set([
 	"AO_AGENT",
 	"AO_ALLOWED_ORIGINS",
 	"AO_DATA_DIR",
+	"AO_DESKTOP_BUILD_ID",
 	"AO_HOST",
 	"AO_PORT",
 	"AO_REQUEST_TIMEOUT",
@@ -60,8 +61,30 @@ export function parseDaemonLaunchAgentPID(output: string): number | null {
 	return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
 }
 
-export function daemonLaunchAgentOwnsPID(launchAgentPID: number | null, daemonPID: number | undefined): boolean {
-	return launchAgentPID !== null && daemonPID !== undefined && launchAgentPID === daemonPID;
+export function daemonLaunchAgentOwnsPID(
+	launchAgentPID: number | null,
+	daemonPID: number | undefined,
+	daemonParentPID: number | null,
+): boolean {
+	return (
+		launchAgentPID !== null &&
+		daemonPID !== undefined &&
+		(launchAgentPID === daemonPID || launchAgentPID === daemonParentPID)
+	);
+}
+
+export function shouldReplaceDaemonLaunchAgent(options: {
+	loaded: boolean;
+	ownsDaemon: boolean;
+	identityMismatch: boolean;
+	definitionChanged: boolean;
+	preserveLoadedDefinition: boolean;
+}): boolean {
+	return (
+		options.loaded &&
+		options.ownsDaemon &&
+		(options.identityMismatch || (options.definitionChanged && !options.preserveLoadedDefinition))
+	);
 }
 
 function joinPath(...segments: string[]): string {
@@ -111,12 +134,35 @@ function plistString(value: string, indent: string): string {
 	return `${indent}<string>${xml(value)}</string>`;
 }
 
+export const DAEMON_SUPERVISOR_SCRIPT = [
+	"child=",
+	"stop() {",
+	'  if [ -n "$child" ]; then',
+	'    kill -TERM "$child" 2>/dev/null || true',
+	'    wait "$child"',
+	"  fi",
+	"  exit 0",
+	"}",
+	"trap stop TERM INT HUP",
+	"while :; do",
+	'  "$@" &',
+	"  child=$!",
+	'  wait "$child"',
+	"  status=$?",
+	"  child=",
+	'  if [ "$status" -eq 0 ]; then exit 0; fi',
+	"  sleep 1",
+	"done",
+].join("\n");
+
 export function renderDaemonLaunchAgentPlist(
 	job: DaemonLaunchAgent,
 	launch: DaemonLaunchSpec,
 	env: NodeJS.ProcessEnv,
 ): string {
-	const args = launch.source === "configured" ? ["/bin/sh", "-lc", launch.command] : [launch.command, ...launch.args];
+	const daemonArgs =
+		launch.source === "configured" ? ["/bin/sh", "-lc", launch.command] : [launch.command, ...launch.args];
+	const args = ["/bin/sh", "-c", DAEMON_SUPERVISOR_SCRIPT, "ao-daemon-supervisor", ...daemonArgs];
 	const environment = Object.entries(env)
 		.filter((entry): entry is [string, string] => typeof entry[1] === "string")
 		.sort(([a], [b]) => a.localeCompare(b));

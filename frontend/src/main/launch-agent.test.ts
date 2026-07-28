@@ -5,6 +5,7 @@ import {
 	parseDaemonLaunchAgentPID,
 	renderDaemonLaunchAgentPlist,
 	resolveDaemonLaunchAgent,
+	shouldReplaceDaemonLaunchAgent,
 	splitDaemonLaunchAgentEnvironment,
 } from "./launch-agent";
 
@@ -15,10 +16,32 @@ describe("parseDaemonLaunchAgentPID", () => {
 	});
 
 	it("requires the live service PID to match the probed daemon", () => {
-		expect(daemonLaunchAgentOwnsPID(4242, 4242)).toBe(true);
-		expect(daemonLaunchAgentOwnsPID(null, 4242)).toBe(false);
-		expect(daemonLaunchAgentOwnsPID(4242, 5151)).toBe(false);
-		expect(daemonLaunchAgentOwnsPID(4242, undefined)).toBe(false);
+		expect(daemonLaunchAgentOwnsPID(4242, 4242, null)).toBe(true);
+		expect(daemonLaunchAgentOwnsPID(4242, 5151, 4242)).toBe(true);
+		expect(daemonLaunchAgentOwnsPID(null, 4242, null)).toBe(false);
+		expect(daemonLaunchAgentOwnsPID(4242, 5151, 6161)).toBe(false);
+		expect(daemonLaunchAgentOwnsPID(4242, undefined, null)).toBe(false);
+	});
+
+	it("preserves a loaded packaged definition for shared development", () => {
+		expect(
+			shouldReplaceDaemonLaunchAgent({
+				loaded: true,
+				ownsDaemon: true,
+				identityMismatch: false,
+				definitionChanged: true,
+				preserveLoadedDefinition: true,
+			}),
+		).toBe(false);
+		expect(
+			shouldReplaceDaemonLaunchAgent({
+				loaded: true,
+				ownsDaemon: true,
+				identityMismatch: false,
+				definitionChanged: true,
+				preserveLoadedDefinition: false,
+			}),
+		).toBe(true);
 	});
 });
 
@@ -58,6 +81,7 @@ describe("splitDaemonLaunchAgentEnvironment", () => {
 			PATH: "/opt/homebrew/bin:/usr/bin",
 			LC_CTYPE: "UTF-8",
 			AO_RUN_FILE: "/tmp/ao/running.json",
+			AO_DESKTOP_BUILD_ID: "release:0.10.4",
 			AO_TELEMETRY_POSTHOG_HOST: "https://example.test",
 			GH_TOKEN: "github-secret",
 			AO_GITHUB_TOKEN: "ao-secret",
@@ -71,6 +95,7 @@ describe("splitDaemonLaunchAgentEnvironment", () => {
 			PATH: "/opt/homebrew/bin:/usr/bin",
 			LC_CTYPE: "UTF-8",
 			AO_RUN_FILE: "/tmp/ao/running.json",
+			AO_DESKTOP_BUILD_ID: "release:0.10.4",
 			AO_TELEMETRY_POSTHOG_HOST: "https://example.test",
 		});
 		expect(Object.keys(result.persisted)).not.toContain("GH_TOKEN");
@@ -96,6 +121,7 @@ describe("splitDaemonLaunchAgentEnvironment", () => {
 		);
 		expect(plist).not.toContain("secret");
 		expect(plist).not.toContain("GH_TOKEN");
+		expect(plist).toContain("<key>AO_DESKTOP_BUILD_ID</key>\n    <string>release:0.10.4</string>");
 	});
 });
 
@@ -115,6 +141,7 @@ describe("renderDaemonLaunchAgentPlist", () => {
 		);
 
 		expect(plist).toContain("<key>LimitLoadToSessionType</key>\n  <string>Aqua</string>");
+		expect(plist).toContain("<string>ao-daemon-supervisor</string>");
 		expect(plist).toContain("<string>/Applications/AO &amp; Friends/ao</string>");
 		expect(plist).toContain("<string>/tmp/a &lt; b</string>");
 		expect(plist).toContain("<string>a&amp;b&lt;&quot;c&quot;&gt;</string>");
