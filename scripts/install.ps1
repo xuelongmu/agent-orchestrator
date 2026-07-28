@@ -115,27 +115,46 @@ function Invoke-NpmCI {
         [string]$Directory
     )
 
+    $runtimeParts = (Get-NodeRuntimeIdentity) -split '/', 2
+    $hadOSOverride = Test-Path Env:npm_config_os
+    $previousOSOverride = if ($hadOSOverride) {
+        $env:npm_config_os
+    }
+    else {
+        $null
+    }
+    $hadCPUOverride = Test-Path Env:npm_config_cpu
+    $previousCPUOverride = if ($hadCPUOverride) {
+        $env:npm_config_cpu
+    }
+    else {
+        $null
+    }
     $hadPlatformOverride = Test-Path Env:npm_config_platform
-    $previousPlatformOverride = if ($hadPlatformOverride) {
-        $env:npm_config_platform
-    }
-    else {
-        $null
-    }
+    $previousPlatformOverride = if ($hadPlatformOverride) { $env:npm_config_platform } else { $null }
     $hadArchitectureOverride = Test-Path Env:npm_config_arch
-    $previousArchitectureOverride = if ($hadArchitectureOverride) {
-        $env:npm_config_arch
-    }
-    else {
-        $null
-    }
+    $previousArchitectureOverride = if ($hadArchitectureOverride) { $env:npm_config_arch } else { $null }
 
     try {
         Remove-Item Env:npm_config_platform -ErrorAction SilentlyContinue
         Remove-Item Env:npm_config_arch -ErrorAction SilentlyContinue
+        $env:npm_config_os = $runtimeParts[0]
+        $env:npm_config_cpu = $runtimeParts[1]
         Invoke-Native -Command npm -Arguments @('ci', '--prefix', $Directory)
     }
     finally {
+        if ($hadOSOverride) {
+            $env:npm_config_os = $previousOSOverride
+        }
+        else {
+            Remove-Item Env:npm_config_os -ErrorAction SilentlyContinue
+        }
+        if ($hadCPUOverride) {
+            $env:npm_config_cpu = $previousCPUOverride
+        }
+        else {
+            Remove-Item Env:npm_config_cpu -ErrorAction SilentlyContinue
+        }
         if ($hadPlatformOverride) {
             $env:npm_config_platform = $previousPlatformOverride
         }
@@ -316,41 +335,47 @@ function Install-Binary {
         [string]$Destination
     )
 
+    $stagedPath = "$Destination.new-$PID"
+    $setAsidePath = "$Destination.in-use-$PID"
+    $hadDestination = Test-Path -LiteralPath $Destination
+
     try {
-        Copy-Item -LiteralPath $Source -Destination $Destination -Force
-        return
+        # Stage the validated build on the destination volume before touching
+        # the only installed copy.
+        Copy-Item -LiteralPath $Source -Destination $stagedPath -Force
+        if ($hadDestination) {
+            Move-Item -LiteralPath $Destination -Destination $setAsidePath -Force
+        }
+
+        try {
+            Move-Item -LiteralPath $stagedPath -Destination $Destination -Force
+        }
+        catch {
+            $publishError = $_
+            if ($hadDestination -and (Test-Path -LiteralPath $setAsidePath)) {
+                try {
+                    Move-Item -LiteralPath $setAsidePath -Destination $Destination -Force
+                }
+                catch {
+                    throw "Publishing the new AO binary failed; the intact previous binary remains at $setAsidePath"
+                }
+            }
+            throw $publishError
+        }
     }
-    catch {
-        $copyError = $_
-        if (-not (Test-Path -LiteralPath $Destination)) {
-            throw
+    finally {
+        if (Test-Path -LiteralPath $stagedPath) {
+            Remove-Item -LiteralPath $stagedPath -Force
         }
     }
 
-    # Windows can keep an executable locked while restored PTY hosts continue
-    # serving live sessions after the daemon exits. Rename the old image out of
-    # the stable PATH location, then publish the new build in its place.
-    $setAsidePath = "$Destination.in-use-$PID"
-    try {
-        Move-Item -LiteralPath $Destination -Destination $setAsidePath -Force
-    }
-    catch {
-        throw $copyError
-    }
-
-    try {
-        Copy-Item -LiteralPath $Source -Destination $Destination -Force
-    }
-    catch {
-        Move-Item -LiteralPath $setAsidePath -Destination $Destination -Force
-        throw
-    }
-
-    try {
-        Remove-Item -LiteralPath $setAsidePath -Force
-    }
-    catch {
-        Write-Warning "The previous in-use binary remains at $setAsidePath and can be removed after its sessions exit."
+    if ($hadDestination -and (Test-Path -LiteralPath $setAsidePath)) {
+        try {
+            Remove-Item -LiteralPath $setAsidePath -Force
+        }
+        catch {
+            Write-Warning "The previous in-use binary remains at $setAsidePath and can be removed after its sessions exit."
+        }
     }
 }
 
@@ -502,7 +527,8 @@ if ($nodeRuntimeIdentity -notin @('win32/x64', 'win32/arm64')) {
 }
 
 if ($Start) {
-    $releaseApp = Get-Process -Name 'agent-orchestrator' -ErrorAction SilentlyContinue
+    $releaseApp = Get-Process -Name 'agent-orchestrator' -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.HasExited }
     if ($releaseApp) {
         throw 'Close the installed Agent Orchestrator desktop app before using -Start'
     }
