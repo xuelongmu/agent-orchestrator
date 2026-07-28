@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/keychainsession"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
 )
@@ -68,7 +69,8 @@ func NewWithDeps(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager,
 	}
 	srv.http = &http.Server{
 		Handler: NewRouterWithControl(cfg, log, termMgr, deps, ControlDeps{
-			RequestShutdown: srv.requestShutdown,
+			RequestShutdown:      srv.requestShutdown,
+			ProbeKeychainSession: keychainsession.Probe,
 		}),
 		// ReadHeaderTimeout guards against slow-loris even on loopback;
 		// per-request body/handler timeouts are applied per-surface.
@@ -147,7 +149,9 @@ func (s *Server) Run(ctx context.Context) error {
 		// The deadline elapsed with connections still open; force them closed.
 		s.log.Warn("graceful shutdown timed out, forcing close", "err", err)
 		_ = s.http.Close()
-		return fmt.Errorf("graceful shutdown exceeded %s: %w", s.cfg.ShutdownTimeout, err)
+		// This is still a deliberate stop, not a runtime crash. Returning an
+		// error would make the macOS supervisor restart the daemon after `ao stop`.
+		return nil
 	}
 
 	s.log.Info("daemon stopped cleanly")

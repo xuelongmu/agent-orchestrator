@@ -1,12 +1,12 @@
 # Daemon environment: the GUI-launch PATH/credentials problem
 
-Status: proposed
+Status: implemented
 Scope: desktop (Electron) launch of the AO daemon on macOS (and any GUI-launched
 desktop platform)
 
 ## Summary
 
-When the desktop app is launched from Finder/Dock/Spotlight, the daemon it spawns
+When the desktop app is launched from Finder/Dock/Spotlight, the daemon it starts
 inherits a stunted environment (minimal `PATH`, no shell-exported credentials).
 The daemon then cannot find `tmux`/`git`/the agent CLIs, and the agents it
 launches cannot see API keys. The same app launched from a terminal works,
@@ -14,9 +14,54 @@ because a terminal-started process inherits the shell's fully-populated
 environment. The fix is to resolve the user's login-shell environment once at
 startup and use it as the base for the daemon's environment.
 
+## Aqua audit session and login-keychain access
+
+Environment repair alone does not grant login-keychain access. macOS scopes
+keychain interaction to an audit session, and a daemon inherited from the wrong
+launch context can receive `errSecInteractionNotAllowed` even when it has the
+right user ID and environment. AO therefore writes a mode-0600 LaunchAgent
+definition beside its selected run file and bootstraps it into `gui/<uid>` with
+`LimitLoadToSessionType=Aqua`. A credential-holding supervisor inside the job
+restarts the daemon child after an unsuccessful exit, while a graceful `ao stop`
+exits the supervisor and remains stopped. launchd does not restart a lost
+supervisor without its private environment. The desktop Stop action unloads the
+job explicitly.
+
+The on-disk plist contains only non-secret launch configuration such as paths,
+locale, state location, port, and telemetry mode. Credentials and all other
+shell variables are handed directly to a label-specific in-memory supervisor
+over a protected local stream. The supervisor retains that private environment and restarts
+the daemon child after unsuccessful exits, with bounded progressive-backoff
+retries so a permanently broken command does not spin forever. This keeps
+concurrent isolated jobs from overwriting each other's credentials, and keeps
+API keys and tokens out of the mode-0600 file as well as off disk entirely. A
+separate AO handoff helper holds a BSD lock under the canonical
+`~/.ao/launchd` directory and serves the exact environment once over a
+mode-0600 Unix socket. The LaunchAgent supervisor clears its inherited exports,
+imports that protected stream, and then closes the socket before starting the
+daemon. Credentials therefore never enter the plist, launchd's shared
+environment, or a command argument. Electron crashes close the helper's stdin;
+the helper then closes and removes the socket before releasing the lock.
+
+LaunchAgent stdout and stderr are pumped into label-specific files under the AO
+state directory. Each stream rotates at 5 MiB and retains one previous file, so
+routine daemon health logging remains bounded for persistent desktop sessions.
+
+The plist stores only a SHA-256 identity of the transient environment. A
+healthy, AO-owned LaunchAgent is replaced when that identity changes, allowing
+rotated credentials to take effect without writing their values to disk.
+
+`ao doctor` reports `keychain-session` by asking the running daemon to execute
+`security show-keychain-info` from its own process context and, when one exists,
+through the active tmux server. The second check matters during upgrade because
+a persistent pre-Aqua tmux server keeps its original audit session and remains
+the parent of current and future worker panes. A failed interaction in either
+context is a hard failure. The loopback-only diagnostic route is blocked
+entirely on the optional LAN listener.
+
 ## Problem statement
 
-The Electron supervisor spawns the Go daemon with the environment it forwards in
+The Electron supervisor starts the Go daemon with the environment it forwards in
 `daemonEnv()` (`frontend/src/main.ts`), which is essentially `...process.env`
 plus AO's telemetry defaults. The daemon, in turn, is the parent of every agent
 session (it execs `tmux`, which runs `claude`/`codex`, etc.), and the agent's
@@ -27,7 +72,7 @@ session (it execs `tmux`, which runs `claude`/`codex`, etc.), and the agent's
 So whatever environment the daemon receives propagates to the entire stack:
 
 ```
-launchd (or terminal) -> Electron main -> daemon -> tmux -> agent (claude/codex)
+Electron main -> launchd gui/<uid> LaunchAgent -> daemon -> tmux -> agent
 ```
 
 When that environment is impoverished, everything downstream breaks.

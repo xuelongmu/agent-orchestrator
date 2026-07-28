@@ -165,13 +165,13 @@ ao start --release    # always fetch and open the published desktop app
 run directly:
 
 ```bash
-cd frontend && npm run dev       # Electron app; spawns the daemon from source
+cd frontend && npm run dev       # Electron app; starts the daemon from source
 cd frontend && npm run dev:web   # renderer only, in a normal browser
 cd backend  && go run ./cmd/ao daemon   # daemon only, no UI
 ```
 
 `ao daemon` is a hidden command — it is the daemon entrypoint the desktop app
-spawns, not something end users invoke.
+starts (through an Aqua LaunchAgent on macOS), not something end users invoke.
 
 ## Verify your setup
 
@@ -182,7 +182,10 @@ ao doctor
 This is the fastest way to confirm an environment is good. It checks config, the
 data directory, SQLite, the running daemon, git, your platform's terminal runtime
 (tmux on macOS/Linux, ConPTY on Windows), whether the `ao` on your `PATH` is the
-one you built, each agent harness it can find, and your gh token.
+one you built, each agent harness it can find, and your gh token. On macOS it
+also asks the running daemon and any active tmux server to perform a
+login-keychain interaction; `keychain-session: FAIL` means current or future
+workers cannot use login-keychain credentials.
 
 It does **not** check Node or either `node_modules`, so a green `ao doctor` on a
 checkout that skipped the `npm ci` steps above will still fail at
@@ -240,6 +243,18 @@ docker build -f test/cli/Dockerfile -t ao-cli-smoke . && docker run --rm --init 
 ```
 
 ## Troubleshooting
+
+**macOS workers hang with keychain-backed credentials** — the desktop app starts
+the daemon through a LaunchAgent in the user's `gui/<uid>` launchd domain. It
+restarts the daemon child after crashes but stays stopped after a graceful
+`ao stop`. Its
+generated plist and label-specific logs live beside the selected run file under
+`~/.ao/launchd` and `~/.ao` (or the corresponding `AO_RUN_FILE` override).
+This keeps the daemon, tmux server, and worker panes in the Aqua audit session
+where login-keychain interaction is allowed. Run `ao doctor` and check
+`keychain-session`; if it identifies an active tmux server, finish its sessions
+so that pre-Aqua server exits, then stop and start the daemon from the desktop
+app to unload any stale job and bootstrap the current definition.
 
 **Processes still around right after Ctrl-C** — shutdown is graceful, not
 immediate. The daemon drains on SIGTERM within `AO_SHUTDOWN_TIMEOUT` (default

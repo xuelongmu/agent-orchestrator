@@ -29,13 +29,19 @@ import {
 	type UpdateStatus,
 } from "./main/update-settings";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { evaluateDaemonIdentity, type DaemonLaunchSpec, resolveDaemonLaunch } from "./shared/daemon-launch";
+import {
+	daemonBinaryName,
+	evaluateDaemonIdentity,
+	type DaemonLaunchSpec,
+	resolveDaemonLaunch,
+} from "./shared/daemon-launch";
 import { ownedShutdownGraceMs } from "./shared/daemon-shutdown";
 import { createListenPortScanner, defaultRunFilePath, parseRunFile, type RunFileInfo } from "./shared/daemon-discovery";
 import type { DaemonStatus } from "./shared/daemon-status";
@@ -68,7 +74,19 @@ import {
 import { killDaemon, probeProcessLiveness, terminateProcess } from "./main/process-lifecycle";
 import { readMigrationState, updateMigration, writeAppStateMarker, type MigrationState } from "./main/app-state";
 import { isAllowedAppExternalURL, openAllowedAppExternalURL } from "./main/external-open";
-import { pathInside, samePath } from "./shared/path-identity";
+import {
+	daemonLaunchAgentOwnsPID,
+	daemonLaunchAgentOwnsSupervisor,
+	daemonLaunchAgentShutdownTimeout,
+	parseDaemonLaunchAgentPID,
+	renderDaemonLaunchAgentPlist,
+	resolveDaemonLaunchAgent,
+	shouldReplaceDaemonLaunchAgent,
+	splitDaemonLaunchAgentEnvironment,
+	type DaemonLaunchAgent,
+	type DaemonLaunchAgentEnvironment,
+} from "./main/launch-agent";
+import { pathIdentityKey, pathInside, samePath } from "./shared/path-identity";
 
 // Globals injected at compile time by @electron-forge/plugin-vite.
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
@@ -115,16 +133,16 @@ let daemonShutdownGraceMs = ownedShutdownGraceMs(process.env);
 let daemonStartPromise: Promise<DaemonStatus> | null = null;
 let daemonStartEpoch = 0;
 let daemonStatus: DaemonStatus = { state: "stopped" };
+let daemonLaunchAgent: DaemonLaunchAgent | null = null;
 let browserViewHost: BrowserViewHost | null = null;
 let appQuitting = false;
 const daemonOwnership = new DaemonOwnershipController();
 const daemonStopIntent = new DaemonStopIntentController();
 
-// The desktop app owns the daemon it spawns, so replace an unexpectedly exited
-// child with a bounded retry loop. Go's boot reconciliation adopts the durable
-// tmux/ConPTY sessions after the replacement reaches readiness. Intentional
-// stops and app quit cancel the loop below; no signal handling changes are
-// needed in either process.
+// On Windows/Linux the desktop app owns the daemon child it spawns, so replace
+// an unexpected exit with a bounded retry loop. macOS delegates that policy to
+// launchd's KeepAlive job instead. Go's boot reconciliation adopts the durable
+// tmux/ConPTY sessions after either replacement reaches readiness.
 const daemonRestart = new DaemonRestartController({
 	restart: () => (daemonProcess ? undefined : startDaemon()),
 	shouldRestart: () => daemonOwnership.appOwned && !appQuitting && !daemonStopIntent.stopping,
@@ -412,6 +430,328 @@ function runFilePath(): string | null {
 	return defaultRunFilePath(process.platform, process.env, os.homedir());
 }
 
+function canonicalRunFileIdentity(runFile: string): string {
+	return pathIdentityKey(runFile);
+}
+
+type MacDaemonLaunchAgent = {
+	job: DaemonLaunchAgent;
+	runFilePath: string;
+};
+
+async function macDaemonLaunchAgent(): Promise<MacDaemonLaunchAgent | null> {
+	if (process.platform !== "darwin") return null;
+	const runFile = runFilePath();
+	const canonicalRunFile = defaultRunFilePath(process.platform, process.env, os.homedir());
+	if (!runFile || !canonicalRunFile) return null;
+	const resolvedRunFile = await canonicalRunFileIdentity(runFile);
+	return {
+		job: resolveDaemonLaunchAgent(resolvedRunFile, await canonicalRunFileIdentity(canonicalRunFile), os.userInfo().uid),
+		runFilePath: resolvedRunFile,
+	};
+}
+
+async function isLaunchAgentLoaded(job: DaemonLaunchAgent): Promise<boolean> {
+	try {
+		await execFileAsync("/bin/launchctl", ["print", job.serviceTarget]);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function launchAgentProcessID(job: DaemonLaunchAgent): Promise<number | null> {
+	try {
+		const { stdout } = await execFileAsync("/bin/launchctl", ["print", job.serviceTarget]);
+		return parseDaemonLaunchAgentPID(String(stdout));
+	} catch {
+		return null;
+	}
+}
+
+async function processAncestorIDs(pid: number | undefined): Promise<number[]> {
+	if (pid === undefined) return [];
+	const ancestors: number[] = [];
+	const seen = new Set([pid]);
+	let current = pid;
+	for (let depth = 0; depth < 32; depth += 1) {
+		let parent: number;
+		try {
+			const { stdout } = await execFileAsync("/bin/ps", ["-o", "ppid=", "-p", String(current)]);
+			parent = Number(String(stdout).trim());
+		} catch {
+			break;
+		}
+		if (!Number.isSafeInteger(parent) || parent <= 1 || seen.has(parent)) break;
+		ancestors.push(parent);
+		seen.add(parent);
+		current = parent;
+	}
+	return ancestors;
+}
+
+async function launchAgentDefinitionChanged(job: DaemonLaunchAgent, desired: string): Promise<boolean> {
+	try {
+		return (await readFile(job.plistPath, "utf8")) !== desired;
+	} catch {
+		return true;
+	}
+}
+
+async function launchAgentSupervisorIsAOOwned(job: DaemonLaunchAgent, pid: number | null): Promise<boolean> {
+	if (pid === null) return false;
+	try {
+		const [{ stdout }, plist] = await Promise.all([
+			execFileAsync("/bin/ps", ["-ww", "-o", "command=", "-p", String(pid)]),
+			readFile(job.plistPath, "utf8"),
+		]);
+		return daemonLaunchAgentOwnsSupervisor(String(stdout), plist);
+	} catch {
+		return false;
+	}
+}
+
+async function launchAgentShutdownWaitMs(job: DaemonLaunchAgent): Promise<number> {
+	try {
+		const installedTimeout = daemonLaunchAgentShutdownTimeout(await readFile(job.plistPath, "utf8"));
+		return Math.max(daemonShutdownGraceMs, ownedShutdownGraceMs({ AO_SHUTDOWN_TIMEOUT: installedTimeout })) + 2_000;
+	} catch {
+		return daemonShutdownGraceMs + 2_000;
+	}
+}
+
+function launchAgentHandoffBinary(): string {
+	return path.join(
+		app.isPackaged ? process.resourcesPath : app.getAppPath(),
+		"daemon",
+		daemonBinaryName(process.platform),
+	);
+}
+
+async function startLaunchdEnvironmentHandoff(
+	helperBinary: string,
+	lockPath: string,
+	socketPath: string | null,
+	entries: Array<[string, string]> | null,
+): Promise<{ waitForDelivery: () => Promise<void>; release: () => Promise<void> }> {
+	await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o750 });
+	if (socketPath) await mkdir(path.dirname(socketPath), { recursive: true, mode: 0o750 });
+	return new Promise((resolve, reject) => {
+		const holder = spawn("/usr/bin/lockf", ["-k", "-t", "30", lockPath, helperBinary, "launch-agent-handoff"], {
+			stdio: ["pipe", "pipe", "pipe"],
+			windowsHide: true,
+		});
+		let output = "";
+		let errorOutput = "";
+		let settled = false;
+		const fail = (error: Error): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			holder.stdin.destroy();
+			reject(error);
+		};
+		const timer = setTimeout(() => {
+			holder.kill("SIGTERM");
+			fail(new Error("timed out waiting for the macOS launchd environment handoff"));
+		}, 31_000);
+		holder.stderr.on("data", (chunk: Buffer) => {
+			errorOutput += chunk.toString("utf8");
+		});
+		holder.stdout.on("data", (chunk: Buffer) => {
+			output += chunk.toString("utf8");
+			if (settled || !output.includes("ready\n")) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve({
+				waitForDelivery: () => {
+					if (entries === null || output.includes("delivered\n")) return Promise.resolve();
+					return new Promise<void>((deliveryResolve, deliveryReject) => {
+						const deliveryTimer = setTimeout(() => {
+							deliveryReject(new Error("timed out waiting for the private launch environment delivery"));
+						}, PORT_DISCOVERY_TIMEOUT_MS);
+						const onData = (): void => {
+							if (!output.includes("delivered\n")) return;
+							clearTimeout(deliveryTimer);
+							holder.stdout.off("data", onData);
+							deliveryResolve();
+						};
+						holder.stdout.on("data", onData);
+						holder.once("exit", (code) => {
+							clearTimeout(deliveryTimer);
+							deliveryReject(
+								new Error(`macOS launch environment delivery exited with code ${String(code)}: ${errorOutput.trim()}`),
+							);
+						});
+					});
+				},
+				release: () =>
+					new Promise<void>((releaseResolve, releaseReject) => {
+						if (holder.exitCode !== null || holder.signalCode !== null) {
+							releaseResolve();
+							return;
+						}
+						holder.once("error", releaseReject);
+						holder.once("exit", (code) => {
+							if (code === 0) releaseResolve();
+							else
+								releaseReject(
+									new Error(
+										`macOS launchd environment handoff exited with code ${String(code)}: ${errorOutput.trim()}`,
+									),
+								);
+						});
+						holder.stdin.end("release\n");
+					}),
+			});
+		});
+		holder.once("error", (error) => {
+			fail(error);
+		});
+		holder.once("exit", (code) => {
+			if (settled) return;
+			fail(
+				new Error(`could not acquire the macOS launchd environment lock (code ${String(code)}): ${errorOutput.trim()}`),
+			);
+		});
+		const request = entries === null ? {} : { socket_path: socketPath, environment: Object.fromEntries(entries) };
+		holder.stdin.write(`${JSON.stringify(request)}\n`);
+	});
+}
+
+async function installAndKickstartLaunchAgent(
+	job: DaemonLaunchAgent,
+	launch: DaemonLaunchSpec,
+	helperBinary: string,
+	environment: DaemonLaunchAgentEnvironment,
+	sharedDevelopment: boolean,
+	shouldContinue: () => boolean,
+): Promise<boolean> {
+	if (!shouldContinue()) return false;
+	const runtimeEnvironment = {
+		...environment.persisted,
+		...Object.fromEntries(environment.transient),
+	};
+	const environmentHandoff = await startLaunchdEnvironmentHandoff(
+		helperBinary,
+		job.environmentLockPath,
+		job.environmentSocketPath,
+		Object.entries(runtimeEnvironment).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+	);
+	try {
+		if (!shouldContinue()) return false;
+		const plist = renderDaemonLaunchAgentPlist(job, launch, environment.persisted);
+		// Re-probe under the cross-process lock. A packaged app may have loaded
+		// the canonical definition while a shared-development app was waiting.
+		const loaded = await isLaunchAgentLoaded(job);
+		const preserveLoadedDefinition = sharedDevelopment && loaded;
+		const definitionChanged = !preserveLoadedDefinition && (await launchAgentDefinitionChanged(job, plist));
+		if (loaded && definitionChanged) {
+			await execFileAsync("/bin/launchctl", ["bootout", job.serviceTarget]);
+		}
+		if (!shouldContinue()) return false;
+		if (!preserveLoadedDefinition || !loaded) {
+			await mkdir(path.dirname(job.plistPath), { recursive: true, mode: 0o750 });
+			await writeFile(job.plistPath, plist, { encoding: "utf8", mode: 0o600 });
+			await chmod(job.plistPath, 0o600);
+		}
+		if (!shouldContinue()) return false;
+		let startedByBootstrap = false;
+		if (!loaded || definitionChanged) {
+			try {
+				await execFileAsync("/bin/launchctl", ["bootstrap", job.domain, job.plistPath]);
+				startedByBootstrap = true;
+			} catch (error) {
+				// A concurrent app instance may have loaded the same job after our
+				// print probe. Accept that race only when launchd now reports it loaded.
+				if (!(await isLaunchAgentLoaded(job))) throw error;
+			}
+		}
+		if (!shouldContinue()) {
+			if (await isLaunchAgentLoaded(job)) {
+				await execFileAsync("/bin/launchctl", ["bootout", job.serviceTarget]);
+			}
+			return false;
+		}
+		if (!startedByBootstrap) {
+			await execFileAsync("/bin/launchctl", ["kickstart", "-k", job.serviceTarget]);
+		}
+		await environmentHandoff.waitForDelivery();
+		if (!shouldContinue()) {
+			if (await isLaunchAgentLoaded(job)) {
+				await execFileAsync("/bin/launchctl", ["bootout", job.serviceTarget]);
+			}
+			return false;
+		}
+		return true;
+	} finally {
+		// The per-job shell supervisor has received a private copy and owns daemon
+		// child restarts. Releasing the socket helper unlocks the next transaction.
+		await environmentHandoff.release();
+	}
+}
+
+async function startDaemonViaLaunchAgent(
+	launch: DaemonLaunchSpec,
+	job: DaemonLaunchAgent,
+	startEpoch: number,
+	helperBinary: string,
+	environment: DaemonLaunchAgentEnvironment,
+	sharedDevelopment: boolean,
+): Promise<DaemonStatus> {
+	setDaemonStatus({ state: "starting" });
+	daemonOwnership.clear();
+	try {
+		const started = await installAndKickstartLaunchAgent(
+			job,
+			launch,
+			helperBinary,
+			environment,
+			sharedDevelopment,
+			() => startEpoch === daemonStartEpoch && !daemonStopIntent.stopping,
+		);
+		if (!started) return daemonStatus;
+	} catch (error) {
+		if (startEpoch !== daemonStartEpoch || daemonStopIntent.stopping) return daemonStatus;
+		setDaemonStatus({
+			state: "error",
+			message: `Could not start the macOS daemon LaunchAgent: ${String(error)}`,
+			code: "spawn_failed",
+		});
+		return daemonStatus;
+	}
+
+	const deadline = Date.now() + PORT_DISCOVERY_TIMEOUT_MS;
+	while (Date.now() < deadline) {
+		if (startEpoch !== daemonStartEpoch || daemonStopIntent.stopping) return daemonStatus;
+		const existing = await inspectExistingDaemon(launch);
+		if (existing?.status.state === "ready") {
+			setDaemonStatus(existing.status);
+			return daemonStatus;
+		}
+		await new Promise<void>((resolve) => setTimeout(resolve, RUN_FILE_POLL_MS));
+	}
+	setDaemonStatus({
+		state: "error",
+		message: `The macOS daemon LaunchAgent started but did not become ready. See ${job.stderrPath}.`,
+		code: "not_ready",
+	});
+	return daemonStatus;
+}
+
+async function daemonLaunchAgentBuildIdentity(launch: DaemonLaunchSpec): Promise<string> {
+	if (app.isPackaged) return `release:${app.getVersion()}`;
+	if (devDaemonConfig.isIsolated && launch.source !== "configured") {
+		try {
+			const binary = await stat(launch.command);
+			return `development:${binary.size}:${Math.trunc(binary.mtimeMs)}`;
+		} catch {
+			return "development:missing";
+		}
+	}
+	return "development:shared";
+}
+
 // How long to wait for the login shell to print its env before giving up. A
 // misconfigured rc that blocks (or a slow nvm/pyenv chain) must not hang startup;
 // the daemon then falls back to the static PATH floor.
@@ -488,11 +828,11 @@ function ensureShellEnv(): Promise<void> {
 	return shellEnvPromise;
 }
 
-function daemonEnv(): NodeJS.ProcessEnv {
+function daemonEnv(appOwned = true): NodeJS.ProcessEnv {
 	// AO_OWNER=app marks this daemon as app-spawned so the app can re-link the
 	// supervisor on attach (headless `ao start` daemons get no AO_OWNER and stay
 	// unlinked, preserving their persistence across app quit).
-	const ownerTag = { AO_OWNER: "app" };
+	const ownerTag: Record<string, string> = appOwned ? { AO_OWNER: "app" } : {};
 	// Dev shares the installed app's daemon and state by default. Explicit
 	// isolation injects sandbox defaults; user-set values still take priority.
 	const devExtras: Record<string, string> = {};
@@ -507,9 +847,17 @@ function daemonEnv(): NodeJS.ProcessEnv {
 	}
 	// Windows keeps the old behavior exactly: no shell probe, no unix PATH floor.
 	if (process.platform === "win32") {
-		return { ...process.env, ...devExtras, ...telemetryOverrides(), ...ownerTag };
+		const env = { ...process.env, ...devExtras, ...telemetryOverrides(), ...ownerTag };
+		if (!appOwned) delete env.AO_OWNER;
+		return env;
 	}
-	return buildDaemonEnv(process.env, cachedShellEnv, { ...devExtras, ...telemetryOverrides(), ...ownerTag });
+	const env = buildDaemonEnv(process.env, cachedShellEnv, {
+		...devExtras,
+		...telemetryOverrides(),
+		...ownerTag,
+	});
+	if (!appOwned) delete env.AO_OWNER;
+	return env;
 }
 
 function processAlive(pid: number): boolean {
@@ -768,23 +1116,79 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		});
 		return daemonStatus;
 	}
+	const macLaunchAgent = await macDaemonLaunchAgent();
+	daemonLaunchAgent = macLaunchAgent?.job ?? null;
+	const launchAgentBuildIdentity = macLaunchAgent ? await daemonLaunchAgentBuildIdentity(launch) : null;
+	const launchAgentFullEnvironment = macLaunchAgent
+		? {
+				...daemonEnv(false),
+				AO_RUN_FILE: macLaunchAgent.runFilePath,
+				AO_DESKTOP_BUILD_ID: launchAgentBuildIdentity ?? "development:unknown",
+			}
+		: null;
+	const launchAgentEnvironment = launchAgentFullEnvironment
+		? splitDaemonLaunchAgentEnvironment(launchAgentFullEnvironment)
+		: null;
+	if (launchAgentEnvironment) {
+		const transientIdentity = createHash("sha256")
+			.update(JSON.stringify(launchAgentEnvironment.transient))
+			.digest("hex");
+		launchAgentEnvironment.persisted.AO_LAUNCH_AGENT_ENV_ID = `sha256:${transientIdentity}`;
+	}
+	if (launchAgentFullEnvironment) {
+		daemonShutdownGraceMs = ownedShutdownGraceMs(launchAgentFullEnvironment);
+	}
+	const launchAgentLoaded = daemonLaunchAgent ? await isLaunchAgentLoaded(daemonLaunchAgent) : false;
+	const launchAgentPID = daemonLaunchAgent ? await launchAgentProcessID(daemonLaunchAgent) : null;
+	const sharedDevelopment = isDev && !devDaemonConfig.isIsolated;
+	const preserveSharedDevLaunchAgent = sharedDevelopment && launchAgentLoaded;
+	const launchAgentDefinitionIsStale =
+		daemonLaunchAgent !== null &&
+		launchAgentEnvironment !== null &&
+		launchAgentLoaded &&
+		(await launchAgentDefinitionChanged(
+			daemonLaunchAgent,
+			renderDaemonLaunchAgentPlist(daemonLaunchAgent, launch, launchAgentEnvironment.persisted),
+		));
 
+	let replacingMacLaunchAgent = false;
 	const existing = await inspectExistingDaemon(launch);
-	if (startEpoch !== daemonStartEpoch) {
+	if (startEpoch !== daemonStartEpoch || daemonStopIntent.stopping) {
 		return daemonStatus;
 	}
 	if (existing) {
-		setDaemonStatus(existing.status);
-		// Re-link the supervisor only when attaching to an app-owned daemon (one we
-		// previously spawned). Headless `ao start` daemons (owner unset) stay unlinked
-		// so they remain persistent after app quit.
-		const appOwned = shouldLinkOnAttach(existing.owner);
-		daemonOwnership.setAppOwned(appOwned);
-		if (appOwned) {
-			if (existing.status.state === "ready") daemonRestart.onReady();
-			establishSupervisorLink();
+		// A persistent LaunchAgent may still be running the binary from the
+		// previous app version even when its executable path is stable across an
+		// in-place upgrade. Replace an identity mismatch or changed definition
+		// only when launchd confirms that our exact label owns this boundary; a
+		// foreign terminal-started daemon remains fail-closed.
+		const replaceStaleLaunchAgent = shouldReplaceDaemonLaunchAgent({
+			loaded: launchAgentLoaded,
+			ownsDaemon: daemonLaunchAgentOwnsPID(
+				launchAgentPID,
+				existing.status.pid,
+				await processAncestorIDs(existing.status.pid),
+			),
+			identityMismatch: existing.status.code === "identity_mismatch",
+			definitionChanged: launchAgentDefinitionIsStale,
+			preserveLoadedDefinition: preserveSharedDevLaunchAgent,
+		});
+		if (replaceStaleLaunchAgent) {
+			replacingMacLaunchAgent = true;
+			console.log("AO: replacing stale macOS daemon LaunchAgent definition");
+		} else {
+			setDaemonStatus(existing.status);
+			// Re-link the supervisor only when attaching to an app-owned daemon (one we
+			// previously spawned). Headless `ao start` daemons (owner unset) stay unlinked
+			// so they remain persistent after app quit.
+			const appOwned = shouldLinkOnAttach(existing.owner);
+			daemonOwnership.setAppOwned(appOwned);
+			if (appOwned) {
+				if (existing.status.state === "ready") daemonRestart.onReady();
+				establishSupervisorLink();
+			}
+			return daemonStatus;
 		}
-		return daemonStatus;
 	}
 
 	// Defensive: inspectExistingDaemon only attaches when the run-file agrees with
@@ -795,11 +1199,13 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// daemon answers. The expected port (AO_PORT or the default) is exactly the
 	// port the Go child would bind and collide on — probing a hardcoded 3001 would
 	// miss an AO_PORT override.
-	const directDaemon = await resolveDaemonFromPort({
-		expectedPort: resolvedDaemonPort(),
-		probe: readDaemonProbe,
-		identityError: (probe) => daemonIdentityError(launch, probe),
-	});
+	const directDaemon = replacingMacLaunchAgent
+		? null
+		: await resolveDaemonFromPort({
+				expectedPort: resolvedDaemonPort(),
+				probe: readDaemonProbe,
+				identityError: (probe) => daemonIdentityError(launch, probe),
+			});
 	if (startEpoch !== daemonStartEpoch) {
 		return daemonStatus;
 	}
@@ -877,6 +1283,22 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 			code: "binary_missing",
 		});
 		return daemonStatus;
+	}
+
+	// macOS login-keychain access is scoped to the Aqua audit session. Starting
+	// the daemon as an Electron child can put the daemon, its tmux server, and
+	// every worker pane in a non-GUI audit session where securityd refuses all
+	// interaction. launchd's gui/<uid> domain is the session boundary that makes
+	// daemon-spawned workers behave like processes launched from Terminal.
+	if (daemonLaunchAgent && launchAgentEnvironment) {
+		return startDaemonViaLaunchAgent(
+			launch,
+			daemonLaunchAgent,
+			startEpoch,
+			launchAgentHandoffBinary(),
+			launchAgentEnvironment,
+			sharedDevelopment,
+		);
 	}
 
 	setDaemonStatus({ state: "starting" });
@@ -1053,6 +1475,113 @@ async function stopDaemon(): Promise<DaemonStatus> {
 	daemonRestart.cancel();
 	daemonStartEpoch += 1;
 	daemonStartPromise = null;
+	let stopTargetPID = daemonStatus.pid;
+	if (daemonLaunchAgent) {
+		let releaseLaunchAgentLock: (() => Promise<void>) | null = null;
+		try {
+			const lockHandoff = await startLaunchdEnvironmentHandoff(
+				launchAgentHandoffBinary(),
+				daemonLaunchAgent.environmentLockPath,
+				null,
+				null,
+			);
+			releaseLaunchAgentLock = lockHandoff.release;
+		} catch (error) {
+			setDaemonStatus({
+				...daemonStatus,
+				state: "error",
+				message: `Could not acquire the macOS daemon LaunchAgent lock: ${String(error)}`,
+				code: "daemon_unreachable",
+			});
+			return daemonStatus;
+		}
+		let launchAgentStop: "not_owned" | "stopped" | "error" = "not_owned";
+		try {
+			if (await isLaunchAgentLoaded(daemonLaunchAgent)) {
+				const launchAgentPID = await launchAgentProcessID(daemonLaunchAgent);
+				let ownedDaemonPID: number | undefined;
+				const discoveryDeadline =
+					daemonStatus.state === "starting" ? Date.now() + PORT_DISCOVERY_TIMEOUT_MS : Date.now();
+				do {
+					const candidates = new Set<number>();
+					if (stopTargetPID !== undefined) candidates.add(stopTargetPID);
+					const currentRunFile = await readRunFileForStop();
+					if (currentRunFile.state === "present") {
+						candidates.add(currentRunFile.info.pid);
+						stopTargetPID = currentRunFile.info.pid;
+					}
+					const probe = await readDaemonProbe(resolvedDaemonPort(), "healthz");
+					if (probe?.pid !== undefined) {
+						candidates.add(probe.pid);
+						stopTargetPID = probe.pid;
+					}
+					for (const candidate of candidates) {
+						if (daemonLaunchAgentOwnsPID(launchAgentPID, candidate, await processAncestorIDs(candidate))) {
+							ownedDaemonPID = candidate;
+							break;
+						}
+					}
+					if (ownedDaemonPID !== undefined || Date.now() >= discoveryDeadline) break;
+					await new Promise<void>((resolve) => setTimeout(resolve, RUN_FILE_POLL_MS));
+				} while (true);
+				const ownsActiveSupervisor = await launchAgentSupervisorIsAOOwned(daemonLaunchAgent, launchAgentPID);
+				if (ownedDaemonPID !== undefined || ownsActiveSupervisor) {
+					const stopProcessPID = launchAgentPID ?? ownedDaemonPID;
+					try {
+						await execFileAsync("/bin/launchctl", ["bootout", daemonLaunchAgent.serviceTarget]);
+					} catch (error) {
+						setDaemonStatus({
+							...daemonStatus,
+							state: "error",
+							message: `Could not unload the macOS daemon LaunchAgent: ${String(error)}`,
+							code: "daemon_unreachable",
+						});
+						launchAgentStop = "error";
+					}
+					if (launchAgentStop !== "error") {
+						const shutdownWaitMs = await launchAgentShutdownWaitMs(daemonLaunchAgent);
+						const deadline = Date.now() + shutdownWaitMs;
+						let stopped = false;
+						while (Date.now() < deadline) {
+							if (probeProcessLiveness(stopProcessPID!) === "dead") {
+								stopped = true;
+								break;
+							}
+							await new Promise<void>((resolve) => setTimeout(resolve, 200));
+						}
+						if (!stopped) {
+							setDaemonStatus({
+								...daemonStatus,
+								state: "error",
+								message: `The macOS daemon LaunchAgent was unloaded, but its daemon did not stop within ${Math.ceil(
+									shutdownWaitMs / 1_000,
+								)} seconds.`,
+								code: "daemon_unreachable",
+							});
+							launchAgentStop = "error";
+						} else {
+							daemonOwnership.clear();
+							setDaemonStatus({ state: "stopped" });
+							launchAgentStop = "stopped";
+						}
+					}
+				}
+			}
+		} finally {
+			try {
+				await releaseLaunchAgentLock();
+			} catch (error) {
+				setDaemonStatus({
+					...daemonStatus,
+					state: "error",
+					message: `Could not release the macOS daemon LaunchAgent lock: ${String(error)}`,
+					code: "daemon_unreachable",
+				});
+				launchAgentStop = "error";
+			}
+		}
+		if (launchAgentStop !== "not_owned") return daemonStatus;
+	}
 	if (daemonProcess) {
 		const child = daemonProcess;
 		daemonStoppingProcess = child;
@@ -1063,13 +1592,13 @@ async function stopDaemon(): Promise<DaemonStatus> {
 		return daemonStatus;
 	}
 
-	const previousPID = daemonStatus.pid;
+	const previousPID = stopTargetPID;
 	const runFile = await readRunFileForStop();
 	const liveness = previousPID === undefined ? "unknown" : probeProcessLiveness(previousPID);
-	const alreadyStopped = runFile.state === "missing" || liveness === "dead";
+	const alreadyStopped = liveness === "dead" || (runFile.state === "missing" && previousPID === undefined);
 	const ownedPID =
 		runFile.state === "present" && validatedDaemonOwner(runFile.info, previousPID) === "app" ? previousPID : undefined;
-	const port = daemonStatus.port;
+	const port = daemonStatus.port ?? resolvedDaemonPort();
 	const confirmStopped = async (): Promise<boolean> => {
 		const deadline = Date.now() + 7_000;
 		while (Date.now() < deadline) {

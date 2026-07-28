@@ -181,6 +181,62 @@ func TestServerShutdownEndpoint(t *testing.T) {
 	}
 }
 
+func TestServerShutdownTimeoutIsStillDeliberateStop(t *testing.T) {
+	runPath := filepath.Join(t.TempDir(), "running.json")
+	cfg := config.Config{
+		Host:            "127.0.0.1",
+		Port:            0,
+		ShutdownTimeout: 50 * time.Millisecond,
+		RunFilePath:     runPath,
+	}
+	srv, err := NewWithDeps(cfg, discardLogger(), nil, APIDeps{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	baseHandler := srv.http.Handler
+	srv.http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/block" {
+			close(blocked)
+			<-release
+			return
+		}
+		baseHandler.ServeHTTP(w, req)
+	})
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- srv.Run(context.Background()) }()
+	base := "http://" + srv.Addr().String()
+	waitForHealth(t, base)
+	go func() {
+		_, _ = http.Get(base + "/block")
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("blocking request did not start")
+	}
+	resp, err := http.Post(base+"/shutdown", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /shutdown: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run returned crash error for requested timeout: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not force-close after shutdown timeout")
+	}
+	close(release)
+	if after, _ := runfile.Read(runPath); after != nil {
+		t.Error("run-file still present after requested shutdown timeout")
+	}
+}
+
 func TestServerUnexpectedServeExitPreservesRunFile(t *testing.T) {
 	runPath := filepath.Join(t.TempDir(), "running.json")
 	cfg := config.Config{
