@@ -53,6 +53,17 @@ export function splitDaemonLaunchAgentEnvironment(env: NodeJS.ProcessEnv): Daemo
 	return { persisted, transient };
 }
 
+export function parseDaemonLaunchAgentPID(output: string): number | null {
+	const match = output.match(/^\s*pid = (\d+)\s*$/m);
+	if (!match) return null;
+	const pid = Number(match[1]);
+	return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+export function daemonLaunchAgentOwnsPID(launchAgentPID: number | null, daemonPID: number | undefined): boolean {
+	return launchAgentPID !== null && daemonPID !== undefined && launchAgentPID === daemonPID;
+}
+
 function joinPath(...segments: string[]): string {
 	return segments.map((segment) => segment.replace(/\/+$/, "")).join("/");
 }

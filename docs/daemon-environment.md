@@ -27,9 +27,10 @@ stopped. The desktop Stop action unloads the job explicitly.
 
 The on-disk plist contains only non-secret launch configuration such as paths,
 locale, state location, port, and telemetry mode. Credentials and all other
-shell variables are injected into the GUI launchd domain only while the daemon
-is launched, then the previous launchd environment is restored. This keeps API
-keys and tokens out of the mode-0600 file as well as off disk entirely.
+shell variables are injected only into the GUI launchd domain's memory while the
+job is loaded, so crash replacements inherit them; unloading the job restores
+or removes those values. This keeps API keys and tokens out of the mode-0600 file
+as well as off disk entirely.
 
 `ao doctor` reports `keychain-session` by asking the running daemon to execute
 `security show-keychain-info` from its own process context. A failed interaction

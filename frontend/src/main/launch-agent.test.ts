@@ -1,10 +1,26 @@
 import { describe, expect, it } from "vitest";
 import {
+	daemonLaunchAgentOwnsPID,
 	DEFAULT_DAEMON_LAUNCH_AGENT_LABEL,
+	parseDaemonLaunchAgentPID,
 	renderDaemonLaunchAgentPlist,
 	resolveDaemonLaunchAgent,
 	splitDaemonLaunchAgentEnvironment,
 } from "./launch-agent";
+
+describe("parseDaemonLaunchAgentPID", () => {
+	it("reads a running service PID and rejects a dormant job", () => {
+		expect(parseDaemonLaunchAgentPID("state = running\n\tpid = 4242\n")).toBe(4242);
+		expect(parseDaemonLaunchAgentPID("state = exited\n\tlast exit code = 0\n")).toBeNull();
+	});
+
+	it("requires the live service PID to match the probed daemon", () => {
+		expect(daemonLaunchAgentOwnsPID(4242, 4242)).toBe(true);
+		expect(daemonLaunchAgentOwnsPID(null, 4242)).toBe(false);
+		expect(daemonLaunchAgentOwnsPID(4242, 5151)).toBe(false);
+		expect(daemonLaunchAgentOwnsPID(4242, undefined)).toBe(false);
+	});
+});
 
 describe("resolveDaemonLaunchAgent", () => {
 	it("uses the stable production label for the canonical run file", () => {
