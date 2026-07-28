@@ -21,9 +21,15 @@ keychain interaction to an audit session, and a daemon inherited from the wrong
 launch context can receive `errSecInteractionNotAllowed` even when it has the
 right user ID and environment. AO therefore writes a mode-0600 LaunchAgent
 definition beside its selected run file and bootstraps it into `gui/<uid>` with
-`LimitLoadToSessionType=Aqua`. The job is `KeepAlive`, so quitting Electron does
-not strand or silently replace the daemon; the desktop Stop action unloads the
-job explicitly.
+`LimitLoadToSessionType=Aqua`. The job restarts after an unsuccessful exit, so
+quitting Electron does not strand the daemon, while a graceful `ao stop` remains
+stopped. The desktop Stop action unloads the job explicitly.
+
+The on-disk plist contains only non-secret launch configuration such as paths,
+locale, state location, port, and telemetry mode. Credentials and all other
+shell variables are injected into the GUI launchd domain only while the daemon
+is launched, then the previous launchd environment is restored. This keeps API
+keys and tokens out of the mode-0600 file as well as off disk entirely.
 
 `ao doctor` reports `keychain-session` by asking the running daemon to execute
 `security show-keychain-info` from its own process context. A failed interaction

@@ -11,6 +11,48 @@ export type DaemonLaunchAgent = {
 	stderrPath: string;
 };
 
+export type DaemonLaunchAgentEnvironment = {
+	persisted: NodeJS.ProcessEnv;
+	transient: Array<[string, string]>;
+};
+
+const PERSISTED_ENVIRONMENT_KEYS = new Set([
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"SHELL",
+	"TMPDIR",
+	"PATH",
+	"TERM",
+	"LANG",
+	"AO_AGENT",
+	"AO_ALLOWED_ORIGINS",
+	"AO_DATA_DIR",
+	"AO_HOST",
+	"AO_PORT",
+	"AO_REQUEST_TIMEOUT",
+	"AO_RUN_FILE",
+	"AO_SHUTDOWN_TIMEOUT",
+	"AO_TELEMETRY_EVENTS",
+	"AO_TELEMETRY_POSTHOG_HOST",
+	"AO_TELEMETRY_REMOTE",
+]);
+
+export function splitDaemonLaunchAgentEnvironment(env: NodeJS.ProcessEnv): DaemonLaunchAgentEnvironment {
+	const persisted: NodeJS.ProcessEnv = {};
+	const transient: Array<[string, string]> = [];
+	for (const [key, value] of Object.entries(env)) {
+		if (typeof value !== "string") continue;
+		if (PERSISTED_ENVIRONMENT_KEYS.has(key) || key.startsWith("LC_")) {
+			persisted[key] = value;
+		} else {
+			transient.push([key, value]);
+		}
+	}
+	transient.sort(([a], [b]) => a.localeCompare(b));
+	return { persisted, transient };
+}
+
 function joinPath(...segments: string[]): string {
 	return segments.map((segment) => segment.replace(/\/+$/, "")).join("/");
 }
@@ -40,8 +82,8 @@ export function resolveDaemonLaunchAgent(
 		domain,
 		serviceTarget: `${domain}/${label}`,
 		plistPath: joinPath(stateDir, "launchd", `${label}.plist`),
-		stdoutPath: joinPath(stateDir, "daemon.stdout.log"),
-		stderrPath: joinPath(stateDir, "daemon.stderr.log"),
+		stdoutPath: joinPath(stateDir, `${label}.stdout.log`),
+		stderrPath: joinPath(stateDir, `${label}.stderr.log`),
 	};
 }
 
@@ -88,7 +130,10 @@ export function renderDaemonLaunchAgentPlist(
 		"  <key>RunAtLoad</key>",
 		"  <true/>",
 		"  <key>KeepAlive</key>",
-		"  <true/>",
+		"  <dict>",
+		"    <key>SuccessfulExit</key>",
+		"    <false/>",
+		"  </dict>",
 		"  <key>LimitLoadToSessionType</key>",
 		"  <string>Aqua</string>",
 		"  <key>StandardOutPath</key>",
