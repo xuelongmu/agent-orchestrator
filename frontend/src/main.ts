@@ -1442,7 +1442,8 @@ function initAutoUpdates(): void {
 	void ensureUpdatePrefs(stateDir).then(() => startAutoUpdates(stateDir));
 }
 
-// Resolve the bundle path `ao start` will later `open` and stat as a usable app.
+// Resolve the packaged bundle path `ao start` will later `open` and stat as a
+// usable app.
 // On macOS process.execPath is .../Agent Orchestrator.app/Contents/MacOS/<exe>;
 // the thing `ao start` opens is the enclosing `.app` directory, so walk up three
 // levels (MacOS -> Contents -> .app). app.getAppPath() is WRONG here: it returns
@@ -1464,11 +1465,17 @@ function parseInstalledVia(argv: string[]): string | undefined {
 	return flag ? flag.slice("--installed-via=".length) : undefined;
 }
 
-// Write ~/.ao/app-state.json so `ao start`'s resolveApp() can find this bundle
-// (spec §7.1). The app is the sole writer (invariant 3) and writes every launch.
-// A failure here must NOT block startup, so the caller wraps this in try/catch;
-// we still surface it via the log.
+// Write ~/.ao/app-state.json so `ao start`'s resolveApp() can find this packaged
+// bundle (spec §7.1). Development launches leave the marker untouched:
+// process.execPath is the bare Electron runtime, and recording it would make a
+// later release launch show Electron's default app instead of AO. Preserving the
+// marker also keeps custom packaged-app locations discoverable.
+// The app is the sole writer (invariant 3). A failure here must NOT block
+// startup, so the caller wraps this in try/catch; we still surface it via the
+// log.
 async function writeAppStateOnLaunch(): Promise<void> {
+	if (!app.isPackaged) return;
+
 	// Reuse the same ~/.ao resolution as running.json; the marker lives beside it
 	// (the Go side computes its dir as dirname(RunFilePath)). runFilePath() returns
 	// null only when the home dir is unresolvable, in which case we cannot place
