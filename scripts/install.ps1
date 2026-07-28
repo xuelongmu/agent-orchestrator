@@ -109,6 +109,48 @@ function Get-NodeRuntimeIdentity {
     return "$platform/$architecture"
 }
 
+function Invoke-NpmCI {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Directory
+    )
+
+    $hadPlatformOverride = Test-Path Env:npm_config_platform
+    $previousPlatformOverride = if ($hadPlatformOverride) {
+        $env:npm_config_platform
+    }
+    else {
+        $null
+    }
+    $hadArchitectureOverride = Test-Path Env:npm_config_arch
+    $previousArchitectureOverride = if ($hadArchitectureOverride) {
+        $env:npm_config_arch
+    }
+    else {
+        $null
+    }
+
+    try {
+        Remove-Item Env:npm_config_platform -ErrorAction SilentlyContinue
+        Remove-Item Env:npm_config_arch -ErrorAction SilentlyContinue
+        Invoke-Native -Command npm -Arguments @('ci', '--prefix', $Directory)
+    }
+    finally {
+        if ($hadPlatformOverride) {
+            $env:npm_config_platform = $previousPlatformOverride
+        }
+        else {
+            Remove-Item Env:npm_config_platform -ErrorAction SilentlyContinue
+        }
+        if ($hadArchitectureOverride) {
+            $env:npm_config_arch = $previousArchitectureOverride
+        }
+        else {
+            Remove-Item Env:npm_config_arch -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Test-SamePath {
     param(
         [Parameter(Mandatory)]
@@ -320,8 +362,34 @@ function Ensure-ElectronBinary {
 
     $electronRoot = Join-Path $FrontendDirectory 'node_modules\electron'
     $electronExe = Join-Path $electronRoot 'dist\electron.exe'
+    $nodeArch = (& node -p process.arch).Trim()
+    if ($LASTEXITCODE -ne 0 -or $nodeArch -notin @('x64', 'arm64')) {
+        throw "Could not determine a supported 64-bit Node architecture (received '$nodeArch')"
+    }
+
     if (Test-Path -LiteralPath $electronExe) {
-        return
+        try {
+            & $electronExe --version *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return
+            }
+        }
+        catch {
+            # Reinstall below using the active Node host target.
+        }
+
+        Write-Host 'The installed Electron binary cannot run on this host; reinstalling frontend dependencies...'
+        Invoke-NpmCI -Directory $FrontendDirectory
+        Write-DependencyFingerprint -Directory $FrontendDirectory
+        try {
+            & $electronExe --version *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return
+            }
+        }
+        catch {
+            # Fall through to the cache-backed repair below.
+        }
     }
 
     $packagePath = Join-Path $electronRoot 'package.json'
@@ -333,7 +401,15 @@ function Ensure-ElectronBinary {
     Write-Host 'Electron binary is missing; repairing its installation...'
     Invoke-Native -Command node -Arguments @($installScript)
     if (Test-Path -LiteralPath $electronExe) {
-        return
+        try {
+            & $electronExe --version *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return
+            }
+        }
+        catch {
+            # Fall through to the cache-backed repair below.
+        }
     }
 
     # Electron's extract-zip installer can return successfully after extracting
@@ -346,10 +422,6 @@ function Ensure-ElectronBinary {
     else {
         Join-Path $env:LOCALAPPDATA 'electron\Cache'
     }
-    $nodeArch = (& node -p 'process.arch').Trim()
-    if ($LASTEXITCODE -ne 0 -or $nodeArch -notin @('x64', 'arm64', 'ia32')) {
-        throw "Could not determine a supported Node architecture (received '$nodeArch')"
-    }
     $archiveName = "electron-v$electronVersion-win32-$nodeArch.zip"
     $archive = Get-ChildItem -LiteralPath $cacheRoot -Recurse -File -Filter $archiveName -ErrorAction SilentlyContinue |
         Select-Object -First 1
@@ -361,9 +433,16 @@ function Ensure-ElectronBinary {
     New-Item -ItemType Directory -Force -Path $distPath | Out-Null
     Expand-Archive -LiteralPath $archive.FullName -DestinationPath $distPath -Force
     [System.IO.File]::WriteAllText((Join-Path $electronRoot 'path.txt'), 'electron.exe')
-    if (-not (Test-Path -LiteralPath $electronExe)) {
-        throw "Electron repair completed without producing $electronExe"
+    try {
+        & $electronExe --version *> $null
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
     }
+    catch {
+        # Report a single actionable repair failure below.
+    }
+    throw "Electron repair completed without a runnable $electronExe"
 }
 
 function Get-RunningDaemonExecutable {
@@ -417,6 +496,22 @@ $nodeVersion = (& node --version).Trim()
 if ($LASTEXITCODE -ne 0 -or -not (Test-SupportedNodeVersion -Version $nodeVersion)) {
     throw "Node $nodeVersion is unsupported; install Node 20.19+ or 22.12+ (Node 24 also works), then run this installer again"
 }
+$nodeRuntimeIdentity = Get-NodeRuntimeIdentity
+if ($nodeRuntimeIdentity -notin @('win32/x64', 'win32/arm64')) {
+    throw "Node $nodeVersion uses unsupported runtime $nodeRuntimeIdentity; install a 64-bit x64 or ARM64 Windows build of Node, then run this installer again"
+}
+
+if ($Start) {
+    $releaseApp = Get-Process -Name 'agent-orchestrator' -ErrorAction SilentlyContinue
+    if ($releaseApp) {
+        throw 'Close the installed Agent Orchestrator desktop app before using -Start'
+    }
+
+    $sourceApp = Get-RunningSourceApp -FrontendDirectory $frontendDir
+    if ($sourceApp) {
+        throw "AO is already running from this source checkout (PID $($sourceApp.ProcessId))"
+    }
+}
 
 if ($Fetch) {
     $branch = (& git -C $repoRoot branch --show-current).Trim()
@@ -437,18 +532,6 @@ if ($Fetch) {
 
     Invoke-Native -Command git -Arguments @('-C', $repoRoot, 'fetch', 'origin', 'main')
     Invoke-Native -Command git -Arguments @('-C', $repoRoot, 'pull', '--ff-only', 'origin', 'main')
-}
-
-if ($Start) {
-    $releaseApp = Get-Process -Name 'agent-orchestrator' -ErrorAction SilentlyContinue
-    if ($releaseApp) {
-        throw 'Close the installed Agent Orchestrator desktop app before using -Start'
-    }
-
-    $sourceApp = Get-RunningSourceApp -FrontendDirectory $frontendDir
-    if ($sourceApp) {
-        throw "AO is already running from this source checkout (PID $($sourceApp.ProcessId))"
-    }
 }
 
 if (Test-Path -LiteralPath $rootNodeModules) {
@@ -477,12 +560,12 @@ if ($InstallDependencies -or -not $rootDependenciesReady -or -not $frontendDepen
 
     if ($InstallDependencies -or -not $rootDependenciesReady) {
         Write-Host 'Root dependencies are missing or stale; running npm ci...'
-        Invoke-Native -Command npm -Arguments @('ci', '--prefix', $repoRoot)
+        Invoke-NpmCI -Directory $repoRoot
         Write-DependencyFingerprint -Directory $repoRoot
     }
     if ($InstallDependencies -or -not $frontendDependenciesReady) {
         Write-Host 'Frontend dependencies are missing or stale; running npm ci...'
-        Invoke-Native -Command npm -Arguments @('ci', '--prefix', $frontendDir)
+        Invoke-NpmCI -Directory $frontendDir
         Write-DependencyFingerprint -Directory $frontendDir
     }
 }
