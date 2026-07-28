@@ -255,6 +255,31 @@ func TestCheckKeychainSessionMatchesDaemonToAquaAuditSession(t *testing.T) {
 	}
 }
 
+func TestReadKeychainSessionProbeOverridesDefaultClientTimeout(t *testing.T) {
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			deadline, ok := req.Context().Deadline()
+			if !ok || time.Until(deadline) < 4*time.Second {
+				t.Fatalf("probe deadline = %v, want at least four seconds of remaining budget", deadline)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(
+					`{"status":"available","service":"agent-orchestrator-daemon","pid":4321,"detail":"ok"}`,
+				)),
+			}, nil
+		}),
+	}
+	c := &commandContext{deps: Deps{HTTPClient: client}.withDefaults()}
+
+	result, err := c.readKeychainSessionProbe(context.Background(), 3001)
+	if err != nil || result.Status != "available" {
+		t.Fatalf("readKeychainSessionProbe() = (%+v, %v), want available", result, err)
+	}
+}
+
 func TestCheckKeychainSessionFailsOutsideAquaAuditSession(t *testing.T) {
 	srv := keychainDiagnosticServer(t, http.StatusOK, `{"status":"unavailable","service":"agent-orchestrator-daemon","pid":4321,"detail":"security show-keychain-info failed (exit 36)"}`)
 	defer srv.Close()

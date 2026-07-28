@@ -60,14 +60,16 @@ func Probe(ctx context.Context) Result {
 	output, err := runCommand(ctx, tmuxPath, "list-sessions")
 	if err != nil {
 		message := strings.ToLower(string(output))
-		if strings.Contains(message, "no server running") || strings.Contains(message, "no sessions") {
+		if strings.Contains(message, "no server running") {
 			return Result{
 				Supported: true,
 				Available: true,
 				Detail:    "daemon login-keychain interaction succeeded; no active tmux server",
 			}
 		}
-		return Result{Supported: true, Detail: "could not determine the active tmux server audit session"}
+		if !strings.Contains(message, "no sessions") {
+			return Result{Supported: true, Detail: "could not determine the active tmux server audit session"}
+		}
 	}
 
 	command := "/usr/bin/security show-keychain-info " + shellQuote(keychain)

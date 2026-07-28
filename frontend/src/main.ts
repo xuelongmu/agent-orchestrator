@@ -497,6 +497,64 @@ async function installTemporaryLaunchdEnvironment(entries: Array<[string, string
 	}
 }
 
+async function acquireLaunchdEnvironmentLock(lockPath: string): Promise<() => Promise<void>> {
+	await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o750 });
+	return new Promise((resolve, reject) => {
+		const holder = spawn(
+			"/usr/bin/lockf",
+			["-k", "-t", "30", lockPath, "/bin/sh", "-c", 'printf "acquired\\n"; /bin/cat >/dev/null'],
+			{ stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
+		);
+		let output = "";
+		let errorOutput = "";
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			holder.kill("SIGTERM");
+			reject(new Error("timed out waiting for the macOS launchd environment lock"));
+		}, 31_000);
+		holder.stderr.on("data", (chunk: Buffer) => {
+			errorOutput += chunk.toString("utf8");
+		});
+		holder.stdout.on("data", (chunk: Buffer) => {
+			output += chunk.toString("utf8");
+			if (settled || !output.includes("acquired\n")) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve(
+				() =>
+					new Promise<void>((releaseResolve, releaseReject) => {
+						if (holder.exitCode !== null || holder.signalCode !== null) {
+							releaseResolve();
+							return;
+						}
+						holder.once("error", releaseReject);
+						holder.once("exit", (code) => {
+							if (code === 0) releaseResolve();
+							else releaseReject(new Error(`macOS launchd environment lock exited with code ${String(code)}`));
+						});
+						holder.stdin.end();
+					}),
+			);
+		});
+		holder.once("error", (error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			reject(error);
+		});
+		holder.once("exit", (code) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			reject(
+				new Error(`could not acquire the macOS launchd environment lock (code ${String(code)}): ${errorOutput.trim()}`),
+			);
+		});
+	});
+}
+
 async function installAndKickstartLaunchAgent(
 	job: DaemonLaunchAgent,
 	launch: DaemonLaunchSpec,
@@ -519,8 +577,10 @@ async function installAndKickstartLaunchAgent(
 		await chmod(job.plistPath, 0o600);
 	}
 
-	const restoreEnvironment = await installTemporaryLaunchdEnvironment(environment.transient);
+	const releaseEnvironmentLock = await acquireLaunchdEnvironmentLock(job.environmentLockPath);
+	let restoreEnvironment: (() => Promise<void>) | null = null;
 	try {
+		restoreEnvironment = await installTemporaryLaunchdEnvironment(environment.transient);
 		if (!shouldContinue()) return false;
 		if (!loaded || definitionChanged) {
 			try {
@@ -549,7 +609,11 @@ async function installAndKickstartLaunchAgent(
 		// The per-job shell supervisor has inherited a private copy and owns daemon
 		// child restarts. Restore the shared GUI launchd domain immediately so an
 		// isolated job cannot overwrite another job's credentials.
-		await restoreEnvironment();
+		try {
+			if (restoreEnvironment) await restoreEnvironment();
+		} finally {
+			await releaseEnvironmentLock();
+		}
 	}
 }
 

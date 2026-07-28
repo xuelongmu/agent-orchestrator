@@ -7,6 +7,7 @@ export type DaemonLaunchAgent = {
 	domain: string;
 	serviceTarget: string;
 	plistPath: string;
+	environmentLockPath: string;
 	stdoutPath: string;
 	stderrPath: string;
 };
@@ -106,6 +107,7 @@ export function resolveDaemonLaunchAgent(
 	uid: number,
 ): DaemonLaunchAgent {
 	const stateDir = runFilePath.replace(/[/\\][^/\\]+$/, "");
+	const defaultStateDir = defaultRunFilePath.replace(/[/\\][^/\\]+$/, "");
 	const label =
 		runFilePath === defaultRunFilePath
 			? DEFAULT_DAEMON_LAUNCH_AGENT_LABEL
@@ -116,6 +118,7 @@ export function resolveDaemonLaunchAgent(
 		domain,
 		serviceTarget: `${domain}/${label}`,
 		plistPath: joinPath(stateDir, "launchd", `${label}.plist`),
+		environmentLockPath: joinPath(defaultStateDir, "launchd", "environment.lock"),
 		stdoutPath: joinPath(stateDir, `${label}.stdout.log`),
 		stderrPath: joinPath(stateDir, `${label}.stderr.log`),
 	};

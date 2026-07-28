@@ -247,7 +247,8 @@ type keychainSessionProbe struct {
 }
 
 func (c *commandContext) readKeychainSessionProbe(ctx context.Context, port int) (keychainSessionProbe, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	const probeTimeout = 5 * time.Second
+	reqCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(
 		reqCtx,
@@ -258,7 +259,9 @@ func (c *commandContext) readKeychainSessionProbe(ctx context.Context, port int)
 	if err != nil {
 		return keychainSessionProbe{}, err
 	}
-	resp, err := c.deps.HTTPClient.Do(req)
+	probeClient := *c.deps.HTTPClient
+	probeClient.Timeout = probeTimeout
+	resp, err := probeClient.Do(req)
 	if err != nil {
 		return keychainSessionProbe{}, err
 	}

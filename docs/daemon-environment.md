@@ -32,7 +32,9 @@ start a label-specific in-memory supervisor, then the prior domain environment
 is restored. The supervisor retains its job's private environment and restarts
 the daemon child after unsuccessful exits. This keeps concurrent isolated jobs
 from overwriting each other's credentials, and keeps API keys and tokens out of
-the mode-0600 file as well as off disk entirely.
+the mode-0600 file as well as off disk entirely. A BSD lock under the canonical
+`~/.ao/launchd` directory serializes the brief injection transaction across
+packaged and isolated-development Electron processes.
 
 `ao doctor` reports `keychain-session` by asking the running daemon to execute
 `security show-keychain-info` from its own process context and, when one exists,

@@ -53,6 +53,7 @@ describe("resolveDaemonLaunchAgent", () => {
 			domain: "gui/501",
 			serviceTarget: "gui/501/dev.ao.daemon",
 			plistPath: "/Users/me/.ao/launchd/dev.ao.daemon.plist",
+			environmentLockPath: "/Users/me/.ao/launchd/environment.lock",
 			stdoutPath: "/Users/me/.ao/dev.ao.daemon.stdout.log",
 			stderrPath: "/Users/me/.ao/dev.ao.daemon.stderr.log",
 		});
@@ -64,6 +65,7 @@ describe("resolveDaemonLaunchAgent", () => {
 		expect(first.label).toBe(second.label);
 		expect(first.label).toMatch(/^dev\.ao\.daemon\.[0-9a-f]{8}$/);
 		expect(first.plistPath).toContain("/Users/me/.ao/dev/launchd/");
+		expect(first.environmentLockPath).toBe("/Users/me/.ao/launchd/environment.lock");
 	});
 
 	it("keeps log files distinct for isolated jobs in the same directory", () => {
