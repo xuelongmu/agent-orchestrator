@@ -29,20 +29,19 @@ job explicitly.
 
 The on-disk plist contains only non-secret launch configuration such as paths,
 locale, state location, port, and telemetry mode. Credentials and all other
-shell variables are injected into the GUI launchd domain only long enough to
-start a label-specific in-memory supervisor, then the prior domain environment
-is restored. The supervisor retains its job's private environment and restarts
+shell variables are handed directly to a label-specific in-memory supervisor
+over a protected local stream. The supervisor retains that private environment and restarts
 the daemon child after unsuccessful exits, with bounded progressive-backoff
 retries so a permanently broken command does not spin forever. This keeps
 concurrent isolated jobs from overwriting each other's credentials, and keeps
 API keys and tokens out of the mode-0600 file as well as off disk entirely. A
 separate AO handoff helper holds a BSD lock under the canonical
-`~/.ao/launchd` directory, snapshots and injects the environment, and restores
-it before releasing the lock. The helper reads credentials through a pipe and
-temporarily removes ambient variables omitted from the resolved environment, so
-an unset credential cannot leak in from an older launchd value. It automatically
-restores the complete snapshot when Electron releases it or dies, so the shared
-GUI launchd environment cannot be stranded with a job's secrets.
+`~/.ao/launchd` directory and serves the exact environment once over a
+mode-0600 Unix socket. The LaunchAgent supervisor clears its inherited exports,
+imports that protected stream, and then closes the socket before starting the
+daemon. Credentials therefore never enter the plist, launchd's shared
+environment, or a command argument. Electron crashes close the helper's stdin;
+the helper then closes and removes the socket before releasing the lock.
 
 The plist stores only a SHA-256 identity of the transient environment. A
 healthy, AO-owned LaunchAgent is replaced when that identity changes, allowing

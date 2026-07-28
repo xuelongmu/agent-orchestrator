@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	daemonLaunchAgentOwnsPID,
+	daemonLaunchAgentOwnsSupervisor,
 	DEFAULT_DAEMON_LAUNCH_AGENT_LABEL,
 	parseDaemonLaunchAgentPID,
 	renderDaemonLaunchAgentPlist,
@@ -21,6 +22,19 @@ describe("parseDaemonLaunchAgentPID", () => {
 		expect(daemonLaunchAgentOwnsPID(null, 4242, [])).toBe(false);
 		expect(daemonLaunchAgentOwnsPID(4242, 5151, [6161, 7171])).toBe(false);
 		expect(daemonLaunchAgentOwnsPID(4242, undefined, [])).toBe(false);
+	});
+
+	it("recognizes an active AO supervisor without trusting a label alone", () => {
+		expect(
+			daemonLaunchAgentOwnsSupervisor(
+				"/bin/bash -c child= ao-daemon-supervisor /usr/local/bin/ao daemon",
+				"<string>ao-daemon-supervisor</string>",
+			),
+		).toBe(true);
+		expect(daemonLaunchAgentOwnsSupervisor("/usr/local/bin/foreign", "<string>ao-daemon-supervisor</string>")).toBe(
+			false,
+		);
+		expect(daemonLaunchAgentOwnsSupervisor("ao-daemon-supervisor", "<string>foreign</string>")).toBe(false);
 	});
 
 	it("preserves a loaded packaged definition for shared development", () => {
@@ -54,6 +68,7 @@ describe("resolveDaemonLaunchAgent", () => {
 			serviceTarget: "gui/501/dev.ao.daemon",
 			plistPath: "/Users/me/.ao/launchd/dev.ao.daemon.plist",
 			environmentLockPath: "/Users/me/.ao/launchd/environment.lock",
+			environmentSocketPath: "/Users/me/.ao/launchd/dev.ao.daemon.environment.sock",
 			stdoutPath: "/Users/me/.ao/dev.ao.daemon.stdout.log",
 			stderrPath: "/Users/me/.ao/dev.ao.daemon.stderr.log",
 		});
@@ -152,7 +167,10 @@ describe("renderDaemonLaunchAgentPlist", () => {
 		);
 
 		expect(plist).toContain("<key>LimitLoadToSessionType</key>\n  <string>Aqua</string>");
+		expect(plist).toContain("<string>/bin/bash</string>");
 		expect(plist).toContain("<string>ao-daemon-supervisor</string>");
+		expect(plist).toContain("/usr/bin/nc -U &quot;$socket&quot;");
+		expect(plist).toContain("<string>/Users/me/.ao/launchd/dev.ao.daemon.environment.sock</string>");
 		expect(plist).toContain("daemon restart budget exhausted");
 		expect(plist).toContain("<string>/Applications/AO &amp; Friends/ao</string>");
 		expect(plist).toContain("<string>/tmp/a &lt; b</string>");

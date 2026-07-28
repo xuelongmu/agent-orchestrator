@@ -7,6 +7,10 @@ import (
 	"errors"
 )
 
-func install(context.Context, map[string]string) (func() error, error) {
-	return nil, errors.New("launch-agent environment handoff is only available on macOS")
+func prepareEnvironmentSocket(string, map[string]string) (<-chan error, func(), error) {
+	return nil, nil, errors.New("launch-agent environment handoff is only available on macOS")
+}
+
+func waitForEnvironmentDelivery(context.Context, <-chan error, <-chan struct{}) error {
+	return errors.New("launch-agent environment handoff is only available on macOS")
 }

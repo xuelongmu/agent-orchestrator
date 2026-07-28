@@ -76,6 +76,7 @@ import { readMigrationState, updateMigration, writeAppStateMarker, type Migratio
 import { isAllowedAppExternalURL, openAllowedAppExternalURL } from "./main/external-open";
 import {
 	daemonLaunchAgentOwnsPID,
+	daemonLaunchAgentOwnsSupervisor,
 	parseDaemonLaunchAgentPID,
 	renderDaemonLaunchAgentPlist,
 	resolveDaemonLaunchAgent,
@@ -496,6 +497,19 @@ async function launchAgentDefinitionChanged(job: DaemonLaunchAgent, desired: str
 	}
 }
 
+async function launchAgentSupervisorIsAOOwned(job: DaemonLaunchAgent, pid: number | null): Promise<boolean> {
+	if (pid === null) return false;
+	try {
+		const [{ stdout }, plist] = await Promise.all([
+			execFileAsync("/bin/ps", ["-ww", "-o", "command=", "-p", String(pid)]),
+			readFile(job.plistPath, "utf8"),
+		]);
+		return daemonLaunchAgentOwnsSupervisor(String(stdout), plist);
+	} catch {
+		return false;
+	}
+}
+
 function launchAgentHandoffBinary(): string {
 	return path.join(
 		app.isPackaged ? process.resourcesPath : app.getAppPath(),
@@ -507,9 +521,11 @@ function launchAgentHandoffBinary(): string {
 async function startLaunchdEnvironmentHandoff(
 	helperBinary: string,
 	lockPath: string,
+	socketPath: string | null,
 	entries: Array<[string, string]> | null,
-): Promise<() => Promise<void>> {
+): Promise<{ waitForDelivery: () => Promise<void>; release: () => Promise<void> }> {
 	await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o750 });
+	if (socketPath) await mkdir(path.dirname(socketPath), { recursive: true, mode: 0o750 });
 	return new Promise((resolve, reject) => {
 		const holder = spawn("/usr/bin/lockf", ["-k", "-t", "30", lockPath, helperBinary, "launch-agent-handoff"], {
 			stdio: ["pipe", "pipe", "pipe"],
@@ -537,8 +553,29 @@ async function startLaunchdEnvironmentHandoff(
 			if (settled || !output.includes("ready\n")) return;
 			settled = true;
 			clearTimeout(timer);
-			resolve(
-				() =>
+			resolve({
+				waitForDelivery: () => {
+					if (entries === null || output.includes("delivered\n")) return Promise.resolve();
+					return new Promise<void>((deliveryResolve, deliveryReject) => {
+						const deliveryTimer = setTimeout(() => {
+							deliveryReject(new Error("timed out waiting for the private launch environment delivery"));
+						}, PORT_DISCOVERY_TIMEOUT_MS);
+						const onData = (): void => {
+							if (!output.includes("delivered\n")) return;
+							clearTimeout(deliveryTimer);
+							holder.stdout.off("data", onData);
+							deliveryResolve();
+						};
+						holder.stdout.on("data", onData);
+						holder.once("exit", (code) => {
+							clearTimeout(deliveryTimer);
+							deliveryReject(
+								new Error(`macOS launch environment delivery exited with code ${String(code)}: ${errorOutput.trim()}`),
+							);
+						});
+					});
+				},
+				release: () =>
 					new Promise<void>((releaseResolve, releaseReject) => {
 						if (holder.exitCode !== null || holder.signalCode !== null) {
 							releaseResolve();
@@ -556,7 +593,7 @@ async function startLaunchdEnvironmentHandoff(
 						});
 						holder.stdin.end("release\n");
 					}),
-			);
+			});
 		});
 		holder.once("error", (error) => {
 			fail(error);
@@ -567,7 +604,7 @@ async function startLaunchdEnvironmentHandoff(
 				new Error(`could not acquire the macOS launchd environment lock (code ${String(code)}): ${errorOutput.trim()}`),
 			);
 		});
-		const request = entries === null ? {} : { environment: Object.fromEntries(entries) };
+		const request = entries === null ? {} : { socket_path: socketPath, environment: Object.fromEntries(entries) };
 		holder.stdin.write(`${JSON.stringify(request)}\n`);
 	});
 }
@@ -581,10 +618,15 @@ async function installAndKickstartLaunchAgent(
 	shouldContinue: () => boolean,
 ): Promise<boolean> {
 	if (!shouldContinue()) return false;
-	const releaseEnvironmentHandoff = await startLaunchdEnvironmentHandoff(
+	const runtimeEnvironment = {
+		...environment.persisted,
+		...Object.fromEntries(environment.transient),
+	};
+	const environmentHandoff = await startLaunchdEnvironmentHandoff(
 		helperBinary,
 		job.environmentLockPath,
-		environment.transient,
+		job.environmentSocketPath,
+		Object.entries(runtimeEnvironment).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
 	);
 	try {
 		if (!shouldContinue()) return false;
@@ -604,9 +646,11 @@ async function installAndKickstartLaunchAgent(
 			await chmod(job.plistPath, 0o600);
 		}
 		if (!shouldContinue()) return false;
+		let startedByBootstrap = false;
 		if (!loaded || definitionChanged) {
 			try {
 				await execFileAsync("/bin/launchctl", ["bootstrap", job.domain, job.plistPath]);
+				startedByBootstrap = true;
 			} catch (error) {
 				// A concurrent app instance may have loaded the same job after our
 				// print probe. Accept that race only when launchd now reports it loaded.
@@ -619,7 +663,10 @@ async function installAndKickstartLaunchAgent(
 			}
 			return false;
 		}
-		await execFileAsync("/bin/launchctl", ["kickstart", "-k", job.serviceTarget]);
+		if (!startedByBootstrap) {
+			await execFileAsync("/bin/launchctl", ["kickstart", "-k", job.serviceTarget]);
+		}
+		await environmentHandoff.waitForDelivery();
 		if (!shouldContinue()) {
 			if (await isLaunchAgentLoaded(job)) {
 				await execFileAsync("/bin/launchctl", ["bootout", job.serviceTarget]);
@@ -628,10 +675,9 @@ async function installAndKickstartLaunchAgent(
 		}
 		return true;
 	} finally {
-		// The per-job shell supervisor has inherited a private copy and owns daemon
-		// child restarts. Releasing the helper restores the shared GUI launchd
-		// domain and unlocks the next launch transaction.
-		await releaseEnvironmentHandoff();
+		// The per-job shell supervisor has received a private copy and owns daemon
+		// child restarts. Releasing the socket helper unlocks the next transaction.
+		await environmentHandoff.release();
 	}
 }
 
@@ -1423,11 +1469,13 @@ async function stopDaemon(): Promise<DaemonStatus> {
 	if (daemonLaunchAgent) {
 		let releaseLaunchAgentLock: (() => Promise<void>) | null = null;
 		try {
-			releaseLaunchAgentLock = await startLaunchdEnvironmentHandoff(
+			const lockHandoff = await startLaunchdEnvironmentHandoff(
 				launchAgentHandoffBinary(),
 				daemonLaunchAgent.environmentLockPath,
 				null,
+				null,
 			);
+			releaseLaunchAgentLock = lockHandoff.release;
 		} catch (error) {
 			setDaemonStatus({
 				...daemonStatus,
@@ -1466,7 +1514,9 @@ async function stopDaemon(): Promise<DaemonStatus> {
 					if (ownedDaemonPID !== undefined || Date.now() >= discoveryDeadline) break;
 					await new Promise<void>((resolve) => setTimeout(resolve, RUN_FILE_POLL_MS));
 				} while (true);
-				if (ownedDaemonPID !== undefined) {
+				const ownsActiveSupervisor = await launchAgentSupervisorIsAOOwned(daemonLaunchAgent, launchAgentPID);
+				if (ownedDaemonPID !== undefined || ownsActiveSupervisor) {
+					const stopProcessPID = launchAgentPID ?? ownedDaemonPID;
 					try {
 						await execFileAsync("/bin/launchctl", ["bootout", daemonLaunchAgent.serviceTarget]);
 					} catch (error) {
@@ -1483,8 +1533,7 @@ async function stopDaemon(): Promise<DaemonStatus> {
 						const deadline = Date.now() + shutdownWaitMs;
 						let stopped = false;
 						while (Date.now() < deadline) {
-							const runFile = await readRunFileForStop();
-							if (runFile.state === "missing" || probeProcessLiveness(ownedDaemonPID) === "dead") {
+							if (probeProcessLiveness(stopProcessPID!) === "dead") {
 								stopped = true;
 								break;
 							}

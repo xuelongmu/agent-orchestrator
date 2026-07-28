@@ -8,6 +8,7 @@ export type DaemonLaunchAgent = {
 	serviceTarget: string;
 	plistPath: string;
 	environmentLockPath: string;
+	environmentSocketPath: string;
 	stdoutPath: string;
 	stderrPath: string;
 };
@@ -75,6 +76,10 @@ export function daemonLaunchAgentOwnsPID(
 	);
 }
 
+export function daemonLaunchAgentOwnsSupervisor(command: string, plist: string): boolean {
+	return command.includes("ao-daemon-supervisor") && plist.includes("<string>ao-daemon-supervisor</string>");
+}
+
 export function shouldReplaceDaemonLaunchAgent(options: {
 	loaded: boolean;
 	ownsDaemon: boolean;
@@ -136,6 +141,7 @@ export function resolveDaemonLaunchAgent(
 		serviceTarget: `${domain}/${label}`,
 		plistPath: joinPath(stateDir, "launchd", `${label}.plist`),
 		environmentLockPath: joinPath(defaultStateDir, "launchd", "environment.lock"),
+		environmentSocketPath: joinPath(defaultStateDir, "launchd", `${label}.environment.sock`),
 		stdoutPath: joinPath(stateDir, `${label}.stdout.log`),
 		stderrPath: joinPath(stateDir, `${label}.stderr.log`),
 	};
@@ -155,6 +161,12 @@ function plistString(value: string, indent: string): string {
 }
 
 export const DAEMON_SUPERVISOR_SCRIPT = [
+	"socket=$1",
+	"shift",
+	'while IFS= read -r name; do unset "$name"; done < <(compgen -e)',
+	'while IFS= read -r -d "" entry; do export "$entry"; done < <(/usr/bin/nc -U "$socket")',
+	'if [ "$AO_HANDOFF_COMPLETE" != 1 ]; then exit 78; fi',
+	"unset AO_HANDOFF_COMPLETE",
 	"child=",
 	"attempt=0",
 	"delay=1",
@@ -194,7 +206,14 @@ export function renderDaemonLaunchAgentPlist(
 ): string {
 	const daemonArgs =
 		launch.source === "configured" ? ["/bin/sh", "-c", launch.command] : [launch.command, ...launch.args];
-	const args = ["/bin/sh", "-c", DAEMON_SUPERVISOR_SCRIPT, "ao-daemon-supervisor", ...daemonArgs];
+	const args = [
+		"/bin/bash",
+		"-c",
+		DAEMON_SUPERVISOR_SCRIPT,
+		"ao-daemon-supervisor",
+		job.environmentSocketPath,
+		...daemonArgs,
+	];
 	const environment = Object.entries(env)
 		.filter((entry): entry is [string, string] => typeof entry[1] === "string")
 		.sort(([a], [b]) => a.localeCompare(b));
