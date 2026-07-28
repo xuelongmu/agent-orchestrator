@@ -528,7 +528,7 @@ async function startLaunchdEnvironmentHandoff(
 		});
 		holder.stdout.on("data", (chunk: Buffer) => {
 			output += chunk.toString("utf8");
-			if (settled || !output.includes("acquired\n")) return;
+			if (settled || !output.includes("ready\n")) return;
 			settled = true;
 			clearTimeout(timer);
 			resolve(
