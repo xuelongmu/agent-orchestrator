@@ -130,7 +130,7 @@ function Get-FirstAOInPath {
     if (-not $pathExtValue) {
         $pathExtValue = '.COM;.EXE;.BAT;.CMD'
     }
-    $extensions = @(@('') + @(
+    $extensions = @(@(
         $pathExtValue -split ';' | Where-Object { $_ }
     ) + @('.PS1') | Select-Object -Unique)
 
