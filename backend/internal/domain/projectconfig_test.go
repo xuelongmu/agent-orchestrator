@@ -112,8 +112,8 @@ func TestProjectConfigWithDefaults(t *testing.T) {
 	if got.TrackerIntake.Provider != TrackerProviderGitHub {
 		t.Fatalf("TrackerIntake.Provider = %q, want %q", got.TrackerIntake.Provider, TrackerProviderGitHub)
 	}
-	if got.TrackerIntake.MaxConcurrent != DefaultTrackerIntakeMaxConcurrent {
-		t.Fatalf("TrackerIntake.MaxConcurrent = %d, want %d", got.TrackerIntake.MaxConcurrent, DefaultTrackerIntakeMaxConcurrent)
+	if got.TrackerIntake.MaxConcurrent != 6 {
+		t.Fatalf("TrackerIntake.MaxConcurrent = %d, want 6", got.TrackerIntake.MaxConcurrent)
 	}
 
 	got = (ProjectConfig{}).WithDefaults()

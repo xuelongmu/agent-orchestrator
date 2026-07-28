@@ -92,13 +92,13 @@ type TrackerIntakeConfig struct {
 	// such as "*" are passed through unchanged.
 	Assignee string `json:"assignee,omitempty"`
 	// MaxConcurrent caps non-terminated worker sessions per project. Zero uses
-	// the safe default of three; intake never spawns beyond available slots.
+	// the safe default of six; intake never spawns beyond available slots.
 	MaxConcurrent int `json:"maxConcurrent,omitempty"`
 }
 
 // DefaultTrackerIntakeMaxConcurrent bounds autonomous issue intake unless a
 // project explicitly chooses another positive limit.
-const DefaultTrackerIntakeMaxConcurrent = 3
+const DefaultTrackerIntakeMaxConcurrent = 6
 
 // WithDefaults fills the provider only when intake is enabled. Disabled intake
 // leaves the zero value untouched so empty project configs still store as NULL.
