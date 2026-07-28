@@ -15,6 +15,8 @@ func TestRunRestoresEnvironmentWhenElectronPipeCloses(t *testing.T) {
 	state := map[string]string{"GH_TOKEN": "old-token"}
 	runLaunchctl = func(_ context.Context, args ...string) ([]byte, error) {
 		switch args[0] {
+		case "print":
+			return []byte("environment = {\n\tGH_TOKEN => old-token\n}\n"), nil
 		case "getenv":
 			value, ok := state[args[1]]
 			if !ok {
@@ -42,5 +44,48 @@ func TestRunRestoresEnvironmentWhenElectronPipeCloses(t *testing.T) {
 	}
 	if _, ok := state["OPENAI_API_KEY"]; ok {
 		t.Fatal("OPENAI_API_KEY remained after parent pipe closed")
+	}
+}
+
+func TestInstallTemporarilyClearsOmittedLaunchdEnvironment(t *testing.T) {
+	originalRunLaunchctl := runLaunchctl
+	t.Cleanup(func() { runLaunchctl = originalRunLaunchctl })
+	state := map[string]string{
+		"GH_TOKEN":    "old-token",
+		"HTTPS_PROXY": "stale-proxy",
+	}
+	runLaunchctl = func(_ context.Context, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "print":
+			return []byte("environment = {\n\tGH_TOKEN => old-token\n\tHTTPS_PROXY => stale-proxy\n}\n"), nil
+		case "getenv":
+			value, ok := state[args[1]]
+			if !ok {
+				return nil, errors.New("not set")
+			}
+			return []byte(value + "\n"), nil
+		case "setenv":
+			state[args[1]] = args[2]
+		case "unsetenv":
+			delete(state, args[1])
+		}
+		return nil, nil
+	}
+
+	restore, err := install(context.Background(), map[string]string{"GH_TOKEN": "new-token"})
+	if err != nil {
+		t.Fatalf("install() error = %v", err)
+	}
+	if state["GH_TOKEN"] != "new-token" {
+		t.Fatalf("GH_TOKEN = %q, want new value", state["GH_TOKEN"])
+	}
+	if _, ok := state["HTTPS_PROXY"]; ok {
+		t.Fatal("omitted HTTPS_PROXY remained during handoff")
+	}
+	if err := restore(); err != nil {
+		t.Fatalf("restore() error = %v", err)
+	}
+	if state["GH_TOKEN"] != "old-token" || state["HTTPS_PROXY"] != "stale-proxy" {
+		t.Fatalf("restored state = %#v", state)
 	}
 }

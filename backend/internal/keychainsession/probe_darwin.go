@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	tmuxruntime "github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/tmux"
 )
 
 var (
@@ -60,7 +62,7 @@ func Probe(ctx context.Context) Result {
 	output, err := runCommand(ctx, tmuxPath, "list-sessions")
 	if err != nil {
 		message := strings.ToLower(string(output))
-		if strings.Contains(message, "no server running") {
+		if tmuxruntime.ServerMissingOutput(message) {
 			return Result{
 				Supported: true,
 				Available: true,

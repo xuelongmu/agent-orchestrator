@@ -66,12 +66,12 @@ export function parseDaemonLaunchAgentPID(output: string): number | null {
 export function daemonLaunchAgentOwnsPID(
 	launchAgentPID: number | null,
 	daemonPID: number | undefined,
-	daemonParentPID: number | null,
+	daemonAncestorPIDs: readonly number[],
 ): boolean {
 	return (
 		launchAgentPID !== null &&
 		daemonPID !== undefined &&
-		(launchAgentPID === daemonPID || launchAgentPID === daemonParentPID)
+		(launchAgentPID === daemonPID || daemonAncestorPIDs.includes(launchAgentPID))
 	);
 }
 

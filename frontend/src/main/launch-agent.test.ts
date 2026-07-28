@@ -16,11 +16,11 @@ describe("parseDaemonLaunchAgentPID", () => {
 	});
 
 	it("requires the live service PID to match the probed daemon", () => {
-		expect(daemonLaunchAgentOwnsPID(4242, 4242, null)).toBe(true);
-		expect(daemonLaunchAgentOwnsPID(4242, 5151, 4242)).toBe(true);
-		expect(daemonLaunchAgentOwnsPID(null, 4242, null)).toBe(false);
-		expect(daemonLaunchAgentOwnsPID(4242, 5151, 6161)).toBe(false);
-		expect(daemonLaunchAgentOwnsPID(4242, undefined, null)).toBe(false);
+		expect(daemonLaunchAgentOwnsPID(4242, 4242, [])).toBe(true);
+		expect(daemonLaunchAgentOwnsPID(4242, 5151, [6161, 7171, 4242])).toBe(true);
+		expect(daemonLaunchAgentOwnsPID(null, 4242, [])).toBe(false);
+		expect(daemonLaunchAgentOwnsPID(4242, 5151, [6161, 7171])).toBe(false);
+		expect(daemonLaunchAgentOwnsPID(4242, undefined, [])).toBe(false);
 	});
 
 	it("preserves a loaded packaged definition for shared development", () => {

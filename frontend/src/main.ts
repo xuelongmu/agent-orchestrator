@@ -441,16 +441,21 @@ async function canonicalRunFileIdentity(runFile: string): Promise<string> {
 	}
 }
 
-async function macDaemonLaunchAgent(): Promise<DaemonLaunchAgent | null> {
+type MacDaemonLaunchAgent = {
+	job: DaemonLaunchAgent;
+	runFilePath: string;
+};
+
+async function macDaemonLaunchAgent(): Promise<MacDaemonLaunchAgent | null> {
 	if (process.platform !== "darwin") return null;
 	const runFile = runFilePath();
 	const canonicalRunFile = defaultRunFilePath(process.platform, process.env, os.homedir());
 	if (!runFile || !canonicalRunFile) return null;
-	return resolveDaemonLaunchAgent(
-		await canonicalRunFileIdentity(runFile),
-		await canonicalRunFileIdentity(canonicalRunFile),
-		os.userInfo().uid,
-	);
+	const resolvedRunFile = await canonicalRunFileIdentity(runFile);
+	return {
+		job: resolveDaemonLaunchAgent(resolvedRunFile, await canonicalRunFileIdentity(canonicalRunFile), os.userInfo().uid),
+		runFilePath: resolvedRunFile,
+	};
 }
 
 async function isLaunchAgentLoaded(job: DaemonLaunchAgent): Promise<boolean> {
@@ -471,15 +476,25 @@ async function launchAgentProcessID(job: DaemonLaunchAgent): Promise<number | nu
 	}
 }
 
-async function processParentID(pid: number | undefined): Promise<number | null> {
-	if (pid === undefined) return null;
-	try {
-		const { stdout } = await execFileAsync("/bin/ps", ["-o", "ppid=", "-p", String(pid)]);
-		const parent = Number(String(stdout).trim());
-		return Number.isSafeInteger(parent) && parent > 0 ? parent : null;
-	} catch {
-		return null;
+async function processAncestorIDs(pid: number | undefined): Promise<number[]> {
+	if (pid === undefined) return [];
+	const ancestors: number[] = [];
+	const seen = new Set([pid]);
+	let current = pid;
+	for (let depth = 0; depth < 32; depth += 1) {
+		let parent: number;
+		try {
+			const { stdout } = await execFileAsync("/bin/ps", ["-o", "ppid=", "-p", String(current)]);
+			parent = Number(String(stdout).trim());
+		} catch {
+			break;
+		}
+		if (!Number.isSafeInteger(parent) || parent <= 1 || seen.has(parent)) break;
+		ancestors.push(parent);
+		seen.add(parent);
+		current = parent;
 	}
+	return ancestors;
 }
 
 async function launchAgentDefinitionChanged(job: DaemonLaunchAgent, desired: string): Promise<boolean> {
@@ -1053,11 +1068,13 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		});
 		return daemonStatus;
 	}
-	daemonLaunchAgent = await macDaemonLaunchAgent();
-	const launchAgentBuildIdentity = daemonLaunchAgent ? await daemonLaunchAgentBuildIdentity(launch) : null;
-	const launchAgentFullEnvironment = daemonLaunchAgent
+	const macLaunchAgent = await macDaemonLaunchAgent();
+	daemonLaunchAgent = macLaunchAgent?.job ?? null;
+	const launchAgentBuildIdentity = macLaunchAgent ? await daemonLaunchAgentBuildIdentity(launch) : null;
+	const launchAgentFullEnvironment = macLaunchAgent
 		? {
 				...daemonEnv(false),
+				AO_RUN_FILE: macLaunchAgent.runFilePath,
 				AO_DESKTOP_BUILD_ID: launchAgentBuildIdentity ?? "development:unknown",
 			}
 		: null;
@@ -1102,7 +1119,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 			ownsDaemon: daemonLaunchAgentOwnsPID(
 				launchAgentPID,
 				existing.status.pid,
-				await processParentID(existing.status.pid),
+				await processAncestorIDs(existing.status.pid),
 			),
 			identityMismatch: existing.status.code === "identity_mismatch",
 			definitionChanged: launchAgentDefinitionIsStale,

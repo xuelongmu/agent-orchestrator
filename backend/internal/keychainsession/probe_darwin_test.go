@@ -58,6 +58,34 @@ func TestProbePassesWithoutActiveTmuxServer(t *testing.T) {
 	}
 }
 
+func TestProbePassesForDefinitiveMissingTmuxServerVariants(t *testing.T) {
+	for _, output := range []string{
+		"error connecting to /private/tmp/tmux-501/default (No such file or directory)",
+		"error connecting to /private/tmp/tmux-501/default (Connection refused)",
+	} {
+		t.Run(output, func(t *testing.T) {
+			originalLookPath := lookPath
+			originalRunCommand := runCommand
+			t.Cleanup(func() {
+				lookPath = originalLookPath
+				runCommand = originalRunCommand
+			})
+			lookPath = func(string) (string, error) { return "/opt/homebrew/bin/tmux", nil }
+			runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+				if len(args) > 0 && args[0] == "list-sessions" {
+					return []byte(output), errors.New("exit status 1")
+				}
+				return nil, nil
+			}
+
+			result := Probe(context.Background())
+			if !result.Available || !strings.Contains(result.Detail, "no active tmux server") {
+				t.Fatalf("Probe() = %+v, want daemon-only success", result)
+			}
+		})
+	}
+}
+
 func TestProbeChecksEmptyButActiveTmuxServer(t *testing.T) {
 	originalLookPath := lookPath
 	originalRunCommand := runCommand

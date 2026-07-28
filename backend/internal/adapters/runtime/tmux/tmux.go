@@ -355,7 +355,7 @@ func (r *Runtime) reapAfterSurvivorCheck(ctx context.Context, anchors []sessionA
 	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.timeout)
 	defer cancel()
 	out, err := r.run(probeCtx, listAllPaneRefsArgs()...)
-	if err != nil && !serverMissingOutput(string(out)) {
+	if err != nil && !ServerMissingOutput(string(out)) {
 		closeAnchors(candidates)
 		r.reapVerifiedAnchors(ctx, orphaned)
 		return
@@ -690,15 +690,15 @@ func handleID(handle ports.RuntimeHandle) (string, error) {
 // than a transient probe failure.
 func sessionMissingOutput(out string) bool {
 	s := strings.ToLower(out)
-	return serverMissingOutput(s) ||
+	return ServerMissingOutput(s) ||
 		strings.Contains(s, "can't find session") ||
 		strings.Contains(s, "session not found")
 }
 
-// serverMissingOutput is the authoritative set of tmux spellings that prove
+// ServerMissingOutput is the authoritative set of tmux spellings that prove
 // there is no server to own a surviving window. Other command failures are
 // ambiguous and must keep descendant reaping disabled.
-func serverMissingOutput(out string) bool {
+func ServerMissingOutput(out string) bool {
 	s := strings.ToLower(out)
 	if strings.Contains(s, "no server running") {
 		return true

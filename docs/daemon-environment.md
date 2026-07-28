@@ -39,8 +39,10 @@ API keys and tokens out of the mode-0600 file as well as off disk entirely. A
 separate AO handoff helper holds a BSD lock under the canonical
 `~/.ao/launchd` directory, snapshots and injects the environment, and restores
 it before releasing the lock. The helper reads credentials through a pipe and
-automatically restores the snapshot when Electron releases it or dies, so the
-shared GUI launchd environment cannot be stranded with a job's secrets.
+temporarily removes ambient variables omitted from the resolved environment, so
+an unset credential cannot leak in from an older launchd value. It automatically
+restores the complete snapshot when Electron releases it or dies, so the shared
+GUI launchd environment cannot be stranded with a job's secrets.
 
 The plist stores only a SHA-256 identity of the transient environment. A
 healthy, AO-owned LaunchAgent is replaced when that identity changes, allowing
