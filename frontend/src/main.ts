@@ -31,7 +31,7 @@ import {
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -84,7 +84,7 @@ import {
 	type DaemonLaunchAgent,
 	type DaemonLaunchAgentEnvironment,
 } from "./main/launch-agent";
-import { pathInside, samePath } from "./shared/path-identity";
+import { pathIdentityKey, pathInside, samePath } from "./shared/path-identity";
 
 // Globals injected at compile time by @electron-forge/plugin-vite.
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
@@ -428,17 +428,8 @@ function runFilePath(): string | null {
 	return defaultRunFilePath(process.platform, process.env, os.homedir());
 }
 
-async function canonicalRunFileIdentity(runFile: string): Promise<string> {
-	const resolved = path.resolve(runFile);
-	try {
-		return await realpath(resolved);
-	} catch {
-		try {
-			return path.join(await realpath(path.dirname(resolved)), path.basename(resolved));
-		} catch {
-			return resolved;
-		}
-	}
+function canonicalRunFileIdentity(runFile: string): string {
+	return pathIdentityKey(runFile);
 }
 
 type MacDaemonLaunchAgent = {
@@ -1428,6 +1419,7 @@ async function stopDaemon(): Promise<DaemonStatus> {
 	daemonRestart.cancel();
 	daemonStartEpoch += 1;
 	daemonStartPromise = null;
+	let stopTargetPID = daemonStatus.pid;
 	if (daemonLaunchAgent) {
 		let releaseLaunchAgentLock: (() => Promise<void>) | null = null;
 		try {
@@ -1448,10 +1440,33 @@ async function stopDaemon(): Promise<DaemonStatus> {
 		let launchAgentStop: "not_owned" | "stopped" | "error" = "not_owned";
 		try {
 			if (await isLaunchAgentLoaded(daemonLaunchAgent)) {
-				const previousPID = daemonStatus.pid;
 				const launchAgentPID = await launchAgentProcessID(daemonLaunchAgent);
-				const ownsDaemon = daemonLaunchAgentOwnsPID(launchAgentPID, previousPID, await processAncestorIDs(previousPID));
-				if (ownsDaemon) {
+				let ownedDaemonPID: number | undefined;
+				const discoveryDeadline =
+					daemonStatus.state === "starting" ? Date.now() + PORT_DISCOVERY_TIMEOUT_MS : Date.now();
+				do {
+					const candidates = new Set<number>();
+					if (stopTargetPID !== undefined) candidates.add(stopTargetPID);
+					const currentRunFile = await readRunFileForStop();
+					if (currentRunFile.state === "present") {
+						candidates.add(currentRunFile.info.pid);
+						stopTargetPID = currentRunFile.info.pid;
+					}
+					const probe = await readDaemonProbe(resolvedDaemonPort(), "healthz");
+					if (probe?.pid !== undefined) {
+						candidates.add(probe.pid);
+						stopTargetPID = probe.pid;
+					}
+					for (const candidate of candidates) {
+						if (daemonLaunchAgentOwnsPID(launchAgentPID, candidate, await processAncestorIDs(candidate))) {
+							ownedDaemonPID = candidate;
+							break;
+						}
+					}
+					if (ownedDaemonPID !== undefined || Date.now() >= discoveryDeadline) break;
+					await new Promise<void>((resolve) => setTimeout(resolve, RUN_FILE_POLL_MS));
+				} while (true);
+				if (ownedDaemonPID !== undefined) {
 					try {
 						await execFileAsync("/bin/launchctl", ["bootout", daemonLaunchAgent.serviceTarget]);
 					} catch (error) {
@@ -1469,10 +1484,7 @@ async function stopDaemon(): Promise<DaemonStatus> {
 						let stopped = false;
 						while (Date.now() < deadline) {
 							const runFile = await readRunFileForStop();
-							if (
-								runFile.state === "missing" ||
-								(previousPID !== undefined && probeProcessLiveness(previousPID) === "dead")
-							) {
+							if (runFile.state === "missing" || probeProcessLiveness(ownedDaemonPID) === "dead") {
 								stopped = true;
 								break;
 							}
@@ -1521,13 +1533,13 @@ async function stopDaemon(): Promise<DaemonStatus> {
 		return daemonStatus;
 	}
 
-	const previousPID = daemonStatus.pid;
+	const previousPID = stopTargetPID;
 	const runFile = await readRunFileForStop();
 	const liveness = previousPID === undefined ? "unknown" : probeProcessLiveness(previousPID);
-	const alreadyStopped = runFile.state === "missing" || liveness === "dead";
+	const alreadyStopped = liveness === "dead" || (runFile.state === "missing" && previousPID === undefined);
 	const ownedPID =
 		runFile.state === "present" && validatedDaemonOwner(runFile.info, previousPID) === "app" ? previousPID : undefined;
-	const port = daemonStatus.port;
+	const port = daemonStatus.port ?? resolvedDaemonPort();
 	const confirmStopped = async (): Promise<boolean> => {
 		const deadline = Date.now() + 7_000;
 		while (Date.now() < deadline) {
