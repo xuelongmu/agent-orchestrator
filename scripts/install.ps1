@@ -97,6 +97,18 @@ function Test-SupportedNodeVersion {
         $major -gt 22
 }
 
+function Get-NodeRuntimeIdentity {
+    $platform = (& node -p process.platform).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not determine the Node platform'
+    }
+    $architecture = (& node -p process.arch).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not determine the Node architecture'
+    }
+    return "$platform/$architecture"
+}
+
 function Test-SamePath {
     param(
         [Parameter(Mandatory)]
@@ -199,24 +211,43 @@ function Ensure-AOOnPath {
 function Test-InstalledDependenciesMatchLockfile {
     param(
         [Parameter(Mandatory)]
-        [string]$FrontendDirectory
+        [string]$Directory
     )
 
-    $packageLock = Join-Path $FrontendDirectory 'package-lock.json'
-    $lockFingerprint = Join-Path $FrontendDirectory 'node_modules\.ao-package-lock.sha256'
+    $packageLock = Join-Path $Directory 'package-lock.json'
+    $lockFingerprint = Join-Path $Directory 'node_modules\.ao-package-lock.sha256'
     if (-not (Test-Path -LiteralPath $packageLock) -or
         -not (Test-Path -LiteralPath $lockFingerprint)) {
         return $false
     }
 
     try {
-        $expected = Get-FileSHA256 -Path $packageLock
+        $expected = @(
+            Get-FileSHA256 -Path $packageLock
+            Get-NodeRuntimeIdentity
+        ) -join "`n"
         $installed = (Get-Content -LiteralPath $lockFingerprint -Raw).Trim()
         return $expected.Equals($installed, [System.StringComparison]::OrdinalIgnoreCase)
     }
     catch {
         return $false
     }
+}
+
+function Write-DependencyFingerprint {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Directory
+    )
+
+    $fingerprint = @(
+        Get-FileSHA256 -Path (Join-Path $Directory 'package-lock.json')
+        Get-NodeRuntimeIdentity
+    ) -join "`n"
+    [System.IO.File]::WriteAllText(
+        (Join-Path $Directory 'node_modules\.ao-package-lock.sha256'),
+        $fingerprint
+    )
 }
 
 function Get-RunningSourceApp {
@@ -371,6 +402,7 @@ $scriptDir = Split-Path -Parent $PSCommandPath
 $repoRoot = (Resolve-Path (Join-Path $scriptDir '..')).Path
 $backendDir = Join-Path $repoRoot 'backend'
 $frontendDir = Join-Path $repoRoot 'frontend'
+$rootNodeModules = Join-Path $repoRoot 'node_modules'
 $nodeModules = Join-Path $frontendDir 'node_modules'
 $resolvedInstallDirectory = [System.IO.Path]::GetFullPath($InstallDirectory)
 $installPath = Join-Path $resolvedInstallDirectory 'ao.exe'
@@ -419,31 +451,40 @@ if ($Start) {
     }
 }
 
-if (Test-Path -LiteralPath $nodeModules) {
-    $dependenciesReady =
-        (Test-Native -Command npm -Arguments @('--prefix', $frontendDir, 'ls', '--all')) -and
-        (Test-InstalledDependenciesMatchLockfile -FrontendDirectory $frontendDir)
+if (Test-Path -LiteralPath $rootNodeModules) {
+    $rootDependenciesReady =
+        (Test-Native -Command npm -Arguments @('--prefix', $repoRoot, 'ls', '--all')) -and
+        (Test-InstalledDependenciesMatchLockfile -Directory $repoRoot)
 }
 else {
-    $dependenciesReady = $false
+    $rootDependenciesReady = $false
 }
 
-if ($InstallDependencies -or -not $dependenciesReady) {
+if (Test-Path -LiteralPath $nodeModules) {
+    $frontendDependenciesReady =
+        (Test-Native -Command npm -Arguments @('--prefix', $frontendDir, 'ls', '--all')) -and
+        (Test-InstalledDependenciesMatchLockfile -Directory $frontendDir)
+}
+else {
+    $frontendDependenciesReady = $false
+}
+
+if ($InstallDependencies -or -not $rootDependenciesReady -or -not $frontendDependenciesReady) {
     $sourceApp = Get-RunningSourceApp -FrontendDirectory $frontendDir
     if ($sourceApp) {
-        throw "Frontend dependencies need updating, but AO is running from this source checkout (PID $($sourceApp.ProcessId)); close it and run the installer again"
+        throw "Dependencies need updating, but AO is running from this source checkout (PID $($sourceApp.ProcessId)); close it and run the installer again"
     }
-    if (-not $dependenciesReady) {
+
+    if ($InstallDependencies -or -not $rootDependenciesReady) {
+        Write-Host 'Root dependencies are missing or stale; running npm ci...'
+        Invoke-Native -Command npm -Arguments @('ci', '--prefix', $repoRoot)
+        Write-DependencyFingerprint -Directory $repoRoot
+    }
+    if ($InstallDependencies -or -not $frontendDependenciesReady) {
         Write-Host 'Frontend dependencies are missing or stale; running npm ci...'
+        Invoke-Native -Command npm -Arguments @('ci', '--prefix', $frontendDir)
+        Write-DependencyFingerprint -Directory $frontendDir
     }
-    Invoke-Native -Command npm -Arguments @('ci', '--prefix', $frontendDir)
-    $packageLockHash = Get-FileSHA256 -Path (
-        Join-Path $frontendDir 'package-lock.json'
-    )
-    [System.IO.File]::WriteAllText(
-        (Join-Path $nodeModules '.ao-package-lock.sha256'),
-        $packageLockHash
-    )
 }
 Ensure-ElectronBinary -FrontendDirectory $frontendDir
 
