@@ -66,12 +66,17 @@ function Test-SamePath {
         [string]$Right
     )
 
-    $leftPath = [System.IO.Path]::GetFullPath(
-        [Environment]::ExpandEnvironmentVariables($Left).Trim().Trim('"')
-    ).TrimEnd('\')
-    $rightPath = [System.IO.Path]::GetFullPath(
-        [Environment]::ExpandEnvironmentVariables($Right).Trim().Trim('"')
-    ).TrimEnd('\')
+    try {
+        $leftPath = [System.IO.Path]::GetFullPath(
+            [Environment]::ExpandEnvironmentVariables($Left).Trim().Trim('"')
+        ).TrimEnd('\')
+        $rightPath = [System.IO.Path]::GetFullPath(
+            [Environment]::ExpandEnvironmentVariables($Right).Trim().Trim('"')
+        ).TrimEnd('\')
+    }
+    catch {
+        return $false
+    }
     return $leftPath.Equals($rightPath, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
@@ -91,11 +96,10 @@ function Ensure-AOOnPath {
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $userEntries = @($userPath -split ';' | Where-Object { $_ })
-    $userHasDirectory = @($userEntries | Where-Object {
-        Test-SamePath -Left $_ -Right $Directory
-    }).Count -gt 0
+    $userDirectoryLeads = $userEntries.Count -gt 0 -and
+        (Test-SamePath -Left $userEntries[0] -Right $Directory)
 
-    if ($currentResolvesToTarget -and $userHasDirectory) {
+    if ($currentResolvesToTarget -and $userDirectoryLeads) {
         Write-Host "ao already resolves to $Executable; PATH is unchanged."
         return
     }
@@ -112,6 +116,58 @@ function Ensure-AOOnPath {
     })
     $env:PATH = (@($Directory) + $otherProcessEntries) -join ';'
     Write-Host "Placed $Directory at the beginning of your user PATH."
+}
+
+function Test-InstalledDependenciesMatchLockfile {
+    param(
+        [Parameter(Mandatory)]
+        [string]$FrontendDirectory
+    )
+
+    $packageLock = Join-Path $FrontendDirectory 'package-lock.json'
+    $installedLock = Join-Path $FrontendDirectory 'node_modules\.package-lock.json'
+    if (-not (Test-Path -LiteralPath $packageLock) -or
+        -not (Test-Path -LiteralPath $installedLock)) {
+        return $false
+    }
+
+    # Windows PowerShell 5.1 strips quotes from native-command arguments.
+    # Keep this node -e program quote-free so the comparison works in both
+    # Windows PowerShell and PowerShell 7.
+    $compareLocks = @'
+const fs = require(String.fromCharCode(102, 115));
+const expected = JSON.parse(fs.readFileSync(process.argv[1]));
+const installed = JSON.parse(fs.readFileSync(process.argv[2]));
+for (const [path, actualPackage] of Object.entries(installed.packages || {})) {
+  const expectedPackage = expected.packages && expected.packages[path];
+  if (!expectedPackage ||
+      expectedPackage.version !== actualPackage.version ||
+      expectedPackage.integrity !== actualPackage.integrity) {
+    process.exit(1);
+  }
+}
+'@
+    return Test-Native -Command node -Arguments @(
+        '-e',
+        $compareLocks,
+        $packageLock,
+        $installedLock
+    )
+}
+
+function Get-RunningSourceApp {
+    param(
+        [Parameter(Mandatory)]
+        [string]$FrontendDirectory
+    )
+
+    $electronExe = Join-Path $FrontendDirectory 'node_modules\electron\dist\electron.exe'
+    return Get-CimInstance Win32_Process |
+        Where-Object {
+            $_.ExecutablePath -and
+            (Test-SamePath -Left $_.ExecutablePath -Right $electronExe)
+        } |
+        Select-Object -First 1
 }
 
 function Install-Binary {
@@ -255,7 +311,7 @@ $nodeModules = Join-Path $frontendDir 'node_modules'
 $resolvedInstallDirectory = [System.IO.Path]::GetFullPath($InstallDirectory)
 $installPath = Join-Path $resolvedInstallDirectory 'ao.exe'
 
-foreach ($command in @('git', 'go', 'npm')) {
+foreach ($command in @('git', 'go', 'node', 'npm')) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         throw "$command is required but was not found on PATH"
     }
@@ -288,26 +344,26 @@ if ($Start) {
         throw 'Close the installed Agent Orchestrator desktop app before using -Start'
     }
 
-    $electronExe = Join-Path $frontendDir 'node_modules\electron\dist\electron.exe'
-    $sourceApp = Get-CimInstance Win32_Process |
-        Where-Object {
-            $_.ExecutablePath -and
-            (Test-SamePath -Left $_.ExecutablePath -Right $electronExe)
-        } |
-        Select-Object -First 1
+    $sourceApp = Get-RunningSourceApp -FrontendDirectory $frontendDir
     if ($sourceApp) {
         throw "AO is already running from this source checkout (PID $($sourceApp.ProcessId))"
     }
 }
 
 if (Test-Path -LiteralPath $nodeModules) {
-    $dependenciesReady = Test-Native -Command npm -Arguments @('--prefix', $frontendDir, 'ls', '--depth=0')
+    $dependenciesReady =
+        (Test-Native -Command npm -Arguments @('--prefix', $frontendDir, 'ls', '--depth=0')) -and
+        (Test-InstalledDependenciesMatchLockfile -FrontendDirectory $frontendDir)
 }
 else {
     $dependenciesReady = $false
 }
 
 if ($InstallDependencies -or -not $dependenciesReady) {
+    $sourceApp = Get-RunningSourceApp -FrontendDirectory $frontendDir
+    if ($sourceApp) {
+        throw "Frontend dependencies need updating, but AO is running from this source checkout (PID $($sourceApp.ProcessId)); close it and run the installer again"
+    }
     if (-not $dependenciesReady) {
         Write-Host 'Frontend dependencies are missing or stale; running npm ci...'
     }
