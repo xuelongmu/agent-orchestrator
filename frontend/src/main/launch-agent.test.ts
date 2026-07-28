@@ -147,7 +147,7 @@ describe("renderDaemonLaunchAgentPlist", () => {
 		expect(plist).toContain("<string>/Applications/AO &amp; Friends/ao</string>");
 		expect(plist).toContain("<string>/tmp/a &lt; b</string>");
 		expect(plist).toContain("<string>a&amp;b&lt;&quot;c&quot;&gt;</string>");
-		expect(plist).toContain("<key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>");
+		expect(plist).not.toContain("<key>KeepAlive</key>");
 	});
 
 	it("runs an explicitly configured command through the shell", () => {
@@ -163,7 +163,7 @@ describe("renderDaemonLaunchAgentPlist", () => {
 			},
 			{},
 		);
-		expect(plist).toContain("<string>/bin/sh</string>\n    <string>-lc</string>");
+		expect(plist).toContain("<string>/bin/sh</string>\n    <string>-c</string>");
 		expect(plist).toContain("<string>/opt/ao daemon --flag</string>");
 	});
 });

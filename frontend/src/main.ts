@@ -559,27 +559,29 @@ async function installAndKickstartLaunchAgent(
 	job: DaemonLaunchAgent,
 	launch: DaemonLaunchSpec,
 	environment: DaemonLaunchAgentEnvironment,
-	preserveLoadedDefinition: boolean,
+	sharedDevelopment: boolean,
 	shouldContinue: () => boolean,
 ): Promise<boolean> {
 	if (!shouldContinue()) return false;
-	const plist = renderDaemonLaunchAgentPlist(job, launch, environment.persisted);
-	const loaded = await isLaunchAgentLoaded(job);
-	const definitionChanged = !preserveLoadedDefinition && (await launchAgentDefinitionChanged(job, plist));
-
-	if (loaded && definitionChanged) {
-		await execFileAsync("/bin/launchctl", ["bootout", job.serviceTarget]);
-	}
-	if (!shouldContinue()) return false;
-	if (!preserveLoadedDefinition || !loaded) {
-		await mkdir(path.dirname(job.plistPath), { recursive: true, mode: 0o750 });
-		await writeFile(job.plistPath, plist, { encoding: "utf8", mode: 0o600 });
-		await chmod(job.plistPath, 0o600);
-	}
-
 	const releaseEnvironmentLock = await acquireLaunchdEnvironmentLock(job.environmentLockPath);
 	let restoreEnvironment: (() => Promise<void>) | null = null;
 	try {
+		if (!shouldContinue()) return false;
+		const plist = renderDaemonLaunchAgentPlist(job, launch, environment.persisted);
+		// Re-probe under the cross-process lock. A packaged app may have loaded
+		// the canonical definition while a shared-development app was waiting.
+		const loaded = await isLaunchAgentLoaded(job);
+		const preserveLoadedDefinition = sharedDevelopment && loaded;
+		const definitionChanged = !preserveLoadedDefinition && (await launchAgentDefinitionChanged(job, plist));
+		if (loaded && definitionChanged) {
+			await execFileAsync("/bin/launchctl", ["bootout", job.serviceTarget]);
+		}
+		if (!shouldContinue()) return false;
+		if (!preserveLoadedDefinition || !loaded) {
+			await mkdir(path.dirname(job.plistPath), { recursive: true, mode: 0o750 });
+			await writeFile(job.plistPath, plist, { encoding: "utf8", mode: 0o600 });
+			await chmod(job.plistPath, 0o600);
+		}
 		restoreEnvironment = await installTemporaryLaunchdEnvironment(environment.transient);
 		if (!shouldContinue()) return false;
 		if (!loaded || definitionChanged) {
@@ -622,7 +624,7 @@ async function startDaemonViaLaunchAgent(
 	job: DaemonLaunchAgent,
 	startEpoch: number,
 	environment: DaemonLaunchAgentEnvironment,
-	preserveLoadedDefinition: boolean,
+	sharedDevelopment: boolean,
 ): Promise<DaemonStatus> {
 	setDaemonStatus({ state: "starting" });
 	daemonOwnership.clear();
@@ -631,7 +633,7 @@ async function startDaemonViaLaunchAgent(
 			job,
 			launch,
 			environment,
-			preserveLoadedDefinition,
+			sharedDevelopment,
 			() => startEpoch === daemonStartEpoch && !daemonStopIntent.stopping,
 		);
 		if (!started) return daemonStatus;
@@ -661,6 +663,19 @@ async function startDaemonViaLaunchAgent(
 		code: "not_ready",
 	});
 	return daemonStatus;
+}
+
+async function daemonLaunchAgentBuildIdentity(launch: DaemonLaunchSpec): Promise<string> {
+	if (app.isPackaged) return `release:${app.getVersion()}`;
+	if (devDaemonConfig.isIsolated && launch.source !== "configured") {
+		try {
+			const binary = await stat(launch.command);
+			return `development:${binary.size}:${Math.trunc(binary.mtimeMs)}`;
+		} catch {
+			return "development:missing";
+		}
+	}
+	return "development:shared";
 }
 
 // How long to wait for the login shell to print its env before giving up. A
@@ -1028,10 +1043,11 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		return daemonStatus;
 	}
 	daemonLaunchAgent = macDaemonLaunchAgent();
+	const launchAgentBuildIdentity = daemonLaunchAgent ? await daemonLaunchAgentBuildIdentity(launch) : null;
 	const launchAgentFullEnvironment = daemonLaunchAgent
 		? {
 				...daemonEnv(false),
-				AO_DESKTOP_BUILD_ID: app.isPackaged ? `release:${app.getVersion()}` : "development",
+				AO_DESKTOP_BUILD_ID: launchAgentBuildIdentity ?? "development:unknown",
 			}
 		: null;
 	const launchAgentEnvironment = launchAgentFullEnvironment
@@ -1042,7 +1058,8 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	}
 	const launchAgentLoaded = daemonLaunchAgent ? await isLaunchAgentLoaded(daemonLaunchAgent) : false;
 	const launchAgentPID = daemonLaunchAgent ? await launchAgentProcessID(daemonLaunchAgent) : null;
-	const preserveSharedDevLaunchAgent = isDev && !devDaemonConfig.isIsolated && launchAgentLoaded;
+	const sharedDevelopment = isDev && !devDaemonConfig.isIsolated;
+	const preserveSharedDevLaunchAgent = sharedDevelopment && launchAgentLoaded;
 	const launchAgentDefinitionIsStale =
 		daemonLaunchAgent !== null &&
 		launchAgentEnvironment !== null &&
@@ -1192,13 +1209,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// interaction. launchd's gui/<uid> domain is the session boundary that makes
 	// daemon-spawned workers behave like processes launched from Terminal.
 	if (daemonLaunchAgent && launchAgentEnvironment) {
-		return startDaemonViaLaunchAgent(
-			launch,
-			daemonLaunchAgent,
-			startEpoch,
-			launchAgentEnvironment,
-			preserveSharedDevLaunchAgent,
-		);
+		return startDaemonViaLaunchAgent(launch, daemonLaunchAgent, startEpoch, launchAgentEnvironment, sharedDevelopment);
 	}
 
 	setDaemonStatus({ state: "starting" });

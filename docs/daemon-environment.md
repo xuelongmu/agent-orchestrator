@@ -21,9 +21,11 @@ keychain interaction to an audit session, and a daemon inherited from the wrong
 launch context can receive `errSecInteractionNotAllowed` even when it has the
 right user ID and environment. AO therefore writes a mode-0600 LaunchAgent
 definition beside its selected run file and bootstraps it into `gui/<uid>` with
-`LimitLoadToSessionType=Aqua`. The job restarts after an unsuccessful exit, so
-quitting Electron does not strand the daemon, while a graceful `ao stop` remains
-stopped. The desktop Stop action unloads the job explicitly.
+`LimitLoadToSessionType=Aqua`. A credential-holding supervisor inside the job
+restarts the daemon child after an unsuccessful exit, while a graceful `ao stop`
+exits the supervisor and remains stopped. launchd does not restart a lost
+supervisor without its private environment. The desktop Stop action unloads the
+job explicitly.
 
 The on-disk plist contains only non-secret launch configuration such as paths,
 locale, state location, port, and telemetry mode. Credentials and all other

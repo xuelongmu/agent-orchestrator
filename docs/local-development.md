@@ -246,7 +246,8 @@ docker build -f test/cli/Dockerfile -t ao-cli-smoke . && docker run --rm --init 
 
 **macOS workers hang with keychain-backed credentials** — the desktop app starts
 the daemon through a LaunchAgent in the user's `gui/<uid>` launchd domain. It
-restarts after crashes but stays stopped after a graceful `ao stop`. Its
+restarts the daemon child after crashes but stays stopped after a graceful
+`ao stop`. Its
 generated plist and label-specific logs live beside the selected run file under
 `~/.ao/launchd` and `~/.ao` (or the corresponding `AO_RUN_FILE` override).
 This keeps the daemon, tmux server, and worker panes in the Aqua audit session

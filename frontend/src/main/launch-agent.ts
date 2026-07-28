@@ -164,7 +164,7 @@ export function renderDaemonLaunchAgentPlist(
 	env: NodeJS.ProcessEnv,
 ): string {
 	const daemonArgs =
-		launch.source === "configured" ? ["/bin/sh", "-lc", launch.command] : [launch.command, ...launch.args];
+		launch.source === "configured" ? ["/bin/sh", "-c", launch.command] : [launch.command, ...launch.args];
 	const args = ["/bin/sh", "-c", DAEMON_SUPERVISOR_SCRIPT, "ao-daemon-supervisor", ...daemonArgs];
 	const environment = Object.entries(env)
 		.filter((entry): entry is [string, string] => typeof entry[1] === "string")
@@ -189,11 +189,6 @@ export function renderDaemonLaunchAgentPlist(
 		"  </dict>",
 		"  <key>RunAtLoad</key>",
 		"  <true/>",
-		"  <key>KeepAlive</key>",
-		"  <dict>",
-		"    <key>SuccessfulExit</key>",
-		"    <false/>",
-		"  </dict>",
 		"  <key>LimitLoadToSessionType</key>",
 		"  <string>Aqua</string>",
 		"  <key>StandardOutPath</key>",
