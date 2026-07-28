@@ -43,6 +43,10 @@ daemon. Credentials therefore never enter the plist, launchd's shared
 environment, or a command argument. Electron crashes close the helper's stdin;
 the helper then closes and removes the socket before releasing the lock.
 
+LaunchAgent stdout and stderr are pumped into label-specific files under the AO
+state directory. Each stream rotates at 5 MiB and retains one previous file, so
+routine daemon health logging remains bounded for persistent desktop sessions.
+
 The plist stores only a SHA-256 identity of the transient environment. A
 healthy, AO-owned LaunchAgent is replaced when that identity changes, allowing
 rotated credentials to take effect without writing their values to disk.

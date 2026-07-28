@@ -181,6 +181,11 @@ describe("renderDaemonLaunchAgentPlist", () => {
 		expect(plist).toContain("<string>ao-daemon-supervisor</string>");
 		expect(plist).toContain("/usr/bin/nc -U &quot;$socket&quot;");
 		expect(plist).toContain("<string>/Users/me/.ao/launchd/dev.ao.daemon.environment.sock</string>");
+		expect(plist).toContain("<string>/Users/me/.ao/dev.ao.daemon.stdout.log</string>");
+		expect(plist).toContain("<string>/Users/me/.ao/dev.ao.daemon.stderr.log</string>");
+		expect(plist).toContain("max_log_bytes=5242880");
+		expect(plist).toContain("pump_log");
+		expect(plist.match(/<string>\/dev\/null<\/string>/g)).toHaveLength(2);
 		expect(plist).toContain("daemon restart budget exhausted");
 		expect(plist).toContain("<string>/Applications/AO &amp; Friends/ao</string>");
 		expect(plist).toContain("<string>/tmp/a &lt; b</string>");
