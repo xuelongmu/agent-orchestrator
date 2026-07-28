@@ -306,50 +306,14 @@ try {
     }
     Write-Host ''
     if ($Start) {
-        Write-Host "Starting AO from source at $repoRoot"
-        Write-Host 'This terminal stays attached to the dev app; press Ctrl-C to stop it.'
-        $previousDaemonCommand = $env:AO_DAEMON_COMMAND
-        $previousPort = $env:AO_PORT
-        $previousRunFile = $env:AO_RUN_FILE
-        $previousDataDirectory = $env:AO_DATA_DIR
-        $env:AO_DAEMON_COMMAND = "`"$installPath`" daemon"
-        if (-not $env:AO_PORT) {
-            $env:AO_PORT = '3001'
-        }
-        if (-not $env:AO_RUN_FILE) {
-            $env:AO_RUN_FILE = Join-Path $HOME '.ao\running.json'
-        }
-        if (-not $env:AO_DATA_DIR) {
-            $env:AO_DATA_DIR = Join-Path $HOME '.ao\data'
-        }
-        Push-Location $frontendDir
+        Push-Location $repoRoot
         try {
-            # Run the repository's canonical dev command while suppressing its
-            # predev release-build hook. The installer already built the exact
-            # daemon executable and AO_DAEMON_COMMAND makes the source app
-            # supervise that binary.
-            Invoke-Native -Command npm -Arguments @('--ignore-scripts', 'run', 'dev')
+            # The source-built CLI owns checkout discovery, dependency
+            # preflight, daemon warnings, and the attached Forge lifecycle.
+            Invoke-Native -Command $installPath -Arguments @('start', '--source')
         }
         finally {
             Pop-Location
-            if ($null -eq $previousDaemonCommand) {
-                Remove-Item Env:AO_DAEMON_COMMAND -ErrorAction SilentlyContinue
-            }
-            else {
-                $env:AO_DAEMON_COMMAND = $previousDaemonCommand
-            }
-            foreach ($entry in @{
-                AO_PORT = $previousPort
-                AO_RUN_FILE = $previousRunFile
-                AO_DATA_DIR = $previousDataDirectory
-            }.GetEnumerator()) {
-                if ($null -eq $entry.Value) {
-                    Remove-Item "Env:$($entry.Key)" -ErrorAction SilentlyContinue
-                }
-                else {
-                    Set-Item "Env:$($entry.Key)" $entry.Value
-                }
-            }
         }
     }
     else {
