@@ -1442,7 +1442,8 @@ function initAutoUpdates(): void {
 	void ensureUpdatePrefs(stateDir).then(() => startAutoUpdates(stateDir));
 }
 
-// Resolve the bundle path `ao start` will later `open` and stat as a usable app.
+// Resolve the packaged bundle path `ao start` will later `open` and stat as a
+// usable app.
 // On macOS process.execPath is .../Agent Orchestrator.app/Contents/MacOS/<exe>;
 // the thing `ao start` opens is the enclosing `.app` directory, so walk up three
 // levels (MacOS -> Contents -> .app). app.getAppPath() is WRONG here: it returns
@@ -1464,10 +1465,13 @@ function parseInstalledVia(argv: string[]): string | undefined {
 	return flag ? flag.slice("--installed-via=".length) : undefined;
 }
 
-// Write ~/.ao/app-state.json so `ao start`'s resolveApp() can find this bundle
-// (spec §7.1). The app is the sole writer (invariant 3) and writes every launch.
-// A failure here must NOT block startup, so the caller wraps this in try/catch;
-// we still surface it via the log.
+// Write ~/.ao/app-state.json so `ao start`'s resolveApp() can find a packaged
+// bundle (spec §7.1). A development launch deliberately records no appPath:
+// process.execPath is the bare Electron runtime, and opening it later without
+// the source directory would show Electron's default app instead of AO.
+// The app is the sole writer (invariant 3) and writes every launch. A failure
+// here must NOT block startup, so the caller wraps this in try/catch; we still
+// surface it via the log.
 async function writeAppStateOnLaunch(): Promise<void> {
 	// Reuse the same ~/.ao resolution as running.json; the marker lives beside it
 	// (the Go side computes its dir as dirname(RunFilePath)). runFilePath() returns
@@ -1480,7 +1484,7 @@ async function writeAppStateOnLaunch(): Promise<void> {
 	const stateDir = path.dirname(runFile);
 	await writeAppStateMarker({
 		stateDir,
-		appPath: resolveBundlePath(),
+		appPath: app.isPackaged ? resolveBundlePath() : "",
 		version: app.getVersion(),
 		installedVia: parseInstalledVia(process.argv),
 		now: () => new Date(),

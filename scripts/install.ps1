@@ -258,6 +258,17 @@ if ($Start) {
     if ($releaseApp) {
         throw 'Close the installed Agent Orchestrator desktop app before using -Start'
     }
+
+    $electronExe = Join-Path $frontendDir 'node_modules\electron\dist\electron.exe'
+    $sourceApp = Get-CimInstance Win32_Process |
+        Where-Object {
+            $_.ExecutablePath -and
+            (Test-SamePath -Left $_.ExecutablePath -Right $electronExe)
+        } |
+        Select-Object -First 1
+    if ($sourceApp) {
+        throw "AO is already running from this source checkout (PID $($sourceApp.ProcessId))"
+    }
 }
 
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "ao-source-install-$PID"
@@ -313,10 +324,11 @@ try {
         }
         Push-Location $frontendDir
         try {
-            # Invoke Forge directly so npm does not run the predev release-build
-            # hook. The installer already built the exact daemon executable and
-            # AO_DAEMON_COMMAND makes the source app supervise that binary.
-            Invoke-Native -Command npm -Arguments @('exec', '--', 'electron-forge', 'start')
+            # Run the repository's canonical dev command while suppressing its
+            # predev release-build hook. The installer already built the exact
+            # daemon executable and AO_DAEMON_COMMAND makes the source app
+            # supervise that binary.
+            Invoke-Native -Command npm -Arguments @('--ignore-scripts', 'run', 'dev')
         }
         finally {
             Pop-Location
