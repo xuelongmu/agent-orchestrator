@@ -34,7 +34,12 @@ function Test-Native {
 
     $previousErrorPreference = $ErrorActionPreference
     $hadNativeErrorPreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
-    $previousNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+    $previousNativeErrorPreference = if ($hadNativeErrorPreference) {
+        $PSNativeCommandUseErrorActionPreference
+    }
+    else {
+        $null
+    }
     try {
         $ErrorActionPreference = 'Continue'
         $PSNativeCommandUseErrorActionPreference = $false
@@ -81,13 +86,20 @@ function Ensure-AOOnPath {
 
     $currentAO = Get-Command ao -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
-    if ($currentAO -and (Test-SamePath -Left $currentAO.Source -Right $Executable)) {
+    $currentResolvesToTarget = $currentAO -and
+        (Test-SamePath -Left $currentAO.Source -Right $Executable)
+
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $userEntries = @($userPath -split ';' | Where-Object { $_ })
+    $userHasDirectory = @($userEntries | Where-Object {
+        Test-SamePath -Left $_ -Right $Directory
+    }).Count -gt 0
+
+    if ($currentResolvesToTarget -and $userHasDirectory) {
         Write-Host "ao already resolves to $Executable; PATH is unchanged."
         return
     }
 
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $userEntries = @($userPath -split ';' | Where-Object { $_ })
     $otherUserEntries = @($userEntries | Where-Object {
         -not (Test-SamePath -Left $_ -Right $Directory)
     })
@@ -183,10 +195,15 @@ function Ensure-ElectronBinary {
     else {
         Join-Path $env:LOCALAPPDATA 'electron\Cache'
     }
-    $archive = Get-ChildItem -LiteralPath $cacheRoot -Recurse -File -Filter "electron-v$electronVersion-win32-*.zip" -ErrorAction SilentlyContinue |
+    $nodeArch = (& node -p 'process.arch').Trim()
+    if ($LASTEXITCODE -ne 0 -or $nodeArch -notin @('x64', 'arm64', 'ia32')) {
+        throw "Could not determine a supported Node architecture (received '$nodeArch')"
+    }
+    $archiveName = "electron-v$electronVersion-win32-$nodeArch.zip"
+    $archive = Get-ChildItem -LiteralPath $cacheRoot -Recurse -File -Filter $archiveName -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if (-not $archive) {
-        throw "Electron $electronVersion did not install and its cache archive was not found under $cacheRoot"
+        throw "Electron $electronVersion did not install and $archiveName was not found under $cacheRoot"
     }
 
     $distPath = Join-Path $electronRoot 'dist'
@@ -195,6 +212,33 @@ function Ensure-ElectronBinary {
     [System.IO.File]::WriteAllText((Join-Path $electronRoot 'path.txt'), 'electron.exe')
     if (-not (Test-Path -LiteralPath $electronExe)) {
         throw "Electron repair completed without producing $electronExe"
+    }
+}
+
+function Get-RunningDaemonExecutable {
+    $runFile = if ($env:AO_RUN_FILE) {
+        $env:AO_RUN_FILE
+    }
+    else {
+        Join-Path $HOME '.ao\running.json'
+    }
+    if (-not (Test-Path -LiteralPath $runFile)) {
+        return $null
+    }
+
+    try {
+        $run = Get-Content -LiteralPath $runFile -Raw | ConvertFrom-Json
+        if (-not $run.port) {
+            return $null
+        }
+        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$($run.port)/healthz" -TimeoutSec 2
+        if ($health.service -ne 'agent-orchestrator-daemon') {
+            return $null
+        }
+        return $health.executablePath
+    }
+    catch {
+        return $null
     }
 }
 
@@ -238,21 +282,6 @@ if ($Fetch) {
     Invoke-Native -Command git -Arguments @('-C', $repoRoot, 'pull', '--ff-only', 'origin', 'main')
 }
 
-if (Test-Path -LiteralPath $nodeModules) {
-    $dependenciesReady = Test-Native -Command npm -Arguments @('--prefix', $frontendDir, 'ls', '--depth=0')
-}
-else {
-    $dependenciesReady = $false
-}
-
-if ($InstallDependencies -or -not $dependenciesReady) {
-    if (-not $dependenciesReady) {
-        Write-Host 'Frontend dependencies are missing or stale; running npm ci...'
-    }
-    Invoke-Native -Command npm -Arguments @('ci', '--prefix', $frontendDir)
-}
-Ensure-ElectronBinary -FrontendDirectory $frontendDir
-
 if ($Start) {
     $releaseApp = Get-Process -Name 'agent-orchestrator' -ErrorAction SilentlyContinue
     if ($releaseApp) {
@@ -271,6 +300,21 @@ if ($Start) {
     }
 }
 
+if (Test-Path -LiteralPath $nodeModules) {
+    $dependenciesReady = Test-Native -Command npm -Arguments @('--prefix', $frontendDir, 'ls', '--depth=0')
+}
+else {
+    $dependenciesReady = $false
+}
+
+if ($InstallDependencies -or -not $dependenciesReady) {
+    if (-not $dependenciesReady) {
+        Write-Host 'Frontend dependencies are missing or stale; running npm ci...'
+    }
+    Invoke-Native -Command npm -Arguments @('ci', '--prefix', $frontendDir)
+}
+Ensure-ElectronBinary -FrontendDirectory $frontendDir
+
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "ao-source-install-$PID"
 $builtPath = Join-Path $tempRoot 'ao.exe'
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
@@ -284,8 +328,8 @@ try {
         Pop-Location
     }
 
-    & $builtPath status *> $null
-    if ($LASTEXITCODE -eq 0) {
+    $daemonExecutable = Get-RunningDaemonExecutable
+    if ($daemonExecutable -and (Test-SamePath -Left $daemonExecutable -Right $installPath)) {
         Write-Host 'Stopping the running AO daemon before replacing ao.exe...'
         Invoke-Native -Command $builtPath -Arguments @('stop', '--timeout', '10s')
     }
