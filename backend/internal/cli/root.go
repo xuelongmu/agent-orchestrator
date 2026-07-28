@@ -225,6 +225,7 @@ func NewRootCommand(deps Deps) *cobra.Command {
 	})
 
 	root.AddCommand(newDaemonCommand())
+	root.AddCommand(newLaunchAgentHandoffCommand())
 	root.AddCommand(newStartCommand(ctx))
 	root.AddCommand(newStopCommand(ctx))
 	root.AddCommand(newStatusCommand(ctx))
@@ -256,7 +257,7 @@ type commandContext struct {
 
 func shouldEmitCLIInvocation(cmd *cobra.Command) bool {
 	switch strings.TrimSpace(cmd.CommandPath()) {
-	case "ao daemon", "ao start", "ao doctor", "ao completion", "ao help":
+	case "ao daemon", "ao launch-agent-handoff", "ao start", "ao doctor", "ao completion", "ao help":
 		return false
 	default:
 		return true

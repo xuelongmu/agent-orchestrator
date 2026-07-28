@@ -32,11 +32,19 @@ locale, state location, port, and telemetry mode. Credentials and all other
 shell variables are injected into the GUI launchd domain only long enough to
 start a label-specific in-memory supervisor, then the prior domain environment
 is restored. The supervisor retains its job's private environment and restarts
-the daemon child after unsuccessful exits. This keeps concurrent isolated jobs
-from overwriting each other's credentials, and keeps API keys and tokens out of
-the mode-0600 file as well as off disk entirely. A BSD lock under the canonical
-`~/.ao/launchd` directory serializes the brief injection transaction across
-packaged and isolated-development Electron processes.
+the daemon child after unsuccessful exits, with bounded progressive-backoff
+retries so a permanently broken command does not spin forever. This keeps
+concurrent isolated jobs from overwriting each other's credentials, and keeps
+API keys and tokens out of the mode-0600 file as well as off disk entirely. A
+separate AO handoff helper holds a BSD lock under the canonical
+`~/.ao/launchd` directory, snapshots and injects the environment, and restores
+it before releasing the lock. The helper reads credentials through a pipe and
+automatically restores the snapshot when Electron releases it or dies, so the
+shared GUI launchd environment cannot be stranded with a job's secrets.
+
+The plist stores only a SHA-256 identity of the transient environment. A
+healthy, AO-owned LaunchAgent is replaced when that identity changes, allowing
+rotated credentials to take effect without writing their values to disk.
 
 `ao doctor` reports `keychain-session` by asking the running daemon to execute
 `security show-keychain-info` from its own process context and, when one exists,

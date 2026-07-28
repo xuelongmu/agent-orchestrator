@@ -29,13 +29,19 @@ import {
 	type UpdateStatus,
 } from "./main/update-settings";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { evaluateDaemonIdentity, type DaemonLaunchSpec, resolveDaemonLaunch } from "./shared/daemon-launch";
+import {
+	daemonBinaryName,
+	evaluateDaemonIdentity,
+	type DaemonLaunchSpec,
+	resolveDaemonLaunch,
+} from "./shared/daemon-launch";
 import { ownedShutdownGraceMs } from "./shared/daemon-shutdown";
 import { createListenPortScanner, defaultRunFilePath, parseRunFile, type RunFileInfo } from "./shared/daemon-discovery";
 import type { DaemonStatus } from "./shared/daemon-status";
@@ -422,12 +428,29 @@ function runFilePath(): string | null {
 	return defaultRunFilePath(process.platform, process.env, os.homedir());
 }
 
-function macDaemonLaunchAgent(): DaemonLaunchAgent | null {
+async function canonicalRunFileIdentity(runFile: string): Promise<string> {
+	const resolved = path.resolve(runFile);
+	try {
+		return await realpath(resolved);
+	} catch {
+		try {
+			return path.join(await realpath(path.dirname(resolved)), path.basename(resolved));
+		} catch {
+			return resolved;
+		}
+	}
+}
+
+async function macDaemonLaunchAgent(): Promise<DaemonLaunchAgent | null> {
 	if (process.platform !== "darwin") return null;
 	const runFile = runFilePath();
 	const canonicalRunFile = defaultRunFilePath(process.platform, process.env, os.homedir());
 	if (!runFile || !canonicalRunFile) return null;
-	return resolveDaemonLaunchAgent(runFile, canonicalRunFile, os.userInfo().uid);
+	return resolveDaemonLaunchAgent(
+		await canonicalRunFileIdentity(runFile),
+		await canonicalRunFileIdentity(canonicalRunFile),
+		os.userInfo().uid,
+	);
 }
 
 async function isLaunchAgentLoaded(job: DaemonLaunchAgent): Promise<boolean> {
@@ -467,52 +490,38 @@ async function launchAgentDefinitionChanged(job: DaemonLaunchAgent, desired: str
 	}
 }
 
-async function installTemporaryLaunchdEnvironment(entries: Array<[string, string]>): Promise<() => Promise<void>> {
-	const previous: Array<{ key: string; value: string | null }> = [];
-	const restore = async (): Promise<void> => {
-		for (const { key, value } of previous.reverse()) {
-			if (value === null) {
-				await execFileAsync("/bin/launchctl", ["unsetenv", key]);
-			} else {
-				await execFileAsync("/bin/launchctl", ["setenv", key, value]);
-			}
-		}
-	};
-	try {
-		for (const [key, value] of entries) {
-			let inherited: string | null = null;
-			try {
-				const { stdout } = await execFileAsync("/bin/launchctl", ["getenv", key]);
-				inherited = String(stdout).replace(/\n$/, "");
-			} catch {
-				// launchctl exits non-zero when the variable is not set.
-			}
-			await execFileAsync("/bin/launchctl", ["setenv", key, value]);
-			previous.push({ key, value: inherited });
-		}
-		return restore;
-	} catch (error) {
-		await restore();
-		throw error;
-	}
+function launchAgentHandoffBinary(): string {
+	return path.join(
+		app.isPackaged ? process.resourcesPath : app.getAppPath(),
+		"daemon",
+		daemonBinaryName(process.platform),
+	);
 }
 
-async function acquireLaunchdEnvironmentLock(lockPath: string): Promise<() => Promise<void>> {
+async function startLaunchdEnvironmentHandoff(
+	helperBinary: string,
+	lockPath: string,
+	entries: Array<[string, string]>,
+): Promise<() => Promise<void>> {
 	await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o750 });
 	return new Promise((resolve, reject) => {
-		const holder = spawn(
-			"/usr/bin/lockf",
-			["-k", "-t", "30", lockPath, "/bin/sh", "-c", 'printf "acquired\\n"; /bin/cat >/dev/null'],
-			{ stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
-		);
+		const holder = spawn("/usr/bin/lockf", ["-k", "-t", "30", lockPath, helperBinary, "launch-agent-handoff"], {
+			stdio: ["pipe", "pipe", "pipe"],
+			windowsHide: true,
+		});
 		let output = "";
 		let errorOutput = "";
 		let settled = false;
-		const timer = setTimeout(() => {
+		const fail = (error: Error): void => {
 			if (settled) return;
 			settled = true;
+			clearTimeout(timer);
+			holder.stdin.destroy();
+			reject(error);
+		};
+		const timer = setTimeout(() => {
 			holder.kill("SIGTERM");
-			reject(new Error("timed out waiting for the macOS launchd environment lock"));
+			fail(new Error("timed out waiting for the macOS launchd environment handoff"));
 		}, 31_000);
 		holder.stderr.on("data", (chunk: Buffer) => {
 			errorOutput += chunk.toString("utf8");
@@ -532,39 +541,44 @@ async function acquireLaunchdEnvironmentLock(lockPath: string): Promise<() => Pr
 						holder.once("error", releaseReject);
 						holder.once("exit", (code) => {
 							if (code === 0) releaseResolve();
-							else releaseReject(new Error(`macOS launchd environment lock exited with code ${String(code)}`));
+							else
+								releaseReject(
+									new Error(
+										`macOS launchd environment handoff exited with code ${String(code)}: ${errorOutput.trim()}`,
+									),
+								);
 						});
-						holder.stdin.end();
+						holder.stdin.end("release\n");
 					}),
 			);
 		});
 		holder.once("error", (error) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			reject(error);
+			fail(error);
 		});
 		holder.once("exit", (code) => {
 			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			reject(
+			fail(
 				new Error(`could not acquire the macOS launchd environment lock (code ${String(code)}): ${errorOutput.trim()}`),
 			);
 		});
+		holder.stdin.write(`${JSON.stringify({ environment: Object.fromEntries(entries) })}\n`);
 	});
 }
 
 async function installAndKickstartLaunchAgent(
 	job: DaemonLaunchAgent,
 	launch: DaemonLaunchSpec,
+	helperBinary: string,
 	environment: DaemonLaunchAgentEnvironment,
 	sharedDevelopment: boolean,
 	shouldContinue: () => boolean,
 ): Promise<boolean> {
 	if (!shouldContinue()) return false;
-	const releaseEnvironmentLock = await acquireLaunchdEnvironmentLock(job.environmentLockPath);
-	let restoreEnvironment: (() => Promise<void>) | null = null;
+	const releaseEnvironmentHandoff = await startLaunchdEnvironmentHandoff(
+		helperBinary,
+		job.environmentLockPath,
+		environment.transient,
+	);
 	try {
 		if (!shouldContinue()) return false;
 		const plist = renderDaemonLaunchAgentPlist(job, launch, environment.persisted);
@@ -582,7 +596,6 @@ async function installAndKickstartLaunchAgent(
 			await writeFile(job.plistPath, plist, { encoding: "utf8", mode: 0o600 });
 			await chmod(job.plistPath, 0o600);
 		}
-		restoreEnvironment = await installTemporaryLaunchdEnvironment(environment.transient);
 		if (!shouldContinue()) return false;
 		if (!loaded || definitionChanged) {
 			try {
@@ -609,13 +622,9 @@ async function installAndKickstartLaunchAgent(
 		return true;
 	} finally {
 		// The per-job shell supervisor has inherited a private copy and owns daemon
-		// child restarts. Restore the shared GUI launchd domain immediately so an
-		// isolated job cannot overwrite another job's credentials.
-		try {
-			if (restoreEnvironment) await restoreEnvironment();
-		} finally {
-			await releaseEnvironmentLock();
-		}
+		// child restarts. Releasing the helper restores the shared GUI launchd
+		// domain and unlocks the next launch transaction.
+		await releaseEnvironmentHandoff();
 	}
 }
 
@@ -623,6 +632,7 @@ async function startDaemonViaLaunchAgent(
 	launch: DaemonLaunchSpec,
 	job: DaemonLaunchAgent,
 	startEpoch: number,
+	helperBinary: string,
 	environment: DaemonLaunchAgentEnvironment,
 	sharedDevelopment: boolean,
 ): Promise<DaemonStatus> {
@@ -632,6 +642,7 @@ async function startDaemonViaLaunchAgent(
 		const started = await installAndKickstartLaunchAgent(
 			job,
 			launch,
+			helperBinary,
 			environment,
 			sharedDevelopment,
 			() => startEpoch === daemonStartEpoch && !daemonStopIntent.stopping,
@@ -1042,7 +1053,7 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 		});
 		return daemonStatus;
 	}
-	daemonLaunchAgent = macDaemonLaunchAgent();
+	daemonLaunchAgent = await macDaemonLaunchAgent();
 	const launchAgentBuildIdentity = daemonLaunchAgent ? await daemonLaunchAgentBuildIdentity(launch) : null;
 	const launchAgentFullEnvironment = daemonLaunchAgent
 		? {
@@ -1053,6 +1064,12 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	const launchAgentEnvironment = launchAgentFullEnvironment
 		? splitDaemonLaunchAgentEnvironment(launchAgentFullEnvironment)
 		: null;
+	if (launchAgentEnvironment) {
+		const transientIdentity = createHash("sha256")
+			.update(JSON.stringify(launchAgentEnvironment.transient))
+			.digest("hex");
+		launchAgentEnvironment.persisted.AO_LAUNCH_AGENT_ENV_ID = `sha256:${transientIdentity}`;
+	}
 	if (launchAgentFullEnvironment) {
 		daemonShutdownGraceMs = ownedShutdownGraceMs(launchAgentFullEnvironment);
 	}
@@ -1209,7 +1226,14 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	// interaction. launchd's gui/<uid> domain is the session boundary that makes
 	// daemon-spawned workers behave like processes launched from Terminal.
 	if (daemonLaunchAgent && launchAgentEnvironment) {
-		return startDaemonViaLaunchAgent(launch, daemonLaunchAgent, startEpoch, launchAgentEnvironment, sharedDevelopment);
+		return startDaemonViaLaunchAgent(
+			launch,
+			daemonLaunchAgent,
+			startEpoch,
+			launchAgentHandoffBinary(),
+			launchAgentEnvironment,
+			sharedDevelopment,
+		);
 	}
 
 	setDaemonStatus({ state: "starting" });

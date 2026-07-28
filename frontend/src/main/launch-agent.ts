@@ -31,6 +31,7 @@ const PERSISTED_ENVIRONMENT_KEYS = new Set([
 	"AO_DATA_DIR",
 	"AO_DESKTOP_BUILD_ID",
 	"AO_HOST",
+	"AO_LAUNCH_AGENT_ENV_ID",
 	"AO_PORT",
 	"AO_REQUEST_TIMEOUT",
 	"AO_RUN_FILE",
@@ -92,6 +93,20 @@ function joinPath(...segments: string[]): string {
 	return segments.map((segment) => segment.replace(/\/+$/, "")).join("/");
 }
 
+function normalizePathIdentity(value: string): string {
+	const absolute = value.startsWith("/");
+	const parts: string[] = [];
+	for (const part of value.split(/[/\\]+/)) {
+		if (!part || part === ".") continue;
+		if (part === "..") {
+			parts.pop();
+		} else {
+			parts.push(part);
+		}
+	}
+	return `${absolute ? "/" : ""}${parts.join("/")}`;
+}
+
 function stableSuffix(value: string): string {
 	let hash = 0x811c9dc5;
 	for (let i = 0; i < value.length; i += 1) {
@@ -106,12 +121,14 @@ export function resolveDaemonLaunchAgent(
 	defaultRunFilePath: string,
 	uid: number,
 ): DaemonLaunchAgent {
-	const stateDir = runFilePath.replace(/[/\\][^/\\]+$/, "");
-	const defaultStateDir = defaultRunFilePath.replace(/[/\\][^/\\]+$/, "");
+	const normalizedRunFile = normalizePathIdentity(runFilePath);
+	const normalizedDefaultRunFile = normalizePathIdentity(defaultRunFilePath);
+	const stateDir = normalizedRunFile.replace(/[/\\][^/\\]+$/, "");
+	const defaultStateDir = normalizedDefaultRunFile.replace(/[/\\][^/\\]+$/, "");
 	const label =
-		runFilePath === defaultRunFilePath
+		normalizedRunFile === normalizedDefaultRunFile
 			? DEFAULT_DAEMON_LAUNCH_AGENT_LABEL
-			: `${DEFAULT_DAEMON_LAUNCH_AGENT_LABEL}.${stableSuffix(runFilePath)}`;
+			: `${DEFAULT_DAEMON_LAUNCH_AGENT_LABEL}.${stableSuffix(normalizedRunFile)}`;
 	const domain = `gui/${uid}`;
 	return {
 		label,
@@ -139,6 +156,8 @@ function plistString(value: string, indent: string): string {
 
 export const DAEMON_SUPERVISOR_SCRIPT = [
 	"child=",
+	"attempt=0",
+	"delay=1",
 	"stop() {",
 	'  if [ -n "$child" ]; then',
 	'    kill -TERM "$child" 2>/dev/null || true',
@@ -148,13 +167,23 @@ export const DAEMON_SUPERVISOR_SCRIPT = [
 	"}",
 	"trap stop TERM INT HUP",
 	"while :; do",
+	"  started=$(/bin/date +%s)",
 	'  "$@" &',
 	"  child=$!",
 	'  wait "$child"',
 	"  status=$?",
 	"  child=",
 	'  if [ "$status" -eq 0 ]; then exit 0; fi',
-	"  sleep 1",
+	"  ended=$(/bin/date +%s)",
+	'  if [ "$((ended - started))" -ge 30 ]; then attempt=0; delay=1; fi',
+	"  attempt=$((attempt + 1))",
+	'  if [ "$attempt" -ge 4 ]; then',
+	'    echo "AO: daemon restart budget exhausted after $attempt unsuccessful exits" >&2',
+	'    exit "$status"',
+	"  fi",
+	'  sleep "$delay"',
+	"  delay=$((delay * 2))",
+	'  if [ "$delay" -gt 8 ]; then delay=8; fi',
 	"done",
 ].join("\n");
 

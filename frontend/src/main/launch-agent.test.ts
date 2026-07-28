@@ -68,6 +68,12 @@ describe("resolveDaemonLaunchAgent", () => {
 		expect(first.environmentLockPath).toBe("/Users/me/.ao/launchd/environment.lock");
 	});
 
+	it("maps equivalent canonical run-file spellings to the production label", () => {
+		const job = resolveDaemonLaunchAgent("/Users/me/.ao/dev/../running.json", "/Users/me/.ao/./running.json", 501);
+		expect(job.label).toBe(DEFAULT_DAEMON_LAUNCH_AGENT_LABEL);
+		expect(job.plistPath).toBe("/Users/me/.ao/launchd/dev.ao.daemon.plist");
+	});
+
 	it("keeps log files distinct for isolated jobs in the same directory", () => {
 		const first = resolveDaemonLaunchAgent("/tmp/ao/first.json", "/Users/me/.ao/running.json", 501);
 		const second = resolveDaemonLaunchAgent("/tmp/ao/second.json", "/Users/me/.ao/running.json", 501);
@@ -84,6 +90,7 @@ describe("splitDaemonLaunchAgentEnvironment", () => {
 			LC_CTYPE: "UTF-8",
 			AO_RUN_FILE: "/tmp/ao/running.json",
 			AO_DESKTOP_BUILD_ID: "release:0.10.4",
+			AO_LAUNCH_AGENT_ENV_ID: "sha256:credential-fingerprint",
 			AO_TELEMETRY_POSTHOG_HOST: "https://example.test",
 			GH_TOKEN: "github-secret",
 			AO_GITHUB_TOKEN: "ao-secret",
@@ -98,6 +105,7 @@ describe("splitDaemonLaunchAgentEnvironment", () => {
 			LC_CTYPE: "UTF-8",
 			AO_RUN_FILE: "/tmp/ao/running.json",
 			AO_DESKTOP_BUILD_ID: "release:0.10.4",
+			AO_LAUNCH_AGENT_ENV_ID: "sha256:credential-fingerprint",
 			AO_TELEMETRY_POSTHOG_HOST: "https://example.test",
 		});
 		expect(Object.keys(result.persisted)).not.toContain("GH_TOKEN");
@@ -124,6 +132,7 @@ describe("splitDaemonLaunchAgentEnvironment", () => {
 		expect(plist).not.toContain("secret");
 		expect(plist).not.toContain("GH_TOKEN");
 		expect(plist).toContain("<key>AO_DESKTOP_BUILD_ID</key>\n    <string>release:0.10.4</string>");
+		expect(plist).toContain("<key>AO_LAUNCH_AGENT_ENV_ID</key>\n    <string>sha256:credential-fingerprint</string>");
 	});
 });
 
@@ -144,6 +153,7 @@ describe("renderDaemonLaunchAgentPlist", () => {
 
 		expect(plist).toContain("<key>LimitLoadToSessionType</key>\n  <string>Aqua</string>");
 		expect(plist).toContain("<string>ao-daemon-supervisor</string>");
+		expect(plist).toContain("daemon restart budget exhausted");
 		expect(plist).toContain("<string>/Applications/AO &amp; Friends/ao</string>");
 		expect(plist).toContain("<string>/tmp/a &lt; b</string>");
 		expect(plist).toContain("<string>a&amp;b&lt;&quot;c&quot;&gt;</string>");
