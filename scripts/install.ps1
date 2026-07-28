@@ -57,6 +57,29 @@ function Test-Native {
     }
 }
 
+function Get-FileSHA256 {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return -join @($sha256.ComputeHash($stream) | ForEach-Object {
+                $_.ToString('x2')
+            })
+        }
+        finally {
+            $sha256.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 function Test-SamePath {
     param(
         [Parameter(Mandatory)]
@@ -80,6 +103,27 @@ function Test-SamePath {
     return $leftPath.Equals($rightPath, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-FirstAOInPath {
+    param(
+        [AllowEmptyString()]
+        [string]$PathValue
+    )
+
+    foreach ($entry in @($PathValue -split ';' | Where-Object { $_ })) {
+        try {
+            $directory = [Environment]::ExpandEnvironmentVariables($entry).Trim().Trim('"')
+            $candidate = Join-Path $directory 'ao.exe'
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                return [System.IO.Path]::GetFullPath($candidate)
+            }
+        }
+        catch {
+            # Ignore malformed PATH entries; Windows does the same during lookup.
+        }
+    }
+    return $null
+}
+
 function Ensure-AOOnPath {
     param(
         [Parameter(Mandatory)]
@@ -88,6 +132,13 @@ function Ensure-AOOnPath {
         [Parameter(Mandatory)]
         [string]$Executable
     )
+
+    $machineAO = Get-FirstAOInPath -PathValue (
+        [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    )
+    if ($machineAO -and -not (Test-SamePath -Left $machineAO -Right $Executable)) {
+        throw "A machine PATH entry resolves ao to $machineAO before the user PATH is searched; remove that system-wide AO installation, then run this installer again"
+    }
 
     $currentAO = Get-Command ao -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
@@ -125,34 +176,20 @@ function Test-InstalledDependenciesMatchLockfile {
     )
 
     $packageLock = Join-Path $FrontendDirectory 'package-lock.json'
-    $installedLock = Join-Path $FrontendDirectory 'node_modules\.package-lock.json'
+    $lockFingerprint = Join-Path $FrontendDirectory 'node_modules\.ao-package-lock.sha256'
     if (-not (Test-Path -LiteralPath $packageLock) -or
-        -not (Test-Path -LiteralPath $installedLock)) {
+        -not (Test-Path -LiteralPath $lockFingerprint)) {
         return $false
     }
 
-    # Windows PowerShell 5.1 strips quotes from native-command arguments.
-    # Keep this node -e program quote-free so the comparison works in both
-    # Windows PowerShell and PowerShell 7.
-    $compareLocks = @'
-const fs = require(String.fromCharCode(102, 115));
-const expected = JSON.parse(fs.readFileSync(process.argv[1]));
-const installed = JSON.parse(fs.readFileSync(process.argv[2]));
-for (const [path, actualPackage] of Object.entries(installed.packages || {})) {
-  const expectedPackage = expected.packages && expected.packages[path];
-  if (!expectedPackage ||
-      expectedPackage.version !== actualPackage.version ||
-      expectedPackage.integrity !== actualPackage.integrity) {
-    process.exit(1);
-  }
-}
-'@
-    return Test-Native -Command node -Arguments @(
-        '-e',
-        $compareLocks,
-        $packageLock,
-        $installedLock
-    )
+    try {
+        $expected = Get-FileSHA256 -Path $packageLock
+        $installed = (Get-Content -LiteralPath $lockFingerprint -Raw).Trim()
+        return $expected.Equals($installed, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Get-RunningSourceApp {
@@ -352,7 +389,7 @@ if ($Start) {
 
 if (Test-Path -LiteralPath $nodeModules) {
     $dependenciesReady =
-        (Test-Native -Command npm -Arguments @('--prefix', $frontendDir, 'ls', '--depth=0')) -and
+        (Test-Native -Command npm -Arguments @('--prefix', $frontendDir, 'ls', '--all')) -and
         (Test-InstalledDependenciesMatchLockfile -FrontendDirectory $frontendDir)
 }
 else {
@@ -368,6 +405,13 @@ if ($InstallDependencies -or -not $dependenciesReady) {
         Write-Host 'Frontend dependencies are missing or stale; running npm ci...'
     }
     Invoke-Native -Command npm -Arguments @('ci', '--prefix', $frontendDir)
+    $packageLockHash = Get-FileSHA256 -Path (
+        Join-Path $frontendDir 'package-lock.json'
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $nodeModules '.ao-package-lock.sha256'),
+        $packageLockHash
+    )
 }
 Ensure-ElectronBinary -FrontendDirectory $frontendDir
 
