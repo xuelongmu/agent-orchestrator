@@ -80,6 +80,23 @@ function Get-FileSHA256 {
     }
 }
 
+function Test-SupportedNodeVersion {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Version
+    )
+
+    if ($Version -notmatch '^v?(\d+)\.(\d+)\.(\d+)$') {
+        return $false
+    }
+
+    $major = [int]$Matches[1]
+    $minor = [int]$Matches[2]
+    return ($major -eq 20 -and $minor -ge 19) -or
+        ($major -eq 22 -and $minor -ge 12) -or
+        $major -gt 22
+}
+
 function Test-SamePath {
     param(
         [Parameter(Mandatory)]
@@ -352,6 +369,11 @@ foreach ($command in @('git', 'go', 'node', 'npm')) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         throw "$command is required but was not found on PATH"
     }
+}
+
+$nodeVersion = (& node --version).Trim()
+if ($LASTEXITCODE -ne 0 -or -not (Test-SupportedNodeVersion -Version $nodeVersion)) {
+    throw "Node $nodeVersion is unsupported; install Node 20.19+ or 22.12+ (Node 24 also works), then run this installer again"
 }
 
 if ($Fetch) {
