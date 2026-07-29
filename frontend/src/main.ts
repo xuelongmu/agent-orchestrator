@@ -537,7 +537,10 @@ async function startLaunchdEnvironmentHandoff(
 	await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o750 });
 	if (socketPath) await mkdir(path.dirname(socketPath), { recursive: true, mode: 0o750 });
 	return new Promise((resolve, reject) => {
-		const holder = spawn("/usr/bin/lockf", ["-k", "-t", "30", lockPath, helperBinary, "launch-agent-handoff"], {
+		// The helper takes the lock itself. It used to run under `/usr/bin/lockf`,
+		// which macOS does not ship (it is a FreeBSD utility), so every handoff
+		// died with ENOENT and the daemon never started.
+		const holder = spawn(helperBinary, ["launch-agent-handoff", "--lock", lockPath], {
 			stdio: ["pipe", "pipe", "pipe"],
 			windowsHide: true,
 		});
