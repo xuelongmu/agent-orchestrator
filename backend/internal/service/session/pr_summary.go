@@ -140,13 +140,16 @@ func (s *Service) stackParents(ctx context.Context, projectID domain.ProjectID, 
 	branchKey := func(pr domain.PullRequest, branch string) string {
 		return pr.Provider + "\x00" + pr.Host + "\x00" + pr.Repo + "\x00" + branch
 	}
-	openBySource := map[string]domain.PullRequest{}
+	// Several open PRs can share one source branch (e.g. across native
+	// stacks), so every candidate is kept and the native-stack filter picks
+	// among them per child.
+	openBySource := map[string][]domain.PullRequest{}
+	seenCandidate := map[string]bool{}
 	addCandidate := func(pr domain.PullRequest) {
-		if !pr.Merged && !pr.Closed && pr.SourceBranch != "" && pr.HeadInBaseRepo() {
+		if !pr.Merged && !pr.Closed && pr.SourceBranch != "" && pr.HeadInBaseRepo() && !seenCandidate[pr.URL] {
+			seenCandidate[pr.URL] = true
 			key := branchKey(pr, pr.SourceBranch)
-			if _, ok := openBySource[key]; !ok {
-				openBySource[key] = pr
-			}
+			openBySource[key] = append(openBySource[key], pr)
 		}
 	}
 	for _, pr := range prs {
@@ -172,9 +175,11 @@ func (s *Service) stackParents(ctx context.Context, projectID domain.ProjectID, 
 		if pr.Merged || pr.Closed || pr.TargetBranch == "" {
 			continue
 		}
-		parent, ok := openBySource[branchKey(pr, pr.TargetBranch)]
-		if ok && parent.URL != pr.URL && domain.NativeStackAllowsParent(pr.StackNumber, parent.StackNumber) {
-			parents[pr.URL] = parent
+		for _, parent := range openBySource[branchKey(pr, pr.TargetBranch)] {
+			if parent.URL != pr.URL && domain.NativeStackAllowsParent(pr.StackNumber, parent.StackNumber) {
+				parents[pr.URL] = parent
+				break
+			}
 		}
 	}
 	return parents

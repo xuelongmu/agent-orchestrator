@@ -69,6 +69,9 @@ func TestStackParentsMatchesAcrossSessionsWithinOneRepo(t *testing.T) {
 func TestStackParentsHonorNativeStackMembership(t *testing.T) {
 	store := &fakeStore{openPRsByRepo: []domain.PullRequest{
 		{URL: "otherstack", HTMLURL: "hother", Number: 5, SessionID: "other", Repo: "acme/app", StackNumber: 9, SourceBranch: "s/root", TargetBranch: "main"},
+		// A same-branch decoy from another stack listed before the real
+		// parent must not shadow it.
+		{URL: "shadow", HTMLURL: "hshadow", Number: 7, SessionID: "other", Repo: "acme/app", StackNumber: 9, SourceBranch: "s/mid", TargetBranch: "main"},
 		{URL: "samestack", HTMLURL: "hsame", Number: 6, SessionID: "other", Repo: "acme/app", StackNumber: 4, SourceBranch: "s/mid", TargetBranch: "s/base"},
 	}}
 	svc := &Service{store: store}
@@ -79,7 +82,7 @@ func TestStackParentsHonorNativeStackMembership(t *testing.T) {
 	}
 	parents := svc.stackParents(context.Background(), "proj-1", prs)
 	if parents["nativechild"].URL != "samestack" {
-		t.Fatalf("same-stack parent should match: %+v", parents)
+		t.Fatalf("same-stack parent should match despite the same-branch decoy: %+v", parents)
 	}
 	if _, ok := parents["strandedchild"]; ok {
 		t.Fatalf("native child must not adopt a parent from another stack: %+v", parents)

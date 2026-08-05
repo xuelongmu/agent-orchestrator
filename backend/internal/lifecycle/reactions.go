@@ -1502,8 +1502,10 @@ func (m *Manager) applyStackParentHeadChange(ctx context.Context, id domain.Sess
 		if err != nil {
 			return err
 		}
+		parentStack, _, _ := o.PR.Stack.Flatten()
 		for _, pr := range prs {
-			if !pr.Merged && !pr.Closed && pr.URL != prURL && pr.TargetBranch == o.PR.SourceBranch && stackPRMatchesObservationRepo(pr, o) {
+			if !pr.Merged && !pr.Closed && pr.URL != prURL && pr.TargetBranch == o.PR.SourceBranch && stackPRMatchesObservationRepo(pr, o) &&
+				domain.NativeStackAllowsParent(pr.StackNumber, parentStack) {
 				childrenBySession[session.ID] = append(childrenBySession[session.ID], pr)
 			}
 		}
