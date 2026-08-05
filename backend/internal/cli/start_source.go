@@ -157,7 +157,8 @@ func (c *commandContext) checkRunningDevDaemon(ctx context.Context, w io.Writer,
 		return fmt.Errorf("ao start: load daemon configuration: %w", err)
 	}
 	runFile, isolated := devRunFilePath(cfg.RunFilePath)
-	port := devDaemonPort(cfg.Port, isolated)
+	configuredPort := devDaemonPort(cfg.Port, isolated)
+	port := configuredPort
 
 	pid, runFileLive := 0, false
 	if info, err := runfile.CheckStale(runFile); err == nil && info != nil {
@@ -165,6 +166,14 @@ func (c *commandContext) checkRunningDevDaemon(ctx context.Context, w io.Writer,
 	}
 
 	probe, probeErr := c.readProbe(ctx, port, "healthz")
+	if runFileLive && (probeErr != nil || probe.Service != daemonmeta.ServiceName || probe.PID != pid) {
+		// Electron treats a missing, stale, or PID-inconsistent run file as a
+		// hint failure and probes the configured port directly. Mirror that
+		// fallback before rejecting a genuine same-checkout daemon.
+		if fallback, err := c.readProbe(ctx, configuredPort, "healthz"); err == nil && fallback.Service == daemonmeta.ServiceName {
+			probe, probeErr, port, runFileLive = fallback, nil, configuredPort, false
+		}
+	}
 	if probeErr != nil || probe.Service != daemonmeta.ServiceName {
 		if !runFileLive {
 			return nil

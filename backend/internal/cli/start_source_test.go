@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -256,6 +257,51 @@ func TestStart_SourceReusesDaemonFromSameCheckout(t *testing.T) {
 		if !strings.Contains(errOut, want) {
 			t.Fatalf("output %q missing %q", errOut, want)
 		}
+	}
+}
+
+func TestStart_SourceFallsBackFromPIDInconsistentRunFile(t *testing.T) {
+	cfg := setConfigEnv(t)
+	root := makeCheckout(t, true)
+	chdir(t, root)
+
+	staleWorkingDirectory := filepath.Join(t.TempDir(), "other", "backend")
+	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(probeResult{
+			Status: "ok", Service: daemonmeta.ServiceName, PID: 31337,
+			WorkingDirectory: staleWorkingDirectory,
+		})
+	}))
+	t.Cleanup(stale.Close)
+
+	expected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(probeResult{
+			Status: "ok", Service: daemonmeta.ServiceName, PID: 4242,
+			WorkingDirectory: filepath.Join(root, "backend"),
+		})
+	}))
+	t.Cleanup(expected.Close)
+	expectedPort := serverPort(t, expected.URL)
+	t.Setenv("AO_PORT", strconv.Itoa(expectedPort))
+
+	if err := runfile.Write(cfg.runFile, runfile.Info{
+		PID: os.Getpid(), Port: serverPort(t, stale.URL), StartedAt: time.Unix(100, 0).UTC(),
+	}); err != nil {
+		t.Fatalf("write run-file: %v", err)
+	}
+
+	deps := Deps{
+		HTTPClient:  expected.Client(),
+		LookPath:    func(string) (string, error) { return "/usr/bin/npm", nil },
+		RunAttached: func(context.Context, string, string, ...string) error { return nil },
+	}
+
+	_, errOut, err := executeCLI(t, deps, "start", "--source")
+	if err != nil {
+		t.Fatalf("start --source: %v", err)
+	}
+	if !strings.Contains(errOut, "pid 4242") || !strings.Contains(errOut, fmt.Sprintf("port %d", expectedPort)) {
+		t.Fatalf("output = %q, want configured-port daemon identity", errOut)
 	}
 }
 
