@@ -26,13 +26,19 @@ export function evaluateDaemonIdentity(
 		// Electron always enables it for development launches.
 		if (!policy.enforceDevCheckout) return null;
 
+		if (probe.executablePath) {
+			if (!policy.samePath(probe.executablePath, launch.command)) {
+				return `Another AO daemon is already running from ${probe.executablePath}; expected development binary ${launch.command}. Stop the other daemon before using this checkout.`;
+			}
+			return null;
+		}
+
 		const cwdMatches = probe.workingDirectory ? policy.samePath(probe.workingDirectory, launch.cwd) : false;
-		const executableMatches = probe.executablePath ? policy.pathInside(probe.executablePath, launch.cwd) : false;
 		if (!probe.workingDirectory && !probe.executablePath) {
 			return "An older AO daemon is already running, but it does not report its checkout identity. Stop it and restart this app.";
 		}
-		if (!cwdMatches && !executableMatches) {
-			const actual = probe.workingDirectory ?? probe.executablePath ?? "an unknown location";
+		if (!cwdMatches) {
+			const actual = probe.workingDirectory ?? "an unknown location";
 			return `Another AO daemon is already running from ${actual}; expected this checkout at ${launch.cwd}. Stop the other daemon before using this checkout.`;
 		}
 		return null;

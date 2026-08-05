@@ -453,7 +453,11 @@ func TestDevDaemonMatchesCheckout(t *testing.T) {
 		want  bool
 	}{
 		{"backend working directory", probeResult{WorkingDirectory: filepath.Join(root, "backend")}, true},
-		{"binary inside backend", probeResult{ExecutablePath: filepath.Join(root, "backend", "bin", "ao")}, true},
+		{"expected dev binary", probeResult{ExecutablePath: filepath.Join(root, "frontend", "daemon", devDaemonBinaryName())}, true},
+		{"released binary with matching cwd", probeResult{
+			ExecutablePath:   filepath.Join(t.TempDir(), "resources", "daemon", devDaemonBinaryName()),
+			WorkingDirectory: filepath.Join(root, "backend"),
+		}, false},
 		{"other checkout", probeResult{WorkingDirectory: filepath.Join(t.TempDir(), "backend")}, false},
 		{"packaged binary", probeResult{ExecutablePath: filepath.Join(t.TempDir(), "resources", "daemon", "ao")}, false},
 		{"missing identity", probeResult{}, false},

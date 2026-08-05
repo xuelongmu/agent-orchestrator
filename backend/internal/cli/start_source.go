@@ -218,18 +218,21 @@ func devDaemonStopRemedy(runFile string, isolated, runFileLive bool, pid int) st
 }
 
 func devDaemonMatchesCheckout(probe probeResult, root string) bool {
-	backend := filepath.Join(root, "backend")
-	return probe.WorkingDirectory != "" && sameDevPath(probe.WorkingDirectory, backend) ||
-		probe.ExecutablePath != "" && devPathInside(probe.ExecutablePath, backend)
+	if probe.ExecutablePath != "" {
+		return sameDevPath(probe.ExecutablePath, filepath.Join(root, "frontend", "daemon", devDaemonBinaryName()))
+	}
+	return probe.WorkingDirectory != "" && sameDevPath(probe.WorkingDirectory, filepath.Join(root, "backend"))
+}
+
+func devDaemonBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "ao.exe"
+	}
+	return "ao"
 }
 
 func sameDevPath(a, b string) bool {
 	return comparableDevPath(a) == comparableDevPath(b)
-}
-
-func devPathInside(child, parent string) bool {
-	rel, err := filepath.Rel(comparableDevPath(parent), comparableDevPath(child))
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 func comparableDevPath(path string) string {

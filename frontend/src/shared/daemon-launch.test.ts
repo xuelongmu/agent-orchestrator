@@ -150,6 +150,21 @@ describe("development daemon attach identity", () => {
 			},
 			{ enforceDevCheckout: true, samePath, pathInside },
 		);
-		expect(identity).toContain("/other/backend");
+		expect(identity).toContain("/other/frontend/daemon/ao");
+	});
+
+	it("rejects a released executable even when its working directory matches the checkout", () => {
+		const identity = evaluateDaemonIdentity(
+			launch,
+			{
+				status: "ok",
+				service: DAEMON_SERVICE_NAME,
+				pid: 4242,
+				executablePath: "/Applications/Agent Orchestrator.app/Contents/Resources/daemon/ao",
+				workingDirectory: "/repo/backend",
+			},
+			{ enforceDevCheckout: true, samePath, pathInside },
+		);
+		expect(identity).toContain("expected development binary /repo/frontend/daemon/ao");
 	});
 });
