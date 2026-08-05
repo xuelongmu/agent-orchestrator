@@ -41,6 +41,8 @@ func TestProjectConfigValidate(t *testing.T) {
 		{"p2-only review limit", ProjectConfig{ReviewPolicy: ReviewPolicyConfig{P2OnlyRoundLimit: 3}}, false},
 		{"negative p2-only review limit", ProjectConfig{ReviewPolicy: ReviewPolicyConfig{P2OnlyRoundLimit: -1}}, true},
 		{"p2-only review limit above maximum", ProjectConfig{ReviewPolicy: ReviewPolicyConfig{P2OnlyRoundLimit: MaxP2OnlyReviewRounds + 1}}, true},
+		{"human review triggers", ProjectConfig{ReviewPolicy: ReviewPolicyConfig{HumanReviewTriggers: []string{"data model changes", "permissioning changes"}}}, false},
+		{"blank human review trigger", ProjectConfig{ReviewPolicy: ReviewPolicyConfig{HumanReviewTriggers: []string{"data model changes", "  "}}}, true},
 		{"tracker intake assignee rule", ProjectConfig{TrackerIntake: TrackerIntakeConfig{Enabled: true, Assignee: "alice"}}, false},
 		{"tracker intake explicit github", ProjectConfig{TrackerIntake: TrackerIntakeConfig{Enabled: true, Provider: TrackerProviderGitHub, Assignee: "alice"}}, false},
 		{"tracker intake no rule", ProjectConfig{TrackerIntake: TrackerIntakeConfig{Enabled: true}}, true},

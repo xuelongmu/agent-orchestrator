@@ -3278,6 +3278,10 @@ components:
       type: object
     ReviewPolicyConfig:
       properties:
+        humanReviewTriggers:
+          items:
+            type: string
+          type: array
         outOfScopeDeflection:
           type: boolean
         p2OnlyRoundLimit:
@@ -3578,6 +3582,10 @@ components:
           format: date-time
           type: string
         sourceBranch:
+          type: string
+        stackedOnNumber:
+          type: integer
+        stackedOnUrl:
           type: string
         state:
           enum:

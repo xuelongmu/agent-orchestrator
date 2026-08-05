@@ -23,7 +23,12 @@ type PRSummary struct {
 	Author           string
 	SourceBranch     string
 	TargetBranch     string
-	HeadSHA          string
+	// StackedOnURL/StackedOnNumber identify the open sibling PR whose source
+	// branch this PR targets. Set only while that parent is open: the child is
+	// stacked and cannot merge until the parent does, but remains buildable.
+	StackedOnURL    string
+	StackedOnNumber int
+	HeadSHA         string
 	Additions        int
 	Deletions        int
 	ChangedFiles     int
@@ -119,8 +124,32 @@ func (s *Service) ListPRSummaries(ctx context.Context, id domain.SessionID) ([]P
 		}
 		out = append(out, summarizePR(pr, checks, reviews, threads, comments))
 	}
+	annotateStacks(prs, out)
 	sortPRSummaries(out)
 	return out, nil
+}
+
+// annotateStacks marks each open PR that targets the source branch of another
+// open PR in the same session. Mirrors the stack rule in buildStacks: a parent
+// counts only while open.
+func annotateStacks(prs []domain.PullRequest, out []PRSummary) {
+	openBySource := make(map[string]domain.PullRequest, len(prs))
+	for _, pr := range prs {
+		if !pr.Merged && !pr.Closed && pr.SourceBranch != "" {
+			openBySource[pr.SourceBranch] = pr
+		}
+	}
+	for i, s := range out {
+		if s.State == domain.PRStateMerged || s.State == domain.PRStateClosed || s.TargetBranch == "" {
+			continue
+		}
+		parent, ok := openBySource[s.TargetBranch]
+		if !ok || parent.URL == s.URL {
+			continue
+		}
+		out[i].StackedOnURL = firstNonEmpty(parent.HTMLURL, parent.URL)
+		out[i].StackedOnNumber = parent.Number
+	}
 }
 
 func summarizePR(pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment) PRSummary {

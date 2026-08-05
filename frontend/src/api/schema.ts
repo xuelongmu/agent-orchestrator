@@ -1197,6 +1197,7 @@ export interface components {
             threadResolved?: boolean;
         };
         ReviewPolicyConfig: {
+            humanReviewTriggers?: string[];
             outOfScopeDeflection?: boolean;
             p2OnlyRoundLimit?: number;
         };
@@ -1311,6 +1312,8 @@ export interface components {
             /** Format: date-time */
             reviewObservedAt?: string;
             sourceBranch: string;
+            stackedOnNumber?: number;
+            stackedOnUrl?: string;
             /** @enum {string} */
             state: "draft" | "open" | "merged" | "closed";
             targetBranch: string;

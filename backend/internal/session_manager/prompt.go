@@ -78,6 +78,9 @@ func buildSystemPromptText(cfg systemPromptConfig) string {
 		if policy := reviewConvergencePrompt(cfg.ReviewPolicy, true); policy != "" {
 			sections = append(sections, policy)
 		}
+		if triggers := humanReviewTriggersPrompt(cfg.ReviewPolicy, true); triggers != "" {
+			sections = append(sections, triggers)
+		}
 		if rules := strings.TrimSpace(cfg.OrchestratorRules); rules != "" {
 			sections = append(sections, "## Project-Specific Orchestrator Rules\n"+rules)
 		}
@@ -85,6 +88,9 @@ func buildSystemPromptText(cfg systemPromptConfig) string {
 		sections = append(sections, workerSystemPrompt(cfg.Project))
 		if policy := reviewConvergencePrompt(cfg.ReviewPolicy, false); policy != "" {
 			sections = append(sections, policy)
+		}
+		if triggers := humanReviewTriggersPrompt(cfg.ReviewPolicy, false); triggers != "" {
+			sections = append(sections, triggers)
 		}
 		if orchestratorID := strings.TrimSpace(cfg.OrchestratorSessionID); orchestratorID != "" {
 			sections = append(sections, workerOrchestratorPrompt(orchestratorID))
@@ -116,7 +122,33 @@ func reviewConvergencePrompt(policy domain.ReviewPolicyConfig, orchestrator bool
 	}
 	return fmt.Sprintf(`## Project Review Convergence Policy
 
-After %d consecutive completed automated review rounds whose only findings are explicitly tagged P2 or P3, %s. Treat the threshold as the project's explicit disposition of the remaining automated P2/P3 suggestions. P0/P1 findings, untagged or ambiguous feedback, human-requested changes, failed or pending required checks, merge conflicts, and human holds remain blocking. Do not merge unless the human has authorized merging.`, limit, roleAction)
+After %d consecutive completed automated review rounds whose only findings are explicitly tagged P2 or P3, %s. Treat the threshold as the project's explicit disposition of the remaining automated P2/P3 suggestions. P0/P1 findings, untagged or ambiguous feedback, human-requested changes, failed or pending required checks, merge conflicts, and human holds remain merge-blocking. Do not merge unless the human has authorized merging.`, limit, roleAction)
+}
+
+// humanReviewTriggersPrompt renders the project's configured human-review
+// classification. The list is project judgment, not code: agents apply it to
+// the actual change, and a match gates merging only.
+func humanReviewTriggersPrompt(policy domain.ReviewPolicyConfig, orchestrator bool) string {
+	triggers := make([]string, 0, len(policy.HumanReviewTriggers))
+	for _, t := range policy.HumanReviewTriggers {
+		if t = strings.TrimSpace(t); t != "" {
+			triggers = append(triggers, "- "+t)
+		}
+	}
+	if len(triggers) == 0 {
+		return ""
+	}
+	roleRule := "If your change crosses one of these, say so in the PR/MR description so it is routed for human review. The gate blocks merging, not continued work."
+	if orchestrator {
+		roleRule = "Classify each PR against this list when it is opened and again at review time, since scope can drift during implementation. A matching PR needs explicit human approval before merge; treat that as a merge gate only and keep dependent work moving."
+	}
+	return fmt.Sprintf(`## Human Review Triggers
+
+This project requires human review before merging changes involving:
+
+%s
+
+%s`, strings.Join(triggers, "\n"), roleRule)
 }
 
 // systemPromptGuard is appended to every agent system prompt. The role,
@@ -236,6 +268,12 @@ Your job is to coordinate work, not to perform implementation. Keep the project 
 - A PR is `+"`REVIEW_CLEAN`"+` only when one fresh snapshot proves that it is open and non-draft on the expected base, all required checks for the exact current head have succeeded, Codex has returned an explicit clean verdict for that head, no unresolved human feedback or undispositioned reviewer finding remains, no hold or requested change remains, required approvals are present, and the provider reports the PR mergeable. Silence, inactivity, engagement, and green CI alone are never a clean verdict.
 - If Codex reports findings, route them to the responsible worker, wait for the fixes to be pushed, and require another current-head pass. Reapply the 30-minute fallback after each push when automatic review does not start.
 - Re-read the head and all merge gates immediately before merging. If anything changed, restart the review evaluation. Once `+"`REVIEW_CLEAN`"+` holds, merge with the repository's supported customary method without asking again, then report the result to the human.
+
+## Stacked PRs and Human Gates
+
+- A PR waiting only on human review or approval is merge-blocked, not build-blocked. Keep dependent work moving: have workers stack follow-up PRs on the gated branch and note the merge order in each PR body.
+- Never merge a PR while a PR it stacks on is unmerged or still needs human approval. After a parent merges, have its worker retarget and rebase the next PR in order before re-evaluating its merge gates.
+- Pause dependent work only when the open question on the parent could change what the dependent builds on.
 
 %s`, projectName(project), project.ID, project.ID, project.ID, projectContextSection(project))
 }

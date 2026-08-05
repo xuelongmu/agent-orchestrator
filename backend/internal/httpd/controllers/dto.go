@@ -334,6 +334,8 @@ type SessionPRSummary struct {
 	Author           string                       `json:"author"`
 	SourceBranch     string                       `json:"sourceBranch"`
 	TargetBranch     string                       `json:"targetBranch"`
+	StackedOnURL     string                       `json:"stackedOnUrl,omitempty"`
+	StackedOnNumber  int                          `json:"stackedOnNumber,omitempty"`
 	HeadSHA          string                       `json:"headSha"`
 	Additions        int                          `json:"additions"`
 	Deletions        int                          `json:"deletions"`
@@ -417,6 +419,8 @@ func NewSessionPRSummary(in sessionsvc.PRSummary) SessionPRSummary {
 		Author:           in.Author,
 		SourceBranch:     in.SourceBranch,
 		TargetBranch:     in.TargetBranch,
+		StackedOnURL:     in.StackedOnURL,
+		StackedOnNumber:  in.StackedOnNumber,
 		HeadSHA:          in.HeadSHA,
 		Additions:        in.Additions,
 		Deletions:        in.Deletions,
