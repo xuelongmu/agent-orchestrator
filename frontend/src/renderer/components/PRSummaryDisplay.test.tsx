@@ -30,11 +30,7 @@ const summary = (overrides: Partial<SessionPRSummary> = {}): SessionPRSummary =>
 
 describe("PRSummaryMeta", () => {
 	it("shows the stack position when the PR is stacked on an open parent", () => {
-		render(
-			<PRSummaryMeta
-				pr={summary({ stackedOnNumber: 6, stackedOnUrl: "https://github.com/acme/repo/pull/6" })}
-			/>,
-		);
+		render(<PRSummaryMeta pr={summary({ stackedOnNumber: 6, stackedOnUrl: "https://github.com/acme/repo/pull/6" })} />);
 
 		expect(screen.getByText(/stacked on #6/)).toBeInTheDocument();
 	});
