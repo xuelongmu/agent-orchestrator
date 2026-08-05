@@ -64,6 +64,13 @@ AO does defend the following boundaries:
   trees. Those guarantees do not prevent hostile same-user process
   interference. "Daemon-owned" describes lifecycle ownership only: verifier
   commands still run as the same OS account and are not a privileged broker.
+- Worker launch is registration-first: AO assigns and persists a session id
+  before starting the harness, binds that identity into the runtime environment,
+  and tears down a launched process under daemon lifetime if registration cannot
+  complete. On Windows, boot reconciliation also reports and reaps durable
+  ConPTY hosts that have no committed session runtime handle. This is an
+  accidental-orphan cleanup guarantee, not protection from a hostile worker
+  that can alter same-user process or registry state.
 - Worktrees reduce accidental source-tree conflicts. They do not provide
   confidentiality or integrity against another process running as the user.
 

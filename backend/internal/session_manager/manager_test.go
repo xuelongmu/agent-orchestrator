@@ -311,6 +311,8 @@ func (f *fakeStore) DeleteSessionWorktrees(_ context.Context, id domain.SessionI
 type fakeLCM struct {
 	store                   *fakeStore
 	completed               int
+	beforeSpawned           func()
+	spawnedErr              error
 	beforeDependencyMark    func(domain.SessionID)
 	beforeDependencySuccess func(domain.SessionID)
 	beforeTerminated        func(domain.SessionID)
@@ -371,7 +373,16 @@ func (s *fakeDependencyScheduler) ReleaseRecovered(_ context.Context, id domain.
 	return nil
 }
 
-func (l *fakeLCM) MarkSpawned(_ context.Context, id domain.SessionID, metadata domain.SessionMetadata) error {
+func (l *fakeLCM) MarkSpawned(ctx context.Context, id domain.SessionID, metadata domain.SessionMetadata) error {
+	if l.beforeSpawned != nil {
+		l.beforeSpawned()
+	}
+	if l.spawnedErr != nil {
+		return l.spawnedErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	l.completed++
 	rec := l.store.sessions[id]
 	rec.IsTerminated = false
@@ -487,11 +498,14 @@ type fakeRuntime struct {
 	outputCalls        int
 	outputErr          error
 	// aliveByHandle maps a RuntimeHandle.ID to its liveness; missing = false.
-	aliveByHandle    map[string]bool
-	aliveErr         error
-	aliveErrByHandle map[string]error
-	destroyedIDs     []string
-	beforeDestroy    func(ports.RuntimeHandle)
+	aliveByHandle              map[string]bool
+	aliveErr                   error
+	aliveErrByHandle           map[string]error
+	destroyedIDs               []string
+	beforeDestroy              func(ports.RuntimeHandle)
+	destroyRequiresLiveContext bool
+	owned                      []ports.RuntimeHandle
+	listOwnedErr               error
 }
 
 func (r *fakeRuntime) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
@@ -508,13 +522,19 @@ func (r *fakeRuntime) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.
 func (r *fakeRuntime) ExpectedHandle(domain.SessionID) ports.RuntimeHandle {
 	return ports.RuntimeHandle{ID: "h1"}
 }
-func (r *fakeRuntime) Destroy(_ context.Context, handle ports.RuntimeHandle) error {
+func (r *fakeRuntime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error {
+	if r.destroyRequiresLiveContext && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if r.beforeDestroy != nil {
 		r.beforeDestroy(handle)
 	}
 	r.destroyed++
 	r.destroyedIDs = append(r.destroyedIDs, handle.ID)
 	return r.destroyErr
+}
+func (r *fakeRuntime) ListOwned(_ context.Context) ([]ports.RuntimeHandle, error) {
+	return append([]ports.RuntimeHandle(nil), r.owned...), r.listOwnedErr
 }
 func (r *fakeRuntime) IsAlive(_ context.Context, handle ports.RuntimeHandle) (bool, error) {
 	r.aliveCalls++
@@ -2877,6 +2897,30 @@ func TestSpawn_RollsBackOnRuntimeFailure(t *testing.T) {
 	}
 	if rec, present := st.sessions["mer-1"]; present {
 		t.Fatalf("seed row must be deleted before a runtime handle is live, got %+v", rec)
+	}
+}
+
+func TestSpawn_CanceledAfterRuntimeCreateStillDestroysProcess(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(context.Background())
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: testRoleAgents()}
+	rt := &fakeRuntime{destroyRequiresLiveContext: true}
+	lcm := &fakeLCM{store: st, beforeSpawned: cancel}
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Workspace: &fakeWorkspace{path: "/ws/mer-1"},
+		Store: st, Messenger: &fakeMessenger{}, Lifecycle: lcm,
+		LifetimeContext: context.Background(), LookPath: func(string) (string, error) { return "/bin/true", nil },
+	})
+
+	_, err := m.Spawn(requestCtx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Spawn error = %v, want context.Canceled", err)
+	}
+	if rt.created != 1 || rt.destroyed != 1 {
+		t.Fatalf("runtime create/destroy = %d/%d, want 1/1; canceled registration left a process alive", rt.created, rt.destroyed)
+	}
+	if rec := st.sessions["mer-1"]; !rec.IsTerminated {
+		t.Fatalf("aborted spawn row = %+v, want terminated", rec)
 	}
 }
 
@@ -8075,6 +8119,48 @@ func TestReconcile_AdoptAcrossDaemonRestart(t *testing.T) {
 	// Truly-dead, unmarked session is NOT resurrected.
 	if !st.sessions["mer-4"].IsTerminated {
 		t.Fatal("terminated session with no restore marker must stay terminated")
+	}
+}
+
+func TestReconcile_ReapsOwnedRuntimeWithoutCommittedRegistration(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker}
+	rt := &fakeRuntime{owned: []ports.RuntimeHandle{{ID: "mer-1"}, {ID: "missing-row"}}}
+	var logs bytes.Buffer
+	m := New(Deps{
+		Runtime: rt, Agents: fakeAgents{}, Workspace: &fakeWorkspace{}, Store: st,
+		Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st},
+		LifetimeContext: context.Background(), Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+
+	if err := m.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !reflect.DeepEqual(rt.destroyedIDs, []string{"mer-1", "missing-row"}) {
+		t.Fatalf("destroyed runtime ids = %v, want [mer-1 missing-row]", rt.destroyedIDs)
+	}
+	if _, ok := st.sessions["mer-1"]; ok {
+		t.Fatal("uncommitted seed row survived orphan runtime cleanup")
+	}
+	if !strings.Contains(logs.String(), "reaping runtime without committed session registration") {
+		t.Fatalf("reconcile log = %q, want unregistered-runtime report", logs.String())
+	}
+}
+
+func TestReconcile_PreservesOwnedRuntimeWithCommittedRegistration(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID: "mer-1", ProjectID: "mer", Kind: domain.KindWorker,
+		Metadata: domain.SessionMetadata{WorkspacePath: "/ws/mer-1", RuntimeHandleID: "mer-1"},
+	}
+	rt := &fakeRuntime{owned: []ports.RuntimeHandle{{ID: "mer-1"}}, aliveByHandle: map[string]bool{"mer-1": true}}
+	m := New(Deps{Runtime: rt, Agents: fakeAgents{}, Workspace: &fakeWorkspace{}, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}})
+
+	if err := m.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if rt.destroyed != 0 {
+		t.Fatalf("committed runtime destroyed %d times", rt.destroyed)
 	}
 }
 
