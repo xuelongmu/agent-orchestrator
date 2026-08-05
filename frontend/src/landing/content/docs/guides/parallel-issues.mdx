@@ -29,10 +29,12 @@ For a quick interactive version, just run `ao spawn` a few times — `batch-spaw
 If your issues use GitHub's native dependency edges, check them before batch-spawning so an agent doesn't start work that's parked behind another issue (requires `gh` ≥ 2.94.0):
 
 ```bash
-gh issue view 43 --json blockedBy --jq '.blockedBy.nodes[] | select(.state == "OPEN") | .number'
+gh issue view 43 --json blockedBy --jq '.blockedBy
+  | if .totalCount > (.nodes | length) then error("blocker list truncated — paginate the GraphQL blockedBy connection") else . end
+  | .nodes[] | select(.state == "OPEN") | .number'
 ```
 
-An empty result means #43 has no open blockers — spawn it. If it lists issue numbers, spawn those first and hold #43 until they close. Batch-spawn each "wave" of unblocked issues, then batch-spawn the next wave as blockers merge.
+An empty result means #43 has no open blockers — spawn it. If it lists issue numbers, spawn those first and hold #43 until they close. Batch-spawn each "wave" of unblocked issues, then batch-spawn the next wave as blockers merge. (`gh` returns at most the first 50 blockers per issue; the `totalCount` guard makes the command fail instead of silently green-lighting a still-blocked issue in that extreme case.)
 
 ## One agent, many issues? No.
 
