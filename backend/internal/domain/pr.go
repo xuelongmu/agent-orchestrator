@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // ---- PR read model ----
 
@@ -40,6 +43,9 @@ type PullRequest struct {
 	Provider string
 	Host     string
 	Repo     string
+	// HeadRepo is the full name of the repository the head branch lives in.
+	// It differs from Repo for fork PRs; empty means unobserved (legacy rows).
+	HeadRepo string
 
 	SourceBranch   string
 	TargetBranch   string
@@ -69,6 +75,14 @@ type PullRequest struct {
 	ObservedAt       time.Time
 	CIObservedAt     time.Time
 	ReviewObservedAt time.Time
+}
+
+// HeadInBaseRepo reports whether the PR's head branch lives in its base
+// repository. A fork-headed PR's source branch is not an AO-owned branch, so
+// it can never be a stack parent. Empty means unobserved (legacy rows) and is
+// treated as same-repo for backwards compatibility.
+func (p PullRequest) HeadInBaseRepo() bool {
+	return p.HeadRepo == "" || strings.EqualFold(p.HeadRepo, p.Repo)
 }
 
 // PullRequestCheck is one normalized CI check run for a pull request.

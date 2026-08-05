@@ -1554,7 +1554,55 @@ func (m *Manager) notificationIntentForCurrentSCM(ctx context.Context, id domain
 	if !ok {
 		return nil, nil
 	}
-	return m.notificationIntentForSCM(rec, o), nil
+	intent := m.notificationIntentForSCM(rec, o)
+	if intent == nil || intent.Type != domain.NotificationReadyToMerge {
+		return intent, nil
+	}
+	// A child stacked on a still-open parent cannot merge until that parent
+	// does, so telling the human it is ready invites a premature merge.
+	stacked, err := m.prStackedOnOpenParent(ctx, id, o)
+	if err != nil {
+		return nil, err
+	}
+	if stacked {
+		return nil, nil
+	}
+	return intent, nil
+}
+
+// prStackedOnOpenParent reports whether the observed PR targets the source
+// branch of another open PR in the same repository. Parents may be owned by
+// any session when the store supports the cross-session read; fork-headed PRs
+// never count as parents.
+func (m *Manager) prStackedOnOpenParent(ctx context.Context, id domain.SessionID, o ports.SCMObservation) (bool, error) {
+	target := strings.TrimSpace(o.PR.TargetBranch)
+	if target == "" {
+		return false, nil
+	}
+	childURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
+	var candidates []domain.PullRequest
+	if st, ok := m.store.(stackParentStore); ok && strings.TrimSpace(o.Repo) != "" {
+		open, err := st.ListOpenPRsByRepo(ctx, o.Provider, o.Host, o.Repo)
+		if err != nil {
+			return false, err
+		}
+		candidates = open
+	} else {
+		prs, err := m.store.ListPRsBySession(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		candidates = prs
+	}
+	for _, pr := range candidates {
+		if pr.Merged || pr.Closed || pr.URL == childURL || pr.SourceBranch == "" || !pr.HeadInBaseRepo() {
+			continue
+		}
+		if pr.SourceBranch == target {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (m *Manager) notificationIntentForSCM(rec domain.SessionRecord, o ports.SCMObservation) *ports.NotificationIntent {

@@ -44,11 +44,13 @@ func TestStackParentsMatchesAcrossSessionsWithinOneRepo(t *testing.T) {
 	store := &fakeStore{openPRsByRepo: []domain.PullRequest{
 		{URL: "parent", HTMLURL: "hparent", Number: 7, SessionID: "other", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/root", TargetBranch: "main"},
 		{URL: "decoy", HTMLURL: "hdecoy", Number: 9, SessionID: "other", Provider: "github", Host: "ghe.example.com", Repo: "acme/app", SourceBranch: "s/other", TargetBranch: "main"},
+		{URL: "fork", HTMLURL: "hfork", Number: 11, SessionID: "other", Provider: "github", Host: "github.com", Repo: "acme/app", HeadRepo: "outsider/app", SourceBranch: "s/forked", TargetBranch: "main"},
 	}}
 	svc := &Service{store: store}
 	prs := []domain.PullRequest{
 		{URL: "child", Number: 8, SessionID: "mine", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/root/a", TargetBranch: "s/root"},
 		{URL: "lost", Number: 10, SessionID: "mine", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/lost", TargetBranch: "s/other"},
+		{URL: "forkchild", Number: 12, SessionID: "mine", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/fc", TargetBranch: "s/forked"},
 	}
 	parents := svc.stackParents(context.Background(), prs)
 	if parents["child"].URL != "parent" {
@@ -56,5 +58,8 @@ func TestStackParentsMatchesAcrossSessionsWithinOneRepo(t *testing.T) {
 	}
 	if _, ok := parents["lost"]; ok {
 		t.Fatalf("branch match on another host must not mark: %+v", parents)
+	}
+	if _, ok := parents["forkchild"]; ok {
+		t.Fatalf("fork-headed PR must not be a stack parent: %+v", parents)
 	}
 }

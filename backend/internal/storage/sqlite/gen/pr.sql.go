@@ -102,7 +102,7 @@ func (q *Queries) GetDisplayPRFactsBySession(ctx context.Context, sessionID doma
 }
 
 const getPR = `-- name: GetPR :one
-SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature FROM pr WHERE url = ?
+SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature, head_repo FROM pr WHERE url = ?
 `
 
 func (q *Queries) GetPR(ctx context.Context, url string) (PR, error) {
@@ -148,6 +148,7 @@ func (q *Queries) GetPR(ctx context.Context, url string) (PR, error) {
 		&i.CIObservedAt,
 		&i.ReviewObservedAt,
 		&i.LastNudgeSignature,
+		&i.HeadRepo,
 	)
 	return i, err
 }
@@ -185,7 +186,7 @@ func (q *Queries) GetPRLastNudgeSignature(ctx context.Context, url string) (stri
 }
 
 const listOpenPRsByRepo = `-- name: ListOpenPRsByRepo :many
-SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature FROM pr
+SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature, head_repo FROM pr
 WHERE provider = ? AND host = ? AND repo = ? AND is_merged = 0 AND is_closed = 0
 ORDER BY updated_at DESC
 `
@@ -245,6 +246,7 @@ func (q *Queries) ListOpenPRsByRepo(ctx context.Context, arg ListOpenPRsByRepoPa
 			&i.CIObservedAt,
 			&i.ReviewObservedAt,
 			&i.LastNudgeSignature,
+			&i.HeadRepo,
 		); err != nil {
 			return nil, err
 		}
@@ -336,7 +338,7 @@ func (q *Queries) ListPRFactsBySession(ctx context.Context, sessionID domain.Ses
 }
 
 const listPRsBySession = `-- name: ListPRsBySession :many
-SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature FROM pr
+SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature, head_repo FROM pr
 WHERE session_id = ?
 ORDER BY updated_at DESC
 `
@@ -390,6 +392,7 @@ func (q *Queries) ListPRsBySession(ctx context.Context, sessionID domain.Session
 			&i.CIObservedAt,
 			&i.ReviewObservedAt,
 			&i.LastNudgeSignature,
+			&i.HeadRepo,
 		); err != nil {
 			return nil, err
 		}
@@ -473,14 +476,14 @@ func (q *Queries) UpsertLegacyPR(ctx context.Context, arg UpsertLegacyPRParams) 
 const upsertPR = `-- name: UpsertPR :exec
 INSERT INTO pr (
     url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at,
-    provider, host, repo, source_branch, target_branch, head_sha, title,
+    provider, host, repo, head_repo, source_branch, target_branch, head_sha, title,
     additions, deletions, changed_files, author, base_sha, merge_commit_sha,
     is_draft, is_merged, is_closed,
     provider_state, provider_mergeable, provider_merge_state_status, html_url,
     created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider,
     metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (url) DO UPDATE SET
     number = excluded.number,
     pr_state = excluded.pr_state,
@@ -491,6 +494,7 @@ ON CONFLICT (url) DO UPDATE SET
     provider = excluded.provider,
     host = excluded.host,
     repo = excluded.repo,
+    head_repo = excluded.head_repo,
     source_branch = excluded.source_branch,
     target_branch = excluded.target_branch,
     head_sha = excluded.head_sha,
@@ -532,6 +536,7 @@ type UpsertPRParams struct {
 	Provider                 string
 	Host                     string
 	Repo                     string
+	HeadRepo                 string
 	SourceBranch             string
 	TargetBranch             string
 	HeadSha                  string
@@ -574,6 +579,7 @@ func (q *Queries) UpsertPR(ctx context.Context, arg UpsertPRParams) error {
 		arg.Provider,
 		arg.Host,
 		arg.Repo,
+		arg.HeadRepo,
 		arg.SourceBranch,
 		arg.TargetBranch,
 		arg.HeadSha,

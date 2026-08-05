@@ -141,7 +141,7 @@ func (s *Service) stackParents(ctx context.Context, prs []domain.PullRequest) ma
 	}
 	openBySource := map[string]domain.PullRequest{}
 	addCandidate := func(pr domain.PullRequest) {
-		if !pr.Merged && !pr.Closed && pr.SourceBranch != "" {
+		if !pr.Merged && !pr.Closed && pr.SourceBranch != "" && pr.HeadInBaseRepo() {
 			key := branchKey(pr, pr.SourceBranch)
 			if _, ok := openBySource[key]; !ok {
 				openBySource[key] = pr

@@ -1,14 +1,14 @@
 -- name: UpsertPR :exec
 INSERT INTO pr (
     url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at,
-    provider, host, repo, source_branch, target_branch, head_sha, title,
+    provider, host, repo, head_repo, source_branch, target_branch, head_sha, title,
     additions, deletions, changed_files, author, base_sha, merge_commit_sha,
     is_draft, is_merged, is_closed,
     provider_state, provider_mergeable, provider_merge_state_status, html_url,
     created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider,
     metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (url) DO UPDATE SET
     number = excluded.number,
     pr_state = excluded.pr_state,
@@ -19,6 +19,7 @@ ON CONFLICT (url) DO UPDATE SET
     provider = excluded.provider,
     host = excluded.host,
     repo = excluded.repo,
+    head_repo = excluded.head_repo,
     source_branch = excluded.source_branch,
     target_branch = excluded.target_branch,
     head_sha = excluded.head_sha,
