@@ -106,6 +106,56 @@ func TestMerge_SquashMergesTrackedPRAtExactHead(t *testing.T) {
 	}
 }
 
+// stackAwareActionStore layers the optional project-scoped stack read over the
+// plain fake store, mirroring the production SQLite store.
+type stackAwareActionStore struct {
+	*fakeActionStore
+	session    domain.SessionRecord
+	sessionOK  bool
+	openByRepo []domain.PullRequest
+}
+
+func (f *stackAwareActionStore) GetSession(_ context.Context, _ domain.SessionID) (domain.SessionRecord, bool, error) {
+	return f.session, f.sessionOK, nil
+}
+
+func (f *stackAwareActionStore) ListOpenPRsByRepo(_ context.Context, _ domain.ProjectID, _, _, _ string) ([]domain.PullRequest, error) {
+	return f.openByRepo, nil
+}
+
+func TestMerge_RefusesChildStackedOnOpenParent(t *testing.T) {
+	child := mergeablePR()
+	child.SessionID = "mer-1"
+	child.SourceBranch = "s/root/a"
+	child.TargetBranch = "s/root"
+	store := &stackAwareActionStore{
+		fakeActionStore: &fakeActionStore{pr: child, ok: true},
+		session:         domain.SessionRecord{ID: "mer-1", ProjectID: "proj-1"},
+		sessionOK:       true,
+		openByRepo: []domain.PullRequest{
+			{URL: "https://github.com/acme/widgets/pull/41", Number: 41, Repo: "acme/widgets", SourceBranch: "s/root", TargetBranch: "main"},
+		},
+	}
+	scm := readySCM(child)
+	scm.observations[0].PR.TargetBranch = "s/root"
+	svc := NewActionService(ActionDeps{Store: store, Merger: scm, Reader: scm})
+
+	_, err := svc.Merge(context.Background(), MergeRequest{PRID: "42", PRURL: child.URL, ExpectedHeadSHA: child.HeadSHA})
+	if !errors.Is(err, ErrPRNotMergeable) {
+		t.Fatalf("err = %v, want ErrPRNotMergeable", err)
+	}
+	if scm.mergeCalls != 0 {
+		t.Fatalf("provider merge was attempted for a stacked child: %d", scm.mergeCalls)
+	}
+
+	// Once the parent is merged, the same request goes through.
+	store.openByRepo[0].Merged = true
+	scm.result = ports.SCMMergeResult{MergeCommitSHA: "merge-sha"}
+	if _, err := svc.Merge(context.Background(), MergeRequest{PRID: "42", PRURL: child.URL, ExpectedHeadSHA: child.HeadSHA}); err != nil {
+		t.Fatalf("merged parent should unblock the child: %v", err)
+	}
+}
+
 func TestMerge_RequiresCallerExpectedHead(t *testing.T) {
 	store := &fakeActionStore{pr: mergeablePR(), ok: true}
 	scm := readySCM(store.pr)

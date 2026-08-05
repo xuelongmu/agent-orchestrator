@@ -86,6 +86,15 @@ type actionStore interface {
 	ListPRReviewThreads(ctx context.Context, prURL string) ([]domain.PullRequestReviewThread, error)
 }
 
+// mergeStackStore is the production store's optional wider read used to refuse
+// merging a child PR whose target branch is still owned by an open parent PR
+// in the same project. Test/embedding stores may omit it; the merge then
+// relies on the provider gate alone.
+type mergeStackStore interface {
+	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
+	ListOpenPRsByRepo(ctx context.Context, projectID domain.ProjectID, provider, host, repo string) ([]domain.PullRequest, error)
+}
+
 type actionReader interface {
 	FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
 	FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error)
@@ -168,6 +177,17 @@ func (s *ActionService) Merge(ctx context.Context, request MergeRequest) (MergeR
 	if !scmready.IsReadyToMerge(fresh) {
 		return MergeResult{}, ErrPRPreconditions
 	}
+	target := strings.TrimSpace(fresh.PR.TargetBranch)
+	if target == "" {
+		target = strings.TrimSpace(tracked.TargetBranch)
+	}
+	stacked, err := s.stackedOnOpenParent(ctx, tracked, target)
+	if err != nil {
+		return MergeResult{}, err
+	}
+	if stacked {
+		return MergeResult{}, fmt.Errorf("%w: pull request is stacked on an open parent; merge the parent first", ErrPRNotMergeable)
+	}
 
 	out, err := s.merger.MergePullRequest(ctx, ports.SCMMergeRequest{
 		PR:              ref,
@@ -212,6 +232,40 @@ func (s *ActionService) fetchMergeReadiness(ctx context.Context, ref ports.SCMPR
 	}
 	observation.Review = review
 	return observation, nil
+}
+
+// stackedOnOpenParent reports whether target is still owned as the source
+// branch of another open, non-fork-headed PR in the same project. The dashboard
+// hides the merge action for stacked children; this is the API-side guard so
+// other clients cannot squash a child into its unmerged parent branch.
+func (s *ActionService) stackedOnOpenParent(ctx context.Context, tracked domain.PullRequest, target string) (bool, error) {
+	if target == "" {
+		return false, nil
+	}
+	st, ok := s.store.(mergeStackStore)
+	if !ok || strings.TrimSpace(tracked.Repo) == "" {
+		return false, nil
+	}
+	rec, found, err := st.GetSession(ctx, tracked.SessionID)
+	if err != nil {
+		return false, fmt.Errorf("load pull request session: %w", err)
+	}
+	if !found {
+		return false, nil
+	}
+	open, err := st.ListOpenPRsByRepo(ctx, rec.ProjectID, tracked.Provider, tracked.Host, tracked.Repo)
+	if err != nil {
+		return false, fmt.Errorf("list open pull requests: %w", err)
+	}
+	for _, pr := range open {
+		if pr.Merged || pr.Closed || pr.URL == tracked.URL || pr.SourceBranch == "" || !pr.HeadInBaseRepo() {
+			continue
+		}
+		if pr.SourceBranch == target {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func parsePRNumber(value string) (int, error) {
