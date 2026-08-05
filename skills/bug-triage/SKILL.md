@@ -330,6 +330,24 @@ Search by subsystem and add a `## Related` section to the issue body:
 - [#35](url): same race condition
 ```
 
+**Dependency edges (gh ≥ 2.94.0):** when the relationship is a real ordering
+dependency — this fix can't land until another issue is resolved — record it as
+a native GitHub blocked-by/blocking edge, not just prose:
+
+```bash
+gh issue edit <number> --repo AgentWrapper/agent-orchestrator --add-blocked-by <blocker>
+gh issue view <number> --repo AgentWrapper/agent-orchestrator --json blockedBy,blocking
+```
+
+The JSON fields return `{ nodes, totalCount }`; if `totalCount` exceeds the
+nodes listed, the result is truncated — paginate the GraphQL `blockedByIssues`
+connection instead of trusting the short list. On older gh (< 2.94.0; check
+`gh --version`) these flags and fields don't exist: fall back to GraphQL or
+state the dependency in the issue body. The `blocked` **status label** stays for
+at-a-glance filtering, but the edge is the machine-readable fact agents should
+trust when picking work — an issue with an open blocker is not `ready-for-agent`
+regardless of labels.
+
 ### 5f. Push a fix PR (always attempt)
 
 This is a Go repo: fixes go through a local branch, build, and `gh pr create`

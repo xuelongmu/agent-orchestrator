@@ -24,6 +24,16 @@ AO:
 
 For a quick interactive version, just run `ao spawn` a few times — `batch-spawn` adds the duplicate detection.
 
+## Spawn only unblocked issues
+
+If your issues use GitHub's native dependency edges, check them before batch-spawning so an agent doesn't start work that's parked behind another issue (requires `gh` ≥ 2.94.0):
+
+```bash
+gh issue view 43 --json blockedBy --jq '.blockedBy.nodes[] | select(.state == "OPEN") | .number'
+```
+
+An empty result means #43 has no open blockers — spawn it. If it lists issue numbers, spawn those first and hold #43 until they close. Batch-spawn each "wave" of unblocked issues, then batch-spawn the next wave as blockers merge.
+
 ## One agent, many issues? No.
 
 Each spawn is one agent working on exactly one issue. If you want the same issue worked on by two different agents (e.g. Claude Code and Codex) in parallel, pass `--agent`:
