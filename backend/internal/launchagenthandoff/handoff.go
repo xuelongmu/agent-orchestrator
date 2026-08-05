@@ -8,17 +8,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 )
+
+// LockTimeout bounds the wait for a concurrent handoff to release the lock. It
+// matches the caller's own readiness timeout, so a contended launch surfaces the
+// lock wait rather than a generic startup stall.
+const LockTimeout = 30 * time.Second
 
 type request struct {
 	Environment *map[string]string `json:"environment,omitempty"`
 	SocketPath  string             `json:"socket_path,omitempty"`
 }
 
-// Run reads one JSON request, reports socket readiness, serves the environment
-// once, then removes the socket when Electron sends a release line or its pipe
-// closes. The helper is a separate process so Electron crashes still clean up.
-func Run(ctx context.Context, in io.Reader, out io.Writer) error {
+// Run holds the handoff lock for the call's duration, then reads one JSON
+// request, reports socket readiness, serves the environment once, and removes
+// the socket when Electron sends a release line or its pipe closes. The helper
+// is a separate process so Electron crashes still clean up.
+//
+// The lock is taken before the request is read so a second launch waits its turn
+// instead of racing to bind the same socket path.
+func Run(ctx context.Context, in io.Reader, out io.Writer, lockPath string) error {
+	releaseLock, err := acquireLock(ctx, lockPath, LockTimeout)
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
 	reader := bufio.NewReader(in)
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
