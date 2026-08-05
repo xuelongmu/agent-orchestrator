@@ -95,15 +95,20 @@ describe("development daemon attach identity", () => {
 			probe,
 			identityError: (daemonProbe) =>
 				evaluateDaemonIdentity(launch, daemonProbe, {
-					enforceDevCheckout: devConfig.isIsolated,
+					enforceDevCheckout: true,
 					samePath,
 					pathInside,
 				}),
 		});
 	}
 
-	it("attaches to the canonical packaged daemon in shared development", async () => {
-		await expect(attachWith({})).resolves.toMatchObject({ state: "ready", port: 3001, pid: 4242 });
+	it("rejects the canonical packaged daemon in shared development", async () => {
+		await expect(attachWith({})).resolves.toMatchObject({
+			state: "error",
+			port: 3001,
+			pid: 4242,
+			code: "identity_mismatch",
+		});
 	});
 
 	it("retains strict checkout identity in isolated development", async () => {

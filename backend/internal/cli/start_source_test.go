@@ -88,8 +88,9 @@ func TestResolveStartMode(t *testing.T) {
 		want      startMode
 	}{
 		{"auto dev build in checkout runs source", startModeAuto, "/repo", true, startModeSource},
-		{"auto stamped build in checkout stays on release", startModeAuto, "/repo", false, startModeRelease},
-		{"auto dev build outside a checkout stays on release", startModeAuto, "", true, startModeRelease},
+		{"auto stamped build in checkout runs source", startModeAuto, "/repo", false, startModeSource},
+		{"auto dev build outside a checkout refuses release", startModeAuto, "", true, startModeDevOutsideCheckout},
+		{"auto stamped build outside a checkout runs release", startModeAuto, "", false, startModeRelease},
 		{"explicit source wins over a stamped build", startModeSource, "/repo", false, startModeSource},
 		{"explicit release wins inside a checkout", startModeRelease, "/repo", true, startModeRelease},
 	}
@@ -99,6 +100,54 @@ func TestResolveStartMode(t *testing.T) {
 				t.Fatalf("resolveStartMode = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestStart_DevBuildOutsideCheckoutRequiresExplicitRelease(t *testing.T) {
+	setConfigEnv(t)
+	chdir(t, t.TempDir())
+
+	deps := Deps{
+		HTTPClient: offlineHTTPClient(),
+		RunAttached: func(context.Context, string, string, ...string) error {
+			t.Fatal("must not run source or install a release outside a checkout")
+			return nil
+		},
+	}
+
+	_, _, err := executeCLI(t, deps, "start")
+	if ExitCode(err) != 2 {
+		t.Fatalf("exit code = %d, want 2 (explicit choice required); err = %v", ExitCode(err), err)
+	}
+	if !strings.Contains(err.Error(), "refusing release mode") || !strings.Contains(err.Error(), "--release") {
+		t.Fatalf("error = %v, want refusal and explicit --release guidance", err)
+	}
+}
+
+func TestStart_AutoRunsCheckoutEvenForStampedBuild(t *testing.T) {
+	setConfigEnv(t)
+	root := makeCheckout(t, true)
+	chdir(t, root)
+
+	oldVersion := Version
+	Version = "1.2.3"
+	t.Cleanup(func() { Version = oldVersion })
+
+	var ran bool
+	deps := Deps{
+		HTTPClient: offlineHTTPClient(),
+		LookPath:   func(string) (string, error) { return "/usr/bin/npm", nil },
+		RunAttached: func(context.Context, string, string, ...string) error {
+			ran = true
+			return nil
+		},
+	}
+
+	if _, _, err := executeCLI(t, deps, "start"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !ran {
+		t.Fatal("did not run the source harness from the checkout")
 	}
 }
 
@@ -170,57 +219,28 @@ func TestStart_SourceRunsFrontendDevHarness(t *testing.T) {
 	}
 }
 
-func TestStart_SourceWarnsWhenADaemonIsAlreadyRunning(t *testing.T) {
+func TestStart_SourceReusesDaemonFromSameCheckout(t *testing.T) {
 	cfg := setConfigEnv(t)
 	root := makeCheckout(t, true)
 	chdir(t, root)
 
-	// A live PID makes runfile.CheckStale report the daemon as running.
-	if err := runfile.Write(cfg.runFile, runfile.Info{
-		PID: os.Getpid(), Port: 3001, StartedAt: time.Unix(100, 0).UTC(),
-	}); err != nil {
-		t.Fatalf("write run-file: %v", err)
-	}
-
-	deps := Deps{
-		HTTPClient:  offlineHTTPClient(),
-		LookPath:    func(string) (string, error) { return "/usr/bin/npm", nil },
-		RunAttached: func(context.Context, string, string, ...string) error { return nil },
-	}
-
-	_, errOut, err := executeCLI(t, deps, "start", "--source")
-	if err != nil {
-		t.Fatalf("start --source: %v", err)
-	}
-	// A dev launch attaches to an existing daemon rather than starting this
-	// checkout's, so the warning must name the escape hatches, not claim the
-	// app will refuse to attach.
-	for _, want := range []string{"already running", "ao stop", "ISOLATE_DEV=true"} {
-		if !strings.Contains(errOut, want) {
-			t.Fatalf("warning %q missing %q", errOut, want)
-		}
-	}
-}
-
-func TestStart_SourceWarnsWhenOnlyThePortAnswers(t *testing.T) {
-	// No run file at all, but a daemon holds the port. Electron attaches in
-	// exactly this case through main.ts's direct-port fallback, so the warning
-	// must not depend on the run file being readable.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/healthz" {
 			http.NotFound(w, r)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(probeResult{
-			Status: "ok", Service: daemonmeta.ServiceName, PID: 4242,
+			Status: "ok", Service: daemonmeta.ServiceName, PID: os.Getpid(),
+			WorkingDirectory: filepath.Join(root, "backend"),
 		})
 	}))
 	t.Cleanup(srv.Close)
 
-	setConfigEnv(t)
-	t.Setenv("AO_PORT", strconv.Itoa(serverPort(t, srv.URL)))
-	root := makeCheckout(t, true)
-	chdir(t, root)
+	if err := runfile.Write(cfg.runFile, runfile.Info{
+		PID: os.Getpid(), Port: serverPort(t, srv.URL), StartedAt: time.Unix(100, 0).UTC(),
+	}); err != nil {
+		t.Fatalf("write run-file: %v", err)
+	}
 
 	deps := Deps{
 		HTTPClient:  srv.Client(),
@@ -232,8 +252,47 @@ func TestStart_SourceWarnsWhenOnlyThePortAnswers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start --source: %v", err)
 	}
-	if !strings.Contains(errOut, "already running") || !strings.Contains(errOut, "pid 4242") {
-		t.Fatalf("no warning for a port-only daemon: %q", errOut)
+	for _, want := range []string{"Using the AO daemon", "this checkout"} {
+		if !strings.Contains(errOut, want) {
+			t.Fatalf("output %q missing %q", errOut, want)
+		}
+	}
+}
+
+func TestStart_SourceRejectsDifferentDaemonWhenOnlyThePortAnswers(t *testing.T) {
+	// No run file at all, but a daemon holds the port. Electron attaches in
+	// exactly this case through main.ts's direct-port fallback, so rejection must
+	// not depend on the run file being readable.
+	otherWorkingDirectory := filepath.Join(t.TempDir(), "packaged", "resources")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(probeResult{
+			Status: "ok", Service: daemonmeta.ServiceName, PID: 4242,
+			WorkingDirectory: otherWorkingDirectory,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	setConfigEnv(t)
+	t.Setenv("AO_PORT", strconv.Itoa(serverPort(t, srv.URL)))
+	root := makeCheckout(t, true)
+	chdir(t, root)
+
+	deps := Deps{
+		HTTPClient: srv.Client(),
+		LookPath:   func(string) (string, error) { return "/usr/bin/npm", nil },
+		RunAttached: func(context.Context, string, string, ...string) error {
+			t.Fatal("must not launch the dev harness with a mismatched daemon")
+			return nil
+		},
+	}
+
+	_, _, err := executeCLI(t, deps, "start", "--source")
+	if err == nil || !strings.Contains(err.Error(), "another AO daemon") || !strings.Contains(err.Error(), "pid 4242") {
+		t.Fatalf("error = %v, want mismatched port-only daemon refusal", err)
 	}
 }
 
@@ -293,22 +352,44 @@ func TestStart_SourceIsolatedRemedyScopesTheStop(t *testing.T) {
 		RunAttached: func(context.Context, string, string, ...string) error { return nil },
 	}
 
-	_, errOut, err := executeCLI(t, deps, "start", "--source")
-	if err != nil {
-		t.Fatalf("start --source: %v", err)
+	_, _, err := executeCLI(t, deps, "start", "--source")
+	if err == nil {
+		t.Fatal("start --source succeeded with an unverified isolated daemon")
 	}
 	// Plain `ao stop` resolves through config.Load, which ignores ISOLATE_DEV and
 	// would stop the canonical daemon instead, so the remedy must name the
 	// isolated paths. It quotes them rather than emitting a shell command: a
 	// POSIX `VAR=x cmd` prefix is not valid in PowerShell or cmd.exe.
-	if !strings.Contains(errOut, strconv.Quote(isolatedRunFile)) {
-		t.Fatalf("remedy does not name the isolated run file: %q", errOut)
+	if !strings.Contains(err.Error(), strconv.Quote(isolatedRunFile)) {
+		t.Fatalf("remedy does not name the isolated run file: %q", err)
 	}
-	if !strings.Contains(errOut, strconv.Quote(filepath.Join(home, ".ao", "dev", "data"))) {
-		t.Fatalf("remedy does not name the isolated data dir: %q", errOut)
+	if !strings.Contains(err.Error(), strconv.Quote(filepath.Join(home, ".ao", "dev", "data"))) {
+		t.Fatalf("remedy does not name the isolated data dir: %q", err)
 	}
-	if strings.Contains(errOut, "AO_RUN_FILE="+isolatedRunFile) {
-		t.Fatalf("remedy emits a POSIX-only env prefix: %q", errOut)
+	if strings.Contains(err.Error(), "AO_RUN_FILE="+isolatedRunFile) {
+		t.Fatalf("remedy emits a POSIX-only env prefix: %q", err)
+	}
+}
+
+func TestDevDaemonMatchesCheckout(t *testing.T) {
+	root := makeCheckout(t, false)
+	tests := []struct {
+		name  string
+		probe probeResult
+		want  bool
+	}{
+		{"backend working directory", probeResult{WorkingDirectory: filepath.Join(root, "backend")}, true},
+		{"binary inside backend", probeResult{ExecutablePath: filepath.Join(root, "backend", "bin", "ao")}, true},
+		{"other checkout", probeResult{WorkingDirectory: filepath.Join(t.TempDir(), "backend")}, false},
+		{"packaged binary", probeResult{ExecutablePath: filepath.Join(t.TempDir(), "resources", "daemon", "ao")}, false},
+		{"missing identity", probeResult{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := devDaemonMatchesCheckout(tt.probe, root); got != tt.want {
+				t.Fatalf("devDaemonMatchesCheckout = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

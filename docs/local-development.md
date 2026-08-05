@@ -149,10 +149,15 @@ Then, from anywhere inside the checkout:
 ao start
 ```
 
-A binary you built yourself (its version reports `dev`) run from inside a
-checkout starts **that checkout** through the frontend dev harness, and blocks
-until you stop it with Ctrl-C. A released `ao` — or `ao start` run from outside a
-checkout — resolves the installed desktop app instead, downloading it if needed.
+Inside a checkout, `ao start` starts **that checkout** through the frontend dev
+harness and blocks until you stop it with Ctrl-C. The checkout wins even if a
+released `ao` happens to be first on `PATH`, so contributor commands do not
+silently install or launch a stale desktop release.
+
+Outside a checkout, a released `ao` resolves the installed desktop app,
+downloading it if needed. A binary you built yourself (its version reports
+`dev`) refuses to install the desktop app from outside a checkout unless you
+explicitly pass `--release`.
 
 Force either path explicitly:
 
@@ -271,12 +276,9 @@ result:
 ISOLATE_DEV=true ao start --source
 ```
 
-**Your backend changes do not seem to be running** — a dev launch attaches to
-whatever AO daemon already holds the canonical port rather than starting one
-from your checkout. Checkout identity is only enforced when `ISOLATE_DEV=true`,
-so an installed `/Applications/Agent Orchestrator.app` or a stray `npm run dev`
-will be used silently. `ao start --source` warns when it sees a live daemon.
-Either stop the other one:
+**A daemon from another checkout is already running** — development launches
+fail closed instead of attaching to a packaged daemon or another checkout. Stop
+the other daemon:
 
 ```bash
 ao stop

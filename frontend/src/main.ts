@@ -883,7 +883,7 @@ async function readDaemonProbe(port: number, endpoint: "healthz" | "readyz"): Pr
 
 function daemonIdentityError(launch: DaemonLaunchSpec, probe: DaemonProbe): string | null {
 	return evaluateDaemonIdentity(launch, probe, {
-		enforceDevCheckout: devDaemonConfig.isIsolated,
+		enforceDevCheckout: true,
 		samePath,
 		pathInside,
 	});

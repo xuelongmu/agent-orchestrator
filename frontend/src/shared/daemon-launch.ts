@@ -21,8 +21,9 @@ export function evaluateDaemonIdentity(
 	policy: DaemonIdentityPolicy,
 ): string | null {
 	if (launch.source === "dev") {
-		// Shared development deliberately accepts any genuine AO daemon on the
-		// canonical port. Isolated development keeps checkout identity strict.
+		// Development must never silently attach to a daemon from another checkout
+		// or a packaged app. The policy remains explicit for unit-level consumers;
+		// Electron always enables it for development launches.
 		if (!policy.enforceDevCheckout) return null;
 
 		const cwdMatches = probe.workingDirectory ? policy.samePath(probe.workingDirectory, launch.cwd) : false;
