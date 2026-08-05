@@ -12,6 +12,13 @@ ALTER TABLE pr ADD COLUMN stack_position INTEGER NOT NULL DEFAULT 0;
 -- +goose StatementBegin
 ALTER TABLE pr ADD COLUMN stack_size INTEGER NOT NULL DEFAULT 0;
 -- +goose StatementEnd
+-- Existing open rows carry a metadata hash computed before stack fields
+-- existed; with unchanged provider ETags the observer would never refetch
+-- them and native membership would stay unobserved. Clearing the hash marks
+-- them refresh candidates once; the next poll re-fetches and re-hashes.
+-- +goose StatementBegin
+UPDATE pr SET metadata_hash = '' WHERE is_merged = 0 AND is_closed = 0;
+-- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
