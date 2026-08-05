@@ -13,22 +13,22 @@ import (
 
 // PRSummary is the user-facing SCM read model for one PR owned by a session.
 type PRSummary struct {
-	URL              string
-	HTMLURL          string
-	Number           int
-	Title            string
-	State            domain.PRState
-	Provider         string
-	Repo             string
-	Author           string
-	SourceBranch     string
-	TargetBranch     string
+	URL          string
+	HTMLURL      string
+	Number       int
+	Title        string
+	State        domain.PRState
+	Provider     string
+	Repo         string
+	Author       string
+	SourceBranch string
+	TargetBranch string
 	// StackedOnURL/StackedOnNumber identify the open sibling PR whose source
 	// branch this PR targets. Set only while that parent is open: the child is
 	// stacked and cannot merge until the parent does, but remains buildable.
-	StackedOnURL    string
-	StackedOnNumber int
-	HeadSHA         string
+	StackedOnURL     string
+	StackedOnNumber  int
+	HeadSHA          string
 	Additions        int
 	Deletions        int
 	ChangedFiles     int
