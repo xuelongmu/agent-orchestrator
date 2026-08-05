@@ -220,6 +220,31 @@ func TestStart_SourceRunsFrontendDevHarness(t *testing.T) {
 	}
 }
 
+func TestStart_SourceRespectsConfiguredDaemonOverride(t *testing.T) {
+	setConfigEnv(t)
+	root := makeCheckout(t, true)
+	chdir(t, root)
+	t.Setenv("AO_DAEMON_COMMAND", "custom-ao daemon")
+
+	var ran bool
+	deps := Deps{
+		HTTPClient: offlineHTTPClient(),
+		LookPath:   func(string) (string, error) { return "/usr/bin/npm", nil },
+		RunAttached: func(context.Context, string, string, ...string) error {
+			ran = true
+			return nil
+		},
+	}
+
+	_, errOut, err := executeCLI(t, deps, "start", "--source")
+	if err != nil {
+		t.Fatalf("start --source: %v", err)
+	}
+	if !ran || !strings.Contains(errOut, "explicitly configured daemon") {
+		t.Fatalf("ran = %v, stderr = %q", ran, errOut)
+	}
+}
+
 func TestStart_SourceReusesDaemonFromSameCheckout(t *testing.T) {
 	cfg := setConfigEnv(t)
 	root := makeCheckout(t, true)
@@ -339,6 +364,9 @@ func TestStart_SourceRejectsDifferentDaemonWhenOnlyThePortAnswers(t *testing.T) 
 	_, _, err := executeCLI(t, deps, "start", "--source")
 	if err == nil || !strings.Contains(err.Error(), "another AO daemon") || !strings.Contains(err.Error(), "pid 4242") {
 		t.Fatalf("error = %v, want mismatched port-only daemon refusal", err)
+	}
+	if strings.Contains(err.Error(), "ao stop") || !strings.Contains(err.Error(), "stop process pid 4242 manually") {
+		t.Fatalf("error = %v, want a PID-aware remedy without ao stop", err)
 	}
 }
 

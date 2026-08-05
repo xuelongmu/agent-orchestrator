@@ -105,8 +105,12 @@ func (c *commandContext) runStartFromSource(ctx context.Context, out, errOut io.
 		return fmt.Errorf("ao start: frontend dependencies are not installed; run `npm ci --prefix %s` first", frontend)
 	}
 
-	if err := c.checkRunningDevDaemon(ctx, errOut, root); err != nil {
-		return err
+	if strings.TrimSpace(os.Getenv("AO_DAEMON_COMMAND")) == "" {
+		if err := c.checkRunningDevDaemon(ctx, errOut, root); err != nil {
+			return err
+		}
+	} else {
+		_, _ = fmt.Fprintln(errOut, "AO_DAEMON_COMMAND is set; using the explicitly configured daemon.")
 	}
 
 	_, _ = fmt.Fprintf(out, "Starting Agent Orchestrator from source at %s\n", root)
@@ -178,10 +182,10 @@ func (c *commandContext) checkRunningDevDaemon(ctx context.Context, w io.Writer,
 		if !runFileLive {
 			return nil
 		}
-		return fmt.Errorf("ao start: an AO daemon appears to be running (pid %d, port %d), but its checkout identity could not be verified; %s", pid, port, devDaemonStopRemedy(runFile, isolated))
+		return fmt.Errorf("ao start: an AO daemon appears to be running (pid %d, port %d), but its checkout identity could not be verified; %s", pid, port, devDaemonStopRemedy(runFile, isolated, runFileLive, pid))
 	}
 	if runFileLive && probe.PID != pid {
-		return fmt.Errorf("ao start: the AO daemon on port %d reports pid %d, not run-file pid %d, so its checkout identity cannot be trusted; %s", port, probe.PID, pid, devDaemonStopRemedy(runFile, isolated))
+		return fmt.Errorf("ao start: the AO daemon on port %d reports pid %d, not run-file pid %d, so its checkout identity cannot be trusted; %s", port, probe.PID, pid, devDaemonStopRemedy(runFile, isolated, runFileLive, probe.PID))
 	}
 	if !devDaemonMatchesCheckout(probe, root) {
 		actual := probe.WorkingDirectory
@@ -191,13 +195,19 @@ func (c *commandContext) checkRunningDevDaemon(ctx context.Context, w io.Writer,
 		if actual == "" {
 			actual = "an unknown location"
 		}
-		return fmt.Errorf("ao start: another AO daemon is already running from %s (pid %d, port %d); expected this checkout at %s; %s", actual, probe.PID, port, root, devDaemonStopRemedy(runFile, isolated))
+		return fmt.Errorf("ao start: another AO daemon is already running from %s (pid %d, port %d); expected this checkout at %s; %s", actual, probe.PID, port, root, devDaemonStopRemedy(runFile, isolated, runFileLive, probe.PID))
 	}
 	_, _ = fmt.Fprintf(w, "Using the AO daemon already running from this checkout (pid %d, port %d).\n", probe.PID, port)
 	return nil
 }
 
-func devDaemonStopRemedy(runFile string, isolated bool) string {
+func devDaemonStopRemedy(runFile string, isolated, runFileLive bool, pid int) string {
+	if !runFileLive {
+		if isolated {
+			return fmt.Sprintf("stop process pid %d manually; see docs/local-development.md for isolated daemon cleanup", pid)
+		}
+		return fmt.Sprintf("stop process pid %d manually, or set ISOLATE_DEV=true to use a separate data dir and port", pid)
+	}
 	if isolated {
 		return fmt.Sprintf("stop it by running `ao stop` with "+
 			"AO_RUN_FILE=%q and AO_DATA_DIR=%q set (`ao stop` does not read ISOLATE_DEV); "+
