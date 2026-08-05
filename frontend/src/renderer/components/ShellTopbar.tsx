@@ -1,6 +1,15 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
-import { GitBranch, LayoutDashboard, PanelRightClose, PanelRightOpen, Plus, Square, Trash2 } from "lucide-react";
+import {
+	GitBranch,
+	LayoutDashboard,
+	PanelRightClose,
+	PanelRightOpen,
+	Plus,
+	RotateCw,
+	Square,
+	Trash2,
+} from "lucide-react";
 import { useState } from "react";
 import { NotificationCenter } from "./NotificationCenter";
 import {
@@ -12,6 +21,8 @@ import {
 import { useWorkspaceQuery, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import { apiClient, apiErrorMessage } from "../lib/api-client";
 import { spawnOrchestrator } from "../lib/spawn-orchestrator";
+import { restartProjectOrchestrator } from "../lib/restart-orchestrator";
+import { OrchestratorRestartDialog } from "./OrchestratorRestartDialog";
 import { addRendererExceptionStep, captureRendererEvent, captureRendererException } from "../lib/telemetry";
 import { useUiStore } from "../stores/ui-store";
 import { OrchestratorIcon } from "./icons";
@@ -75,6 +86,24 @@ export function ShellTopbar() {
 	const projectLabel = project?.name ?? session?.workspaceName ?? (projectId ? "" : "agent-orchestrator");
 	const orchestrator = projectId ? findProjectOrchestrator(all, projectId) : undefined;
 	const isProjectRestarting = projectId ? restartingProjectIds.has(projectId) : false;
+	const setProjectRestarting = useUiStore((state) => state.setProjectRestarting);
+	const setOrchestratorReplacementError = useUiStore((state) => state.setOrchestratorReplacementError);
+	const [restartConfirmOpen, setRestartConfirmOpen] = useState(false);
+
+	// Reachable from the orchestrator's own view because that is where a stale
+	// context is noticed. restartProjectOrchestrator navigates to the replacement,
+	// so this reads as the current session handing off to its successor.
+	const confirmRestartOrchestrator = async () => {
+		setRestartConfirmOpen(false);
+		if (!projectId) return;
+		await restartProjectOrchestrator({
+			projectId,
+			queryClient,
+			navigate,
+			setProjectRestarting,
+			setOrchestratorReplacementError,
+		});
+	};
 
 	if (isLinux && !isSessionRoute) {
 		return null;
@@ -178,6 +207,21 @@ export function ShellTopbar() {
 									<LayoutDashboard className="size-icon-md" aria-hidden="true" />
 									Kanban
 								</TopbarButton>
+								{/* Only for a live orchestrator: on a terminated one "restart" would
+								    really mean "spawn a fresh one", which the board's Spawn
+								    Orchestrator action already covers. */}
+								{session && sessionIsActive(session) ? (
+									<TopbarButton
+										aria-label="Restart orchestrator"
+										disabled={isProjectRestarting}
+										onClick={() => setRestartConfirmOpen(true)}
+										style={noDragStyle}
+										title="Restart orchestrator"
+										variant="icon"
+									>
+										<RotateCw className="size-icon-md" aria-hidden="true" />
+									</TopbarButton>
+								) : null}
 							</>
 						) : null}
 						{/* Kill control sits beside the orchestrator link for active workers —
@@ -230,6 +274,12 @@ export function ShellTopbar() {
 					</>
 				) : null}
 			</div>
+			<OrchestratorRestartDialog
+				busy={isProjectRestarting}
+				onConfirm={() => void confirmRestartOrchestrator()}
+				onOpenChange={setRestartConfirmOpen}
+				open={restartConfirmOpen}
+			/>
 		</header>
 	);
 }

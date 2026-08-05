@@ -25,6 +25,7 @@ import { useWorkspaceQuery, workspaceQueryKey } from "../hooks/useWorkspaceQuery
 import { NotificationCenter } from "./NotificationCenter";
 import { BoardWelcome, ProjectBoardEmpty } from "./BoardEmptyState";
 import { OrchestratorIcon } from "./icons";
+import { OrchestratorRestartDialog } from "./OrchestratorRestartDialog";
 import { TopbarButton, TopbarKillError } from "./TopbarButton";
 import { spawnOrchestrator } from "../lib/spawn-orchestrator";
 import { restartProjectOrchestrator } from "../lib/restart-orchestrator";
@@ -59,6 +60,7 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 	const orchestrator = projectId ? newestActiveOrchestrator(workspaces[0]?.sessions ?? []) : undefined;
 	const [isSpawning, setIsSpawning] = useState(false);
 	const [spawnError, setSpawnError] = useState<string | null>(null);
+	const [restartConfirmOpen, setRestartConfirmOpen] = useState(false);
 	const restartingProjectIds = useUiStore((state) => state.restartingProjectIds);
 	const orchestratorStartupError = useUiStore((state) =>
 		projectId ? (state.orchestratorStartupErrors[projectId] ?? null) : null,
@@ -194,6 +196,11 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 		});
 	};
 
+	const confirmRestartOrchestrator = async () => {
+		setRestartConfirmOpen(false);
+		await restartOrchestrator();
+	};
+
 	const actions = projectId ? (
 		<>
 			{isLinux ? <NotificationCenter /> : null}
@@ -226,6 +233,21 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 							? "Orchestrator"
 							: "Spawn Orchestrator"}
 			</TopbarButton>
+			{/* Restarting a *healthy* orchestrator is the only way to start an
+			    unrelated stream of work without inheriting the previous one's
+			    context. The banner's Restart only appears once health degrades, so
+			    without this the action is unreachable exactly when it is wanted. */}
+			{orchestrator && health.state === "ok" ? (
+				<TopbarButton
+					aria-label="Restart orchestrator"
+					disabled={isProjectRestarting}
+					onClick={() => setRestartConfirmOpen(true)}
+					title="Restart orchestrator"
+					variant="icon"
+				>
+					<RotateCw className="size-icon-md" aria-hidden="true" />
+				</TopbarButton>
+			) : null}
 		</>
 	) : isLinux ? (
 		<NotificationCenter />
@@ -341,6 +363,12 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 					}}
 				/>
 			)}
+			<OrchestratorRestartDialog
+				busy={isProjectRestarting}
+				onConfirm={() => void confirmRestartOrchestrator()}
+				onOpenChange={setRestartConfirmOpen}
+				open={restartConfirmOpen}
+			/>
 		</div>
 	);
 }
