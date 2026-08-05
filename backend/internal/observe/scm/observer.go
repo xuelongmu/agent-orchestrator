@@ -1250,19 +1250,23 @@ func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRep
 			if !ok {
 				continue
 			}
+			stackNum, stackPos, stackSiz := pr.Stack.Flatten()
 			known := domain.PullRequest{
-				URL:          firstNonEmpty(pr.URL, pr.HTMLURL),
-				SessionID:    sr.session.ID,
-				Number:       pr.Number,
-				Draft:        pr.Draft,
-				HeadRepo:     pr.HeadRepo,
-				SourceBranch: pr.SourceBranch,
-				TargetBranch: pr.TargetBranch,
-				HeadSHA:      pr.HeadSHA,
-				Provider:     repo.Provider,
-				Host:         repo.Host,
-				Repo:         repoFullName(repo),
-				UpdatedAt:    now,
+				URL:           firstNonEmpty(pr.URL, pr.HTMLURL),
+				SessionID:     sr.session.ID,
+				Number:        pr.Number,
+				Draft:         pr.Draft,
+				HeadRepo:      pr.HeadRepo,
+				StackNumber:   stackNum,
+				StackPosition: stackPos,
+				StackSize:     stackSiz,
+				SourceBranch:  pr.SourceBranch,
+				TargetBranch:  pr.TargetBranch,
+				HeadSHA:       pr.HeadSHA,
+				Provider:      repo.Provider,
+				Host:          repo.Host,
+				Repo:          repoFullName(repo),
+				UpdatedAt:     now,
 			}
 			// Persist the discovered PR as an open baseline row immediately, before
 			// the refresh/lifecycle pass runs. A session can own several PRs, and a
@@ -1679,6 +1683,7 @@ func domainFromObservation(sessionID domain.SessionID, obs ports.SCMObservation,
 	if opts.reviewFetched || reviewObservedAt.IsZero() {
 		reviewObservedAt = obs.ObservedAt
 	}
+	stackNum, stackPos, stackSiz := obs.PR.Stack.Flatten()
 	pr := domain.PullRequest{
 		URL:                      firstNonEmpty(obs.PR.URL, obs.PR.HTMLURL),
 		SessionID:                sessionID,
@@ -1694,6 +1699,9 @@ func domainFromObservation(sessionID domain.SessionID, obs ports.SCMObservation,
 		Host:                     obs.Host,
 		Repo:                     obs.Repo,
 		HeadRepo:                 firstNonEmpty(obs.PR.HeadRepo, local.HeadRepo),
+		StackNumber:              stackNum,
+		StackPosition:            stackPos,
+		StackSize:                stackSiz,
 		SourceBranch:             obs.PR.SourceBranch,
 		TargetBranch:             obs.PR.TargetBranch,
 		HeadSHA:                  obs.PR.HeadSHA,
@@ -1749,13 +1757,22 @@ func domainFromObservation(sessionID domain.SessionID, obs ports.SCMObservation,
 	return pr, checks, reviews, threads, comments
 }
 
+// localStackObservation projects stored native-stack membership back into the
+// observation shape so local-only refreshes preserve it.
+func localStackObservation(pr domain.PullRequest) *ports.SCMPRStackObservation {
+	if pr.StackNumber <= 0 {
+		return nil
+	}
+	return &ports.SCMPRStackObservation{Number: pr.StackNumber, Position: pr.StackPosition, Size: pr.StackSize}
+}
+
 func observationFromLocal(repo ports.SCMRepo, pr domain.PullRequest, checks []domain.PullRequestCheck) ports.SCMObservation {
 	return ports.SCMObservation{
 		Fetched:      true,
 		Provider:     firstNonEmpty(pr.Provider, repo.Provider),
 		Host:         firstNonEmpty(pr.Host, repo.Host),
 		Repo:         firstNonEmpty(pr.Repo, repoFullName(repo)),
-		PR:           ports.SCMPRObservation{URL: pr.URL, Number: pr.Number, State: normalizePRState(pr.Draft, pr.Merged, pr.Closed), Draft: pr.Draft, Merged: pr.Merged, Closed: pr.Closed, HeadRepo: pr.HeadRepo, SourceBranch: pr.SourceBranch, TargetBranch: pr.TargetBranch, HeadSHA: pr.HeadSHA, Title: pr.Title, Additions: pr.Additions, Deletions: pr.Deletions, ChangedFiles: pr.ChangedFiles, Author: pr.Author, BaseSHA: pr.BaseSHA, MergeCommitSHA: pr.MergeCommitSHA, ProviderState: pr.ProviderState, ProviderMergeable: pr.ProviderMergeable, ProviderMergeStateStatus: pr.ProviderMergeStateStatus, HTMLURL: pr.HTMLURL, CreatedAtProvider: pr.CreatedAtProvider, UpdatedAtProvider: pr.UpdatedAtProvider, MergedAtProvider: pr.MergedAtProvider, ClosedAtProvider: pr.ClosedAtProvider},
+		PR:           ports.SCMPRObservation{URL: pr.URL, Number: pr.Number, State: normalizePRState(pr.Draft, pr.Merged, pr.Closed), Draft: pr.Draft, Merged: pr.Merged, Closed: pr.Closed, HeadRepo: pr.HeadRepo, Stack: localStackObservation(pr), SourceBranch: pr.SourceBranch, TargetBranch: pr.TargetBranch, HeadSHA: pr.HeadSHA, Title: pr.Title, Additions: pr.Additions, Deletions: pr.Deletions, ChangedFiles: pr.ChangedFiles, Author: pr.Author, BaseSHA: pr.BaseSHA, MergeCommitSHA: pr.MergeCommitSHA, ProviderState: pr.ProviderState, ProviderMergeable: pr.ProviderMergeable, ProviderMergeStateStatus: pr.ProviderMergeStateStatus, HTMLURL: pr.HTMLURL, CreatedAtProvider: pr.CreatedAtProvider, UpdatedAtProvider: pr.UpdatedAtProvider, MergedAtProvider: pr.MergedAtProvider, ClosedAtProvider: pr.ClosedAtProvider},
 		CI:           ciObservationFromLocal(pr, checks),
 		Review:       ports.SCMReviewObservation{Decision: string(pr.Review)},
 		Mergeability: mergeabilityObservationFromLocal(pr),

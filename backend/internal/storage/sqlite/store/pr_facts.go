@@ -47,6 +47,7 @@ func (s *Store) ListPRFactsForSession(ctx context.Context, id domain.SessionID) 
 			ReviewComments: r.ReviewComments,
 			Repo:           r.Repo,
 			HeadRepo:       r.HeadRepo,
+			StackNumber:    int(r.StackNumber),
 			SourceBranch:   r.SourceBranch,
 			TargetBranch:   r.TargetBranch,
 			UpdatedAt:      r.UpdatedAt,

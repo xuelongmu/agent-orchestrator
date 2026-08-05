@@ -1722,3 +1722,66 @@ func TestFetchReviewThreadsRejectsMessageFromCommitOtherThanObservedHead(t *test
 		t.Fatalf("FetchReviewThreads = %+v, %v; want fail closed without stale message", got, err)
 	}
 }
+
+func TestFetchPullRequestsMapsNativeStackMembership(t *testing.T) {
+	ref := ports.SCMPRRef{Repo: ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "octocat", Name: "hello", Repo: "octocat/hello"}, Number: 42}
+	fake := newFakeGH(t)
+	fx := basePRFixture()
+	var pr map[string]any
+	fx.prData(func(m map[string]any) {
+		pr = m
+		m["stackEntry"] = map[string]any{
+			"position": float64(2),
+			"stack":    map[string]any{"number": float64(7), "size": float64(3), "baseRefName": "main"},
+		}
+	})
+	fake.on(http.MethodPost, "/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"pr0": map[string]any{"pullRequest": pr}}})
+	})
+	got, err := newProviderForTest(t, fake).FetchPullRequests(ctx(), []ports.SCMPRRef{ref})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("FetchPullRequests = %+v, %v", got, err)
+	}
+	stack := got[0].PR.Stack
+	if stack == nil || stack.Number != 7 || stack.Position != 2 || stack.Size != 3 || stack.BaseRef != "main" {
+		t.Fatalf("stack = %+v", stack)
+	}
+}
+
+func TestFetchPullRequestsFallsBackWhenStackFieldsUnsupported(t *testing.T) {
+	// A GHES schema without the stacked-PR preview rejects the stack selection;
+	// the provider must latch, retry without it, and keep later fetches clean.
+	ref := ports.SCMPRRef{Repo: ports.SCMRepo{Provider: "github", Host: "ghe.example.com", Owner: "octocat", Name: "hello", Repo: "octocat/hello"}, Number: 42}
+	fake := newFakeGH(t)
+	fx := basePRFixture()
+	var pr map[string]any
+	fx.prData(func(m map[string]any) { pr = m })
+	stackQueries := 0
+	totalQueries := 0
+	fake.on(http.MethodPost, "/graphql", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		totalQueries++
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(body), "stackEntry") {
+			stackQueries++
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []map[string]any{{"message": `Field 'stackEntry' doesn't exist on type 'PullRequest'`}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"pr0": map[string]any{"pullRequest": pr}}})
+	})
+	provider := newProviderForTest(t, fake)
+	got, err := provider.FetchPullRequests(ctx(), []ports.SCMPRRef{ref})
+	if err != nil || len(got) != 1 || got[0].PR.Stack != nil {
+		t.Fatalf("first fetch = %+v, %v", got, err)
+	}
+	if stackQueries != 1 || totalQueries != 2 {
+		t.Fatalf("queries = %d total, %d with stack; want 2/1", totalQueries, stackQueries)
+	}
+	if _, err := provider.FetchPullRequests(ctx(), []ports.SCMPRRef{ref}); err != nil {
+		t.Fatal(err)
+	}
+	if stackQueries != 1 || totalQueries != 3 {
+		t.Fatalf("latch failed: %d total, %d with stack; want 3/1", totalQueries, stackQueries)
+	}
+}

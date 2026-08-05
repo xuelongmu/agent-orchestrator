@@ -1158,7 +1158,7 @@ func (m *Manager) prBlockedByOpenParent(ctx context.Context, id domain.SessionID
 	}
 	// Session-local parents answer without a session-record read; a parent
 	// owned by another worker in the same project needs the cross-session set.
-	if openParentOwnsBranch(prs, child.URL, child.TargetBranch) {
+	if openParentOwnsBranch(prs, child.URL, child.TargetBranch, child.StackNumber) {
 		return true, nil
 	}
 	st, ok := m.store.(stackParentStore)
@@ -1173,7 +1173,7 @@ func (m *Manager) prBlockedByOpenParent(ctx context.Context, id domain.SessionID
 	if err != nil {
 		return false, err
 	}
-	return openParentOwnsBranch(open, child.URL, child.TargetBranch), nil
+	return openParentOwnsBranch(open, child.URL, child.TargetBranch, child.StackNumber), nil
 }
 
 // ApplySCMObservation is the provider-neutral lifecycle entrypoint used by the
@@ -1502,8 +1502,10 @@ func (m *Manager) applyStackParentHeadChange(ctx context.Context, id domain.Sess
 		if err != nil {
 			return err
 		}
+		parentStack, _, _ := o.PR.Stack.Flatten()
 		for _, pr := range prs {
-			if !pr.Merged && !pr.Closed && pr.URL != prURL && pr.TargetBranch == o.PR.SourceBranch && stackPRMatchesObservationRepo(pr, o) {
+			if !pr.Merged && !pr.Closed && pr.URL != prURL && pr.TargetBranch == o.PR.SourceBranch && stackPRMatchesObservationRepo(pr, o) &&
+				domain.NativeStackAllowsParent(pr.StackNumber, parentStack) {
 				childrenBySession[session.ID] = append(childrenBySession[session.ID], pr)
 			}
 		}
@@ -1601,7 +1603,8 @@ func (m *Manager) prStackedOnOpenParent(ctx context.Context, rec domain.SessionR
 	if err != nil {
 		return false, err
 	}
-	return openParentOwnsBranch(candidates, childURL, o.PR.TargetBranch), nil
+	childStack, _, _ := o.PR.Stack.Flatten()
+	return openParentOwnsBranch(candidates, childURL, o.PR.TargetBranch, childStack), nil
 }
 
 // stackParentCandidates returns the open-parent candidate set: the project's
@@ -1615,8 +1618,10 @@ func (m *Manager) stackParentCandidates(ctx context.Context, projectID domain.Pr
 }
 
 // openParentOwnsBranch reports whether an open, non-fork-headed candidate PR
-// other than the child owns target as its source branch.
-func openParentOwnsBranch(candidates []domain.PullRequest, childURL, target string) bool {
+// other than the child owns target as its source branch. childStack carries
+// the child's native stack number; inside a native stack only same-stack
+// candidates count as parents.
+func openParentOwnsBranch(candidates []domain.PullRequest, childURL, target string, childStack int) bool {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return false
@@ -1625,7 +1630,7 @@ func openParentOwnsBranch(candidates []domain.PullRequest, childURL, target stri
 		if pr.Merged || pr.Closed || pr.URL == childURL || pr.SourceBranch == "" || !pr.HeadInBaseRepo() {
 			continue
 		}
-		if pr.SourceBranch == target {
+		if pr.SourceBranch == target && domain.NativeStackAllowsParent(childStack, pr.StackNumber) {
 			return true
 		}
 	}

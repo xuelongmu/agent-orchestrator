@@ -397,6 +397,7 @@ func claimRowsFromSCM(sessionID domain.SessionID, obs ports.SCMObservation, now 
 	if observedAt.IsZero() {
 		observedAt = now
 	}
+	stackNum, stackPos, stackSiz := obs.PR.Stack.Flatten()
 	pr := domain.PullRequest{
 		URL:                      firstNonEmpty(obs.PR.URL, obs.PR.HTMLURL),
 		SessionID:                sessionID,
@@ -412,6 +413,9 @@ func claimRowsFromSCM(sessionID domain.SessionID, obs ports.SCMObservation, now 
 		Host:                     obs.Host,
 		Repo:                     obs.Repo,
 		HeadRepo:                 obs.PR.HeadRepo,
+		StackNumber:              stackNum,
+		StackPosition:            stackPos,
+		StackSize:                stackSiz,
 		SourceBranch:             obs.PR.SourceBranch,
 		TargetBranch:             obs.PR.TargetBranch,
 		HeadSHA:                  obs.PR.HeadSHA,
