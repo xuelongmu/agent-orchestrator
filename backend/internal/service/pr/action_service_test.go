@@ -156,6 +156,31 @@ func TestMerge_RefusesChildStackedOnOpenParent(t *testing.T) {
 	}
 }
 
+// A PR in a native stack requires GitHub's asynchronous stack merge endpoint;
+// AO's synchronous merge must fail closed even for the stack bottom.
+func TestMerge_RefusesNativeStackPRUntilAsyncMergeSupported(t *testing.T) {
+	bottom := mergeablePR()
+	bottom.SessionID = "mer-1"
+	bottom.StackNumber = 3
+	bottom.SourceBranch = "s/root"
+	bottom.TargetBranch = "main"
+	store := &stackAwareActionStore{
+		fakeActionStore: &fakeActionStore{pr: bottom, ok: true},
+		session:         domain.SessionRecord{ID: "mer-1", ProjectID: "proj-1"},
+		sessionOK:       true,
+	}
+	scm := readySCM(bottom)
+	svc := NewActionService(ActionDeps{Store: store, Merger: scm, Reader: scm})
+
+	_, err := svc.Merge(context.Background(), MergeRequest{PRID: "42", PRURL: bottom.URL, ExpectedHeadSHA: bottom.HeadSHA})
+	if !errors.Is(err, ErrPRNotMergeable) {
+		t.Fatalf("err = %v, want ErrPRNotMergeable", err)
+	}
+	if scm.mergeCalls != 0 {
+		t.Fatalf("synchronous merge was attempted for a native-stack PR: %d", scm.mergeCalls)
+	}
+}
+
 func TestMerge_RequiresCallerExpectedHead(t *testing.T) {
 	store := &fakeActionStore{pr: mergeablePR(), ok: true}
 	scm := readySCM(store.pr)

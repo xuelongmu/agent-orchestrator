@@ -188,6 +188,14 @@ func (s *ActionService) Merge(ctx context.Context, request MergeRequest) (MergeR
 	if stacked {
 		return MergeResult{}, fmt.Errorf("%w: pull request is stacked on an open parent; merge the parent first", ErrPRNotMergeable)
 	}
+	// GitHub requires the asynchronous stack merge endpoint for PRs in a
+	// native stack; AO's synchronous merge would be an unsupported provider
+	// mutation. Fail closed (fresh membership preferred, stored as backstop)
+	// until async stack merge is implemented.
+	freshStackNumber, _, _ := fresh.PR.Stack.Flatten()
+	if freshStackNumber > 0 || tracked.StackNumber > 0 {
+		return MergeResult{}, fmt.Errorf("%w: pull request is part of a native stack; merge it from the provider until AO supports the asynchronous stack merge API", ErrPRNotMergeable)
+	}
 
 	out, err := s.merger.MergePullRequest(ctx, ports.SCMMergeRequest{
 		PR:              ref,

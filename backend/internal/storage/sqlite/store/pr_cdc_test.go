@@ -53,6 +53,45 @@ func TestPRChecksCDC_EmitsOnInsertAndStatusUpdate(t *testing.T) {
 	}
 }
 
+// Joining or leaving a native stack changes derived blocked status, so a
+// stack-membership-only update must emit pr_updated; an unchanged re-poll
+// stays silent.
+func TestPRCDC_EmitsOnStackMembershipChange(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := "https://example/pr/9"
+	now := time.Now()
+	write := func(stackNumber int) {
+		pr := domain.PullRequest{URL: url, SessionID: rec.ID, Number: 9, StackNumber: stackNumber, UpdatedAt: now}
+		if err := s.WriteSCMObservation(ctx, pr, nil, nil, nil, nil, ports.ReviewWritePreserve); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(0) // insert -> pr_created
+	write(7) // joins a stack -> pr_updated
+	write(7) // unchanged re-poll -> NO event
+	write(0) // leaves the stack -> pr_updated
+
+	rows, err := s.EventsAfter(ctx, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := 0
+	for _, r := range rows {
+		if r.Type == "pr_updated" {
+			updated++
+		}
+	}
+	if updated != 2 {
+		t.Fatalf("want 2 pr_updated events (join + leave, no-op suppressed), got %d", updated)
+	}
+}
+
 func TestPRReviewThreadsCDC_EmitsOnInsertAndResolvedTransition(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
