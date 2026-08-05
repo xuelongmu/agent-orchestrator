@@ -340,8 +340,9 @@ gh issue view <number> --repo AgentWrapper/agent-orchestrator --json blockedBy,b
 ```
 
 The JSON fields return `{ nodes, totalCount }`; if `totalCount` exceeds the
-nodes listed, the result is truncated — paginate the GraphQL `blockedByIssues`
-connection instead of trusting the short list. On older gh (< 2.94.0; check
+nodes listed, the result is truncated — paginate the GraphQL
+`blockedBy(first: ..., after: ...)` connection on `Issue` instead of trusting
+the short list. On older gh (< 2.94.0; check
 `gh --version`) these flags and fields don't exist: fall back to GraphQL or
 state the dependency in the issue body. The `blocked` **status label** stays for
 at-a-glance filtering, but the edge is the machine-readable fact agents should
