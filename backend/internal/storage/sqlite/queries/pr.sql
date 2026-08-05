@@ -123,6 +123,8 @@ SELECT
     pr.review_decision,
     pr.ci_state,
     pr.mergeability,
+    pr.repo,
+    pr.head_repo,
     pr.source_branch,
     pr.target_branch,
     pr.updated_at,

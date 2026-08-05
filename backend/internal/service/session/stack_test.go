@@ -31,6 +31,19 @@ func TestBuildStacksMarksBlockedChildren(t *testing.T) {
 	}
 }
 
+// A fork-headed PR's source branch is not an AO-owned branch, so a same-session
+// PR targeting that branch name is not a blocked stack child.
+func TestBuildStacksIgnoresForkHeadedParents(t *testing.T) {
+	prs := []domain.PRFacts{
+		{URL: "fork", Repo: "acme/app", HeadRepo: "outsider/app", SourceBranch: "feature", TargetBranch: "main"},
+		{URL: "child", Repo: "acme/app", SourceBranch: "ao/x", TargetBranch: "feature"},
+	}
+	st := buildStacks(prs)
+	if st["child"].Blocked {
+		t.Fatal("fork-headed PR must not block a same-branch-name child")
+	}
+}
+
 func TestBuildStacksMergedParentUnblocksChild(t *testing.T) {
 	prs := []domain.PRFacts{
 		{URL: "p142", SourceBranch: "ao/abc", TargetBranch: "main", Merged: true},

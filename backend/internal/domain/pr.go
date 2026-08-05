@@ -20,9 +20,19 @@ type PRFacts struct {
 	Review         ReviewDecision
 	Mergeability   Mergeability
 	ReviewComments bool // has unresolved review comments (any author) to address
-	SourceBranch   string
-	TargetBranch   string
-	UpdatedAt      time.Time
+	// Repo/HeadRepo mirror PullRequest: a differing head repo marks a fork PR,
+	// whose source branch is not an AO-owned stack parent. Empty HeadRepo means
+	// unobserved (legacy rows) and is treated as same-repo.
+	Repo         string
+	HeadRepo     string
+	SourceBranch string
+	TargetBranch string
+	UpdatedAt    time.Time
+}
+
+// HeadInBaseRepo mirrors PullRequest.HeadInBaseRepo for the facts snapshot.
+func (p PRFacts) HeadInBaseRepo() bool {
+	return p.HeadRepo == "" || strings.EqualFold(p.HeadRepo, p.Repo)
 }
 
 // PullRequest is the app-level representation of one tracked pull request as

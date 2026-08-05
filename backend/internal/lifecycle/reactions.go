@@ -1447,6 +1447,11 @@ func (m *Manager) applyStackParentHeadChange(ctx context.Context, id domain.Sess
 	if prURL == "" || o.PR.HeadSHA == "" {
 		return nil
 	}
+	// A fork-headed PR's source branch is not an AO-owned stack parent, so its
+	// head movements are not parent updates for same-base children.
+	if o.PR.HeadRepo != "" && !strings.EqualFold(o.PR.HeadRepo, o.Repo) {
+		return nil
+	}
 
 	m.react.mu.Lock()
 	if !m.react.loaded[prURL] {

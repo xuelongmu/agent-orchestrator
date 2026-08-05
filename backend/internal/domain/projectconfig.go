@@ -131,7 +131,10 @@ type ReviewPolicyConfig struct {
 	// before merge (e.g. "data model or migration changes", "third-party
 	// integrations", "permissioning changes"). Agents classify PRs against the
 	// list at dispatch and again at review time; a match gates merging only,
-	// never continued building.
+	// never continued building. Enforcement is prompt-level: agents route the
+	// PR to a human and repository branch protection holds the approval; the
+	// daemon does not yet persist classifications or block the merge route on
+	// them.
 	HumanReviewTriggers []string `json:"humanReviewTriggers,omitempty"`
 }
 

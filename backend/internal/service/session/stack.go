@@ -17,11 +17,12 @@ type stackInfo struct {
 
 // buildStacks derives the stack position of every PR from the source/target
 // branch columns alone. A parent counts only while open, matching the rule that
-// a merged or closed parent no longer blocks its children.
+// a merged or closed parent no longer blocks its children; a fork-headed PR's
+// source branch is not an AO-owned branch and never counts as a parent.
 func buildStacks(prs []domain.PRFacts) map[string]stackInfo {
 	openSources := make(map[string]bool, len(prs))
 	for _, p := range prs {
-		if !p.Merged && !p.Closed && p.SourceBranch != "" {
+		if !p.Merged && !p.Closed && p.SourceBranch != "" && p.HeadInBaseRepo() {
 			openSources[p.SourceBranch] = true
 		}
 	}

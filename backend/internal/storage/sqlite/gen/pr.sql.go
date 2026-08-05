@@ -278,6 +278,8 @@ SELECT
     pr.review_decision,
     pr.ci_state,
     pr.mergeability,
+    pr.repo,
+    pr.head_repo,
     pr.source_branch,
     pr.target_branch,
     pr.updated_at,
@@ -301,6 +303,8 @@ type ListPRFactsBySessionRow struct {
 	ReviewDecision domain.ReviewDecision
 	CIState        domain.CIState
 	Mergeability   domain.Mergeability
+	Repo           string
+	HeadRepo       string
 	SourceBranch   string
 	TargetBranch   string
 	UpdatedAt      time.Time
@@ -327,6 +331,8 @@ func (q *Queries) ListPRFactsBySession(ctx context.Context, sessionID domain.Ses
 			&i.ReviewDecision,
 			&i.CIState,
 			&i.Mergeability,
+			&i.Repo,
+			&i.HeadRepo,
 			&i.SourceBranch,
 			&i.TargetBranch,
 			&i.UpdatedAt,
