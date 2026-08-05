@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionActivityState, WorkspaceSession, WorkspaceSummary } from "../types/workspace";
 import { ShellTopbar, TopbarKillButton } from "./ShellTopbar";
+import { spawnOrchestrator } from "../lib/spawn-orchestrator";
 
 const { navigateMock, onKilledMock, paramsMock, postMock, useWorkspaceQueryMock } = vi.hoisted(() => ({
 	navigateMock: vi.fn(),
@@ -126,6 +127,7 @@ beforeEach(() => {
 	postMock.mockResolvedValue({ data: { ok: true, sessionId: "sess-1" }, error: undefined });
 	useWorkspaceQueryMock.mockReset();
 	useWorkspaceQueryMock.mockReturnValue({ data: [], isError: false, isLoading: false });
+	vi.mocked(spawnOrchestrator).mockReset();
 });
 
 describe("ShellTopbar status pill", () => {
@@ -178,6 +180,44 @@ describe("ShellTopbar orchestrator actions", () => {
 		expect(screen.getByRole("button", { name: "Open Kanban" })).toHaveClass("bg-primary");
 		expect(screen.getByRole("button", { name: "New task" })).toHaveClass("bg-raised");
 		expect(screen.getByRole("button", { name: "New task" })).not.toHaveClass("bg-primary");
+	});
+
+	it("offers a restart action on a live orchestrator session", () => {
+		renderTopbar(orchestrator);
+
+		expect(screen.getByRole("button", { name: "Restart orchestrator" })).toBeVisible();
+	});
+
+	it("withholds the restart action once the orchestrator is terminated", () => {
+		renderTopbar({ ...orchestrator, status: "terminated" });
+
+		expect(screen.queryByRole("button", { name: "Restart orchestrator" })).not.toBeInTheDocument();
+	});
+
+	it("withholds the restart action on worker sessions", () => {
+		renderTopbar(sessionWith());
+
+		expect(screen.queryByRole("button", { name: "Restart orchestrator" })).not.toBeInTheDocument();
+	});
+
+	it("restarts on the project, and only after the confirmation is accepted", async () => {
+		vi.mocked(spawnOrchestrator).mockResolvedValue("orch-2");
+		renderTopbar(orchestrator);
+
+		await userEvent.click(screen.getByRole("button", { name: "Restart orchestrator" }));
+		expect(spawnOrchestrator).not.toHaveBeenCalled();
+
+		await userEvent.click(screen.getByRole("button", { name: /^Restart$/ }));
+
+		await waitFor(() => expect(spawnOrchestrator).toHaveBeenCalledWith("proj-1", "restart", true));
+		// The replacement takes over the view, so the old session hands off rather
+		// than leaving the user on a retired orchestrator.
+		await waitFor(() =>
+			expect(navigateMock).toHaveBeenCalledWith({
+				to: "/projects/$projectId/sessions/$sessionId",
+				params: { projectId: "proj-1", sessionId: "orch-2" },
+			}),
+		);
 	});
 });
 
