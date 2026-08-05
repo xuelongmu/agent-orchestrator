@@ -627,7 +627,6 @@ async function installAndKickstartLaunchAgent(
 	launch: DaemonLaunchSpec,
 	helperBinary: string,
 	environment: DaemonLaunchAgentEnvironment,
-	sharedDevelopment: boolean,
 	shouldContinue: () => boolean,
 ): Promise<boolean> {
 	if (!shouldContinue()) return false;
@@ -647,17 +646,14 @@ async function installAndKickstartLaunchAgent(
 		// Re-probe under the cross-process lock. A packaged app may have loaded
 		// the canonical definition while a shared-development app was waiting.
 		const loaded = await isLaunchAgentLoaded(job);
-		const preserveLoadedDefinition = sharedDevelopment && loaded;
-		const definitionChanged = !preserveLoadedDefinition && (await launchAgentDefinitionChanged(job, plist));
+		const definitionChanged = await launchAgentDefinitionChanged(job, plist);
 		if (loaded && definitionChanged) {
 			await execFileAsync("/bin/launchctl", ["bootout", job.serviceTarget]);
 		}
 		if (!shouldContinue()) return false;
-		if (!preserveLoadedDefinition || !loaded) {
-			await mkdir(path.dirname(job.plistPath), { recursive: true, mode: 0o750 });
-			await writeFile(job.plistPath, plist, { encoding: "utf8", mode: 0o600 });
-			await chmod(job.plistPath, 0o600);
-		}
+		await mkdir(path.dirname(job.plistPath), { recursive: true, mode: 0o750 });
+		await writeFile(job.plistPath, plist, { encoding: "utf8", mode: 0o600 });
+		await chmod(job.plistPath, 0o600);
 		if (!shouldContinue()) return false;
 		let startedByBootstrap = false;
 		if (!loaded || definitionChanged) {
@@ -700,7 +696,6 @@ async function startDaemonViaLaunchAgent(
 	startEpoch: number,
 	helperBinary: string,
 	environment: DaemonLaunchAgentEnvironment,
-	sharedDevelopment: boolean,
 ): Promise<DaemonStatus> {
 	setDaemonStatus({ state: "starting" });
 	daemonOwnership.clear();
@@ -710,7 +705,6 @@ async function startDaemonViaLaunchAgent(
 			launch,
 			helperBinary,
 			environment,
-			sharedDevelopment,
 			() => startEpoch === daemonStartEpoch && !daemonStopIntent.stopping,
 		);
 		if (!started) return daemonStatus;
@@ -1143,8 +1137,6 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 	}
 	const launchAgentLoaded = daemonLaunchAgent ? await isLaunchAgentLoaded(daemonLaunchAgent) : false;
 	const launchAgentPID = daemonLaunchAgent ? await launchAgentProcessID(daemonLaunchAgent) : null;
-	const sharedDevelopment = isDev && !devDaemonConfig.isIsolated;
-	const preserveSharedDevLaunchAgent = sharedDevelopment && launchAgentLoaded;
 	const launchAgentDefinitionIsStale =
 		daemonLaunchAgent !== null &&
 		launchAgentEnvironment !== null &&
@@ -1174,7 +1166,6 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 			),
 			identityMismatch: existing.status.code === "identity_mismatch",
 			definitionChanged: launchAgentDefinitionIsStale,
-			preserveLoadedDefinition: preserveSharedDevLaunchAgent,
 		});
 		if (replaceStaleLaunchAgent) {
 			replacingMacLaunchAgent = true;
@@ -1300,7 +1291,6 @@ async function startDaemonInner(startEpoch: number): Promise<DaemonStatus> {
 			startEpoch,
 			launchAgentHandoffBinary(),
 			launchAgentEnvironment,
-			sharedDevelopment,
 		);
 	}
 

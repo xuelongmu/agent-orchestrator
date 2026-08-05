@@ -1,13 +1,13 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
@@ -85,7 +85,21 @@ func isSourceCheckout(dir string) bool {
 	if err != nil {
 		return false
 	}
-	return bytes.Contains(data, []byte(backendModuleLine))
+	return goModulePath(data) == strings.TrimPrefix(backendModuleLine, "module ")
+}
+
+func goModulePath(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "module" {
+			continue
+		}
+		if path, err := strconv.Unquote(fields[1]); err == nil {
+			return path
+		}
+		return fields[1]
+	}
+	return ""
 }
 
 // runStartFromSource launches the desktop app from the checkout at root via the
@@ -96,6 +110,11 @@ func isSourceCheckout(dir string) bool {
 // orphan it.
 func (c *commandContext) runStartFromSource(ctx context.Context, out, errOut io.Writer, root string) error {
 	frontend := filepath.Join(root, "frontend")
+	restoreRunFile, err := normalizeRunFileOverride()
+	if err != nil {
+		return fmt.Errorf("ao start: resolve AO_RUN_FILE: %w", err)
+	}
+	defer restoreRunFile()
 
 	npmPath, err := c.deps.LookPath("npm")
 	if err != nil {
@@ -119,6 +138,21 @@ func (c *commandContext) runStartFromSource(ctx context.Context, out, errOut io.
 
 	name, args := devHarnessArgv(npmPath)
 	return c.deps.RunAttached(ctx, frontend, name, args...)
+}
+
+func normalizeRunFileOverride() (func(), error) {
+	raw, set := os.LookupEnv("AO_RUN_FILE")
+	if !set || strings.TrimSpace(raw) == "" {
+		return func() {}, nil
+	}
+	absolute, err := filepath.Abs(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Setenv("AO_RUN_FILE", absolute); err != nil {
+		return nil, err
+	}
+	return func() { _ = os.Setenv("AO_RUN_FILE", raw) }, nil
 }
 
 // devRunFilePath resolves the run file the dev launch will actually consult,
@@ -170,19 +204,20 @@ func (c *commandContext) checkRunningDevDaemon(ctx context.Context, w io.Writer,
 	}
 
 	probe, probeErr := c.readProbe(ctx, port, "healthz")
-	if runFileLive && (probeErr != nil || probe.Service != daemonmeta.ServiceName || probe.PID != pid) {
+	if runFileLive && (!isAODaemonProbe(probe, probeErr) || probe.PID != pid) {
 		// Electron treats a missing, stale, or PID-inconsistent run file as a
 		// hint failure and probes the configured port directly. Mirror that
 		// fallback before rejecting a genuine same-checkout daemon.
-		if fallback, err := c.readProbe(ctx, configuredPort, "healthz"); err == nil && fallback.Service == daemonmeta.ServiceName {
+		if fallback, err := c.readProbe(ctx, configuredPort, "healthz"); isAODaemonProbe(fallback, err) {
 			probe, probeErr, port, runFileLive = fallback, nil, configuredPort, false
 		}
 	}
-	if probeErr != nil || probe.Service != daemonmeta.ServiceName {
-		if !runFileLive {
-			return nil
-		}
-		return fmt.Errorf("ao start: an AO daemon appears to be running (pid %d, port %d), but its checkout identity could not be verified; %s", pid, port, devDaemonStopRemedy(runFile, isolated, runFileLive, pid))
+	if !isAODaemonProbe(probe, probeErr) {
+		// A live PID in running.json is not proof of a live daemon: PIDs can be
+		// recycled and an unresponsive daemon is handled by the launch takeover
+		// path. With no genuine AO response on either candidate port, let Electron
+		// and daemon startup classify or replace the stale run file.
+		return nil
 	}
 	if runFileLive && probe.PID != pid {
 		return fmt.Errorf("ao start: the AO daemon on port %d reports pid %d, not run-file pid %d, so its checkout identity cannot be trusted; %s", port, probe.PID, pid, devDaemonStopRemedy(runFile, isolated, runFileLive, probe.PID))
@@ -199,6 +234,10 @@ func (c *commandContext) checkRunningDevDaemon(ctx context.Context, w io.Writer,
 	}
 	_, _ = fmt.Fprintf(w, "Using the AO daemon already running from this checkout (pid %d, port %d).\n", probe.PID, port)
 	return nil
+}
+
+func isAODaemonProbe(probe probeResult, err error) bool {
+	return err == nil && probe.Service == daemonmeta.ServiceName
 }
 
 func devDaemonStopRemedy(runFile string, isolated, runFileLive bool, pid int) string {

@@ -184,6 +184,21 @@ func TestFindSourceCheckout_RejectsNonAOTree(t *testing.T) {
 	}
 }
 
+func TestFindSourceCheckout_RequiresExactModuleDirective(t *testing.T) {
+	for _, module := range []string{
+		"module github.com/aoagents/agent-orchestrator/backend-fork\n",
+		"module example.com/other\n// " + backendModuleLine + "\n",
+	} {
+		root := makeCheckout(t, false)
+		if err := os.WriteFile(filepath.Join(root, "backend", "go.mod"), []byte(module), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := findSourceCheckout(root); got != "" {
+			t.Fatalf("findSourceCheckout with %q = %q, want empty", module, got)
+		}
+	}
+}
+
 func TestStart_SourceRunsFrontendDevHarness(t *testing.T) {
 	setConfigEnv(t)
 	root := makeCheckout(t, true)
@@ -242,6 +257,32 @@ func TestStart_SourceRespectsConfiguredDaemonOverride(t *testing.T) {
 	}
 	if !ran || !strings.Contains(errOut, "explicitly configured daemon") {
 		t.Fatalf("ran = %v, stderr = %q", ran, errOut)
+	}
+}
+
+func TestStart_SourceNormalizesRelativeRunFileForHarness(t *testing.T) {
+	setConfigEnv(t)
+	root := makeCheckout(t, true)
+	chdir(t, root)
+	t.Setenv("AO_RUN_FILE", filepath.Join("state", "running.json"))
+	want := filepath.Join(root, "state", "running.json")
+
+	deps := Deps{
+		HTTPClient: offlineHTTPClient(),
+		LookPath:   func(string) (string, error) { return "/usr/bin/npm", nil },
+		RunAttached: func(context.Context, string, string, ...string) error {
+			if got := os.Getenv("AO_RUN_FILE"); got != want {
+				t.Fatalf("AO_RUN_FILE during harness = %q, want %q", got, want)
+			}
+			return nil
+		},
+	}
+
+	if _, _, err := executeCLI(t, deps, "start", "--source"); err != nil {
+		t.Fatalf("start --source: %v", err)
+	}
+	if got := os.Getenv("AO_RUN_FILE"); got != filepath.Join("state", "running.json") {
+		t.Fatalf("AO_RUN_FILE after harness = %q, want restored relative value", got)
 	}
 }
 
@@ -400,7 +441,7 @@ func TestStart_SourceIsolatedIgnoresTheCanonicalDaemon(t *testing.T) {
 	}
 }
 
-func TestStart_SourceIsolatedRemedyScopesTheStop(t *testing.T) {
+func TestStart_SourceIsolatedAllowsUnresponsiveLivePID(t *testing.T) {
 	setConfigEnv(t)
 	root := makeCheckout(t, true)
 	chdir(t, root)
@@ -426,22 +467,8 @@ func TestStart_SourceIsolatedRemedyScopesTheStop(t *testing.T) {
 		RunAttached: func(context.Context, string, string, ...string) error { return nil },
 	}
 
-	_, _, err := executeCLI(t, deps, "start", "--source")
-	if err == nil {
-		t.Fatal("start --source succeeded with an unverified isolated daemon")
-	}
-	// Plain `ao stop` resolves through config.Load, which ignores ISOLATE_DEV and
-	// would stop the canonical daemon instead, so the remedy must name the
-	// isolated paths. It quotes them rather than emitting a shell command: a
-	// POSIX `VAR=x cmd` prefix is not valid in PowerShell or cmd.exe.
-	if !strings.Contains(err.Error(), strconv.Quote(isolatedRunFile)) {
-		t.Fatalf("remedy does not name the isolated run file: %q", err)
-	}
-	if !strings.Contains(err.Error(), strconv.Quote(filepath.Join(home, ".ao", "dev", "data"))) {
-		t.Fatalf("remedy does not name the isolated data dir: %q", err)
-	}
-	if strings.Contains(err.Error(), "AO_RUN_FILE="+isolatedRunFile) {
-		t.Fatalf("remedy emits a POSIX-only env prefix: %q", err)
+	if _, _, err := executeCLI(t, deps, "start", "--source"); err != nil {
+		t.Fatalf("start --source blocked stale live-PID recovery: %v", err)
 	}
 }
 
