@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"testing"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -9,54 +10,51 @@ import (
 // #142 (root → main), #143 stacked on #142, #144 stacked on #143. Only open
 // parents annotate their children; a merged parent no longer marks the child
 // as stacked.
-func TestAnnotateStacksMarksChildrenOfOpenParents(t *testing.T) {
+func TestStackParentsMarksChildrenOfOpenParents(t *testing.T) {
+	svc := &Service{store: &fakeStore{}}
 	prs := []domain.PullRequest{
-		{URL: "p142", HTMLURL: "h142", Number: 142, SourceBranch: "s/root", TargetBranch: "main"},
-		{URL: "p143", HTMLURL: "h143", Number: 143, SourceBranch: "s/root/a", TargetBranch: "s/root"},
-		{URL: "p144", HTMLURL: "h144", Number: 144, SourceBranch: "s/root/a/b", TargetBranch: "s/root/a"},
+		{URL: "p142", HTMLURL: "h142", Number: 142, Repo: "acme/app", SourceBranch: "s/root", TargetBranch: "main"},
+		{URL: "p143", HTMLURL: "h143", Number: 143, Repo: "acme/app", SourceBranch: "s/root/a", TargetBranch: "s/root"},
+		{URL: "p144", HTMLURL: "h144", Number: 144, Repo: "acme/app", SourceBranch: "s/root/a/b", TargetBranch: "s/root/a"},
 	}
-	out := []PRSummary{
-		{URL: "p142", State: domain.PRStateOpen, TargetBranch: "main"},
-		{URL: "p143", State: domain.PRStateOpen, TargetBranch: "s/root"},
-		{URL: "p144", State: domain.PRStateOpen, TargetBranch: "s/root/a"},
+	parents := svc.stackParents(context.Background(), prs)
+	if _, ok := parents["p142"]; ok {
+		t.Fatalf("root PR should not be stacked: %+v", parents)
 	}
-	annotateStacks(prs, out)
-	if out[0].StackedOnURL != "" || out[0].StackedOnNumber != 0 {
-		t.Fatalf("root PR should not be stacked: %+v", out[0])
+	if parents["p143"].Number != 142 || parents["p144"].Number != 143 {
+		t.Fatalf("stack parents = %+v", parents)
 	}
-	if out[1].StackedOnURL != "h142" || out[1].StackedOnNumber != 142 {
-		t.Fatalf("child should be stacked on #142: %+v", out[1])
-	}
-	if out[2].StackedOnURL != "h143" || out[2].StackedOnNumber != 143 {
-		t.Fatalf("grandchild should be stacked on #143: %+v", out[2])
+
+	out := []PRSummary{{URL: "p143", State: domain.PRStateOpen}}
+	annotateStacks(parents, out)
+	if out[0].StackedOnURL != "h142" || out[0].StackedOnNumber != 142 {
+		t.Fatalf("child should be annotated with #142: %+v", out[0])
 	}
 
 	prs[0].Merged = true
-	out[1].StackedOnURL, out[1].StackedOnNumber = "", 0
-	annotateStacks(prs, out)
-	if out[1].StackedOnURL != "" {
-		t.Fatalf("merged parent should stop annotating the child: %+v", out[1])
+	parents = svc.stackParents(context.Background(), prs)
+	if _, ok := parents["p143"]; ok {
+		t.Fatalf("merged parent should stop blocking the child: %+v", parents)
 	}
 }
 
-// A parent owned by another session still annotates the child when it appears
-// in the candidate set, and a same-named branch in a different repository does
-// not.
-func TestAnnotateStacksMatchesAcrossSessionsWithinOneRepo(t *testing.T) {
-	candidates := []domain.PullRequest{
-		{URL: "parent", HTMLURL: "hparent", Number: 7, Repo: "acme/app", SourceBranch: "s/root", TargetBranch: "main"},
-		{URL: "decoy", HTMLURL: "hdecoy", Number: 9, Repo: "acme/other", SourceBranch: "s/other", TargetBranch: "main"},
-		{URL: "child", Number: 8, Repo: "acme/app", SourceBranch: "s/root/a", TargetBranch: "s/root"},
+// A parent owned by another session still matches when the repo-wide lookup
+// returns it, and a same-named branch on another provider/host/repo does not.
+func TestStackParentsMatchesAcrossSessionsWithinOneRepo(t *testing.T) {
+	store := &fakeStore{openPRsByRepo: []domain.PullRequest{
+		{URL: "parent", HTMLURL: "hparent", Number: 7, SessionID: "other", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/root", TargetBranch: "main"},
+		{URL: "decoy", HTMLURL: "hdecoy", Number: 9, SessionID: "other", Provider: "github", Host: "ghe.example.com", Repo: "acme/app", SourceBranch: "s/other", TargetBranch: "main"},
+	}}
+	svc := &Service{store: store}
+	prs := []domain.PullRequest{
+		{URL: "child", Number: 8, SessionID: "mine", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/root/a", TargetBranch: "s/root"},
+		{URL: "lost", Number: 10, SessionID: "mine", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/lost", TargetBranch: "s/other"},
 	}
-	out := []PRSummary{
-		{URL: "child", State: domain.PRStateOpen, Repo: "acme/app", TargetBranch: "s/root"},
-		{URL: "lost", State: domain.PRStateOpen, Repo: "acme/app", TargetBranch: "s/other"},
+	parents := svc.stackParents(context.Background(), prs)
+	if parents["child"].URL != "parent" {
+		t.Fatalf("cross-session parent should mark the child: %+v", parents)
 	}
-	annotateStacks(candidates, out)
-	if out[0].StackedOnURL != "hparent" || out[0].StackedOnNumber != 7 {
-		t.Fatalf("cross-session parent should annotate the child: %+v", out[0])
-	}
-	if out[1].StackedOnURL != "" {
-		t.Fatalf("branch match in another repo must not annotate: %+v", out[1])
+	if _, ok := parents["lost"]; ok {
+		t.Fatalf("branch match on another host must not mark: %+v", parents)
 	}
 }

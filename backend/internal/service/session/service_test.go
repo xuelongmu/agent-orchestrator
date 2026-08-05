@@ -344,7 +344,7 @@ func (f *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]
 	return []domain.PullRequest{{URL: pr.URL, SessionID: id, Number: pr.Number, Draft: pr.Draft, Merged: pr.Merged, Closed: pr.Closed, CI: pr.CI, Review: pr.Review, Mergeability: pr.Mergeability, UpdatedAt: pr.UpdatedAt}}, nil
 }
 
-func (f *fakeStore) ListOpenPRsByRepo(context.Context, string) ([]domain.PullRequest, error) {
+func (f *fakeStore) ListOpenPRsByRepo(context.Context, string, string, string) ([]domain.PullRequest, error) {
 	return f.openPRsByRepo, nil
 }
 

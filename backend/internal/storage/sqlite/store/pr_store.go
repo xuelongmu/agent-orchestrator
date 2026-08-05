@@ -329,9 +329,9 @@ func (s *Store) ListPRsBySession(ctx context.Context, sessionID domain.SessionID
 }
 
 // ListOpenPRsByRepo returns every open (non-merged, non-closed) PR tracked for
-// a repository across all sessions, newest first.
-func (s *Store) ListOpenPRsByRepo(ctx context.Context, repo string) ([]domain.PullRequest, error) {
-	rows, err := s.qr.ListOpenPRsByRepo(ctx, repo)
+// one provider/host/repo across all sessions, newest first.
+func (s *Store) ListOpenPRsByRepo(ctx context.Context, provider, host, repo string) ([]domain.PullRequest, error) {
+	rows, err := s.qr.ListOpenPRsByRepo(ctx, gen.ListOpenPRsByRepoParams{Provider: provider, Host: host, Repo: repo})
 	if err != nil {
 		return nil, fmt.Errorf("list open prs for %s: %w", repo, err)
 	}

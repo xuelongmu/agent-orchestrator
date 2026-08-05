@@ -124,63 +124,67 @@ func (s *Service) ListPRSummaries(ctx context.Context, id domain.SessionID) ([]P
 		}
 		out = append(out, summarizePR(pr, checks, reviews, threads, comments))
 	}
-	annotateStacks(s.stackParentCandidates(ctx, prs), out)
+	annotateStacks(s.stackParents(ctx, prs), out)
 	sortPRSummaries(out)
 	return out, nil
 }
 
-// stackParentCandidates widens the parent search beyond this session: an
-// orchestrator may keep dependent work moving in a separate worker session, so
-// a child's open parent can be owned elsewhere in the same repository. Lookup
-// failures degrade to session-local candidates rather than failing the read.
-func (s *Service) stackParentCandidates(ctx context.Context, prs []domain.PullRequest) []domain.PullRequest {
-	candidates := prs
-	seenRepo := map[string]bool{}
-	seenURL := make(map[string]bool, len(prs))
-	for _, pr := range prs {
-		seenURL[pr.URL] = true
+// stackParents maps each of the session's open PRs (by URL) to the open PR
+// whose source branch it targets, mirroring the stack rule in buildStacks: a
+// parent counts only while open. Parents are matched within one
+// provider/host/repo and may be owned by another session — an orchestrator can
+// keep dependent work moving in a separate worker. Lookup failures degrade to
+// session-local candidates rather than failing the read.
+func (s *Service) stackParents(ctx context.Context, prs []domain.PullRequest) map[string]domain.PullRequest {
+	branchKey := func(pr domain.PullRequest, branch string) string {
+		return pr.Provider + "\x00" + pr.Host + "\x00" + pr.Repo + "\x00" + branch
+	}
+	openBySource := map[string]domain.PullRequest{}
+	addCandidate := func(pr domain.PullRequest) {
+		if !pr.Merged && !pr.Closed && pr.SourceBranch != "" {
+			key := branchKey(pr, pr.SourceBranch)
+			if _, ok := openBySource[key]; !ok {
+				openBySource[key] = pr
+			}
+		}
 	}
 	for _, pr := range prs {
-		repo := strings.TrimSpace(pr.Repo)
-		if pr.Merged || pr.Closed || repo == "" || seenRepo[repo] {
+		addCandidate(pr)
+	}
+	seenRepo := map[string]bool{}
+	for _, pr := range prs {
+		repoKey := branchKey(pr, "")
+		if pr.Merged || pr.Closed || strings.TrimSpace(pr.Repo) == "" || seenRepo[repoKey] {
 			continue
 		}
-		seenRepo[repo] = true
-		open, err := s.store.ListOpenPRsByRepo(ctx, repo)
+		seenRepo[repoKey] = true
+		open, err := s.store.ListOpenPRsByRepo(ctx, pr.Provider, pr.Host, pr.Repo)
 		if err != nil {
 			continue
 		}
 		for _, candidate := range open {
-			if !seenURL[candidate.URL] {
-				seenURL[candidate.URL] = true
-				candidates = append(candidates, candidate)
-			}
+			addCandidate(candidate)
 		}
 	}
-	return candidates
+	parents := map[string]domain.PullRequest{}
+	for _, pr := range prs {
+		if pr.Merged || pr.Closed || pr.TargetBranch == "" {
+			continue
+		}
+		if parent, ok := openBySource[branchKey(pr, pr.TargetBranch)]; ok && parent.URL != pr.URL {
+			parents[pr.URL] = parent
+		}
+	}
+	return parents
 }
 
-// annotateStacks marks each open PR that targets the source branch of another
-// open PR in the same repository. Mirrors the stack rule in buildStacks: a
-// parent counts only while open.
-func annotateStacks(candidates []domain.PullRequest, out []PRSummary) {
-	openBySource := make(map[string]domain.PullRequest, len(candidates))
-	branchKey := func(repo, branch string) string { return repo + "\x00" + branch }
-	for _, pr := range candidates {
-		if !pr.Merged && !pr.Closed && pr.SourceBranch != "" {
-			openBySource[branchKey(pr.Repo, pr.SourceBranch)] = pr
-		}
-	}
+// annotateStacks copies the derived stack position onto the summaries.
+func annotateStacks(parents map[string]domain.PullRequest, out []PRSummary) {
 	for i, s := range out {
-		if s.State == domain.PRStateMerged || s.State == domain.PRStateClosed || s.TargetBranch == "" {
-			continue
+		if parent, ok := parents[s.URL]; ok {
+			out[i].StackedOnURL = firstNonEmpty(parent.HTMLURL, parent.URL)
+			out[i].StackedOnNumber = parent.Number
 		}
-		parent, ok := openBySource[branchKey(s.Repo, s.TargetBranch)]
-		if !ok || parent.URL == s.URL {
-			continue
-		}
-		out[i].StackedOnURL = firstNonEmpty(parent.HTMLURL, parent.URL)
-		out[i].StackedOnNumber = parent.Number
 	}
 }
 

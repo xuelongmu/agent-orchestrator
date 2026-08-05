@@ -24,7 +24,10 @@ const noSignalGrace = 90 * time.Second
 // status is the worst-wins aggregate across its open PRs; stacked children whose
 // parent is still open are exempt from the aggregation since they cannot merge
 // until the parent does. Merged/closed PRs only matter once no open PR remains.
-func deriveStatus(rec domain.SessionRecord, prs []domain.PRFacts, now time.Time, signalCapable bool) domain.SessionStatus {
+// extBlocked names PR URLs stacked on an open parent owned outside this
+// session; buildStacks below only sees the session's own PRs, so those
+// children need their blocked position supplied by the caller.
+func deriveStatus(rec domain.SessionRecord, prs []domain.PRFacts, now time.Time, signalCapable bool, extBlocked map[string]bool) domain.SessionStatus {
 	if rec.IsTerminated {
 		if anyMerged(prs) {
 			return domain.StatusMerged
@@ -41,7 +44,7 @@ func deriveStatus(rec domain.SessionRecord, prs []domain.PRFacts, now time.Time,
 
 	open := openPRs(prs)
 	if len(open) > 0 {
-		return aggregatePRStatus(open)
+		return aggregatePRStatus(open, extBlocked)
 	}
 	if anyMerged(prs) {
 		return domain.StatusMerged
@@ -93,15 +96,25 @@ func anyMerged(prs []domain.PRFacts) bool {
 // so a broken child is not hidden behind the stack. If no PR contributes any
 // signal (a degenerate stack with no visible root), it falls back to aggregating
 // the raw status across all open PRs so the session never goes dark.
-func aggregatePRStatus(open []domain.PRFacts) domain.SessionStatus {
+func aggregatePRStatus(open []domain.PRFacts, extBlocked map[string]bool) domain.SessionStatus {
 	stacks := buildStacks(open)
 	candidates := make([]domain.SessionStatus, 0, len(open))
+	suppressedExt := 0
 	for _, p := range open {
 		s := prPipelineStatus(p)
-		if stacks[p.URL].Blocked && !isActionableChildSignal(s) {
+		if (stacks[p.URL].Blocked || extBlocked[p.URL]) && !isActionableChildSignal(s) {
+			if extBlocked[p.URL] {
+				suppressedExt++
+			}
 			continue
 		}
 		candidates = append(candidates, s)
+	}
+	// A session whose only open PRs are children of parents owned elsewhere is
+	// waiting on those parents: report plain pr_open rather than falling back
+	// to the child's own readiness, which would invite a premature merge.
+	if len(candidates) == 0 && suppressedExt > 0 {
+		candidates = append(candidates, domain.StatusPROpen)
 	}
 	if len(candidates) == 0 {
 		for _, p := range open {

@@ -186,12 +186,18 @@ func (q *Queries) GetPRLastNudgeSignature(ctx context.Context, url string) (stri
 
 const listOpenPRsByRepo = `-- name: ListOpenPRsByRepo :many
 SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature FROM pr
-WHERE repo = ? AND is_merged = 0 AND is_closed = 0
+WHERE provider = ? AND host = ? AND repo = ? AND is_merged = 0 AND is_closed = 0
 ORDER BY updated_at DESC
 `
 
-func (q *Queries) ListOpenPRsByRepo(ctx context.Context, repo string) ([]PR, error) {
-	rows, err := q.db.QueryContext(ctx, listOpenPRsByRepo, repo)
+type ListOpenPRsByRepoParams struct {
+	Provider string
+	Host     string
+	Repo     string
+}
+
+func (q *Queries) ListOpenPRsByRepo(ctx context.Context, arg ListOpenPRsByRepoParams) ([]PR, error) {
+	rows, err := q.db.QueryContext(ctx, listOpenPRsByRepo, arg.Provider, arg.Host, arg.Repo)
 	if err != nil {
 		return nil, err
 	}
