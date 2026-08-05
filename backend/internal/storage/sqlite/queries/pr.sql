@@ -75,9 +75,11 @@ WHERE session_id = ?
 ORDER BY updated_at DESC;
 
 -- name: ListOpenPRsByRepo :many
-SELECT * FROM pr
-WHERE provider = ? AND host = ? AND repo = ? AND is_merged = 0 AND is_closed = 0
-ORDER BY updated_at DESC;
+SELECT pr.* FROM pr
+JOIN sessions ON sessions.id = pr.session_id
+WHERE sessions.project_id = ? AND pr.provider = ? AND pr.host = ? AND pr.repo = ?
+    AND pr.is_merged = 0 AND pr.is_closed = 0
+ORDER BY pr.updated_at DESC;
 
 -- name: GetPRLastNudgeSignature :one
 SELECT last_nudge_signature FROM pr WHERE url = ?;

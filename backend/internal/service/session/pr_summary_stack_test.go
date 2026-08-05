@@ -17,7 +17,7 @@ func TestStackParentsMarksChildrenOfOpenParents(t *testing.T) {
 		{URL: "p143", HTMLURL: "h143", Number: 143, Repo: "acme/app", SourceBranch: "s/root/a", TargetBranch: "s/root"},
 		{URL: "p144", HTMLURL: "h144", Number: 144, Repo: "acme/app", SourceBranch: "s/root/a/b", TargetBranch: "s/root/a"},
 	}
-	parents := svc.stackParents(context.Background(), prs)
+	parents := svc.stackParents(context.Background(), "proj-1", prs)
 	if _, ok := parents["p142"]; ok {
 		t.Fatalf("root PR should not be stacked: %+v", parents)
 	}
@@ -32,7 +32,7 @@ func TestStackParentsMarksChildrenOfOpenParents(t *testing.T) {
 	}
 
 	prs[0].Merged = true
-	parents = svc.stackParents(context.Background(), prs)
+	parents = svc.stackParents(context.Background(), "proj-1", prs)
 	if _, ok := parents["p143"]; ok {
 		t.Fatalf("merged parent should stop blocking the child: %+v", parents)
 	}
@@ -52,7 +52,7 @@ func TestStackParentsMatchesAcrossSessionsWithinOneRepo(t *testing.T) {
 		{URL: "lost", Number: 10, SessionID: "mine", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/lost", TargetBranch: "s/other"},
 		{URL: "forkchild", Number: 12, SessionID: "mine", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/fc", TargetBranch: "s/forked"},
 	}
-	parents := svc.stackParents(context.Background(), prs)
+	parents := svc.stackParents(context.Background(), "proj-1", prs)
 	if parents["child"].URL != "parent" {
 		t.Fatalf("cross-session parent should mark the child: %+v", parents)
 	}

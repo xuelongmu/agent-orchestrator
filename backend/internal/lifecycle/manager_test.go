@@ -4843,6 +4843,46 @@ func TestSCMObservation_Notifications(t *testing.T) {
 	}
 }
 
+// stackParentFakeStore layers the optional cross-session stack read over the
+// plain fake store, mirroring the production SQLite store.
+type stackParentFakeStore struct {
+	*fakeStore
+	openByRepo []domain.PullRequest
+}
+
+func (f *stackParentFakeStore) ListOpenPRsByRepo(context.Context, domain.ProjectID, string, string, string) ([]domain.PullRequest, error) {
+	return f.openByRepo, nil
+}
+
+func TestPRBlockedByOpenParentSeesCrossSessionParents(t *testing.T) {
+	base := newFakeStore()
+	base.sessions["mer-1"] = working("mer-1")
+	base.prs["mer-1"] = []domain.PullRequest{
+		{URL: "child", SessionID: "mer-1", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/root/a", TargetBranch: "s/root"},
+	}
+	st := &stackParentFakeStore{fakeStore: base, openByRepo: []domain.PullRequest{
+		{URL: "parent", SessionID: "other", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/root", TargetBranch: "main"},
+	}}
+	m := New(st, nil)
+
+	blocked, err := m.prBlockedByOpenParent(ctx, "mer-1", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !blocked {
+		t.Fatal("cross-session open parent should exempt the child from conflict nudges")
+	}
+
+	st.openByRepo[0].Merged = true
+	blocked, err = m.prBlockedByOpenParent(ctx, "mer-1", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked {
+		t.Fatal("merged parent should stop exempting the child")
+	}
+}
+
 func TestSCMObservation_ReadySuppressedForStackedChild(t *testing.T) {
 	// A green child stacked on a still-open parent branch must not notify the
 	// human as ready to merge; the parent has to merge (or close) first.

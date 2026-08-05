@@ -1146,18 +1146,34 @@ func (m *Manager) prBlockedByOpenParent(ctx context.Context, id domain.SessionID
 	if err != nil {
 		return false, err
 	}
-	openSources := make(map[string]bool, len(prs))
-	for _, pr := range prs {
-		if !pr.Merged && !pr.Closed && pr.SourceBranch != "" {
-			openSources[pr.SourceBranch] = true
+	var child *domain.PullRequest
+	for i := range prs {
+		if prs[i].URL == prURL {
+			child = &prs[i]
+			break
 		}
 	}
-	for _, pr := range prs {
-		if pr.URL == prURL {
-			return pr.TargetBranch != "" && openSources[pr.TargetBranch], nil
-		}
+	if child == nil || strings.TrimSpace(child.TargetBranch) == "" {
+		return false, nil
 	}
-	return false, nil
+	// Session-local parents answer without a session-record read; a parent
+	// owned by another worker in the same project needs the cross-session set.
+	if openParentOwnsBranch(prs, child.URL, child.TargetBranch) {
+		return true, nil
+	}
+	st, ok := m.store.(stackParentStore)
+	if !ok || strings.TrimSpace(child.Repo) == "" {
+		return false, nil
+	}
+	rec, found, err := m.store.GetSession(ctx, id)
+	if err != nil || !found {
+		return false, err
+	}
+	open, err := st.ListOpenPRsByRepo(ctx, rec.ProjectID, child.Provider, child.Host, child.Repo)
+	if err != nil {
+		return false, err
+	}
+	return openParentOwnsBranch(open, child.URL, child.TargetBranch), nil
 }
 
 // ApplySCMObservation is the provider-neutral lifecycle entrypoint used by the
@@ -1560,7 +1576,7 @@ func (m *Manager) notificationIntentForCurrentSCM(ctx context.Context, id domain
 	}
 	// A child stacked on a still-open parent cannot merge until that parent
 	// does, so telling the human it is ready invites a premature merge.
-	stacked, err := m.prStackedOnOpenParent(ctx, id, o)
+	stacked, err := m.prStackedOnOpenParent(ctx, rec, o)
 	if err != nil {
 		return nil, err
 	}
@@ -1572,37 +1588,43 @@ func (m *Manager) notificationIntentForCurrentSCM(ctx context.Context, id domain
 
 // prStackedOnOpenParent reports whether the observed PR targets the source
 // branch of another open PR in the same repository. Parents may be owned by
-// any session when the store supports the cross-session read; fork-headed PRs
-// never count as parents.
-func (m *Manager) prStackedOnOpenParent(ctx context.Context, id domain.SessionID, o ports.SCMObservation) (bool, error) {
-	target := strings.TrimSpace(o.PR.TargetBranch)
-	if target == "" {
-		return false, nil
-	}
+// any session in the same project when the store supports the cross-session
+// read; fork-headed PRs never count as parents.
+func (m *Manager) prStackedOnOpenParent(ctx context.Context, rec domain.SessionRecord, o ports.SCMObservation) (bool, error) {
 	childURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
-	var candidates []domain.PullRequest
-	if st, ok := m.store.(stackParentStore); ok && strings.TrimSpace(o.Repo) != "" {
-		open, err := st.ListOpenPRsByRepo(ctx, o.Provider, o.Host, o.Repo)
-		if err != nil {
-			return false, err
-		}
-		candidates = open
-	} else {
-		prs, err := m.store.ListPRsBySession(ctx, id)
-		if err != nil {
-			return false, err
-		}
-		candidates = prs
+	candidates, err := m.stackParentCandidates(ctx, rec.ProjectID, rec.ID, o.Provider, o.Host, o.Repo)
+	if err != nil {
+		return false, err
+	}
+	return openParentOwnsBranch(candidates, childURL, o.PR.TargetBranch), nil
+}
+
+// stackParentCandidates returns the open-parent candidate set: the project's
+// open PRs for the repository when the store supports the cross-session read,
+// otherwise the session's own PRs.
+func (m *Manager) stackParentCandidates(ctx context.Context, projectID domain.ProjectID, id domain.SessionID, provider, host, repo string) ([]domain.PullRequest, error) {
+	if st, ok := m.store.(stackParentStore); ok && strings.TrimSpace(repo) != "" {
+		return st.ListOpenPRsByRepo(ctx, projectID, provider, host, repo)
+	}
+	return m.store.ListPRsBySession(ctx, id)
+}
+
+// openParentOwnsBranch reports whether an open, non-fork-headed candidate PR
+// other than the child owns target as its source branch.
+func openParentOwnsBranch(candidates []domain.PullRequest, childURL, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
 	}
 	for _, pr := range candidates {
 		if pr.Merged || pr.Closed || pr.URL == childURL || pr.SourceBranch == "" || !pr.HeadInBaseRepo() {
 			continue
 		}
 		if pr.SourceBranch == target {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 func (m *Manager) notificationIntentForSCM(rec domain.SessionRecord, o ports.SCMObservation) *ports.NotificationIntent {

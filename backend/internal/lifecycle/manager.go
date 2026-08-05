@@ -47,11 +47,12 @@ type stackSessionStore interface {
 }
 
 // stackParentStore is the production store's cross-session PR read used to
-// veto ready-to-merge notifications for PRs stacked on an open parent that may
-// be owned by another session. Test/embedding stores may omit it; the veto
-// then falls back to same-session parents.
+// treat PRs stacked on an open parent owned by another session in the same
+// project as blocked (ready-notification veto, conflict-nudge exemption).
+// Test/embedding stores may omit it; checks then fall back to same-session
+// parents.
 type stackParentStore interface {
-	ListOpenPRsByRepo(ctx context.Context, provider, host, repo string) ([]domain.PullRequest, error)
+	ListOpenPRsByRepo(ctx context.Context, projectID domain.ProjectID, provider, host, repo string) ([]domain.PullRequest, error)
 }
 
 type designContractDeliveryStore interface {

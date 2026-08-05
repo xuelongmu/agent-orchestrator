@@ -95,7 +95,8 @@ type PRConflictFile struct {
 // ListPRSummaries returns all PRs owned by a session with concise SCM details
 // assembled from persisted PR/check/review facts.
 func (s *Service) ListPRSummaries(ctx context.Context, id domain.SessionID) ([]PRSummary, error) {
-	if _, ok, err := s.store.GetSession(ctx, id); err != nil {
+	rec, ok, err := s.store.GetSession(ctx, id)
+	if err != nil {
 		return nil, fmt.Errorf("get %s: %w", id, err)
 	} else if !ok {
 		return nil, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
@@ -124,7 +125,7 @@ func (s *Service) ListPRSummaries(ctx context.Context, id domain.SessionID) ([]P
 		}
 		out = append(out, summarizePR(pr, checks, reviews, threads, comments))
 	}
-	annotateStacks(s.stackParents(ctx, prs), out)
+	annotateStacks(s.stackParents(ctx, rec.ProjectID, prs), out)
 	sortPRSummaries(out)
 	return out, nil
 }
@@ -132,10 +133,10 @@ func (s *Service) ListPRSummaries(ctx context.Context, id domain.SessionID) ([]P
 // stackParents maps each of the session's open PRs (by URL) to the open PR
 // whose source branch it targets, mirroring the stack rule in buildStacks: a
 // parent counts only while open. Parents are matched within one
-// provider/host/repo and may be owned by another session — an orchestrator can
-// keep dependent work moving in a separate worker. Lookup failures degrade to
-// session-local candidates rather than failing the read.
-func (s *Service) stackParents(ctx context.Context, prs []domain.PullRequest) map[string]domain.PullRequest {
+// provider/host/repo and may be owned by another session in the same project —
+// an orchestrator can keep dependent work moving in a separate worker. Lookup
+// failures degrade to session-local candidates rather than failing the read.
+func (s *Service) stackParents(ctx context.Context, projectID domain.ProjectID, prs []domain.PullRequest) map[string]domain.PullRequest {
 	branchKey := func(pr domain.PullRequest, branch string) string {
 		return pr.Provider + "\x00" + pr.Host + "\x00" + pr.Repo + "\x00" + branch
 	}
@@ -158,7 +159,7 @@ func (s *Service) stackParents(ctx context.Context, prs []domain.PullRequest) ma
 			continue
 		}
 		seenRepo[repoKey] = true
-		open, err := s.store.ListOpenPRsByRepo(ctx, pr.Provider, pr.Host, pr.Repo)
+		open, err := s.store.ListOpenPRsByRepo(ctx, projectID, pr.Provider, pr.Host, pr.Repo)
 		if err != nil {
 			continue
 		}

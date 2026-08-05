@@ -29,7 +29,7 @@ type Store interface {
 	GetDisplayPRFactsForSession(ctx context.Context, id domain.SessionID) (domain.PRFacts, bool, error)
 	ListPRFactsForSession(ctx context.Context, id domain.SessionID) ([]domain.PRFacts, error)
 	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
-	ListOpenPRsByRepo(ctx context.Context, provider, host, repo string) ([]domain.PullRequest, error)
+	ListOpenPRsByRepo(ctx context.Context, projectID domain.ProjectID, provider, host, repo string) ([]domain.PullRequest, error)
 	ListChecks(ctx context.Context, prURL string) ([]domain.PullRequestCheck, error)
 	ListPRReviews(ctx context.Context, prURL string) ([]domain.PullRequestReview, error)
 	ListPRReviewThreads(ctx context.Context, prURL string) ([]domain.PullRequestReviewThread, error)
@@ -717,24 +717,24 @@ func (s *Service) toSession(ctx context.Context, rec domain.SessionRecord, inclu
 			handoffView = &handoff
 		}
 	}
-	return domain.Session{SessionRecord: rec, Status: deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness), s.externallyBlockedPRs(ctx, rec.ID, prs)), TerminalHandleID: rec.Metadata.RuntimeHandleID, DependencyPending: rec.DependencyPending(), Handoff: handoffView, DependsOn: dependsOn, PRs: prs}, nil
+	return domain.Session{SessionRecord: rec, Status: deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness), s.externallyBlockedPRs(ctx, rec, prs)), TerminalHandleID: rec.Metadata.RuntimeHandleID, DependencyPending: rec.DependencyPending(), Handoff: handoffView, DependsOn: dependsOn, PRs: prs}, nil
 }
 
 // externallyBlockedPRs names the session's open PRs whose stack parent is
 // owned by another session, so status derivation can suppress their readiness
 // signals just like session-local stacked children. Lookup failures degrade to
 // no external suppression rather than failing the read.
-func (s *Service) externallyBlockedPRs(ctx context.Context, id domain.SessionID, prs []domain.PRFacts) map[string]bool {
+func (s *Service) externallyBlockedPRs(ctx context.Context, rec domain.SessionRecord, prs []domain.PRFacts) map[string]bool {
 	if len(openPRs(prs)) == 0 {
 		return nil
 	}
-	raw, err := s.store.ListPRsBySession(ctx, id)
+	raw, err := s.store.ListPRsBySession(ctx, rec.ID)
 	if err != nil {
 		return nil
 	}
 	blocked := map[string]bool{}
-	for childURL, parent := range s.stackParents(ctx, raw) {
-		if parent.SessionID != id {
+	for childURL, parent := range s.stackParents(ctx, rec.ProjectID, raw) {
+		if parent.SessionID != rec.ID {
 			blocked[childURL] = true
 		}
 	}

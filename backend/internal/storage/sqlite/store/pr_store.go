@@ -329,9 +329,11 @@ func (s *Store) ListPRsBySession(ctx context.Context, sessionID domain.SessionID
 }
 
 // ListOpenPRsByRepo returns every open (non-merged, non-closed) PR tracked for
-// one provider/host/repo across all sessions, newest first.
-func (s *Store) ListOpenPRsByRepo(ctx context.Context, provider, host, repo string) ([]domain.PullRequest, error) {
-	rows, err := s.qr.ListOpenPRsByRepo(ctx, gen.ListOpenPRsByRepoParams{Provider: provider, Host: host, Repo: repo})
+// one provider/host/repo across the project's sessions, newest first. The
+// project scope keeps a same-named repo registered under another AO project
+// from contributing stack parents.
+func (s *Store) ListOpenPRsByRepo(ctx context.Context, projectID domain.ProjectID, provider, host, repo string) ([]domain.PullRequest, error) {
+	rows, err := s.qr.ListOpenPRsByRepo(ctx, gen.ListOpenPRsByRepoParams{ProjectID: projectID, Provider: provider, Host: host, Repo: repo})
 	if err != nil {
 		return nil, fmt.Errorf("list open prs for %s: %w", repo, err)
 	}
