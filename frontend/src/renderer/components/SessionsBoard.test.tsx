@@ -654,6 +654,91 @@ describe("SessionsBoard", () => {
 			params: { projectId: "p1", sessionId: "s-merged" },
 		});
 	});
+
+	it("offers a restart action for a healthy orchestrator", () => {
+		workspaceQueryMock.mockReturnValue({
+			data: [workspaceWithSessions([boardSession({ id: "p1-orchestrator", kind: "orchestrator" })])],
+			isError: false,
+			isSuccess: true,
+		});
+
+		renderBoard("p1");
+
+		expect(screen.getByRole("button", { name: "Restart orchestrator" })).toBeVisible();
+	});
+
+	it("does not offer a restart action when no orchestrator is running", () => {
+		workspaceQueryMock.mockReturnValue({
+			data: [workspaceWithSessions([boardSession({ id: "p1-4" })])],
+			isError: false,
+			isSuccess: true,
+		});
+
+		renderBoard("p1");
+
+		expect(screen.queryByRole("button", { name: "Restart orchestrator" })).not.toBeInTheDocument();
+	});
+
+	it("restarts only after the confirmation is accepted", async () => {
+		postMock.mockResolvedValue({ data: { orchestrator: { id: "p1-orchestrator-2" } }, response: { status: 201 } });
+		workspaceQueryMock.mockReturnValue({
+			data: [workspaceWithSessions([boardSession({ id: "p1-orchestrator", kind: "orchestrator" })])],
+			isError: false,
+			isSuccess: true,
+		});
+
+		renderBoard("p1");
+		await userEvent.click(screen.getByRole("button", { name: "Restart orchestrator" }));
+
+		// Opening the dialog must not have restarted anything yet.
+		expect(postMock).not.toHaveBeenCalled();
+		expect(screen.getByText(/context is discarded/i)).toBeVisible();
+
+		await userEvent.click(screen.getByRole("button", { name: /^Restart$/ }));
+
+		await waitFor(() =>
+			expect(postMock).toHaveBeenCalledWith("/api/v1/orchestrators", {
+				body: { projectId: "p1", clean: true },
+			}),
+		);
+	});
+
+	it("abandons the restart when the confirmation is cancelled", async () => {
+		workspaceQueryMock.mockReturnValue({
+			data: [workspaceWithSessions([boardSession({ id: "p1-orchestrator", kind: "orchestrator" })])],
+			isError: false,
+			isSuccess: true,
+		});
+
+		renderBoard("p1");
+		await userEvent.click(screen.getByRole("button", { name: "Restart orchestrator" }));
+		await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+		expect(postMock).not.toHaveBeenCalled();
+		await waitFor(() => expect(screen.queryByText(/context is discarded/i)).not.toBeInTheDocument());
+	});
+
+	it("leaves the restart to the health banner when the orchestrator is already degraded", () => {
+		workspaceQueryMock.mockReturnValue({
+			data: [
+				{
+					...workspaceWithSessions([
+						boardSession({ id: "p1-orchestrator", kind: "orchestrator", provider: "claude-code" }),
+					]),
+					orchestratorAgent: "codex",
+				},
+			],
+			isError: false,
+			isSuccess: true,
+		});
+
+		renderBoard("p1");
+
+		// The banner already renders its own Restart; a second one in the topbar
+		// would be two controls for one action.
+		expect(screen.queryByRole("button", { name: "Restart orchestrator" })).not.toBeInTheDocument();
+		expect(screen.getByRole("button", { name: /restart/i })).toBeVisible();
+	});
 });
 
 function workspaceWithSessions(sessions: WorkspaceSession[]): WorkspaceSummary {
