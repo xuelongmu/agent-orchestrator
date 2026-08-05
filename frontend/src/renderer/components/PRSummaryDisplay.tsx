@@ -23,7 +23,8 @@ export function PRSummaryMeta({
 }) {
 	const branchRange = prBranchRange(pr);
 	const hasDiff = hasDiffMetadata(pr);
-	const primary = [leading, branchRange, pr.author].filter(Boolean);
+	const stackedOn = pr.stackedOnNumber ? `stacked on #${pr.stackedOnNumber}` : undefined;
+	const primary = [leading, branchRange, stackedOn, pr.author].filter(Boolean);
 	if (primary.length === 0 && !hasDiff) {
 		return null;
 	}

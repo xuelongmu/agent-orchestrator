@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { SessionPRSummary } from "../hooks/useSessionScmSummary";
-import { PRSummaryParts } from "./PRSummaryDisplay";
+import { PRSummaryMeta, PRSummaryParts } from "./PRSummaryDisplay";
 
 const summary = (overrides: Partial<SessionPRSummary> = {}): SessionPRSummary => ({
 	url: "https://github.com/acme/repo/pull/7",
@@ -26,6 +26,24 @@ const summary = (overrides: Partial<SessionPRSummary> = {}): SessionPRSummary =>
 	ciObservedAt: "2026-06-15T00:00:00Z",
 	reviewObservedAt: "2026-06-15T00:00:00Z",
 	...overrides,
+});
+
+describe("PRSummaryMeta", () => {
+	it("shows the stack position when the PR is stacked on an open parent", () => {
+		render(
+			<PRSummaryMeta
+				pr={summary({ stackedOnNumber: 6, stackedOnUrl: "https://github.com/acme/repo/pull/6" })}
+			/>,
+		);
+
+		expect(screen.getByText(/stacked on #6/)).toBeInTheDocument();
+	});
+
+	it("omits the stack note for an unstacked PR", () => {
+		render(<PRSummaryMeta pr={summary()} />);
+
+		expect(screen.queryByText(/stacked on/)).not.toBeInTheDocument();
+	});
 });
 
 describe("PRSummaryParts", () => {

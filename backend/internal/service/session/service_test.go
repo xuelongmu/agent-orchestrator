@@ -44,6 +44,7 @@ type fakeStore struct {
 	sessions                map[domain.SessionID]domain.SessionRecord
 	pr                      map[domain.SessionID]domain.PRFacts
 	ownedPRs                map[domain.SessionID][]domain.PullRequest
+	openPRsByRepo           []domain.PullRequest
 	projects                map[string]domain.ProjectRecord
 	checks                  map[string][]domain.PullRequestCheck
 	reviews                 map[string][]domain.PullRequestReview
@@ -341,6 +342,10 @@ func (f *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]
 		return nil, nil
 	}
 	return []domain.PullRequest{{URL: pr.URL, SessionID: id, Number: pr.Number, Draft: pr.Draft, Merged: pr.Merged, Closed: pr.Closed, CI: pr.CI, Review: pr.Review, Mergeability: pr.Mergeability, UpdatedAt: pr.UpdatedAt}}, nil
+}
+
+func (f *fakeStore) ListOpenPRsByRepo(context.Context, string) ([]domain.PullRequest, error) {
+	return f.openPRsByRepo, nil
 }
 
 func (f *fakeStore) AddPRDesignContractInvariant(_ context.Context, sessionID domain.SessionID, prURL, invariant string, _ time.Time) (string, error) {

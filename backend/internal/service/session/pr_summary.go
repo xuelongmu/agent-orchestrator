@@ -124,26 +124,58 @@ func (s *Service) ListPRSummaries(ctx context.Context, id domain.SessionID) ([]P
 		}
 		out = append(out, summarizePR(pr, checks, reviews, threads, comments))
 	}
-	annotateStacks(prs, out)
+	annotateStacks(s.stackParentCandidates(ctx, prs), out)
 	sortPRSummaries(out)
 	return out, nil
 }
 
-// annotateStacks marks each open PR that targets the source branch of another
-// open PR in the same session. Mirrors the stack rule in buildStacks: a parent
-// counts only while open.
-func annotateStacks(prs []domain.PullRequest, out []PRSummary) {
-	openBySource := make(map[string]domain.PullRequest, len(prs))
+// stackParentCandidates widens the parent search beyond this session: an
+// orchestrator may keep dependent work moving in a separate worker session, so
+// a child's open parent can be owned elsewhere in the same repository. Lookup
+// failures degrade to session-local candidates rather than failing the read.
+func (s *Service) stackParentCandidates(ctx context.Context, prs []domain.PullRequest) []domain.PullRequest {
+	candidates := prs
+	seenRepo := map[string]bool{}
+	seenURL := make(map[string]bool, len(prs))
 	for _, pr := range prs {
+		seenURL[pr.URL] = true
+	}
+	for _, pr := range prs {
+		repo := strings.TrimSpace(pr.Repo)
+		if pr.Merged || pr.Closed || repo == "" || seenRepo[repo] {
+			continue
+		}
+		seenRepo[repo] = true
+		open, err := s.store.ListOpenPRsByRepo(ctx, repo)
+		if err != nil {
+			continue
+		}
+		for _, candidate := range open {
+			if !seenURL[candidate.URL] {
+				seenURL[candidate.URL] = true
+				candidates = append(candidates, candidate)
+			}
+		}
+	}
+	return candidates
+}
+
+// annotateStacks marks each open PR that targets the source branch of another
+// open PR in the same repository. Mirrors the stack rule in buildStacks: a
+// parent counts only while open.
+func annotateStacks(candidates []domain.PullRequest, out []PRSummary) {
+	openBySource := make(map[string]domain.PullRequest, len(candidates))
+	branchKey := func(repo, branch string) string { return repo + "\x00" + branch }
+	for _, pr := range candidates {
 		if !pr.Merged && !pr.Closed && pr.SourceBranch != "" {
-			openBySource[pr.SourceBranch] = pr
+			openBySource[branchKey(pr.Repo, pr.SourceBranch)] = pr
 		}
 	}
 	for i, s := range out {
 		if s.State == domain.PRStateMerged || s.State == domain.PRStateClosed || s.TargetBranch == "" {
 			continue
 		}
-		parent, ok := openBySource[s.TargetBranch]
+		parent, ok := openBySource[branchKey(s.Repo, s.TargetBranch)]
 		if !ok || parent.URL == s.URL {
 			continue
 		}

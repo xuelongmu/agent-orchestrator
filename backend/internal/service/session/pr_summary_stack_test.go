@@ -38,3 +38,25 @@ func TestAnnotateStacksMarksChildrenOfOpenParents(t *testing.T) {
 		t.Fatalf("merged parent should stop annotating the child: %+v", out[1])
 	}
 }
+
+// A parent owned by another session still annotates the child when it appears
+// in the candidate set, and a same-named branch in a different repository does
+// not.
+func TestAnnotateStacksMatchesAcrossSessionsWithinOneRepo(t *testing.T) {
+	candidates := []domain.PullRequest{
+		{URL: "parent", HTMLURL: "hparent", Number: 7, Repo: "acme/app", SourceBranch: "s/root", TargetBranch: "main"},
+		{URL: "decoy", HTMLURL: "hdecoy", Number: 9, Repo: "acme/other", SourceBranch: "s/other", TargetBranch: "main"},
+		{URL: "child", Number: 8, Repo: "acme/app", SourceBranch: "s/root/a", TargetBranch: "s/root"},
+	}
+	out := []PRSummary{
+		{URL: "child", State: domain.PRStateOpen, Repo: "acme/app", TargetBranch: "s/root"},
+		{URL: "lost", State: domain.PRStateOpen, Repo: "acme/app", TargetBranch: "s/other"},
+	}
+	annotateStacks(candidates, out)
+	if out[0].StackedOnURL != "hparent" || out[0].StackedOnNumber != 7 {
+		t.Fatalf("cross-session parent should annotate the child: %+v", out[0])
+	}
+	if out[1].StackedOnURL != "" {
+		t.Fatalf("branch match in another repo must not annotate: %+v", out[1])
+	}
+}

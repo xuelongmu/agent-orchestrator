@@ -88,7 +88,7 @@ func TestProjectSetConfig_ReviewPolicyJSON(t *testing.T) {
 
 	_, errOut, err := executeCLI(t, Deps{
 		ProcessAlive: func(int) bool { return true },
-	}, "project", "set-config", "demo", "--config-json", `{"reviewPolicy":{"outOfScopeDeflection":true,"p2OnlyRoundLimit":3}}`)
+	}, "project", "set-config", "demo", "--config-json", `{"reviewPolicy":{"outOfScopeDeflection":true,"p2OnlyRoundLimit":3,"humanReviewTriggers":["data model changes"]}}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
 	}
@@ -98,6 +98,9 @@ func TestProjectSetConfig_ReviewPolicyJSON(t *testing.T) {
 	}
 	if !got.Config.ReviewPolicy.OutOfScopeDeflection || got.Config.ReviewPolicy.P2OnlyRoundLimit != 3 {
 		t.Fatalf("review policy request = %#v", got.Config.ReviewPolicy)
+	}
+	if len(got.Config.ReviewPolicy.HumanReviewTriggers) != 1 || got.Config.ReviewPolicy.HumanReviewTriggers[0] != "data model changes" {
+		t.Fatalf("human review triggers request = %#v", got.Config.ReviewPolicy)
 	}
 }
 

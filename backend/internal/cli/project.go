@@ -98,8 +98,9 @@ type trackerIntakeConfig struct {
 
 // reviewPolicyConfig mirrors domain.ReviewPolicyConfig.
 type reviewPolicyConfig struct {
-	OutOfScopeDeflection bool `json:"outOfScopeDeflection,omitempty"`
-	P2OnlyRoundLimit     int  `json:"p2OnlyRoundLimit,omitempty"`
+	OutOfScopeDeflection bool     `json:"outOfScopeDeflection,omitempty"`
+	P2OnlyRoundLimit     int      `json:"p2OnlyRoundLimit,omitempty"`
+	HumanReviewTriggers  []string `json:"humanReviewTriggers,omitempty"`
 }
 
 // orchestrationPolicyConfig mirrors domain.OrchestrationPolicyConfig.

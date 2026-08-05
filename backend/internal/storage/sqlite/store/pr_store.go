@@ -328,6 +328,20 @@ func (s *Store) ListPRsBySession(ctx context.Context, sessionID domain.SessionID
 	return out, nil
 }
 
+// ListOpenPRsByRepo returns every open (non-merged, non-closed) PR tracked for
+// a repository across all sessions, newest first.
+func (s *Store) ListOpenPRsByRepo(ctx context.Context, repo string) ([]domain.PullRequest, error) {
+	rows, err := s.qr.ListOpenPRsByRepo(ctx, repo)
+	if err != nil {
+		return nil, fmt.Errorf("list open prs for %s: %w", repo, err)
+	}
+	out := make([]domain.PullRequest, 0, len(rows))
+	for _, p := range rows {
+		out = append(out, prRowFromGen(p))
+	}
+	return out, nil
+}
+
 // ListChecks returns every recorded check run for a PR.
 func (s *Store) ListChecks(ctx context.Context, prURL string) ([]domain.PullRequestCheck, error) {
 	rows, err := s.qr.ListChecksByPR(ctx, prURL)
