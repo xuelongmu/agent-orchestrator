@@ -23,8 +23,11 @@ type PRFacts struct {
 	// Repo/HeadRepo mirror PullRequest: a differing head repo marks a fork PR,
 	// whose source branch is not an AO-owned stack parent. Empty HeadRepo means
 	// unobserved (legacy rows) and is treated as same-repo.
-	Repo         string
-	HeadRepo     string
+	Repo     string
+	HeadRepo string
+	// StackNumber mirrors PullRequest.StackNumber: the provider's native stack
+	// membership, zero when none reported.
+	StackNumber  int
 	SourceBranch string
 	TargetBranch string
 	UpdatedAt    time.Time
@@ -33,6 +36,14 @@ type PRFacts struct {
 // HeadInBaseRepo mirrors PullRequest.HeadInBaseRepo for the facts snapshot.
 func (p PRFacts) HeadInBaseRepo() bool {
 	return p.HeadRepo == "" || strings.EqualFold(p.HeadRepo, p.Repo)
+}
+
+// NativeStackAllowsParent reports whether native stacked-PR membership permits
+// a parent edge. A child inside a native stack only accepts parents from the
+// same stack — the provider's stack is authoritative for the chain — while a
+// child outside any native stack (zero) accepts branch-inferred parents.
+func NativeStackAllowsParent(childStack, parentStack int) bool {
+	return childStack <= 0 || childStack == parentStack
 }
 
 // PullRequest is the app-level representation of one tracked pull request as
@@ -56,6 +67,13 @@ type PullRequest struct {
 	// HeadRepo is the full name of the repository the head branch lives in.
 	// It differs from Repo for fork PRs; empty means unobserved (legacy rows).
 	HeadRepo string
+
+	// StackNumber is the provider's native stack number when the PR belongs to
+	// a native stack (GitHub public preview); zero means none reported and
+	// branch-topology inference applies alone. Position/size are context.
+	StackNumber   int
+	StackPosition int
+	StackSize     int
 
 	SourceBranch   string
 	TargetBranch   string

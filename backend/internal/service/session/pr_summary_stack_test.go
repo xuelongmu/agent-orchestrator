@@ -63,3 +63,28 @@ func TestStackParentsMatchesAcrossSessionsWithinOneRepo(t *testing.T) {
 		t.Fatalf("fork-headed PR must not be a stack parent: %+v", parents)
 	}
 }
+
+// A child inside a native stack only accepts same-stack parents; a child
+// outside any native stack still accepts branch-inferred parents.
+func TestStackParentsHonorNativeStackMembership(t *testing.T) {
+	store := &fakeStore{openPRsByRepo: []domain.PullRequest{
+		{URL: "otherstack", HTMLURL: "hother", Number: 5, SessionID: "other", Repo: "acme/app", StackNumber: 9, SourceBranch: "s/root", TargetBranch: "main"},
+		{URL: "samestack", HTMLURL: "hsame", Number: 6, SessionID: "other", Repo: "acme/app", StackNumber: 4, SourceBranch: "s/mid", TargetBranch: "s/base"},
+	}}
+	svc := &Service{store: store}
+	prs := []domain.PullRequest{
+		{URL: "nativechild", Number: 8, SessionID: "mine", Repo: "acme/app", StackNumber: 4, SourceBranch: "s/mid/x", TargetBranch: "s/mid"},
+		{URL: "strandedchild", Number: 9, SessionID: "mine", Repo: "acme/app", StackNumber: 4, SourceBranch: "s/y", TargetBranch: "s/root"},
+		{URL: "inferredchild", Number: 10, SessionID: "mine", Repo: "acme/app", SourceBranch: "s/z", TargetBranch: "s/root"},
+	}
+	parents := svc.stackParents(context.Background(), "proj-1", prs)
+	if parents["nativechild"].URL != "samestack" {
+		t.Fatalf("same-stack parent should match: %+v", parents)
+	}
+	if _, ok := parents["strandedchild"]; ok {
+		t.Fatalf("native child must not adopt a parent from another stack: %+v", parents)
+	}
+	if parents["inferredchild"].URL != "otherstack" {
+		t.Fatalf("non-native child keeps branch inference: %+v", parents)
+	}
+}

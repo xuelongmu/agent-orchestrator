@@ -97,6 +97,9 @@ type PR struct {
 	ReviewObservedAt         sql.NullTime
 	LastNudgeSignature       string
 	HeadRepo                 string
+	StackNumber              int64
+	StackPosition            int64
+	StackSize                int64
 }
 
 type PRCheck struct {

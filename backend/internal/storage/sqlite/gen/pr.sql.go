@@ -102,7 +102,7 @@ func (q *Queries) GetDisplayPRFactsBySession(ctx context.Context, sessionID doma
 }
 
 const getPR = `-- name: GetPR :one
-SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature, head_repo FROM pr WHERE url = ?
+SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature, head_repo, stack_number, stack_position, stack_size FROM pr WHERE url = ?
 `
 
 func (q *Queries) GetPR(ctx context.Context, url string) (PR, error) {
@@ -149,6 +149,9 @@ func (q *Queries) GetPR(ctx context.Context, url string) (PR, error) {
 		&i.ReviewObservedAt,
 		&i.LastNudgeSignature,
 		&i.HeadRepo,
+		&i.StackNumber,
+		&i.StackPosition,
+		&i.StackSize,
 	)
 	return i, err
 }
@@ -186,7 +189,7 @@ func (q *Queries) GetPRLastNudgeSignature(ctx context.Context, url string) (stri
 }
 
 const listOpenPRsByRepo = `-- name: ListOpenPRsByRepo :many
-SELECT pr.url, pr.session_id, pr.number, pr.pr_state, pr.review_decision, pr.ci_state, pr.mergeability, pr.updated_at, pr.provider, pr.host, pr.repo, pr.source_branch, pr.target_branch, pr.head_sha, pr.title, pr.additions, pr.deletions, pr.changed_files, pr.author, pr.base_sha, pr.merge_commit_sha, pr.is_draft, pr.is_merged, pr.is_closed, pr.provider_state, pr.provider_mergeable, pr.provider_merge_state_status, pr.html_url, pr.created_at_provider, pr.updated_at_provider, pr.merged_at_provider, pr.closed_at_provider, pr.metadata_hash, pr.ci_hash, pr.review_hash, pr.observed_at, pr.ci_observed_at, pr.review_observed_at, pr.last_nudge_signature, pr.head_repo FROM pr
+SELECT pr.url, pr.session_id, pr.number, pr.pr_state, pr.review_decision, pr.ci_state, pr.mergeability, pr.updated_at, pr.provider, pr.host, pr.repo, pr.source_branch, pr.target_branch, pr.head_sha, pr.title, pr.additions, pr.deletions, pr.changed_files, pr.author, pr.base_sha, pr.merge_commit_sha, pr.is_draft, pr.is_merged, pr.is_closed, pr.provider_state, pr.provider_mergeable, pr.provider_merge_state_status, pr.html_url, pr.created_at_provider, pr.updated_at_provider, pr.merged_at_provider, pr.closed_at_provider, pr.metadata_hash, pr.ci_hash, pr.review_hash, pr.observed_at, pr.ci_observed_at, pr.review_observed_at, pr.last_nudge_signature, pr.head_repo, pr.stack_number, pr.stack_position, pr.stack_size FROM pr
 JOIN sessions ON sessions.id = pr.session_id
 WHERE sessions.project_id = ? AND pr.provider = ? AND pr.host = ? AND pr.repo = ?
     AND pr.is_merged = 0 AND pr.is_closed = 0
@@ -255,6 +258,9 @@ func (q *Queries) ListOpenPRsByRepo(ctx context.Context, arg ListOpenPRsByRepoPa
 			&i.ReviewObservedAt,
 			&i.LastNudgeSignature,
 			&i.HeadRepo,
+			&i.StackNumber,
+			&i.StackPosition,
+			&i.StackSize,
 		); err != nil {
 			return nil, err
 		}
@@ -280,6 +286,7 @@ SELECT
     pr.mergeability,
     pr.repo,
     pr.head_repo,
+    pr.stack_number,
     pr.source_branch,
     pr.target_branch,
     pr.updated_at,
@@ -305,6 +312,7 @@ type ListPRFactsBySessionRow struct {
 	Mergeability   domain.Mergeability
 	Repo           string
 	HeadRepo       string
+	StackNumber    int64
 	SourceBranch   string
 	TargetBranch   string
 	UpdatedAt      time.Time
@@ -333,6 +341,7 @@ func (q *Queries) ListPRFactsBySession(ctx context.Context, sessionID domain.Ses
 			&i.Mergeability,
 			&i.Repo,
 			&i.HeadRepo,
+			&i.StackNumber,
 			&i.SourceBranch,
 			&i.TargetBranch,
 			&i.UpdatedAt,
@@ -352,7 +361,7 @@ func (q *Queries) ListPRFactsBySession(ctx context.Context, sessionID domain.Ses
 }
 
 const listPRsBySession = `-- name: ListPRsBySession :many
-SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature, head_repo FROM pr
+SELECT url, session_id, number, pr_state, review_decision, ci_state, mergeability, updated_at, provider, host, repo, source_branch, target_branch, head_sha, title, additions, deletions, changed_files, author, base_sha, merge_commit_sha, is_draft, is_merged, is_closed, provider_state, provider_mergeable, provider_merge_state_status, html_url, created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider, metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at, last_nudge_signature, head_repo, stack_number, stack_position, stack_size FROM pr
 WHERE session_id = ?
 ORDER BY updated_at DESC
 `
@@ -407,6 +416,9 @@ func (q *Queries) ListPRsBySession(ctx context.Context, sessionID domain.Session
 			&i.ReviewObservedAt,
 			&i.LastNudgeSignature,
 			&i.HeadRepo,
+			&i.StackNumber,
+			&i.StackPosition,
+			&i.StackSize,
 		); err != nil {
 			return nil, err
 		}
@@ -493,11 +505,12 @@ INSERT INTO pr (
     provider, host, repo, head_repo, source_branch, target_branch, head_sha, title,
     additions, deletions, changed_files, author, base_sha, merge_commit_sha,
     is_draft, is_merged, is_closed,
+    stack_number, stack_position, stack_size,
     provider_state, provider_mergeable, provider_merge_state_status, html_url,
     created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider,
     metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (url) DO UPDATE SET
     number = excluded.number,
     pr_state = excluded.pr_state,
@@ -522,6 +535,9 @@ ON CONFLICT (url) DO UPDATE SET
     is_draft = excluded.is_draft,
     is_merged = excluded.is_merged,
     is_closed = excluded.is_closed,
+    stack_number = excluded.stack_number,
+    stack_position = excluded.stack_position,
+    stack_size = excluded.stack_size,
     provider_state = excluded.provider_state,
     provider_mergeable = excluded.provider_mergeable,
     provider_merge_state_status = excluded.provider_merge_state_status,
@@ -564,6 +580,9 @@ type UpsertPRParams struct {
 	IsDraft                  int64
 	IsMerged                 int64
 	IsClosed                 int64
+	StackNumber              int64
+	StackPosition            int64
+	StackSize                int64
 	ProviderState            string
 	ProviderMergeable        string
 	ProviderMergeStateStatus string
@@ -607,6 +626,9 @@ func (q *Queries) UpsertPR(ctx context.Context, arg UpsertPRParams) error {
 		arg.IsDraft,
 		arg.IsMerged,
 		arg.IsClosed,
+		arg.StackNumber,
+		arg.StackPosition,
+		arg.StackSize,
 		arg.ProviderState,
 		arg.ProviderMergeable,
 		arg.ProviderMergeStateStatus,

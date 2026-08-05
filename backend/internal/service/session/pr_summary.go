@@ -172,7 +172,8 @@ func (s *Service) stackParents(ctx context.Context, projectID domain.ProjectID, 
 		if pr.Merged || pr.Closed || pr.TargetBranch == "" {
 			continue
 		}
-		if parent, ok := openBySource[branchKey(pr, pr.TargetBranch)]; ok && parent.URL != pr.URL {
+		parent, ok := openBySource[branchKey(pr, pr.TargetBranch)]
+		if ok && parent.URL != pr.URL && domain.NativeStackAllowsParent(pr.StackNumber, parent.StackNumber) {
 			parents[pr.URL] = parent
 		}
 	}

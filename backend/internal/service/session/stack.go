@@ -20,15 +20,16 @@ type stackInfo struct {
 // a merged or closed parent no longer blocks its children; a fork-headed PR's
 // source branch is not an AO-owned branch and never counts as a parent.
 func buildStacks(prs []domain.PRFacts) map[string]stackInfo {
-	openSources := make(map[string]bool, len(prs))
+	openSources := make(map[string]domain.PRFacts, len(prs))
 	for _, p := range prs {
 		if !p.Merged && !p.Closed && p.SourceBranch != "" && p.HeadInBaseRepo() {
-			openSources[p.SourceBranch] = true
+			openSources[p.SourceBranch] = p
 		}
 	}
 	out := make(map[string]stackInfo, len(prs))
 	for _, p := range prs {
-		blocked := p.TargetBranch != "" && openSources[p.TargetBranch]
+		parent, ok := openSources[p.TargetBranch]
+		blocked := p.TargetBranch != "" && ok && domain.NativeStackAllowsParent(p.StackNumber, parent.StackNumber)
 		out[p.URL] = stackInfo{Blocked: blocked, BottomOfStack: !blocked}
 	}
 	return out

@@ -44,6 +44,22 @@ func TestBuildStacksIgnoresForkHeadedParents(t *testing.T) {
 	}
 }
 
+// A child in a native stack is only blocked by same-stack parents.
+func TestBuildStacksHonorsNativeStackMembership(t *testing.T) {
+	prs := []domain.PRFacts{
+		{URL: "otherstack", StackNumber: 9, SourceBranch: "feature", TargetBranch: "main"},
+		{URL: "nativechild", StackNumber: 4, SourceBranch: "ao/x", TargetBranch: "feature"},
+		{URL: "inferredchild", SourceBranch: "ao/y", TargetBranch: "feature"},
+	}
+	st := buildStacks(prs)
+	if st["nativechild"].Blocked {
+		t.Fatal("native child must not be blocked by a different stack's branch")
+	}
+	if !st["inferredchild"].Blocked {
+		t.Fatal("non-native child keeps branch inference")
+	}
+}
+
 func TestBuildStacksMergedParentUnblocksChild(t *testing.T) {
 	prs := []domain.PRFacts{
 		{URL: "p142", SourceBranch: "ao/abc", TargetBranch: "main", Merged: true},

@@ -261,7 +261,7 @@ func (s *ActionService) stackedOnOpenParent(ctx context.Context, tracked domain.
 		if pr.Merged || pr.Closed || pr.URL == tracked.URL || pr.SourceBranch == "" || !pr.HeadInBaseRepo() {
 			continue
 		}
-		if pr.SourceBranch == target {
+		if pr.SourceBranch == target && domain.NativeStackAllowsParent(tracked.StackNumber, pr.StackNumber) {
 			return true, nil
 		}
 	}

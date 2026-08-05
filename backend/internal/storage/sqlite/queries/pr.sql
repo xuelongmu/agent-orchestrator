@@ -4,11 +4,12 @@ INSERT INTO pr (
     provider, host, repo, head_repo, source_branch, target_branch, head_sha, title,
     additions, deletions, changed_files, author, base_sha, merge_commit_sha,
     is_draft, is_merged, is_closed,
+    stack_number, stack_position, stack_size,
     provider_state, provider_mergeable, provider_merge_state_status, html_url,
     created_at_provider, updated_at_provider, merged_at_provider, closed_at_provider,
     metadata_hash, ci_hash, review_hash, observed_at, ci_observed_at, review_observed_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (url) DO UPDATE SET
     number = excluded.number,
     pr_state = excluded.pr_state,
@@ -33,6 +34,9 @@ ON CONFLICT (url) DO UPDATE SET
     is_draft = excluded.is_draft,
     is_merged = excluded.is_merged,
     is_closed = excluded.is_closed,
+    stack_number = excluded.stack_number,
+    stack_position = excluded.stack_position,
+    stack_size = excluded.stack_size,
     provider_state = excluded.provider_state,
     provider_mergeable = excluded.provider_mergeable,
     provider_merge_state_status = excluded.provider_merge_state_status,
@@ -125,6 +129,7 @@ SELECT
     pr.mergeability,
     pr.repo,
     pr.head_repo,
+    pr.stack_number,
     pr.source_branch,
     pr.target_branch,
     pr.updated_at,

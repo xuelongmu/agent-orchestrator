@@ -11,6 +11,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -46,6 +47,10 @@ type Provider struct {
 	client      *Client
 	logger      *slog.Logger
 	runCheckout checkoutCommandRunner
+	// stackFieldsUnsupported latches when the host's GraphQL schema rejects the
+	// stacked-PR preview fields (e.g. GHES without the feature), so later batch
+	// fetches skip them instead of failing every query.
+	stackFieldsUnsupported atomic.Bool
 }
 
 type checkoutCommandRunner func(ctx context.Context, dir, name string, args ...string) (string, error)

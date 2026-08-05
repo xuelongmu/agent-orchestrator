@@ -115,8 +115,17 @@ func (p *Provider) FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef)
 	if len(refs) > 25 {
 		return nil, fmt.Errorf("github scm: batch size %d exceeds 25", len(refs))
 	}
-	query, aliases := buildSCMBatchQuery(refs)
+	withStack := !p.stackFieldsUnsupported.Load()
+	query, aliases := buildSCMBatchQuery(refs, withStack)
 	data, err := p.client.doGraphQL(ctx, query, nil)
+	if err != nil && withStack && isUnknownStackFieldError(err) {
+		// The host's schema predates the stacked-PR preview (e.g. GHES).
+		// Latch and retry without the stack selection so one missing feature
+		// does not fail every batch fetch.
+		p.stackFieldsUnsupported.Store(true)
+		query, aliases = buildSCMBatchQuery(refs, false)
+		data, err = p.client.doGraphQL(ctx, query, nil)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -283,6 +292,16 @@ type restListPull struct {
 	} `json:"user"`
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
+	// Stack is present only while the PR belongs to a native stack (public
+	// preview); hosts without the feature simply omit the key.
+	Stack *struct {
+		Number   int `json:"number"`
+		Size     int `json:"size"`
+		Position int `json:"position"`
+		Base     struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+	} `json:"stack"`
 }
 
 func restListPullToSCM(pull restListPull) ports.SCMPRObservation {
@@ -304,10 +323,23 @@ func restListPullToSCM(pull restListPull) ports.SCMPRObservation {
 		HTMLURL:           pull.HTMLURL,
 		CreatedAtProvider: parseGitHubTime(pull.CreatedAt),
 		UpdatedAtProvider: parseGitHubTime(pull.UpdatedAt),
+		Stack:             restStackToSCM(pull),
 	}
 }
 
-func buildSCMBatchQuery(refs []ports.SCMPRRef) (string, []string) {
+func restStackToSCM(pull restListPull) *ports.SCMPRStackObservation {
+	if pull.Stack == nil || pull.Stack.Number <= 0 {
+		return nil
+	}
+	return &ports.SCMPRStackObservation{
+		Number:   pull.Stack.Number,
+		Position: pull.Stack.Position,
+		Size:     pull.Stack.Size,
+		BaseRef:  pull.Stack.Base.Ref,
+	}
+}
+
+func buildSCMBatchQuery(refs []ports.SCMPRRef, withStack bool) (string, []string) {
 	aliases := make([]string, len(refs))
 	var b strings.Builder
 	b.WriteString("query{\n")
@@ -315,19 +347,30 @@ func buildSCMBatchQuery(refs []ports.SCMPRRef) (string, []string) {
 		alias := fmt.Sprintf("pr%d", i)
 		aliases[i] = alias
 		_, _ = fmt.Fprintf(&b, "%s: repository(owner:%s,name:%s){ pullRequest(number:%d){ %s } }\n",
-			alias, graphQLString(ref.Repo.Owner), graphQLString(ref.Repo.Name), ref.Number, scmPRFields())
+			alias, graphQLString(ref.Repo.Owner), graphQLString(ref.Repo.Name), ref.Number, scmPRFields(withStack))
 	}
 	b.WriteString("}")
 	return b.String(), aliases
 }
 
-func scmPRFields() string {
+// isUnknownStackFieldError reports whether a GraphQL failure is the schema
+// rejecting the stacked-PR preview selection rather than a transport error.
+func isUnknownStackFieldError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "stackentry") || strings.Contains(msg, "pullrequeststack")
+}
+
+func scmPRFields(withStack bool) string {
+	stackSelection := ""
+	if withStack {
+		stackSelection = "\nstackEntry{ position stack{ number size baseRefName } }"
+	}
 	return strings.ReplaceAll(`
 number url state isDraft merged closed title additions deletions changedFiles
 mergeable mergeStateStatus reviewDecision headRefName headRefOid baseRefName baseRefOid
 createdAt updatedAt mergedAt closedAt
 author{ login }
-headRepository{ nameWithOwner }
+headRepository{ nameWithOwner }`+stackSelection+`
 mergeCommit{ oid }
 commits(last:1){ nodes{ commit{ oid message statusCheckRollup{ state contexts(first:CONTEXT_LIMIT){ nodes{
   __typename
@@ -459,6 +502,7 @@ func scmObservationFromGraphQL(ref ports.SCMPRRef, pr map[string]any) (ports.SCM
 			UpdatedAtProvider:        parseGitHubTime(str(pr["updatedAt"])),
 			MergedAtProvider:         parseGitHubTime(str(pr["mergedAt"])),
 			ClosedAtProvider:         parseGitHubTime(str(pr["closedAt"])),
+			Stack:                    graphQLStackToSCM(pr),
 		},
 		CI: ports.SCMCIObservation{
 			Summary:           ci,
@@ -801,6 +845,23 @@ func authorLogin(v any) string {
 func headRepoFullName(pr map[string]any) string {
 	head, _ := pr["headRepository"].(map[string]any)
 	return str(head["nameWithOwner"])
+}
+
+func graphQLStackToSCM(pr map[string]any) *ports.SCMPRStackObservation {
+	entry, _ := pr["stackEntry"].(map[string]any)
+	if entry == nil {
+		return nil
+	}
+	stack, _ := entry["stack"].(map[string]any)
+	if stack == nil || int(num(stack["number"])) <= 0 {
+		return nil
+	}
+	return &ports.SCMPRStackObservation{
+		Number:   int(num(stack["number"])),
+		Position: int(num(entry["position"])),
+		Size:     int(num(stack["size"])),
+		BaseRef:  str(stack["baseRefName"]),
+	}
 }
 
 func mergeCommitOID(pr map[string]any) string {

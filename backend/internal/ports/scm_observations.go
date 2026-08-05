@@ -157,6 +157,34 @@ type SCMPRObservation struct {
 	MergedAtProvider time.Time
 	// ClosedAtProvider is the provider's close timestamp when closed.
 	ClosedAtProvider time.Time
+
+	// Stack is the provider's native stacked-PR membership when the PR is part
+	// of one (GitHub public preview). Nil means the provider reported no stack
+	// or does not support the feature; branch-topology inference still applies.
+	Stack *SCMPRStackObservation
+}
+
+// SCMPRStackObservation summarizes native stacked-PR membership. AO treats it
+// as authoritative for which PRs form one stack; parent/child edges are still
+// derived by branch matching within the stack.
+type SCMPRStackObservation struct {
+	// Number is the provider's per-repository stack number.
+	Number int
+	// Position is this PR's position within the stack.
+	Position int
+	// Size is the total number of PRs in the stack.
+	Size int
+	// BaseRef is the trunk branch the whole stack lands on.
+	BaseRef string
+}
+
+// Flatten returns number, position, and size, treating a nil receiver as "no
+// stack" so persistence sites can flatten without a nil check.
+func (s *SCMPRStackObservation) Flatten() (number, position, size int) {
+	if s == nil {
+		return 0, 0, 0
+	}
+	return s.Number, s.Position, s.Size
 }
 
 // SCMCIObservation carries aggregate CI state plus failing-check details.
