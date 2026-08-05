@@ -154,7 +154,7 @@ const isolatedDevDaemonPort = 3002
 func (c *commandContext) checkRunningDevDaemon(ctx context.Context, w io.Writer, root string) error {
 	cfg, err := config.Load()
 	if err != nil {
-		return nil
+		return fmt.Errorf("ao start: load daemon configuration: %w", err)
 	}
 	runFile, isolated := devRunFilePath(cfg.RunFilePath)
 	port := devDaemonPort(cfg.Port, isolated)
