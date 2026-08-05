@@ -116,6 +116,37 @@ describe("PullRequestsPage", () => {
 		});
 	});
 
+	it("replaces the merge action with a stack note for stacked children", () => {
+		setWorkspaces([session("auth", [pr(42, "open")])]);
+		const summary: SessionPRSummary = {
+			url: "https://github.com/acme/repo/pull/42",
+			htmlUrl: "https://github.com/acme/repo/pull/42",
+			number: 42,
+			title: "child",
+			state: "open",
+			provider: "github",
+			repo: "acme/repo",
+			author: "alice",
+			sourceBranch: "feat/parent/child",
+			targetBranch: "feat/parent",
+			stackedOnNumber: 41,
+			stackedOnUrl: "https://github.com/acme/repo/pull/41",
+			headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			additions: 1,
+			deletions: 0,
+			changedFiles: 1,
+			ci: { state: "passing", failingChecks: [] },
+			review: { decision: "approved", hasUnresolvedHumanComments: false, unresolvedBy: [] },
+			mergeability: { state: "mergeable", reasons: [], prUrl: "https://github.com/acme/repo/pull/42" },
+			updatedAt: "2026-06-15T00:00:00Z",
+		};
+		renderPage({ sessionId: "auth", prs: [summary] });
+
+		const childRow = screen.getByText("#42").closest("tr")!;
+		expect(within(childRow).queryByRole("button", { name: "Merge" })).not.toBeInTheDocument();
+		expect(within(childRow).getByText("stacked on #41")).toBeInTheDocument();
+	});
+
 	it("shows an empty state when no session has a PR", () => {
 		setWorkspaces([session("idle", [])]);
 		renderPage();

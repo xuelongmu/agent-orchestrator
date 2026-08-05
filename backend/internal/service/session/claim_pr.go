@@ -411,6 +411,7 @@ func claimRowsFromSCM(sessionID domain.SessionID, obs ports.SCMObservation, now 
 		Provider:                 obs.Provider,
 		Host:                     obs.Host,
 		Repo:                     obs.Repo,
+		HeadRepo:                 obs.PR.HeadRepo,
 		SourceBranch:             obs.PR.SourceBranch,
 		TargetBranch:             obs.PR.TargetBranch,
 		HeadSHA:                  obs.PR.HeadSHA,

@@ -168,15 +168,24 @@ function PRRowView({ row, onOpen }: { row: PRRow; onOpen: () => void }) {
 						>
 							{resolve.isPending ? "…" : "Resolve"}
 						</Button>
-						<Button
-							size="sm"
-							variant="primary"
-							className="h-6 px-2 text-caption"
-							disabled={merge.isPending}
-							onClick={() => merge.mutate()}
-						>
-							{merge.isPending ? "Merging…" : "Merge"}
-						</Button>
+						{row.pr.stackedOnNumber ? (
+							<span
+								className="text-caption text-passive"
+								title={`Stacked on #${row.pr.stackedOnNumber} — merge that PR first`}
+							>
+								stacked on #{row.pr.stackedOnNumber}
+							</span>
+						) : (
+							<Button
+								size="sm"
+								variant="primary"
+								className="h-6 px-2 text-caption"
+								disabled={merge.isPending}
+								onClick={() => merge.mutate()}
+							>
+								{merge.isPending ? "Merging…" : "Merge"}
+							</Button>
+						)}
 					</div>
 				) : (
 					<span className="text-caption text-passive">—</span>

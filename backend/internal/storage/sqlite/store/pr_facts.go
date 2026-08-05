@@ -45,6 +45,8 @@ func (s *Store) ListPRFactsForSession(ctx context.Context, id domain.SessionID) 
 			Review:         r.ReviewDecision,
 			Mergeability:   r.Mergeability,
 			ReviewComments: r.ReviewComments,
+			Repo:           r.Repo,
+			HeadRepo:       r.HeadRepo,
 			SourceBranch:   r.SourceBranch,
 			TargetBranch:   r.TargetBranch,
 			UpdatedAt:      r.UpdatedAt,

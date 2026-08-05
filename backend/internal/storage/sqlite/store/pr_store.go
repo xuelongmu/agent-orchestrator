@@ -328,6 +328,22 @@ func (s *Store) ListPRsBySession(ctx context.Context, sessionID domain.SessionID
 	return out, nil
 }
 
+// ListOpenPRsByRepo returns every open (non-merged, non-closed) PR tracked for
+// one provider/host/repo across the project's sessions, newest first. The
+// project scope keeps a same-named repo registered under another AO project
+// from contributing stack parents.
+func (s *Store) ListOpenPRsByRepo(ctx context.Context, projectID domain.ProjectID, provider, host, repo string) ([]domain.PullRequest, error) {
+	rows, err := s.qr.ListOpenPRsByRepo(ctx, gen.ListOpenPRsByRepoParams{ProjectID: projectID, Provider: provider, Host: host, Repo: repo})
+	if err != nil {
+		return nil, fmt.Errorf("list open prs for %s: %w", repo, err)
+	}
+	out := make([]domain.PullRequest, 0, len(rows))
+	for _, p := range rows {
+		out = append(out, prRowFromGen(p))
+	}
+	return out, nil
+}
+
 // ListChecks returns every recorded check run for a PR.
 func (s *Store) ListChecks(ctx context.Context, prURL string) ([]domain.PullRequestCheck, error) {
 	rows, err := s.qr.ListChecksByPR(ctx, prURL)
@@ -409,6 +425,7 @@ func genPRParams(r domain.PullRequest) gen.UpsertPRParams {
 		Provider:                 r.Provider,
 		Host:                     r.Host,
 		Repo:                     r.Repo,
+		HeadRepo:                 r.HeadRepo,
 		SourceBranch:             r.SourceBranch,
 		TargetBranch:             r.TargetBranch,
 		HeadSha:                  r.HeadSHA,
@@ -492,6 +509,7 @@ func prRowFromGen(p gen.PR) domain.PullRequest {
 		Provider:                 p.Provider,
 		Host:                     p.Host,
 		Repo:                     p.Repo,
+		HeadRepo:                 p.HeadRepo,
 		SourceBranch:             p.SourceBranch,
 		TargetBranch:             p.TargetBranch,
 		HeadSHA:                  p.HeadSha,

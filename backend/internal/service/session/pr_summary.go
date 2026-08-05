@@ -13,16 +13,21 @@ import (
 
 // PRSummary is the user-facing SCM read model for one PR owned by a session.
 type PRSummary struct {
-	URL              string
-	HTMLURL          string
-	Number           int
-	Title            string
-	State            domain.PRState
-	Provider         string
-	Repo             string
-	Author           string
-	SourceBranch     string
-	TargetBranch     string
+	URL          string
+	HTMLURL      string
+	Number       int
+	Title        string
+	State        domain.PRState
+	Provider     string
+	Repo         string
+	Author       string
+	SourceBranch string
+	TargetBranch string
+	// StackedOnURL/StackedOnNumber identify the open sibling PR whose source
+	// branch this PR targets. Set only while that parent is open: the child is
+	// stacked and cannot merge until the parent does, but remains buildable.
+	StackedOnURL     string
+	StackedOnNumber  int
 	HeadSHA          string
 	Additions        int
 	Deletions        int
@@ -90,7 +95,8 @@ type PRConflictFile struct {
 // ListPRSummaries returns all PRs owned by a session with concise SCM details
 // assembled from persisted PR/check/review facts.
 func (s *Service) ListPRSummaries(ctx context.Context, id domain.SessionID) ([]PRSummary, error) {
-	if _, ok, err := s.store.GetSession(ctx, id); err != nil {
+	rec, ok, err := s.store.GetSession(ctx, id)
+	if err != nil {
 		return nil, fmt.Errorf("get %s: %w", id, err)
 	} else if !ok {
 		return nil, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
@@ -119,8 +125,68 @@ func (s *Service) ListPRSummaries(ctx context.Context, id domain.SessionID) ([]P
 		}
 		out = append(out, summarizePR(pr, checks, reviews, threads, comments))
 	}
+	annotateStacks(s.stackParents(ctx, rec.ProjectID, prs), out)
 	sortPRSummaries(out)
 	return out, nil
+}
+
+// stackParents maps each of the session's open PRs (by URL) to the open PR
+// whose source branch it targets, mirroring the stack rule in buildStacks: a
+// parent counts only while open. Parents are matched within one
+// provider/host/repo and may be owned by another session in the same project —
+// an orchestrator can keep dependent work moving in a separate worker. Lookup
+// failures degrade to session-local candidates rather than failing the read.
+func (s *Service) stackParents(ctx context.Context, projectID domain.ProjectID, prs []domain.PullRequest) map[string]domain.PullRequest {
+	branchKey := func(pr domain.PullRequest, branch string) string {
+		return pr.Provider + "\x00" + pr.Host + "\x00" + pr.Repo + "\x00" + branch
+	}
+	openBySource := map[string]domain.PullRequest{}
+	addCandidate := func(pr domain.PullRequest) {
+		if !pr.Merged && !pr.Closed && pr.SourceBranch != "" && pr.HeadInBaseRepo() {
+			key := branchKey(pr, pr.SourceBranch)
+			if _, ok := openBySource[key]; !ok {
+				openBySource[key] = pr
+			}
+		}
+	}
+	for _, pr := range prs {
+		addCandidate(pr)
+	}
+	seenRepo := map[string]bool{}
+	for _, pr := range prs {
+		repoKey := branchKey(pr, "")
+		if pr.Merged || pr.Closed || strings.TrimSpace(pr.Repo) == "" || seenRepo[repoKey] {
+			continue
+		}
+		seenRepo[repoKey] = true
+		open, err := s.store.ListOpenPRsByRepo(ctx, projectID, pr.Provider, pr.Host, pr.Repo)
+		if err != nil {
+			continue
+		}
+		for _, candidate := range open {
+			addCandidate(candidate)
+		}
+	}
+	parents := map[string]domain.PullRequest{}
+	for _, pr := range prs {
+		if pr.Merged || pr.Closed || pr.TargetBranch == "" {
+			continue
+		}
+		if parent, ok := openBySource[branchKey(pr, pr.TargetBranch)]; ok && parent.URL != pr.URL {
+			parents[pr.URL] = parent
+		}
+	}
+	return parents
+}
+
+// annotateStacks copies the derived stack position onto the summaries.
+func annotateStacks(parents map[string]domain.PullRequest, out []PRSummary) {
+	for i, s := range out {
+		if parent, ok := parents[s.URL]; ok {
+			out[i].StackedOnURL = firstNonEmpty(parent.HTMLURL, parent.URL)
+			out[i].StackedOnNumber = parent.Number
+		}
+	}
 }
 
 func summarizePR(pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment) PRSummary {

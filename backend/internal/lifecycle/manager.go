@@ -46,6 +46,15 @@ type stackSessionStore interface {
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
 }
 
+// stackParentStore is the production store's cross-session PR read used to
+// treat PRs stacked on an open parent owned by another session in the same
+// project as blocked (ready-notification veto, conflict-nudge exemption).
+// Test/embedding stores may omit it; checks then fall back to same-session
+// parents.
+type stackParentStore interface {
+	ListOpenPRsByRepo(ctx context.Context, projectID domain.ProjectID, provider, host, repo string) ([]domain.PullRequest, error)
+}
+
 type designContractDeliveryStore interface {
 	GetPendingPRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL string) (designcontract.PendingDelivery, bool, error)
 	CompletePRDesignContractDelivery(ctx context.Context, sessionID domain.SessionID, prURL, deliveryToken string, contractRevision int64) (bool, error)

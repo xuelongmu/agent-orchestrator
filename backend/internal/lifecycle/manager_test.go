@@ -4843,6 +4843,86 @@ func TestSCMObservation_Notifications(t *testing.T) {
 	}
 }
 
+// stackParentFakeStore layers the optional cross-session stack read over the
+// plain fake store, mirroring the production SQLite store.
+type stackParentFakeStore struct {
+	*fakeStore
+	openByRepo []domain.PullRequest
+}
+
+func (f *stackParentFakeStore) ListOpenPRsByRepo(context.Context, domain.ProjectID, string, string, string) ([]domain.PullRequest, error) {
+	return f.openByRepo, nil
+}
+
+func TestPRBlockedByOpenParentSeesCrossSessionParents(t *testing.T) {
+	base := newFakeStore()
+	base.sessions["mer-1"] = working("mer-1")
+	base.prs["mer-1"] = []domain.PullRequest{
+		{URL: "child", SessionID: "mer-1", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/root/a", TargetBranch: "s/root"},
+	}
+	st := &stackParentFakeStore{fakeStore: base, openByRepo: []domain.PullRequest{
+		{URL: "parent", SessionID: "other", Provider: "github", Host: "github.com", Repo: "acme/app", SourceBranch: "s/root", TargetBranch: "main"},
+	}}
+	m := New(st, nil)
+
+	blocked, err := m.prBlockedByOpenParent(ctx, "mer-1", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !blocked {
+		t.Fatal("cross-session open parent should exempt the child from conflict nudges")
+	}
+
+	st.openByRepo[0].Merged = true
+	blocked, err = m.prBlockedByOpenParent(ctx, "mer-1", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked {
+		t.Fatal("merged parent should stop exempting the child")
+	}
+}
+
+func TestSCMObservation_ReadySuppressedForStackedChild(t *testing.T) {
+	// A green child stacked on a still-open parent branch must not notify the
+	// human as ready to merge; the parent has to merge (or close) first.
+	obs := ports.SCMObservation{
+		Fetched: true,
+		PR:      ports.SCMPRObservation{URL: "https://github.com/o/r/pull/9", Number: 9, HeadSHA: "head-9", TargetBranch: "s/root"},
+		CI:      ports.SCMCIObservation{Summary: string(domain.CIPassing), HeadSHA: "head-9"},
+		Review: ports.SCMReviewObservation{
+			Decision: string(domain.ReviewApproved),
+			HeadSHA:  "head-9",
+			Reviews: []ports.SCMReviewSummaryObservation{{
+				Author: "alice", State: string(domain.ReviewApproved), CommitSHA: "head-9",
+			}},
+		},
+		Mergeability: ports.SCMMergeabilityObservation{State: string(domain.MergeMergeable)},
+	}
+	st := newFakeStore()
+	sink := &fakeNotificationSink{}
+	m := New(st, nil, WithNotificationSink(sink))
+	st.sessions["mer-1"] = working("mer-1")
+	st.prs["mer-1"] = []domain.PullRequest{
+		{URL: "https://github.com/o/r/pull/8", Number: 8, SourceBranch: "s/root", TargetBranch: "main"},
+	}
+	if err := m.ApplySCMObservation(ctx, "mer-1", obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 0 {
+		t.Fatalf("stacked child emitted ready intent: %+v", sink.intents)
+	}
+
+	// Once the parent merges, the same observation is ready again.
+	st.prs["mer-1"][0].Merged = true
+	if err := m.ApplySCMObservation(ctx, "mer-1", obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 1 || sink.intents[0].Type != domain.NotificationReadyToMerge {
+		t.Fatalf("merged parent should unblock ready intent: %+v", sink.intents)
+	}
+}
+
 func TestSCMObservation_ReviewDefinitionOfDone(t *testing.T) {
 	base := ports.SCMObservation{
 		Fetched: true,

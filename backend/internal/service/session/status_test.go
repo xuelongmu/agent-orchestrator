@@ -75,7 +75,7 @@ func TestServiceDerivesStatusFromSessionFactsAndPR(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := deriveStatus(tt.rec, tt.pr, statusNow, !tt.hookless); got != tt.want {
+			if got := deriveStatus(tt.rec, tt.pr, statusNow, !tt.hookless, nil); got != tt.want {
 				t.Fatalf("got %q want %q", got, tt.want)
 			}
 		})
@@ -119,7 +119,7 @@ func TestAggregateStackedChildSignals(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := deriveStatus(statusRec(domain.ActivityIdle, false), tt.prs, statusNow, true); got != tt.want {
+			if got := deriveStatus(statusRec(domain.ActivityIdle, false), tt.prs, statusNow, true, nil); got != tt.want {
 				t.Fatalf("got %q want %q", got, tt.want)
 			}
 		})

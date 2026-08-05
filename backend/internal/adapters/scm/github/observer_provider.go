@@ -327,6 +327,7 @@ number url state isDraft merged closed title additions deletions changedFiles
 mergeable mergeStateStatus reviewDecision headRefName headRefOid baseRefName baseRefOid
 createdAt updatedAt mergedAt closedAt
 author{ login }
+headRepository{ nameWithOwner }
 mergeCommit{ oid }
 commits(last:1){ nodes{ commit{ oid message statusCheckRollup{ state contexts(first:CONTEXT_LIMIT){ nodes{
   __typename
@@ -438,6 +439,7 @@ func scmObservationFromGraphQL(ref ports.SCMPRRef, pr map[string]any) (ports.SCM
 			Draft:                    draft,
 			Merged:                   merged,
 			Closed:                   closed,
+			HeadRepo:                 headRepoFullName(pr),
 			SourceBranch:             str(pr["headRefName"]),
 			TargetBranch:             str(pr["baseRefName"]),
 			HeadSHA:                  headSHA,
@@ -794,6 +796,11 @@ func parseGitHubTime(s string) time.Time {
 func authorLogin(v any) string {
 	author, _ := v.(map[string]any)
 	return str(author["login"])
+}
+
+func headRepoFullName(pr map[string]any) string {
+	head, _ := pr["headRepository"].(map[string]any)
+	return str(head["nameWithOwner"])
 }
 
 func mergeCommitOID(pr map[string]any) string {

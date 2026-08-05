@@ -127,6 +127,15 @@ type ReviewPolicyConfig struct {
 	// many consecutive completed rounds containing only explicitly tagged P2/P3
 	// findings. Zero preserves the strict behavior with no convergence escape.
 	P2OnlyRoundLimit int `json:"p2OnlyRoundLimit,omitempty" minimum:"0" maximum:"6"`
+	// HumanReviewTriggers lists change categories that need a human approval
+	// before merge (e.g. "data model or migration changes", "third-party
+	// integrations", "permissioning changes"). Agents classify PRs against the
+	// list at dispatch and again at review time; a match gates merging only,
+	// never continued building. Enforcement is prompt-level: agents route the
+	// PR to a human and repository branch protection holds the approval; the
+	// daemon does not yet persist classifications or block the merge route on
+	// them.
+	HumanReviewTriggers []string `json:"humanReviewTriggers,omitempty"`
 }
 
 // MaxP2OnlyReviewRounds is the largest supported automated review convergence limit.
@@ -137,6 +146,11 @@ const MaxP2OnlyReviewRounds = 6
 func (c ReviewPolicyConfig) Validate() error {
 	if c.P2OnlyRoundLimit < 0 || c.P2OnlyRoundLimit > MaxP2OnlyReviewRounds {
 		return fmt.Errorf("reviewPolicy.p2OnlyRoundLimit: must be between 1 and %d, or 0 to disable", MaxP2OnlyReviewRounds)
+	}
+	for i, trigger := range c.HumanReviewTriggers {
+		if strings.TrimSpace(trigger) == "" {
+			return fmt.Errorf("reviewPolicy.humanReviewTriggers[%d]: must not be blank", i)
+		}
 	}
 	return nil
 }
