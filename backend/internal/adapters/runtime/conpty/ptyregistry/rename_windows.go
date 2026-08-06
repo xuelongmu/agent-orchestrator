@@ -20,7 +20,11 @@ func atomicReplace(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	ret, _, callErr := moveFileExW.Call(uintptr(unsafe.Pointer(srcPtr)), uintptr(unsafe.Pointer(dstPtr)), uintptr(movefileReplaceExisting))
+	ret, _, callErr := moveFileExW.Call(
+		uintptr(unsafe.Pointer(srcPtr)), // #nosec G103 -- required by MoveFileExW.
+		uintptr(unsafe.Pointer(dstPtr)), // #nosec G103 -- required by MoveFileExW.
+		uintptr(movefileReplaceExisting),
+	)
 	if ret == 0 {
 		return callErr
 	}

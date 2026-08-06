@@ -6,6 +6,7 @@ package processalive
 
 import (
 	"errors"
+	"math"
 
 	"golang.org/x/sys/windows"
 )
@@ -13,14 +14,15 @@ import (
 // Alive reports whether pid exists. Access denied counts as alive: the process
 // exists even if the current user cannot wait on it.
 func Alive(pid int) bool {
-	if pid <= 0 {
+	if pid <= 0 || uint64(pid) > math.MaxUint32 {
 		return false
 	}
-	handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
+	pid32 := uint32(pid) // #nosec G115 -- range checked above.
+	handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, pid32)
 	if err != nil {
 		return errors.Is(err, windows.ERROR_ACCESS_DENIED)
 	}
-	defer windows.CloseHandle(handle)
+	defer func() { _ = windows.CloseHandle(handle) }()
 
 	status, err := windows.WaitForSingleObject(handle, 0)
 	if err != nil {

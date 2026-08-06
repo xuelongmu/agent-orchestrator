@@ -35,11 +35,11 @@ func resolvedFilesystemPath(path string) (string, error) {
 	size := uint32(256)
 	for {
 		buf := make([]uint16, size)
-		n, err := windows.GetFinalPathNameByHandle(handle, &buf[0], uint32(len(buf)), 0)
+		n, err := windows.GetFinalPathNameByHandle(handle, &buf[0], size, 0)
 		if err != nil {
 			return "", err
 		}
-		if n < uint32(len(buf)) {
+		if n < size {
 			return filepath.Clean(trimWindowsFinalPathPrefix(windows.UTF16ToString(buf[:n]))), nil
 		}
 		size = n + 1

@@ -121,7 +121,7 @@ func publishProjectionDirectory(sourceRoot, targetRoot *os.Root, stageName, targ
 	}
 	if current, err := sourceRoot.Lstat(stageName); err != nil || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, info) {
 		_ = stage.Close()
-		return errors.New("Windows staging directory changed before no-replace publish")
+		return errors.New("windows staging directory changed before no-replace publish")
 	}
 	sourceDirectory, sourceDirectoryHandle, err := openDurableWindowsDirectory(sourceRoot)
 	if err != nil {
