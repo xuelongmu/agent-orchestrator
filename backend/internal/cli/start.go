@@ -66,12 +66,12 @@ func newStartCommand(ctx *commandContext) *cobra.Command {
 		Use:   "start",
 		Short: "Open Agent Orchestrator — from this source checkout, or the published desktop app",
 		Long: "Open Agent Orchestrator.\n\n" +
-			"Run from a source checkout with a binary you built yourself, `ao start`\n" +
-			"launches that checkout via the frontend dev harness and blocks until you\n" +
-			"stop it. This is the contributor path: it runs your code.\n\n" +
-			"Otherwise the desktop app owns the daemon, state, and updates: `ao start`\n" +
-			"resolves the installed app (or downloads the latest release), opens it,\n" +
-			"and exits.\n\n" +
+			"Run from a source checkout, `ao start` launches that checkout via the\n" +
+			"frontend dev harness and blocks until you stop it. This is the contributor\n" +
+			"path: it runs your code even if a released ao is first on PATH.\n\n" +
+			"Outside a checkout, a released ao resolves the installed desktop app (or\n" +
+			"downloads the latest release), opens it, and exits. A dev build refuses\n" +
+			"that download unless --release is explicit.\n\n" +
 			"Use --source or --release to choose explicitly.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -104,12 +104,17 @@ func (c *commandContext) runStart(ctx context.Context, cmd *cobra.Command, opts 
 		requested = startModeRelease
 	}
 
-	// A missing working directory is not fatal: it only means we cannot detect a
-	// checkout, so auto resolution falls through to the release path.
+	// A missing working directory means we cannot detect a checkout. A release
+	// build may continue to its normal app path; a dev build stops below rather
+	// than treating that missing signal as permission to install a release.
 	cwd, _ := os.Getwd()
 	checkout := findSourceCheckout(cwd)
 
-	if resolveStartMode(requested, checkout, isDevBuild()) == startModeSource {
+	mode := resolveStartMode(requested, checkout, isDevBuild())
+	if mode == startModeDevOutsideCheckout {
+		return usageError{errors.New("ao start: refusing release mode from a dev build outside an Agent Orchestrator checkout; run from inside the checkout, or use `ao start --release` to opt in")}
+	}
+	if mode == startModeSource {
 		if checkout == "" {
 			return usageError{fmt.Errorf("ao start: --source must run inside an Agent Orchestrator checkout; none found at or above %q", cwd)}
 		}

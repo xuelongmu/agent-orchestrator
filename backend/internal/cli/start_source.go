@@ -1,12 +1,13 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
@@ -28,10 +29,13 @@ const backendModuleLine = "module github.com/aoagents/agent-orchestrator/backend
 type startMode int
 
 const (
-	// startModeAuto picks source when a dev build runs inside a checkout.
+	// startModeAuto protects development contexts from implicitly installing a
+	// release: a checkout runs source, and a dev build outside one stops with
+	// guidance to change directory or opt in with --release.
 	startModeAuto startMode = iota
 	startModeSource
 	startModeRelease
+	startModeDevOutsideCheckout
 )
 
 // isDevBuild reports whether this binary was built from source without release
@@ -39,15 +43,19 @@ const (
 func isDevBuild() bool { return Version == devVersion }
 
 // resolveStartMode turns the flag pair plus the ambient context into a concrete
-// mode. Auto only chooses source for a dev-stamped binary inside a checkout: a
-// distributed `ao` keeps launching the distributed app even when the user
-// happens to be standing in a clone.
+// mode. A checkout is the strongest development signal, regardless of which
+// `ao` happens to be first on PATH. A dev-stamped binary outside a checkout is
+// also protected from silently fetching a release; runStart explains how to
+// choose a source checkout or explicitly opt into --release.
 func resolveStartMode(requested startMode, checkout string, devBuild bool) startMode {
 	if requested != startModeAuto {
 		return requested
 	}
-	if checkout != "" && devBuild {
+	if checkout != "" {
 		return startModeSource
+	}
+	if devBuild {
+		return startModeDevOutsideCheckout
 	}
 	return startModeRelease
 }
@@ -77,7 +85,21 @@ func isSourceCheckout(dir string) bool {
 	if err != nil {
 		return false
 	}
-	return bytes.Contains(data, []byte(backendModuleLine))
+	return goModulePath(data) == strings.TrimPrefix(backendModuleLine, "module ")
+}
+
+func goModulePath(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "module" {
+			continue
+		}
+		if path, err := strconv.Unquote(fields[1]); err == nil {
+			return path
+		}
+		return fields[1]
+	}
+	return ""
 }
 
 // runStartFromSource launches the desktop app from the checkout at root via the
@@ -88,6 +110,11 @@ func isSourceCheckout(dir string) bool {
 // orphan it.
 func (c *commandContext) runStartFromSource(ctx context.Context, out, errOut io.Writer, root string) error {
 	frontend := filepath.Join(root, "frontend")
+	restoreRunFile, err := normalizeRunFileOverride()
+	if err != nil {
+		return fmt.Errorf("ao start: resolve AO_RUN_FILE: %w", err)
+	}
+	defer restoreRunFile()
 
 	npmPath, err := c.deps.LookPath("npm")
 	if err != nil {
@@ -97,7 +124,13 @@ func (c *commandContext) runStartFromSource(ctx context.Context, out, errOut io.
 		return fmt.Errorf("ao start: frontend dependencies are not installed; run `npm ci --prefix %s` first", frontend)
 	}
 
-	c.warnRunningDaemon(ctx, errOut)
+	if strings.TrimSpace(os.Getenv("AO_DAEMON_COMMAND")) == "" {
+		if err := c.checkRunningDevDaemon(ctx, errOut, root); err != nil {
+			return err
+		}
+	} else {
+		_, _ = fmt.Fprintln(errOut, "AO_DAEMON_COMMAND is set; using the explicitly configured daemon.")
+	}
 
 	_, _ = fmt.Fprintf(out, "Starting Agent Orchestrator from source at %s\n", root)
 	_, _ = fmt.Fprintf(out, "Running `npm run dev` in %s — press Ctrl-C to stop.\n", frontend)
@@ -105,6 +138,21 @@ func (c *commandContext) runStartFromSource(ctx context.Context, out, errOut io.
 
 	name, args := devHarnessArgv(npmPath)
 	return c.deps.RunAttached(ctx, frontend, name, args...)
+}
+
+func normalizeRunFileOverride() (func(), error) {
+	raw, set := os.LookupEnv("AO_RUN_FILE")
+	if !set || strings.TrimSpace(raw) == "" {
+		return func() {}, nil
+	}
+	absolute, err := filepath.Abs(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Setenv("AO_RUN_FILE", absolute); err != nil {
+		return nil, err
+	}
+	return func() { _ = os.Setenv("AO_RUN_FILE", raw) }, nil
 }
 
 // devRunFilePath resolves the run file the dev launch will actually consult,
@@ -138,56 +186,104 @@ func devDaemonPort(configured int, isolated bool) int {
 // frontend/src/shared/dev-daemon-config.ts.
 const isolatedDevDaemonPort = 3002
 
-// warnRunningDaemon prints a heads-up when a daemon the dev launch would attach
-// to is already live.
-//
-// A dev launch does NOT enforce checkout identity by default: Electron passes
-// enforceDevCheckout: devDaemonConfig.isIsolated, which is false unless
-// ISOLATE_DEV=true. So the app attaches to whatever genuine AO daemon holds the
-// port it is going to use rather than spawning one from this checkout — meaning
-// backend changes here silently would not be running. Say that plainly; the
-// failure is invisible otherwise.
-func (c *commandContext) warnRunningDaemon(ctx context.Context, w io.Writer) {
+// checkRunningDevDaemon validates a daemon the dev launch would attach to. It
+// fails closed unless the daemon proves it came from this checkout; Electron
+// repeats the same check after npm starts to cover races with this preflight.
+func (c *commandContext) checkRunningDevDaemon(ctx context.Context, w io.Writer, root string) error {
 	cfg, err := config.Load()
 	if err != nil {
-		return
+		return fmt.Errorf("ao start: load daemon configuration: %w", err)
 	}
 	runFile, isolated := devRunFilePath(cfg.RunFilePath)
-	port := devDaemonPort(cfg.Port, isolated)
+	configuredPort := devDaemonPort(cfg.Port, isolated)
+	port := configuredPort
 
-	pid, live := 0, false
+	pid, runFileLive := 0, false
 	if info, err := runfile.CheckStale(runFile); err == nil && info != nil {
-		pid, port, live = info.PID, info.Port, true
-	} else if probe, err := c.readProbe(ctx, port, "healthz"); err == nil && probe.Service == daemonmeta.ServiceName {
-		// The run file is missing, stale, or unparseable, but a daemon may still
-		// hold the port. Electron attaches in exactly that case via the
-		// direct-port fallback in main.ts, so staying silent here would hide the
-		// attachment the warning exists to surface.
-		pid, live = probe.PID, true
+		pid, port, runFileLive = info.PID, info.Port, true
 	}
-	if !live {
-		return
+
+	probe, probeErr := c.readProbe(ctx, port, "healthz")
+	if runFileLive && (!isAODaemonProbe(probe, probeErr) || probe.PID != pid) {
+		// Electron treats a missing, stale, or PID-inconsistent run file as a
+		// hint failure and probes the configured port directly. Mirror that
+		// fallback before rejecting a genuine same-checkout daemon.
+		if fallback, err := c.readProbe(ctx, configuredPort, "healthz"); isAODaemonProbe(fallback, err) {
+			probe, probeErr, port, runFileLive = fallback, nil, configuredPort, false
+		}
 	}
-	remedy := "Stop it with `ao stop`, or set ISOLATE_DEV=true to use a separate data dir and port."
+	if !isAODaemonProbe(probe, probeErr) {
+		// A live PID in running.json is not proof of a live daemon: PIDs can be
+		// recycled and an unresponsive daemon is handled by the launch takeover
+		// path. With no genuine AO response on either candidate port, let Electron
+		// and daemon startup classify or replace the stale run file.
+		return nil
+	}
+	if runFileLive && probe.PID != pid {
+		return fmt.Errorf("ao start: the AO daemon on port %d reports pid %d, not run-file pid %d, so its checkout identity cannot be trusted; %s", port, probe.PID, pid, devDaemonStopRemedy(runFile, isolated, runFileLive, probe.PID))
+	}
+	if !devDaemonMatchesCheckout(probe, root) {
+		actual := probe.WorkingDirectory
+		if actual == "" {
+			actual = probe.ExecutablePath
+		}
+		if actual == "" {
+			actual = "an unknown location"
+		}
+		return fmt.Errorf("ao start: another AO daemon is already running from %s (pid %d, port %d); expected this checkout at %s; %s", actual, probe.PID, port, root, devDaemonStopRemedy(runFile, isolated, runFileLive, probe.PID))
+	}
+	_, _ = fmt.Fprintf(w, "Using the AO daemon already running from this checkout (pid %d, port %d).\n", probe.PID, port)
+	return nil
+}
+
+func isAODaemonProbe(probe probeResult, err error) bool {
+	return err == nil && probe.Service == daemonmeta.ServiceName
+}
+
+func devDaemonStopRemedy(runFile string, isolated, runFileLive bool, pid int) string {
+	if !runFileLive {
+		if isolated {
+			return fmt.Sprintf("stop process pid %d manually; see docs/local-development.md for isolated daemon cleanup", pid)
+		}
+		return fmt.Sprintf("stop process pid %d manually, or set ISOLATE_DEV=true to use a separate data dir and port", pid)
+	}
 	if isolated {
-		// ISOLATE_DEV is already on, so recommending it would be nonsense. Plain
-		// `ao stop` is also wrong: it resolves through config.Load, which does
-		// not read ISOLATE_DEV, so it would target the canonical daemon and
-		// report success while the isolated one kept running.
-		//
-		// Name the two variables rather than emitting a command. A copy-paste
-		// line would have to pick a shell — POSIX `VAR=x cmd` prefixes are not
-		// valid in PowerShell or cmd.exe — and would need per-shell quoting for
-		// paths containing spaces. docs/local-development.md carries the actual
-		// invocations, where the shell is known.
-		remedy = fmt.Sprintf("If it is not from this checkout, stop it by running `ao stop` with "+
+		return fmt.Sprintf("stop it by running `ao stop` with "+
 			"AO_RUN_FILE=%q and AO_DATA_DIR=%q set (`ao stop` does not read ISOLATE_DEV); "+
 			"see docs/local-development.md.",
 			runFile, filepath.Join(filepath.Dir(runFile), "data"))
 	}
-	_, _ = fmt.Fprintf(w,
-		"Warning: an AO daemon is already running (pid %d, port %d), and a dev launch\n"+
-			"attaches to it instead of starting one from this checkout. If it is not this\n"+
-			"checkout's daemon, your backend changes will not be running. %s\n",
-		pid, port, remedy)
+	return "stop it with `ao stop`, or set ISOLATE_DEV=true to use a separate data dir and port"
+}
+
+func devDaemonMatchesCheckout(probe probeResult, root string) bool {
+	if probe.ExecutablePath != "" {
+		return sameDevPath(probe.ExecutablePath, filepath.Join(root, "frontend", "daemon", devDaemonBinaryName()))
+	}
+	return probe.WorkingDirectory != "" && sameDevPath(probe.WorkingDirectory, filepath.Join(root, "backend"))
+}
+
+func devDaemonBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "ao.exe"
+	}
+	return "ao"
+}
+
+func sameDevPath(a, b string) bool {
+	return comparableDevPath(a) == comparableDevPath(b)
+}
+
+func comparableDevPath(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
 }

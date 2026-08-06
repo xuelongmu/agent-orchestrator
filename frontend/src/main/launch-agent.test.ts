@@ -47,23 +47,21 @@ describe("parseDaemonLaunchAgentPID", () => {
 		expect(daemonLaunchAgentShutdownTimeout("<key>AO_PORT</key><string>3001</string>")).toBeUndefined();
 	});
 
-	it("preserves a loaded packaged definition for shared development", () => {
+	it("replaces a loaded definition when its daemon identity or plist is stale", () => {
 		expect(
 			shouldReplaceDaemonLaunchAgent({
 				loaded: true,
 				ownsDaemon: true,
-				identityMismatch: false,
-				definitionChanged: true,
-				preserveLoadedDefinition: true,
+				identityMismatch: true,
+				definitionChanged: false,
 			}),
-		).toBe(false);
+		).toBe(true);
 		expect(
 			shouldReplaceDaemonLaunchAgent({
 				loaded: true,
 				ownsDaemon: true,
 				identityMismatch: false,
 				definitionChanged: true,
-				preserveLoadedDefinition: false,
 			}),
 		).toBe(true);
 	});

@@ -138,28 +138,29 @@ describe("daemon identity path boundaries", () => {
 		).toBeNull();
 	});
 
-	it("retains development executable containment checks", () => {
+	it("rejects an ad-hoc checkout executable instead of the expected development binary", () => {
 		const checkout = "/Users/example/Documents/projects/agent-orchestrator/backend";
 		const executable = `${checkout}/tmp/ao`;
+		const expected = "/Users/example/Documents/projects/agent-orchestrator/frontend/daemon/ao";
 		const launch: DaemonLaunchSpec = {
-			command: "go",
-			args: ["run", "./cmd/ao", "daemon"],
+			command: expected,
+			args: ["daemon"],
 			cwd: checkout,
 			shell: false,
 			source: "dev",
 		};
-		const identity = options("darwin", [checkout, executable], true);
+		const identity = options("darwin", [checkout, executable, expected], true);
 
-		expect(
-			evaluateDaemonIdentity(
-				launch,
-				{ status: "ready", service: "ao-daemon", pid: 42, executablePath: executable.toLowerCase() },
-				{
-					enforceDevCheckout: true,
-					samePath: (a, b) => samePath(a, b, identity),
-					pathInside: (child, parent) => pathInside(child, parent, identity),
-				},
-			),
-		).toBeNull();
+		const error = evaluateDaemonIdentity(
+			launch,
+			{ status: "ready", service: "ao-daemon", pid: 42, executablePath: executable.toLowerCase() },
+			{
+				enforceDevCheckout: true,
+				samePath: (a, b) => samePath(a, b, identity),
+				pathInside: (child, parent) => pathInside(child, parent, identity),
+			},
+		);
+		expect(error).toContain(executable.toLowerCase());
+		expect(error).toContain(expected);
 	});
 });

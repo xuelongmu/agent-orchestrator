@@ -90,13 +90,8 @@ export function shouldReplaceDaemonLaunchAgent(options: {
 	ownsDaemon: boolean;
 	identityMismatch: boolean;
 	definitionChanged: boolean;
-	preserveLoadedDefinition: boolean;
 }): boolean {
-	return (
-		options.loaded &&
-		options.ownsDaemon &&
-		(options.identityMismatch || (options.definitionChanged && !options.preserveLoadedDefinition))
-	);
+	return options.loaded && options.ownsDaemon && (options.identityMismatch || options.definitionChanged);
 }
 
 function joinPath(...segments: string[]): string {

@@ -42,11 +42,12 @@ go vet ./...
 go run ./cmd/ao daemon    # run the daemon from source (hidden command)
 ```
 
-`ao start` is not the daemon entrypoint. From a checkout with a binary you built
-it launches the frontend dev harness (`npm run dev`) and blocks; otherwise it
-resolves — and if necessary downloads — the published desktop app. Use
-`ao start --source` / `--release` to pick explicitly, and `ao daemon` when you
-want the daemon alone.
+`ao start` is not the daemon entrypoint. From inside a checkout it launches the
+frontend dev harness (`npm run dev`) and blocks, even when a released `ao` is
+first on `PATH`. Outside a checkout, a released binary resolves — and if
+necessary downloads — the published desktop app; a dev binary requires an
+explicit `--release` opt-in. Use `ao start --source` / `--release` to choose
+explicitly, and `ao daemon` when you want the daemon alone.
 
 Frontend-specific checks:
 

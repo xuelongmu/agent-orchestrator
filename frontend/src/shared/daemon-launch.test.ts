@@ -95,15 +95,20 @@ describe("development daemon attach identity", () => {
 			probe,
 			identityError: (daemonProbe) =>
 				evaluateDaemonIdentity(launch, daemonProbe, {
-					enforceDevCheckout: devConfig.isIsolated,
+					enforceDevCheckout: true,
 					samePath,
 					pathInside,
 				}),
 		});
 	}
 
-	it("attaches to the canonical packaged daemon in shared development", async () => {
-		await expect(attachWith({})).resolves.toMatchObject({ state: "ready", port: 3001, pid: 4242 });
+	it("rejects the canonical packaged daemon in shared development", async () => {
+		await expect(attachWith({})).resolves.toMatchObject({
+			state: "error",
+			port: 3001,
+			pid: 4242,
+			code: "identity_mismatch",
+		});
 	});
 
 	it("retains strict checkout identity in isolated development", async () => {
@@ -145,6 +150,21 @@ describe("development daemon attach identity", () => {
 			},
 			{ enforceDevCheckout: true, samePath, pathInside },
 		);
-		expect(identity).toContain("/other/backend");
+		expect(identity).toContain("/other/frontend/daemon/ao");
+	});
+
+	it("rejects a released executable even when its working directory matches the checkout", () => {
+		const identity = evaluateDaemonIdentity(
+			launch,
+			{
+				status: "ok",
+				service: DAEMON_SERVICE_NAME,
+				pid: 4242,
+				executablePath: "/Applications/Agent Orchestrator.app/Contents/Resources/daemon/ao",
+				workingDirectory: "/repo/backend",
+			},
+			{ enforceDevCheckout: true, samePath, pathInside },
+		);
+		expect(identity).toContain("expected development binary /repo/frontend/daemon/ao");
 	});
 });
