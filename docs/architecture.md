@@ -852,6 +852,16 @@ restore, cleanup, and workspace mutation. A teardown that wins the gate blocks
 later delivery and leaves the terminal guard to observe the durable terminated
 state; a delivery that wins completes its one pane write before teardown starts.
 
+Worker process ownership follows a register-then-launch invariant on every
+platform. The session seed row assigns the AO session id before workspace or
+runtime creation, and that id is injected into the launch as `AO_SESSION_ID`.
+After a runtime exists, registration completion (`MarkSpawned`) either commits
+its handle or teardown runs under the daemon lifetime even if the client request
+was canceled. On boot, runtimes with durable process inventory (currently the
+Windows ConPTY registry) are compared with committed session handles; an
+unregistered AO-owned host is reported, terminated, and any still-seed row is
+removed before normal adoption and restore passes run.
+
 ### Attach Flow
 
 ```mermaid

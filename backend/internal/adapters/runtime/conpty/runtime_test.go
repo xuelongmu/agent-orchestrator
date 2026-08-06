@@ -269,6 +269,13 @@ func TestCreate_RegistersSession(t *testing.T) {
 	if !found {
 		t.Fatal("session not in registry after Create")
 	}
+	owned, err := rt.ListOwned(context.Background())
+	if err != nil {
+		t.Fatalf("ListOwned: %v", err)
+	}
+	if len(owned) != 1 || owned[0].ID != "sess-abc" {
+		t.Fatalf("ListOwned = %v, want sess-abc", owned)
+	}
 
 	hosts["sess-abc"].cleanup(t)
 }

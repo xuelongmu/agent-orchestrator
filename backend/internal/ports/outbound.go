@@ -166,6 +166,13 @@ type Runtime interface {
 	IsAlive(ctx context.Context, handle RuntimeHandle) (bool, error)
 }
 
+// OwnedRuntimeInventory is an optional recovery surface for runtimes that can
+// durably enumerate process owners created by AO. Session reconciliation uses
+// it to reap launches that survived without a committed session handle.
+type OwnedRuntimeInventory interface {
+	ListOwned(ctx context.Context) ([]RuntimeHandle, error)
+}
+
 // RuntimeConfig is the spec for launching a session's process in a Runtime.
 // Argv is the agent's launch command as discrete arguments; each Runtime
 // shell-quotes it for its own shell, so the command survives args with spaces

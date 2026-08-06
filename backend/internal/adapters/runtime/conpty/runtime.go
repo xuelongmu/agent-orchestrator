@@ -24,6 +24,7 @@ import (
 
 // Ensure Runtime satisfies the port at compile time (Attach in attach.go).
 var _ ports.Runtime = (*Runtime)(nil)
+var _ ports.OwnedRuntimeInventory = (*Runtime)(nil)
 
 // validSessionID matches agent-orchestrator's assertValidSessionId.
 var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -154,6 +155,24 @@ func isReservedHostEnvKey(key string) bool {
 // ExpectedHandle returns Create's deterministic handle before external launch.
 func (r *Runtime) ExpectedHandle(id domain.SessionID) ports.RuntimeHandle {
 	return ports.RuntimeHandle{ID: string(id)}
+}
+
+// ListOwned returns the durable pty-host identities launched in this AO data
+// namespace. The registry prunes dead host PIDs; endpoint identity is still
+// verified by Destroy before any process is terminated.
+func (r *Runtime) ListOwned(_ context.Context) ([]ports.RuntimeHandle, error) {
+	if r.initErr != nil {
+		return nil, r.initErr
+	}
+	entries, err := ptyregistry.ListAt(r.dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("conpty: list owned runtimes: %w", err)
+	}
+	handles := make([]ports.RuntimeHandle, 0, len(entries))
+	for _, entry := range entries {
+		handles = append(handles, ports.RuntimeHandle{ID: entry.SessionID})
+	}
+	return handles, nil
 }
 
 // Create spawns a detached pty-host for the session, waits for READY, stores

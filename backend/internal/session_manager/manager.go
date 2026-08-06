@@ -721,7 +721,7 @@ func (m *Manager) launchCreatedSession(ctx context.Context, cfg ports.SpawnConfi
 	if err != nil {
 		var runtimeCleanupErr error
 		if launchPersisted {
-			runtimeCleanupErr = m.destroyLaunchRuntime(ctx, predictedHandle, promotionToken)
+			runtimeCleanupErr = m.destroyLaunchRuntime(predictedHandle)
 		}
 		cleanupErr := errors.Join(runtimeCleanupErr, m.rollbackLaunchAttempt(ctx, rec, ws, workspaceProject, promotionToken, launchPersisted))
 		if promotionToken != "" && cleanupErr != nil {
@@ -742,7 +742,7 @@ func (m *Manager) launchCreatedSession(ctx context.Context, cfg ports.SpawnConfi
 		markErr = fmt.Errorf("dependency promotion reservation lost or session terminated")
 	}
 	if markErr != nil {
-		runtimeErr := m.destroyLaunchRuntime(ctx, handle, promotionToken)
+		runtimeErr := m.destroyLaunchRuntime(handle)
 		cleanupErr := errors.Join(runtimeErr, m.rollbackStartedLaunchAttempt(ctx, rec, ws, workspaceProject, promotionToken, launchPersisted))
 		if promotionToken != "" && cleanupErr != nil {
 			cleanupErr = dependencyLaunchCleanupError{err: cleanupErr}
@@ -754,7 +754,7 @@ func (m *Manager) launchCreatedSession(ctx context.Context, cfg ports.SpawnConfi
 	}
 	if delivery == ports.PromptDeliveryAfterStart && prompt != "" {
 		if err := m.deliverAfterStartPrompt(ctx, agent, launchCfg, handle, id, prompt); err != nil {
-			runtimeErr := m.destroyLaunchRuntime(ctx, handle, promotionToken)
+			runtimeErr := m.destroyLaunchRuntime(handle)
 			cleanupErr := errors.Join(runtimeErr, m.rollbackStartedLaunchAttempt(ctx, rec, ws, workspaceProject, promotionToken, launchPersisted))
 			if cleanupErr == nil && promotionToken == "" {
 				m.markSpawnFailedTerminatedWithoutWorkspace(ctx, id)
@@ -785,7 +785,7 @@ func (m *Manager) launchCreatedSession(ctx context.Context, cfg ports.SpawnConfi
 		if commitErr == nil {
 			commitErr = errors.New("dependency promotion reservation lost or session terminated")
 		}
-		runtimeErr := m.destroyLaunchRuntime(ctx, handle, promotionToken)
+		runtimeErr := m.destroyLaunchRuntime(handle)
 		cleanupErr := errors.Join(runtimeErr, m.rollbackStartedLaunchAttempt(ctx, rec, ws, workspaceProject, promotionToken, launchPersisted))
 		if cleanupErr != nil {
 			cleanupErr = dependencyLaunchCleanupError{err: cleanupErr}
@@ -842,16 +842,65 @@ func (m *Manager) rollbackStartedLaunchAttempt(ctx context.Context, rec domain.S
 	return cleanupErr
 }
 
-func (m *Manager) destroyLaunchRuntime(ctx context.Context, handle ports.RuntimeHandle, promotionToken string) error {
-	if promotionToken == "" {
-		return m.destroyRuntime(ctx, handle)
-	}
+func (m *Manager) destroyLaunchRuntime(handle ports.RuntimeHandle) error {
+	// Runtime.Create may have completed just as the request was canceled. Once
+	// an external process exists, rollback belongs to the daemon lifetime: a
+	// canceled request context must not turn cleanup into a no-op and leave an
+	// unregistered agent running. Dependency launches already require the same
+	// lifetime fence, so use it for both paths.
 	cleanupCtx, cancel := m.promotionLifetimeContext()
 	defer cancel()
 	if err := cleanupCtx.Err(); err != nil {
 		return err
 	}
 	return m.destroyRuntime(cleanupCtx, handle)
+}
+
+// reconcileUnregisteredRuntimes reaps AO-owned process hosts that have no
+// committed durable runtime handle. This covers a daemon crash or aborted
+// request after external launch but before MarkSpawned commits registration.
+// Runtimes without a durable inventory surface retain their existing per-row
+// reconciliation behavior.
+func (m *Manager) reconcileUnregisteredRuntimes(ctx context.Context, recs []domain.SessionRecord) {
+	inventory, ok := m.runtime.(ports.OwnedRuntimeInventory)
+	if !ok {
+		return
+	}
+	handles, err := inventory.ListOwned(ctx)
+	if err != nil {
+		m.logger.Error("reconcile: owned runtime inventory failed", "error", err)
+		return
+	}
+	committed := make(map[string]struct{}, len(recs))
+	bySessionID := make(map[domain.SessionID]domain.SessionRecord, len(recs))
+	for _, rec := range recs {
+		bySessionID[rec.ID] = rec
+		if handle := runtimeHandle(rec.Metadata); handle.ID != "" {
+			committed[handle.ID] = struct{}{}
+		}
+	}
+	for _, handle := range handles {
+		if handle.ID == "" {
+			continue
+		}
+		if _, ok := committed[handle.ID]; ok {
+			continue
+		}
+		m.logger.Warn("reconcile: reaping runtime without committed session registration", "runtimeHandle", handle.ID)
+		cleanupCtx, cancel := m.promotionLifetimeContext()
+		err := m.destroyRuntime(cleanupCtx, handle)
+		cancel()
+		if err != nil {
+			m.logger.Error("reconcile: unregistered runtime reap failed", "runtimeHandle", handle.ID, "error", err)
+			continue
+		}
+		// ConPTY handles are the AO session id. DeleteSession is seed-only, so
+		// this cannot remove a committed or otherwise observable session row.
+		id := domain.SessionID(handle.ID)
+		if rec, ok := bySessionID[id]; ok && runtimeHandle(rec.Metadata).ID == "" {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
+	}
 }
 
 // destroyRuntime is the only runtime teardown boundary. Durable cleanup lease
@@ -2218,6 +2267,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("reconcile: list sessions: %w", err)
 	}
+	m.reconcileUnregisteredRuntimes(ctx, recs)
 	// Recover an editor draft before adopting its crash-surviving runtime. The
 	// durable claim prevents a restart from repeating an Enter that the prior
 	// daemon already attempted. A failed recovery is best-effort and never
@@ -2332,7 +2382,7 @@ func (m *Manager) resetRecoveredDependencyLaunch(observed domain.SessionRecord, 
 		return false, nil
 	}
 	if alive {
-		if err := m.destroyLaunchRuntime(cleanupCtx, runtimeHandle(latest.Metadata), latest.DependencyPromotionToken); err != nil {
+		if err := m.destroyLaunchRuntime(runtimeHandle(latest.Metadata)); err != nil {
 			return false, fmt.Errorf("reconcile %s: destroy interrupted dependency runtime: %w", latest.ID, err)
 		}
 	}
