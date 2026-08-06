@@ -5,6 +5,7 @@ package conpty
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 
 	"golang.org/x/sys/windows"
@@ -32,7 +33,11 @@ func (p *windowsProcess) Close() error {
 
 // defaultOSProcessFinder opens and retains the exact Windows process object.
 func defaultOSProcessFinder(pid int) (processKiller, error) {
-	h, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_TERMINATE, false, uint32(pid))
+	if pid <= 0 || uint64(pid) > math.MaxUint32 {
+		return nil, fmt.Errorf("OpenProcess: invalid pid %d", pid)
+	}
+	pid32 := uint32(pid) // #nosec G115 -- range checked above.
+	h, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_TERMINATE, false, pid32)
 	if err != nil {
 		return nil, fmt.Errorf("OpenProcess(%d): %w", pid, err)
 	}

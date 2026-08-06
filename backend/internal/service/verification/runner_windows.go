@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,7 +63,15 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 		_, copyErr := io.Copy(output, outputRead)
 		copyDone <- copyErr
 	}()
-	process, openErr := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|0x0800, false, uint32(cmd.Process.Pid)) // PROCESS_SUSPEND_RESUME
+	pid := cmd.Process.Pid
+	var process windows.Handle
+	var openErr error
+	if pid <= 0 || uint64(pid) > math.MaxUint32 {
+		openErr = fmt.Errorf("invalid verification guardian pid %d", pid)
+	} else {
+		pid32 := uint32(pid)                                                                                             // #nosec G115 -- range checked above.
+		process, openErr = windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|0x0800, false, pid32) // PROCESS_SUSPEND_RESUME
+	}
 	if openErr != nil {
 		_ = ownerWrite.Close()
 		_ = cmd.Process.Kill()
@@ -74,7 +83,8 @@ func runProcessTree(ctx context.Context, spec RunSpec) (RunResult, error) {
 	defer func() { _ = windows.CloseHandle(process) }()
 	if err = windows.AssignProcessToJobObject(job, process); err == nil {
 		status, _, _ := ntResumeProcess.Call(uintptr(process))
-		if int32(status) < 0 {
+		// NTSTATUS uses bit 31 as the severity/failure bit.
+		if status&uintptr(0x80000000) != 0 {
 			err = fmt.Errorf("resume verification guardian: NTSTATUS %#x", status)
 		}
 	}
@@ -136,7 +146,12 @@ func newKillJob() (windows.Handle, error) {
 	}
 	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	if _, err = windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+	if _, err = windows.SetInformationJobObject(
+		job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)), // #nosec G103 -- required by SetInformationJobObject.
+		uint32(unsafe.Sizeof(info)),
+	); err != nil {
 		_ = windows.CloseHandle(job)
 		return 0, err
 	}

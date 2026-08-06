@@ -129,7 +129,13 @@ jobs:
         run: go test -count=1 ./internal/service/verification
 
   lint:
-    runs-on: ubuntu-latest
+    name: Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows-specific files have distinct Win32 and ConPTY lint surfaces.
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -149,8 +155,8 @@ jobs:
           # (e.g. v2.1.x) are built with go1.24 and refuse to analyze 1.25 code.
           version: v2.12.2
           working-directory: backend
-          # Blocking on the full ruleset: the tree is clean at zero findings, so
-          # any new issue fails CI rather than being grandfathered.
+          # Blocking on the full ruleset on both native platforms: the tree is
+          # clean at zero findings, so issues are not grandfathered.
 
   api-drift:
     runs-on: ubuntu-latest

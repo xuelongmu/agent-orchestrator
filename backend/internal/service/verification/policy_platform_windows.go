@@ -16,7 +16,7 @@ func validatePlatformExecutable(executable string) error {
 	}
 	extension := strings.ToLower(filepath.Ext(executable))
 	if extension == ".cmd" || extension == ".bat" {
-		return fmt.Errorf("Windows batch executable %q is not allowed; configure a native executable", executable)
+		return fmt.Errorf("windows batch executable %q is not allowed; configure a native executable", executable)
 	}
 	if resolved, err := exec.LookPath(executable); err == nil {
 		extension = strings.ToLower(filepath.Ext(resolved))
